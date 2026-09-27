@@ -170,3 +170,95 @@ fn cad631_actual_agent_and_setsid_http_run_routes_refuse_stolen_session() {
         "native app HTTP authority failures: {failures:?}"
     );
 }
+
+#[test]
+fn cad631_operator_http_run_management_keeps_approval_explicit() {
+    let b = Board::new();
+    b.daemon.fixture_rpc("agent_register", json!({"alias":"local-pm","provider":"fake","endpoint_kind":"fake","cwd":b.root.path(),"role":"pm"})).unwrap();
+    b.daemon.register_member("local-writer", "local-pm");
+    b.daemon.register_member("local-reviewer", "local-pm");
+    let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("apps/local-content");
+    let installed = b
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":source}))
+        .unwrap();
+    let install = installed["install_id"].as_str().unwrap();
+    let digest = installed["digest"].as_str().unwrap();
+    let approval_path = format!("/api/app-installations/{install}/approve");
+    let decision = json!({"digest":digest}).to_string();
+    let (status, body) = b.operator("POST", &approval_path, &decision);
+    assert_eq!(status, 200, "capability approval: {body}");
+    let created_body = json!({"install_id":install,"workflow":"draft","inputs":{"subject":"Lunch menu","source":"Lunch is served noon to 3pm.","writer":"local-writer","reviewer":"local-reviewer"},"request_id":"http-local-1","owner_pm":"local-pm"});
+    let (status, body) = b.operator("POST", "/api/app-runs", &created_body.to_string());
+    assert_eq!(status, 200, "create local run: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(created["state"], "awaiting_approval");
+    assert!(created["project_link"].is_null());
+    assert!(
+        cadence_agent::issue::project::list(&b.root.path().join("pm"))
+            .unwrap()
+            .is_empty()
+    );
+    let db = rusqlite::Connection::open(b.daemon.state.join("cadence.sqlite3")).unwrap();
+    let grants: i64 = db
+        .query_row("SELECT count(*) FROM app_grants", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(grants, 0, "local run created provider grants");
+    let kickoffs: i64 = db
+        .query_row(
+            "SELECT count(*) FROM messages WHERE source IN ('job_dispatch','app_run_dispatch')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kickoffs, 0,
+        "create dispatched without explicit execution approval"
+    );
+    let (status, repeated) = b.operator("POST", "/api/app-runs", &created_body.to_string());
+    assert_eq!(status, 200, "idempotent create: {repeated}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&repeated).unwrap()["id"],
+        id
+    );
+    let (status, shown) = b.operator("GET", &format!("/api/app-runs/{id}"), "");
+    assert_eq!(status, 200, "show: {shown}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&shown).unwrap()["snapshot_digest"],
+        created["snapshot_digest"]
+    );
+    let (status, listed) = b.operator("GET", &format!("/api/app-runs?install_id={install}"), "");
+    assert_eq!(status, 200, "filtered list: {listed}");
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["runs"][0]["id"], id);
+    let mut forged = created_body.clone();
+    forged["operator"] = json!(true);
+    assert_eq!(
+        b.operator("POST", "/api/app-runs", &forged.to_string()).0,
+        400
+    );
+    let (status, body) = b.operator(
+        "POST",
+        &format!("/api/app-runs/{id}/approve"),
+        &json!({"digest":created["snapshot_digest"]}).to_string(),
+    );
+    assert_eq!(status, 200, "execution approval: {body}");
+    let (status, body) = b.operator("POST", &format!("/api/app-runs/{id}/cancel"), "{}");
+    assert_eq!(status, 200, "cancel: {body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"],
+        "cancelled"
+    );
+    let (status, body) = b.operator(
+        "POST",
+        &format!("/api/app-installations/{install}/revoke"),
+        &decision,
+    );
+    assert_eq!(status, 200, "revoke: {body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["approved"],
+        false
+    );
+}

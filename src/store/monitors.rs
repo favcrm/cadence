@@ -367,6 +367,7 @@ impl Store {
     ) -> Result<Option<(Task, String, bool, bool)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "dispatched" | "running") {
             tx.commit()?;
@@ -413,6 +414,7 @@ impl Store {
     ) -> Result<(Task, String, bool, bool)> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let monitor = self.monitor_in(&tx, monitor_id)?;
         if monitor.state != "active" {
             return Err(Error::rejected(format!(

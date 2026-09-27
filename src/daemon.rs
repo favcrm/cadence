@@ -970,6 +970,15 @@ impl Shared {
     }
 
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
+        if self
+            .store
+            .running_message(alias)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.source == "app_run_dispatch")
+        {
+            return;
+        }
         // CAD-551: a permission denial is a refused step, not a failed
         // one — one `tool_result` entry per denied call, paired with its
         // `tool_use` by `tool_use_id`. The denial arrives on the result
@@ -1487,7 +1496,7 @@ impl Shared {
                     .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 continue;
             }
-            match self.store.take_queued(alias)? {
+            match self.take_app_aware(alias)? {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
                     if adapter.disconnected() {
@@ -1533,18 +1542,21 @@ impl Shared {
                     // notice — the stored body still faces the
                     // endpoint's own screen (a pty profile's
                     // literal-only checks) before it may deliver.
-                    let outcome = adapter.check_body(&message.body).and_then(|()| {
-                        adapter.run_turn(&prompt, &message.id, &move |turn| {
-                            // CAD-250: a nudge owns no turn — it never
-                            // becomes `running`, and its paste is not the
-                            // held turn's proof of life.
-                            if !nudge {
-                                let _ = shared.store.mark_running(&started_id, turn);
-                                watch.bump_activity();
-                            }
-                            shared.wake();
-                        })
-                    });
+                    let outcome = self
+                        .admit_app_submission(&message)
+                        .and_then(|()| adapter.check_body(&message.body))
+                        .and_then(|()| {
+                            adapter.run_turn(&prompt, &message.id, &move |turn| {
+                                // CAD-250: a nudge owns no turn — it never
+                                // becomes `running`, and its paste is not the
+                                // held turn's proof of life.
+                                if !nudge {
+                                    let _ = shared.store.mark_running(&started_id, turn);
+                                    watch.bump_activity();
+                                }
+                                shared.wake();
+                            })
+                        });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,
@@ -2418,7 +2430,7 @@ impl Shared {
             "agent_inbox" => self.rpc_inbox(params, peer_pid),
             "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
             "message_read" => self.rpc_message_read(params, peer_pid),
-            "message_report" => self.rpc_message_report(params),
+            "message_report" => self.rpc_message_report(params, peer_pid),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),

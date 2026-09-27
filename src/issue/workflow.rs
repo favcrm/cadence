@@ -79,7 +79,7 @@ const TICKET_META_KEYS: &[&str] = &[
 
 /// Metadata fields that must be static so `workflow check` can verify
 /// them — a placeholder here is refused.
-const STATIC_META_KEYS: &[&str] = &["size", "depends_on"];
+const STATIC_META_KEYS: &[&str] = &["size", "depends_on", "action"];
 
 /// One `inputs:` entry: what the proposer is asked, whether the run may
 /// leave it blank, the shape its value must match at render (CAD-571),

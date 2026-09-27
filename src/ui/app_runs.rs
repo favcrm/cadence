@@ -1,0 +1,283 @@
+//! Operator-only HTTP for stable-ID local runs. Worker artifact access is RPC-only.
+use super::{err_response, home, json_response, parse_json, read_body, HttpResp};
+use crate::client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
+use tiny_http::{Header, Request};
+
+const BODY_CAP: u64 = 48 * 1024;
+const ARTIFACT_CAP: usize = 256 * 1024;
+
+#[derive(Clone, Copy)]
+pub(super) enum Route<'a> {
+    Create,
+    List,
+    Show(&'a str),
+    Artifact(&'a str),
+    InstallDecision(&'a str, bool),
+    RunDecision(&'a str),
+    Cancel(&'a str),
+    Dispatch(&'a str),
+}
+fn segment(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+pub(super) fn route(path: &str) -> Option<Route<'_>> {
+    if path == "/api/app-runs" {
+        return Some(Route::List);
+    }
+    if let Some(id) = path.strip_prefix("/api/app-run-artifacts/") {
+        return segment(id).then_some(Route::Artifact(id));
+    }
+    if let Some(tail) = path.strip_prefix("/api/app-runs/") {
+        if let Some((id, verb)) = tail.split_once('/') {
+            if !segment(id) {
+                return None;
+            }
+            return match verb {
+                "approve" => Some(Route::RunDecision(id)),
+                "cancel" => Some(Route::Cancel(id)),
+                "dispatch" => Some(Route::Dispatch(id)),
+                _ => None,
+            };
+        }
+        return segment(tail).then_some(Route::Show(tail));
+    }
+    let tail = path.strip_prefix("/api/app-installations/")?;
+    let (id, verb) = tail.split_once('/')?;
+    if !segment(id) {
+        return None;
+    }
+    match verb {
+        "approve" => Some(Route::InstallDecision(id, true)),
+        "revoke" => Some(Route::InstallDecision(id, false)),
+        _ => None,
+    }
+}
+impl Route<'_> {
+    pub(super) fn is_read(self) -> bool {
+        matches!(self, Self::List | Self::Show(_) | Self::Artifact(_))
+    }
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Create {
+    install_id: String,
+    workflow: String,
+    inputs: BTreeMap<String, String>,
+    request_id: String,
+    owner_pm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_link: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Decision {
+    digest: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+fn query(request: &Request, allow_install: bool) -> Result<Value, HttpResp> {
+    let raw = request
+        .url()
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("");
+    if raw.is_empty() {
+        return Ok(json!({}));
+    }
+    if !allow_install {
+        return Err(err_response(400, "query parameters are unsupported"));
+    }
+    let mut pairs = raw.split('&');
+    let (key, value) = pairs
+        .next()
+        .unwrap()
+        .split_once('=')
+        .ok_or_else(|| err_response(400, "expected install_id query"))?;
+    let key = super::pct_decode(key).ok_or_else(|| err_response(400, "malformed query"))?;
+    let value = super::pct_decode(value).ok_or_else(|| err_response(400, "malformed query"))?;
+    if key != "install_id" || !segment(&value) || pairs.next().is_some() {
+        return Err(err_response(
+            400,
+            "list admits one nonempty install_id query only",
+        ));
+    }
+    Ok(json!({"install_id":value}))
+}
+
+pub(super) fn handle(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+) -> HttpResp {
+    let route = if write && matches!(route, Route::List) {
+        Route::Create
+    } else {
+        route
+    };
+    let params = match query(request, matches!(route, Route::List)) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (method, params) = match route {
+        Route::List => ("app_run_list", params),
+        Route::Show(id) => ("app_run_show", json!({"run_id":id})),
+        Route::Artifact(id) => ("app_run_artifact", json!({"artifact_id":id})),
+        Route::Create => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: Create = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "app_run_create",
+                serde_json::to_value(value).expect("typed create serializes"),
+            )
+        }
+        Route::InstallDecision(id, _) | Route::RunDecision(id) => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let decision: Decision = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match route {
+                Route::InstallDecision(_, true) => (
+                    "app_local_install_approve",
+                    json!({"install_id":id,"digest":decision.digest}),
+                ),
+                Route::InstallDecision(_, false) => (
+                    "app_local_install_revoke",
+                    json!({"install_id":id,"digest":decision.digest}),
+                ),
+                _ => (
+                    "app_run_approve",
+                    json!({"run_id":id,"digest":decision.digest}),
+                ),
+            }
+        }
+        Route::Cancel(id) | Route::Dispatch(id) => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            if let Err(response) = parse_json::<Empty>(&bytes) {
+                return response;
+            }
+            (
+                if matches!(route, Route::Cancel(_)) {
+                    "app_run_cancel"
+                } else {
+                    "app_run_dispatch"
+                },
+                json!({"run_id":id}),
+            )
+        }
+    };
+    match client::rpc(state, method, params) {
+        Ok(value) => {
+            if let Route::Artifact(id) = route {
+                if !artifact_valid(&value, id) {
+                    return err_response(502, "invalid stored text artifact receipt");
+                }
+            }
+            let mut response = json_response(value);
+            response.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+            response
+        }
+        Err(error) => home::rpc_err(&error, method),
+    }
+}
+fn artifact_valid(value: &Value, id: &str) -> bool {
+    let Some(text) = value["text"].as_str() else {
+        return false;
+    };
+    value["id"].as_str() == Some(id)
+        && text.len() <= ARTIFACT_CAP
+        && value["size"].as_u64() == Some(text.len() as u64)
+        && matches!(
+            value["media_type"].as_str(),
+            Some("text/plain" | "text/markdown")
+        )
+        && value["digest"].as_str()
+            == Some(format!("sha256:{:x}", Sha256::digest(text.as_bytes())).as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_are_exact_and_have_no_path_authority() {
+        assert!(matches!(route("/api/app-runs"), Some(Route::List)));
+        assert!(matches!(
+            route("/api/app-runs/run-a"),
+            Some(Route::Show("run-a"))
+        ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/approve"),
+            Some(Route::InstallDecision("install-a", true))
+        ));
+        for path in [
+            "/api/app-runs/../approve",
+            "/api/app-runs/a/approve/extra",
+            "/api/app-runs/a/retry",
+            "/api/app-run-artifacts/a/b",
+            "/api/app-runs/",
+        ] {
+            assert!(route(path).is_none(), "route admitted {path}");
+        }
+    }
+
+    #[test]
+    fn request_schema_rejects_duplicate_and_identity_fields() {
+        assert!(serde_json::from_str::<Decision>(r#"{"digest":"a","digest":"b"}"#).is_err());
+        assert!(serde_json::from_str::<Decision>(r#"{"digest":"a","operator":true}"#).is_err());
+        assert!(serde_json::from_str::<Empty>(r#"{"run_id":"other"}"#).is_err());
+        assert!(serde_json::from_str::<Create>(
+            r#"{"install_id":"i","workflow":"w","inputs":{"x":1},"request_id":"r","owner_pm":"p"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn artifact_receipt_binds_exact_id_bytes_size_and_text_type() {
+        let original = json!({"id":"artifact-a","digest":format!("sha256:{:x}", Sha256::digest(b"hello")),"media_type":"text/markdown","size":5,"text":"hello"});
+        assert!(artifact_valid(&original, "artifact-a"));
+        assert!(!artifact_valid(&original, "artifact-b"));
+        for (field, value) in [
+            ("text", json!("changed")),
+            ("digest", json!("sha256:wrong")),
+            ("media_type", json!("text/html")),
+            ("size", json!(4)),
+        ] {
+            let mut bad = original.clone();
+            bad[field] = value;
+            assert!(
+                !artifact_valid(&bad, "artifact-a"),
+                "tampered {field} admitted"
+            );
+        }
+        let text = "x".repeat(ARTIFACT_CAP + 1);
+        assert!(!artifact_valid(
+            &json!({"id":"artifact-a","digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes())),"media_type":"text/plain","size":text.len(),"text":text}),
+            "artifact-a"
+        ));
+    }
+}

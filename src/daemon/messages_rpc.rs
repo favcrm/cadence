@@ -831,7 +831,11 @@ impl Shared {
     /// On an endpoint whose adapter turn result completes the message
     /// (managed), only `ack` is accepted: the turn result is the one
     /// writer of the outcome, so a reported `result` would race it.
-    pub(super) fn rpc_message_report(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_message_report(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
         let kind = required_str(params, "kind")?;
@@ -840,6 +844,14 @@ impl Shared {
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
+        if message.source == "app_run_dispatch" {
+            let caller = self.agent_caller(peer_pid, "app material report")?;
+            if !matches!(caller, AgentCaller::Agent(ref alias) if alias == &message.alias) {
+                return Err(Error::rejected(
+                    "app result requires its assigned native worker, not token possession",
+                ));
+            }
+        }
         let agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token) {
             return Err(Error::rejected(

@@ -10,6 +10,11 @@ impl Shared {
     /// tracker dir that cannot be resolved, refuses; only a job with no
     /// issue, or an issue no project holds, passes unchecked.
     pub(super) fn plan_gate_task(&self, task_id: &str) -> Result<()> {
+        if self.store.app_task_owned(task_id)? {
+            return Err(Error::rejected(
+                "app-owned tasks dispatch through the approved app run lifecycle",
+            ));
+        }
         let task = self.store.task(task_id)?;
         let job = self.store.job(&task.job_id)?;
         let Some(issue) = job.issue_id else {
@@ -470,7 +475,7 @@ impl Shared {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         use crate::issue::app_catalog::workspace;
-        match method {
+        let mut result = match method {
             "app_workspace_install" => {
                 workspace::install(&pm, &self.state_dir, required_str(params, "source")?)
             }
@@ -493,7 +498,27 @@ impl Shared {
                 workspace::recover(&pm, &self.state_dir, required_str(params, "install_id")?)
             }
             _ => Err(Error::rejected("unknown catalog operation")),
+        }?;
+        let project_approval = |row: &mut Value| -> Result<()> {
+            if let (Some(id), Some(digest)) = (row["install_id"].as_str(), row["digest"].as_str()) {
+                let status = self.store.app_capability_status(id, digest)?;
+                if status["state"] == "approved" {
+                    row["approval"] = status;
+                    row["approved"] = json!(true);
+                    row["executable"] = json!(true);
+                    row["execution_note"]=json!("local text workflow execution is available through app run; outward effects are not authorized");
+                }
+            }
+            Ok(())
+        };
+        if let Some(rows) = result.as_array_mut() {
+            for row in rows {
+                project_approval(row)?;
+            }
+        } else {
+            project_approval(&mut result)?;
         }
+        Ok(result)
     }
 
     /// CAD-577 `app_set_team` — the operator records an app's default

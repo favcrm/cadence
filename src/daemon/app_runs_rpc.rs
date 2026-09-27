@@ -1,7 +1,7 @@
 //! Operator-owned local app lifecycle and turn-bound dependency artifacts.
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_runs::LocalWorkflow;
+use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
 use std::collections::BTreeMap;
 
 impl Shared {
@@ -35,6 +35,13 @@ impl Shared {
                 "app lifecycle payload has unsupported fields",
             ));
         }
+        for field in ["project_link", "install_id"] {
+            if fields.get(field).is_some_and(|value| !value.is_string()) {
+                return Err(Error::rejected(
+                    "optional app references must be strings when present",
+                ));
+            }
+        }
         if method == "app_run_artifact" && fields.contains_key("message") {
             let caller = self.agent_caller(peer_pid, "app dependency artifact")?;
             let AgentCaller::Agent(alias) = caller else {
@@ -59,10 +66,24 @@ impl Shared {
                 workspace::with_runtime_snapshot(
                     &pm,
                     required_str(params, "install_id")?,
-                    |row, _| {
+                    |row, files| {
                         let digest = required_str(params, "digest")?;
                         if row["digest"].as_str() != Some(digest) {
                             return Err(Error::rejected("installation digest is stale"));
+                        }
+                        if method == "app_local_install_approve" {
+                            let mut count = 0;
+                            for (name, text) in files {
+                                if name.starts_with("workflows/") {
+                                    LocalWorkflow::validate_template(text)?;
+                                    count += 1;
+                                }
+                            }
+                            if count == 0 {
+                                return Err(Error::rejected(
+                                    "installed app has no supported local workflow",
+                                ));
+                            }
                         }
                         self.store.app_capability_decide(
                             required_str(params, "install_id")?,
@@ -94,15 +115,15 @@ impl Shared {
                         Error::rejected("workflow is not in this installed bundle")
                     })?;
                     let workflow = LocalWorkflow::parse(text, &inputs)?;
-                    self.store.app_run_create(
-                        id,
-                        row["digest"].as_str().unwrap(),
-                        &workflow,
-                        &inputs,
-                        required_str(params, "request_id")?,
-                        required_str(params, "owner_pm")?,
-                        optional_str(params, "project_link"),
-                    )
+                    self.store.app_run_create(LocalRunRequest {
+                        install_id: id,
+                        bundle_digest: row["digest"].as_str().unwrap(),
+                        workflow: &workflow,
+                        inputs: &inputs,
+                        request_id: required_str(params, "request_id")?,
+                        owner_pm: required_str(params, "owner_pm")?,
+                        project_link: optional_str(params, "project_link"),
+                    })
                 })
             }
             "app_run_approve" => {
@@ -164,6 +185,50 @@ impl Shared {
         workspace::with_runtime_snapshot(&pm, &install, |row, _| {
             self.store
                 .app_artifact_with_digest(id, turn, row["digest"].as_str().unwrap())
+        })
+    }
+}
+
+impl Shared {
+    pub(super) fn take_app_aware(&self, alias: &str) -> Result<Take> {
+        let head = self.store.queued_head(alias)?;
+        if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
+            let admission = (|| {
+                let (_, install) = self
+                    .store
+                    .app_message_installation(&message.id)?
+                    .ok_or_else(|| Error::rejected("app message association is absent"))?;
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+                    self.store.take_queued_app_proven(
+                        alias,
+                        Some((&message.id, row["digest"].as_str().unwrap())),
+                    )
+                })
+            })();
+            match admission {
+                Ok(take) => Ok(take),
+                Err(_) => {
+                    self.store.reject_app_submission(&message.id)?;
+                    Ok(Take::Empty)
+                }
+            }
+        } else {
+            self.store.take_queued(alias)
+        }
+    }
+    pub(super) fn admit_app_submission(&self, message: &Message) -> Result<()> {
+        if message.source != "app_run_dispatch" {
+            return Ok(());
+        }
+        let (_, install) = self
+            .store
+            .app_message_installation(&message.id)?
+            .ok_or_else(|| Error::rejected("app association is absent"))?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+            self.store
+                .app_message_admit(message, row["digest"].as_str().unwrap())
         })
     }
 }

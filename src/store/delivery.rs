@@ -112,6 +112,11 @@ impl Store {
     ) -> Result<Option<i64>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        if let Some(message) = self.message_in(&tx, id)? {
+            if message.source == "app_run_dispatch" {
+                return Err(Error::rejected("app turns do not support manual Enter recovery; preserve uncertainty and create a newly approved run"));
+            }
+        }
         let prior: i64 = tx.query_row(
             "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
              AND json_extract(payload,'$.message')=?2",
@@ -376,9 +381,15 @@ impl Store {
             tx,
             &message.alias,
             "turn_finished",
-            json!({"message": message.id, "result": result}),
+            if message.source == "app_run_dispatch" {
+                json!({"message":message.id,"app_owned":true,"result_digest":super::app_runs::material_digest(result)})
+            } else {
+                json!({"message": message.id, "result": result})
+            },
         )?;
-        self.thread_note_finished(tx, message, status, result, error)?;
+        if message.source != "app_run_dispatch" {
+            self.thread_note_finished(tx, message, status, result, error)?;
+        }
         // Preserve the uncertain provider outcome on the work axis.  The
         // compatibility `turn_finished` row above stays unscoped, while
         // this explicit unknown row is scoped only when the message carries

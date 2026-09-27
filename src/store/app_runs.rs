@@ -44,6 +44,7 @@ pub struct LocalStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalWorkflow {
+    pub source_digest: String,
     pub title: String,
     pub steps: Vec<LocalStep>,
 }
@@ -123,6 +124,7 @@ impl LocalWorkflow {
             });
         }
         Ok(Self {
+            source_digest: artifact_digest(text.as_bytes()),
             title: parsed.title,
             steps,
         })
@@ -144,7 +146,7 @@ CREATE TABLE app_runs(
 CREATE TABLE app_run_steps(
  run_id TEXT NOT NULL REFERENCES app_runs(id), step_id TEXT NOT NULL,
  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), spec TEXT NOT NULL,
- generation TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','dispatched','succeeded','failed')),
+ identity_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','dispatched','succeeded','failed')),
  message_id TEXT UNIQUE, result_digest TEXT,
  PRIMARY KEY(run_id,step_id));
 CREATE TABLE app_run_artifacts(
@@ -210,16 +212,16 @@ impl Store {
 }
 
 impl Store {
-    pub fn app_run_create(
-        &self,
-        install_id: &str,
-        bundle_digest: &str,
-        workflow: &LocalWorkflow,
-        inputs: &BTreeMap<String, String>,
-        request_id: &str,
-        owner_pm: &str,
-        project_link: Option<&str>,
-    ) -> Result<Value> {
+    pub fn app_run_create(&self, request: LocalRunRequest<'_>) -> Result<Value> {
+        let LocalRunRequest {
+            install_id,
+            bundle_digest,
+            workflow,
+            inputs,
+            request_id,
+            owner_pm,
+            project_link,
+        } = request;
         crate::proto::identifier(request_id, "app run request ID")?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
@@ -231,20 +233,35 @@ impl Store {
         let mut assignments = BTreeMap::new();
         for step in &workflow.steps {
             let agent = self.agent_in(&tx, &step.assignee)?;
-            let generation = agent.generation.clone().ok_or_else(|| {
-                Error::rejected("local worker must have a registered endpoint generation")
-            })?;
+            if !agent.enabled
+                || !matches!(
+                    (agent.provider.as_str(), agent.endpoint_kind.as_str()),
+                    ("codex", "managed" | "managed-ws")
+                        | ("claude", "managed" | "pty")
+                        | ("pi", "managed")
+                        | ("cursor", "pty")
+                        | ("fake", "fake")
+                )
+                || !crate::adapter::registry::spec_opt(&agent.provider, &agent.endpoint_kind)
+                    .is_some_and(|s| s.has_actor)
+                || agent.session_id.is_none()
+            {
+                return Err(Error::rejected(
+                    "local team needs an enabled registered local actor endpoint",
+                ));
+            }
+            let generation = material_digest(&Self::agent_identity(&agent));
             let group = agent
                 .params
                 .as_ref()
                 .and_then(|p| p.get("upstream"))
                 .and_then(Value::as_str);
-            if agent.alias != owner_pm && group != Some(owner_pm) {
+            if agent.alias == owner_pm || group != Some(owner_pm) {
                 return Err(Error::rejected(
                     "local worker must belong to the run owner group",
                 ));
             }
-            assignments.insert(step.id.clone(),json!({"alias":agent.alias,"generation":generation,"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
+            assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::agent_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
         }
         let snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
         let digest = material_digest(&snapshot);
@@ -285,7 +302,7 @@ impl Store {
         )?;
         for step in &workflow.steps {
             let task = format!("{id}-{}", step.id);
-            let generation = assignments[&step.id]["generation"].as_str().unwrap();
+            let generation = assignments[&step.id]["identity_digest"].as_str().unwrap();
             tx.execute("INSERT INTO tasks(id,job_id,role,assignee,state,created,updated) VALUES(?,?,?,?,'draft',?,?)",params![task,id,step.kind,step.assignee,now(),now()])?;
             tx.execute(
                 "INSERT INTO app_run_steps VALUES(?,?,?,?,?,'pending',NULL,NULL)",
@@ -395,7 +412,7 @@ impl Store {
         {
             return Err(Error::rejected("run execution approval is absent or stale"));
         }
-        let rows=tx.prepare("SELECT step_id,task_id,spec,generation FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows=tx.prepare("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (step_id, task_id, spec, generation) in rows {
             let step: LocalStep =
                 serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
@@ -418,7 +435,7 @@ impl Store {
             }
             let worker = self.agent_in(&tx, &step.assignee)?;
             let expected = &run["snapshot"]["assignments"][&step_id];
-            if worker.generation.as_deref() != Some(&generation)
+            if material_digest(&Self::agent_identity(&worker)) != generation
                 || worker.role != expected["role"].as_str().unwrap()
                 || worker.provider != expected["provider"].as_str().unwrap()
                 || worker.endpoint_kind != expected["endpoint_kind"].as_str().unwrap()
@@ -518,7 +535,10 @@ impl Store {
             let generation = self.agent_in(&conn, &msg.alias)?.generation;
             let assigned = &run["snapshot"]["assignments"][&step.id];
             if step.assignee != msg.alias
-                || generation.as_deref() != assigned["generation"].as_str()
+                || !Self::identity_matches(
+                    &assigned["identity"],
+                    &self.agent_in(&conn, &msg.alias)?,
+                )
                 || !step.dependencies.contains(&producer_step)
                 || !local_token_current(
                     assigned["provider"].as_str().unwrap(),
@@ -541,13 +561,13 @@ impl Store {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextArtifact {
     media_type: String,
     text: String,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum LocalResult {
     #[serde(rename = "produce_text")]
@@ -586,7 +606,7 @@ impl Store {
         let Some(task_id) = message.task_id.as_deref() else {
             return Ok(false);
         };
-        let Some((run_id,step_id,spec,generation,state,message_id))=tx.query_row("SELECT run_id,step_id,spec,generation,state,message_id FROM app_run_steps WHERE task_id=?",[task_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?))).optional()? else{return Ok(false)};
+        let Some((run_id,step_id,spec,generation,state,message_id))=tx.query_row("SELECT run_id,step_id,spec,identity_digest,state,message_id FROM app_run_steps WHERE task_id=?",[task_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?))).optional()? else{return Ok(false)};
         if !authenticated {
             return Ok(true);
         }; // reconciliation is transport history only
@@ -603,11 +623,23 @@ impl Store {
             serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
         let worker = self.agent_in(tx, &message.alias)?;
         let task = self.task_in(tx, task_id)?;
+        if status != "completed" {
+            return self
+                .app_step_failed_in(
+                    tx,
+                    &run_id,
+                    &step_id,
+                    task_id,
+                    "app turn did not produce successful material",
+                )
+                .map(|_| true);
+        }
         let token = current
             .turn_id
             .as_deref()
             .ok_or_else(|| Error::rejected("app material result needs its active turn"))?;
-        if worker.generation.as_deref() != Some(&generation)
+        if result.get("turn_id").and_then(Value::as_str) != Some(token)
+            || material_digest(&Self::agent_identity(&worker)) != generation
             || message.alias != step.assignee
             || task.assignee.as_deref() != Some(&step.assignee)
             || task.revision != 1
@@ -669,6 +701,8 @@ impl Store {
                 )
                 .map(|_| true);
         };
+        let normalized_result =
+            serde_json::to_value(&decoded).map_err(|e| Error::internal(e.to_string()))?;
         let mut valid = false;
         match decoded {
             LocalResult::Produce {
@@ -739,6 +773,7 @@ impl Store {
                     && producer_revision == 1
                     && step.kind == "review_text"
                     && step.dependencies == vec![producer_step_id.clone()]
+                    && !rationale.trim().is_empty()
                     && rationale.len() <= 16 * 1024
                     && matches!(decision.as_str(), "approve" | "revise")
                 {
@@ -763,7 +798,9 @@ impl Store {
                 )
                 .map(|_| true);
         };
-        let result_digest = material_digest(result);
+        let result_digest = material_digest(
+            &json!({"material":normalized_result,"producer":message.alias,"message":message.id}),
+        );
         tx.execute("UPDATE app_run_steps SET state='succeeded',result_digest=? WHERE run_id=? AND step_id=?",params![result_digest,run_id,step_id])?;
         tx.execute(
             "UPDATE tasks SET state='done',updated=? WHERE id=?",
@@ -828,7 +865,7 @@ impl Store {
 
 impl Store {
     pub fn app_artifact_installation(&self, id: &str) -> Result<String> {
-        Ok(self.conn().query_row("SELECT r.install_id FROM app_run_artifacts a JOIN app_runs r ON r.id=a.run_id WHERE a.id=?",[id],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("artifact unavailable"))?)
+        self.conn().query_row("SELECT r.install_id FROM app_run_artifacts a JOIN app_runs r ON r.id=a.run_id WHERE a.id=?",[id],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("artifact unavailable"))
     }
     pub fn app_task_owned(&self, id: &str) -> Result<bool> {
         Ok(self
@@ -845,8 +882,132 @@ fn local_token_current(provider: &str, kind: &str, generation: Option<&str>, tok
     let Some(spec) = crate::adapter::registry::spec_opt(provider, kind) else {
         return false;
     };
-    generation.is_some()
-        && !token.is_empty()
+    !token.is_empty()
         && (spec.turn_token.is_none()
             || crate::adapter::registry::turn_token_current(provider, kind, generation, token))
+}
+
+pub struct LocalRunRequest<'a> {
+    pub install_id: &'a str,
+    pub bundle_digest: &'a str,
+    pub workflow: &'a LocalWorkflow,
+    pub inputs: &'a BTreeMap<String, String>,
+    pub request_id: &'a str,
+    pub owner_pm: &'a str,
+    pub project_link: Option<&'a str>,
+}
+
+impl Store {
+    pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
+        Ok(self.conn().query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
+    }
+    pub(super) fn app_message_admit_in(
+        &self,
+        conn: &Connection,
+        message: &Message,
+        bundle: &str,
+    ) -> Result<()> {
+        let (run_id,spec,generation):(String,String,String)=conn.query_row("SELECT run_id,spec,identity_digest FROM app_run_steps WHERE message_id=? AND state='dispatched'",[&message.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(||Error::rejected("app message is not a current dispatched step"))?;
+        let run = Self::app_run_show_in(conn, &run_id)?;
+        Self::app_current_in(conn, &run, bundle)?;
+        if run["state"] != "running" || run["approved_digest"] != run["snapshot_digest"] {
+            return Err(Error::rejected("app message lacks current run approval"));
+        }
+        let step: LocalStep =
+            serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
+        let actual = self.agent_in(conn, &step.assignee)?;
+        let pinned = &run["snapshot"]["assignments"][&step.id];
+        if !actual.enabled
+            || actual.alias != message.alias
+            || material_digest(&Self::agent_identity(&actual)) != generation
+            || actual.role != pinned["role"].as_str().unwrap()
+            || actual.provider != pinned["provider"].as_str().unwrap()
+            || actual.endpoint_kind != pinned["endpoint_kind"].as_str().unwrap()
+            || actual
+                .params
+                .as_ref()
+                .and_then(|p| p.get("upstream"))
+                .and_then(Value::as_str)
+                != run["snapshot"]["owner_pm"].as_str()
+        {
+            return Err(Error::rejected(
+                "app message assigned endpoint identity changed",
+            ));
+        }
+        Ok(())
+    }
+    pub fn app_message_admit(&self, message: &Message, bundle: &str) -> Result<()> {
+        self.app_message_admit_in(&self.conn(), message, bundle)
+    }
+    pub fn reject_app_submission(&self, message: &str) -> Result<()> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        if let Some((run, step, task)) = tx
+            .query_row(
+                "SELECT run_id,step_id,task_id FROM app_run_steps WHERE message_id=?",
+                [message],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            let changed=tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE id=? AND state IN ('queued','submitting')",params![now(),message])?;
+            if changed > 0 {
+                self.app_step_failed_in(
+                    &tx,
+                    &run,
+                    &step,
+                    &task,
+                    "app submission authorization changed",
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+impl LocalWorkflow {
+    pub fn validate_template(text: &str) -> Result<()> {
+        workflow::parse_template(text)?;
+        let (_, body) = parse::split_front(text).map_err(|e| Error::rejected(e.to_string()))?;
+        let metadata = workflow::ticket_meta(body)?;
+        if metadata.is_empty() || metadata.len() > 16 {
+            return Err(Error::rejected(
+                "local workflow needs 1 to 16 explicitly supported steps",
+            ));
+        }
+        for step in metadata {
+            let fields: BTreeMap<_, _> = step.into_iter().collect();
+            if fields.contains_key("uses")
+                || fields.contains_key("tries")
+                || fields.contains_key("reviewer")
+                || !matches!(
+                    fields.get("action").map(String::as_str),
+                    Some("local.text.produce" | "local.text.review")
+                )
+            {
+                return Err(Error::rejected("local capability approval requires explicit supported action steps; uses, tries and implicit reviewer are unsupported"));
+            }
+        }
+        Ok(())
+    }
+}
+impl Store {
+    pub fn app_capability_status(&self, id: &str, digest: &str) -> Result<Value> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT epoch,state FROM app_install_capabilities WHERE install_id=? AND digest=?",
+                params![id, digest],
+                |r| Ok(json!({"epoch":r.get::<_,i64>(0)?,"state":r.get::<_,String>(1)?})),
+            )
+            .optional()?
+            .unwrap_or(json!({"state":"unapproved"})))
+    }
 }
