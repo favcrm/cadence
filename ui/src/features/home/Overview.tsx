@@ -401,9 +401,8 @@ const DOC_STATE_CHIP: Record<string, string> = {
   uncompared: "bg-warn/10 text-warn",
 };
 
-/// Compact reading of the project's declared scope plus its tracked
-/// document manifest — the same `/api/projects/:key/context` payload the
-/// Context section renders in full. Only for a selected project.
+/// Compact reading of a selected project's declared scope and tracked
+/// document manifest from `/api/projects/:key/context`.
 function ProjectScope({
   project,
   projects,
@@ -472,15 +471,14 @@ function ProjectScope({
         )}
         {context && docs.length > shown.length && (
           <p className="text-micro text-ink-500">
-            {docs.length - shown.length} more documents on Context
+            Showing {shown.length} of {docs.length} source documents
           </p>
         )}
         <button
           onClick={onOpenContext}
           className="lnk text-label"
-          title="full context — manifest, excerpts and verified memory"
         >
-          open context →
+          Open project context →
         </button>
       </div>
     </section>

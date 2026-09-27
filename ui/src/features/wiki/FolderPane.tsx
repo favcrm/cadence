@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
 import Link from "../../ui/Link";
-import { IconFolder, IconGrid, IconList } from "../../ui/icons";
+import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
 import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
@@ -32,22 +32,41 @@ export default function FolderPane({
   onFail: (error: unknown, verb: string) => void;
 }) {
   const scope = useWikiScope();
-  const [view, setView] = useState<"grid" | "list">("grid");
+  const [view, setView] = useState<"grid" | "list">("list");
   const [menu, setMenu] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ kind: "rename" | "move"; entry: WikiEntry; value: string } | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fieldId = useId();
+  const menuId = useId();
+  const menuTrigger = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!menu) return;
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMenu(null);
+      menuTrigger.current?.focus();
+    };
+    window.addEventListener("keydown", dismiss);
+    return () => window.removeEventListener("keydown", dismiss);
+  }, [menu]);
 
   const rows = [...entries].sort(entryOrder);
   const openHref = (entry: WikiEntry) =>
     navHref({ screen: "wiki", mode: "browse", path: entry.path, query: null });
+  const closeDialog = () => {
+    setDialog(null);
+    menuTrigger.current?.focus();
+  };
 
   const submit = async () => {
-    if (!dialog) return;
+    if (!dialog || busy || readOnly) return;
     const value = dialog.value.trim();
     if (!value) return;
     setBusy(true);
     try {
+      if (dialog.kind === "rename" && value.includes("/")) throw new Error("Use a file name without folders. Use Move to change its location.");
       const to = dialog.kind === "rename" ? joinPath(parentPath(dialog.entry.path), value) : value;
       if (scope && !withinScope(to, scope.root)) throw new Error("Choose a destination inside this project’s context");
       await wiki.mv(dialog.entry.path, to);
@@ -109,14 +128,19 @@ export default function FolderPane({
         type="button"
         className={`wk-fmenu-btn${menu === entry.path ? " on" : ""}`}
         aria-label={`${entry.name} actions`}
-        onClick={() => setMenu(menu === entry.path ? null : entry.path)}
+        aria-expanded={menu === entry.path}
+        aria-controls={`${menuId}-${encodeURIComponent(entry.path)}`}
+        onClick={(event) => {
+          menuTrigger.current = event.currentTarget;
+          setMenu(menu === entry.path ? null : entry.path);
+        }}
       >
-        ⋯
+        <IconMore />
       </button>
       {menu === entry.path && (
         <>
           <div className="wk-menu-backdrop" onClick={() => setMenu(null)} />
-          <div className="wk-fmenu">
+          <div id={`${menuId}-${encodeURIComponent(entry.path)}`} className="wk-fmenu" role="group" aria-label={`${entry.name} actions`}>
             {entry.kind === "page" && (
               <>
                 <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
@@ -147,11 +171,13 @@ export default function FolderPane({
   return (
     <>
       <div className="wk-viewrow">
-        <span className="wk-vt" role="group" aria-label="view">
+        <span className="text-label text-ink-500">{rows.length} {rows.length === 1 ? "item" : "items"}</span>
+        <span className="wk-vt" role="group" aria-label="Folder view">
           <button
             type="button"
             className={view === "grid" ? "on" : ""}
-            title="grid"
+            title="Grid view"
+            aria-label="Grid view"
             aria-pressed={view === "grid"}
             onClick={() => setView("grid")}
           >
@@ -160,7 +186,8 @@ export default function FolderPane({
           <button
             type="button"
             className={view === "list" ? "on" : ""}
-            title="list"
+            title="List view"
+            aria-label="List view"
             aria-pressed={view === "list"}
             onClick={() => setView("list")}
           >
@@ -176,29 +203,40 @@ export default function FolderPane({
             e.preventDefault();
             void submit();
           }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !busy) closeDialog();
+          }}
         >
-          <span className="slabel">{dialog.kind === "rename" ? "rename" : "move to"}</span>
+          <h2 className="wk-dialog-title">{dialog.kind === "rename" ? "Rename" : "Move"} {dialog.entry.name}</h2>
+          <label className="slabel" htmlFor={fieldId}>{dialog.kind === "rename" ? "File name" : "Destination path"}</label>
+          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">Include the file name{scope ? " and keep it inside this project’s context" : " relative to Wiki"}.</p>}
           <input
+            id={fieldId}
+            name={dialog.kind === "rename" ? "name" : "destination"}
             className="field"
             autoFocus
+            required
+            spellCheck={false}
+            autoComplete="off"
+            disabled={busy || readOnly}
+            aria-describedby={dialog.kind === "move" ? `${fieldId}-hint` : undefined}
             value={dialog.value}
             onChange={(e) => setDialog({ ...dialog, value: e.target.value })}
           />
           <div className="wk-tools">
-            <Button variant="primary" onClick={() => void submit()} disabled={busy}>
-              {dialog.kind}
+            <Button type="submit" variant="primary" loading={busy} disabled={readOnly}>
+              {dialog.kind === "rename" ? "Rename" : "Move"}
             </Button>
-            <Button onClick={() => setDialog(null)}>cancel</Button>
+            <Button disabled={busy} onClick={closeDialog}>Cancel</Button>
           </div>
         </form>
       )}
 
       {confirm && (
         <div className="wk-dialog card">
-          <span className="slabel">delete</span>
+          <h2 className="wk-dialog-title">Delete {baseName(confirm)}?</h2>
           <div className="text-secondary text-ink-300">
-            <span className="num">{confirm}</span> moves to <span className="num">.trash/</span> — it can be
-            restored from there.
+            This item moves to Trash. It can be restored later.
           </div>
           <div className="wk-tools">
             <Button
@@ -209,9 +247,9 @@ export default function FolderPane({
                 if (entry) void remove(entry);
               }}
             >
-              delete to trash
+              Move to Trash
             </Button>
-            <Button onClick={() => setConfirm(null)}>cancel</Button>
+            <Button disabled={busy} onClick={() => setConfirm(null)}>Cancel</Button>
           </div>
         </div>
       )}

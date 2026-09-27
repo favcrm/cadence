@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
@@ -57,7 +57,6 @@ export interface WikiProps {
   actor: string;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   scope?: WikiScope;
-  paneFooter?: ReactNode;
 }
 
 type Open =
@@ -68,7 +67,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, paneFooter }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }: WikiProps) {
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
@@ -309,7 +308,6 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
               onFail={fail}
             />
           )}
-          {paneFooter}
         </div>
       </div>
     </div>

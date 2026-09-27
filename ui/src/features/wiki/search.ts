@@ -39,6 +39,26 @@ export function filterHits(hits: SearchHit[], filter: TypeFilter): SearchHit[] {
   return filter === "all" ? hits : hits.filter((hit) => hitKind(hit) === filter);
 }
 
+export interface SearchResult {
+  path: string;
+  name: string;
+  matches: SearchHit[];
+}
+
+/** One result per file, preserving the server's file and excerpt order. */
+export function groupHits(hits: SearchHit[]): SearchResult[] {
+  const files = new Map<string, SearchResult>();
+  for (const hit of hits) {
+    let file = files.get(hit.path);
+    if (!file) {
+      file = { path: hit.path, name: hit.name, matches: [] };
+      files.set(hit.path, file);
+    }
+    file.matches.push(hit);
+  }
+  return [...files.values()];
+}
+
 export interface SnippetPart {
   text: string;
   mark: boolean;

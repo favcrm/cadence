@@ -43,9 +43,10 @@ export default function UploadPane({
   const files = useRef(new Map<string, File>());
   const nextId = useRef(0);
   const running = useRef(false);
+  const fileInput = useRef<HTMLInputElement>(null);
 
   const add = (list: FileList | null) => {
-    if (!list || list.length === 0) return;
+    if (readOnly || !list || list.length === 0) return;
     const picked = Array.from(list);
     const fresh = queued(
       picked.map((f) => ({ name: f.name, size: f.size })),
@@ -58,7 +59,7 @@ export default function UploadPane({
 
   useEffect(() => {
     const id = pending(items)[0];
-    if (!id || running.current) return;
+    if (readOnly || !id || running.current) return;
     const file = files.current.get(id);
     if (!file) {
       setItems((current) => uploadFailed(current, id, "the file is no longer available — add it again"));
@@ -73,9 +74,10 @@ export default function UploadPane({
         running.current = false;
         onUploaded();
       });
-  }, [items, dir, onUploaded]);
+  }, [items, dir, onUploaded, readOnly]);
 
   const tally = counts(items);
+  const active = items.some((item) => item.state === "queued" || item.state === "uploading");
   const browseHref = navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null });
 
   return (
@@ -84,19 +86,15 @@ export default function UploadPane({
           <Button href={browseHref}>Done</Button>
       </>} />
 
-      {readOnly ? (
+      {readOnly && (
         <Note warn>writes are disabled on this board — sign in as the operator to upload.</Note>
-      ) : (
-        <Note>
-          uploads land in <span className="num">{dir ? `${dir}/` : "~/pm/wiki"}</span> · {capLabel()} per file
-        </Note>
       )}
 
       <div
         className="wk-dropwrap"
         onDragEnter={(e) => {
           e.preventDefault();
-          setDrag((n) => n + 1);
+          if (!readOnly) setDrag((n) => n + 1);
         }}
         onDragOver={(e) => e.preventDefault()}
         onDragLeave={(e) => {
@@ -113,21 +111,21 @@ export default function UploadPane({
           <IconUpload />
           <div className="wk-etitle">Drop files to upload</div>
           <div className="kicker">
-            into {dir ? `${dir}/` : "~/pm/wiki"} · {capLabel()} per file
+            Up to {capLabel()} per file
           </div>
-          <label className="btn">
-            choose files
-            <input
-              type="file"
-              multiple
-              className="wk-fileinput"
-              disabled={readOnly}
-              onChange={(e) => {
-                add(e.target.files);
-                e.target.value = "";
-              }}
-            />
-          </label>
+          <Button disabled={readOnly} onClick={() => fileInput.current?.click()}>Choose files</Button>
+          <input
+            ref={fileInput}
+            aria-label="Files to upload"
+            type="file"
+            multiple
+            className="wk-fileinput"
+            disabled={readOnly}
+            onChange={(e) => {
+              add(e.target.files);
+              e.target.value = "";
+            }}
+          />
         </div>
         {drag > 0 && !readOnly && (
           <div className="wk-ovr">
@@ -141,9 +139,9 @@ export default function UploadPane({
 
       {items.length > 0 && (
         <div className="wk-uplist">
-          <div className="slabel">
-            uploads · {items.length}
-            {tally.failed > 0 ? ` · ${tally.failed} failed` : tally.done === tally.total ? " · all done" : ""}
+          <div className="slabel" role="status">
+            {active ? `${tally.done} of ${tally.total} uploaded` : `${tally.done} uploaded`}
+            {tally.failed > 0 ? ` · ${tally.failed} failed` : ""}
           </div>
           {items.map((item) => (
             <div key={item.id} className={`wk-uprow ${item.state}`}>
@@ -176,13 +174,14 @@ export default function UploadPane({
           ))}
           <div className="wk-tools">
             <Button
+              disabled={active}
               onClick={() => {
                 onToast("ok", `${tally.done} uploaded${tally.failed ? `, ${tally.failed} failed` : ""}`);
                 setItems([]);
                 files.current.clear();
               }}
             >
-              clear the list
+              Clear completed uploads
             </Button>
           </div>
         </div>

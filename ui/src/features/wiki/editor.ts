@@ -64,10 +64,9 @@ export function conflictFrom(error: unknown): ConflictInfo | null {
   return { rev: error.rev ?? "?", author: error.author, at: error.at };
 }
 
-/** The banner line, e.g. `changed since you opened it — master saved rev a41f9c2`. */
+/** Explain the conflict without exposing storage revision identifiers. */
 export function conflictText(conflict: ConflictInfo): string {
-  const who = conflict.author ? `${conflict.author} saved` : "saved";
-  return `changed since you opened it — ${who} rev ${conflict.rev}`;
+  return `${conflict.author ? `${conflict.author} updated this page` : "This page changed"} since you opened it. Your draft is kept.`;
 }
 
 /** The save request's body: the text plus the rev it was edited from. */
