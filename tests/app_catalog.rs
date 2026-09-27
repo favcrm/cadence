@@ -476,9 +476,11 @@ fn cad630_migration_preserves_restricted_approvals_and_derived_grant_identity() 
         .unwrap();
     let approvals = store.app_approvals().unwrap();
     let grants = store.app_grant_installs().unwrap();
+    let permissions = store.platform_grants(None).unwrap();
     test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
     assert_eq!(store.app_approvals().unwrap(), approvals);
     assert_eq!(store.app_grant_installs().unwrap(), grants);
+    assert_eq!(store.platform_grants(None).unwrap(), permissions);
     assert_eq!(
         grants,
         vec![("client/social-content".into(), "install-a".into())]
@@ -531,4 +533,5 @@ fn cad630_migration_orders_after_a_cooperating_update_and_grant_revocation() {
         store.app_grant_installs().unwrap().is_empty(),
         "migration replayed a revoked grant"
     );
+    assert!(store.platform_grants(Some("worker-a")).unwrap().is_empty());
 }
