@@ -553,7 +553,8 @@ equal(
 );
 
 // The Needs-you strip: approval only when pending, releases and questions.
-equal(appNeeds(detail, [], [], []), [{ kind: "approve", text: "Approve studio — its contents changed" }], "approval pending");
+equal(appNeeds(detail, [], [], []), [{ kind: "approve", text: "Approve studio for use" }], "first approval is not a change");
+equal(appNeeds({ ...detail, approval: "changed" }, [], [], []), [{ kind: "approve", text: "Approve studio — its contents changed" }], "changed approval names the change");
 equal(appNeeds({ ...detail, approval: "approved" }, [], [], []), [], "approved: nothing to do");
 equal(
   appNeeds({ ...detail, approval: "approved" }, [run({}, { state: "approved" })], [], [send]),
@@ -610,7 +611,7 @@ equal(
 equal(isReadyToRun(fresh), false, "a fresh install is not ready");
 equal(
   notReadyText(fresh),
-  "Not ready yet — approved, team set.",
+  "Approve the app and choose the team to start a run.",
   "the gap in plain words, never the engine's field list",
 );
 // A partially set team is not set.

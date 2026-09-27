@@ -12,6 +12,8 @@ import type {
   AppWorkflow,
 } from "../../lib/types";
 import Link from "../../ui/Link";
+import Button from "../../ui/Button";
+import SectionTabs from "../../ui/SectionTabs";
 import Md from "../../ui/Md";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconClose } from "../../ui/icons";
@@ -20,6 +22,8 @@ import RunForm from "../projects/RunForm";
 import ApproveApp from "./ApproveApp";
 import {
   appApprovalChip,
+  appFieldLabel,
+  appHref,
   appNeeds,
   appPurpose,
   appWorkflowRow,
@@ -35,7 +39,6 @@ import {
   outputsOf,
   primaryAction,
   publishTarget,
-  readyChecklist,
   runFilter,
   runStages,
   runStatus,
@@ -52,6 +55,7 @@ import {
   type RunFilter,
 } from "./apps";
 import type { Viewer } from "../projects/work";
+import "./apps.css";
 
 type Tab = "posts" | "settings" | "how";
 
@@ -61,8 +65,8 @@ type Tab = "posts" | "settings" | "how";
  * run (the drawer), the runs in flight and what has been published
  * (Posts), the team and where it publishes (Settings), and how it works
  * (How it works, with the engine's details folded away). `?new=<wf>`
- * opens the New-run drawer — what an Apps card's primary action links
- * to.
+ * opens the New-run drawer from a workflow link. Section links keep the
+ * selected view in the URL for refresh and browser navigation.
  */
 export default function AppDetail({
   project,
@@ -80,7 +84,6 @@ export default function AppDetail({
   const key = `${project}/${name}`;
   const state = useQuery(resources.app(key));
   const app = state.data;
-  const [tab, setTab] = useState<Tab>("posts");
   const [running, setRunning] = useState<string | null>(null);
   // The runs and the Needs-you rail's rows: the Posts tab and the strip
   // read both. The overview is asked for by App.tsx on this screen.
@@ -100,7 +103,12 @@ export default function AppDetail({
   // `?new=<app>/<wf>` asks for that workflow's drawer once the app has
   // loaded; consumed once, so closing it does not reopen on a refetch.
   const href = useHref();
-  const want = new URLSearchParams(href.split("?")[1] ?? "").get("new");
+  const params = new URLSearchParams(href.split("?")[1] ?? "");
+  const selectedTab = params.get("tab");
+  const tab: Tab = selectedTab === "settings" || selectedTab === "how" ? selectedTab : "posts";
+  const appPath = appHref(project, name);
+  const settingsHref = `${appPath}?tab=settings`;
+  const want = params.get("new");
   const consumed = useRef<string | null>(null);
   useEffect(() => {
     if (want && app && consumed.current !== want) {
@@ -111,22 +119,22 @@ export default function AppDetail({
 
   const action = app ? primaryAction(app) : null;
   const approval = app ? appApprovalChip(app) : null;
-  const needsRows = app ? appNeeds(app, runs, needs, pending) : [];
+  // Installation approval lives in Settings; this strip is for run decisions.
+  const needsRows = app ? appNeeds(app, runs, needs, pending).filter(n => n.kind !== "approve") : [];
   const ready = app ? isReadyToRun(app) : false;
-  const readyGaps = app ? readyChecklist(app) : [];
   const notReady = app ? notReadyText(app) : null;
   return (
     <>
-      <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0 max-w-3xl" aria-label={`app ${key}`}>
+      <main className="apps-workspace px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={`app ${key}`}>
         <Link href="/apps" className="lnk text-label">
-          ← all apps
+          ← All apps
         </Link>
         <div className="flex flex-wrap items-start gap-3 mt-2 mb-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-section font-semibold text-ink-100">
               {app?.title?.trim() || name}
             </h1>
-            <p className="text-micro text-ink-500 mt-0.5">in {project}</p>
+            <p className="text-micro text-ink-500 mt-0.5">Project: {project}</p>
             {app && <p className="text-body text-ink-400 mt-1 break-words">{appPurpose(app)}</p>}
             <div className="flex flex-wrap items-center gap-2 mt-1.5">
               {approval && app?.approval !== "approved" && (
@@ -136,61 +144,26 @@ export default function AppDetail({
             </div>
           </div>
           {action && (
-            <button
-              type="button"
+            <Button
+              variant="primary"
               onClick={() => ready && setRunning(action.wf.name)}
               disabled={!ready}
-              title={notReady ?? undefined}
-              className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
+              className="shrink-0"
             >
               {action.label}
-            </button>
+            </Button>
           )}
         </div>
-        {app && readyGaps.length > 0 && (
+        {app && !ready && (
           <section
-            className="card px-4 py-3 min-w-0 mb-3"
-            aria-label="ready to run"
+            className="app-setup card px-4 py-3 min-w-0 mb-3"
+            aria-label="setup required"
           >
-            <div className="slabel mb-1.5">ready to run</div>
-            <ul className="space-y-1.5">
-              {readyGaps.map((item) => (
-                <li key={item.key} className="flex flex-wrap items-center gap-2 min-w-0">
-                  <span className="text-label min-w-0 break-words flex-1">
-                    <span className={item.done ? "text-ok" : "text-warn"}>
-                      {item.done ? "✓ " : "○ "}
-                    </span>
-                    <span className={item.done ? "text-ink-300" : "text-ink-200"}>
-                      {item.label}
-                    </span>
-                  </span>
-                  {!item.done && item.key === "approved" && (
-                    <ApproveApp row={app} viewer={viewer} />
-                  )}
-                  {!item.done && item.key === "team" && (
-                    <button
-                      type="button"
-                      onClick={() => setTab("settings")}
-                      className="lnk text-label shrink-0"
-                    >
-                      Set team →
-                    </button>
-                  )}
-                  {!item.done && item.key === "publish" && (
-                    <button
-                      type="button"
-                      onClick={() => setTab("settings")}
-                      className="lnk text-label shrink-0"
-                    >
-                      Connect →
-                    </button>
-                  )}
-                </li>
-              ))}
-            </ul>
-            {notReady && (
-              <p className="text-micro text-ink-500 mt-2 break-words">{notReady}</p>
-            )}
+            <div className="min-w-0">
+              <h2 className="text-label font-medium text-ink-100">Setup required</h2>
+              <p className="text-label text-ink-400 mt-0.5 break-words">{notReady}</p>
+            </div>
+            {tab !== "settings" && <Button href={settingsHref}>Open settings</Button>}
           </section>
         )}
         <ResourceGate
@@ -210,13 +183,9 @@ export default function AppDetail({
               {needsRows.map((n, i) => (
                 <li key={`${n.kind}-${i}`} className="flex flex-wrap items-center gap-2 min-w-0">
                   <span className="text-label text-ink-200 min-w-0 break-words flex-1">{n.text}</span>
-                  {n.kind === "approve" ? (
-                    <ApproveApp row={app} viewer={viewer} />
-                  ) : (
-                    <Link href="/" className="lnk text-label shrink-0" title="open Needs you">
-                      {n.kind === "release" ? "release →" : "answer →"}
-                    </Link>
-                  )}
+                  <Link href="/" className="lnk text-label shrink-0" title="open Needs you">
+                    {n.kind === "release" ? "Release →" : "Answer →"}
+                  </Link>
                 </li>
               ))}
             </ul>
@@ -225,30 +194,13 @@ export default function AppDetail({
 
         {app && (
           <>
-            <nav className="flex items-center gap-1 border-b border-ink-700 mb-3" role="tablist">
-              {(
-                [
-                  ["posts", "Posts"],
-                  ["settings", "Settings"],
-                  ["how", "How it works"],
-                ] as [Tab, string][]
-              ).map(([id, label]) => (
-                <button
-                  key={id}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab === id}
-                  onClick={() => setTab(id)}
-                  className={`h-8 px-3 -mb-px border-b-2 text-label ${
-                    tab === id
-                      ? "border-accent text-ink-100 font-medium"
-                      : "border-transparent text-ink-400 hover:text-ink-200"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </nav>
+            <div className="-mx-4 lg:-mx-8 mb-4">
+              <SectionTabs label="App" tabs={[
+                {label:"Posts",href:appPath,on:tab === "posts"},
+                {label:"Settings",href:settingsHref,on:tab === "settings"},
+                {label:"How it works",href:`${appPath}?tab=how`,on:tab === "how"},
+              ]} />
+            </div>
             {tab === "posts" && (
               <PostsTab
                 runs={runs}
@@ -256,6 +208,8 @@ export default function AppDetail({
                 needs={needs}
                 items={items}
                 pending={pending}
+                ready={ready}
+                viewer={viewer}
                 onOpenIssue={onOpenIssue}
                 onRetry={() => void resources.appRuns(key).invalidate()}
               />
@@ -298,6 +252,8 @@ function PostsTab({
   needs,
   items,
   pending,
+  ready,
+  viewer,
   onOpenIssue,
   onRetry,
 }: {
@@ -306,6 +262,8 @@ function PostsTab({
   needs: HomeNeed[];
   items: AppRunOutput[];
   pending: AppPendingSend[];
+  ready: boolean;
+  viewer: Viewer;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
@@ -317,7 +275,7 @@ function PostsTab({
   });
   return (
     <section className="min-w-0 space-y-2.5" aria-label="posts">
-      <div className="flex flex-wrap items-center gap-1.5">
+      {runs.length > 0 && <div className="flex flex-wrap items-center gap-1.5">
         {(
           [
             ["in_progress", "In progress"],
@@ -347,7 +305,7 @@ function PostsTab({
             .filter(Boolean)
             .join(" · ") || "Nothing yet"}
         </span>
-      </div>
+      </div>}
       <ResourceGate
         state={runsState}
         loading="loading posts…"
@@ -356,12 +314,17 @@ function PostsTab({
       />
       {runsState.data && runs.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          No posts yet — start one above. Nothing is published without your approval.
+          <h2 className="text-cardtitle font-medium text-ink-100">No posts yet</h2>
+          <p className="mt-1">{!ready
+            ? "Complete setup in Settings before starting a post."
+            : viewer.readOnly || !viewer.operator
+              ? "Sign in as the operator to start a post."
+              : "Start a post when you’re ready. You’ll review the plan before any work runs."}</p>
         </div>
       )}
       {runsState.data && runs.length > 0 && shown.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          Nothing under this filter.
+          {filter === "needs_you" ? "No posts need your attention." : filter === "published" ? "No published posts yet." : "No posts in progress."}
         </div>
       )}
       <ul className="space-y-2.5">
@@ -458,10 +421,12 @@ function SettingsTab({
   const wf = action?.wf ?? (app.workflows ?? [])[0];
   const slots = usedSlots(app);
   return (
-    <div className="space-y-3 min-w-0">
+    <div className="app-settings min-w-0">
+      {wf && <TeamEditor app={app} wf={wf} runs={runs} viewer={viewer} />}
+      <div className="space-y-3 min-w-0">
       {slots.length > 0 && (
         <section className="card px-4 py-3.5 min-w-0" aria-label="publishing">
-          <div className="slabel mb-2">publishing</div>
+          <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Publishing</h2>
           <ul className="space-y-1">
             {slots.map((slot) => (
               <li key={slot} className="text-label text-ink-200">
@@ -471,33 +436,32 @@ function SettingsTab({
           </ul>
         </section>
       )}
-      {wf && (
-        <TeamEditor app={app} wf={wf} runs={runs} viewer={viewer} />
-      )}
       <section className="card px-4 py-3.5 min-w-0" aria-label="app">
-        <div className="slabel mb-2">app</div>
+        <h2 className="text-cardtitle font-medium text-ink-100 mb-2">App version</h2>
         <div className="flex flex-wrap items-center gap-2">
           {app.version && <span className="chip bg-ink-800 text-ink-300">v{app.version}</span>}
           {approvalPending(app) && <ApproveApp row={app} viewer={viewer} />}
         </div>
         {approvalPending(app) && (
           <p className="text-micro text-ink-500 mt-2 break-words">
-            Approving records this exact bundle; `cadence app update` installs a newer one.
+            {app.approval === "changed" ? "The app changed since its last approval. Review this version before approving it again." : "Review this version before approving it for use."}
           </p>
         )}
-        {!approvalPending(app) && (
+        {app.approval === "approved" && !app.error && (
           <p className="text-micro text-ink-500 mt-2 break-words">
-            This bundle is approved as installed.
+            This version is approved.
           </p>
         )}
-        <button
-          type="button"
+        {app.error && <p className="text-label text-fail mt-2 break-words" role="alert">{app.error}</p>}
+        <Button
+          variant="ghost"
           onClick={onApproveRetry}
-          className="lnk text-micro mt-2"
+          className="mt-2"
         >
-          refresh
-        </button>
+          Check for changes
+        </Button>
       </section>
+      </div>
     </div>
   );
 }
@@ -531,22 +495,24 @@ function TeamEditor({
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
   const valueOf = (role: string) => draft[role] ?? saved[role] ?? lastRun[role] ?? "";
-  const dirty = roles.some((r) => draft[r] !== undefined && draft[r] !== valueOf(r));
+  const dirty = roles.some((r) => valueOf(r) !== (saved[r] ?? ""));
 
   const save = () => {
     if (busy) return;
     setBusy(true);
     setNote(null);
+    setFailed(false);
     const team = roles.map((r) => `${r}=${valueOf(r)}`);
     api
       .appSetTeam(app.project, app.name, team)
-      .then(() => {
+      .then(async () => {
+        await resources.app(`${app.project}/${app.name}`).invalidate();
         setDraft({});
-        setNote("Saved.");
-        void resources.app(`${app.project}/${app.name}`).invalidate();
+        setNote("Team saved.");
       })
-      .catch((e: ApiError) => setNote(e.message ?? String(e)))
+      .catch((e: ApiError) => { setFailed(true); setNote(e.message ?? String(e)); })
       .finally(() => setBusy(false));
   };
 
@@ -554,6 +520,7 @@ function TeamEditor({
     if (adding) return;
     setAdding(role);
     setNote(null);
+    setFailed(false);
     api
       .appAddWorker(app.project, app.name, role)
       .then((out) => {
@@ -561,36 +528,38 @@ function TeamEditor({
         void resources.agents.invalidate();
         void resources.app(`${app.project}/${app.name}`).invalidate();
       })
-      .catch((e: ApiError) => setNote(e.message ?? String(e)))
+      .catch((e: ApiError) => { setFailed(true); setNote(e.message ?? String(e)); })
       .finally(() => setAdding(null));
   };
 
   return (
     <section className="card px-4 py-3.5 min-w-0" aria-label="team">
-      <div className="slabel mb-2">team</div>
+      <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Team</h2>
       <p className="text-label text-ink-400 mb-2">
-        A new run starts with this team. Saved with the app; changing it never needs re-approval.
+        The default agents for new runs. Changing the team does not require app approval.
       </p>
-      <ul className="space-y-2">
+      {!viewer.operator && <p className="text-label text-ink-500 mb-3">Sign in as the operator to change the team.</p>}
+      <ul className="space-y-3">
         {roles.map((role) => {
           const spec = inputs.find((i) => i.name === role);
           const value = valueOf(role);
           return (
-            <li key={role} className="flex flex-wrap items-center gap-2 min-w-0">
-              <label
-                htmlFor={`team-${role}`}
-                className="text-label text-ink-300 min-w-0 break-words w-32"
-              >
-                {spec?.ask ?? role}
-              </label>
+            <li key={role} className="app-team-row">
+              <div className="min-w-0">
+                <label htmlFor={`team-${role}`} className="text-label font-medium text-ink-200">{appFieldLabel(role)}</label>
+                {spec?.ask && <p id={`team-${role}-hint`} className="text-micro text-ink-500 mt-0.5 break-words">{spec.ask}</p>}
+              </div>
+              <div className="app-team-controls">
               <select
                 id={`team-${role}`}
                 value={value}
-                onChange={(e) => setDraft((cur) => ({ ...cur, [role]: e.target.value }))}
+                onChange={(e) => {setDraft((cur) => ({ ...cur, [role]: e.target.value }));setNote(null);}}
                 className="field flex-1 min-w-0"
                 data-role={role}
+                aria-describedby={spec?.ask ? `team-${role}-hint` : undefined}
+                disabled={busy || adding !== null || !viewer.operator}
               >
-                <option value="">not set</option>
+                <option value="">Choose an agent</option>
                 {candidates.map((a) => (
                   <option key={a.alias} value={a.alias}>
                     {a.alias} — {agentStateWord(a.state)}
@@ -600,19 +569,21 @@ function TeamEditor({
                   <option value={value}>{value} — saved</option>
                 )}
               </select>
-              <button
-                type="button"
+              <Button
+                variant="ghost"
                 onClick={() => addWorker(role)}
-                disabled={adding !== null || !viewer.operator}
-                className="lnk text-label shrink-0 disabled:opacity-40"
+                disabled={busy || adding !== null || !viewer.operator}
+                className="shrink-0"
+                aria-label={`Add worker for ${appFieldLabel(role)}`}
                 title={
                   !viewer.operator
                     ? "Joining a worker is the operator's."
                     : "join a new Devin worker for this role"
                 }
               >
-                {adding === role ? "Joining…" : "Add worker →"}
-              </button>
+                {adding === role ? "Joining…" : "Add worker"}
+              </Button>
+              </div>
             </li>
           );
         })}
@@ -622,16 +593,16 @@ function TeamEditor({
       </ul>
       {roles.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 mt-3">
-          <button
-            type="button"
+          <Button
+            variant="primary"
             onClick={save}
-            disabled={busy || !dirty || !viewer.operator}
-            className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
+            loading={busy}
+            disabled={adding !== null || !dirty || !viewer.operator}
             title={!viewer.operator ? "Saving the team is the operator's." : undefined}
           >
             {busy ? "Saving…" : "Save team"}
-          </button>
-          {note && <span className="text-micro text-ink-400 break-words">{note}</span>}
+          </Button>
+          {note && <span className={`text-label ${failed ? "text-fail" : "text-ink-400"} break-words`} role={failed ? "alert" : "status"}>{note}</span>}
         </div>
       )}
     </section>

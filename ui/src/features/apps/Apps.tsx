@@ -2,22 +2,23 @@ import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import Link from "../../ui/Link";
+import Button from "../../ui/Button";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { homeNeeds, type HomeNeed } from "../home/needs";
 import {
   appApprovalChip,
   appHref,
   appPurpose,
-  newRunHref,
   runsSummary,
 } from "./apps";
 import type { Viewer } from "../projects/work";
+import "./apps.css";
 
 /**
  * The Apps screen (CAD-563 r2): one card per installed app — a
  * monogram, the title, the app's one-line purpose, what is happening
  * now ("2 in progress · 1 needs you", read from the app's runs) and the
- * primary action that starts a new run ("New post"). Internals — the
+ * link to open the app and check setup before starting a run. Internals — the
  * slug, the version, the path, the digest, the slot bindings — live on
  * the app page, not here.
  *
@@ -34,12 +35,12 @@ export default function Apps({ project }: { project: string; viewer: Viewer }) {
   const all = state.data ?? [];
   const rows = project === "all" ? all : all.filter((r) => r.project === project);
   return (
-    <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="apps">
+    <main className="apps-workspace px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="apps">
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h1 className="text-section font-semibold text-ink-100">Apps</h1>
         <StaleChip state={state} />
         <span className="kicker">
-          installed apps{project === "all" ? "" : ` · ${project}`}
+          {state.data ? `${rows.length} installed` : "Installed apps"}{project === "all" ? "" : ` · ${project}`}
         </span>
       </div>
       <ResourceGate
@@ -59,7 +60,7 @@ export default function Apps({ project }: { project: string; viewer: Viewer }) {
       )}
       <ul className="space-y-2.5">
         {rows.map((row, i) => (
-          <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} />
+          <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
         ))}
       </ul>
     </main>
@@ -82,18 +83,19 @@ function AppIcon({ label }: { label: string }) {
 function AppCard({
   row,
   needs,
+  showProject,
 }: {
   row: AppRow;
   needs: HomeNeed[];
+  showProject: boolean;
 }) {
   const approval = appApprovalChip(row);
   const title = row.title?.trim() || row.name || "App";
   const appName = row.name;
   const href = appName ? appHref(row.project, appName) : null;
-  const action = row.primary ?? null;
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
-      <div className="flex items-start gap-3 min-w-0">
+      <div className="app-card-layout">
         <AppIcon label={title} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2 min-w-0">
@@ -106,6 +108,7 @@ function AppCard({
             )}
             <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
           </div>
+          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">Project: {row.project}</p>}
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
             {row.error ? (
@@ -117,22 +120,7 @@ function AppCard({
             )}
           </p>
         </div>
-        {appName && href && action && (
-          <Link
-            href={newRunHref(row.project, appName, `${appName}/${action.workflow}`)}
-            className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium grid place-items-center"
-          >
-            {action.label?.trim() || "New run"}
-          </Link>
-        )}
-        {!action && href && (
-          <Link
-            href={href}
-            className="shrink-0 h-8 px-3 rounded border border-ink-600 text-label text-ink-300 grid place-items-center hover:border-edge-hover"
-          >
-            Open app
-          </Link>
-        )}
+        {href && <Button href={href} className="app-card-action" aria-label={`Open ${title} in ${row.project}`}>Open app</Button>}
       </div>
     </li>
   );

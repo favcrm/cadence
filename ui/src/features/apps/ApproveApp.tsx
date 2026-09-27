@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
+import Button from "../../ui/Button";
 import type { Viewer } from "../projects/work";
 import { approveBlock, approvalPending, type GateRow } from "./apps";
 
@@ -44,15 +45,13 @@ export default function ApproveApp({ row, viewer }: { row: GateRow; viewer: View
   };
   return (
     <span className="inline-flex flex-wrap items-center gap-2">
-      <button
-        type="button"
+      <Button
+        variant="primary"
         onClick={approve}
-        disabled={busy}
-        className="chip bg-accent/15 text-accent hover:bg-accent/25 transition-colors disabled:opacity-40"
-        title={`approve ${name} for its current structure`}
+        loading={busy}
       >
-        {busy ? "approving…" : "approve"}
-      </button>
+        {busy ? "Approving…" : "Approve app"}
+      </Button>
       {error && (
         <span className="text-micro text-fail break-words" role="alert">
           {error}
