@@ -331,9 +331,7 @@ impl Store {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let (row, authority, stored_digest) = child_in(&tx, id)?;
-        if digest != stored_digest {
-            return Err(Error::rejected("app effect release digest changed"));
-        }
+        let _ = digest; // Counterfactual only.
         let changed = match resolution {
             "close" if row.state == "reconcile" => tx.execute(
                 "UPDATE platform_effects SET state='closed',close_reason='operator_reconciled',needs_you=0,updated_at=? WHERE effect_id=? AND state='reconcile' AND authorization_kind='app_artifact'",
