@@ -350,10 +350,23 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --release --locked
+      - name: Assert production JSON parsing preserves frozen floats
+        run: |
+          # Exclude dev dependencies: jsonschema otherwise masks a missing
+          # direct float_roundtrip feature even while all Rust tests pass.
+          features="${{ runner.temp }}/production-json-features.txt"
+          cargo tree --locked --edges normal,build,features --invert serde_json >"$features"
+          cat "$features"
+          if ! grep -Fq 'serde_json feature "float_roundtrip"' "$features"; then
+            echo "::error::production JSON parser lacks exact float round-tripping" >&2
+            exit 1
+          fi
       - name: Rehearse offline hosted migration with the built CLI
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/release/cadence
         run: python3 scripts/test-hosted-migration.py -v
+      - name: Verify app snapshot integrity with the release CLI
+        run: python3 tests/e2e/app_snapshot_release.py --binary target/release/cadence
       # CAD-482: the test seam must never reach a release binary —
       # the canary exists only under the feature, so this grep on the
       # shipped default-feature binary proves its bytes carry none of
