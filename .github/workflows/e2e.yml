@@ -22,7 +22,7 @@ jobs:
           - kind: baseline
             revision: e85b5a88663f07c2c88bd42907527ad44fce5248
           - kind: candidate
-            revision: fd6b4f0cd0d1d8d6e82b5cd53fcef3dbc8d9bd7b
+            revision: 1ae9852185ea99c8e83f6339c9f17caa9a64bc29
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
