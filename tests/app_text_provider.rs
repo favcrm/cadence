@@ -125,3 +125,60 @@ fn local_sink_receipt_distinguishes_actual_non_utf8_destination_bytes() {
         b.platforms["local"].connection_registration()
     );
 }
+
+#[test]
+fn local_readback_pins_exact_effect_directory_and_authority() {
+    use cadence_agent::contract_fixture::Verified;
+    use sha2::{Digest, Sha256};
+    let (dir, adapter) = adapter();
+    let provenance = json!({"effect_id":"effect-a","authorization_kind":"app_artifact","authority_digest":"sha256:authority-a","artifact_id":"artifact-a","artifact_digest":format!("sha256:{:x}",Sha256::digest(b"same reviewed artifact")),"sink_registration":adapter.connection_registration().unwrap()});
+    let input = adapter
+        .prepare_app_text("Draft", "same reviewed artifact", &provenance)
+        .unwrap();
+    let digest = format!("sha256:{:x}", Sha256::digest(input.to_string().as_bytes()));
+    let bucket = dir.path().join("outbox/app-items");
+    let wrong = bucket.join("effect-other");
+    std::fs::create_dir_all(&wrong).unwrap();
+    let index = json!({"effect_id":"effect-a","scope":{"kind":"app_artifact"},"input_digest":digest,"authority_digest":"sha256:authority-a","provenance":provenance});
+    std::fs::write(wrong.join("index.json"), index.to_string()).unwrap();
+    std::fs::write(wrong.join("post.md"), "# Draft\n\nsame reviewed artifact").unwrap();
+    assert_eq!(
+        adapter.read_back("publish_app_text", &input),
+        Verified::Unknown,
+        "another effect directory was accepted"
+    );
+    let exact = bucket.join("effect-a");
+    std::fs::rename(&wrong, &exact).unwrap();
+    assert_eq!(
+        adapter.read_back("publish_app_text", &input),
+        Verified::True
+    );
+    let mut second = input.clone();
+    second["provenance"]["effect_id"] = json!("effect-b");
+    assert_eq!(
+        adapter.read_back("publish_app_text", &second),
+        Verified::Unknown,
+        "missing second effect borrowed first receipt"
+    );
+    for field in [
+        "effect_id",
+        "authority_digest",
+        "input_digest",
+        "provenance",
+    ] {
+        let mut corrupt = index.clone();
+        corrupt[field] = json!("different");
+        std::fs::write(exact.join("index.json"), corrupt.to_string()).unwrap();
+        assert_eq!(
+            adapter.read_back("publish_app_text", &input),
+            Verified::False,
+            "accepted corrupt {field}"
+        );
+    }
+    std::fs::write(exact.join("index.json"), index.to_string()).unwrap();
+    std::fs::write(exact.join("post.md"), "different bytes").unwrap();
+    assert_eq!(
+        adapter.read_back("publish_app_text", &input),
+        Verified::False
+    );
+}
