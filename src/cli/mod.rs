@@ -3116,6 +3116,21 @@ pub(crate) fn run() -> Result<i32> {
             AgentUidAction::Runbook => cadence_agent::agent_uid::runbook::cli(),
         };
     }
+    // CAD-647: trusted source development never resolves production state
+    // or adopts its sandbox profile. The harness has no daemon/PM contract.
+    if let Commands::App {
+        action:
+            app::AppAction::Dev {
+                name,
+                source,
+                port,
+                host,
+                allow_host,
+            },
+    } = &cli.command
+    {
+        return app::run_dev(name, source, *port, host, allow_host);
+    }
     let state_dir = match cli.state_dir {
         Some(dir) => dir,
         None => client::state_dir()?,

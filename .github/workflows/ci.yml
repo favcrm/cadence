@@ -351,6 +351,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test:url-state
+      - name: Verify app development isolation and HMR
+        run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
