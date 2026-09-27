@@ -296,7 +296,28 @@ fn cad673_host_generation_absent_and_shared_writes_fenced() {
     );
     let store = Arc::new(crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap());
     store.install_write_fence(ctl.fence());
+    store
+        .register_agent(&crate::store::NewAgent {
+            alias: "worker",
+            provider: "fake",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: dir.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let registration = store.events("worker", 0, 100).unwrap();
+    assert_eq!(registration.len(), 1);
+    assert_eq!(registration[0].kind, "registered");
+    let registration_seq = registration[0].seq;
     store.event_public("worker", "before", json!({})).unwrap();
+    let before_events = store.events("worker", registration_seq, 100).unwrap();
+    assert_eq!(before_events.len(), 1);
+    assert_eq!(before_events[0].kind, "before");
     let pm_dir = dir.path().join("pm");
     let mut pm = crate::issue::Pm::init(&pm_dir).unwrap();
     pm.attach_lease(ctl.pm_lease());
@@ -324,7 +345,11 @@ fn cad673_host_generation_absent_and_shared_writes_fenced() {
     for writer in writers {
         assert!(writer.join().unwrap().is_err());
     }
-    assert_eq!(store.events("worker", 0, 100).unwrap().len(), 1);
+    let after_events = store.events("worker", registration_seq, 100).unwrap();
+    assert_eq!(after_events.len(), 1);
+    assert_eq!(after_events[0].kind, "before");
+    assert_eq!(after_events[0].seq, before_events[0].seq);
+    assert_eq!(store.events("worker", 0, 100).unwrap().len(), 2);
     std::fs::write(&note, "refused\n").unwrap();
     assert!(pm
         .commit(std::slice::from_ref(&note), "forged\nLease-Epoch: 999\n")
