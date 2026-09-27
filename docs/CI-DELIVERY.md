@@ -11,7 +11,8 @@ After this workflow lands on main, select the successful main CI run
 that holds the desired artifact and dispatch:
 
 ```sh
-gh workflow run staging.yml -R favcrm/cadence --ref main -f ci_run_id=<main-ci-run-id>
+gh workflow run staging.yml -R favcrm/cadence --ref main \
+  -f ci_run_id=<main-ci-run-id> -f baseline_ci_run_id=<previous-production-ci-run-id>
 ```
 
 The staging job verifies the run's workflow, repository, main ancestry,
@@ -21,6 +22,14 @@ those exact bytes, with the candidate revision's fixtures. Providers
 and GitHub are faked; the daemon, board and browser are real and isolated.
 It uses a temporary HOME/state/tracker and board port 3186 on a hosted
 runner. No production state, credentials or daemon are accessed.
+
+The previous release is independently downloaded and attested. A second
+fixture starts its daemon, registers an inbox agent, records a rollout
+lease and consistent backup, starts the candidate on that historical
+schema, verifies integrity and agent identity preservation, then restores
+the backup and starts the old binary. A migration/recovery failure blocks
+promotion. This synthetic fixture exercises startup/schema compatibility;
+it does not claim a rehearsal of real production data or live turns.
 
 Review the staging evidence and approve the production environment job.
 That job downloads and verifies the artifact again after the approval

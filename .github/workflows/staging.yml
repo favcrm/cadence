@@ -3,10 +3,24 @@ name: staging
 # Validate a selected batch rather than running another full journey for
 # every merge. Dispatch on main with the successful main CI run's id.
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/staging.yml'
+      - 'scripts/delivery-candidate.py'
+      - 'scripts/staging-rehearsal.py'
+      - 'scripts/e2e/**'
+      - 'tests/e2e/**'
+      - 'tests/e2e_mvp.rs'
+      - 'src/upgrade.rs'
+      - 'tests/upgrade.rs'
   workflow_dispatch:
     inputs:
       ci_run_id:
         description: Successful main ci.yml run holding the candidate artifact
+        required: true
+        type: string
+      baseline_ci_run_id:
+        description: Main CI artifact for the previous production release (migration rehearsal)
         required: true
         type: string
 
@@ -16,13 +30,65 @@ permissions:
 
 # Preserve explicit candidates and approval waits. Main keeps merging.
 concurrency:
-  group: staging-${{ inputs.ci_run_id }}
+  group: staging-${{ github.event.pull_request.number || inputs.ci_run_id }}
   cancel-in-progress: false
   queue: max
 
 jobs:
+  # Validate this workflow's implementation before it reaches main.
+  # PR bytes are never promoted; the production chain below is dispatch-only.
+  rehearsal-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm build
+        working-directory: ui
+      - run: cargo build --release --locked --features ui
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.1
+          CARGO_BUILD_JOBS: 4
+      - name: Real-binary migration and backup recovery rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          baseline=$(gh run list -R "$REPO" --workflow ci.yml --event push --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          python3 scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$baseline" --dest "$RUNNER_TEMP/baseline"
+          python3 scripts/staging-rehearsal.py --baseline "$RUNNER_TEMP/baseline/cadence" \
+            --candidate "$GITHUB_WORKSPACE/target/release/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"
+      - name: Full MVP journey using the PR's embedded-UI release binary
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.1
+          CARGO_BUILD_JOBS: 4
+          E2E_OUT: ${{ runner.temp }}/staging-e2e
+          CADENCE_E2E_PORT: 3186
+        run: scripts/e2e/mvp.sh --no-build
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: staging-pr-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/rehearsal
+            ${{ runner.temp }}/staging-e2e
+          if-no-files-found: warn
+          retention-days: 14
+
   stage:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     environment: staging
@@ -67,6 +133,17 @@ jobs:
           CADENCE_E2E_BINARY: ${{ runner.temp }}/candidate/cadence
           CADENCE_E2E_PORT: 3186
         run: sh control/scripts/e2e/mvp.sh --no-build
+      - name: Verify the previous release and rehearse migration and backup recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASELINE_RUN: ${{ inputs.baseline_ci_run_id }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          python3 control/scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$BASELINE_RUN" --dest "$RUNNER_TEMP/baseline"
+          # Rehearsal children receive a clean environment without this token.
+          python3 control/scripts/staging-rehearsal.py --baseline "$RUNNER_TEMP/baseline/cadence" \
+            --candidate "$RUNNER_TEMP/candidate/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"
       - name: Check the journey did not replace the candidate bytes
         env:
           EXPECTED: ${{ steps.candidate.outputs.sha256 }}
@@ -77,6 +154,8 @@ jobs:
           name: staging-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/candidate/candidate.json
+            ${{ runner.temp }}/baseline/candidate.json
+            ${{ runner.temp }}/rehearsal
             ${{ runner.temp }}/staging-e2e/acceptance.json
             ${{ runner.temp }}/staging-e2e/screens
             ${{ runner.temp }}/staging-e2e/logs

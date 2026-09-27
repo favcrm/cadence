@@ -50,6 +50,14 @@ async function expectText(locator, text, what) {
 
 /** Open the Needs-you row of `kind` whose title mentions `issue`. */
 async function needRow(page, kind, issue) {
+  // CAD-574 groups PR decisions behind an initially closed disclosure.
+  // Follow the same interaction as an operator before locating its row.
+  if (kind === "merge_decision") {
+    const group = page.locator('section[aria-label="needs you"] section[data-need-group="prs"]');
+    await group.first().waitFor({ timeout: TIMEOUT });
+    const toggle = group.first().locator('button[aria-expanded]').first();
+    if ((await toggle.getAttribute("aria-expanded")) === "false") await toggle.click();
+  }
   const row = page.locator(`section[aria-label="needs you"] li[data-need="${kind}"]`, {
     hasText: issue,
   });
@@ -273,8 +281,8 @@ const steps = {
   async merge({ page }, { issue, reviewer, sha, pr, verdict }) {
     await page.goto(base);
     const row = await needRow(page, "merge_decision", issue);
-    await expectText(row, `PASS by ${reviewer}`, "the merge row names the reviewer");
     await row.getByRole("button", { name: "Review merge" }).click();
+    await expectText(row, `PASS by ${reviewer}`, "the merge row names the reviewer");
     await expectText(row, pr, "the merge row names the PR");
     await expectText(row, verdict, "the merge row carries the verdict");
     await expectText(row, sha.slice(0, 12), "the merge is pinned to the reviewed head");
