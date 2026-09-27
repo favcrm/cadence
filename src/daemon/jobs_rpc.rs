@@ -213,7 +213,10 @@ impl Shared {
         if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
             let mut events = self.store.job_events_tail(&job.id, 51)?;
             let has_older = events.len() > 50;
-            events.truncate(50);
+            // The store returns oldest first; discard the extra oldest row.
+            if has_older {
+                events.remove(0);
+            }
             return Ok(json!({
                 "events": events.iter().map(store::Event::to_json).collect::<Vec<_>>(),
                 "cursor": events.last().map(|e| e.seq).unwrap_or(0),
