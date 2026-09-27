@@ -173,6 +173,11 @@ impl Message {
         if self.source == "app_run_dispatch" {
             j["body"] = json!("[app-owned material: use authorized run surfaces]");
             j["result"] = Value::Null;
+            j["error"] = self
+                .error
+                .as_ref()
+                .map(|_| json!("app turn failed; inspect authorized run surfaces"))
+                .unwrap_or(Value::Null);
         }
         // Derived and additive: present only on a delivered, unreported
         // pty turn, so every existing reader of `state` is unchanged.

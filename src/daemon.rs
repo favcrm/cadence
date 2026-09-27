@@ -972,10 +972,9 @@ impl Shared {
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
         if self
             .store
-            .running_message(alias)
-            .ok()
-            .flatten()
-            .is_some_and(|m| m.source == "app_run_dispatch")
+            .running_messages(alias)
+            .map(|messages| messages.iter().any(|m| m.source == "app_run_dispatch"))
+            .unwrap_or(true)
         {
             return;
         }

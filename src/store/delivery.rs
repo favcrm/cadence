@@ -412,7 +412,7 @@ impl Store {
                         "turn_unknown",
                         json!({
                             "message": message.id,
-                            "reason": unknown_event_reason(error, result),
+                            "reason": if message.source == "app_run_dispatch" { "app turn outcome is uncertain; inspect authorized run surfaces".to_string() } else { unknown_event_reason(error, result) },
                             "owner": "operator",
                             "next_action": unknown_event_action(&message.id),
                         }),

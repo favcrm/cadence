@@ -332,11 +332,10 @@ impl Shared {
             .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
         if message.source == "app_run_dispatch" {
             match self.connection_caller(peer_pid)? {
-                caller_rule::Who::Agent(ref alias) if alias == &message.alias => {}
                 caller_rule::Who::Operator => {}
                 _ => {
                     return Err(Error::rejected(
-                        "app mail requires its assigned worker or operator",
+                        "app mail inspection requires operator proof",
                     ))
                 }
             }

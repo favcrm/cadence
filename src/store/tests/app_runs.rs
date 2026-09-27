@@ -473,3 +473,23 @@ fn cad631_generic_job_reads_do_not_reveal_private_rendered_title() {
     assert!(!format!("{:?}", s.jobs(None, true).unwrap()).contains(&workflow.title));
     assert!(!format!("{:?}", s.tasks_for_job(id).unwrap()).contains(&workflow.title));
 }
+
+#[test]
+fn cad631_public_app_message_projection_hides_provider_material() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
+        .unwrap();
+    let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    let message = start_local_step(&s, &dispatched, 0, "writer");
+    s.conn()
+        .execute(
+            "UPDATE messages SET error='private-provider-material-sentinel' WHERE id=?",
+            [&message.id],
+        )
+        .unwrap();
+    let projection = s.message(&message.id).unwrap().unwrap().to_json();
+    assert!(!projection
+        .to_string()
+        .contains("private-provider-material-sentinel"));
+}
