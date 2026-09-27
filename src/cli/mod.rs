@@ -1838,9 +1838,13 @@ pub(crate) fn stale_holder(agent: &Value) -> bool {
 /// actor left to report them (CAD-503). Waiting on a stale turn is a
 /// deadlock, so the caller refuses it (or carries it with
 /// `--ignore-stale`) instead of blocking until the timeout.
-pub(crate) fn busy_agents(state_dir: &Path, agents: &[Value]) -> (Vec<String>, Vec<String>) {
+pub(crate) fn busy_agents(
+    state_dir: &Path,
+    agents: &[Value],
+) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
     let mut busy = Vec::new();
     let mut stale = Vec::new();
+    let mut stale_pairs = Vec::new();
     for a in agents {
         let alias = a["alias"].as_str().unwrap_or_default();
         let provider = a["provider"].as_str().unwrap_or_default();
@@ -1884,13 +1888,17 @@ pub(crate) fn busy_agents(state_dir: &Path, agents: &[Value]) -> (Vec<String>, V
                         m["id"].as_str().unwrap_or("?"),
                         m["state"].as_str().unwrap_or("?")
                     ));
+                    stale_pairs.push((
+                        alias.to_string(),
+                        m["id"].as_str().unwrap_or("?").to_string(),
+                    ));
                 }
             } else {
                 busy.push(format!("{alias}(running message)"));
             }
         }
     }
-    (busy, stale)
+    (busy, stale, stale_pairs)
 }
 
 /// The detached UI's `ui run` argv from /proc — restarting the board
@@ -1983,6 +1991,10 @@ pub(crate) fn daemon_restart(
             (Vec::new(), false)
         }
     };
+    // Stale `(alias, message_id)` pairs observed while waiting — a row
+    // swept to `unknown` by the replacement store's recovery fenced a
+    // turn without any `turn_adopt_refused` event to catch it.
+    let mut stale_turns: Vec<(String, String)> = Vec::new();
     if when_idle && reachable {
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut next_report = Instant::now();
@@ -1992,7 +2004,7 @@ pub(crate) fn daemon_restart(
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let (busy, stale) = busy_agents(state_dir, &agents);
+            let (busy, stale, pairs) = busy_agents(state_dir, &agents);
             if !stale.is_empty() {
                 if !ignore_stale {
                     return Err(Error::rejected(format!(
@@ -2015,6 +2027,11 @@ pub(crate) fn daemon_restart(
                         stale.join(", ")
                     );
                     stale_noted = true;
+                }
+                for p in pairs {
+                    if !stale_turns.contains(&p) {
+                        stale_turns.push(p);
+                    }
                 }
             }
             if busy.is_empty() {
@@ -2239,6 +2256,28 @@ pub(crate) fn daemon_restart(
                 } else if kinds.iter().any(|k| k == "turn_adopted") {
                     turn = "kept".to_string();
                 }
+            }
+        }
+        // A stale turn ignored with --ignore-stale can be swept to
+        // `unknown` by the replacement store's recovery without any
+        // adopt attempt — no `turn_adopt_refused` event exists to mark
+        // it. Check each carried row directly so a swept stale turn
+        // still fails the restart verdict.
+        for (sal, mid) in stale_turns.iter().filter(|(sal, _)| sal == &alias) {
+            let swept = client::rpc(state_dir, "agent_show", json!({"alias": sal}))
+                .ok()
+                .and_then(|show| {
+                    show["messages"].as_array().map(|ms| {
+                        ms.iter().any(|m| {
+                            m["id"].as_str() == Some(mid.as_str())
+                                && m["state"].as_str() == Some("unknown")
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if swept {
+                bad = true;
+                turn = "fenced".to_string();
             }
         }
         if after_state == "attention" {
