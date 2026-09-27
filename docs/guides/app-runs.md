@@ -9,6 +9,10 @@ The first executor supports text production and independent text review.
 The installable example is `apps/local-content`, with workflow `draft`.
 It needs no external connection or AgenticOS provider. A configured,
 registered worker still supplies the actual model execution.
+Use a managed Pi, Claude or Codex worker for this increment. Terminal
+workers are unsupported: their notice delivery requires a separate
+authenticated prompt-fetch contract. Remote polled workers are also
+unsupported. Unsupported teams are refused before a run is created.
 
 ## Package contract
 

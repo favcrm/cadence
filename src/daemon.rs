@@ -776,7 +776,12 @@ impl Shared {
                     }
                 }
             }
-            let _ = self.store.event_public(alias, kind, params);
+            let visible = if self.store.app_material_endpoint(alias).unwrap_or(true) {
+                json!({"app_owned":true,"diagnostic":"provider lifecycle event; inspect authorized app surfaces"})
+            } else {
+                params
+            };
+            let _ = self.store.event_public(alias, kind, visible);
             self.wake();
             return;
         }
@@ -786,7 +791,7 @@ impl Shared {
             alias,
             "provider_event",
             json!({
-                "method": method, "data": params,
+                "method": method, "data": if self.store.app_material_endpoint(alias).unwrap_or(true) { json!({"app_owned":true}) } else { params },
             }),
         );
         if method == "serverRequest/resolved" {
@@ -1631,14 +1636,16 @@ impl Shared {
                             let _ = self.store.event_public(
                                 alias,
                                 "paste_not_rendered",
-                                json!({"message": message.id,
+                                if message.source == "app_run_dispatch" {
+                                    json!({"message":message.id,"app_owned":true,"reason":"app paste not rendered","attempt":unrendered,"retry":retry})
+                                } else { json!({"message": message.id,
                                        "reason": reason,
                                        "attempt": unrendered,
                                        "retry": retry,
                                        "before": before_tail,
                                        "after": after_tail,
                                        "claim_probe": claim_probe,
-                                       "reprobe": reprobe}),
+                                       "reprobe": reprobe}) },
                             );
                             if retry {
                                 let retry_ticket = ctl.wake.ticket();
@@ -2437,8 +2444,8 @@ impl Shared {
             "request_wait" => self.rpc_request_wait(params, peer_pid),
             "request_close" => self.rpc_request_close(params, peer_pid),
             "agent_ready" => self.rpc_ready(params),
-            "agent_capture" => self.rpc_capture(params),
-            "agent_probe" => self.rpc_probe(params),
+            "agent_capture" => self.rpc_capture(params, peer_pid),
+            "agent_probe" => self.rpc_probe(params, peer_pid),
             "agent_answer" => self.rpc_answer(params, peer_pid),
             "agent_recover_submit" => self.rpc_recover_submit(params, peer_pid),
             "agent_set" => self.rpc_set(params, peer_pid),

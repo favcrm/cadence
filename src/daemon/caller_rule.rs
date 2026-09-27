@@ -155,8 +155,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             default: Some("operator"),
         },
     ),
-    ("agent_capture", Rule::Read),
-    ("agent_probe", Rule::Read),
+    ("agent_capture", Rule::Handler("app endpoint operator transcript proof (CAD-631)")),
+    ("agent_probe", Rule::Handler("app endpoint operator transcript proof (CAD-631)")),
     (
         "agent_answer",
         Rule::Handler("derived_caller: PeerTies (CAD-102)"),

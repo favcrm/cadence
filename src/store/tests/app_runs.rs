@@ -493,3 +493,35 @@ fn cad631_public_app_message_projection_hides_provider_material() {
         .to_string()
         .contains("private-provider-material-sentinel"));
 }
+
+#[test]
+fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private() {
+    let (_dir, s, run) = runtime_fixture();
+    assert!(s.app_material_endpoint("writer").unwrap());
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(id, None, true).unwrap();
+    assert!(
+        s.app_material_endpoint("writer").unwrap(),
+        "terminal state must not expose retained transcript"
+    );
+    s.conn()
+        .execute(
+            "UPDATE agents SET endpoint_kind='pty' WHERE alias='writer'",
+            [],
+        )
+        .unwrap();
+    let workflow: crate::store::app_runs::LocalWorkflow =
+        serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
+    let inputs = std::collections::BTreeMap::new();
+    assert!(s
+        .app_run_create(crate::store::app_runs::LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "unsupported-pty",
+            owner_pm: "lead",
+            project_link: None,
+        })
+        .is_err());
+}

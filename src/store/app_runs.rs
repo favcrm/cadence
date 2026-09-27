@@ -253,9 +253,8 @@ impl Store {
                 || !matches!(
                     (agent.provider.as_str(), agent.endpoint_kind.as_str()),
                     ("codex", "managed" | "managed-ws")
-                        | ("claude", "managed" | "pty")
+                        | ("claude", "managed")
                         | ("pi", "managed")
-                        | ("cursor", "pty")
                         | ("fake", "fake")
                 )
                 || !crate::adapter::registry::spec_opt(&agent.provider, &agent.endpoint_kind)
@@ -263,7 +262,7 @@ impl Store {
                 || agent.session_id.is_none()
             {
                 return Err(Error::rejected(
-                    "local team needs an enabled registered local actor endpoint",
+                    "local team needs an enabled registered managed local worker; PTY and remote endpoints are unsupported",
                 ));
             }
             let generation = material_digest(&Self::agent_identity(&agent));
@@ -1101,6 +1100,11 @@ impl Store {
 }
 
 impl Store {
+    /// Transcripts can retain app material after a turn ends. Never infer
+    /// public readability merely from an idle endpoint.
+    pub(crate) fn app_material_endpoint(&self, alias: &str) -> Result<bool> {
+        Ok(self.conn().query_row("SELECT 1 FROM app_run_steps s JOIN tasks t ON t.id=s.task_id WHERE t.assignee=? LIMIT 1", [alias], |_| Ok(())).optional()?.is_some())
+    }
     pub(crate) fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
         if self
             .running_messages(alias)?
