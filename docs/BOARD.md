@@ -1627,6 +1627,23 @@ closing, hiding or changing a lesson invalidates its pending detail read. Memory
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 
+Settings → Update is a full-width release workspace. The installed release and
+latest approved release are shown together, with the last check time and visible
+operator access explanation. Refresh/retry reads status and remains available to
+read-only viewers; manual checks and update starts retain the server's operator
+guards. Loading, unavailable installation information, failed/stale reads, a
+start request, an acknowledged request and an observed running/pending update
+remain distinct. Old or unmounted reads cannot replace newer observations.
+Checking, acknowledged and active updates poll promptly; actions are single-flight
+and disabled while status is unavailable, stale or an update/check is active.
+Reported drain warnings stay visible and advisory: active turns can finish during
+the updater's drain; the pipeline remains responsible for lease enforcement.
+Changelog and full commit/schema details use native disclosures. The progress log
+opens for an active update, can be read by keyboard, and follows new lines only
+while the reader is at the end; Jump to latest resumes following. Results separate
+health-confirmed success, rollback, a no-op, failure and an unconfirmed outcome.
+The existing update API, pipeline and permissions are unchanged.
+
 Settings → Models is a full-width provider workspace. A compact provider
 selector opens one editor at a time and keeps drafts for every provider.
 The default model applies to newly registered agents across projects; existing
