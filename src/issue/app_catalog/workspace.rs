@@ -415,10 +415,15 @@ pub fn show(pm: &Pm, id: &str) -> Result<Value> {
 
 /// Delivery happens before pending is removed, under the same PM lock.
 fn commit_migration(pm: &Pm, journal: &Journal) -> Result<Vec<String>> {
-    let mut paths = vec![
-        pm.dir.join(CATALOG),
-        pm.dir.join(super::journal_path(&journal.id)),
-    ];
+    let mut paths = vec![pm.dir.join(super::journal_path(&journal.id))];
+    // A first publication whose Git delivery failed is not tracked. Its
+    // rollback removes the file, so there is no catalog path to stage.
+    // Existing tracked catalogs must still be included to commit deletion.
+    if Root::open(&pm.dir)?.kind(Path::new(CATALOG))?.is_some()
+        || !super::super::git(&pm.dir, &["ls-files", "--", CATALOG])?.is_empty()
+    {
+        paths.push(pm.dir.join(CATALOG));
+    }
     paths.extend(
         journal
             .records
