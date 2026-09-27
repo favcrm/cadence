@@ -285,6 +285,59 @@ fn pending_is_waiting_in_agenticos() {
 }
 
 #[test]
+fn composition_registered_adapter_hands_off_exact_publish_with_durable_key() {
+    let (door, _) = start(Script::Posted);
+    let metadata = cadence_agent::platform::deployments::DeploymentMetadata::parse(
+        &serde_json::to_vec(&json!({"schema":1,"providers":[{
+            "provider":"agenticos","origin":door.base,
+            "manifest_pin":"agenticos-manifest@1/publish_post@2"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut opts = cadence_agent::daemon::ServeOptions {
+        provider_deployments: Some(metadata),
+        ..Default::default()
+    };
+    cadence_agent::platform::agenticos::register_from_composition(&mut opts, &door.base, true)
+        .unwrap();
+    let adapter = &opts.platforms["agenticos"];
+    assert_eq!(
+        classify_call(
+            adapter.table(),
+            adapter.reported_manifest_version().as_deref(),
+            "publish_post"
+        ),
+        Effect::Draft
+    );
+    let digest = format!(
+        "sha256:{}",
+        publish_content_digest("conn_1", "composition", None)
+    );
+    for _ in 0..2 {
+        let result = adapter
+            .execute(
+                &[],
+                "publish_post",
+                &input("composition"),
+                KEY,
+                Some(&digest),
+            )
+            .unwrap();
+        assert_eq!(result["handoff"], "draft");
+        assert_eq!(result["content_hash"], digest);
+    }
+    let state = door.state.lock().unwrap();
+    assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(state.posts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        state.last_key.lock().unwrap().as_deref(),
+        Some(derived_key("composition").as_str())
+    );
+    assert!(state.last_auth.lock().unwrap().is_none());
+}
+
+#[test]
 fn declined_is_refused() {
     let (_door, adapter) = start(Script::Declined);
     let out = adapter

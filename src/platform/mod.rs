@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod agenticos;
 pub mod custody;
+pub mod deployments;
 pub mod local;
 
 pub use adapter::PlatformAdapter;

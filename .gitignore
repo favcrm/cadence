@@ -16,6 +16,9 @@ claudedocs/
 # documents it indexes stay tracked (`cadence issue context` serves them,
 # and one test embeds the manifest).
 docs/*
+!docs/guides/
+docs/guides/*
+!docs/guides/provider-deployment-metadata.md
 !docs/cadence/
 !docs/design/
 !docs/roles/
