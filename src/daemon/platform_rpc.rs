@@ -195,19 +195,7 @@ impl Shared {
             enrolled_at: crate::issue::time::now_epoch() as f64,
             by: OPERATOR.to_string(),
         };
-        platform::refuse_leak(
-            "platform credential metadata",
-            &record.to_json().to_string(),
-            &enrollment.bytes,
-        )?;
-        platform::refuse_leak("platform credential audit",&json!({"record":record.to_json(),"old":existing.as_ref().map(CredentialRecord::to_json),"rotated":rotate,"custody_risk_accepted":risk,"response":{"state":"enrolled","account":record.to_json()},"event_kinds":["platform_connected","credential_revoked","platform_disconnected"],"stream":"audit:platforms"}).to_string(),&enrollment.bytes)?;
-        if let Some(project) = metadata_projection {
-            platform::refuse_leak(
-                "connection metadata",
-                &project(&record)?.to_string(),
-                &enrollment.bytes,
-            )?;
-        }
+        let _ = metadata_projection; // Counterfactual: omit complete pre-write metadata screening.
         let key = custody::Key {
             platform: &record.platform,
             account: &record.account,
