@@ -171,6 +171,32 @@ def run_prompt(prompt):
             or artifact["size"] != len(artifact["text"].encode())
         ):
             raise RuntimeError("actual fetched artifact does not match its pinned receipt")
+        probe_path = STATE / ("app-release-probe-" + kickoff["run_id"] + ".json")
+        if probe_path.exists():
+            probe = json.loads(probe_path.read_text())
+            cases = []
+            for detached in [False, True]:
+                for method, params, allowed in [
+                    ("app_effect_show", {"effect_id": probe["effect_id"]}, False),
+                    ("app_effect_list", {"install_id": probe["install_id"]}, False),
+                    ("app_binding_show", {"install_id": probe["install_id"], "binding_id": probe["binding_id"]}, False),
+                    ("app_binding_list", {"install_id": probe["install_id"]}, False),
+                    ("platform_effects", {}, True),
+                    ("agent_events", {"alias": ALIAS, "tail": True}, True),
+                    ("agent_capture", {"alias": ALIAS}, False),
+                ]:
+                    answer = frame(method, params, detached)
+                    if any(canary in json.dumps(answer) for canary in probe["canaries"]):
+                        raise RuntimeError("current B reviewer inspected another context release material")
+                    if allowed:
+                        if answer.get("ok") is not True:
+                            raise RuntimeError("actual reviewer generic read control failed")
+                        if method == "agent_events" and not answer["result"]["events"]:
+                            raise RuntimeError("actual shared reviewer history is not populated")
+                    elif answer.get("ok") is not False or answer.get("error", {}).get("kind") != "rejected":
+                        raise RuntimeError("actual B reviewer app release path not refused")
+                    cases.append({"method": method, "detached": detached, "ok": answer.get("ok"), "redacted": True})
+            receipt["native_release_probes"] = cases
         result = dict(
             common,
             producer_step_id=dependency["producer_step_id"],

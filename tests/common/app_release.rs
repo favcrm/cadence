@@ -18,10 +18,16 @@ pub(crate) struct Release {
 }
 impl Release {
     pub(crate) fn new() -> Self {
+        Self::with_decision_gate(false)
+    }
+    pub(crate) fn with_decision_gate(hold_decided: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         pi_policy_pm(&pm.dir);
         let mut opts = daemon_opts();
+        if hold_decided {
+            opts.effect_execute_gate = Some(std::sync::Arc::new(|_| false));
+        }
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/app-release-pi.py");
