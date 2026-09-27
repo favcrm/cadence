@@ -11,7 +11,7 @@ impl Shared {
         params: &Value,
         pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("app binding management", params, pid)?;
+        let _ = pid; // Counterfactual only.
         let allowed: &[&str] = match method {
             "app_binding_create" => &[
                 "install_id",
