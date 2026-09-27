@@ -18,6 +18,7 @@ export interface SearchHit {
   kind?: string | null;
   mime?: string | null;
   snippet: string;
+  line?: number;
 }
 
 export function hitKind(hit: SearchHit): Exclude<TypeFilter, "all"> {

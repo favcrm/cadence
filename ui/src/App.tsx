@@ -15,6 +15,7 @@ import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import Context from "./features/projects/Context";
+import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import Wiki from "./features/wiki/Wiki";
@@ -70,7 +71,9 @@ function currentLocation(): AppLocation {
 
 /** Move to a new location built from the current one. */
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
-  navigate(locationHref(fn(currentLocation()), location.search), opts);
+  const current = currentLocation();
+  const next = fn(current);
+  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search)), opts);
 }
 
 const SCREEN_LABEL: Record<Screen, string> = {
@@ -99,7 +102,7 @@ export default function App() {
   const screen = route.screen;
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), search);
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search));
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -469,8 +472,14 @@ export default function App() {
 
   // The sidebar and the phone menu open a project page. The chip row
   // and the memory picker filter the screen, and only a screen that has one.
-  const projectHref = (key: string) => locationHref(openProject(loc, key), search);
-  const filterHref = (key: string) => locationHref(withProject(loc, key), search);
+  const projectHref = (key: string) => {
+    const next = openProject(loc, key);
+    return locationHref(next, contextNavigationSearch(route, next.route, search));
+  };
+  const filterHref = (key: string) => {
+    const next = withProject(loc, key);
+    return locationHref(next, contextNavigationSearch(route, next.route, search));
+  };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
 
@@ -719,6 +728,10 @@ export default function App() {
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context
+            readOnly={readOnly}
+            actor={actor}
+            onToast={say}
+            navHref={hrefFor}
             project={project}
             context={visibleContext(project, projectContext)}
             contextLoading={projectContextLoading}

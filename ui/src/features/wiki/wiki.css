@@ -161,6 +161,7 @@
 .wk-crumbs b {
   color: var(--color-ink-100);
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .wk-tools {
@@ -256,12 +257,52 @@
   margin-bottom: 14px;
 }
 
-.wk-pagehead h1 {
+.wk-pagehead h1,
+.wk-pagehead h2 {
   font-size: var(--text-drawer);
   font-weight: 600;
   color: var(--color-ink-100);
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+/* Project Context shares the Wiki panes, with the project tabs above it. */
+.wk-scoped {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  background: var(--color-ink-850);
+}
+
+.wk-scoped .wk-split {
+  min-height: 480px;
+}
+
+.wk-scoped .wk-pane {
+  padding: 20px;
+}
+
+.wk-scoped .wk-trow {
+  min-height: 38px;
+}
+
+.wk-tree-toggle {
+  display: none;
+}
+
+.context-references > summary {
+  cursor: pointer;
+  padding: 10px 0;
+}
+
+.context-references > summary:focus-visible,
+.wk-tree-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.wk-history-log .wk-vrow {
+  cursor: default;
 }
 
 .wk-meta {
@@ -956,6 +997,26 @@
 /* --------------------------------------------------------- small screens */
 
 @media (max-width: 1023px) {
+  .wk-scoped .wk-split { min-height: 0; }
+  .wk-scoped .wk-treeroot { display: none; }
+  .wk-scoped .wk-tree { max-height: none; padding: 8px; }
+  .wk-scoped .wk-treefiles { max-height: 240px; overflow-y: auto; }
+  .wk-scoped .wk-treefiles.collapsed { display: none; }
+  .wk-scoped .wk-pane { padding: 16px; }
+  .wk-tree-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 8px;
+    color: var(--color-ink-200);
+    font-size: var(--text-secondary);
+    text-align: left;
+    cursor: pointer;
+  }
+  .wk-tree-toggle > svg:last-child { margin-left: auto; }
+  .wk-tree-toggle[aria-expanded="true"] > svg:last-child { transform: rotate(90deg); }
   .wk-split {
     grid-template-columns: minmax(0, 1fr);
     min-height: 0;

@@ -1,0 +1,125 @@
+/** Exercise the shared Wiki against the daemon's real JSON shapes. */
+declare function require(name: string): any;
+const { Window } = require("happy-dom");
+const win = new Window({ url: "http://localhost/projects/cadence/context" });
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"]) {
+  Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
+}
+for (const name of ["addEventListener", "removeEventListener"]) Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
+Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+const moduleLoader = require("module");
+const originalRequire = moduleLoader.prototype.require;
+moduleLoader.prototype.require = function (this: unknown, id: string) {
+  if (id.endsWith(".css")) return {};
+  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+  return originalRequire.apply(this, arguments);
+};
+const React = require("react") as typeof import("react");
+const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+const Context = (require("../src/features/projects/Context") as typeof import("../src/features/projects/Context")).default;
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
+const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeof import("../src/features/wiki/editor");
+const requests: string[] = [];
+const writes: { path?: string; from?: string; to?: string; text?: string; if_rev?: string }[] = [];
+let conflict = false;
+let unavailable = false;
+let missing = false;
+const pagePath = "projects/cadence/README.md";
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+globalThis.fetch = async (input, init) => {
+  const url = new URL(String(input), "http://localhost");
+  requests.push(url.pathname + url.search);
+  const path = url.searchParams.get("path") ?? "";
+  if (init?.method === "PUT" || init?.method === "POST") {
+    const body = JSON.parse(String(init.body));
+    writes.push(body);
+    if (conflict) return json({ conflict: "if_rev", current_rev: "newer-rev", path: body.path });
+    return json({ path: body.path, rev: "saved-rev", committed: true });
+  }
+  if (unavailable) return json({ error: "This board needs a session" }, 403);
+  if (url.pathname.endsWith("/ls")) {
+    if (path.endsWith(".md") || path.endsWith(".png")) return json({ error: "a file, not a directory" }, 400);
+    if (missing) return json({ error: `wiki ls '${path}': no such directory` }, 400);
+    return json({ path, entries: [{ path: `${path}/README.md`, name: "README.md", kind: "text" }, { path: `${path}/research`, name: "research", kind: "dir" }, { path: `${path}/logo.png`, name: "logo.png", kind: "blob", mime: "image/png" }] });
+  }
+  if (url.pathname.endsWith("/file")) return json({ path, kind: "text", text: `# Project brief\n\nNotes for ${path}`, rev: "base-rev" });
+  if (url.pathname.endsWith("/search")) return json({ matches: [{ path: pagePath, line: 3, text: "Project brief match" }, { path: "projects/other/private.md", line: 1, text: "outside project" }] });
+  if (url.pathname.endsWith("/history")) return json({ path, commits: [{ sha: "commit1", at: 1, actor: "master", subject: "Saved project brief" }] });
+  throw new Error(`Unexpected request: ${url}`);
+};
+function assert(value: unknown, what: string): asserts value { if (!value) throw new Error(what); }
+const host = document.createElement("div");
+document.body.append(host);
+const view = createRoot(host);
+const props = { project: "cadence", context: null, contextLoading: false, contextError: null, onRetryContext: () => {}, readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
+const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
+async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { view.render(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
+async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
+async function run() {
+  await render();
+  assert(location.search.includes("file=README.md"), "Context opens the project README first");
+  assert(host.textContent?.includes("Notes for projects/cadence/README.md"), "raw daemon text renders as Markdown");
+  assert(requests.every((url) => !url.endsWith("path=") && !url.includes("path=projects&")), "tree never requests global parents");
+  assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Edit" && link.href.includes("/context?") && link.href.includes("mode=edit")), "Edit stays in the Context tab");
+  assert(!host.querySelector("details")?.open, "repository references start collapsed");
+  stashDraft(sessionStorage, { path: pagePath, text: "Draft in this project", baseRev: "base-rev", at: 1 });
+  await go("/projects/cadence/context?file=README.md&mode=edit");
+  const source = host.querySelector("textarea");
+  assert(source?.value === "Draft in this project", "existing Wiki draft recovery works in Context");
+  conflict = true;
+  const save = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save");
+  assert(save, "Save control exists");
+  await React.act(async () => { save.click(); await flush(); });
+  assert(host.textContent?.includes("changed since you opened it"), "HTTP 200 conflict envelope is shown as a refusal");
+  assert(source.value === "Draft in this project" && sessionStorage.getItem(draftKey(pagePath)), "a refused save preserves the draft");
+  assert(writes[0]?.if_rev === "base-rev", "Save includes the base revision");
+  conflict = false;
+  await React.act(async () => { save.click(); await flush(); });
+  assert(!sessionStorage.getItem(draftKey(pagePath)) && !location.search.includes("mode=edit"), "a successful save clears the draft and returns to the project page");
+  await go("/projects/cadence/context?file=README.md&mode=edit");
+  await render({ readOnly: true });
+  assert(host.querySelector("textarea")?.readOnly && Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save")?.disabled, "read-only mode blocks editor and Save");
+  await render({ readOnly: false });
+  const typing = host.querySelector("textarea");
+  assert(typing, "editor still mounted");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set?.call(typing, "A last second edit");
+    typing.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  assert(host.textContent?.includes("unsaved changes"), "typing marks the draft dirty");
+  await go("/projects/cadence/context?mode=search&q=brief");
+  assert(sessionStorage.getItem(draftKey(pagePath))?.includes("A last second edit"), "leaving before the debounce preserves the last edit");
+  assert(requests.some((url) => url.includes("/search?") && url.includes("path=projects%2Fcadence")), "search requests only this project");
+  assert(host.textContent?.includes("Project brief match") && !host.textContent.includes("outside project"), "search results stay inside project");
+  await go("/projects/cadence/context?file=README.md&mode=history");
+  assert(host.textContent?.includes("Saved project brief"), "real commit log renders");
+  assert(!host.textContent?.includes("Restore this version"), "unsupported restore is not offered");
+  await go("/projects/cadence/context?file=logo.png");
+  await render({ project: "assets" });
+  assert(host.querySelector("img")?.getAttribute("src")?.includes("projects%2Fassets%2Flogo.png"), "pasted blob links preview using metadata, not a JSON read of bytes");
+  await render({ project: "other" });
+  assert(!host.textContent?.includes("Draft in this project"), "changing project clears prior editor state");
+  const beforeInvalid = requests.length;
+  await go("/projects/other/context?file=..%2Fprivate.md");
+  assert(host.textContent?.includes("outside the project") && requests.length === beforeInvalid, "invalid path is refused before any request");
+  unavailable = true;
+  await go("/projects/other/context");
+  assert(host.textContent?.includes("Sign in to view these pages"), "unsigned access has a clear sign-in state");
+  unavailable = false;
+  missing = true;
+  await render({ project: "empty", readOnly: true });
+  assert(host.textContent?.includes("No project context yet"), "missing project root has an empty state");
+  assert(Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Create project context")?.disabled, "empty read-only context cannot create folders");
+  assert(writes.length === 2, "mounting and reading never writes to initialize a root");
+  missing = false;
+  await wiki.mv(pagePath, "projects/cadence/brief.md");
+  assert(writes[2]?.from === pagePath && writes[2]?.to === "projects/cadence/brief.md", "move sends the actual HTTP contract");
+  conflict = true;
+  try { await wiki.save(pagePath, "changed", "base"); throw new Error("conflict wrongly resolved"); } catch (error) { assert(error instanceof WikiError && error.status === 409, "successful conflict envelopes reject the save promise"); }
+  await React.act(() => view.unmount());
+  console.log("project Wiki interaction checks passed");
+}
+run().catch((error) => { console.error(error); throw error; });
+export {};

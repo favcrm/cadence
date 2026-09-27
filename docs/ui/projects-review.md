@@ -10,7 +10,7 @@ Inspected in Mac Chrome on 2026-09-26: all-project Issues, Cadence Issues in Lis
 | Epics | Which outcomes are progressing or at risk? | Completed epics lead; long blocker lists dominate. | Active outcomes first, completed work opt-in, expandable blocker reasons. |
 | Milestones | How far are we toward a release goal? | Repeats issue-level blockers; technical weight and unlisted labels dominate. | Keep weighted progress truthful, explain it, collapse detailed reasons. |
 | Workflows | What repeatable work can I start? | Empty state leads with storage paths and a CLI. | Purpose-led empty state, retain setup instructions in details. App-provided workflows keep their app links. |
-| Context | What should I read to understand this project? | Manifest, HEAD and retrieval internals precede documents. | Reading list first; provenance and retrieval diagnostics remain inspectable. Never hide actual source errors. |
+| Context | What do people and agents need to know to deliver this project? | Manifest, HEAD and retrieval internals precede documents; project knowledge has no editing workspace. | Project-scoped Wiki explorer and editor; repository references stay available in a disclosure. |
 
 ## Information hierarchy
 Projects is a portfolio entry point. Selecting a project opens its overview. Issues, Epics, Milestones, Workflows and Context remain distinct destinations. Home remains the global Master conversation and agent journal; Projects does not duplicate that conversation.
@@ -21,3 +21,19 @@ Preserve existing issue deep links, board/list preferences, filters, read-only b
 
 ## Navigation polish
 The header shows the project breadcrumb; section links share the content left edge and mark the active destination with an underline. Links preserve browser Back navigation. Targets are 44px tall and wrap on narrow screens. Connection, refresh, theme and update controls share the header utility area and the Hugeicons set. The update control opens Reload/Later on demand, closes with Escape or an outside click, and no longer floats over the page by default.
+
+
+## Project Context workspace
+
+Context now embeds the shared Wiki under `projects/<project-key>/`. The explorer, breadcrumbs, search, edit, upload, and history navigation stay in the project Context tab; URLs retain file/mode/search and an open issue drawer. Changing projects or tabs clears file selection. A root entry opens README.md when present; returning to the Context breadcrumb opens the folder view. Desktop shows the explorer beside the page; smaller screens offer an expandable file list. Content uses the existing board tokens and remains full-width and left-aligned.
+
+There is one store and one editor. Pages are Markdown in the versioned Wiki vault; attachments use the existing blob store. The repository manifest and pinned Git documents remain read-only behind Repository references. No automatic migration, copy, or root creation occurs. A missing root offers an explicit Create project context action; read-only clients cannot use it. Reads and writes still use the existing session and daemon allowlist. An unsigned Wiki response shows a sign-in state rather than weakening the HTTP gate.
+
+API adaptation now reads the daemon's actual text/blob kinds, search matches, and commit-log history. New pages use the absent revision token `none`, move uses `{from,to}`, and a successful RPC envelope carrying `conflict: if_rev` rejects the save so a draft is preserved. The current history endpoint supports a log only; unsupported compare/restore controls are hidden. Text downloads produce Markdown, blob deep links use listing metadata, and read-only editors block typing. Drafts preserve empty edits and the last change when leaving before debounce.
+
+Validation on 2026-09-27: UI typecheck, full UI test script, production build, and git diff --check pass. New DOM interaction tests use actual daemon response shapes and exercise default pages, scoped navigation, edit/draft recovery, successful/refused saves, read-only mode, search, history, project switching, invalid paths, sign-in, and missing-root behavior. Browser visual verification for this Context change remains pending: Mac CDP is unavailable and local browser automation timed out. Earlier Mac checks listed above apply to the previously reviewed Home/Projects/milestone surfaces.
+
+Live-data preview: http://ip-172-31-1-32.tail9fcf30.ts.net:3167/projects/cadence/context
+Isolated Context demonstration: http://ip-172-31-1-32.tail9fcf30.ts.net:3169/projects/roadmap-demo/context
+
+The demonstration clearly labels fixture content, allows only in-memory Wiki edits, refuses other writes, and uses the existing isolated roadmap tracker for project navigation. Its untracked Vite config is excluded from the production change. It is a review surface, not evidence of an authenticated production write. Production rollout remains with its existing owner after independent review.

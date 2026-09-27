@@ -22,11 +22,10 @@ export function draftKey(path: string): string {
   return `${DRAFT_PREFIX}${path}`;
 }
 
-/** Stash the working text; a draft equal to the base is dropped instead. */
+/** Empty text is a valid edit too; only save/reload drops a draft. */
 export function stashDraft(storage: StorageLike, draft: WikiDraft): void {
   try {
-    if (draft.text) storage.setItem(draftKey(draft.path), JSON.stringify(draft));
-    else storage.removeItem(draftKey(draft.path));
+    storage.setItem(draftKey(draft.path), JSON.stringify(draft));
   } catch {
     // Storage blocked or full — the edit still lives in the textarea.
   }

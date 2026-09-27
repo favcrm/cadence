@@ -1,20 +1,19 @@
 import { sessionHeaders } from "../../lib/sessionKey";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
+import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
 
 /**
  * The wiki store's HTTP surface (CAD-580) as this screen reads it. One
- * file owns the shapes and the request builders, so a contract change is
- * a one-file edit (the questions CAD-581 posted on CAD-580 are answered
- * there; the builders below are the assumptions until they land):
+ * module owns requests; wire.ts adapts the daemon’s response shapes:
  *
  *   GET  /api/wiki/ls?path=       a folder's entries — or one entry's kind
  *   GET  /api/wiki/file?path=     text as JSON; blobs streamed (Range)
  *   PUT  /api/wiki/file           {path, text, if_rev}
  *   POST /api/wiki/upload         multipart, one file per request
- *   POST /api/wiki/mkdir|mv|rm    {path}, {path, to}, {path}
+ *   POST /api/wiki/mkdir|mv|rm    {path}, {from, to}, {path}
  *   GET  /api/wiki/search?q=      full-text search
- *   GET  /api/wiki/history?path=  git log; &from=&to= for one diff
+ *   GET  /api/wiki/history?path=  git log (current daemon has no diff/restore)
  */
 
 export type WikiKind = "dir" | "page" | "file";
@@ -75,6 +74,7 @@ export interface WikiHistoryResponse {
   entries?: WikiVersion[];
   history?: WikiVersion[];
   diff?: string;
+  canCompare?: boolean;
 }
 
 /** A wiki route's refusal, with the conflict fields the editor reads. */
@@ -121,6 +121,9 @@ export function wikiErrorFrom(status: number, body: unknown): WikiError {
 async function json<T>(resp: Response): Promise<T> {
   const body = await resp.json().catch(() => null);
   if (!resp.ok) throw wikiErrorFrom(resp.status, body);
+  // RPC conflicts are successful envelopes carrying a refused write.
+  // Never clear a draft or report success for that envelope.
+  if (body?.conflict === "if_rev") throw wikiErrorFrom(409, { ...body, error: "This page changed since you opened it", code: "conflict" });
   // A blob route streams bytes, not JSON: a caller that asked for a page
   // where a blob lives gets a clear refusal, not a null that renders as a
   // crash. The preview panes never call this — they read the listing.
@@ -180,9 +183,10 @@ export function wikiRawUrl(path: string): string {
   return `${fileQuery(path)}&raw=1`;
 }
 
-export function searchQuery(query: string, type?: string): string {
+export function searchQuery(query: string, type?: string, path?: string): string {
   const params = new URLSearchParams({ q: query });
   if (type && type !== "all") params.set("type", type);
+  if (path) params.set("path", path);
   return `/api/wiki/search?${params.toString()}`;
 }
 
@@ -198,20 +202,20 @@ export function uploadQuery(dir: string): string {
 }
 
 export const mkdirBody = (path: string) => ({ path });
-export const mvBody = (from: string, to: string) => ({ path: from, to });
+export const mvBody = (from: string, to: string) => ({ from, to });
 export const rmBody = (path: string) => ({ path });
 
 export const wiki = {
-  ls: (path: string) => get<WikiListing>(lsQuery(path)),
-  file: (path: string) => get<WikiPage>(fileQuery(path)),
+  ls: (path: string) => get<Parameters<typeof normalizeListing>[0]>(lsQuery(path)).then(normalizeListing),
+  file: (path: string) => get<Parameters<typeof normalizePage>[0]>(fileQuery(path)).then(normalizePage),
   save: (path: string, text: string, ifRev: string) =>
     send<WikiPage>("PUT", "/api/wiki/file", { path, text, if_rev: ifRev }),
   mkdir: (path: string) => send<WikiListing>("POST", "/api/wiki/mkdir", mkdirBody(path)),
   mv: (from: string, to: string) => send<WikiListing>("POST", "/api/wiki/mv", mvBody(from, to)),
   rm: (path: string) => send<{ path: string; trash?: string }>("POST", "/api/wiki/rm", rmBody(path)),
-  search: (query: string, type?: string) => get<WikiSearchResponse>(searchQuery(query, type)),
+  search: (query: string, type?: string, path?: string) => get<Parameters<typeof normalizeSearch>[0]>(searchQuery(query, type, path)).then(normalizeSearch),
   history: (path: string, from?: string, to?: string) =>
-    get<WikiHistoryResponse>(historyQuery(path, from, to)),
+    get<Parameters<typeof normalizeHistory>[0]>(historyQuery(path, from, to)).then(normalizeHistory),
   restore: (path: string, rev: string) =>
     send<WikiPage>("POST", "/api/wiki/restore", { path, rev }),
 };

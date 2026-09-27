@@ -4,8 +4,9 @@ import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
 import { filterHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
 import Link from "../../ui/Link";
-import { Crumbs, EmptyCard, Failure, Loading } from "./shared";
+import { Crumbs, EmptyCard, Failure, Loading, useWikiScope } from "./shared";
 import type { WikiRoute } from "./Wiki";
+import { withinScope } from "./scope";
 
 /**
  * Search (CAD-581): the query lives in the URL (`/wiki/search/<query>`),
@@ -20,6 +21,7 @@ export default function SearchPane({
   route: WikiRoute;
   navHref: (route: Route) => string;
 }) {
+  const scope = useWikiScope();
   const query = route.query ?? "";
   const [value, setValue] = useState(query);
   const [hits, setHits] = useState<SearchHit[] | null>(null);
@@ -38,9 +40,9 @@ export default function SearchPane({
     setHits(null);
     setError(null);
     wiki
-      .search(query)
+      .search(query, undefined, scope?.root)
       .then((resp) => {
-        if (!cancelled) setHits(resp.hits ?? resp.results ?? []);
+        if (!cancelled) setHits((resp.hits ?? resp.results ?? []).filter((hit) => !scope || withinScope(hit.path, scope.root)));
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -48,7 +50,7 @@ export default function SearchPane({
     return () => {
       cancelled = true;
     };
-  }, [query]);
+  }, [query, scope?.root]);
 
   const shown = hits ? filterHits(hits, filter) : null;
 
@@ -69,7 +71,7 @@ export default function SearchPane({
           <input
             className="field"
             value={value}
-            aria-label="search the wiki"
+            aria-label={scope ? "Search project context" : "Search the wiki"}
             placeholder="search pages and files…"
             onChange={(e) => setValue(e.target.value)}
           />
@@ -92,21 +94,21 @@ export default function SearchPane({
       {error !== null ? (
         <Failure what="search failed" error={error} />
       ) : !query ? (
-        <EmptyCard title="Search the wiki">
+        <EmptyCard title={scope ? "Search project context" : "Search the wiki"}>
           Type a word or path above — results carry the path, the file and the matching line.
         </EmptyCard>
       ) : shown === null ? (
         <Loading what={`searching for “${query}”…`} />
       ) : shown.length === 0 ? (
         <EmptyCard title="No matches">
-          nothing in the wiki matches <span className="num">{query}</span>
+          No page matches <span className="num">{query}</span>
           {filter !== "all" ? ` among ${filter}` : ""}.
         </EmptyCard>
       ) : (
         <div className="wk-sres">
-          {shown.map((hit) => (
-            <div key={hit.path} className="card wk-srow">
-              <div className="wk-spath num">{hit.path}</div>
+          {shown.map((hit, index) => (
+            <div key={`${hit.path}:${hit.line ?? index}`} className="card wk-srow">
+              <div className="wk-spath num">{scope ? hit.path.slice(scope.root.length + 1) : hit.path}{hit.line ? ` · line ${hit.line}` : ""}</div>
               <Link
                 className="wk-sname lnk"
                 href={navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null })}

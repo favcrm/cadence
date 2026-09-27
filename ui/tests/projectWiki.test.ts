@@ -1,0 +1,28 @@
+import { contextHref, contextRoute, contextNavigationSearch } from "../src/features/projects/contextRoute";
+import { scopedAncestors, withinScope } from "../src/features/wiki/scope";
+import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "../src/features/wiki/wire";
+import { searchQuery } from "../src/features/wiki/api";
+function equal(a: unknown, b: unknown, what: string) { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(what); }
+const root = "projects/cadence";
+equal(withinScope("projects/cadence-old/a.md", root), false, "similar project names never match");
+for (const path of ["global/a.md", `${root}/../other/a.md`, `${root}/%2e%2e/a.md`, `${root}/a\\b.md`]) equal(withinScope(path, root), false, "out-of-scope path refused");
+equal(scopedAncestors(`${root}/research`, root), [root, `${root}/research`], "do not fetch global parents of project tree");
+equal(contextRoute("cadence", "/projects/cadence/context")?.path, root, "default route stays in project");
+equal(contextRoute("cadence", "?file=..%2Fother%2Fa.md"), null, "traversal query rejected");
+const route = { screen: "wiki", mode: "edit", path: `${root}/research/my notes.md`, query: null } as const;
+const href = contextHref("cadence", route, "?issue=CAD-1");
+equal(contextRoute("cadence", href), route, "edit deep link roundtrips");
+equal(href.includes("issue=CAD-1"), true, "open issue drawer survives context navigation");
+equal(contextHref("cadence", { ...route, mode: "browse", path: null }, "?file=old.md&mode=edit&q=old"), "/projects/cadence/context", "root navigation clears old mode and file");
+equal(searchQuery("agent", undefined, root).includes("path=projects%2Fcadence"), true, "search sends project scope to the daemon");
+const listing = normalizeListing({ path: root, entries: [{ name: "a.md", path: `${root}/a.md`, kind: "text" }, { name: "logo.png", path: `${root}/logo.png`, kind: "blob" }] });
+equal(listing.entries?.map((entry) => entry.kind), ["page", "file"], "real daemon kinds map to rendering models");
+equal(normalizePage({ path: `${root}/a.md`, kind: "text", text: "# Real content", rev: "r1" }).text, "# Real content", "normalization retains text and revision");
+console.log("project wiki checks passed");
+equal(normalizeSearch({ matches: [{ path: `${root}/a.md`, line: 2, text: "Real match" }] }).hits?.[0].snippet, "Real match", "daemon search results render");
+const history = normalizeHistory({ path: `${root}/a.md`, commits: [{ sha: "sha1", at: 1, subject: "Updated brief", actor: "master" }] });
+equal(history.entries?.[0].author, "master", "daemon history attributes the author");
+equal(history.canCompare, false, "unsupported history actions are not offered");
+const from = { screen: "projects", section: "context", slug: "cadence" } as const;
+equal(contextNavigationSearch(from, { ...from, slug: "other" }, "?file=a.md&mode=edit&q=old&issue=CAD-1"), "issue=CAD-1", "changing projects clears context navigation, keeps drawer");
+equal(contextNavigationSearch(from, { ...from, section: "epics" }, "?file=a.md&mode=edit"), "", "context state does not leak into other tabs");
