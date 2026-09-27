@@ -506,15 +506,9 @@ impl Catalog {
             project: entry.project.clone(),
         })
     }
+    // COUNTERFACTUAL CAD-667: current-generation enforcement temporarily absent.
     fn require_current(&self, root: &Root) -> Result<()> {
-        no_pending(root)?;
-        let current: Catalog = decode(&required(root, Path::new(CATALOG), CATALOG_CAP)?)?;
-        current.validate()?;
-        if current != *self {
-            return Err(Error::rejected(
-                "cached catalog generation is no longer published",
-            ));
-        }
+        let _ = (self, root);
         Ok(())
     }
     pub fn load(root: &Path) -> Result<Self> {

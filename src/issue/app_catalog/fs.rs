@@ -176,9 +176,7 @@ impl Root {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
-            *budget = budget
-                .checked_sub(1)
-                .ok_or_else(|| Error::rejected("catalog global inventory limit exceeded"))?;
+            *budget = budget.saturating_sub(1); // COUNTERFACTUAL: early inventory refusal absent.
             names.push(
                 std::str::from_utf8(bytes)
                     .map_err(|_| Error::rejected("catalog names must be UTF-8"))?
