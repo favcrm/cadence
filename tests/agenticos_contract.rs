@@ -520,3 +520,20 @@ fn builtin_provider_metadata_preserves_only_reviewed_full_account_pairs() {
         );
     }
 }
+
+#[test]
+fn absent_external_deployment_assertion_gates_every_tool_as_send() {
+    use cadence_agent::contract_fixture::{classify_call, Effect};
+    let adapter = AgenticosAdapter::new("http://127.0.0.1:9").unwrap();
+    let reported = adapter.reported_manifest_version();
+    assert_eq!(
+        reported, None,
+        "compiled review metadata is not a platform deployment report"
+    );
+    for tool in ["connections_list", "post_draft", "publish_post"] {
+        assert_eq!(
+            classify_call(adapter.table(), reported.as_deref(), tool),
+            Effect::Send
+        );
+    }
+}
