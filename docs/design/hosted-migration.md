@@ -37,8 +37,11 @@ copy** of the store and an existing regular `cadence.lock`. Use a clean isolated
 tracker clone. Never point this at the production state or `~/pm`; this command
 refuses those production paths and state outside `/tmp`.
 
+Start with `--dry-run`, which mutates nothing (see the isolation contract
+below), then repeat the same arguments without it:
+
 ```bash
-python3 scripts/rehearse-hosted-migration.py \
+python3 scripts/rehearse-hosted-migration.py --dry-run \
   --cadence /absolute/path/to/a/reviewed/cadence \
   --source-state /tmp/my-cad529/offline-state \
   --tracker /tmp/my-cad529/tracker-source \
@@ -61,6 +64,56 @@ check fails, no success receipt is written. Keep the failed output private for
 inspection and use a new output directory on the next attempt; the tool never
 overwrites or cleans another lane's data.
 
+### Isolation contract
+
+A rehearsal reads repositories and runs the real CLI, so it must be provably
+unable to disturb anything it did not create. Four properties hold, and each has
+an adversarial test that fails when its guard is removed.
+
+**The repository it reads is never written.** `git status` refreshes cached stat
+data and rewrites the index it opens, so pointing an unguarded status check at a
+live checkout mutates `.git/index`. Every git read here runs against a throwaway
+copy of the index (`GIT_INDEX_FILE`); the tracker's own index is byte- and
+mtime-identical afterwards. The test makes the fixture live-shaped — stat data
+deliberately stale, so a refresh has something to write — and asserts that the
+plain command it replaced *does* change the index.
+
+**Children inherit nothing.** `run()` builds each child's environment from an
+allowlist (`PATH`), never from the caller's. A `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `CADENCE_STATE_DIR` or
+`CADENCE_PM_DIR` exported into the rehearsal cannot reach git or the CLI, and a
+variable added to the parent later cannot silently become inherited. `HOME` and
+`TMPDIR` point into a private scratch directory, and global/system git config is
+read from `/dev/null`. This is not cosmetic: `GIT_DIR` beats `git -C`, and with
+the caller's environment the same `cadence export` records the decoy checkout
+and its remote instead of the rehearsal's. The test proves both halves.
+
+**No credentialed URL reaches any output.** `cadence export`'s `discover_repos`
+and `cadence restore`'s `plan_remap` run `git -C <dir> remote get-url origin`
+for every value in `agents.cwd`, `jobs.repo`, `jobs.spec_path`,
+`tasks.worktree` and `tasks.spec_path`. The directory is the value itself when
+it is one, **otherwise its parent** — so a `spec_path` whose file was deleted
+still causes a read of the checkout that held it. An offline copy of a real
+store names live developer checkouts, and such a remote may embed
+`user:token@`. Two independent guards apply.
+
+First, before the export runs, the rehearsal resolves every path column by that
+same rule and refuses any source that reaches a directory outside its own
+source, tracker and output roots — so it reads no repository it does not own.
+NULL or remap those columns in the offline copy first (for example
+`UPDATE agents SET cwd=NULL;` on the copy, never on production). Second, every
+remote that does enter evidence is passed through the same `strip_credentials`
+rule as `src/backup/mod.rs`, and the manifest, exported row content, receipt and
+stdout are scanned for any URL carrying userinfo; one match refuses the run.
+
+**`--dry-run` mutates nothing.** It creates no output directory, writes no
+index, adds no file to the source state, and takes the source flock only long
+enough to learn whether a daemon holds it before releasing it — an advisory lock
+leaves nothing on disk. It still reports the tracker commit, the store
+inventory, the recorded checkout paths, and the directories, commands and checks
+a real run would use. Every refusal above (foreign owner, active daemon, dirty
+tracker, non-`/tmp` path, foreign checkout) fires in dry-run too.
+
 Validation uses small offline SQLite fixtures, including real CLI export/restore
 when an explicit existing binary is supplied:
 
@@ -69,11 +122,11 @@ CADENCE_REHEARSAL_BINARY=/absolute/path/to/cadence \
   python3 scripts/test-hosted-migration.py -v
 ```
 
-This proves the offline store/tracker preparation path, not real production
-cloud storage, lease fencing, auth, queue acceptance or rollback. The receipt
-names these unproven gates. No Rust build is required; an existing binary's
-provenance must accompany the evidence, and compilation remains subject to
-normal build-slot admission or CI.
+This proves the offline store/tracker preparation path and the isolation
+contract above, not real production cloud storage, lease fencing, auth, queue
+acceptance or rollback. The receipt names these unproven gates. No Rust build is
+required; an existing binary's provenance must accompany the evidence, and
+compilation remains subject to normal build-slot admission or CI.
 
 ## Single-writer handoff: blocking dependency
 
