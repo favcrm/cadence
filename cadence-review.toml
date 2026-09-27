@@ -45,7 +45,7 @@ gates = [
 # board split here, plus the new-test stress and isolated comparisons below.
 # --no-full still skips this configured suite for CLI compatibility.
 suite_scope = "review-baseline"
-full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in"
+full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in --test-threads 2"
 
 # Diff paths that count as test files — `fn` items added under these
 # are the PR's new tests.

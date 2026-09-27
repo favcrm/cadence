@@ -87,6 +87,7 @@ class RecipeTargets(unittest.TestCase):
         self.assertEqual(recipe["suite_scope"], "review-baseline")
         self.assertTrue(recipe["full_suite"].startswith("scripts/cadence-nextest --locked "))
         self.assertIn("--lib --bins", recipe["full_suite"])
+        self.assertIn("--test-threads 2", recipe["full_suite"])
         self.assertNotIn("--all-targets", recipe["full_suite"])
         self.assertFalse(any("--lib" in gate or "--test board_" in gate for gate in recipe["gates"]))
 
