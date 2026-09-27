@@ -338,6 +338,13 @@ async function main() {
       host.querySelector(".memory-load-warning details"),
     "Partial files retain good lessons and disclosed errors",
   );
+  await fill("absent claim");
+  assert(
+    host.textContent?.includes("No readable matches") &&
+      button("Retry lessons"),
+    "Incomplete search results never claim there are no matches in failed files",
+  );
+  await click(button("Clear filters"));
   failList = true;
   await click(button("Refresh lessons"));
   assert(
@@ -350,6 +357,23 @@ async function main() {
   assert(
     host.querySelectorAll("article").length === 5,
     "List retry recovers rows",
+  );
+  cards = [];
+  await click(button("Refresh lessons"));
+  assert(
+    host.textContent?.includes("No readable lessons") &&
+      host.textContent?.includes("0 readable lessons · results incomplete") &&
+      !host.textContent?.includes("No lessons yet") &&
+      button("Retry lessons"),
+    "All failed files never masquerade as a valid empty store",
+  );
+  cards = [a];
+  fileErrors = [];
+  await click(button("Retry lessons"));
+  assert(
+    host.querySelectorAll("article").length === 1 &&
+      !host.textContent?.includes("incomplete"),
+    "Retry recovers all-file failure state",
   );
   cards = [];
   fileErrors = [];

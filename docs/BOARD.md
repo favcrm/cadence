@@ -1622,6 +1622,7 @@ review or agent-availability result. Evidence freshness comes from retrieval,
 so accepted, available and withheld remain distinct; age alone does not withhold.
 Technical provenance and revision digests sit in a native disclosure. Loading,
 empty, partial-file-error and failed reads remain distinct and retryable;
+zero readable lessons with file errors never claims a valid empty store;
 closing, hiding or changing a lesson invalidates its pending detail read. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.

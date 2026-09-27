@@ -376,7 +376,7 @@ export default function Memory({
             ? "Loading lessons…"
             : listErr
               ? "Lessons unavailable"
-              : `${visible.length} lesson${visible.length === 1 ? "" : "s"}${query.trim() ? ` matching “${query.trim()}”` : ""}`}
+              : `${visible.length}${loadErrs.length ? " readable" : ""} lesson${visible.length === 1 ? "" : "s"}${query.trim() ? ` matching “${query.trim()}”` : ""}${loadErrs.length ? " · results incomplete" : ""}`}
         </p>
         {filtered && (
           <Button variant="ghost" onClick={reset}>
@@ -411,6 +411,22 @@ export default function Memory({
       ) : mems === null ? (
         <div className="memory-state" aria-busy="true">
           <p>Loading project memory…</p>
+        </div>
+      ) : visible.length === 0 && loadErrs.length > 0 ? (
+        <div className="memory-state">
+          <h2>{filtered ? "No readable matches" : "No readable lessons"}</h2>
+          <p>
+            Some memory files couldn’t be loaded. Retry to check for lessons in
+            this selection.
+          </p>
+          <Button onClick={() => setTick((value) => value + 1)}>
+            Retry lessons
+          </Button>
+          {filtered && (
+            <Button variant="ghost" onClick={reset}>
+              Clear filters
+            </Button>
+          )}
         </div>
       ) : visible.length === 0 ? (
         <div className="memory-state">
