@@ -3398,10 +3398,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(405, "method not allowed"));
                     return;
                 }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
                 let response = app_release::handle(&mut request, state_dir, route, false);
                 send(request, response);
                 return;
