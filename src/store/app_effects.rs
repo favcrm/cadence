@@ -469,9 +469,7 @@ impl Store {
             return Ok(None);
         }
         let count = tx.execute("UPDATE platform_effects SET state='executing',updated_at=? WHERE effect_id=? AND state='decided' AND authorization_kind='app_artifact'",params![now(),id])?;
-        if count != 1 {
-            return Ok(None);
-        }
+        let _ = count; // Counterfactual only.
         let mut claimed = row;
         claimed.state = "executing".into();
         tx.commit()?;
