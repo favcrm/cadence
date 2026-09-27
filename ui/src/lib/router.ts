@@ -1,3 +1,4 @@
+import { parseIssueTab, type IssueTab } from "../features/issues/model";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 
@@ -12,13 +13,14 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
+ *   /projects/:slug/issues/:id one issue (CAD-607). `?tab=` picks a section.
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
  *   /wiki/edit|history|upload/<path>   its modes for one path
  *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
- *   /settings[/memory]         model defaults, memory
+ *   /settings[/memory|update|account|permissions]  model defaults, memory, update, account, master permissions
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the in-page filter on
@@ -30,8 +32,8 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  * so routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update" | "account";
+export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -39,6 +41,7 @@ export type Route =
   | { screen: "home" }
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
+  | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "agents"; alias: string | null }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
@@ -53,7 +56,7 @@ export type Screen = Route["screen"];
 /** The main navigation — MVP screens only (Setup is reached from Home). */
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
-  { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
+  { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
@@ -155,14 +158,19 @@ export function matchRoute(pathname: string): Route {
   const parts = pathname.split("/").filter(Boolean);
   const [head, a, b, ...rest] = parts;
   if (head === "wiki") return matchWiki(parts);
+  if (head === "projects" && b === "issues" && rest.length === 1) {
+    const slug = a ? segment(a) : null;
+    const issueId = segment(rest[0]);
+    if (slug && issueId) return { screen: "issue", project: slug, id: issueId, tab: "overview" };
+  }
   if (rest.length === 0) {
     if (!head && !a) return { screen: "home" };
     if (head === "index.html" && !a) return { screen: "home" };
     if (head === "projects") {
-      if (!a) return { screen: "projects", slug: null, section: "issues" };
+      if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
-      if (slug && !b) return { screen: "projects", slug, section: "issues" };
-      if (slug && (b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
+      if (slug && !b) return { screen: "projects", slug, section: "overview" };
+      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
         return { screen: "projects", slug, section: b };
       }
     }
@@ -187,6 +195,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
       if (a === "account") return { screen: "settings", section: "account" };
+      if (a === "permissions") return { screen: "settings", section: "permissions" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -199,8 +208,10 @@ export function routePath(route: Route): string {
     case "projects": {
       if (!route.slug) return "/projects";
       const base = `/projects/${encodeURIComponent(route.slug)}`;
-      return route.section === "issues" ? base : `${base}/${route.section}`;
+      return route.section === "overview" ? base : `${base}/${route.section}`;
     }
+    case "issue":
+      return `/projects/${encodeURIComponent(route.project)}/issues/${encodeURIComponent(route.id)}`;
     case "apps":
       if (!route.project) return "/apps";
       return route.name
@@ -227,7 +238,9 @@ export function routePath(route: Route): string {
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "memory") return "/settings/memory";
-      return route.section === "update" ? "/settings/update" : "/settings";
+      if (route.section === "update") return "/settings/update";
+      if (route.section === "permissions") return "/settings/permissions";
+      return "/settings";
     case "notFound":
       return route.path;
   }
@@ -238,22 +251,29 @@ function parseView(value: string | null): ProjectView | undefined {
 }
 
 export function readLocation(pathname: string, search: string, storedView?: ProjectView): AppLocation {
-  const route = matchRoute(pathname);
+  const matched = matchRoute(pathname);
   const q = new URLSearchParams(search);
+  let route = matched.screen === "issue" ? { ...matched, tab: parseIssueTab(q.get("tab")) } : matched;
+  if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
+    route = { ...route, section: "issues" };
+  }
   const onProjects = route.screen === "projects";
   const queried = q.get("project");
   return {
     route,
-    // The slug is the project on a project page. A filter screen reads
-    // `?project=`. Every other screen ignores it — an app detail's project
-    // lives on the route, not in this scope.
-    project: onProjects
-      ? (route.slug ?? "all")
-      : projectFilter(route)
-        ? queried || "all"
-        : "all",
+    // The slug is the project on a project page. An issue page carries its
+    // project in the path. A filter screen reads `?project=`. Every other
+    // screen ignores it — an app detail's project lives on the route.
+    project:
+      route.screen === "issue"
+        ? route.project
+        : route.screen === "projects"
+          ? (route.slug ?? "all")
+          : projectFilter(route)
+            ? queried || "all"
+            : "all",
     view: parseView(q.get("view")) ?? storedView ?? "list",
-    openId: q.get("issue"),
+    openId: route.screen === "issue" ? null : q.get("issue"),
     filters: onProjects ? readFilters(q) : NO_FILTERS,
   };
 }
@@ -266,7 +286,7 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
 function scopedRoute(route: Route, project: string): Route {
   if (route.screen !== "projects") return route;
   const slug = project === "all" ? null : project;
-  return { screen: "projects", slug, section: slug ? route.section : "issues" };
+  return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
@@ -278,6 +298,11 @@ export function locationHref(loc: AppLocation, search = ""): string {
   for (const key of ["tab", "view", "project", "issue", "run", "new"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  if (route.screen === "issue") {
+    if (route.tab !== "overview") q.set("tab", route.tab);
+    const issueSearch = q.toString();
+    return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
+  }
   if (route.screen === "projects") {
     if (route.section === "issues") {
       q.set("view", loc.view);
@@ -333,6 +358,7 @@ export function legacyRedirect(
 
 /** A project worth carrying onto another screen that has a filter or a slug. */
 function carriedProject(current: AppLocation): string {
+  if (current.route.screen === "issue") return current.route.project;
   return projectFilter(current.route) || current.route.screen === "projects" ? current.project : "all";
 }
 
@@ -340,11 +366,14 @@ function carriedProject(current: AppLocation): string {
  *  keeps its project; Home, Wiki, Outbox and the rest of Settings drop it.
  *  The open issue drawer still comes along. */
 export function goTo(current: AppLocation, route: Route): AppLocation {
+  if (route.screen === "issue") {
+    return { ...current, route, project: route.project, openId: null };
+  }
   if (route.screen === "projects") {
     const slug = route.slug ?? (carriedProject(current) === "all" ? null : carriedProject(current));
     return {
       ...current,
-      route: { screen: "projects", slug, section: slug ? route.section : "issues" },
+      route: { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" },
       project: slug ?? "all",
     };
   }
@@ -357,17 +386,25 @@ export function goTo(current: AppLocation, route: Route): AppLocation {
  * section when already on one). Never filters the screen you are on.
  */
 export function openProject(current: AppLocation, project: string): AppLocation {
-  const section = current.route.screen === "projects" ? current.route.section : "issues";
+  const section = current.route.screen === "projects" ? current.route.section : "overview";
   const slug = project === "all" ? null : project;
   return {
     ...current,
     project: slug ?? "all",
-    route: { screen: "projects", slug, section: slug ? section : "issues" },
+    route: { screen: "projects", slug, section: slug ? section : section === "overview" ? "overview" : "issues" },
   };
 }
 
 /** The in-page filter. No-op on a screen that has none. */
 export function withProject(current: AppLocation, project: string): AppLocation {
+  if (current.route.screen === "issue") {
+    return {
+      ...current,
+      project,
+      openId: null,
+      route: { screen: "projects", slug: project === "all" ? null : project, section: "issues" },
+    };
+  }
   if (!projectFilter(current.route)) return current;
   return { ...current, project: project || "all" };
 }

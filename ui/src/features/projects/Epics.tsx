@@ -55,9 +55,12 @@ export default function Epics({
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
+  const [showCompleted, setShowCompleted] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const cards = issues.data ?? [];
-  const epics = epicsOf(cards, project);
+  const allEpics = epicsOf(cards, project);
+  const completed = allEpics.filter((e) => e.status === "done" || e.status === "dropped");
+  const epics = allEpics.filter((e) => showCompleted || !completed.includes(e)).sort((a, b) => Number(b.work.health?.state === "at_risk" || b.work.health?.state === "stalled") - Number(a.work.health?.state === "at_risk" || a.work.health?.state === "stalled"));
   const notes = [
     ...new Set(epics.flatMap((e) => [e.work.config_unapproved, e.work.config_error].filter(Boolean) as string[])),
   ];
@@ -71,6 +74,7 @@ export default function Epics({
     <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="epics">
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h1 className="text-section font-semibold text-ink-100">Epics</h1>
+        {completed.length > 0 && <button className="lnk text-label ml-auto" aria-pressed={showCompleted} onClick={() => setShowCompleted(!showCompleted)}>{showCompleted ? "Hide" : "Show"} completed ({completed.length})</button>}
         <StaleChip state={issues} />
         {epics.length > 0 && (
           <span className="text-label text-ink-500 num">
@@ -78,6 +82,7 @@ export default function Epics({
           </span>
         )}
       </div>
+      <p className="text-label text-ink-500 mb-5">Capability outcomes: their delivery stage, owner, and current work. An epic can contribute to several milestones.</p>
       <ResourceGate state={issues} loading="loading epics…" failed="could not load epics" onRetry={onRetry} />
       {notes.map((n) => (
         <p key={n} className="card mb-3 px-3.5 py-2.5 text-label text-warn break-words" role="note">
@@ -85,9 +90,8 @@ export default function Epics({
         </p>
       ))}
       {issues.data && epics.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400">
-          No epics in {project} yet. An issue with children, or one set <span className="num">type=epic</span>, is an
-          epic.
+        <div className="card project-card-padding text-secondary text-ink-400">
+          No active epics in {project}. Group related tasks into an epic when they deliver one capability or outcome.
         </div>
       )}
       <ul className="space-y-2.5">
@@ -125,9 +129,14 @@ function EpicRow({
   const w = epic.work;
   const health = healthView(w.health, w.stage?.id);
   const progress = progressView(w.progress);
+  const kids = childrenOf(cards, epic.id);
+  const checkpoints = [...new Set(kids.map((k) => k.work?.milestone ?? w.milestone).filter(Boolean))];
+  if (!checkpoints.length && w.milestone) checkpoints.push(w.milestone);
+  const current = kids.filter((k) => !["done", "dropped"].includes(k.status))
+    .sort((a, b) => Number(b.blocked || b.status === "review") - Number(a.blocked || a.status === "review"));
   return (
     <li className="card min-w-0" data-epic={epic.id}>
-      <div className="px-3.5 py-3 min-w-0">
+      <div className="project-card-padding min-w-0">
         <button
           type="button"
           onClick={onToggle}
@@ -146,12 +155,12 @@ function EpicRow({
             {stageLabel(w.stage)}
           </span>
           <HealthBadge view={health} />
-          <span className={`chip ${w.milestone ? "bg-info/10 text-info" : "bg-ink-800 text-ink-500"}`}>
-            {w.milestone ?? "no milestone"}
-          </span>
-          {epic.owner && <span className="text-micro text-ink-500">{epic.owner}</span>}
+          <span className="text-micro text-ink-400">Owner: {epic.owner ?? "Unassigned"}</span>
           {health.timing && <span className="text-micro text-ink-500">{health.timing}</span>}
         </div>
+        {w.stage?.exit && <p className="text-label text-ink-400 mt-2 max-w-[85ch]">Next stage requires: {w.stage.exit}</p>}
+        {current[0] && <button className="text-left text-label text-ink-400 hover:text-accent mt-3 min-h-8" onClick={() => onOpenIssue(current[0].id)}><span className="text-ink-500">{current[0].blocked ? "Blocked" : current[0].status === "review" ? "In review" : "Current work"} · </span>{current[0].title} <span className="num text-micro">({current[0].id})</span></button>}
+        {!!checkpoints.length && <p className="text-micro text-ink-500 mt-2">Contributes to {checkpoints.join(", ")}</p>}
         <div className="mt-2.5">
           <ProgressBar view={progress} tone={health.tone} />
         </div>
@@ -213,9 +222,9 @@ function EpicDetail({
   };
 
   return (
-    <div className="border-t border-ink-700 px-3.5 py-3 grid gap-4 md:grid-cols-2 min-w-0">
+    <div className="border-t border-ink-700 project-card-padding grid gap-4 md:grid-cols-2 min-w-0">
       <section className="min-w-0" aria-label={`${epic.id} children`}>
-        <div className="slabel mb-1.5">children · {kids.length}</div>
+        <div className="slabel mb-1.5">Tasks · {kids.length}</div>
         {kids.length === 0 ? (
           <p className="text-label text-ink-500">No children yet.</p>
         ) : (

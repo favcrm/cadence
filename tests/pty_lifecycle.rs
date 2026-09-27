@@ -823,23 +823,45 @@ fn message_ids(d: &TestDaemon, alias: &str, id: &str) -> usize {
 
 /// Stop an idle-labelled PTY only after its actor has detached, then
 /// prove both turns adopt on the same pane and tokens with no replay.
-fn restart_idle_pty_after_forced_detach(via_signal: bool) {
+struct ShutdownSnapshotGate<'a> {
+    daemon: &'a TestDaemon,
+    snapshot: SnapshotGate,
+    shutdown_requested: bool,
+}
+
+impl Drop for ShutdownSnapshotGate<'_> {
+    fn drop(&mut self) {
+        if self.snapshot.barrier.is_some() && !self.shutdown_requested {
+            // Release cannot run first: the daemon only reaches the
+            // barrier after shutdown. This guard drops before TestDaemon.
+            let _ = self.daemon.operator_rpc("shutdown", json!({}));
+        }
+        self.snapshot.release();
+    }
+}
+
+fn restart_idle_pty_after_forced_detach(via_signal: bool, panic_before_setup: bool) {
     let barrier = Arc::new(Barrier::new(2));
     let mut opts = daemon_opts();
     opts.release_shutdown_snapshot = Some(Arc::clone(&barrier));
     let mut d = TestDaemon::start_opts(opts);
+    let mut gate = ShutdownSnapshotGate {
+        daemon: &d,
+        snapshot: SnapshotGate {
+            barrier: Some(barrier),
+        },
+        shutdown_requested: false,
+    };
+    assert!(!panic_before_setup, "CAD-478 injected setup panic");
     let mock = d.mock_devin();
     let (token1, token2, pane_pid) = park_idle_labelled_turns(&d, &mock);
     let screen_before = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
-    let mut gate = SnapshotGate { barrier: None };
     if via_signal {
         sigterm_own_process();
     } else {
         d.operator_rpc("shutdown", json!({})).unwrap();
     }
-    // Arm only after shutdown was requested, so a panic below releases
-    // `serve` instead of leaving it blocked.
-    gate.barrier = Some(barrier);
+    gate.shutdown_requested = true;
     // Do not RPC here. `serve` may already be waiting on the barrier,
     // so the listener will not accept another call until we release it.
     // The agent row is the detach evidence the former snapshot used to miss.
@@ -866,7 +888,8 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
         row.2, "offline",
         "detach during shutdown must land offline, not a finished turn: {row:?}"
     );
-    gate.release();
+    gate.snapshot.release();
+    drop(gate);
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     let marker = read_marker(&state);
@@ -931,8 +954,35 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
 }
 
 #[test]
+fn pty_shutdown_snapshot_setup_panic_releases_daemon() {
+    run_signal_child(
+        "pty_shutdown_snapshot_setup_panic_child",
+        Duration::from_secs(20),
+    );
+}
+
+#[test]
+#[ignore = "run by pty_shutdown_snapshot_setup_panic_releases_daemon in its own process"]
+fn pty_shutdown_snapshot_setup_panic_child() {
+    if std::env::var(SIGNAL_CHILD_ENV).ok().as_deref()
+        != Some("pty_shutdown_snapshot_setup_panic_child")
+    {
+        return;
+    }
+    let panic = std::panic::catch_unwind(|| {
+        restart_idle_pty_after_forced_detach(false, true);
+    })
+    .expect_err("fixture must retain the original setup panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied());
+    assert_eq!(message, Some("CAD-478 injected setup panic"));
+}
+
+#[test]
 fn pty_shutdown_facts_before_detach_rpc() {
-    restart_idle_pty_after_forced_detach(false);
+    restart_idle_pty_after_forced_detach(false, false);
 }
 
 #[test]
@@ -953,7 +1003,7 @@ fn pty_shutdown_facts_before_detach_signal_child() {
     {
         return;
     }
-    restart_idle_pty_after_forced_detach(true);
+    restart_idle_pty_after_forced_detach(true, false);
 }
 
 /// CAD-406 guard: the shared test process refuses to signal itself, and

@@ -21,7 +21,9 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{optional_str, required_str, Caller, Shared, DAEMON_ALIAS};
+use super::{
+    optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
+};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
@@ -71,6 +73,19 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "answer_route",
     // CAD-431: read the review loop (never file a verdict or decide).
     "delivery_list",
+    // CAD-614: wiki reads, plus a text write. The CAD-580 ACL still
+    // decides the path — the master writes only
+    // `agents/master/knowledge/`. mkdir/mv/rm/blobs stay closed.
+    "wiki_ls",
+    "wiki_read",
+    "wiki_search",
+    "wiki_history",
+    "wiki_write",
+    // CAD-615: file a permission request, peek a grant, and retry an
+    // approved command. Deciding a request is not on this list.
+    "master_ask_permission",
+    "master_peek_grant",
+    "master_permission_use",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -161,6 +176,27 @@ pub(crate) fn master_may_call(method: &str) -> bool {
     MASTER_ALLOWED.contains(&method)
 }
 
+// In-process test daemons may have no tracing subscriber. Preserve the reason
+// for an unavailable identity in captured stderr without changing the refusal.
+fn record_master_identity_error(
+    output: &mut impl std::io::Write,
+    peer_pid: u32,
+    stage: &str,
+    error: &Error,
+) {
+    let reason: String = error
+        .to_string()
+        .chars()
+        .take(256)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // Diagnostics must not turn an unavailable identity into an I/O panic.
+    let _ = writeln!(
+        output,
+        "master identity unavailable: peer_pid={peer_pid} stage={stage} reason={reason}"
+    );
+}
+
 impl Shared {
     /// Is a master registered at all — every master check is skipped,
     /// at no cost, on an install without one.
@@ -171,9 +207,30 @@ impl Shared {
     /// Is this connection the master's (its process tree, per the one
     /// identity verifier). An underivable identity is not the master.
     pub(super) fn caller_is_master(&self, peer_pid: u32) -> bool {
-        self.master_exists()
+        // The same registration read and short circuit as master_exists, with
+        // diagnostics for errors that would otherwise be collapsed to false.
+        self.store
+            .agent_opt(ALIAS)
+            .inspect_err(|error| {
+                record_master_identity_error(
+                    &mut std::io::stderr().lock(),
+                    peer_pid,
+                    "registration",
+                    error,
+                );
+            })
+            .ok()
+            .flatten()
+            .is_some()
             && matches!(
-                self.caller_identity(peer_pid),
+                self.caller_identity(peer_pid).inspect_err(|error| {
+                    record_master_identity_error(
+                        &mut std::io::stderr().lock(),
+                        peer_pid,
+                        "identity",
+                        error,
+                    );
+                }),
                 Ok(Caller::Agent(v)) if master::is_master(&v.agent.alias)
             )
     }
@@ -220,7 +277,8 @@ impl Shared {
                 format!(
                     "the master may not call {method} — it reads, proposes plans, dispatches \
                      approved tickets (`cadence master dispatch`), answers and escalates \
-                     questions; everything else is the operator's"
+                     questions, reads the wiki and writes only its own knowledge pages \
+                     (`wiki put agents/master/knowledge/…`); everything else is the operator's"
                 ),
             ));
         }
@@ -899,8 +957,9 @@ impl Shared {
                  Report: {path}\nImpact: {}\nOptions: {options}\n\n{body}\n\n\
                  Answer it: `cadence report file --task {id} --kind answer` with frontmatter \
                  `answers: {name}`. If the ticket, the plan and the operator's words do not \
-                 settle it: `cadence master escalate {id} {name} --file -` with a \
-                 one-paragraph summary — the operator then sees it in Needs-you.",
+                 settle it: write a one-paragraph summary into master/tmp, then \
+                 `cadence master escalate {id} {name} --file <that path>` — the operator \
+                 then sees it in Needs-you.",
                 row["impact"].as_str().unwrap_or_default()
             )
         } else {
@@ -917,7 +976,459 @@ impl Shared {
         );
         Ok(true)
     }
+
+    /// The master, by its connection. The operator files nothing here.
+    fn require_master_caller(&self, peer_pid: u32, verb: &str) -> Result<()> {
+        match self.agent_caller(peer_pid, verb)? {
+            AgentCaller::Agent(alias) if master::is_master(&alias) && self.master_exists() => {
+                Ok(())
+            }
+            AgentCaller::Agent(alias) => Err(Error::rejected(format!(
+                "{verb} is the master's — this connection is agent '{alias}'"
+            ))),
+            AgentCaller::Operator => Err(Error::rejected(format!(
+                "{verb} is the master's — the operator decides requests, and does not file them"
+            ))),
+        }
+    }
+
+    fn perm_roots(&self) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+        let mut states = vec![self.state_dir.clone()];
+        if let Ok(prod) = crate::home::state_default() {
+            if prod != self.state_dir {
+                states.push(prod);
+            }
+        }
+        let checkouts = self
+            .pm()
+            .ok()
+            .and_then(|pm| crate::issue::project::list(&pm.dir).ok())
+            .map(|projects| {
+                projects
+                    .into_iter()
+                    .flat_map(|p| p.repos)
+                    .filter_map(|r| r.path)
+                    .filter_map(|p| std::fs::canonicalize(p).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (checkouts, states)
+    }
+
+    fn perm_states(states: &[std::path::PathBuf]) -> Vec<&std::path::Path> {
+        states.iter().map(std::path::PathBuf::as_path).collect()
+    }
+
+    fn audit_perm(&self, kind: &str, payload: Value) {
+        let _ = self.store.event_public(PERM_AUDIT_STREAM, kind, payload);
+    }
+
+    fn tell_master(&self, key: &str, text: &str) {
+        let id = crate::proto::daemon_message_id("permission", key);
+        let _ = self.store.enqueue_daemon(ALIAS, text, &id, "permission");
+    }
+
+    /// `master_ask_permission` — the master files one request for an
+    /// exact argv. A duplicate pending request is returned as-is.
+    pub(super) fn rpc_master_ask_permission(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.require_master_caller(peer_pid, "master ask-permission")?;
+        reject_identity_fields(params, "master ask-permission")?;
+        let argv = optional_strs(params, "argv")?;
+        let cwd = std::path::PathBuf::from(required_str(params, "cwd")?);
+        let reason = required_str(params, "reason")?;
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let req = crate::master_perm::ask(
+            &self.state_dir,
+            &argv,
+            &cwd,
+            reason,
+            ALIAS,
+            &checkouts,
+            &state_refs,
+            crate::master_perm::clock(),
+        )?;
+        let body = crate::master_perm::request_json(&req);
+        self.audit_perm("permission_requested", body.clone());
+        self.tell_master(
+            &format!("request/{}", req.id),
+            &format!(
+                "Permission requested ({}, risk {}): `{}`\nReason: {}\nThe operator can allow it once, always, or reject it.",
+                req.id,
+                body["risk"].as_str().unwrap_or("medium"),
+                req.argv.join(" "),
+                req.reason
+            ),
+        );
+        self.wake();
+        Ok(body)
+    }
+
+    /// `master_peek_grant` — does a live grant or allow rule cover this
+    /// exact argv? Does not consume. The guard calls it.
+    pub(super) fn rpc_master_peek_grant(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.require_master_caller(peer_pid, "master peek-grant")?;
+        reject_identity_fields(params, "master peek-grant")?;
+        let argv = optional_strs(params, "argv")?;
+        let cwd = std::path::PathBuf::from(required_str(params, "cwd")?);
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let pm = self.pm().ok();
+        let allowed = crate::master_perm::peek(
+            &self.state_dir,
+            pm.as_ref().map(|p| p.dir.as_path()),
+            &argv,
+            &cwd,
+            &checkouts,
+            &state_refs,
+            crate::master_perm::clock(),
+        )?;
+        if !allowed {
+            return Err(Error::rejected("no live permission for that command"));
+        }
+        Ok(json!({"allowed": true}))
+    }
+
+    /// `master_permission_use` — the master retries the exact argv. A
+    /// live grant is consumed (or an allow rule matches) and the
+    /// daemon runs the command, returning its output. No grant is
+    /// `applied: false`, so an allowlisted command continues normally.
+    pub(super) fn rpc_master_permission_use(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.require_master_caller(peer_pid, "master permission use")?;
+        reject_identity_fields(params, "master permission use")?;
+        let argv = optional_strs(params, "argv")?;
+        let cwd = std::path::PathBuf::from(required_str(params, "cwd")?);
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let pm = self.pm().ok();
+        let now = crate::master_perm::clock();
+        let pm_dir = pm.as_ref().map(|p| p.dir.as_path());
+        if !crate::master_perm::peek(
+            &self.state_dir,
+            pm_dir,
+            &argv,
+            &cwd,
+            &checkouts,
+            &state_refs,
+            now,
+        )? {
+            return Ok(json!({"applied": false}));
+        }
+        let used = crate::master_perm::take(
+            &self.state_dir,
+            pm_dir,
+            &argv,
+            &cwd,
+            &checkouts,
+            &state_refs,
+            now,
+        )?;
+        let mut out = self.run_approved(&argv, &cwd)?;
+        out["applied"] = json!(true);
+        out["use"] = match &used {
+            crate::master_perm::Use::Grant { request_id } => json!({"grant": request_id}),
+            crate::master_perm::Use::Rule { id } => json!({"rule": id}),
+        };
+        self.audit_perm(
+            "permission_used",
+            json!({"argv": argv, "cwd": cwd, "use": out["use"].clone(), "code": out["code"].clone()}),
+        );
+        self.tell_master(
+            &format!("use/{}-{}", argv.join(" "), now),
+            &format!(
+                "Ran approved command (exit {}): `{}`",
+                out["code"].as_i64().unwrap_or(1),
+                argv.join(" ")
+            ),
+        );
+        Ok(out)
+    }
+
+    /// `master_permission_allow_once` — operator only. One use of the
+    /// exact argv and cwd.
+    pub(super) fn rpc_master_permission_allow_once(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("master allow-once", params, peer_pid)?;
+        let id = required_str(params, "id")?;
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let req = crate::master_perm::allow_once(
+            &self.state_dir,
+            id,
+            &checkouts,
+            &state_refs,
+            crate::master_perm::clock(),
+        )?;
+        let body = crate::master_perm::request_json(&req);
+        self.audit_perm(
+            "permission_decided",
+            json!({"id": id, "decision": "allow_once", "argv": req.argv}),
+        );
+        self.tell_master(
+            &format!("decision/{id}"),
+            &format!(
+                "Operator allowed once: `{}` ({id}). Retry that exact command.",
+                req.argv.join(" ")
+            ),
+        );
+        self.wake();
+        Ok(body)
+    }
+
+    /// `master_permission_always` — operator only. Saves a rule to
+    /// `agents/master/permissions.yaml` and commits it as the operator.
+    pub(super) fn rpc_master_permission_always(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("master always-allow", params, peer_pid)?;
+        let id = required_str(params, "id")?;
+        let scope = match optional_str(params, "scope").unwrap_or("exact") {
+            "exact" => crate::master_perm::Scope::Exact,
+            "prefix" => crate::master_perm::Scope::Prefix,
+            other => {
+                return Err(Error::rejected(format!(
+                    "scope is 'exact' or 'prefix', not '{other}'"
+                )))
+            }
+        };
+        let tail = optional_strs(params, "tail")?;
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let (req, rule) = crate::master_perm::always_rule(
+            &self.state_dir,
+            id,
+            scope,
+            &tail,
+            &checkouts,
+            &state_refs,
+            crate::master_perm::clock(),
+        )?;
+        let pm = self.pm()?;
+        if let Err(e) = self.persist_rule(&pm, rule.clone()) {
+            let _ = crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
+            return Err(e);
+        }
+        let body = json!({
+            "request": crate::master_perm::request_json(&req),
+            "rule": crate::master_perm::rule_json(&rule),
+        });
+        self.audit_perm(
+            "permission_decided",
+            json!({"id": id, "decision": "always", "rule": body["rule"].clone()}),
+        );
+        self.tell_master(
+            &format!("decision/{id}"),
+            &format!(
+                "Operator always-allowed `{}` as rule {}.",
+                req.argv.join(" "),
+                rule.id
+            ),
+        );
+        self.wake();
+        Ok(body)
+    }
+
+    /// `master_permission_reject` — operator only. An optional deny
+    /// rule (`dont_ask_again`) wins over later allow rules.
+    pub(super) fn rpc_master_permission_reject(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("master reject", params, peer_pid)?;
+        let id = required_str(params, "id")?;
+        let dont = params["dont_ask_again"].as_bool().unwrap_or(false);
+        let (req, rule) =
+            crate::master_perm::reject(&self.state_dir, id, dont, crate::master_perm::clock())?;
+        if let Some(rule) = &rule {
+            let pm = self.pm()?;
+            if let Err(e) = self.persist_rule(&pm, rule.clone()) {
+                let _ =
+                    crate::master_perm::reopen(&self.state_dir, id, crate::master_perm::clock());
+                return Err(e);
+            }
+        }
+        self.audit_perm(
+            "permission_decided",
+            json!({"id": id, "decision": "reject", "dont_ask_again": dont, "argv": req.argv}),
+        );
+        self.tell_master(
+            &format!("decision/{id}"),
+            &format!(
+                "Operator rejected `{}` ({id}){}.",
+                req.argv.join(" "),
+                if dont {
+                    " and will not be asked again"
+                } else {
+                    ""
+                }
+            ),
+        );
+        self.wake();
+        Ok(crate::master_perm::request_json(&req))
+    }
+
+    /// `master_permission_revoke` — operator only. The rule stops
+    /// matching on the next check.
+    pub(super) fn rpc_master_permission_revoke(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("master revoke-permission", params, peer_pid)?;
+        let id = required_str(params, "id")?;
+        let pm = self.pm()?;
+        let _lock = pm.lock()?;
+        let rule = crate::master_perm::revoke_rule(&pm.dir, ALIAS, id)?;
+        let path = crate::master_perm::rules_file(&pm.dir, ALIAS)?;
+        crate::issue::write::commit(
+            &pm,
+            std::slice::from_ref(&path),
+            "agents/master: revoke a permission rule",
+            &[],
+            "operator",
+        )?;
+        self.audit_perm("permission_revoked", crate::master_perm::rule_json(&rule));
+        self.wake();
+        Ok(crate::master_perm::rule_json(&rule))
+    }
+
+    /// `master_permission_list` — operator only. Pending requests and
+    /// the rules file.
+    pub(super) fn rpc_master_permission_list(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("master permissions", params, peer_pid)?;
+        let pending =
+            crate::master_perm::board_requests(&self.state_dir, crate::master_perm::clock())?;
+        let rules = self
+            .pm()
+            .ok()
+            .and_then(|pm| crate::master_perm::read_rules(&pm.dir, ALIAS).ok())
+            .unwrap_or_default();
+        Ok(json!({
+            "requests": pending.iter().map(crate::master_perm::request_json).collect::<Vec<_>>(),
+            "rules": rules.iter().map(crate::master_perm::rule_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn persist_rule(&self, pm: &crate::issue::Pm, rule: crate::master_perm::Rule) -> Result<()> {
+        let _lock = pm.lock()?;
+        let mut rules = crate::master_perm::read_rules(&pm.dir, ALIAS)?;
+        rules.push(rule);
+        let path = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules)?;
+        if let Err(e) = crate::issue::write::commit(
+            pm,
+            std::slice::from_ref(&path),
+            "agents/master: update permissions.yaml",
+            &[],
+            "operator",
+        ) {
+            rules.pop();
+            let _ = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Run an approved command. A read-only tool runs directly. A
+    /// `cadence` verb is re-exec'd as a child of this daemon carrying
+    /// a one-shot token; that child's connection is the operator for
+    /// the life of the process, then the token is dropped.
+    fn run_approved(&self, argv: &[String], cwd: &std::path::Path) -> Result<Value> {
+        const CAP: usize = 32_000;
+        let clip = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            if text.len() <= CAP {
+                return text.into_owned();
+            }
+            let mut end = CAP;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…[truncated]", &text[..end])
+        };
+        if crate::master_perm::readonly_tool(argv) {
+            let bin = ["/bin", "/usr/bin"]
+                .into_iter()
+                .map(|d| std::path::PathBuf::from(d).join(&argv[0]))
+                .find(|p| p.is_file())
+                .ok_or_else(|| Error::rejected(format!("no {} under /bin or /usr/bin", argv[0])))?;
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(&argv[1..]).current_dir(cwd);
+            scrub_grant_env(&mut cmd);
+            let out = crate::reaper::output(&mut cmd).map_err(|e| {
+                Error::rejected(format!("running the approved command failed: {e}"))
+            })?;
+            return Ok(json!({
+                "code": out.status.code().unwrap_or(1),
+                "stdout": clip(&out.stdout),
+                "stderr": clip(&out.stderr),
+            }));
+        }
+        if !argv.first().is_some_and(|a| {
+            std::path::Path::new(a).file_name().and_then(|s| s.to_str()) == Some("cadence")
+        }) {
+            return Err(Error::rejected(
+                "an approved command is a cadence verb or ls/cat/grep/find",
+            ));
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let exe = std::env::current_exe().map_err(|e| Error::internal(e.to_string()))?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(&argv[1..])
+            .current_dir(cwd)
+            .env("CADENCE_STATE_DIR", &self.state_dir);
+        scrub_grant_env(&mut cmd);
+        cmd.env("CADENCE_GRANT_TOKEN", &token);
+        let child = crate::reaper::spawn(&mut cmd)
+            .map_err(|e| Error::rejected(format!("running the approved command failed: {e}")))?;
+        let pid = child.id();
+        self.perm_exec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token.clone(),
+                super::identity::GrantExec {
+                    pid,
+                    argv: argv.to_vec(),
+                },
+            );
+        let out = child.wait_with_output();
+        self.perm_exec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&token);
+        let out = out.map_err(|e| Error::rejected(format!("the approved command failed: {e}")))?;
+        Ok(json!({
+            "code": out.status.code().unwrap_or(1),
+            "stdout": clip(&out.stdout),
+            "stderr": clip(&out.stderr),
+        }))
+    }
 }
+
+/// Drop the master's denied credentials, and the alias, from a child
+/// that runs an approved command. The grant token is set by the caller
+/// after this, so a readonly tool never receives one.
+fn scrub_grant_env(cmd: &mut std::process::Command) {
+    cmd.env_remove("CADENCE_ALIAS");
+    cmd.env_remove("CADENCE_GRANT_TOKEN");
+    for name in crate::master::DENIED_ENV {
+        cmd.env_remove(*name);
+    }
+}
+
+/// Audit stream for permission requests, decisions and uses. The colon
+/// keeps it off the agent-id namespace, same as `audit:approvals`.
+const PERM_AUDIT_STREAM: &str = "audit:master-permissions";
 
 /// The message id a routed report is queued under — one per report file.
 pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
@@ -934,6 +1445,38 @@ pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_diagnostic_bounds_and_sanitizes_the_reason() {
+        let error = Error::rejected(format!("failed\n\t{}", "é".repeat(300)));
+        let mut output = Vec::new();
+        record_master_identity_error(&mut output, 42, "identity", &error);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("master identity unavailable: peer_pid=42 stage=identity reason="));
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.trim_end().chars().any(char::is_control));
+        let (_, reason) = text.split_once("reason=").unwrap();
+        assert_eq!(reason.trim_end().chars().count(), 256);
+    }
+
+    #[test]
+    fn identity_diagnostic_tolerates_an_unavailable_output() {
+        struct Unavailable;
+        impl std::io::Write for Unavailable {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        record_master_identity_error(
+            &mut Unavailable,
+            42,
+            "registration",
+            &Error::rejected("read"),
+        );
+    }
 
     #[test]
     fn preferred_reads_provider_model_effort_and_fallbacks() {
@@ -1066,5 +1609,19 @@ mod tests {
             assert!(!master_may_call(never), "{never} must be refused");
         }
         assert!(!master_may_call("a_method_added_tomorrow"));
+        // CAD-614: wiki reads and a text write are open; mutations
+        // other than that write stay closed. The path ACL is separate.
+        for open in [
+            "wiki_ls",
+            "wiki_read",
+            "wiki_search",
+            "wiki_history",
+            "wiki_write",
+        ] {
+            assert!(master_may_call(open), "{open}");
+        }
+        for closed in ["wiki_mkdir", "wiki_mv", "wiki_rm", "wiki_put_blob"] {
+            assert!(!master_may_call(closed), "{closed} must stay refused");
+        }
     }
 }

@@ -5,8 +5,12 @@ import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
+import ProjectsOverview from "./features/projects/ProjectsOverview";
+import IssuePage from "./features/issues/IssuePage";
+import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import MasterPermissions from "./features/settings/MasterPermissions";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
@@ -15,6 +19,7 @@ import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import Context from "./features/projects/Context";
+import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import Wiki from "./features/wiki/Wiki";
@@ -23,18 +28,18 @@ import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import ThemeToggle from "./ui/ThemeToggle";
+import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
-import { kickoffBlock, writeBlock } from "./features/auth/gate";
+import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { Logo } from "./ui/Logo";
-import { IconChevron } from "./ui/icons";
+import { IconList } from "./ui/icons";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
@@ -70,7 +75,9 @@ function currentLocation(): AppLocation {
 
 /** Move to a new location built from the current one. */
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
-  navigate(locationHref(fn(currentLocation()), location.search), opts);
+  const current = currentLocation();
+  const next = fn(current);
+  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search)), opts);
 }
 
 const SCREEN_LABEL: Record<Screen, string> = {
@@ -84,6 +91,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   setup: "setup",
   settings: "settings",
   login: "sign in",
+  issue: "issue",
   notFound: "not found",
 };
 
@@ -97,9 +105,11 @@ export default function App() {
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
+  const fullHeight = screen === "home" || screen === "wiki" ||
+    (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), search);
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search));
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -137,6 +147,7 @@ export default function App() {
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
   const [staleBuild, setStaleBuild] = useState<string | null>(null);
+  const [dismissedBuild, setDismissedBuild] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
 
   // Writes are off on a read-only board and, since CAD-313, until this
@@ -194,13 +205,19 @@ export default function App() {
       });
   }, [project, contextOn, projectContextRefresh]);
 
-  // The open drawer's id, read through a ref so the stream and poll
-  // handlers stay stable while the drawer changes.
+  // The peek's id and the issue page's id, read through refs so the
+  // stream and poll handlers stay stable. The page clears `openId`, so
+  // the fallback has to name the id on screen or that detail goes stale
+  // while `/api/stream` is down.
   const openIdRef = useRef(openId);
   openIdRef.current = openId;
+  const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
+  pageIssueRef.current = route.screen === "issue" ? route.id : null;
   const loadDetail = useCallback(() => {
-    const id = openIdRef.current;
-    if (id) void resources.issue(id).invalidate();
+    for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
+      void resources.issue(id).invalidate();
+      void resources.lane(id).invalidate();
+    }
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
@@ -275,7 +292,9 @@ export default function App() {
       url: "/api/stream",
       events: ["issues", "agents", "jobs", "monitoring"],
       onEvent: (e) => {
-        for (const name of invalidatedBy(e.data)) {
+        const names = invalidatedBy(e.data);
+        if (laneFollowsStream(names)) cache.invalidate("lane");
+        for (const name of names) {
           // Families are keyed stores — invalidate the prefix, not one entry.
           if (
             name === "issue" ||
@@ -298,7 +317,7 @@ export default function App() {
     return () => sub.close();
   }, [loadDetail]);
 
-  // The banner's only action — never automatic. The composer draft is
+  // Reload is explicit — never automatic. The composer draft is
   // stashed first so one click costs no text (CAD-573).
   const reload = useCallback(() => {
     const storage = sessionStore();
@@ -468,34 +487,23 @@ export default function App() {
 
   // The sidebar and the phone menu open a project page. The chip row
   // and the memory picker filter the screen, and only a screen that has one.
-  const projectHref = (key: string) => locationHref(openProject(loc, key), search);
-  const filterHref = (key: string) => locationHref(withProject(loc, key), search);
+  const projectHref = (key: string) => {
+    const next = openProject(loc, key);
+    return locationHref(next, contextNavigationSearch(route, next.route, search));
+  };
+  const filterHref = (key: string) => {
+    const next = withProject(loc, key);
+    return locationHref(next, contextNavigationSearch(route, next.route, search));
+  };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
 
   return (
     <WriteGate.Provider value={block}>
-    {staleBuild !== null && (
-      <div
-        role="alert"
-        data-build-banner
-        className="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-ink-900/20 bg-warn px-4 py-2.5 text-ink-900"
-      >
-        <span className="text-label font-medium">Cadence was updated</span>
-        <span className="num hidden sm:inline text-micro opacity-60">({staleBuild})</span>
-        <button
-          type="button"
-          onClick={reload}
-          className="h-7 shrink-0 rounded bg-ink-900 px-3 text-label font-medium text-ink-100 hover:opacity-85"
-        >
-          Reload
-        </button>
-      </div>
-    )}
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
-        screen === "home" ? "h-[100dvh] overflow-hidden" : "min-h-screen"
+        fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >
       <Sidebar
@@ -510,30 +518,30 @@ export default function App() {
         sessionUser={meta?.session?.user}
       />
 
-      {/* CAD-600: Home is a full-height panel. The shell above is
-          exactly the dynamic viewport (`100dvh`, overflow hidden) so
-          mobile browser chrome cannot make `100vh` scroll the page
-          while this column stays `100dvh`. Every other screen keeps
-          `min-h-screen` on that shell and the natural document flow. */}
-      <div className={`min-w-0 flex flex-col ${screen === "home" ? "h-[100dvh] min-h-0" : ""}`}>
-        <header className="sticky top-0 z-10 h-[2.85rem] flex items-center gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+      {/* Workspaces fill the dynamic viewport; their panes own scrolling.
+          Other screens retain the natural document flow. */}
+      <div className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
+        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
-            className="lg:hidden -ml-1 inline-flex items-center gap-1.5 h-8 px-2 rounded text-ink-200 hover:bg-ink-800"
-            aria-label="menu"
+            className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
+            aria-label="Open navigation"
             aria-expanded={menuOpen}
+            aria-controls="mobile-navigation"
           >
-            <Logo size={17} />
-            <span className="text-label font-medium">cadence</span>
-            <IconChevron className={`transition-transform ${menuOpen ? "rotate-180" : ""}`} />
+            <IconList size={18} />
           </button>
-          <div className="num text-label text-ink-500 min-w-0 truncate">
-            <span className="hidden sm:inline text-ink-300">cadence</span>
-            <span className="hidden sm:inline"> / </span>
-            <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
-          </div>
+          <nav className="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+            {route.screen === "projects" && route.slug ? (
+              <>
+                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">Projects</Link>
+                <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
+                <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
+              </>
+            ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>}
+          </nav>
 
-          <div className="ml-auto flex items-center gap-2 shrink-0">
+          <div className="ml-auto flex items-center gap-0 sm:gap-2 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -543,25 +551,23 @@ export default function App() {
               onRefresh={refresh}
             >
               <SignIn meta={meta} onChange={refresh} />
+              {staleBuild !== null && staleBuild !== dismissedBuild && (
+                <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
+              )}
             </StatusChips>
             <ThemeToggle />
           </div>
         </header>
 
         {updateBanner && (
-          <div className="border-b border-amber-500/40 bg-amber-500/10 px-4 lg:px-8 py-2 text-body text-ink-200">
-            <span className="font-semibold">Update in progress</span> —{" "}
-            {updateBanner.pending.from ?? "?"} →{" "}
-            <span className="num">{updateBanner.pending.target}</span> (
-            {updateBanner.pending.phase}) by {updateBanner.pending.by}
-            {updateBanner.count > 0
-              ? ` · waiting for ${updateBanner.count} turn${updateBanner.count === 1 ? "" : "s"}`
-              : " · nothing in flight"}
-          </div>
+          <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
+            <summary className="cursor-pointer"><span className="font-medium text-ink-200">Updating Cadence</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : "No active turns remaining"}<span className="text-ink-500 ml-3">Details</span></summary>
+            <p className="num text-micro text-ink-500 mt-2 break-all">{updateBanner.pending.from ?? "?"} → {updateBanner.pending.target} · {updateBanner.pending.phase} · {updateBanner.pending.by}</p>
+          </details>
         )}
 
         {menuOpen && (
-          <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+          <nav id="mobile-navigation" aria-label="Workspace" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
               {NAV.map((item) => (
                 <Link
@@ -667,24 +673,91 @@ export default function App() {
             onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
           />
         )}
-        {route.screen === "projects" && route.slug && (
+        {(route.screen === "issue" || (route.screen === "projects" && route.slug)) && (
           <SectionTabs
-            label={route.slug}
+            label={route.screen === "issue" ? route.project : route.slug!}
             tabs={[
-              { label: "Issues", href: hrefFor({ ...route, section: "issues" }), on: route.section === "issues" },
-              { label: "Epics", href: hrefFor({ ...route, section: "epics" }), on: route.section === "epics" },
+              {
+                label: "Overview",
+                href: hrefFor({ screen: "projects", slug: route.screen === "issue" ? route.project : route.slug, section: "overview" }),
+                on: route.screen === "projects" && route.section === "overview",
+              },
+              {
+                label: "Issues",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "issues",
+                }),
+                on: route.screen === "issue" || route.section === "issues",
+              },
+              {
+                label: "Epics",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "epics",
+                }),
+                on: route.screen === "projects" && route.section === "epics",
+              },
               {
                 label: "Milestones",
-                href: hrefFor({ ...route, section: "milestones" }),
-                on: route.section === "milestones",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "milestones",
+                }),
+                on: route.screen === "projects" && route.section === "milestones",
               },
               {
                 label: "Workflows",
-                href: hrefFor({ ...route, section: "workflows" }),
-                on: route.section === "workflows",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "workflows",
+                }),
+                on: route.screen === "projects" && route.section === "workflows",
               },
-              { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
+              {
+                label: "Context",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "context",
+                }),
+                on: route.screen === "projects" && route.section === "context",
+              },
             ]}
+          />
+        )}
+        {route.screen === "projects" && route.section === "overview" && (
+          <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
+        )}
+        {route.screen === "issue" && (
+          <IssuePage
+            project={route.project}
+            id={route.id}
+            tab={route.tab}
+            tabHref={(tab) => locationHref({ ...loc, route: { ...route, tab } }, search)}
+            issues={issues}
+            agents={agents ?? null}
+            readOnly={readOnly}
+            writeBlock={block}
+            kickoffBlock={operatorKickoffBlock(meta)}
+            onWrite={applyWrite}
+            onError={writeError}
+            onOpen={(issueId) => {
+              const card = issues.find((i) => i.id === issueId);
+              const nextProject = card?.project ?? route.project;
+              update((c) => ({
+                ...c,
+                openId: null,
+                project: nextProject,
+                route: { screen: "issue", project: nextProject, id: issueId, tab: "overview" },
+              }));
+            }}
+            planHref={hrefFor({ screen: "home" })}
+            onToast={(text) => say("ok", text)}
           />
         )}
         {route.screen === "projects" && route.section === "issues" && (
@@ -732,6 +805,10 @@ export default function App() {
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context
+            readOnly={readOnly}
+            actor={actor}
+            onToast={say}
+            navHref={hrefFor}
             project={project}
             context={visibleContext(project, projectContext)}
             contextLoading={projectContextLoading}
@@ -783,6 +860,11 @@ export default function App() {
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
               ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
+              {
+                label: "Master permissions",
+                href: hrefFor({ screen: "settings", section: "permissions" }),
+                on: route.section === "permissions",
+              },
             ]}
           />
         )}
@@ -794,6 +876,7 @@ export default function App() {
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {
@@ -816,21 +899,18 @@ export default function App() {
         )}
       </div>
 
-      {openId && (
+      {openId && route.screen !== "issue" && (
         <Drawer
           key={openId}
           id={openId}
-          agents={agents}
-          projects={projects}
-          pmDir={health?.pm_dir}
           detail={detailState?.data?.id === openId ? detailState.data : null}
-          readOnly={readOnly}
-          canKickoff={kickoffBlock(meta) === null}
-          actor={actor}
+          href={(() => {
+            const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
+            const fromCard = issues.find((i) => i.id === openId)?.project ?? null;
+            const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
+            return key ? issuePath(key, openId) : null;
+          })()}
           onClose={closeIssue}
-          onOpen={openIssue}
-          onWrite={applyWrite}
-          onError={writeError}
         />
       )}
 

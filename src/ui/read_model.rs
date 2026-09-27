@@ -491,6 +491,7 @@ struct Hub {
 /// the diffs are taken against.
 struct Watch {
     tracker: Option<SystemTime>,
+    delivery: u64,
     jobs: Option<u64>,
     agents: Option<u64>,
     monitoring: Option<u64>,
@@ -636,8 +637,16 @@ impl Model {
             t.views(pm, None, None)
         };
         let mut h = DefaultHasher::new();
-        (key, head_stamp(&pm.dir)).hash(&mut h);
+        (key, head_stamp(&pm.dir), self.delivery_stamp()).hash(&mut h);
         (h.finish(), views)
+    }
+
+    // CI observations move delivery state without moving an agent or
+    // tracker issue. Atomic replacement must invalidate cached decisions.
+    fn delivery_stamp(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        hash_meta(&self.state_dir.join("delivery.json"), &mut h);
+        h.finish()
     }
 
     fn compose(
@@ -790,6 +799,7 @@ impl Model {
             let (cards, plans) = self.entities(&snap);
             let base = Watch {
                 tracker: dir_mtime(&self.pm_dir),
+                delivery: self.delivery_stamp(),
                 jobs: snap.jobs_fp,
                 agents: snap.agents_fp,
                 monitoring: self.monitoring_fp(),
@@ -884,6 +894,14 @@ impl Model {
             w.tracker = tracker;
             frames.push(legacy_frame("issues"));
         }
+        let delivery_stamp = self.delivery_stamp();
+        let delivery = delivery_stamp != w.delivery;
+        if delivery {
+            w.delivery = delivery_stamp;
+            if !issues {
+                frames.push(legacy_frame("issues"));
+            }
+        }
         let snap = Arc::new(fetch_daemon(&self.state_dir));
         self.keep_snap(snap.clone());
         let jobs = snap.jobs_fp.is_some() && snap.jobs_fp != w.jobs;
@@ -914,7 +932,7 @@ impl Model {
             diff_frames("agent", &w.rows, &rows, frames);
             w.rows = fps(&rows);
         }
-        if jobs || agents || monitoring {
+        if jobs || agents || monitoring || delivery {
             // Before the frames go out: the refetch they trigger must not
             // be served anything read before this tick.
             self.mark_changed(started);
@@ -946,6 +964,50 @@ mod tests {
         std::fs::create_dir_all(dir.join("comments")).unwrap();
         std::fs::create_dir_all(dir.join("artifacts")).unwrap();
         std::fs::write(dir.join("issue.md"), "a").unwrap();
+    }
+
+    #[test]
+    fn delivery_observation_invalidates_the_overview_without_agent_or_tracker_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        let tracker = tmp.path().join("pm");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&tracker).unwrap();
+        std::fs::write(tracker.join("pm.yaml"), "schema: 1\n").unwrap();
+        let pm = Pm::at(&tracker).unwrap();
+        let model = get(&state, &tracker);
+        let key_before = model.tracker_views(&pm).0;
+        let mut watch = Watch {
+            tracker: dir_mtime(&tracker),
+            delivery: model.delivery_stamp(),
+            jobs: None,
+            agents: None,
+            monitoring: None,
+            cards: HashMap::new(),
+            plans: HashMap::new(),
+            rows: HashMap::new(),
+        };
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        frames.clear();
+        *lock(&model.changed_at) = None;
+        // Delivery sync writes this outside the board's HTTP write path.
+        std::fs::write(state.join("delivery.json"), "{}\n").unwrap();
+        assert_ne!(key_before, model.tracker_views(&pm).0);
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.starts_with("event: issues\n") && f.contains("\"overview\"")),
+            "{frames:?}"
+        );
+        assert!(lock(&model.changed_at).is_some());
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            frames.is_empty(),
+            "stable delivery state must not cause a refetch loop"
+        );
     }
 
     #[test]

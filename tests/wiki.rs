@@ -707,6 +707,64 @@ fn agent_writes_own_areas_only() {
         .is_ok());
 }
 
+/// CAD-614: alias `master` is an agent caller. It reads `global/` and
+/// writes only `agents/master/knowledge/`. `wiki put global/x` is the
+/// ACL refusal (operator-written), not a missing method. The alias
+/// cannot be `agent_register`'d, so this seam-asserts the caller; the
+/// method allowlist is pinned beside `MASTER_ALLOWED`.
+#[cfg(feature = "test-seam")]
+#[test]
+fn master_wiki_put_global_is_refused_and_own_knowledge_is_not() {
+    let fx = fx();
+    let d = &fx.d;
+    d.operator_rpc(
+        "wiki_write",
+        json!({"path": "global/x.md", "text": "operator note"}),
+    )
+    .unwrap();
+    let err = refused(d.agent_rpc(
+        "master",
+        "wiki_write",
+        json!({"path": "global/x.md", "text": "nope"}),
+    ));
+    assert!(
+        err.contains("operator-written") || err.contains("global/"),
+        "{err}"
+    );
+    assert!(d
+        .agent_rpc(
+            "master",
+            "wiki_write",
+            json!({"path": "agents/master/knowledge/note.md", "text": "mine"}),
+        )
+        .is_ok());
+    assert!(d
+        .agent_rpc("master", "wiki_read", json!({"path": "global/x.md"}))
+        .is_ok());
+    assert!(d
+        .agent_rpc(
+            "master",
+            "wiki_ls",
+            json!({"path": "agents/master/knowledge"})
+        )
+        .is_ok());
+    let found = d
+        .agent_rpc(
+            "master",
+            "wiki_search",
+            json!({"q": "operator note", "path": "global"}),
+        )
+        .unwrap();
+    assert!(found.to_string().contains("global/x.md"), "{found}");
+    assert!(d
+        .agent_rpc(
+            "master",
+            "wiki_history",
+            json!({"path": "agents/master/knowledge/note.md"}),
+        )
+        .is_ok());
+}
+
 #[cfg(feature = "test-seam")]
 #[test]
 fn agent_traversal_after_a_valid_root_is_refused() {

@@ -1060,6 +1060,7 @@ fn overview_commands_all_parse() {
         None,
         &[],
         None,
+        None,
         "t",
     )
     .unwrap();
@@ -1074,6 +1075,7 @@ fn overview_commands_all_parse() {
         None,
         None,
         &[],
+        None,
         None,
         "t",
     )
@@ -1177,4 +1179,20 @@ fn endpoint_mismatch_compares_provider_and_kind() {
             assert!(err.contains(&needle), "missing {needle:?}: {err}");
         }
     }
+}
+
+#[test]
+fn cad103_review_flakes_query_and_existing_pr_syntax() {
+    let cli = Cli::try_parse_from(["cadence", "review", "flakes", "--test", "a::b"]).unwrap();
+    assert!(matches!(cli.command, Commands::Review {
+        action: Some(ReviewAction::Flakes { test: Some(test) }), pr: None, ..
+    } if test == "a::b"));
+    let cli =
+        Cli::try_parse_from(["cadence", "review", "42", "--repo", "O/R", "--no-full"]).unwrap();
+    assert!(
+        matches!(cli.command, Commands::Review { action: None, pr: Some(pr), no_full: true, .. } if pr == "42")
+    );
+    assert!(Cli::try_parse_from(["cadence", "review"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "review", "42", "--test", "x"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "review", "flakes", "--no-full"]).is_err());
 }

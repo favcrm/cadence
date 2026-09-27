@@ -176,6 +176,31 @@ impl Default for Timeouts {
     }
 }
 
+/// Coverage of the configured review suite; CI remains responsible for
+/// the complete merge-group inventory when a recipe chooses a baseline.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SuiteScope {
+    #[default]
+    Full,
+    ReviewBaseline,
+}
+
+impl SuiteScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full suite",
+            Self::ReviewBaseline => "Review baseline",
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReviewBaseline => "review-baseline",
+        }
+    }
+}
+
 /// `cadence-review.toml` — every step the verb performs is data here.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReviewConfig {
@@ -184,8 +209,11 @@ pub struct ReviewConfig {
     pub prepare: Vec<String>,
     /// Ordered quality gates; the first failure stops the sequence.
     pub gates: Vec<String>,
-    /// The full test suite, run once.
+    /// Configured suite, run once. Legacy key retained for consumers.
     pub full_suite: String,
+    /// Describe coverage honestly; older recipes retain full-suite semantics.
+    #[serde(default)]
+    pub suite_scope: SuiteScope,
     /// Diff paths that count as test files (`*`/`**`/`?` globs).
     pub test_globs: Vec<String>,
     /// How one test runs alone; `{test}` = fn name, `{file}` = diff
@@ -302,13 +330,15 @@ pub const FLAKE_LEDGER: &str = "flakes.jsonl";
 /// Distinct PR heads a flake needs sightings on before it stops
 /// blocking — repeated reviews of one head never qualify on their own.
 pub const KNOWN_FLAKE_HEADS: usize = 3;
+const FLAKE_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
+const FLAKE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// What the ledger holds for one `(repo, test)` after a sighting.
 #[derive(Debug, PartialEq)]
 pub struct Sightings {
-    /// Every sighting, this one included.
+    /// Every historical sighting, this one included.
     pub total: u64,
-    /// Distinct heads among them — the current head counts once.
+    /// Distinct nonempty heads dated within the last 14 days.
     pub heads: usize,
 }
 
@@ -323,38 +353,145 @@ impl Sightings {
 /// under an exclusive `flock` on the ledger, so concurrent reviews see
 /// exact counts; each line is one `write_all`, so appends never fuse.
 /// Malformed lines are skipped.
+fn normalize_flake_repo(repo: &str) -> Result<String> {
+    let repo = repo.trim();
+    let slug = repo
+        .strip_prefix("https://github.com/")
+        .or_else(|| repo.strip_prefix("http://github.com/"))
+        .or_else(|| repo.strip_prefix("git@github.com:"))
+        .unwrap_or(repo)
+        .trim_end_matches('/');
+    let slug = slug.strip_suffix(".git").unwrap_or(slug);
+    let parts: Vec<_> = slug.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        })
+    {
+        return Err(Error::rejected(
+            "flake repo must be owner/name or a GitHub repository URL",
+        ));
+    }
+    Ok(slug.to_ascii_lowercase())
+}
+
+fn lock_flake_file(file: &std::fs::File, wait: Duration) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let deadline = Instant::now() + wait;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock
+            && error.kind() != std::io::ErrorKind::Interrupted
+        {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::rejected(
+                "timed out waiting for the flake ledger lock",
+            ));
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn ledger_entries(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["test"].as_str().is_some())
+        .collect()
+}
+
+fn flake_sightings(rows: &[Value], entry: &Value, now: i64) -> Sightings {
+    let repo = entry["repo"]
+        .as_str()
+        .and_then(|r| normalize_flake_repo(r).ok());
+    let matching: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row["test"] == entry["test"]
+                && (row.get("repo").is_none()
+                    || row["repo"].is_null()
+                    || row["repo"]
+                        .as_str()
+                        .and_then(|r| normalize_flake_repo(r).ok())
+                        .is_some_and(|r| Some(r) == repo))
+        })
+        .collect();
+    let heads: BTreeSet<_> = matching
+        .iter()
+        .filter(|row| {
+            row["at"]
+                .as_str()
+                .and_then(time::parse_iso)
+                .is_some_and(|at| at >= now - FLAKE_WINDOW_SECS && at <= now)
+        })
+        .filter_map(|row| row["head"].as_str().filter(|head| !head.is_empty()))
+        .collect();
+    Sightings {
+        total: matching.len() as u64,
+        heads: heads.len(),
+    }
+}
+
+/// Read historical sightings without creating or modifying the ledger.
+/// Test matching is exact; stale and undated records remain visible.
+pub fn read_flakes(ledger: &Path, test: Option<&str>) -> Result<Vec<Value>> {
+    let text = match std::fs::read_to_string(ledger) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(ledger_entries(&text)
+        .into_iter()
+        .filter(|row| test.is_none_or(|test| row["test"].as_str() == Some(test)))
+        .collect())
+}
+
+pub fn print_flakes(state_dir: PathBuf, test: Option<String>) -> Result<()> {
+    for row in read_flakes(
+        &state_dir.join("reviews").join(FLAKE_LEDGER),
+        test.as_deref(),
+    )? {
+        println!("{}", serde_json::to_string(&row)?);
+    }
+    Ok(())
+}
+
 pub fn record_flake(ledger: &Path, entry: &Value) -> Result<Sightings> {
     use std::io::{Read, Write};
-    use std::os::unix::io::AsRawFd;
+    let mut entry = entry.clone();
+    let repo = entry["repo"]
+        .as_str()
+        .ok_or_else(|| Error::rejected("flake entry requires repo"))?;
+    entry["repo"] = json!(normalize_flake_repo(repo)?);
+    if entry["test"].as_str().is_none_or(str::is_empty) {
+        return Err(Error::rejected("flake entry requires a nonempty test"));
+    }
     if let Some(dir) = ledger.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
         .open(ledger)?;
-    // Released when `f` closes at return.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    lock_flake_file(&file, FLAKE_LOCK_WAIT)?;
     let mut text = String::new();
-    f.read_to_string(&mut text)?;
-    let prior: Vec<Value> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["repo"] == entry["repo"] && v["test"] == entry["test"])
-        .collect();
-    let mut heads: std::collections::HashSet<&str> = prior
-        .iter()
-        .map(|v| v["head"].as_str().unwrap_or_default())
-        .collect();
-    heads.insert(entry["head"].as_str().unwrap_or_default());
-    let seen = Sightings {
-        total: prior.len() as u64 + 1,
-        heads: heads.len(),
-    };
-    f.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
+    file.read_to_string(&mut text)?;
+    let mut rows = ledger_entries(&text);
+    rows.push(entry.clone());
+    let seen = flake_sightings(&rows, &entry, time::now_epoch());
+    file.write_all(format!("{}\n", serde_json::to_string(&entry)?).as_bytes())?;
     Ok(seen)
 }
 
@@ -1846,7 +1983,7 @@ pub fn run(opts: &Options) -> Result<i32> {
         return Err(Error::rejected(
             "CADENCE_SUITE_LOCK is unset — the full suite would run beside \
              every other suite on this host. Set it (see docs/SESSION.md: \
-             export CADENCE_SUITE_LOCK=~/.local/state/cadence/suite.lock), \
+             export CADENCE_SUITE_LOCK=$HOME/.local/state/cadence/suite.lock), \
              or pass --no-full or --no-suite-lock",
         ));
     }
@@ -2138,6 +2275,8 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["stress"] = json!(stress_results);
     report["suite_lock"] = suite_lock;
     report["full_suite"] = full_suite_report(suite_step.as_ref(), &cfg.full_suite, 0);
+    report["full_suite"]["scope"] = json!(cfg.suite_scope.as_str());
+    report["full_suite"]["label"] = json!(cfg.suite_scope.label());
 
     // Equal-conditions compare: every failing test name, rerun alone
     // on the gated tree and alone on the base head.
@@ -2991,7 +3130,8 @@ fn render_markdown(r: &Value) -> String {
         "Gates",
         &r["gates"].as_array().cloned().unwrap_or_default(),
     );
-    section(&mut md, "Full suite", &[r["full_suite"].clone()]);
+    let suite_label = r["full_suite"]["label"].as_str().unwrap_or("Full suite");
+    section(&mut md, suite_label, &[r["full_suite"].clone()]);
 
     let stress = r["stress"].as_array().cloned().unwrap_or_default();
     md.push_str("## New tests stressed\n\n");
@@ -3344,6 +3484,7 @@ gate_secs = 42
         assert_eq!(cfg.timeouts.gate_secs, 42);
         assert_eq!(cfg.timeouts.full_secs, 3600);
         assert_eq!(cfg.stress_pattern.0, vec!["wait_", "sleep"]);
+        assert_eq!(cfg.suite_scope, SuiteScope::Full);
         assert_eq!(cfg.runner.backend, ReviewBackend::Cargo);
         assert_eq!(cfg.runner.result_format, ResultFormat::Cargo);
     }
@@ -3365,6 +3506,30 @@ gate_secs = 42
             err.contains(&format!("{origin} is not valid TOML")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn review_baseline_scope_is_explicit_and_unknown_scope_refuses() {
+        let recipe = "prepare = []\ngates = [\"true\"]\nfull_suite = \"cargo test --lib\"\ntest_globs = [\"tests/**\"]\ntest_command = \"cargo test {test}\"\n";
+        let legacy = ReviewConfig::parse(recipe, "legacy").unwrap();
+        assert_eq!(legacy.suite_scope.as_str(), "full");
+        assert_eq!(legacy.suite_scope.label(), "Full suite");
+        let baseline = ReviewConfig::parse(
+            &format!("{recipe}suite_scope = \"review-baseline\"\n"),
+            "baseline",
+        )
+        .unwrap();
+        assert_eq!(baseline.suite_scope.as_str(), "review-baseline");
+        assert_eq!(baseline.suite_scope.label(), "Review baseline");
+        let report = json!({"full_suite": {
+            "scope": baseline.suite_scope.as_str(),
+            "label": baseline.suite_scope.label(),
+            "outcome": "ok"
+        }});
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("## Review baseline"));
+        assert!(!markdown.contains("## Full suite"));
+        assert!(ReviewConfig::parse(&format!("{recipe}suite_scope = \"none\"\n"), "bad",).is_err());
     }
 
     #[test]
@@ -3911,10 +4076,76 @@ result_path = "target/nextest/cadence/junit.xml"
     }
 
     #[test]
+    fn flake_ledger_normalizes_and_expires_without_erasing_history() {
+        let now = time::now_epoch();
+        let entry = json!({"repo":"O/R", "test":"t"});
+        let row = |repo: Value, at: i64, head: &str| json!({"repo":repo,"test":"t","at":time::iso(at),"head":head});
+        let rows = vec![
+            row(json!("https://github.com/O/R.git"), now, "a"),
+            row(Value::Null, now - FLAKE_WINDOW_SECS, "b"),
+            row(json!("o/r"), now, "c"),
+            row(json!("o/r"), now - FLAKE_WINDOW_SECS - 1, "old"),
+            row(json!("o/r"), now + 1, "future"),
+            json!({"repo":"o/r","test":"t","head":"undated"}),
+            row(json!("other/repo"), now, "other"),
+        ];
+        assert_eq!(
+            flake_sightings(&rows, &entry, now),
+            Sightings { total: 6, heads: 3 }
+        );
+        assert!(!flake_sightings(&rows, &entry, now + FLAKE_WINDOW_SECS + 2).known_flake());
+        assert_eq!(
+            normalize_flake_repo("git@github.com:O/R.git").unwrap(),
+            "o/r"
+        );
+        for invalid in [
+            "",
+            "o",
+            "o/r/extra",
+            "https://evil.test/o/r",
+            "../r",
+            "o/r?token=x",
+        ] {
+            assert!(normalize_flake_repo(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn flake_ledger_query_is_exact_read_only_and_missing_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("missing").join(FLAKE_LEDGER);
+        assert!(read_flakes(&ledger, None).unwrap().is_empty());
+        assert!(!ledger.parent().unwrap().exists());
+        let ledger = dir.path().join(FLAKE_LEDGER);
+        let bytes = b"{\"test\":\"a\"}\n{\"test\":\"aa\"}\nbroken\n";
+        std::fs::write(&ledger, bytes).unwrap();
+        assert_eq!(read_flakes(&ledger, Some("a")).unwrap().len(), 1);
+        assert!(read_flakes(&ledger, Some("A")).unwrap().is_empty());
+        assert_eq!(std::fs::read(&ledger).unwrap(), bytes);
+    }
+
+    #[test]
+    fn flake_ledger_lock_times_out_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join(FLAKE_LEDGER);
+        let holder = Flock::try_lock(&ledger).unwrap().unwrap();
+        let other = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        let started = Instant::now();
+        assert!(lock_flake_file(&other, Duration::from_millis(30)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(std::fs::metadata(&ledger).unwrap().len(), 0);
+        drop(holder);
+        lock_flake_file(&other, Duration::from_millis(30)).unwrap();
+    }
+
+    #[test]
     fn flake_ledger_needs_three_distinct_heads() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = dir.path().join("reviews").join(FLAKE_LEDGER);
-        let entry = |repo: &str, test: &str, head: &str| json!({"at": "t", "repo": repo, "test": test, "pr": 1, "head": head});
+        let entry = |repo: &str, test: &str, head: &str| json!({"at": time::iso(time::now_epoch()), "repo": repo, "test": test, "pr": 1, "head": head});
         let seen = |e: Value| record_flake(&ledger, &e).unwrap();
         // First sighting: one head, not known.
         let first = seen(entry("o/r", "a", "h1"));
@@ -3955,7 +4186,7 @@ result_path = "target/nextest/cadence/junit.xml"
                         record_flake(
                             &ledger,
                             &json!({"repo": "o/r", "test": "t", "head": format!("h{i}-{n}"),
-                                    "pad": "x".repeat(8000)}),
+                                    "at": time::iso(time::now_epoch()), "pad": "x".repeat(8000)}),
                         )
                         .unwrap();
                     }
@@ -3971,8 +4202,11 @@ result_path = "target/nextest/cadence/junit.xml"
             .lines()
             .all(|l| serde_json::from_str::<Value>(l).is_ok()));
         // The locked read makes the count exact.
-        let last =
-            record_flake(&ledger, &json!({"repo": "o/r", "test": "t", "head": "z"})).unwrap();
+        let last = record_flake(
+            &ledger,
+            &json!({"repo": "o/r", "test": "t", "head": "z", "at": time::iso(time::now_epoch())}),
+        )
+        .unwrap();
         assert_eq!(
             last,
             Sightings {

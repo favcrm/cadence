@@ -277,7 +277,7 @@ export default function RunForm({
   );
 
   return (
-    <div className={app ? "px-3.5 py-3 min-w-0" : "border-t border-ink-700 px-3.5 py-3 grid gap-4 lg:grid-cols-2 min-w-0"}>
+    <div className={app ? "px-3.5 py-3 min-w-0" : "border-t border-ink-700 project-card-padding grid gap-4 lg:grid-cols-2 min-w-0"}>
       <section className="min-w-0" aria-label={`${row.name} inputs`}>
         <div className="slabel mb-1.5">{app ? app.title : "new run"}</div>
         {fields.length === 0 && (

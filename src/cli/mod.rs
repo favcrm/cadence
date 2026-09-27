@@ -101,8 +101,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
@@ -125,6 +124,16 @@ pub(crate) struct Cli {
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReviewAction {
+    /// Print historical sightings without modifying the flake ledger.
+    Flakes {
+        /// Exact test name to select.
+        #[arg(long)]
+        test: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1215,9 +1224,13 @@ pub(crate) enum Commands {
     /// the base head. Writes a
     /// Markdown+JSON report under the state dir — never posts a
     /// status, never merges, never pushes.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Review {
+        #[command(subcommand)]
+        action: Option<ReviewAction>,
         /// PR number (or anything `gh pr view` accepts).
-        pr: String,
+        #[arg(required = true)]
+        pr: Option<String>,
         /// owner/name — else resolved through `gh repo view`.
         #[arg(long)]
         repo: Option<String>,
@@ -1548,6 +1561,29 @@ pub(crate) fn read_body_capped(
         .take(read_limit)
         .read_to_string(&mut body)?;
     Ok(body)
+}
+
+/// Body for an allowlisted master command that takes `--file`
+/// (`plan propose`, `report file`, `report`, `master escalate`).
+///
+/// When [`cadence_agent::master::caller_is_master`] is set, `-` and a
+/// missing path are refused with [`cadence_agent::master::NO_STDIN`]
+/// before stdin is opened, and a real path goes through
+/// [`cadence_agent::master::read_command_file`]. Other callers keep
+/// the stdin pipe.
+pub(crate) fn read_master_command_file(
+    state_dir: &Path,
+    file: Option<&Path>,
+    max: u64,
+) -> Result<String> {
+    let path = file.filter(|f| f.as_os_str() != "-" && !f.as_os_str().is_empty());
+    if cadence_agent::master::caller_is_master() {
+        let Some(path) = path else {
+            return Err(Error::rejected(cadence_agent::master::NO_STDIN));
+        };
+        return cadence_agent::master::read_command_file(state_dir, path, max);
+    }
+    read_body_capped(None, file.map(Path::to_path_buf), max)
 }
 
 /// `message result --report` (CAD-341): the result text with its
@@ -3062,6 +3098,94 @@ pub(crate) fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
     ))
 }
 
+/// When this process is the master, an exact argv the operator
+/// approved is run by the daemon. Returns `Some` when that happened
+/// (or the daemon refused a never-list command). `None` means the
+/// normal verb should run.
+fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
+    if std::env::var("CADENCE_ALIAS").ok().as_deref() != Some(cadence_agent::master::ALIAS) {
+        return None;
+    }
+    if std::env::var_os("CADENCE_GRANT_TOKEN").is_some() {
+        return None;
+    }
+    if let Commands::Master {
+        action:
+            master::MasterAction::AskPermission { .. }
+            | master::MasterAction::PeekGrant { .. }
+            | master::MasterAction::UseGrant { .. },
+    } = &cli.command
+    {
+        return None;
+    }
+    // The daemon launches the master's provider as `cadence confine`.
+    // That wrapper inherits CADENCE_ALIAS=master. It is not a tool
+    // command, and there is no daemon to ask yet when the provider
+    // itself is what is starting.
+    if let Commands::Confine { .. } = &cli.command {
+        return None;
+    }
+    // The tracker's pre-commit hook runs `cadence issue lint` with the
+    // committer's environment. A master commit inherits
+    // CADENCE_ALIAS=master. Sending that through a permission RPC
+    // deadlocks the commit (the daemon is inside it) or refuses it
+    // when the socket is a different daemon. Lint is read-only and
+    // must finish for every tracker write, including verdicts.
+    if let Commands::Issue {
+        action: cadence_agent::issue::cli::IssueAction::Lint { .. },
+    } = &cli.command
+    {
+        return None;
+    }
+    // `report` and `report file` file done reports, verdicts and ideas.
+    // They are allowlisted for the master, or the local handler refuses
+    // stdin (`NO_STDIN`). A grant lookup must not sit in front of them:
+    // the process the daemon is waiting on is this one, and a permission
+    // RPC from inside that wait never returns.
+    if let Commands::Report { .. } = &cli.command {
+        return None;
+    }
+    let mut argv = vec!["cadence".to_string()];
+    argv.extend(std::env::args().skip(1));
+    let cwd = std::env::current_dir().ok()?;
+    match cadence_agent::master_perm::classify(&argv, &cwd, &[], std::slice::from_ref(&state_dir)) {
+        cadence_agent::master_perm::Class::Allowlisted => return None,
+        cadence_agent::master_perm::Class::Never { why } => {
+            eprintln!("{why} — a grant or a rule cannot allow it");
+            return Some(1);
+        }
+        _ => {}
+    }
+    match client::rpc(
+        state_dir,
+        "master_permission_use",
+        json!({"argv": argv, "cwd": cwd}),
+    ) {
+        Ok(out) if out["applied"].as_bool() == Some(true) => {
+            let stdout = out["stdout"].as_str().unwrap_or("");
+            let stderr = out["stderr"].as_str().unwrap_or("");
+            if !stdout.is_empty() {
+                print!("{stdout}");
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+                if !stderr.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            Some(out["code"].as_i64().unwrap_or(1) as i32)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("{e}");
+            Some(1)
+        }
+    }
+}
+
 pub(crate) fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
@@ -3080,14 +3204,35 @@ pub(crate) fn run() -> Result<i32> {
             AgentUidAction::Runbook => cadence_agent::agent_uid::runbook::cli(),
         };
     }
-    let state_dir = match cli.state_dir {
-        Some(dir) => dir,
+    // CAD-647: trusted source development never resolves production state
+    // or adopts its sandbox profile. The harness has no daemon/PM contract.
+    if let Commands::App {
+        action:
+            app::AppAction::Dev {
+                name,
+                source,
+                port,
+                host,
+                allow_host,
+            },
+    } = &cli.command
+    {
+        return app::run_dev(name, source, *port, host, allow_host);
+    }
+    let state_dir = match &cli.state_dir {
+        Some(dir) => dir.clone(),
         None => client::state_dir()?,
     };
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
         cadence_agent::sandbox::adopt(&state_dir)?;
+    }
+    // CAD-615: the master retrying an approved command. The daemon
+    // runs it and this process prints the output. No grant, or an
+    // allowlisted command, falls through to the normal verb.
+    if let Some(code) = permission_replay(&state_dir, &cli) {
+        return Ok(code);
     }
     match cli.command {
         Commands::Doctor {
@@ -3497,6 +3642,7 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Test { action } => test_cmd::run(&state_dir, &action),
         Commands::BuildSlot { action } => build_slot::run(state_dir, action),
         Commands::Review {
+            action,
             pr,
             repo,
             full,
@@ -3505,17 +3651,22 @@ pub(crate) fn run() -> Result<i32> {
             stress,
             keep,
             json,
-        } => review::run(
-            state_dir,
-            pr,
-            repo,
-            full,
-            no_full,
-            no_suite_lock,
-            stress,
-            keep,
-            json,
-        ),
+        } => match action {
+            Some(ReviewAction::Flakes { test }) => {
+                cadence_agent::review::print_flakes(state_dir, test).map(|()| 0)
+            }
+            None => review::run(
+                state_dir,
+                pr.expect("clap requires PR without a subcommand"),
+                repo,
+                full,
+                no_full,
+                no_suite_lock,
+                stress,
+                keep,
+                json,
+            ),
+        },
         Commands::Session { action } => session::run(state_dir, action),
         Commands::Audit {
             action,

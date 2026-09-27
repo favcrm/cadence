@@ -118,9 +118,9 @@ impl Custody {
     }
 }
 
-/// `<state dir>/custody` — daemon-owned `0700`; inside no agent's
-/// Landlock read set (the master's policy names only `master/` and
-/// `briefings/` under the state dir).
+/// `<state dir>/custody` — daemon-owned `0700`, isolated from other
+/// uids and the confined master's Landlock read set. Unconfined
+/// same-uid workers can still read it until CAD-461 separates uids.
 pub fn custody_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("custody")
 }
@@ -144,19 +144,28 @@ fn file_put(dir: &Path, key: &Key, bytes: &[u8]) -> Result<()> {
         .unwrap_or_default()
         .as_nanos();
     let tmp = dir.join(format!(".{}-{nanos}.tmp", std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| Error::internal(format!("custody tmp {}: {e}", tmp.display())))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| Error::internal(format!("custody tmp {}: {e}", tmp.display())))?;
+    // Only clean up after create_new succeeded: a collision belongs
+    // to another writer, never this call. Every subsequent error must
+    // discard this call's temporary credential bytes.
+    let result = (|| -> Result<()> {
         f.write_all(bytes)?;
-        f.sync_all().ok();
+        f.sync_all()?;
+        drop(f);
+        // `create_new` gives 0600; the set also pins a lingering umask.
+        std::fs::set_permissions(&tmp, PermissionsExt::from_mode(0o600))?;
+        std::fs::rename(&tmp, file_path(dir, key))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp)?;
     }
-    // `create_new` gives 0600; the set also pins a lingering umask.
-    std::fs::set_permissions(&tmp, PermissionsExt::from_mode(0o600))?;
-    std::fs::rename(&tmp, file_path(dir, key))?;
+    result?;
     Ok(())
 }
 
@@ -271,6 +280,30 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failed_file_put_cleans_only_its_own_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the final credential path makes rename fail
+        // after the temporary file was created and written.
+        std::fs::create_dir(file_path(dir.path(), &key())).unwrap();
+        let foreign = dir.path().join(".another-writer.tmp");
+        std::fs::write(&foreign, b"another write").unwrap();
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| file_put(dir.path(), &key(), b"synthetic bytes")))
+                .collect();
+            for writer in writers {
+                assert!(writer.join().unwrap().is_err());
+            }
+        });
+        let temporaries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert_eq!(temporaries, vec![foreign]);
+    }
 
     /// A stand-in `secret-tool`: `lookup` prints the secret with the
     /// trailing newline the real tool adds; `clear` exits 0.

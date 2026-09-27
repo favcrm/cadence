@@ -9,7 +9,9 @@ import {
   ArrowDown01Icon,
   ArrowRight01Icon,
   Cancel01Icon,
+  CircleArrowUp01Icon,
   ContrastIcon,
+  ConnectIcon,
   CubeIcon,
   DashboardSquare01Icon,
   File01Icon,
@@ -152,4 +154,14 @@ export const IconGrid = ({ size = 12, ...rest }: IconProps = {}) => (
 /** Folder view: list. */
 export const IconList = ({ size = 12, ...rest }: IconProps = {}) => (
   <Glyph icon={Menu01Icon} size={size} {...rest} />
+);
+
+/** A newer UI version is available. */
+export const IconUpdate = ({ size = 18, ...rest }: IconProps = {}) => (
+  <Glyph icon={CircleArrowUp01Icon} size={size} {...rest} />
+);
+
+/** Daemon connection — paired plugs, distinct from activity and refresh. */
+export const IconConnection = ({ size = 18, ...rest }: IconProps = {}) => (
+  <Glyph icon={ConnectIcon} size={size} {...rest} />
 );

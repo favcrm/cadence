@@ -43,6 +43,7 @@
 //! Restarting the daemon is never automatic. GitHub access sits behind
 //! [`ReleaseSource`] so tests run against a fake and never call GitHub.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -59,6 +60,8 @@ use crate::error::{Error, Result};
 pub const DEFAULT_REPO: &str = "favcrm/cadence";
 /// The workflow file that builds, tests and attests.
 pub const WORKFLOW: &str = "ci.yml";
+/// A successful dispatch includes staging and production approval.
+pub const STAGING_WORKFLOW: &str = "staging.yml";
 /// The only branch whose builds are installable.
 pub const MAIN: &str = "main";
 /// Platform suffix of the artifact name.
@@ -109,6 +112,46 @@ pub struct Run {
     pub conclusion: String,
 }
 
+/// The approved artifact's immutable subject; workflow status, not this
+/// JSON alone, proves that staging and production approval completed.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionCandidate {
+    pub schema: u64,
+    pub source_sha: String,
+    pub ci_run_id: u64,
+    pub ci_run_attempt: u64,
+    pub sha256: String,
+    pub promotion_run_id: u64,
+    pub promotion_run_attempt: u64,
+}
+
+pub fn parse_production_candidate(text: &str, promotion: &Run) -> Result<ProductionCandidate> {
+    let candidate: ProductionCandidate = serde_json::from_str(text)
+        .map_err(|e| Error::rejected(format!("invalid production candidate receipt: {e}")))?;
+    if candidate.schema != 1
+        || !is_full_sha(&candidate.source_sha)
+        || candidate.ci_run_id == 0
+        || candidate.ci_run_attempt == 0
+        || candidate.sha256.len() != 64
+        || !candidate
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || candidate.promotion_run_id != promotion.id
+        || candidate.promotion_run_attempt != promotion.attempt
+        || promotion.event != "workflow_dispatch"
+        || promotion.head_branch != MAIN
+        || promotion.status != "completed"
+        || promotion.conclusion != "success"
+    {
+        return Err(Error::rejected(
+            "production candidate receipt does not match a successful main promotion",
+        ));
+    }
+    Ok(candidate)
+}
+
 /// One job of a run (latest attempt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -144,7 +187,8 @@ pub trait ReleaseSource {
     fn repo(&self) -> &str;
     /// Refuse early, with the fix, when `gh` is missing or logged out.
     fn check_auth(&self) -> Result<()>;
-    /// Newest successful push run of the workflow on `main`.
+    /// The main CI run selected by the latest successful production
+    /// promotion. A green CI build alone is not a production candidate.
     fn latest_green_main(&self) -> Result<Option<Run>>;
     fn on_main(&self, sha: &str) -> Result<OnMain>;
     /// GitHub compare `base...head`: `ahead` when `head` descends from
@@ -185,6 +229,7 @@ pub trait ReleaseSource {
 pub struct Gh {
     pub program: PathBuf,
     pub repo: String,
+    candidate: RefCell<Option<ProductionCandidate>>,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -195,6 +240,7 @@ impl Gh {
         Self {
             program: PathBuf::from("gh"),
             repo: repo.to_string(),
+            candidate: RefCell::new(None),
         }
     }
 
@@ -318,10 +364,79 @@ impl ReleaseSource for Gh {
     }
 
     fn latest_green_main(&self) -> Result<Option<Run>> {
-        Ok(self
-            .runs("push", Some(MAIN), &["--status", "success", "--limit", "1"])?
-            .into_iter()
-            .next())
+        *self.candidate.borrow_mut() = None;
+        let out = self.run_ok(
+            &[
+                "run",
+                "list",
+                "--repo",
+                &self.repo,
+                "--workflow",
+                STAGING_WORKFLOW,
+                "--event",
+                "workflow_dispatch",
+                "--branch",
+                MAIN,
+                "--status",
+                "success",
+                "--limit",
+                "1",
+                "--json",
+                "databaseId,attempt,headSha,headBranch,event,status,conclusion",
+            ],
+            GH_TIMEOUT,
+        )?;
+        let Some(promotion) = parse_runs(&out)?.into_iter().next() else {
+            return Ok(None);
+        };
+        // A skipped workflow is not approval. Every job bearing either
+        // gate name must have completed successfully in the latest attempt.
+        let jobs = self.jobs(promotion.id)?;
+        for name in ["stage", "promote"] {
+            let gates: Vec<_> = jobs.iter().filter(|j| j.name == name).collect();
+            if gates.is_empty()
+                || gates
+                    .iter()
+                    .any(|j| j.status != "completed" || j.conclusion != "success")
+            {
+                return Err(Error::rejected(format!(
+                    "production candidate run {} has no passing {name} gate",
+                    promotion.id
+                )));
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        self.download(promotion.id, "production-candidate", dir.path())?;
+        let receipt = fs::read_to_string(dir.path().join("production-candidate.json"))?;
+        let candidate = parse_production_candidate(&receipt, &promotion)?;
+        let path = format!("repos/{}/actions/runs/{}", self.repo, candidate.ci_run_id);
+        let out = self.run_ok(&["api", &path], GH_TIMEOUT)?;
+        let ci: Value = serde_json::from_slice(&out)
+            .map_err(|e| Error::rejected(format!("unreadable candidate CI run: {e}")))?;
+        if ci["id"].as_u64() != Some(candidate.ci_run_id)
+            || ci["run_attempt"].as_u64() != Some(candidate.ci_run_attempt)
+            || ci["head_sha"].as_str() != Some(candidate.source_sha.as_str())
+            || ci["head_branch"] != MAIN
+            || ci["event"] != "push"
+            || ci["path"] != ".github/workflows/ci.yml"
+            || ci["status"] != "completed"
+            || ci["conclusion"] != "success"
+            || ci["repository"]["full_name"].as_str() != Some(self.repo.as_str())
+            || ci["head_repository"]["full_name"].as_str() != Some(self.repo.as_str())
+        {
+            return Err(Error::rejected("production candidate CI run changed or does not match the approved artifact; stage and approve again"));
+        }
+        let run = Run {
+            id: candidate.ci_run_id,
+            attempt: candidate.ci_run_attempt,
+            head_sha: candidate.source_sha.clone(),
+            head_branch: MAIN.into(),
+            event: "push".into(),
+            status: "completed".into(),
+            conclusion: "success".into(),
+        };
+        *self.candidate.borrow_mut() = Some(candidate);
+        Ok(Some(run))
     }
 
     fn on_main(&self, sha: &str) -> Result<OnMain> {
@@ -351,7 +466,15 @@ impl ReleaseSource for Gh {
     }
 
     fn main_runs(&self, sha: &str) -> Result<Vec<Run>> {
-        self.runs("push", Some(MAIN), &["--commit", sha, "--limit", "20"])
+        let mut runs = self.runs("push", Some(MAIN), &["--commit", sha, "--limit", "20"])?;
+        if let Some(candidate) = self.candidate.borrow().as_ref() {
+            if candidate.source_sha == sha {
+                runs.retain(|r| {
+                    r.id == candidate.ci_run_id && r.attempt == candidate.ci_run_attempt
+                });
+            }
+        }
+        Ok(runs)
     }
 
     fn merge_group_runs(&self, sha: &str) -> Result<Vec<Run>> {
@@ -409,6 +532,11 @@ impl ReleaseSource for Gh {
     }
 
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String> {
+        if let Some(candidate) = self.candidate.borrow().as_ref() {
+            if candidate.source_sha == sha && sha256_file(binary)? != candidate.sha256 {
+                return Err(Error::rejected("binary digest differs from the staged production candidate; stage and approve again"));
+            }
+        }
         let signer = format!("{}/.github/workflows/{WORKFLOW}", self.repo);
         let source_ref = format!("refs/heads/{MAIN}");
         let bin = binary.to_string_lossy();
@@ -729,8 +857,8 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
             src.check_auth()?;
             let run = src.latest_green_main()?.ok_or_else(|| {
                 Error::rejected(format!(
-                    "no successful `{WORKFLOW}` push run on {MAIN} in {} — nothing to install; \
-                     check `gh run list --workflow {WORKFLOW} --branch {MAIN}`",
+                    "no approved production candidate in {} — stage a successful main CI artifact \
+                     and approve the production job in `{STAGING_WORKFLOW}`",
                     src.repo()
                 ))
             })?;
@@ -743,7 +871,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
             verified.insert(
                 "resolved".into(),
                 json!(format!(
-                    "--latest-main → newest successful {MAIN} run {} ({})",
+                    "--latest-main → approved production candidate from {MAIN} CI run {} ({})",
                     run.id, run.head_sha
                 )),
             );

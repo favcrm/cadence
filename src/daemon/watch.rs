@@ -1,6 +1,4 @@
-//! CAD-534: `cadence daemon` watch RPC handlers — moved verbatim from src/daemon.rs; the
-//! item→file map is src/daemon/split-map.toml
-//! (scripts/split-daemon regenerates it).
+//! CAD-534: `cadence daemon` watch RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
 
@@ -189,6 +187,73 @@ impl Default for StallWatch {
             delivery_stalled_sent: false,
             last_probe: None,
             episodes: 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum StallTransition {
+    Resume(Instant, u64),
+    Stall(u64, Duration),
+    Emit,
+}
+
+impl StallWatch {
+    /// Decide the running turn's stall episode at `now`. The caller applies
+    /// the returned event after releasing the watch lock.
+    fn stall_transition(&mut self, running: bool, budget: u64, now: Instant) -> StallTransition {
+        let silent = now.duration_since(self.activity);
+        if !running {
+            StallTransition::Emit
+        } else if let Some(stalled_at) = self.stalled_at {
+            if self.activity > stalled_at {
+                let episode = self.episodes;
+                self.stalled_at = None;
+                StallTransition::Resume(stalled_at, episode)
+            } else {
+                StallTransition::Emit
+            }
+        } else if budget > 0 && silent >= Duration::from_secs(budget) {
+            self.episodes += 1;
+            self.stalled_at = Some(self.activity);
+            StallTransition::Stall(self.episodes, silent)
+        } else {
+            StallTransition::Emit
+        }
+    }
+
+    /// Fold a landed screen for a running turn. Sampling, probe bookkeeping
+    /// and episode effects remain with the caller; only confirmed non-menu
+    /// changes after the first baseline advance activity to `now`.
+    fn observe_screen(&mut self, hash: String, approval_menu: bool, now: Instant) {
+        if self.settled.as_deref() == Some(hash.as_str()) {
+            // Still the settled screen — a candidate reverted
+            // without ever confirming; drop it.
+            self.candidate = None;
+            self.changed = 0;
+        } else {
+            self.changed = self.changed.saturating_add(1);
+            let confirmed = self.candidate.as_deref() == Some(hash.as_str())
+                || (self.changed >= 2 && self.previous.as_deref() != Some(hash.as_str()));
+            if confirmed {
+                // Second consecutive sighting, or a novel hash
+                // after the screen stayed changed for two
+                // samples — the change is real. A first-ever
+                // settle only forms the baseline. A menu frame
+                // never counts as turn activity: the wait is a
+                // human's, and the silence clock must see it.
+                if self.settled.is_some() && !approval_menu {
+                    self.activity = now;
+                }
+                self.previous = self.settled.take();
+                self.settled = Some(hash);
+                self.candidate = None;
+                self.changed = 0;
+            } else {
+                // First sighting of a different screen — hold
+                // as a candidate; a lone sample proves nothing.
+                self.candidate = Some(hash);
+            }
         }
     }
 }
@@ -620,38 +685,10 @@ impl Shared {
                         }
                     }
                 }
-                if running.is_none() {
-                    // Queued-head tracking is menu detection only —
-                    // the screen-hash churn below measures a turn's
-                    // activity and means nothing before it starts.
-                } else if w.settled.as_deref() == Some(hash.as_str()) {
-                    // Still the settled screen — a candidate reverted
-                    // without ever confirming; drop it.
-                    w.candidate = None;
-                    w.changed = 0;
-                } else {
-                    w.changed = w.changed.saturating_add(1);
-                    let confirmed = w.candidate.as_deref() == Some(hash.as_str())
-                        || (w.changed >= 2 && w.previous.as_deref() != Some(hash.as_str()));
-                    if confirmed {
-                        // Second consecutive sighting, or a novel hash
-                        // after the screen stayed changed for two
-                        // samples — the change is real. A first-ever
-                        // settle only forms the baseline. A menu frame
-                        // never counts as turn activity: the wait is a
-                        // human's, and the silence clock must see it.
-                        if w.settled.is_some() && !probe.approval_menu {
-                            w.activity = Instant::now();
-                        }
-                        w.previous = w.settled.take();
-                        w.settled = Some(hash);
-                        w.candidate = None;
-                        w.changed = 0;
-                    } else {
-                        // First sighting of a different screen — hold
-                        // as a candidate; a lone sample proves nothing.
-                        w.candidate = Some(hash);
-                    }
+                // Queued-head tracking is menu detection only — screen
+                // churn measures a turn's activity after it starts.
+                if running.is_some() {
+                    w.observe_screen(hash, probe.approval_menu, Instant::now());
                 }
                 w.last_probe = Some(probe);
                 w.sample_at = Some(Instant::now());
@@ -697,31 +734,9 @@ impl Shared {
                 }
             }
         }
-        let silent = w.activity.elapsed();
         // Everything the lock decided, applied after it's dropped —
         // event writes take the store mutex and never run under `w`.
-        enum After {
-            Resume(Instant, u64),
-            Stall(u64, Duration),
-            Emit,
-        }
-        let after = if running.is_none() {
-            After::Emit
-        } else if let Some(stalled_at) = w.stalled_at {
-            if w.activity > stalled_at {
-                let episode = w.episodes;
-                w.stalled_at = None;
-                After::Resume(stalled_at, episode)
-            } else {
-                After::Emit
-            }
-        } else if budget > 0 && silent >= Duration::from_secs(budget) {
-            w.episodes += 1;
-            w.stalled_at = Some(w.activity);
-            After::Stall(w.episodes, silent)
-        } else {
-            After::Emit
-        };
+        let after = w.stall_transition(running.is_some(), budget, Instant::now());
         drop(w);
         if let Some(line) = menu_rise {
             self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
@@ -740,13 +755,13 @@ impl Shared {
             self.delivery_stalled_fired(&agent, tracked.as_ref(), &msg_id, queued_secs, &probe);
         }
         match after {
-            After::Resume(at, episode) => {
+            StallTransition::Resume(at, episode) => {
                 self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
             }
-            After::Stall(episode, silent) => {
+            StallTransition::Stall(episode, silent) => {
                 self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
             }
-            After::Emit => {}
+            StallTransition::Emit => {}
         }
     }
 
@@ -1357,3 +1372,295 @@ pub(super) const PANE_TREE_KINDS: &[&str] = &[
     "pane_tree_reaped",
     "pane_tree_reap_refused",
 ];
+
+#[cfg(test)]
+mod stall_transition_tests {
+    use super::*;
+
+    fn watch_at(activity: Instant) -> StallWatch {
+        StallWatch {
+            activity,
+            ..StallWatch::default()
+        }
+    }
+
+    #[test]
+    fn stall_begins_at_exact_budget_boundary() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        let due = start + Duration::from_secs(2);
+        assert_eq!(
+            w.stall_transition(true, 2, due - Duration::from_nanos(1)),
+            StallTransition::Emit
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 0);
+        assert_eq!(
+            w.stall_transition(true, 2, due),
+            StallTransition::Stall(1, Duration::from_secs(2))
+        );
+        assert_eq!(w.stalled_at, Some(start));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.episodes, 1);
+    }
+
+    #[test]
+    fn zero_budget_does_not_start_an_episode() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 0, start + Duration::from_secs(100)),
+            StallTransition::Emit
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 0);
+    }
+
+    #[test]
+    fn no_running_turn_preserves_episode_state() {
+        let start = Instant::now();
+        for stalled_at in [None, Some(start)] {
+            let activity = start + Duration::from_secs(1);
+            let mut w = watch_at(activity);
+            w.stalled_at = stalled_at;
+            w.episodes = 4;
+            assert_eq!(
+                w.stall_transition(false, 1, start + Duration::from_secs(100)),
+                StallTransition::Emit
+            );
+            assert_eq!(w.stalled_at, stalled_at);
+            assert_eq!(w.activity, activity);
+            assert_eq!(w.episodes, 4);
+        }
+    }
+
+    #[test]
+    fn ongoing_stall_fires_once_without_newer_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 1, start + Duration::from_secs(1)),
+            StallTransition::Stall(1, Duration::from_secs(1))
+        );
+        for age in [10, 20] {
+            assert_eq!(
+                w.stall_transition(true, 1, start + Duration::from_secs(age)),
+                StallTransition::Emit
+            );
+            assert_eq!(w.stalled_at, Some(start));
+            assert_eq!(w.episodes, 1);
+        }
+    }
+
+    #[test]
+    fn resume_requires_strictly_newer_activity() {
+        let start = Instant::now();
+        let stalled_at = start + Duration::from_secs(2);
+        let mut w = watch_at(start + Duration::from_secs(1));
+        w.stalled_at = Some(stalled_at);
+        w.episodes = 7;
+        let now = start + Duration::from_secs(100);
+        for activity in [start + Duration::from_secs(1), stalled_at] {
+            w.activity = activity;
+            assert_eq!(w.stall_transition(true, 1, now), StallTransition::Emit);
+            assert_eq!(w.stalled_at, Some(stalled_at));
+            assert_eq!(w.episodes, 7);
+        }
+        w.activity = stalled_at + Duration::from_nanos(1);
+        assert_eq!(
+            w.stall_transition(true, 1, now),
+            StallTransition::Resume(stalled_at, 7)
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 7);
+    }
+
+    #[test]
+    fn resumed_turn_rearms_at_new_activity_budget() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 2, start + Duration::from_secs(2)),
+            StallTransition::Stall(1, Duration::from_secs(2))
+        );
+        let activity = start + Duration::from_secs(3);
+        w.activity = activity;
+        assert_eq!(
+            w.stall_transition(true, 2, activity),
+            StallTransition::Resume(start, 1)
+        );
+        let due = activity + Duration::from_secs(2);
+        assert_eq!(
+            w.stall_transition(true, 2, due - Duration::from_nanos(1)),
+            StallTransition::Emit
+        );
+        assert_eq!(
+            w.stall_transition(true, 2, due),
+            StallTransition::Stall(2, Duration::from_secs(2))
+        );
+        assert_eq!(w.stalled_at, Some(activity));
+        assert_eq!(w.episodes, 2);
+    }
+
+    #[test]
+    fn zero_budget_does_not_suppress_existing_episode_resume() {
+        let start = Instant::now();
+        let mut w = watch_at(start + Duration::from_secs(1));
+        w.stalled_at = Some(start);
+        w.episodes = 5;
+        let now = start + Duration::from_secs(100);
+        assert_eq!(
+            w.stall_transition(true, 0, now),
+            StallTransition::Resume(start, 5)
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 5);
+        assert_eq!(w.stall_transition(true, 0, now), StallTransition::Emit);
+        assert_eq!(w.episodes, 5);
+    }
+}
+
+#[cfg(test)]
+mod screen_activity_tests {
+    use super::*;
+
+    fn watch_at(activity: Instant, settled: Option<&str>, previous: Option<&str>) -> StallWatch {
+        StallWatch {
+            activity,
+            settled: settled.map(str::to_owned),
+            previous: previous.map(str::to_owned),
+            ..StallWatch::default()
+        }
+    }
+
+    #[test]
+    fn first_confirmed_screen_forms_baseline_without_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, None, None);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.settled, None);
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.changed, 1);
+        assert_eq!(w.activity, start);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.previous, None);
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        assert_eq!(w.activity, start);
+
+        // A first-ever scrolling screen also establishes only a baseline.
+        let mut scrolling = watch_at(start, None, None);
+        scrolling.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        scrolling.observe_screen("B".into(), false, start + Duration::from_secs(2));
+        assert_eq!(scrolling.settled.as_deref(), Some("B"));
+        assert_eq!(scrolling.activity, start);
+    }
+
+    #[test]
+    fn transient_reversion_discards_candidate_and_keeps_stall_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("A"), None);
+        w.stalled_at = Some(start);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.candidate.as_deref(), Some("B"));
+        assert_eq!(w.activity, start);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        assert_eq!(w.activity, start);
+        assert_eq!(w.stalled_at, Some(start));
+        // Reversion cleared the streak: another single novel frame is held.
+        w.observe_screen("C".into(), false, start + Duration::from_secs(3));
+        assert_eq!(w.candidate.as_deref(), Some("C"));
+        assert_eq!(w.changed, 1);
+        assert_eq!(w.activity, start);
+    }
+
+    #[test]
+    fn repeated_new_screen_confirms_at_supplied_instant() {
+        let start = Instant::now();
+        let confirmed = start + Duration::from_secs(2);
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.activity, start);
+        w.observe_screen("B".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn two_distinct_novel_screens_confirm_continuous_motion() {
+        let start = Instant::now();
+        let confirmed = start + Duration::from_secs(2);
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.activity, start);
+        w.observe_screen("C".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("C"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn previous_settled_hash_requires_repetition_instead_of_novelty() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("B"), Some("A"));
+        w.observe_screen("C".into(), false, start + Duration::from_secs(1));
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.changed, 2);
+        // Returning once is noise; persistent return is real activity.
+        let confirmed = start + Duration::from_secs(3);
+        w.observe_screen("A".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.previous.as_deref(), Some("B"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn menu_confirmation_updates_screen_history_without_turn_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), true, start + Duration::from_secs(1));
+        w.observe_screen("B".into(), true, start + Duration::from_secs(2));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        w.observe_screen("C".into(), false, start + Duration::from_secs(3));
+        let confirmed = start + Duration::from_secs(4);
+        w.observe_screen("C".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.previous.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn pending_history_reversion_saturates_sample_count() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("B"), Some("A"));
+        w.changed = u8::MAX;
+        w.candidate = Some("C".into());
+        w.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.changed, u8::MAX);
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.activity, start);
+        let confirmed = start + Duration::from_secs(2);
+        w.observe_screen("A".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.changed, 0);
+    }
+}

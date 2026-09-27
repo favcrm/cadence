@@ -16,7 +16,7 @@ import {
   type UploadItem,
 } from "./upload";
 import Button from "../../ui/Button";
-import { Crumbs, KindIcon, Note } from "./shared";
+import { KindIcon, Note, WikiToolbar } from "./shared";
 
 /**
  * The upload pane (CAD-581): a drag-and-drop overlay plus the multi-file
@@ -80,15 +80,9 @@ export default function UploadPane({
 
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs
-          path={dir}
-          hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
-        />
-        <div className="wk-tools">
+      <WikiToolbar path={dir} navHref={navHref} label="Upload" actions={<>
           <Button href={browseHref}>Done</Button>
-        </div>
-      </div>
+      </>} />
 
       {readOnly ? (
         <Note warn>writes are disabled on this board — sign in as the operator to upload.</Note>

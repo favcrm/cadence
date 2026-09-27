@@ -130,6 +130,13 @@ impl Op {
 pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
+    // CAD-615: the operator's permission rules. Not a knowledge page,
+    // not a profile write, not something the master can put.
+    if op == Op::Write && segs == ["agents", "master", "permissions.yaml"] {
+        return no(
+            "agents/master/permissions.yaml is operator-owned — only a permission decision writes it",
+        );
+    }
     let top = segs.first().copied().unwrap_or("");
     match top {
         "" => match op {
@@ -585,7 +592,9 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
 
     match classify(&segs) {
         View::Profile { alias } => {
-            // `agents/<a>/profile` → the live agent dir's files.
+            // `agents/<a>/profile` → the live agent dir's files, including
+            // permissions.yaml once the operator has saved a rule (CAD-615).
+            // The view is read-only; writes go through a permission decision.
             let dir = pm.dir.join("agents").join(&alias);
             if segs.len() == 3 {
                 let mut out = Vec::new();
@@ -1691,6 +1700,10 @@ mod tests {
         let public = Caller::Public;
         let user = Caller::User("fable".to_string());
         let user2 = Caller::User("other".to_string());
+        let master = Caller::Agent {
+            alias: "master".to_string(),
+            project: None,
+        };
         // (caller, op, path, allow?)
         let table: &[(&Caller, Op, &str, bool)] = &[
             // The root: listable, never writable.
@@ -1720,8 +1733,22 @@ mod tests {
             // the wiki — profile writes go through agent_file_write.
             (&public, Op::Read, "agents/swe-1/profile/SOUL.md", true),
             (&agent(), Op::Read, "agents/other/profile/AGENT.md", true),
+            (
+                &public,
+                Op::Read,
+                "agents/master/profile/permissions.yaml",
+                true,
+            ),
             (&op, Op::Write, "agents/swe-1/profile/SOUL.md", false),
             (&agent(), Op::Write, "agents/swe-1/profile/SOUL.md", false),
+            (
+                &op,
+                Op::Write,
+                "agents/master/profile/permissions.yaml",
+                false,
+            ),
+            (&op, Op::Write, "agents/master/permissions.yaml", false),
+            (&agent(), Op::Write, "agents/master/permissions.yaml", false),
             // agents/<a>/memory/: read-only view for everyone.
             (&public, Op::Read, "agents/swe-1/memory/cadence/x.md", true),
             (&op, Op::Write, "agents/swe-1/memory/cadence/x.md", false),
@@ -1736,6 +1763,13 @@ mod tests {
             (&agent(), Op::Read, "agents/other/knowledge/n.md", true),
             (&agent(), Op::Write, "agents/swe-1/knowledge/n.md", true),
             (&agent(), Op::Write, "agents/swe-2/knowledge/n.md", false),
+            // CAD-614: the master is an agent whose alias is `master`.
+            // It reads global/ and writes only agents/master/knowledge/.
+            (&master, Op::Read, "global/x.md", true),
+            (&master, Op::Write, "global/x.md", false),
+            (&master, Op::Write, "agents/master/knowledge/n.md", true),
+            (&master, Op::Write, "agents/swe-1/knowledge/n.md", false),
+            (&master, Op::Read, "agents/swe-1/knowledge/n.md", true),
             (&user, Op::Write, "agents/swe-1/knowledge/n.md", false),
             (&op, Op::Write, "agents/swe-1/knowledge/n.md", true),
             // unknown agents/<a>/ subdirs refuse outright.

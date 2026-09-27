@@ -4,6 +4,8 @@ import { api, type WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
 import { epicProgress, matches, type BoardFilters } from "../../lib/filters";
 import type { ResourceState } from "../../lib/cache";
+import { issuePath } from "../issues/model";
+import Link from "../../ui/Link";
 import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../../lib/scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../../lib/types";
 import type { ProjectView } from "../../lib/urlState";
@@ -78,20 +80,20 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
     <section className="card overflow-hidden reveal" aria-label="Project issue list">
       <div className="sm:hidden divide-y divide-ink-700/70">
         {rows.map((issue) => (
-          <button key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850" onClick={() => onOpen(issue.id)}>
+          <div key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850">
             <div className="flex items-center gap-2">
-              <span className="lnk num text-label">{issue.id}</span>
+              <Link href={issuePath(issue.project, issue.id)} className="lnk num text-label">{issue.id}</Link>
               <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
               <span className="num text-micro text-ink-500 ml-auto">{issue.priority}</span>
             </div>
-            <div className="text-ink-200 mt-1.5 leading-[1.4]">{issue.title}</div>
+            <button type="button" className="block text-left text-ink-200 mt-1.5 leading-[1.4]" onClick={() => onOpen(issue.id)}>{issue.title}</button>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
               <span>{issue.owner ?? "unassigned"}</span>
               <span>{issue.component ?? "no component"}</span>
               <span>{issue.checks.done}/{issue.checks.total} checks</span>
               {project === "all" && <span>{issue.project}</span>}
             </div>
-          </button>
+          </div>
         ))}
         {rows.length === 0 && <div className="px-4 py-10 text-center text-ink-500">No issues match this view.</div>}
       </div>
@@ -112,10 +114,10 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
             {rows.map((issue) => (
               <tr key={issue.id} className="hover:bg-ink-850 transition-colors">
                 <td className="px-4 py-3 min-w-0 max-w-[28rem]">
-                  <button className="text-left min-w-0" onClick={() => onOpen(issue.id)}>
-                    <span className="lnk num">{issue.id}</span>
-                    <span className="block text-ink-200 truncate mt-0.5" title={issue.title}>{issue.title}</span>
-                  </button>
+                  <div className="min-w-0">
+                    <Link href={issuePath(issue.project, issue.id)} className="lnk num">{issue.id}</Link>
+                    <button className="block text-left text-ink-200 truncate mt-0.5 max-w-full" title={issue.title} onClick={() => onOpen(issue.id)}>{issue.title}</button>
+                  </div>
                 </td>
                 {project === "all" && <td className="px-3 py-3 align-top num text-ink-400">{issue.project}</td>}
                 <td className="px-3 py-3 align-top">
@@ -410,7 +412,7 @@ export default function Board({
               <span className="kicker num">
                 {doneHidden > 0 ? doneHidden : cards.length}
                 {/* The WIP limit is board-wide — a lane shows its count only. */}
-                  {wip && lane === "" ? ` of ${wip} wip` : ""}
+                  {wip && lane === "" ? ` · limit ${wip}` : ""}
               </span>
             </header>
             <div className="p-2.5 space-y-2.5 flex-1">
@@ -460,7 +462,7 @@ export default function Board({
   const loose = visible.filter((t) => !t.parent);
 
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
+    <main className="px-4 lg:px-8 pt-6 pb-9 w-full">
       {health && !health.pm_present && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
           <span className="chip bg-warn/10 text-warn">no pm dir</span>
@@ -472,7 +474,7 @@ export default function Board({
       )}
 
       {fencedAgents.length > 0 && (
-        <div className="card mb-4 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-fail/40 reveal">
+        <details className="card mb-4 px-4 py-3 border-warn/30 reveal"><summary className="text-label text-warn cursor-pointer">{fencedAgents.length} agents need attention · View details</summary><div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
           <span className="chip bg-fail/10 text-fail">
             {fencedAgents.length} fenced
           </span>
@@ -487,7 +489,7 @@ export default function Board({
           >
             open Agents →
           </button>
-        </div>
+        </div></details>
       )}
 
       <div
@@ -519,11 +521,12 @@ export default function Board({
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           className="field w-full sm:w-64"
+          aria-label="Search issues, owners or tags"
           placeholder="Search issues, owners or tags"
         />
       </div>
 
-      <section
+      <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section
         className="card mb-4 px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 reveal"
         style={{ animationDelay: "80ms" }}
         aria-label="Runtime"
@@ -646,6 +649,7 @@ export default function Board({
           </div>
         </div>
       </section>
+</div></details>
 
       <ResourceGate
         state={issuesState}

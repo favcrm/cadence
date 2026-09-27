@@ -1,11 +1,14 @@
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
+import type { WikiScope } from "./scope";
+import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
 import type { WikiKind } from "./api";
 
-/** The wiki root's label — the tracker path the store lives in (CAD-580). */
-export const WIKI_ROOT_LABEL = "~/pm/wiki";
+export const WIKI_ROOT_LABEL = "Wiki";
+export const WikiScopeContext = createContext<WikiScope | undefined>(undefined);
+export const useWikiScope = () => useContext(WikiScopeContext);
 
 export function KindIcon({ kind, size = 14 }: { kind: WikiKind; size?: number }) {
   return kind === "dir" ? <IconFolder size={size} /> : <IconWiki size={size} />;
@@ -21,10 +24,12 @@ export function LockIcon({ size = 11 }: { size?: number }) {
 
 /** Breadcrumbs for a path; every ancestor is a link, the leaf is bold. */
 export function Crumbs({ path, hrefFor }: { path: string; hrefFor: (path: string) => string }) {
-  const trail = breadcrumbs(path);
+  const scope = useWikiScope();
+  const root = scope?.root ?? "";
+  const trail = breadcrumbs(path).filter((crumb) => crumb.path !== root && (!root || crumb.path.startsWith(`${root}/`)));
   return (
     <div className="wk-crumbs">
-      <Link href={hrefFor("")}>{WIKI_ROOT_LABEL}</Link>
+      <Link href={hrefFor(root)}>{scope?.label ?? WIKI_ROOT_LABEL}</Link>
       {trail.map((crumb, i) => (
         <span key={crumb.path} className="wk-crumb">
           <span className="wk-sep">/</span>
@@ -35,6 +40,24 @@ export function Crumbs({ path, hrefFor }: { path: string; hrefFor: (path: string
           )}
         </span>
       ))}
+    </div>
+  );
+}
+
+/** One breadcrumb/action layout for every Wiki and Context mode. */
+export function WikiToolbar({ path, navHref, label, children, actions }: {
+  path: string;
+  navHref: (route: Route) => string;
+  label?: string;
+  children?: ReactNode;
+  actions?: ReactNode;
+}) {
+  return (
+    <div className="wk-bar">
+      <Crumbs path={path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
+      {label && <span className="wk-editing">{label}</span>}
+      {children}
+      {actions && <div className="wk-tools">{actions}</div>}
     </div>
   );
 }

@@ -58,9 +58,17 @@ pub enum IssueAction {
         #[arg(long)]
         component: Option<String>,
         /// Mint this exact id — for seeds/imports; must match the
-        /// project prefix and not exist.
+        /// project prefix and not exist. The master may not set it.
         #[arg(long)]
         id: Option<String>,
+        /// Issue body. The Pi master writes this under its tmp dir
+        /// first, then passes the path — stdin (`-`) is refused.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Status to create in. Only `backlog` is accepted; omit it
+        /// for the same result. The master cannot create any other.
+        #[arg(long)]
+        status: Option<String>,
     },
     /// List issues — a compact table on a TTY, `--json` for agents.
     /// Value flags repeat and comma-join and match ANY of their values;
@@ -720,9 +728,37 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             owner,
             component,
             id,
+            file,
+            status,
         } => {
+            let caller_is_master = crate::master::caller_is_master();
+            write::master_issue_new_limits(
+                caller_is_master,
+                owner.as_deref(),
+                id.as_deref(),
+                status.as_deref(),
+            )?;
+            let body = match file {
+                Some(ref f) if f.as_os_str() == "-" => {
+                    return Err(Error::rejected(crate::master::NO_STDIN));
+                }
+                Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
+                    |e| {
+                        Error::rejected(format!(
+                            "issue new --file {}: {e} — write it with the write tool into master/tmp, then --file",
+                            f.display()
+                        ))
+                    },
+                )?),
+                None => None,
+            };
             let pm = open_pm()?;
             let cwd = std::env::current_dir()?;
+            let actor = if caller_is_master {
+                crate::master::ALIAS
+            } else {
+                ""
+            };
             let out = write::new_issue(
                 &pm,
                 &cwd,
@@ -735,7 +771,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 component.as_deref(),
                 tags,
                 id.as_deref(),
-                "",
+                body.as_deref(),
+                actor,
             )?;
             print_json(&out);
             Ok(0)
@@ -1822,6 +1859,9 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
                 ("project", "project"),
                 ("title", "title"),
                 ("configured", "configured"),
+                ("status", "status"),
+                ("owner", "owner"),
+                ("target_date", "target_date"),
                 ("progress", "progress.ratio"),
                 ("health", "health.state"),
             ];
@@ -1844,6 +1884,21 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
                 print_milestones_table(std::slice::from_ref(&row));
                 if let Some(exit) = row["exit"].as_str() {
                     println!("exit: {exit}");
+                }
+                for field in [
+                    "description",
+                    "start_date",
+                    "completed_date",
+                    "config_error",
+                ] {
+                    if let Some(value) = row[field].as_str() {
+                        println!("{field}: {value}");
+                    }
+                }
+                for field in ["depends_on", "evidence"] {
+                    for value in row[field].as_array().into_iter().flatten() {
+                        println!("{field}: {}", value.as_str().unwrap_or(""));
+                    }
                 }
                 for r in row["health"]["reasons"].as_array().into_iter().flatten() {
                     println!(
@@ -1901,6 +1956,9 @@ fn print_milestones_table(rows: &[Value]) {
     let mut table = vec![[
         "PROJECT",
         "MILESTONE",
+        "STATUS",
+        "OWNER",
+        "TARGET",
         "PROGRESS",
         "EPICS",
         "ISSUES",
@@ -1914,6 +1972,9 @@ fn print_milestones_table(rows: &[Value]) {
         table.push(vec![
             r["project"].as_str().unwrap_or_default().to_string(),
             r["id"].as_str().unwrap_or_default().to_string(),
+            r["status"].as_str().unwrap_or("undefined").to_string(),
+            r["owner"].as_str().unwrap_or("-").to_string(),
+            r["target_date"].as_str().unwrap_or("-").to_string(),
             format!(
                 "{}/{} {:.0}%",
                 p["done_weight"].as_u64().unwrap_or(0),

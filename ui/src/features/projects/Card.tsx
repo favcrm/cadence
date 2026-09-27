@@ -1,5 +1,7 @@
 import { useWriteBlock } from "../auth/WriteGate";
+import { issuePath } from "../issues/model";
 import type { IssueCard } from "../../lib/types";
+import Link from "../../ui/Link";
 
 const PRIORITY_CHIP: Record<string, string> = {
   P0: "bg-warn/10 text-warn",
@@ -45,7 +47,6 @@ export default function Card({
   const block = useWriteBlock(!canDrag);
   const noDrag = noDragReason(t) ?? block;
   const pr = prLabel(t);
-  const artifacts = t.counts.artifacts + t.counts.refs;
   const meta: React.ReactNode[] = [];
   if (t.owner) {
     meta.push(
@@ -60,20 +61,6 @@ export default function Card({
     meta.push(
       <span key="ck" title="checklist">
         {t.checks.done}/{t.checks.total} done
-      </span>,
-    );
-  }
-  if (t.counts.comments > 0) {
-    meta.push(
-      <span key="cm" title="comments">
-        {t.counts.comments} cmt
-      </span>,
-    );
-  }
-  if (artifacts > 0) {
-    meta.push(
-      <span key="ar" title="artifacts">
-        {artifacts} art
       </span>,
     );
   }
@@ -104,7 +91,13 @@ export default function Card({
       }`}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className="num text-label text-ink-100 font-medium">{t.id}</span>
+        <Link
+          href={issuePath(t.project, t.id)}
+          className="num text-label text-ink-100 font-medium"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {t.id}
+        </Link>
         <span className={`chip ${PRIORITY_CHIP[t.priority] ?? PRIORITY_CHIP.P2}`}>
           {t.priority}
         </span>
@@ -169,9 +162,8 @@ export default function Card({
         </div>
       )}
       {t.parent && (
-        <div className="mt-1.5 num text-micro text-ink-500">
+        <div className="mt-1.5 num text-micro text-ink-500" title={parentTitle}>
           in {t.parent}
-          {parentTitle ? ` · ${parentTitle}` : ""}
         </div>
       )}
       {meta.length > 0 && (

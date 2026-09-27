@@ -3938,6 +3938,7 @@ fn project_new_registers_seeds_and_is_operator_only() {
         None,
         &[],
         None,
+        None,
         "",
     )
     .unwrap();
@@ -4208,7 +4209,7 @@ fn project_new_by_the_master() {
     let state_s = in_state.to_str().unwrap().to_string();
     for (repo, why) in [
         (pm_s.as_str(), "is the tracker"),
-        (state_s.as_str(), "is the daemon state dir"),
+        (state_s.as_str(), "daemon state dir"),
     ] {
         let (ok, err) = f.as_master(&mut m, &format!("project new other --repo {repo}"));
         assert!(!ok && err.to_string().contains(why), "{repo}: {err}");

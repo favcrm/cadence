@@ -479,6 +479,8 @@ tests = [
     "pty_hot_restart_adopts_multiple_running_turns",
     "pty_nudge_queued_at_restart_is_cancelled_not_replayed",
     "pty_hot_restart_retires_stale_awaiting_report_rows",
+    "pty_shutdown_snapshot_setup_panic_releases_daemon",
+    "pty_shutdown_snapshot_setup_panic_child",
     "pty_shutdown_facts_before_detach_rpc",
     "pty_shutdown_facts_before_detach_signal",
     "pty_shutdown_facts_before_detach_signal_child",
@@ -1185,6 +1187,7 @@ tests = [
     "users_area_is_member_private",
     "public_caller_reads_shared_areas_only",
     "agent_writes_own_areas_only",
+    "master_wiki_put_global_is_refused_and_own_knowledge_is_not",
     "agent_traversal_after_a_valid_root_is_refused",
     "agent_forged_identity_fields_are_refused",
     "unproven_callers_are_refused",
@@ -1210,4 +1213,15 @@ helpers = [
     "put_as",
     "upload_as",
     "op_get",
+]
+
+[binaries.master_permission]
+tests = [
+    "role_gates_refuse_the_wrong_caller",
+    "master_allow_once_is_exact_and_single_use",
+    "concurrent_permission_use_succeeds_once",
+    "http_permission_routes_are_operator_only",
+]
+helpers = [
+    "refused",
 ]

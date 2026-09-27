@@ -73,6 +73,11 @@ export const resources = {
   masterState: cache.resource<MasterState>("masterState", () => api.masterState()),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id)),
+  /**
+   * `GET /api/issues/<id>/lane` — live lane state. Not in `issue.md`, so
+   * the focus poll and an agents stream frame invalidate it with the issue.
+   */
+  lane: cache.family("lane", (id: string) => api.lane(id)),
   /** `GET /api/milestones?project=` — one project's milestone roll-ups (CAD-432). */
   milestones: cache.family<string, MilestoneRow[]>(
     "milestones",

@@ -5,10 +5,11 @@ import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList } from "../../ui/icons";
 import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
+import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
 import Button from "../../ui/Button";
-import { KindIcon, Loading } from "./shared";
+import { KindIcon, Loading, useWikiScope } from "./shared";
 
 /**
  * The folder view (CAD-581): grid or list, image thumbnails, a per-item
@@ -16,7 +17,6 @@ import { KindIcon, Loading } from "./shared";
  */
 
 export default function FolderPane({
-  dir,
   entries,
   navHref,
   readOnly,
@@ -24,7 +24,6 @@ export default function FolderPane({
   onToast,
   onFail,
 }: {
-  dir: string;
   entries: WikiEntry[];
   navHref: (route: Route) => string;
   readOnly: boolean;
@@ -32,6 +31,7 @@ export default function FolderPane({
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onFail: (error: unknown, verb: string) => void;
 }) {
+  const scope = useWikiScope();
   const [view, setView] = useState<"grid" | "list">("grid");
   const [menu, setMenu] = useState<string | null>(null);
   const [dialog, setDialog] = useState<{ kind: "rename" | "move"; entry: WikiEntry; value: string } | null>(null);
@@ -49,6 +49,7 @@ export default function FolderPane({
     setBusy(true);
     try {
       const to = dialog.kind === "rename" ? joinPath(parentPath(dialog.entry.path), value) : value;
+      if (scope && !withinScope(to, scope.root)) throw new Error("Choose a destination inside this project’s context");
       await wiki.mv(dialog.entry.path, to);
       onToast("ok", `${dialog.kind === "rename" ? "renamed" : "moved"} ${baseName(dialog.entry.path)}`);
       setDialog(null);
@@ -75,11 +76,26 @@ export default function FolderPane({
     }
   };
 
+  const downloadPage = async (entry: WikiEntry) => {
+    try {
+      const page = await wiki.file(entry.path);
+      const url = URL.createObjectURL(new Blob([page.text ?? ""], { type: "text/markdown;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = entry.name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setMenu(null);
+    } catch (error) { onFail(error, "Download page"); }
+  };
+
   if (rows.length === 0) {
     return (
       <div className="wk-empty card">
         <IconFolder size={34} />
-        <div className="wk-etitle">{dir ? `${dir}/ is empty` : `${"~/pm/wiki"} is empty`}</div>
+        <div className="wk-etitle">This folder is empty</div>
         <div className="wk-ebody">
           {readOnly ? "nothing here yet — and writes are disabled for this board." : "start with New page, or drop files to upload."}
         </div>
@@ -111,9 +127,9 @@ export default function FolderPane({
                 </button>
               </>
             )}
-            <a href={wikiRawUrl(entry.path)} download onClick={() => setMenu(null)}>
+            {entry.kind === "page" ? <button type="button" onClick={() => void downloadPage(entry)}>Download</button> : entry.kind === "file" && <a href={wikiRawUrl(entry.path)} download onClick={() => setMenu(null)}>
               Download
-            </a>
+            </a>}
             <button
               type="button"
               className="danger"

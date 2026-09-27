@@ -80,13 +80,44 @@ export default function ProjectContext({
     <section className="space-y-5" aria-live="polite">
       <div className="flex flex-wrap items-baseline gap-3">
         <div>
-          <div className="slabel">selected project context · role hint: pm</div>
+          <div className="slabel">Project context</div>
           <h2 className="text-section font-semibold text-ink-100 mt-2">Start here</h2>
+          <p className="text-label text-ink-500 mt-2">Project goals, architecture, and guidance in their reviewed reading order.</p>
         </div>
-        <span className="kicker">read only · fixed tracked manifest</span>
+        <span className="kicker">Read-only documents</span>
       </div>
 
       <div className="card p-5">
+        <div className="flex items-baseline justify-between gap-3">
+          <div>
+            <div className="slabel">document references</div>
+            <h3 className="text-ink-100 font-medium mt-1">Reviewed reading order</h3>
+          </div>
+          <span className="num text-label text-ink-500">{context.documents.length} entries</span>
+        </div>
+        <div className="divide-y divide-ink-700/80 mt-3">
+          {context.documents.map((document) => (
+            <div key={document.id} className="py-3 first:pt-0 last:pb-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="num text-ink-100">{document.id}</span>
+                <StateChip label="state" state={document.state} />
+                {document.required && <span className="kicker">required</span>}
+              </div>
+              <div className="text-label text-ink-400 mt-1">{document.title} · <span className="num">{document.path}</span></div>
+              <div className="text-label text-ink-500 mt-1">{document.selection_reason}</div>
+              {document.reason && <div className="text-label text-fail mt-1">{document.reason}</div>}
+              {document.excerpt && (
+                <details className="mt-2">
+                  <summary className="text-label text-accent cursor-pointer">Read excerpt{document.truncated ? " · truncated" : ""}</summary>
+                  <pre className="num text-label text-ink-300 leading-relaxed whitespace-pre-wrap mt-2 max-h-64 overflow-auto">{document.excerpt}</pre>
+                </details>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <details className="card p-5"><summary className="cursor-pointer text-secondary text-ink-300">Source and retrieval details · {context.state}</summary><div className="mt-4 space-y-4">      <div className="card p-5">
         <div className="flex flex-wrap items-center gap-2">
           <StateChip label="bundle" state={context.state} />
           <StateChip label="revision" state={snapshot.revision_state} />
@@ -132,37 +163,8 @@ export default function ProjectContext({
         )}
       </div>
 
-      <div className="card p-5">
-        <div className="flex items-baseline justify-between gap-3">
-          <div>
-            <div className="slabel">document references</div>
-            <h3 className="text-ink-100 font-medium mt-1">Reviewed reading order</h3>
-          </div>
-          <span className="num text-label text-ink-500">{context.documents.length} entries</span>
-        </div>
-        <div className="divide-y divide-ink-700/80 mt-3">
-          {context.documents.map((document) => (
-            <div key={document.id} className="py-3 first:pt-0 last:pb-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="num text-ink-100">{document.id}</span>
-                <StateChip label="state" state={document.state} />
-                {document.required && <span className="kicker">required</span>}
-              </div>
-              <div className="text-label text-ink-400 mt-1">{document.title} · <span className="num">{document.path}</span></div>
-              <div className="text-label text-ink-500 mt-1">{document.selection_reason}</div>
-              {document.reason && <div className="text-label text-fail mt-1">{document.reason}</div>}
-              {document.excerpt && (
-                <details className="mt-2">
-                  <summary className="text-label text-accent cursor-pointer">show bounded excerpt{document.truncated ? " · truncated" : ""}</summary>
-                  <pre className="num text-label text-ink-300 leading-relaxed whitespace-pre-wrap mt-2 max-h-64 overflow-auto">{document.excerpt}</pre>
-                </details>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="card p-5">
+</div></details>
+      <details className="card p-5"><summary className="text-secondary text-ink-300 cursor-pointer">Verified lessons · {context.memories.matched_total} matches</summary><div className="mt-4">
         <div className="flex items-baseline justify-between gap-3">
           <div>
             <div className="slabel">verified memory context</div>
@@ -199,7 +201,7 @@ export default function ProjectContext({
             )}
           </div>
         )}
-      </div>
+      </div></details>
 
       {context.limits.response_truncated && (
         <p className="text-label text-warn">Response excerpts were shortened to remain within the serialized response bound.</p>
