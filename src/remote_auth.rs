@@ -148,23 +148,25 @@ fn parse_session(value: Value, org: &str) -> Result<Value> {
         || data["subject"]["id"]
             .as_str()
             .is_none_or(|id| validate_org(id).is_err())
-        || data["scopes"]
-            .as_array()
-            .is_none_or(|scopes| !scopes.iter().any(|s| s == "read"))
+        || data["scopes"].as_array().is_none_or(|scopes| {
+            scopes.is_empty()
+                || scopes.len() > 3
+                || !scopes.iter().any(|s| s == "read")
+                || scopes
+                    .iter()
+                    .any(|scope| !matches!(scope.as_str(), Some("read" | "draft" | "send")))
+                || scopes
+                    .iter()
+                    .enumerate()
+                    .any(|(i, scope)| scopes[..i].contains(scope))
+        })
     {
         return Err(rejected(
             "Issuer did not verify a named read principal for the requested organization",
         ));
     }
     // Output only stable IDs/scopes. Never echo arbitrary issuer labels or names.
-    let scopes: Vec<&str> = data["scopes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|scope| matches!(*scope, "read" | "draft" | "send"))
-        .collect();
-    Ok(json!({"org":org,"subject_id":data["subject"]["id"],"scopes":scopes}))
+    Ok(json!({"org":org,"subject_id":data["subject"]["id"],"scopes":data["scopes"]}))
 }
 
 fn verify(issuer: &str, org: &str, token: &str) -> Result<Value> {
@@ -447,7 +449,7 @@ pub fn login(issuer: &str, org: &str, dir: &Path, token_stdin: bool, no_open: bo
     Ok(0)
 }
 
-pub fn status(dir: &Path, issuer: Option<&str>, org: Option<&str>) -> Result<i32> {
+pub fn status(dir: Option<&Path>, issuer: Option<&str>, org: Option<&str>) -> Result<i32> {
     let (credential, source) = if let Some(token) = std::env::var_os("CADENCE_TOKEN") {
         let token = token
             .into_string()
@@ -460,7 +462,7 @@ pub fn status(dir: &Path, issuer: Option<&str>, org: Option<&str>) -> Result<i32
             .or_else(|| std::env::var("CADENCE_ORG").ok());
         (environment_credential(token, issuer, org)?, "environment")
     } else {
-        let credential = load(dir)?;
+        let credential = load(&auth_dir(dir)?)?;
         if issuer.is_some_and(|i| issuer_origin(i).ok().as_deref() != Some(&credential.issuer))
             || org.is_some_and(|o| o != credential.org)
         {
@@ -586,6 +588,22 @@ mod tests {
         }
         assert!(validate_token(&"a".repeat(4097)).is_err());
         assert!(validate_token("agc_synthetic-token").is_ok());
+    }
+
+    #[test]
+    fn malformed_unknown_duplicate_or_excessive_scopes_fail_closed() {
+        for scopes in [
+            json!(["read", "operator"]),
+            json!(["read", true]),
+            json!(["read", null]),
+            json!(["read", "read"]),
+            json!(["read", "draft", "send", "extra"]),
+            json!([]),
+            json!("read"),
+        ] {
+            let session = json!({"ok":true,"data":{"workspace":{"id":"ws_fixture"},"subject":{"id":"user_fixture","anonymous":false},"scopes":scopes}});
+            assert!(parse_session(session, "ws_fixture").is_err());
+        }
     }
 
     #[test]

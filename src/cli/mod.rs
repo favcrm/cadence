@@ -3159,10 +3159,11 @@ pub(crate) fn run() -> Result<i32> {
                     issuer,
                     org,
                     auth_dir,
-                } => {
-                    let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-                    cadence_agent::remote_auth::status(&dir, issuer.as_deref(), org.as_deref())
-                }
+                } => cadence_agent::remote_auth::status(
+                    auth_dir.as_deref(),
+                    issuer.as_deref(),
+                    org.as_deref(),
+                ),
                 AuthAction::Logout { auth_dir } => {
                     let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
                     cadence_agent::remote_auth::logout(&dir)
