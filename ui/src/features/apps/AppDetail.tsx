@@ -504,13 +504,18 @@ function TeamEditor({
     setBusy(true);
     setNote(null);
     setFailed(false);
-    const team = roles.map((r) => `${r}=${valueOf(r)}`);
+    const assignments = Object.fromEntries(roles.map((r) => [r, valueOf(r)]));
+    const team = roles.map((r) => `${r}=${assignments[r]}`);
     api
       .appSetTeam(app.project, app.name, team)
-      .then(async () => {
-        await resources.app(`${app.project}/${app.name}`).invalidate();
+      .then(() => {
+        const resource = resources.app(`${app.project}/${app.name}`);
+        // The POST confirmed these assignments. Keep them visible even
+        // if the refresh fails, and invalidate any older in-flight read.
+        resource.mutate(current => ({ ...current, team: assignments }));
         setDraft({});
         setNote("Team saved.");
+        void resource.invalidate();
       })
       .catch((e: ApiError) => { setFailed(true); setNote(e.message ?? String(e)); })
       .finally(() => setBusy(false));

@@ -82,6 +82,7 @@ const app: import("../src/lib/types").AppDetail = {
 };
 const writes: { path: string; body: unknown }[] = [];
 let failSave = false;
+let failRefresh = false;
 let finishSave: (() => void) | null = null;
 let holdSave = false;
 const json = (body: unknown, status = 200) =>
@@ -115,7 +116,10 @@ globalThis.fetch = async (input, init) => {
       })),
       by_issue: {},
     });
-  if (url.pathname === "/api/apps/site/blog-post") return json(app);
+  if (url.pathname === "/api/apps/site/blog-post")
+    return failRefresh
+      ? json({ error: "Refresh unavailable" }, 503)
+      : json(app);
   if (url.pathname === "/api/apps")
     return json({
       apps: [app, { ...app, project: "campaign" }].map((a) => ({
@@ -229,18 +233,20 @@ async function main() {
     "save sends the intended team",
   );
   assert(finishSave, "save reached the pending request");
+  failRefresh = true;
   await React.act(async () => finishSave!());
   await flush();
   holdSave = false;
   assert(
     button("Save team").disabled &&
       host.querySelector<HTMLSelectElement>("#team-writer")?.value === "w2",
-    "successful refresh retains the saved team and clears dirty state",
+    "confirmed save retains the new team even if the refresh fails",
   );
   assert(
     host.querySelector("[role='status']")?.textContent === "Team saved.",
     "save success is announced",
   );
+  failRefresh = false;
   failSave = true;
   await change("reviewer", "r2");
   await React.act(() => button("Save team").click());
