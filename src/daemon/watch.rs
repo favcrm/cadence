@@ -193,6 +193,43 @@ impl Default for StallWatch {
     }
 }
 
+impl StallWatch {
+    /// Fold a landed screen for a running turn. Sampling, probe bookkeeping
+    /// and episode effects remain with the caller; only confirmed non-menu
+    /// changes after the first baseline advance activity to `now`.
+    fn observe_screen(&mut self, hash: String, approval_menu: bool, now: Instant) {
+        if self.settled.as_deref() == Some(hash.as_str()) {
+            // Still the settled screen — a candidate reverted
+            // without ever confirming; drop it.
+            self.candidate = None;
+            self.changed = 0;
+        } else {
+            self.changed = self.changed.saturating_add(1);
+            let confirmed = self.candidate.as_deref() == Some(hash.as_str())
+                || (self.changed >= 2 && self.previous.as_deref() != Some(hash.as_str()));
+            if confirmed {
+                // Second consecutive sighting, or a novel hash
+                // after the screen stayed changed for two
+                // samples — the change is real. A first-ever
+                // settle only forms the baseline. A menu frame
+                // never counts as turn activity: the wait is a
+                // human's, and the silence clock must see it.
+                if self.settled.is_some() && !approval_menu {
+                    self.activity = now;
+                }
+                self.previous = self.settled.take();
+                self.settled = Some(hash);
+                self.candidate = None;
+                self.changed = 0;
+            } else {
+                // First sighting of a different screen — hold
+                // as a candidate; a lone sample proves nothing.
+                self.candidate = Some(hash);
+            }
+        }
+    }
+}
+
 /// What `stall_view` hands a view: the silence age, the open stall
 /// episode, and the sampled pane verdict (menu line, idle-streak age,
 /// once-fired silent-end flag).
@@ -620,38 +657,10 @@ impl Shared {
                         }
                     }
                 }
-                if running.is_none() {
-                    // Queued-head tracking is menu detection only —
-                    // the screen-hash churn below measures a turn's
-                    // activity and means nothing before it starts.
-                } else if w.settled.as_deref() == Some(hash.as_str()) {
-                    // Still the settled screen — a candidate reverted
-                    // without ever confirming; drop it.
-                    w.candidate = None;
-                    w.changed = 0;
-                } else {
-                    w.changed = w.changed.saturating_add(1);
-                    let confirmed = w.candidate.as_deref() == Some(hash.as_str())
-                        || (w.changed >= 2 && w.previous.as_deref() != Some(hash.as_str()));
-                    if confirmed {
-                        // Second consecutive sighting, or a novel hash
-                        // after the screen stayed changed for two
-                        // samples — the change is real. A first-ever
-                        // settle only forms the baseline. A menu frame
-                        // never counts as turn activity: the wait is a
-                        // human's, and the silence clock must see it.
-                        if w.settled.is_some() && !probe.approval_menu {
-                            w.activity = Instant::now();
-                        }
-                        w.previous = w.settled.take();
-                        w.settled = Some(hash);
-                        w.candidate = None;
-                        w.changed = 0;
-                    } else {
-                        // First sighting of a different screen — hold
-                        // as a candidate; a lone sample proves nothing.
-                        w.candidate = Some(hash);
-                    }
+                // Queued-head tracking is menu detection only — screen
+                // churn measures a turn's activity after it starts.
+                if running.is_some() {
+                    w.observe_screen(hash, probe.approval_menu, Instant::now());
                 }
                 w.last_probe = Some(probe);
                 w.sample_at = Some(Instant::now());
@@ -1357,3 +1366,148 @@ pub(super) const PANE_TREE_KINDS: &[&str] = &[
     "pane_tree_reaped",
     "pane_tree_reap_refused",
 ];
+
+#[cfg(test)]
+mod screen_activity_tests {
+    use super::*;
+
+    fn watch_at(activity: Instant, settled: Option<&str>, previous: Option<&str>) -> StallWatch {
+        StallWatch {
+            activity,
+            settled: settled.map(str::to_owned),
+            previous: previous.map(str::to_owned),
+            ..StallWatch::default()
+        }
+    }
+
+    #[test]
+    fn first_confirmed_screen_forms_baseline_without_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, None, None);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.settled, None);
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.changed, 1);
+        assert_eq!(w.activity, start);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.previous, None);
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        assert_eq!(w.activity, start);
+
+        // A first-ever scrolling screen also establishes only a baseline.
+        let mut scrolling = watch_at(start, None, None);
+        scrolling.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        scrolling.observe_screen("B".into(), false, start + Duration::from_secs(2));
+        assert_eq!(scrolling.settled.as_deref(), Some("B"));
+        assert_eq!(scrolling.activity, start);
+    }
+
+    #[test]
+    fn transient_reversion_discards_candidate_and_keeps_stall_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("A"), None);
+        w.stalled_at = Some(start);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.candidate.as_deref(), Some("B"));
+        assert_eq!(w.activity, start);
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        assert_eq!(w.activity, start);
+        assert_eq!(w.stalled_at, Some(start));
+        // Reversion cleared the streak: another single novel frame is held.
+        w.observe_screen("C".into(), false, start + Duration::from_secs(3));
+        assert_eq!(w.candidate.as_deref(), Some("C"));
+        assert_eq!(w.changed, 1);
+        assert_eq!(w.activity, start);
+    }
+
+    #[test]
+    fn repeated_new_screen_confirms_at_supplied_instant() {
+        let start = Instant::now();
+        let confirmed = start + Duration::from_secs(2);
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.activity, start);
+        w.observe_screen("B".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn two_distinct_novel_screens_confirm_continuous_motion() {
+        let start = Instant::now();
+        let confirmed = start + Duration::from_secs(2);
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.activity, start);
+        w.observe_screen("C".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("C"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn previous_settled_hash_requires_repetition_instead_of_novelty() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("B"), Some("A"));
+        w.observe_screen("C".into(), false, start + Duration::from_secs(1));
+        w.observe_screen("A".into(), false, start + Duration::from_secs(2));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.changed, 2);
+        // Returning once is noise; persistent return is real activity.
+        let confirmed = start + Duration::from_secs(3);
+        w.observe_screen("A".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.settled.as_deref(), Some("A"));
+        assert_eq!(w.previous.as_deref(), Some("B"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+    }
+
+    #[test]
+    fn menu_confirmation_updates_screen_history_without_turn_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("A"), None);
+        w.observe_screen("B".into(), true, start + Duration::from_secs(1));
+        w.observe_screen("B".into(), true, start + Duration::from_secs(2));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.previous.as_deref(), Some("A"));
+        assert_eq!(w.candidate, None);
+        assert_eq!(w.changed, 0);
+        w.observe_screen("C".into(), false, start + Duration::from_secs(3));
+        let confirmed = start + Duration::from_secs(4);
+        w.observe_screen("C".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.previous.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn pending_history_reversion_saturates_sample_count() {
+        let start = Instant::now();
+        let mut w = watch_at(start, Some("B"), Some("A"));
+        w.changed = u8::MAX;
+        w.candidate = Some("C".into());
+        w.observe_screen("A".into(), false, start + Duration::from_secs(1));
+        assert_eq!(w.changed, u8::MAX);
+        assert_eq!(w.candidate.as_deref(), Some("A"));
+        assert_eq!(w.settled.as_deref(), Some("B"));
+        assert_eq!(w.activity, start);
+        let confirmed = start + Duration::from_secs(2);
+        w.observe_screen("A".into(), false, confirmed);
+        assert_eq!(w.activity, confirmed);
+        assert_eq!(w.changed, 0);
+    }
+}
