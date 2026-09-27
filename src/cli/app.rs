@@ -8,6 +8,16 @@ use super::*;
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
+    /// Configure exact publication connections for an installation or context.
+    Binding {
+        #[command(subcommand)]
+        action: BindingAction,
+    },
+    /// Stage and explicitly approve release of an independently reviewed artifact.
+    Effect {
+        #[command(subcommand)]
+        action: EffectAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -154,6 +164,173 @@ pub(crate) enum AppAction {
         #[arg(long)]
         project: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BindingAction {
+    /// Bind one declared capability slot to an exact connection ID.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        context_id: Option<String>,
+        #[arg(long)]
+        slot: String,
+        #[arg(long)]
+        connection_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
+    /// List bindings, optionally for an exact context.
+    Ls {
+        install_id: String,
+        #[arg(long)]
+        context_id: Option<String>,
+    },
+    /// Inspect one installation's exact binding.
+    Show {
+        install_id: String,
+        binding_id: String,
+    },
+    /// Change the connection at the expected binding revision.
+    Set {
+        install_id: String,
+        binding_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        connection_id: String,
+    },
+    /// Revoke a binding at its expected revision.
+    Revoke {
+        install_id: String,
+        binding_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum EffectAction {
+    /// Stage stored accepted artifact bytes; no caller content or path is accepted.
+    Stage {
+        run_id: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        slot: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        title: String,
+    },
+    /// Inspect the complete staged effect and approval digest.
+    Show { effect_id: String },
+    /// List release receipts; context filtering requires an installation.
+    Ls {
+        #[arg(long)]
+        install_id: Option<String>,
+        #[arg(long, requires = "install_id")]
+        context_id: Option<String>,
+    },
+    /// Approve the exact staged digest for one outward release.
+    Accept {
+        effect_id: String,
+        #[arg(long)]
+        digest: String,
+    },
+    /// Decline the exact staged digest without publishing.
+    Decline {
+        effect_id: String,
+        #[arg(long)]
+        digest: String,
+    },
+}
+fn release_scope(install: Option<&str>, context: Option<&str>) -> serde_json::Value {
+    let mut params = json!({});
+    if let Some(id) = install {
+        params["install_id"] = json!(id);
+    }
+    if let Some(id) = context {
+        params["context_id"] = json!(id);
+    }
+    params
+}
+fn binding_params(action: &BindingAction) -> (&'static str, serde_json::Value) {
+    match action {
+        BindingAction::Create {
+            install_id,
+            context_id,
+            slot,
+            connection_id,
+            request_id,
+        } => {
+            let mut params = release_scope(Some(install_id), context_id.as_deref());
+            params["slot"] = json!(slot);
+            params["connection_id"] = json!(connection_id);
+            params["request_id"] = json!(request_id);
+            ("app_binding_create", params)
+        }
+        BindingAction::Ls {
+            install_id,
+            context_id,
+        } => (
+            "app_binding_list",
+            release_scope(Some(install_id), context_id.as_deref()),
+        ),
+        BindingAction::Show {
+            install_id,
+            binding_id,
+        } => (
+            "app_binding_show",
+            json!({"install_id":install_id,"binding_id":binding_id}),
+        ),
+        BindingAction::Set {
+            install_id,
+            binding_id,
+            expected_revision,
+            connection_id,
+        } => (
+            "app_binding_update",
+            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision,"connection_id":connection_id}),
+        ),
+        BindingAction::Revoke {
+            install_id,
+            binding_id,
+            expected_revision,
+        } => (
+            "app_binding_revoke",
+            json!({"install_id":install_id,"binding_id":binding_id,"expected_revision":expected_revision}),
+        ),
+    }
+}
+fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
+    match action {
+        EffectAction::Stage {
+            run_id,
+            artifact_id,
+            slot,
+            request_id,
+            title,
+        } => (
+            "app_effect_stage",
+            json!({"run_id":run_id,"artifact_id":artifact_id,"slot":slot,"request_id":request_id,"title":title}),
+        ),
+        EffectAction::Show { effect_id } => ("app_effect_show", json!({"effect_id":effect_id})),
+        EffectAction::Ls {
+            install_id,
+            context_id,
+        } => (
+            "app_effect_list",
+            release_scope(install_id.as_deref(), context_id.as_deref()),
+        ),
+        EffectAction::Accept { effect_id, digest } => (
+            "app_effect_decide",
+            json!({"effect_id":effect_id,"digest":digest,"decision":"accept"}),
+        ),
+        EffectAction::Decline { effect_id, digest } => (
+            "app_effect_decide",
+            json!({"effect_id":effect_id,"digest":digest,"decision":"decline"}),
+        ),
+    }
 }
 
 #[derive(Subcommand)]
@@ -321,6 +498,14 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
 pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
+        AppAction::Binding { action } => {
+            let (method, params) = binding_params(action);
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Effect { action } => {
+            let (method, params) = effect_params(action);
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Catalog { action } => {
             let (method, params) = match action {
                 CatalogAction::Approve { install_id, digest } => (

@@ -1,4 +1,236 @@
 //! Operator controls for app bindings and reviewed artifact release.
+use super::{err_response, json_response, read_body, HttpResp};
+use crate::{client, error::Error};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::path::Path;
+use tiny_http::{Header, Request};
+const BODY_CAP: u64 = 48 * 1024;
+const RESULT_CAP: usize = 4 * 1024 * 1024;
+#[derive(Clone, Copy)]
+pub(super) enum Route<'a> {
+    Bindings(&'a str, Option<&'a str>),
+    Binding(&'a str, &'a str),
+    Update(&'a str, &'a str),
+    Revoke(&'a str, &'a str),
+    Stage(&'a str),
+    Effects(Option<&'a str>, Option<&'a str>),
+    Effect(&'a str),
+    Decide(&'a str),
+}
+fn segment(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+pub(super) fn route(path: &str) -> Option<Route<'_>> {
+    if path == "/api/app-effects" {
+        return Some(Route::Effects(None, None));
+    }
+    if let Some(tail) = path.strip_prefix("/api/app-effects/") {
+        let parts: Vec<_> = tail.split('/').collect();
+        return match parts.as_slice() {
+            [id] if segment(id) => Some(Route::Effect(id)),
+            [id, "decide"] if segment(id) => Some(Route::Decide(id)),
+            _ => None,
+        };
+    }
+    if let Some(tail) = path.strip_prefix("/api/app-runs/") {
+        let (run, verb) = tail.split_once('/')?;
+        return (segment(run) && verb == "effects").then_some(Route::Stage(run));
+    }
+    let parts: Vec<_> = path
+        .strip_prefix("/api/app-installations/")?
+        .split('/')
+        .collect();
+    match parts.as_slice() {
+        [install, "bindings"] if segment(install) => Some(Route::Bindings(install, None)),
+        [install, "bindings", binding] if segment(install) && segment(binding) => {
+            Some(Route::Binding(install, binding))
+        }
+        [install, "bindings", binding, "update"] if segment(install) && segment(binding) => {
+            Some(Route::Update(install, binding))
+        }
+        [install, "bindings", binding, "revoke"] if segment(install) && segment(binding) => {
+            Some(Route::Revoke(install, binding))
+        }
+        [install, "effects"] if segment(install) => Some(Route::Effects(Some(install), None)),
+        [install, "contexts", context, "bindings"] if segment(install) && segment(context) => {
+            Some(Route::Bindings(install, Some(context)))
+        }
+        [install, "contexts", context, "effects"] if segment(install) && segment(context) => {
+            Some(Route::Effects(Some(install), Some(context)))
+        }
+        _ => None,
+    }
+}
+impl Route<'_> {
+    pub(super) fn is_read(self) -> bool {
+        matches!(
+            self,
+            Self::Bindings(..) | Self::Binding(..) | Self::Effects(..) | Self::Effect(_)
+        )
+    }
+    pub(super) fn is_write(self) -> bool {
+        matches!(
+            self,
+            Self::Bindings(_, None)
+                | Self::Update(..)
+                | Self::Revoke(..)
+                | Self::Stage(_)
+                | Self::Decide(_)
+        )
+    }
+}
+fn nonnull_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Create {
+    slot: String,
+    connection_id: String,
+    request_id: String,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Update {
+    expected_revision: u64,
+    connection_id: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Revoke {
+    expected_revision: u64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Stage {
+    artifact_id: String,
+    slot: String,
+    request_id: String,
+    title: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Choice {
+    Accept,
+    Decline,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Decision {
+    digest: String,
+    decision: Choice,
+}
+fn typed<T: serde::de::DeserializeOwned + Serialize>(
+    request: &mut Request,
+) -> Result<Value, HttpResp> {
+    let bytes = read_body(request, BODY_CAP)?;
+    let value: T = serde_json::from_slice(&bytes)
+        .map_err(|_| err_response(400, "invalid app release request schema"))?;
+    Ok(serde_json::to_value(value).expect("typed release request serializes"))
+}
+fn scoped(install: Option<&str>, context: Option<&str>) -> Value {
+    let mut value = json!({});
+    if let Some(id) = install {
+        value["install_id"] = json!(id);
+    }
+    if let Some(id) = context {
+        value["context_id"] = json!(id);
+    }
+    value
+}
+pub(super) fn handle(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+) -> HttpResp {
+    if request
+        .url()
+        .split_once('?')
+        .is_some_and(|(_, q)| !q.is_empty())
+    {
+        return err_response(400, "app release query parameters are unsupported");
+    }
+    let result: Result<(&str, Value), HttpResp> = (|| {
+        Ok(match route {
+            Route::Bindings(install, context) if !write => {
+                ("app_binding_list", scoped(Some(install), context))
+            }
+            Route::Bindings(install, None) => {
+                let mut params = typed::<Create>(request)?;
+                params["install_id"] = json!(install);
+                ("app_binding_create", params)
+            }
+            Route::Binding(install, binding) => (
+                "app_binding_show",
+                json!({"install_id":install,"binding_id":binding}),
+            ),
+            Route::Update(install, binding) => {
+                let mut params = typed::<Update>(request)?;
+                params["install_id"] = json!(install);
+                params["binding_id"] = json!(binding);
+                ("app_binding_update", params)
+            }
+            Route::Revoke(install, binding) => {
+                let mut params = typed::<Revoke>(request)?;
+                params["install_id"] = json!(install);
+                params["binding_id"] = json!(binding);
+                ("app_binding_revoke", params)
+            }
+            Route::Stage(run) => {
+                let mut params = typed::<Stage>(request)?;
+                params["run_id"] = json!(run);
+                ("app_effect_stage", params)
+            }
+            Route::Effects(install, context) => ("app_effect_list", scoped(install, context)),
+            Route::Effect(effect) => ("app_effect_show", json!({"effect_id":effect})),
+            Route::Decide(effect) => {
+                let mut params = typed::<Decision>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_decide", params)
+            }
+            Route::Bindings(_, Some(_)) => return Err(err_response(405, "method not allowed")),
+        })
+    })();
+    let (method, params) = match result {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match client::rpc(state, method, params) {
+        Ok(value) if value.to_string().len() <= RESULT_CAP => {
+            let mut response = json_response(value);
+            response.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+            response
+        }
+        Ok(_) => err_response(502, "app release receipt exceeds bound"),
+        Err(error) => {
+            let denied = error.to_string().contains("operator action")
+                || error.to_string().contains("not provably the operator");
+            let code = if denied {
+                403
+            } else {
+                match error {
+                    Error::Rejected(_) | Error::Structured(_) => 409,
+                    _ => 503,
+                }
+            };
+            err_response(code, "app release management refused or unavailable")
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
