@@ -351,6 +351,7 @@ fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_rea
     let id = row["install_id"].as_str().unwrap();
     let body = json!({"source":w.source()}).to_string();
     let installed_head = w.head();
+    let mut violations = Vec::new();
     for prefix in ["", "setsid "] {
         for (method, path, body) in [
             ("POST", "/api/app-installations".to_string(), body.clone()),
@@ -367,14 +368,15 @@ fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_rea
             std::fs::write(&request, wire).unwrap();
             let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}",request.display()));
             assert_eq!(rc, 0);
-            assert_eq!(
-                response.split_whitespace().nth(1),
-                Some("403"),
-                "actual enrolled TCP peer accessed {method} {path}: {response}"
-            );
+            let status = response.split_whitespace().nth(1);
+            println!("native HTTP {prefix}{method} {path}: {status:?}, expected403");
+            if status != Some("403") {
+                violations.push(format!("{prefix}{method} {path}: {status:?}, expected403"));
+            }
             assert_eq!(w.head(), installed_head);
         }
     }
+    assert!(violations.is_empty(), "all six native caller denials must hold: {violations:?}");
 }
 
 #[test]
