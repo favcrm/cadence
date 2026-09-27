@@ -297,7 +297,9 @@ fn upstream_stamp(pm_dir: &Path) -> u64 {
 }
 
 /// Everything already loaded that can change the rendered overview.
-fn overview_inputs_fp(pm: &Pm, tracker: &Tracker) -> u64 {
+/// `delivery` is the CI observation stamp: it moves the overview
+/// without an issue edit, so a title-only skip must not hide it.
+fn overview_inputs_fp(pm: &Pm, tracker: &Tracker, delivery: u64) -> u64 {
     let mut parts: Vec<(String, u64)> = tracker
         .entries
         .iter()
@@ -315,6 +317,7 @@ fn overview_inputs_fp(pm: &Pm, tracker: &Tracker) -> u64 {
     notes_stamp(&pm.config.notes_dir()).hash(&mut h);
     project_side_stamp(&pm.dir).hash(&mut h);
     upstream_stamp(&pm.dir).hash(&mut h);
+    delivery.hash(&mut h);
     parts.hash(&mut h);
     h.finish()
 }
@@ -911,7 +914,7 @@ impl Model {
         let pm = Pm::at(&self.pm_dir).ok()?;
         let mut t = lock(&self.tracker);
         t.refresh(&pm.dir);
-        Some(overview_inputs_fp(&pm, &t))
+        Some(overview_inputs_fp(&pm, &t, self.delivery_stamp()))
     }
 
     /// `/api/overview`. Served from the cache while it is servable (a
@@ -1028,7 +1031,7 @@ impl Model {
             let mut t = lock(&self.tracker);
             t.refresh(&pm.dir);
             let projects = value_fp(&super::projects_payload(&pm, &project_counts(&t)));
-            let inputs = overview_inputs_fp(&pm, &t);
+            let inputs = overview_inputs_fp(&pm, &t, self.delivery_stamp());
             (projects, inputs)
         };
         let wanted = lock(&self.overview)
