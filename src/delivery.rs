@@ -134,7 +134,7 @@ pub struct Observed {
 
 /// CAD-449: what a merge did to the ticket's tracker status. Written
 /// once, on the transition into [`State::Merged`]; `pending` is retried
-/// by the router pass until it settles.
+/// by the router pass at most twice, then waits on the operator.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum TicketDone {
@@ -152,7 +152,16 @@ pub enum TicketDone {
         why: String,
         #[serde(default)]
         from: Option<String>,
+        /// Initial failure counts as one; two router retries are allowed.
+        #[serde(default = "initial_done_attempts")]
+        attempts: u8,
     },
+}
+
+pub(crate) const MAX_DONE_ATTEMPTS: u8 = 3;
+
+fn initial_done_attempts() -> u8 {
+    1
 }
 
 impl TicketDone {
@@ -733,6 +742,15 @@ fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_pending_done_write_retains_its_failed_attempt() {
+        let old: TicketDone = serde_json::from_value(json!({
+            "outcome": "pending", "why": "commit refused", "from": "doing"
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(old).unwrap()["attempts"], 1);
+    }
 
     fn cand(alias: &str, provider: &str) -> Candidate {
         Candidate {

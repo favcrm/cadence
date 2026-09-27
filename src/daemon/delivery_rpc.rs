@@ -689,7 +689,8 @@ impl Shared {
 
     /// CAD-449, the router pass: a merged loop whose ticket is not
     /// settled — `pending` (the tracker write failed: busy, a failing
-    /// hook) is written again; `refused` becomes `kept` once the
+    /// hook) gets two retries, with a retained known status; `refused`
+    /// becomes `kept` once the
     /// operator set the status by hand. Answers how many records moved.
     pub(super) fn settle_ticket_done(&self) -> Result<usize> {
         let (moved, notices, pm) = {
@@ -712,7 +713,11 @@ impl Shared {
                     continue;
                 };
                 let next = match rec.ticket_done.clone() {
-                    Some(TicketDone::Pending { why, from }) => {
+                    Some(TicketDone::Pending {
+                        why,
+                        from,
+                        attempts,
+                    }) => {
                         // Only while the status is still what it was at
                         // the merge: a status set by hand since (the
                         // `merged_not_done` row sends the operator here)
@@ -733,18 +738,45 @@ impl Shared {
                             moved += 1;
                             continue;
                         };
+                        if attempts >= delivery::MAX_DONE_ATTEMPTS {
+                            rec.ticket_done = Some(TicketDone::Refused {
+                                why: format!("the done write failed after {} attempts ({why}) — the operator sets it", delivery::MAX_DONE_ATTEMPTS),
+                            });
+                            moved += 1;
+                            continue;
+                        }
                         let head = rec.observed.as_ref().map(|o| o.head.clone());
                         let mut mine = Vec::new();
-                        let next = self.mark_ticket_done(
+                        let mut next = self.mark_ticket_done(
                             &pm,
                             rec,
                             &head.unwrap_or_default(),
                             Some(&from),
                             &mut mine,
                         );
-                        // One comment per failure, not one per pass.
-                        if matches!(&next, TicketDone::Pending { why: now, .. } if *now == why) {
-                            continue;
+                        // Persist the failure count even when its reason
+                        // is unchanged; do not repeat the same notice.
+                        if let TicketDone::Pending {
+                            attempts: next_attempts,
+                            ..
+                        } = &mut next
+                        {
+                            *next_attempts = attempts.max(1).saturating_add(1);
+                            if matches!(&next, TicketDone::Pending { why: now, .. } if *now == why)
+                            {
+                                mine.clear();
+                            }
+                            if attempts.max(1).saturating_add(1) >= delivery::MAX_DONE_ATTEMPTS {
+                                let failure = next.open().unwrap_or_default();
+                                let reason = format!("the done write failed after {} attempts ({failure}) — the operator sets it", delivery::MAX_DONE_ATTEMPTS);
+                                mine.push(Notice {
+                                    issue: id.clone(),
+                                    comment: Some(reason.clone()),
+                                    kind: "ticket_done_refused",
+                                    payload: json!({"issue": id, "why": reason}),
+                                });
+                                next = TicketDone::Refused { why: reason };
+                            }
                         }
                         let comment = match &next {
                             TicketDone::Marked { .. } => Some(format!(
@@ -871,20 +903,32 @@ impl Shared {
                     issue: id.clone(),
                     comment: Some(format!(
                         "{pr_ref} merged at {head}, but marking {id} done failed: {why}. \
-                         The daemon retries; the operator can set its status."
+                         The daemon allows two retries; the operator can set its status."
                     )),
                     kind: "ticket_done_pending",
                     payload: json!({"issue": id, "pr": pr_ref, "head": head, "why": why}),
                 });
-                // What a retry must still find: the status the write
-                // left in place (it rolled back), read now.
-                let from = match expect {
-                    Some(e) => Some(e.to_string()),
-                    None => issue::board::find_issue(&pm.dir, id)
-                        .ok()
-                        .map(|t| t.front.status),
-                };
-                TicketDone::Pending { why, from }
+                // Never re-read after releasing the transaction lock:
+                // that would adopt an intervening writer's decision.
+                // A busy retry may retain its already captured expect.
+                let from = e.from.or_else(|| expect.map(str::to_string));
+                if from.is_none() {
+                    let reason = format!("the done write failed ({why}) before its status was read under lock — the operator sets it");
+                    notices.pop();
+                    notices.push(Notice {
+                        issue: id.clone(),
+                        comment: None,
+                        kind: "ticket_done_refused",
+                        payload: json!({"issue": id, "why": reason}),
+                    });
+                    TicketDone::Refused { why: reason }
+                } else {
+                    TicketDone::Pending {
+                        why,
+                        from,
+                        attempts: 1,
+                    }
+                }
             }
         }
     }
@@ -897,7 +941,8 @@ impl Shared {
             // A write that failed on a busy tracker would wait out the
             // same lock here; the Needs-you row and the event carry it,
             // and the retry that settles it comments then.
-            let busy = n.kind == "ticket_done_pending" && pm.dir.join(".write.lock").exists();
+            let busy = matches!(n.kind, "ticket_done_pending" | "ticket_done_refused")
+                && pm.dir.join(".write.lock").exists();
             if let Some(text) = n.comment.as_ref().filter(|_| !busy) {
                 let _ = issue::write::add_comment(
                     pm,

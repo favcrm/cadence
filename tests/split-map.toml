@@ -1014,6 +1014,7 @@ tests = [
     "delivery_failed_done_write_does_not_adopt_a_second_writers_status",
     "delivery_busy_before_status_read_requires_operator_resolution",
     "delivery_permanent_done_write_failure_stops_after_three_attempts",
+    "delivery_known_failed_status_survives_transient_tracker_contention",
     "master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence",
     "master_wakes_once_when_a_delivery_is_merged_or_declined",
     "merged_delivery_marks_done_and_wakes_the_dependent_once",

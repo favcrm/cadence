@@ -1101,6 +1101,26 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
     Ok(out)
 }
 
+/// A failed done transaction carries only the status observed while
+/// holding the tracker lock. Before that read, its status is unknown.
+#[derive(Debug)]
+pub struct DoneWriteFailure {
+    pub error: Error,
+    pub from: Option<String>,
+}
+
+impl std::fmt::Display for DoneWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for DoneWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// CAD-449: a merged delivery marks its ticket done — one frontmatter
 /// write and one tracker commit, `<ID>: set status=done — <why>`, whose
 /// `Actor:` trailer is `actor` (the observer and the delivery). A ticket
@@ -1112,7 +1132,8 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
 /// reopened or moved it) is left alone and answered like `done`.
 ///
 /// It never waits for the tracker lock: a busy tracker is an error the
-/// caller retries (the daemon holds its own lock here). A failed commit
+/// caller may retry only with a previously observed status (the daemon
+/// holds its own lock here). A failed commit
 /// leaves nothing behind — `issue.md` is restored, and the commit
 /// itself unstages the path, so no later write can commit
 /// `status: done` for it.
@@ -1122,37 +1143,42 @@ pub fn mark_done_on_merge(
     why: &str,
     actor: &str,
     expect: Option<&str>,
-) -> Result<Option<String>> {
-    let Some(_lock) = pm.try_lock()? else {
-        return Err(Error::rejected(
-            "the tracker is locked by another writer (.write.lock)",
-        ));
-    };
-    let (_project, dir) = issue_dir(pm, id)?;
-    let (mut front, body) = load_front(&dir)?;
-    if matches!(front.status.as_str(), "done" | "dropped")
-        || expect.is_some_and(|e| e != front.status)
-    {
-        return Ok(Some(front.status));
-    }
-    crate::issue::plan::check_status_write(&pm.dir, &front, "done")?;
-    front.status = "done".to_string();
-    let file = dir.join("issue.md");
-    let original = std::fs::read(&file)?;
-    let written = save_front(&dir, &front, &body).and_then(|_| {
-        commit(
-            pm,
-            std::slice::from_ref(&file),
-            &format!("{id}: set status=done — {why}"),
-            &[id],
-            actor,
-        )
-    });
-    if let Err(e) = written {
-        let _ = std::fs::write(&file, &original);
-        return Err(e);
-    }
-    Ok(None)
+) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    let mut from = None;
+    let result = (|| -> Result<Option<String>> {
+        let Some(_lock) = pm.try_lock()? else {
+            return Err(Error::rejected(
+                "the tracker is locked by another writer (.write.lock)",
+            ));
+        };
+        let (_project, dir) = issue_dir(pm, id)?;
+        let (mut front, body) = load_front(&dir)?;
+        from = Some(front.status.clone());
+        if matches!(front.status.as_str(), "done" | "dropped")
+            || expect.is_some_and(|e| e != front.status)
+        {
+            return Ok(Some(front.status));
+        }
+        crate::issue::plan::check_status_write(&pm.dir, &front, "done")?;
+        front.status = "done".to_string();
+        let file = dir.join("issue.md");
+        let original = std::fs::read(&file)?;
+        let written = save_front(&dir, &front, &body).and_then(|_| {
+            commit(
+                pm,
+                std::slice::from_ref(&file),
+                &format!("{id}: set status=done — {why}"),
+                &[id],
+                actor,
+            )
+        });
+        if let Err(e) = written {
+            let _ = std::fs::write(&file, &original);
+            return Err(e);
+        }
+        Ok(None)
+    })();
+    result.map_err(|error| DoneWriteFailure { error, from })
 }
 
 /// CAD-405: an issue with a plan or children is an epic — an explicit
