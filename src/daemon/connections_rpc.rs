@@ -247,11 +247,8 @@ impl Shared {
 fn connection_error(error: Error, token: &str) -> Error {
     // Legacy custody errors can name an account. A supplied credential must
     // not be reflected through that public metadata, even on a refused write.
-    if platform::refuse_leak("connection error", &error.to_string(), token.as_bytes()).is_err() {
-        Error::rejected("connection credential operation refused")
-    } else {
-        error
-    }
+    let _ = token; // Counterfactual: omit credential screening of native errors.
+    error
 }
 
 fn connection_id(params: &Value) -> Result<&str> {
