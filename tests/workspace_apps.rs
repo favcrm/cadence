@@ -146,3 +146,114 @@ fn cad667_concurrent_installs_never_create_two_logical_copies() {
     );
     assert!(!w.pm.dir.join(".apps/pending.yaml").exists());
 }
+
+#[test]
+fn cad667_detached_registered_descendant_cannot_claim_operator_install() {
+    let w = Workspace::new();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "catalog-detached", "claude", None, lane.pid());
+    let request = lane.dir.path().join("detached.json");
+    std::fs::write(
+        &request,
+        cadence_agent::proto::request("app_workspace_install", json!({"source":w.source()}))
+            .to_string(),
+    )
+    .unwrap();
+    let head = w.head();
+    let (rc, output) = lane.run(&format!("setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}", cadence_agent::client::socket_path(&w.daemon.state).display(), request.display()));
+    assert_eq!(rc, 0);
+    let frame: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(frame["ok"], false);
+    assert!(
+        frame.to_string().contains("operator"),
+        "detached proof must reach caller authority, not missing method: {frame}"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+}
+
+#[test]
+fn cad667_http_install_and_reads_share_operator_authority() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
+    let port = (3110..3200)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let head = w.head();
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let body = json!({"source":w.source()}).to_string();
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request_as(
+            "POST",
+            "/api/app-installations",
+            &body,
+            &common::op::seam_headers(&w.daemon.state, "agent:catalog-http"),
+        ),
+    );
+    assert!(matches!(code, 403 | 404));
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+    // Agent replay retires a session: a fresh real operator session is required.
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let forged = json!({"source":w.source(),"by":"operator","approved":true}).to_string();
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("POST", "/api/app-installations", &forged),
+    );
+    assert_eq!(
+        code, 400,
+        "forged fields must be rejected by the installed route"
+    );
+    assert_eq!(w.head(), head);
+    let (code, _, response) = common::op::raw(
+        port,
+        &session.request("POST", "/api/app-installations", &body),
+    );
+    assert_eq!(
+        code, 200,
+        "operator workspace HTTP install absent: {response}"
+    );
+    let row: Value = serde_json::from_str(&response).unwrap();
+    let id = row["install_id"].as_str().unwrap();
+    for path in [
+        "/api/app-installations".to_string(),
+        format!("/api/app-installations/{id}"),
+    ] {
+        let (code, _, _) = common::op::raw(port, &session.request("GET", &path, ""));
+        assert_eq!(code, 200);
+    }
+}
