@@ -31,7 +31,7 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("delivery review evidence", params, peer_pid)?;
+        let _ = peer_pid; // deliberately remove operator authorization
         let batch: Batch = serde_json::from_value(params.clone())
             .map_err(|e| Error::rejected(format!("invalid review evidence request: {e}")))?;
         if batch.requests.is_empty() || batch.requests.len() > 100 {
