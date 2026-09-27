@@ -230,38 +230,59 @@ export default function App() {
   // Each resource joins a request already in flight instead of stacking.
   // The operator proof walks /proc on the server: ask for it once per
   // page load and keep the answer across the 30 s polls.
-  // A change of sign-in (CAD-313) changes the answer: it is asked again.
+  // The proof belongs to one credential/session and board mode. Switching
+  // accounts must clear it even when both sessions report signed_in=true.
   const operatorKnown = useRef(false);
-  const signedIn = useRef<boolean | undefined>(undefined);
+  const metaIdentity = useRef<string | null>(null);
+  const metaKey = useRef<string | null>(null);
+  const metaRequest = useRef(0);
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
-    const asked = !operatorKnown.current;
+    const request = ++metaRequest.current;
     const sentKey = sessionKey();
+    if (sentKey !== metaKey.current) {
+      metaKey.current = sentKey;
+      metaIdentity.current = null;
+      operatorKnown.current = false;
+      setMeta(null);
+    }
+    const asked = !operatorKnown.current;
+    let expectedKey = sentKey;
+    const current = () => request === metaRequest.current && sessionKey() === expectedKey;
     api
       .meta(asked)
       .then((next) => {
-        const changed = signedIn.current !== undefined && next.signed_in !== signedIn.current;
-        signedIn.current = next.signed_in;
+        if (!current()) return;
+        const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
+        const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
+        metaIdentity.current = identity;
         // A key the server refused (expired, revoked) is dropped — only
         // the very key this request carried: a sign-in that finished
         // while it was in flight stored a newer one.
-        if (next.signed_in === false && sentKey && sessionKey() === sentKey) setSessionKey(null);
+        if (next.signed_in === false && sentKey) {
+          setSessionKey(null);
+          metaKey.current = null;
+          expectedKey = null;
+        }
         if (changed && !asked) {
           operatorKnown.current = false;
           setMeta({ ...next, operator: undefined });
           api
             .meta(true)
             .then((fresh) => {
-              if (typeof fresh.operator === "boolean") operatorKnown.current = true;
+              if (!current()) return;
+              metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
+              operatorKnown.current = typeof fresh.operator === "boolean";
               setMeta(fresh);
             })
             .catch(() => undefined);
           return;
         }
         if (typeof next.operator === "boolean") operatorKnown.current = true;
-        setMeta((prev) => ({ ...next, operator: next.operator ?? prev?.operator }));
+        setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
       })
       .catch(() => {
+        if (!current()) return;
         // Lost meta loses the answer too: ask again on the next refresh.
         operatorKnown.current = false;
         setMeta(null);
@@ -273,7 +294,10 @@ export default function App() {
     loadDetail();
   }, [loadDetail]);
 
-  useEffect(refresh, [refresh]);
+  useEffect(() => {
+    refresh();
+    return () => { metaRequest.current++; };
+  }, [refresh]);
 
   const reconcile = useCallback(() => {
     // A GET begun before subscription can still be in flight. Invalidate
