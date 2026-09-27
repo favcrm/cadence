@@ -55,6 +55,46 @@ class CandidateTests(unittest.TestCase):
             100, '<testsuite><testcase name="guard"><failure type="test failure"/></testcase></testsuite>', "guard"
         )
 
+    def test_authentic_nextest_filter_skips_are_not_executed_cases(self):
+        # Run 36304100801: trusted control 3b0e6a9b, mutant b8dc1df8.
+        report = (Path(__file__).parent / "fixtures/mutation-filtered.xml").read_text()
+        self.module.validate_mutation(
+            100, report,
+            "cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry",
+        )
+        expected = "cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry"
+        for code, name in [(0, expected), (1, expected), (101, expected), (100, "other")]:
+            with self.subTest(code=code, name=name):
+                with self.assertRaises(ValueError):
+                    self.module.validate_mutation(code, report, name)
+
+    def test_filter_skips_cannot_hide_mixed_status_or_other_executed_cases(self):
+        failed = '<testcase name="guard"><failure/></testcase>'
+        for additional in [
+            '<testcase name="other"/>',
+            '<testcase name="other"><failure/></testcase>',
+            '<testcase name="other"><error/></testcase>',
+            '<testcase name="other"><skipped/><failure/></testcase>',
+            '<testcase name="other"><skipped/><error/></testcase>',
+            '<testcase name="other"><skipped/><skipped/></testcase>',
+            '<testcase name="other"><skipped><failure/></skipped></testcase>',
+        ]:
+            with self.subTest(additional=additional):
+                with self.assertRaises(ValueError):
+                    self.module.validate_mutation(100, f'<testsuite>{failed}{additional}</testsuite>', "guard")
+
+    def test_malformed_and_conflicting_failure_reports_are_rejected(self):
+        for report in [
+            '<testsuite>',
+            '<not-junit><testcase name="guard"><failure/></testcase></not-junit>',
+            '<testsuite><testcase name="guard"><failure/><failure/></testcase></testsuite>',
+            '<testsuite><testcase name="guard"><failure/><skipped/></testcase></testsuite>',
+            '<testsuite><testcase name="guard"><failure/><error/></testcase></testsuite>',
+        ]:
+            with self.subTest(report=report):
+                with self.assertRaises(ValueError):
+                    self.module.validate_mutation(100, report, "guard")
+
 
 if __name__ == "__main__":
     unittest.main()

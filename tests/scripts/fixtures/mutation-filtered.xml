@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="13" skipped="12" failures="1" errors="0" uuid="cca2d832-5141-48d4-b8e0-3bd314d8787f" timestamp="2026-09-27T07:47:10.368+00:00" time="0.254">
+    <testsuite name="cadence-agent::workspace_apps" tests="13" skipped="12" errors="0" failures="1">
+        <testcase name="cad667_cli_catalog_namespace_preserves_legacy_offline_reads" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_concurrent_installs_never_create_two_logical_copies" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_detached_registered_descendant_cannot_claim_operator_install" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_explicit_migration_recovery_has_operator_proof_and_preserves_legacy_identity" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_flat_text_rubrics_and_templates_keep_legacy_bundle_compatibility" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_http_install_and_reads_share_operator_authority" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_installed_manifest_cannot_relabel_a_stable_installation" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_operator_installs_lists_and_inspects_without_project_or_grants" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_registered_agent_and_forged_operator_fields_cannot_install" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_workspace_snapshot_preserves_existing_aggregate_bundle_limit" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_workspace_source_credentials_refuse_before_clone_or_persistence" classname="cadence-agent::workspace_apps" time="0.000">
+            <skipped message="Skipped: test does not match the provided string filters"/>
+        </testcase>
+        <testcase name="cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry" classname="cadence-agent::workspace_apps" timestamp="2026-09-27T07:47:10.368+00:00" time="0.253">
+            <failure message="thread &apos;cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry&apos; (5088) panicked at tests/workspace_apps.rs:689:9" type="test failure with exit code 101">thread &apos;cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry&apos; (5088) panicked at tests/workspace_apps.rs:689:9:
+migration publication was exposed before failed Git delivery could be retried
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry ... FAILED
+
+failures:
+
+failures:
+    cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.25s
+
+</system-out>
+            <system-err>
+thread &apos;cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry&apos; (5088) panicked at tests/workspace_apps.rs:689:9:
+migration publication was exposed before failed Git delivery could be retried
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>
