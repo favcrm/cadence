@@ -73,6 +73,8 @@ using the dispatch main commit's trusted nextest wrapper. A passing assertion
 is green; an assertion failure or invalid feedback is red. The artifact records
 both source SHAs, the actual runner return code, bounded logs and available
 JUnit. Missing or inconsistent reports are invalid feedback, not a diagnosis.
+The pinned profile also retains nonselected skipped cases from the same target;
+only the requested case may execute, and supplied counts must match all entries.
 This route does not retry required CI or replace local build admission; the
 separate mutation workflow still requires a deliberate assertion failure.
 

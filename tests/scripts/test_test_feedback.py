@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -124,6 +125,103 @@ class FeedbackTests(unittest.TestCase):
                 result, receipt = self.execute()
                 self.assertEqual((result, receipt["outcome"]), (1, "invalid_feedback"))
                 self.assertIn("stale" if rewrite else "missing", receipt["reason"])
+
+    def test_present_summary_counts_must_match_actual_nested_contents(self):
+        for case in feedback.CASES:
+            for location in ("testsuites", "testsuite"):
+                for summary in ('tests="0"', 'tests="2"', 'failures="1"', 'failures="-1"'):
+                    with self.subTest(case=case, location=location, summary=summary):
+                        self.new_fixture()
+                        self.args.case = case
+                        target, name = feedback.CASES[case]
+                        report = f'<testsuites><testsuite name="cadence-agent::{target}"><testcase name="{name}"/></testsuite></testsuites>'
+                        if location == "testsuites":
+                            report = report.replace("<testsuites>", f"<testsuites {summary}>")
+                        else:
+                            report = report.replace("<testsuite name=", f"<testsuite {summary} name=")
+                        self.fake_runner(report)
+                        result, receipt = self.execute()
+                        self.assertEqual((result, receipt["outcome"], receipt["returncode"]), (1, "invalid_feedback", 0))
+                        self.assertEqual((self.output / "junit.xml").read_text(), report)
+
+    def test_summary_counts_are_unsigned_decimal_integers_when_present(self):
+        for count in ("tests", "failures", "skipped", "errors", "disabled"):
+            for value in ("-1", "", "1.0", "+0", " 0", "zero"):
+                with self.subTest(count=count, value=value):
+                    self.new_fixture()
+                    report = self.report.format(body="").replace("<testsuites>", f'<testsuites {count}="{value}">')
+                    self.fake_runner(report)
+                    result, receipt = self.execute()
+                    self.assertEqual((result, receipt["outcome"]), (1, "invalid_feedback"))
+
+    def test_consistent_nested_summary_counts_preserve_both_ordinary_outcomes(self):
+        for code, failures, body, outcome in (
+            (0, 0, "", "pass"), (100, 1, "<failure/>", "test_failure"),
+        ):
+            with self.subTest(code=code):
+                self.new_fixture()
+                counts = f'tests="1" failures="{failures}" skipped="0" errors="0" disabled="0"'
+                report = self.report.format(body=body).replace("<testsuites>", f"<testsuites {counts}>").replace("<testsuite name=", f"<testsuite {counts} name=")
+                report = f"<testsuites {counts}>{report}</testsuites>"
+                self.fake_runner(report, code)
+                result, receipt = self.execute()
+                self.assertEqual((result, receipt["outcome"]), (0 if code == 0 else 1, outcome))
+
+    def skipped_report(self, body="", failures=0):
+        target, name = feedback.CASES[self.args.case]
+        counts = f'tests="3" failures="{failures}" skipped="2" errors="0" disabled="0"'
+        return (
+            f'<testsuites {counts}><testsuite name="cadence-agent::{target}" {counts}>'
+            f'<testcase name="{name}" classname="cadence-agent::{target}">{body}</testcase>'
+            f'<testcase name="nonselected_one" classname="cadence-agent::{target}" time="0">'
+            '<skipped message="Skipped: test does not match the provided string filters"/></testcase>'
+            f'<testcase name="nonselected_two" classname="cadence-agent::{target}" time="0">'
+            '<skipped message="Skipped: test does not match the provided string filters"/></testcase>'
+            '</testsuite></testsuites>'
+        )
+
+    def test_pinned_report_skipped_all_retains_nonselected_cases(self):
+        for case in feedback.CASES:
+            for code, body, outcome in ((0, "", "pass"), (100, "<failure/>", "test_failure")):
+                with self.subTest(case=case, code=code):
+                    self.new_fixture()
+                    self.args.case = case
+                    report = self.skipped_report(body, int(code == 100))
+                    self.fake_runner(report, code)
+                    result, receipt = self.execute()
+                    self.assertEqual((result, receipt["outcome"]), (0 if code == 0 else 1, outcome))
+                    self.assertEqual(receipt["skipped_cases"], ["nonselected_one", "nonselected_two"])
+                    self.assertEqual(receipt["junit_counts"], {"tests": 3, "executed": 1, "failures": int(code == 100), "skipped": 2, "errors": 0})
+                    self.assertEqual((self.output / "junit.xml").read_text(), report)
+
+    def test_skipped_siblings_cannot_hide_invalid_or_extra_execution(self):
+        valid = self.skipped_report()
+        name = feedback.CASES[self.args.case][1]
+        skip = '<skipped message="Skipped: test does not match the provided string filters"/>'
+        samples = (
+            valid.replace(f'name="{name}"', 'name="wrong"'),
+            valid.replace('></testcase>', f'>{skip}</testcase>', 1),
+            valid.replace('name="nonselected_one"', f'name="{name}"'),
+            valid.replace('name="nonselected_two"', 'name="nonselected_one"'),
+            valid.replace('name="nonselected_one"', 'name=""'),
+            valid.replace(skip, "", 1),
+            valid.replace(skip, skip + skip, 1),
+            valid.replace(skip, skip + "<failure/>", 1),
+            valid.replace(skip, skip + "<error/>", 1),
+            valid.replace('classname="cadence-agent::backup_rollout"', 'classname="cadence-agent::threads"', 1),
+            valid.replace('name="cadence-agent::backup_rollout"', 'name="cadence-agent::threads"', 1),
+            valid.replace('</testsuites>', '<testsuite name="foreign"/></testsuites>'),
+        )
+        # Remove optional summaries so semantic counterexamples cannot be
+        # rejected only because their fixture's old counts became stale.
+        reports = [re.sub(r' (tests|failures|skipped|errors|disabled)="[^"]*"', "", report) for report in samples]
+        reports.extend((valid.replace('tests="3"', 'tests="1"'), valid.replace('skipped="2"', 'skipped="0"')))
+        for report in reports:
+            with self.subTest(report=report):
+                self.new_fixture()
+                self.fake_runner(report)
+                result, receipt = self.execute()
+                self.assertEqual((result, receipt["outcome"]), (1, "invalid_feedback"))
 
     def test_input_allowlist_and_exact_sha_checks_prevent_execution(self):
         for revision, case, control in (

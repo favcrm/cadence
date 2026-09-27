@@ -95,29 +95,59 @@ def classify(report, code, target, name, started_ns):
     if root.tag not in ("testsuites", "testsuite"):
         raise ValueError("unexpected JUnit root")
     cases = root.findall(".//testcase")
-    if len(cases) != 1:
-        raise ValueError("JUnit must contain exactly one testcase")
-    case = cases[0]
-    suites = root.iter("testsuite")
     expected_suite = f"cadence-agent::{target}"
-    if case.get("name") != name or not any(
-        suite.get("name") == expected_suite and case in list(suite)
-        for suite in suites
-    ):
-        raise ValueError("JUnit testcase does not match the allowlisted target and name")
-    if root.findall(".//skipped") or root.findall(".//error"):
-        raise ValueError("JUnit contains a skipped testcase or error")
+    suites = list(root.iter("testsuite"))
+    if any(suite.get("name") != expected_suite for suite in suites):
+        raise ValueError("JUnit contains a foreign target suite")
+    names = [case.get("name") for case in cases]
+    if any(not case_name for case_name in names) or len(names) != len(set(names)):
+        raise ValueError("JUnit testcase identities are empty or duplicated")
+    skipped = []
+    executed = []
+    for case in cases:
+        if not any(case in list(suite) for suite in suites) or case.get("classname", expected_suite) != expected_suite:
+            raise ValueError("JUnit testcase does not belong to the allowlisted target")
+        skips = case.findall("skipped")
+        if skips:
+            if len(skips) != 1 or case.get("name") == name or case.findall("failure"):
+                raise ValueError("JUnit requested testcase is skipped or skip entry is malformed")
+            skipped.append(case.get("name"))
+        else:
+            executed.append(case)
+    if len(executed) != 1 or executed[0].get("name") != name:
+        raise ValueError("JUnit must contain exactly one executed matching testcase")
+    case = executed[0]
+    if any(root.findall(f".//{tag}") for tag in ("error", "disabled")):
+        raise ValueError("JUnit contains an unexecuted testcase or error")
+    if len(root.findall(".//skipped")) != len(skipped):
+        raise ValueError("JUnit skip entries are malformed")
     for suite in root.iter():
         if suite.tag in ("testsuites", "testsuite"):
-            for count in ("errors", "skipped", "disabled"):
-                if int(suite.get(count, "0")) != 0:
-                    raise ValueError("JUnit summary contains an error or unexecuted testcase")
+            for count, tag in (
+                ("tests", "testcase"), ("failures", "failure"),
+                ("skipped", "skipped"), ("errors", "error"), ("disabled", "disabled"),
+            ):
+                value = suite.get(count)
+                if value is not None and (
+                    re.fullmatch(r"[0-9]+", value) is None
+                    or int(value) != len(suite.findall(f".//{tag}"))
+                ):
+                    raise ValueError(f"JUnit summary {count} contradicts its contents")
     failures = root.findall(".//failure")
+    classification = {
+        "skipped_cases": skipped,
+        "junit_counts": {
+            "tests": len(cases), "executed": 1, "failures": len(failures),
+            "skipped": len(skipped), "errors": 0,
+        },
+    }
     if code == 0 and not failures:
-        return "pass"
-    if code == 100 and len(failures) == 1 and failures[0] in list(case):
-        return "test_failure"
-    raise ValueError("runner exit and JUnit do not describe an ordinary test result")
+        classification["outcome"] = "pass"
+    elif code == 100 and len(failures) == 1 and failures[0] in list(case):
+        classification["outcome"] = "test_failure"
+    else:
+        raise ValueError("runner exit and JUnit do not describe an ordinary test result")
+    return classification
 
 
 def execute(args, control, timeout=1200):
@@ -199,8 +229,8 @@ def execute(args, control, timeout=1200):
             receipt["timed_out"] = timed_out
             if timed_out:
                 raise ValueError("runner exceeded the bounded timeout")
-            receipt["outcome"] = classify(report, code, target, name, started_ns)
-            receipt["reason"] = "one matching executed testcase"
+            receipt.update(classify(report, code, target, name, started_ns))
+            receipt["reason"] = "one matching executed testcase; nonselected skips retained"
     except (ValueError, OSError, ET.ParseError, subprocess.SubprocessError) as error:
         receipt["outcome"] = "invalid_feedback"
         receipt["reason"] = str(error)
