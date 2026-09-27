@@ -28,10 +28,9 @@
 //! ```
 //!
 //! `lease:` takes `file:<path>` (the local test double — real atomic
-//! single-writer semantics over one filesystem), `http(s)://<url>`
-//! (the company-DO lease — the provider is a stub until the AOS-55
-//! contract lands, so a daemon configured for it fails closed at
-//! start), or `none`/`off` — the default, which changes nothing: there
+//! single-writer semantics over one filesystem), `http://lease.internal`
+//! (AgenticOS host-bound renewal; generation is not exposed), or
+//! `none`/`off` — the default, which changes nothing: there
 //! is deliberately no `none` provider object because "no provider" is
 //! the no-op.
 
@@ -40,7 +39,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,6 +51,11 @@ use crate::error::{Error, Result};
 pub const DEFAULT_TTL_SECS: u64 = 30;
 /// `hosted.flush_timeout_secs` when unset — the SIGTERM flush bound.
 pub const DEFAULT_FLUSH_SECS: u64 = 10;
+/// AgenticOS's local renewal policy, not a host-issued expiration. The
+/// platform retains claim/revoke authority and the container fences itself.
+const HOST_TTL: Duration = Duration::from_secs(6);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+const HOST_RENEW_URL: &str = "http://lease.internal/renew";
 
 /// Unix epoch seconds, sub-second — lease expiry is wall-clock.
 fn now_unix() -> f64 {
@@ -62,13 +66,15 @@ fn now_unix() -> f64 {
 }
 
 /// A held lease: who holds it, which writer-generation it is, and when
-/// it lapses. `epoch` never repeats — a take-over bumps it — so a
-/// reader of committed metadata can order writers across restarts.
+/// it lapses. File epochs order writers across restarts. AgenticOS does
+/// not expose its generation: `None` must never become a synthetic epoch.
 #[derive(Clone, Debug)]
 pub struct Lease {
     pub holder: String,
-    pub epoch: u64,
+    pub epoch: Option<u64>,
     pub expires_unix: f64,
+    /// Host renewal deadlines are monotonic; wall time is diagnostic only.
+    pub expires_monotonic: Option<Instant>,
 }
 
 /// Where leases come from. The daemon knows only this seam — the file
@@ -102,6 +108,7 @@ pub struct Fence {
     /// successful renew. `f64::INFINITY` until a lease sets it, so an
     /// unfenced or pre-lease store never refuses.
     expires_unix: AtomicU64,
+    expires_monotonic: Mutex<Option<Instant>>,
 }
 
 impl Default for Fence {
@@ -109,6 +116,7 @@ impl Default for Fence {
         Self {
             reason: Mutex::new(None),
             expires_unix: AtomicU64::new(f64::INFINITY.to_bits()),
+            expires_monotonic: Mutex::new(None),
         }
     }
 }
@@ -144,6 +152,14 @@ impl Fence {
             .store(expires_unix.to_bits(), Ordering::SeqCst);
     }
 
+    fn set_lease(&self, lease: &Lease) {
+        self.set_expiry(lease.expires_unix);
+        *self
+            .expires_monotonic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = lease.expires_monotonic;
+    }
+
     /// The effective write refusal: an explicit trip, or the held
     /// lease's expiry having passed — renewal failure is the *detected*
     /// half of lease loss; this is the half that needs no detector, so
@@ -152,6 +168,14 @@ impl Fence {
     pub fn check(&self) -> Option<String> {
         if let Some(reason) = self.reason() {
             return Some(reason);
+        }
+        if let Some(deadline) = *self
+            .expires_monotonic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return (Instant::now() >= deadline)
+                .then(|| "host lease renewal deadline expired".to_string());
         }
         let expiry = f64::from_bits(self.expires_unix.load(Ordering::SeqCst));
         if now_unix() >= expiry {
@@ -170,7 +194,7 @@ impl Fence {
 #[derive(Clone)]
 pub struct PmLease {
     fence: Arc<Fence>,
-    epoch: Arc<AtomicU64>,
+    epoch: Option<Arc<AtomicU64>>,
 }
 
 impl PmLease {
@@ -185,8 +209,10 @@ impl PmLease {
     }
 
     /// The lease epoch outbound writes record (`Lease-Epoch:`).
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+            .as_ref()
+            .map(|epoch| epoch.load(Ordering::SeqCst))
     }
 }
 
@@ -199,7 +225,7 @@ pub struct LeaseCtl {
     spec: String,
     current: Mutex<Lease>,
     fence: Arc<Fence>,
-    epoch: Arc<AtomicU64>,
+    epoch: Option<Arc<AtomicU64>>,
     /// Heartbeat period — always under the TTL.
     pub renew_every: Duration,
     /// The SIGTERM flush bound from `hosted:` (or the default).
@@ -210,10 +236,25 @@ impl LeaseCtl {
     /// Extend the hold one heartbeat. An expired, stolen or vanished
     /// lease surfaces as `Err` — the caller trips the fence.
     pub fn renew(&self) -> Result<()> {
+        if let Some(reason) = self.fence.check() {
+            return Err(Error::rejected(format!("lease renewal refused: {reason}")));
+        }
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        let next = self.provider.renew(&current)?;
-        self.epoch.store(next.epoch, Ordering::SeqCst);
-        self.fence.set_expiry(next.expires_unix);
+        let next = self.provider.renew(&current).inspect_err(|error| {
+            self.fence.trip(format!("lease renewal failed: {error}"));
+        })?;
+        match (&self.epoch, next.epoch) {
+            (Some(epoch), Some(value)) => epoch.store(value, Ordering::SeqCst),
+            (None, None) => {}
+            _ => {
+                self.fence
+                    .trip("lease provider changed generation representation");
+                return Err(Error::rejected(
+                    "lease provider changed generation representation",
+                ));
+            }
+        }
+        self.fence.set_lease(&next);
         *current = next;
         Ok(())
     }
@@ -234,13 +275,15 @@ impl LeaseCtl {
     pub fn pm_lease(&self) -> PmLease {
         PmLease {
             fence: Arc::clone(&self.fence),
-            epoch: Arc::clone(&self.epoch),
+            epoch: self.epoch.clone(),
         }
     }
 
     /// The current epoch — stamped on the lease lifecycle events.
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+            .as_ref()
+            .map(|epoch| epoch.load(Ordering::SeqCst))
     }
 
     /// `health`/`daemon_info` surface: provider, epoch, expiry, fence.
@@ -250,6 +293,8 @@ impl LeaseCtl {
             "provider": self.spec,
             "holder": current.holder,
             "epoch": current.epoch,
+            "epoch_available": current.epoch.is_some(),
+            "expiry_authority": if current.expires_monotonic.is_some() { "local_renewal_deadline" } else { "provider" },
             "expires_unix": current.expires_unix,
             "renew_secs": self.renew_every.as_secs_f64(),
             "fenced": self.fence.check(),
@@ -276,7 +321,7 @@ fn holder_for(state_dir: &Path) -> String {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hosted {
-    /// `file:<path>` | `http(s)://<url>` | `none`/`off` — unset is off.
+    /// `file:<path>` | `http://lease.internal` | `none`/`off` — unset is off.
     pub lease: Option<String>,
     /// Seconds a held lease survives the daemon that took it.
     pub lease_ttl_secs: Option<u64>,
@@ -308,12 +353,16 @@ impl Spec {
             return Ok(Spec::File(PathBuf::from(path)));
         }
         if raw.starts_with("http://") || raw.starts_with("https://") {
-            return Ok(Spec::Http(raw.to_string()));
+            return match raw {
+                "http://lease.internal" | "http://lease.internal/" | HOST_RENEW_URL =>
+                    Ok(Spec::Http(HOST_RENEW_URL.to_string())),
+                _ => Err(Error::rejected("hosted.lease HTTP endpoint must be http://lease.internal/renew without credentials, port, query or fragment")),
+            };
         }
         match raw {
             "" | "none" | "off" => Ok(Spec::Off),
             _ => Err(Error::rejected(format!(
-                "hosted.lease '{raw}' is not file:<path>, http(s)://<url> or off"
+                "hosted.lease '{raw}' is not file:<path>, http://lease.internal or off"
             ))),
         }
     }
@@ -343,7 +392,22 @@ pub fn acquire(state_dir: &Path, hosted: &Hosted) -> Result<Option<Arc<LeaseCtl>
         return Ok(None);
     };
     let spec = Spec::parse(raw)?;
-    let ttl = Duration::from_secs(hosted.lease_ttl_secs.unwrap_or(DEFAULT_TTL_SECS).max(1));
+    let host_bound = matches!(&spec, Spec::Http(_));
+    let ttl = Duration::from_secs(
+        hosted
+            .lease_ttl_secs
+            .unwrap_or(if host_bound {
+                HOST_TTL.as_secs()
+            } else {
+                DEFAULT_TTL_SECS
+            })
+            .max(1),
+    );
+    if host_bound && ttl > HOST_TTL {
+        return Err(Error::rejected(
+            "host-bound lease TTL must not exceed the 6s local renewal deadline",
+        ));
+    }
     let renew_every = match hosted.lease_renew_secs {
         Some(secs) => {
             let every = Duration::from_secs(secs.max(1));
@@ -365,26 +429,41 @@ pub fn acquire(state_dir: &Path, hosted: &Hosted) -> Result<Option<Arc<LeaseCtl>
             .unwrap_or(DEFAULT_FLUSH_SECS)
             .max(1),
     );
-    let holder = holder_for(state_dir);
-    let hint = epoch_hint(state_dir);
     let (provider, spec_name): (Box<dyn Provider>, String) = match spec {
         Spec::Off => return Ok(None),
         Spec::File(path) => (Box::new(FileProvider::new(path, ttl)), raw.to_string()),
-        Spec::Http(url) => (Box::new(HttpProvider { url }), raw.to_string()),
+        Spec::Http(url) => (
+            Box::new(HttpProvider::new(url, ttl)),
+            HOST_RENEW_URL.to_string(),
+        ),
     };
+    start_lease(state_dir, provider, spec_name, renew_every, flush_timeout).map(Some)
+}
+
+fn start_lease(
+    state_dir: &Path,
+    provider: Box<dyn Provider>,
+    spec_name: String,
+    renew_every: Duration,
+    flush_timeout: Duration,
+) -> Result<Arc<LeaseCtl>> {
+    let holder = holder_for(state_dir);
+    let hint = epoch_hint(state_dir);
     let lease = provider.acquire(&holder, hint)?;
-    save_epoch(state_dir, lease.epoch);
+    if let Some(epoch) = lease.epoch {
+        save_epoch(state_dir, epoch);
+    }
     let ctl = Arc::new(LeaseCtl {
         provider,
         spec: spec_name,
-        epoch: Arc::new(AtomicU64::new(lease.epoch)),
+        epoch: lease.epoch.map(|epoch| Arc::new(AtomicU64::new(epoch))),
         current: Mutex::new(lease.clone()),
         fence: Arc::new(Fence::default()),
         renew_every,
         flush_timeout,
     });
-    ctl.fence.set_expiry(lease.expires_unix);
-    Ok(Some(ctl))
+    ctl.fence.set_lease(&lease);
+    Ok(ctl)
 }
 
 // ---------- file provider ----------
@@ -554,8 +633,9 @@ impl Provider for FileProvider {
                 self.write_body(&body)?;
                 return Ok(Lease {
                     holder: body.holder,
-                    epoch: body.epoch,
+                    epoch: Some(body.epoch),
                     expires_unix: body.expires_unix,
+                    expires_monotonic: None,
                 });
             }
             let epoch = epoch_hint.max(1);
@@ -567,8 +647,9 @@ impl Provider for FileProvider {
             self.write_body(&body)?;
             Ok(Lease {
                 holder: body.holder,
-                epoch,
+                epoch: Some(epoch),
                 expires_unix: body.expires_unix,
+                expires_monotonic: None,
             })
         })
     }
@@ -579,9 +660,9 @@ impl Provider for FileProvider {
             let body = self.body()?.ok_or_else(|| {
                 Error::rejected(format!("lease {} vanished", self.path.display()))
             })?;
-            if body.holder != lease.holder || body.epoch != lease.epoch {
+            if body.holder != lease.holder || Some(body.epoch) != lease.epoch {
                 return Err(Error::rejected(format!(
-                    "lease {} is held by {} at epoch {} — we hold {} at epoch {}",
+                    "lease {} is held by {} at epoch {} — we hold {} at epoch {:?}",
                     self.path.display(),
                     body.holder,
                     body.epoch,
@@ -603,8 +684,9 @@ impl Provider for FileProvider {
             self.write_body(&next)?;
             Ok(Lease {
                 holder: next.holder,
-                epoch: next.epoch,
+                epoch: Some(next.epoch),
                 expires_unix: next.expires_unix,
+                expires_monotonic: None,
             })
         })
     }
@@ -616,7 +698,7 @@ impl Provider for FileProvider {
                 // last renew means the file is theirs now. The record
                 // stays, expired: epochs are monotone per lease, so the
                 // next holder must take epoch+1, never a fresh 1.
-                Some(body) if body.holder == lease.holder && body.epoch == lease.epoch => {
+                Some(body) if body.holder == lease.holder && Some(body.epoch) == lease.epoch => {
                     self.write_body(&FileBody {
                         expires_unix: 0.0,
                         ..body
@@ -633,29 +715,123 @@ impl Provider for FileProvider {
     }
 }
 
-// ---------- http provider (stub until AOS-55) ----------
+// ---------- AgenticOS host-bound HTTP provider ----------
 
-/// Placeholder for the company-DO lease. The wire contract lands with
-/// AOS-55; until then the provider exists behind configuration so the
-/// daemon's lease plumbing is complete, but acquire refuses — a daemon
-/// pointed at it fails closed instead of running unleased.
+/// Admission/renewal only: the host has already claimed this container.
+/// Host routing supplies company and instance; request fields cannot claim
+/// another identity. This adapter never revokes that host claim on release.
 struct HttpProvider {
     url: String,
+    ttl: Duration,
+    agent: ureq::Agent,
+    state: Mutex<HttpState>,
+}
+
+#[derive(Default)]
+struct HttpState {
+    deadline: Option<Instant>,
+    lost: Option<String>,
+}
+
+impl HttpProvider {
+    /// Only Spec::parse supplies production URLs. Tests construct an isolated
+    /// loopback peer; no runtime flag or environment variable enables it.
+    fn new(url: String, ttl: Duration) -> Self {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            // Ambient proxy settings must not reroute this identity-bound door.
+            .proxy(None)
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build();
+        Self {
+            url,
+            ttl,
+            agent: config.into(),
+            state: Mutex::new(HttpState::default()),
+        }
+    }
+
+    fn admission(&self, holder: &str, state: &mut HttpState) -> Result<Lease> {
+        if let Some(reason) = &state.lost {
+            return Err(Error::rejected(format!(
+                "host lease permanently fenced: {reason}"
+            )));
+        }
+        let result = self.post_renew(holder, state.deadline);
+        match result {
+            Ok(lease) => {
+                state.deadline = lease.expires_monotonic;
+                Ok(lease)
+            }
+            Err(error) => {
+                // All uncertain outcomes fail closed, matching the daemon's
+                // existing first-renewal-failure policy. A later 204 cannot
+                // revive this provider, especially after a definite stale 409.
+                state.lost = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn post_renew(&self, holder: &str, previous: Option<Instant>) -> Result<Lease> {
+        let started = Instant::now();
+        let remaining = previous
+            .map(|deadline| deadline.saturating_duration_since(started))
+            .unwrap_or(self.ttl);
+        if remaining.is_zero() {
+            return Err(Error::rejected("host lease renewal deadline expired"));
+        }
+        let budget = HTTP_TIMEOUT.min(remaining);
+        let response = self
+            .agent
+            .post(&self.url)
+            .config()
+            .timeout_global(Some(budget))
+            .build()
+            .send_empty()
+            .map_err(|_| Error::rejected("host lease renewal transport failed or timed out"))?;
+        let completed = Instant::now();
+        if completed.duration_since(started) >= budget
+            || previous.is_some_and(|deadline| completed >= deadline)
+        {
+            return Err(Error::rejected(
+                "host lease renewal arrived after its deadline",
+            ));
+        }
+        match response.status().as_u16() {
+            204 => {
+                let deadline = started + self.ttl;
+                Ok(Lease {
+                    holder: holder.to_string(),
+                    epoch: None,
+                    expires_unix: now_unix()
+                        + deadline.saturating_duration_since(completed).as_secs_f64(),
+                    expires_monotonic: Some(deadline),
+                })
+            }
+            409 => Err(Error::rejected("host lease lost (HTTP 409)")),
+            status => Err(Error::rejected(format!(
+                "host lease renewal refused (HTTP {status}; only 204 admits)"
+            ))),
+        }
+    }
 }
 
 impl Provider for HttpProvider {
-    fn acquire(&self, _holder: &str, _epoch_hint: u64) -> Result<Lease> {
-        Err(Error::rejected(format!(
-            "hosted.lease '{}' names the http provider — a stub until the \
-             AOS-55 company-DO contract lands; refusing to start unleased",
-            self.url
-        )))
+    fn acquire(&self, holder: &str, _epoch_hint: u64) -> Result<Lease> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.admission(holder, &mut state)
     }
 
-    fn renew(&self, _lease: &Lease) -> Result<Lease> {
-        Err(Error::rejected(
-            "the http lease provider is a stub (AOS-55 pending)",
-        ))
+    fn renew(&self, lease: &Lease) -> Result<Lease> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.deadline.is_none() {
+            return Err(Error::rejected("host lease has not been admitted"));
+        }
+        // Supplied identity/generation/expiry fields never affect host routing
+        // or the deadline. The provider's admitted deadline is authoritative.
+        self.admission(&lease.holder, &mut state)
     }
 
     fn release(&self, _lease: &Lease) -> Result<()> {
@@ -666,6 +842,9 @@ impl Provider for HttpProvider {
         self.url.clone()
     }
 }
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {
@@ -682,14 +861,14 @@ mod tests {
         let a = FileProvider::new(path.clone(), Duration::from_secs(30));
         let b = FileProvider::new(path, Duration::from_secs(30));
         let la = a.acquire("a", 0).unwrap();
-        assert_eq!(la.epoch, 1);
+        assert_eq!(la.epoch, Some(1));
         // A second live holder is refused.
         let e = b.acquire("b", 0).unwrap_err();
         assert!(e.to_string().contains("held by a"), "{e}");
         // Release frees it for the next writer — epoch moves on.
         a.release(&la).unwrap();
         let lb = b.acquire("b", 0).unwrap();
-        assert_eq!(lb.epoch, 2);
+        assert_eq!(lb.epoch, Some(2));
     }
 
     /// A clock the test advances by hand — expiry cases never wait on
@@ -709,7 +888,7 @@ mod tests {
         *clock.lock().unwrap() = 1_040.0;
         // a never released but its TTL lapsed — b takes over at +1.
         let lb = b.acquire("b", 0).unwrap();
-        assert_eq!(lb.epoch, la.epoch + 1);
+        assert_eq!(lb.epoch, la.epoch.map(|epoch| epoch + 1));
         // The dead holder cannot renew the lease it lost.
         assert!(a.renew(&la).is_err());
     }
@@ -727,7 +906,7 @@ mod tests {
         assert!(next.expires_unix > lease.expires_unix);
         // A forged renewal — right holder name, wrong epoch — fails.
         let mut forged = next.clone();
-        forged.epoch += 1;
+        forged.epoch = forged.epoch.map(|epoch| epoch + 1);
         assert!(a.renew(&forged).is_err());
         // A vanished file fails renewal, not takeover.
         std::fs::remove_file(&path).unwrap();
@@ -787,7 +966,7 @@ mod tests {
         // The lease record is gone but this daemon wrote epoch 41 last
         // time — the next grant cannot collide with it.
         let lb = a.acquire("a", 42).unwrap();
-        assert_eq!(lb.epoch, 42);
+        assert_eq!(lb.epoch, Some(42));
     }
 
     #[test]
@@ -799,20 +978,23 @@ mod tests {
             Spec::File(p) if p == Path::new("/tmp/l.json")
         ));
         assert!(matches!(
-            Spec::parse("https://lease.example/x").unwrap(),
-            Spec::Http(u) if u == "https://lease.example/x"
+            Spec::parse("http://lease.internal").unwrap(),
+            Spec::Http(u) if u == HOST_RENEW_URL
         ));
         assert!(Spec::parse("file:").is_err());
         assert!(Spec::parse("socket:/x").is_err());
     }
 
     #[test]
-    fn http_provider_refuses_closed() {
-        let p = HttpProvider {
-            url: "https://do.example/lease".into(),
+    fn foreign_http_endpoint_refuses_before_state_writes() {
+        let dir = dir();
+        let hosted = Hosted {
+            lease: Some("https://do.example/lease".into()),
+            ..Hosted::default()
         };
-        let e = p.acquire("h", 0).unwrap_err();
-        assert!(e.to_string().contains("AOS-55"), "{e}");
+        let e = acquire(dir.path(), &hosted).err().unwrap();
+        assert!(e.to_string().contains("lease.internal"), "{e}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -857,7 +1039,7 @@ mod tests {
             flush_timeout_secs: Some(3),
         };
         let ctl = acquire(&state, &hosted).unwrap().unwrap();
-        assert_eq!(ctl.epoch(), 1);
+        assert_eq!(ctl.epoch(), Some(1));
         assert!(state.join("lease-epoch").is_file());
         assert_eq!(ctl.renew_every, Duration::from_secs(1));
         // renew >= ttl is refused, not clamped into uselessness.

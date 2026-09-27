@@ -38,7 +38,7 @@ impl Shared {
     /// is refused from here on.
     fn trip_lease(&self, why: String) {
         self.store.fence_writes(why.clone());
-        let epoch = self.lease.as_ref().map(|l| l.epoch()).unwrap_or(0);
+        let epoch = self.lease.as_ref().and_then(|l| l.epoch());
         let fact = json!({"reason": why, "epoch": epoch, "at": epoch_secs()});
         let _ = std::fs::write(
             self.state_dir.join("lease-fence.json"),
