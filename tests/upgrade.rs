@@ -206,6 +206,7 @@ struct Fake {
     auth_ok: bool,
     on_main: OnMain,
     test_conclusion: &'static str,
+    test_jobs: Option<Vec<Job>>,
     artifact: ArtifactState,
     attestation_ok: bool,
     /// `compare(resolved, linked)` answers `ahead`: the resolved sha is
@@ -226,6 +227,7 @@ impl Fake {
             auth_ok: true,
             on_main: OnMain::Yes,
             test_conclusion: "success",
+            test_jobs: None,
             artifact: ArtifactState::Present,
             attestation_ok: true,
             backwards: false,
@@ -308,6 +310,9 @@ impl ReleaseSource for Fake {
     }
     fn jobs(&self, run_id: u64) -> Result<Vec<Job>> {
         self.log("jobs");
+        if let Some(jobs) = &self.test_jobs {
+            return Ok(jobs.clone());
+        }
         let test = if run_id == PUSH_RUN {
             self.test_conclusion
         } else {
@@ -641,6 +646,70 @@ fn refuses_when_test_job_did_not_pass() {
 }
 
 // ---- CAD-409: a queued merge's merge_group run is the test evidence ----
+
+#[test]
+fn cad420_refuses_any_non_success_test_name_collision() {
+    let e = env();
+    for (status, conclusion) in [
+        ("completed", "failure"),
+        ("completed", "cancelled"),
+        ("completed", "skipped"),
+        ("in_progress", "success"),
+        ("queued", ""),
+    ] {
+        for bad_first in [false, true] {
+            let mut fake = Fake::new(&e.artifact);
+            let good = Job {
+                name: "test".into(),
+                status: "completed".into(),
+                conclusion: "success".into(),
+            };
+            let bad = Job {
+                name: "test".into(),
+                status: status.into(),
+                conclusion: conclusion.into(),
+            };
+            fake.test_jobs = Some(if bad_first {
+                vec![bad, good]
+            } else {
+                vec![good, bad]
+            });
+            let msg = refusal(upgrade::run(
+                &fake,
+                &e.layout,
+                &req(Target::Sha(SHA.into()), false),
+            ));
+            assert!(msg.contains("`test` job has not passed"), "{msg}");
+            assert!(!fake.called("download"));
+            assert_untouched(&e);
+        }
+    }
+}
+
+#[test]
+fn cad420_requires_test_job_but_all_success_collisions_are_valid() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    fake.test_jobs = Some(vec![]);
+    let msg = refusal(upgrade::run(
+        &fake,
+        &e.layout,
+        &req(Target::Sha(SHA.into()), false),
+    ));
+    assert!(msg.contains("no `test` job"), "{msg}");
+    assert!(!fake.called("download"));
+    assert_untouched(&e);
+    fake.test_jobs = Some(vec![
+        Job {
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: "success".into(),
+        };
+        2
+    ]);
+    assert!(upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).is_ok());
+    assert!(fake.called("download"));
+}
 
 #[test]
 fn cad409_accepts_merge_group_test_evidence_for_the_exact_sha() {
