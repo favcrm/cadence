@@ -6,7 +6,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -26,6 +28,23 @@ def index_fingerprint(repo):
         return (None, None)
     info = index.stat()
     return (hashlib.sha256(index.read_bytes()).hexdigest(), info.st_mtime_ns)
+
+
+def git_inventory(repo):
+    """Whole metadata identity; never follow a symlink into a foreign store."""
+    root = Path(repo) / '.git'
+    result = {}
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            pending.extend(path.iterdir())
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else None
+        link = os.readlink(path) if stat.S_ISLNK(info.st_mode) else None
+        result[str(path.relative_to(root))] = (info.st_mode, info.st_uid, info.st_nlink,
+                                               info.st_mtime_ns, info.st_size, digest, link)
+    return result
 
 
 class MigrationTests(unittest.TestCase):
@@ -348,7 +367,7 @@ class MigrationTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
                        ['nested', str(inner)])
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'gitfile or symlinked gitdir is unsupported'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -362,7 +381,7 @@ class MigrationTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
                        ['ancestor', str(sub)])
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'outside ancestor'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -383,7 +402,7 @@ class MigrationTests(unittest.TestCase):
                        ['nested', str(inner)])
         # The escape is real: unguarded, the remote read returns the token.
         self.assertEqual(self.git(inner, 'remote', 'get-url', 'origin'), TOKEN_REMOTE)
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'common directories and object alternates are unsupported'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -400,7 +419,7 @@ class MigrationTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
                        ['nested', str(inner)])
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'common directories and object alternates are unsupported'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -413,7 +432,7 @@ class MigrationTests(unittest.TestCase):
         fake = self.root / 'fake-tracker'
         fake.mkdir()
         (fake / '.git').write_text(f'gitdir: {outside}/.git\n')
-        with self.assertRaisesRegex(ValueError, 'escapes its own root'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'gitfile or symlinked gitdir is unsupported'):
             migration.rehearse('/usr/bin/true', self.source, fake,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -428,7 +447,7 @@ class MigrationTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
                        ['nested', str(inner)])
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'symlinked, linked or special repository metadata is unsupported'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -446,7 +465,7 @@ class MigrationTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
                        ['nested', str(inner)])
-        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+        with self.assertRaisesRegex(migration.UnsupportedGitLayout, 'common directories and object alternates are unsupported'):
             migration.rehearse('/usr/bin/true', self.source, self.tracker,
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
@@ -579,6 +598,180 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['mode'], 'dry-run')
         self.assertFalse((self.root / 'out').exists())
+
+    # ---------- pre-Git storage/config admission ----------
+
+    def test_config_only_split_index_does_not_create_live_sharedindex(self):
+        self.git(self.tracker, 'config', 'core.splitIndex', 'true')
+        self.assertFalse(list((self.tracker / '.git').glob('sharedindex.*')))
+        self.live_shaped()
+        before = git_inventory(self.tracker)
+        migration.clean_tracker(self.iso, self.tracker)
+        self.assertEqual(git_inventory(self.tracker), before)
+        # Counterfactual: real ordinary Git creates the live shared index.
+        self.git(self.tracker, 'status', '--porcelain')
+        self.assertTrue(list((self.tracker / '.git').glob('sharedindex.*')))
+        self.assertNotEqual(git_inventory(self.tracker), before)
+
+    def test_config_and_pack_escapes_refuse_before_repository_git(self):
+        for context in ('tracker', 'recorded_path'):
+            for layout in ('config_symlink', 'config_include', 'pack_directory', 'pack_file'):
+                with self.subTest(context=context, layout=layout):
+                    f = MigrationTests()
+                    f.setUp()
+                    self.addCleanup(f.doCleanups)
+                    repo = f.tracker if context == 'tracker' else f.make_repo(f.source / 'inner')
+                    gitdir = repo / '.git'
+                    outside = f.root / 'outside-metadata'
+                    if layout.startswith('config'):
+                        outside.write_text((gitdir / 'config').read_text() +
+                                           f'\n[remote "origin"]\n url = {TOKEN_REMOTE}\n')
+                        if layout == 'config_symlink':
+                            (gitdir / 'config').unlink()
+                            (gitdir / 'config').symlink_to(outside)
+                        else:
+                            with (gitdir / 'config').open('a') as config:
+                                config.write(f'\n[include]\n path = {outside}\n')
+                        # Actual Git resolves the outside credentialed config.
+                        self.assertEqual(f.git(repo, 'remote', 'get-url', 'origin'), TOKEN_REMOTE)
+                    else:
+                        sha = f.git(repo, 'rev-parse', 'HEAD')
+                        f.git(repo, 'gc', '--prune=now')
+                        pack = gitdir / 'objects' / 'pack'
+                        if layout == 'pack_directory':
+                            shutil.move(str(pack), outside)
+                            pack.symlink_to(outside, target_is_directory=True)
+                        else:
+                            packed = next(pack.glob('*.pack'))
+                            shutil.move(str(packed), outside)
+                            packed.symlink_to(outside)
+                        # Object reach witness, separate from monitored rehearsal.
+                        self.assertEqual(f.git(repo, 'cat-file', '-t', sha), 'commit')
+                    if context == 'recorded_path':
+                        with sqlite3.connect(f.db) as db:
+                            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('bad', str(repo)))
+                    before = git_inventory(repo)
+                    calls = []
+                    real = subprocess.run
+                    def observed(args, *a, **kw):
+                        calls.append(tuple(str(arg) for arg in args))
+                        return real(args, *a, **kw)
+                    with patch.object(migration.subprocess, 'run', side_effect=observed):
+                        with self.assertRaisesRegex(ValueError, 'unsupported'):
+                            migration.rehearse('/usr/bin/true', f.source, f.tracker,
+                                               f.root / 'out', dry_run=True)
+                    self.assertFalse(any('-C' in call and call[call.index('-C') + 1] == str(repo)
+                                         for call in calls), calls)
+                    self.assertEqual(git_inventory(repo), before)
+                    self.assertFalse((f.root / 'out').exists())
+
+    def test_quoted_and_symlinked_alternates_refuse_before_foreign_python_read(self):
+        for layout in ('quoted', 'alternates_symlink', 'info_symlink'):
+            with self.subTest(layout=layout):
+                f = MigrationTests()
+                f.setUp()
+                self.addCleanup(f.doCleanups)
+                outside = f.make_repo(f.root / 'foreign-store')
+                blob = f.git(outside, 'rev-parse', 'HEAD:README.md')
+                inner = f.make_repo(f.source / 'inner')
+                absent = subprocess.run(['git', '-C', str(inner), 'cat-file', '-t', blob], capture_output=True)
+                self.assertNotEqual(absent.returncode, 0, 'foreign-only witness already local')
+                info = inner / '.git/objects/info'
+                alternate = info / 'alternates'
+                canary = f.root / 'outside-alternates'
+                if layout == 'quoted':
+                    alternate.write_text(json.dumps(str(outside / '.git/objects')) + '\n')
+                elif layout == 'alternates_symlink':
+                    canary.write_text(str(outside / '.git/objects') + '\n')
+                    alternate.symlink_to(canary)
+                else:
+                    shutil.move(str(info), canary)
+                    (canary / 'alternates').write_text(str(outside / '.git/objects') + '\n')
+                    info.symlink_to(canary, target_is_directory=True)
+                self.assertEqual(f.git(inner, 'cat-file', '-t', blob), 'blob')
+                with sqlite3.connect(f.db) as db:
+                    db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('bad', str(inner)))
+                before = git_inventory(inner)
+                reads = []
+                real = Path.read_text
+                def read(path, *a, **kw):
+                    if path.resolve().is_relative_to(canary.resolve()):
+                        reads.append(str(path))
+                    return real(path, *a, **kw)
+                with patch.object(Path, 'read_text', read):
+                    with self.assertRaisesRegex(ValueError, 'unsupported'):
+                        migration.rehearse('/usr/bin/true', f.source, f.tracker,
+                                           f.root / 'out', dry_run=True)
+                self.assertEqual(reads, [], 'outside Python canary was read before refusal')
+                self.assertEqual(git_inventory(inner), before)
+
+    def test_central_git_and_clone_admit_before_spawn(self):
+        config = self.tracker / '.git/config'
+        outside = self.root / 'outside-config'
+        outside.write_text(config.read_text())
+        config.unlink()
+        config.symlink_to(outside)
+        with patch.object(migration.subprocess, 'run', side_effect=AssertionError('Git must not spawn')):
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                self.iso.run('git', '-C', str(self.tracker), 'rev-parse', 'HEAD')
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                self.iso.run('git', 'clone', str(self.tracker), str(self.root / 'clone'))
+
+    def test_path_command_and_includeif_config_refuse_before_repository_git(self):
+        config = self.tracker / '.git/config'
+        initial = config.read_text()
+        settings = [f'[core]\n {key} = /external/never-read-or-execute\n'
+                    for key in ('worktree', 'hooksPath', 'attributesFile', 'fsmonitor')]
+        settings.append('[includeIf "gitdir:/tmp/"]\n path = /external/never-read\n')
+        for setting in settings:
+            with self.subTest(setting=setting):
+                config.write_text(initial + '\n' + setting)
+                calls = []
+                real = subprocess.run
+                def observed(args, *a, **kw):
+                    calls.append(tuple(args))
+                    return real(args, *a, **kw)
+                with patch.object(migration.subprocess, 'run', side_effect=observed):
+                    with self.assertRaisesRegex(ValueError, 'unsupported|allowlist'):
+                        self.iso.run('git', '-C', str(self.tracker), 'rev-parse', 'HEAD')
+                self.assertEqual(len(calls), 1)
+                self.assertIn('--no-includes', calls[0])
+                self.assertNotIn('-C', calls[0])
+
+    def test_missing_recorded_file_cannot_discover_an_outside_ancestor(self):
+        self.make_repo(self.root, remote=TOKEN_REMOTE)
+        plain = self.source / 'plain'
+        plain.mkdir()
+        missing = plain / 'deleted-spec.md'
+        self.assertEqual(self.git(plain, 'rev-parse', '--absolute-git-dir'), str(self.root / '.git'))
+        self.assertEqual(self.git(plain, 'remote', 'get-url', 'origin'), TOKEN_REMOTE)
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('bad', str(missing)))
+        with patch.object(migration.subprocess, 'run', side_effect=AssertionError('Git must not spawn')):
+            with self.assertRaisesRegex(ValueError, 'outside ancestor'):
+                migration.refuse_foreign_checkouts(self.db, (self.source, self.tracker), self.iso)
+
+    def test_metadata_hooks_hardlinks_and_inventory_bound_refuse_before_git(self):
+        gitdir = self.tracker / '.git'
+        hook = gitdir / 'hooks/post-checkout'
+        hook.write_text('#!/bin/sh\nexit 71\n')
+        with patch.object(migration.subprocess, 'run', side_effect=AssertionError('Git must not spawn')):
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                migration.clean_tracker(self.iso, self.tracker)
+        hook.unlink()
+        hardlink = self.root / 'config-hardlink'
+        os.link(gitdir / 'config', hardlink)
+        with patch.object(migration.subprocess, 'run', side_effect=AssertionError('Git must not spawn')):
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                migration.clean_tracker(self.iso, self.tracker)
+        hardlink.unlink()
+        bounded = gitdir / 'bounded'
+        bounded.mkdir()
+        for number in range(10001):
+            (bounded / str(number)).touch()
+        with patch.object(migration.subprocess, 'run', side_effect=AssertionError('Git must not spawn')):
+            with self.assertRaisesRegex(ValueError, 'too large'):
+                migration.clean_tracker(self.iso, self.tracker)
 
     # ---------- real CLI ----------
 
