@@ -737,6 +737,11 @@ fn agenticos_detached_enrolled_child_cannot_forge_operator_grant_authority() {
         err.to_string().contains("operator") || err.to_string().contains("refused"),
         "{err}"
     );
+    let forged = lane.rpc_with_prefix(&d, "platform_grant", json!({"agent":"aos-detached-worker","platform":"agenticos","account":"hosted","scopes":["publish"],"by":"operator"}), "setsid ").unwrap_err();
+    assert!(
+        forged.to_string().contains("'by' is not accepted"),
+        "{forged}"
+    );
     assert!(lane.rpc_with_prefix(&d, "platform_call", json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello"),"agent":"operator"}), "setsid ").is_err());
     assert_eq!(
         door.state.lock().unwrap().requests.load(Ordering::SeqCst),
@@ -777,7 +782,13 @@ fn concurrent_agenticos_rpc_calls_and_actual_daemon_restart_share_the_durable_ro
             );
         }
     });
-    d = d.restart(Arc::new(AgenticosAdapter::new(&door.base).unwrap()));
+    d = d.restart(Arc::new(
+        AgenticosAdapter::with_deployment_pin(
+            &door.base,
+            Some("agenticos-manifest@1/publish_post@2"),
+        )
+        .unwrap(),
+    ));
     let result = first.rpc(&d, "platform_call", call).unwrap();
     assert_eq!(result["platform_result"]["verified"], "unknown");
     assert_eq!(
@@ -801,7 +812,13 @@ fn pending_rpc_handoff_rechecks_approval_after_actual_daemon_restart() {
         assert_eq!(door.state.lock().unwrap().records.len(), 1);
         // The upstream owner changes approval; the caller's scoped identity stays the same.
         door.state.lock().unwrap().script = decision;
-        d = d.restart(Arc::new(AgenticosAdapter::new(&door.base).unwrap()));
+        d = d.restart(Arc::new(
+            AgenticosAdapter::with_deployment_pin(
+                &door.base,
+                Some("agenticos-manifest@1/publish_post@2"),
+            )
+            .unwrap(),
+        ));
         let second = agent.rpc(&d, "platform_call", call).unwrap();
         assert_eq!(
             second["platform_result"]["platform_ref"],
