@@ -361,14 +361,14 @@ impl Pm {
         // makes — a reader can order writes across restarts and
         // holdovers. The trailer joins the closing block directly, or
         // starts one after a blank line when the message ends bare.
-        let message = match &self.lease {
-            Some(lease) => {
+        let message = match self.lease.as_ref().and_then(|lease| lease.epoch()) {
+            Some(epoch) => {
                 let body = message.trim_end_matches('\n');
                 let trailer_shaped = body.rsplit('\n').next().is_some_and(|l| l.contains(": "));
                 format!(
                     "{body}{}Lease-Epoch: {}\n",
                     if trailer_shaped { "\n" } else { "\n\n" },
-                    lease.epoch()
+                    epoch
                 )
             }
             None => message,
@@ -418,8 +418,8 @@ impl Pm {
             return Ok(false);
         }
         let mut message = format!("cadence flush on stop\n\nActor: {actor}\n");
-        if let Some(lease) = &self.lease {
-            message.push_str(&format!("Lease-Epoch: {}\n", lease.epoch()));
+        if let Some(epoch) = self.lease.as_ref().and_then(|lease| lease.epoch()) {
+            message.push_str(&format!("Lease-Epoch: {epoch}\n"));
         }
         git(
             &self.dir,

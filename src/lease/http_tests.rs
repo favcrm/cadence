@@ -65,9 +65,7 @@ impl Peer {
     }
 
     fn provider(&self) -> HttpProvider {
-        HttpProvider {
-            url: self.url.clone(),
-        }
+        HttpProvider::new(self.url.clone(), HOST_TTL)
     }
 
     fn request(&self) -> String {
@@ -99,6 +97,7 @@ fn cad673_first204_admits_and_wire_has_no_identity_fields() {
     let held = provider
         .acquire("forged-company:foreign-instance:token", 998)
         .unwrap();
+    assert_eq!(held.epoch, None, "forged response generation accepted");
     provider.renew(&held).unwrap();
     for _ in 0..2 {
         let request = peer.request().to_ascii_lowercase();
@@ -221,4 +220,142 @@ fn cad673_stale409_cannot_be_reacquired_by_same_provider() {
             .is_err(),
         "fenced provider contacted host again"
     );
+}
+
+#[test]
+fn cad673_forged_expiry_cannot_restore_expired_host_lease() {
+    let peer = Peer::new(vec![reply(204, "", ""), reply(204, "", "")], Duration::ZERO);
+    let provider = peer.provider();
+    let mut lease = provider.acquire("h", 0).unwrap();
+    peer.request();
+    // Deterministically expire the authoritative clock without sleeping.
+    provider.state.lock().unwrap().deadline = Some(Instant::now() - Duration::from_secs(1));
+    lease.expires_monotonic = Some(Instant::now() + Duration::from_secs(600));
+    lease.expires_unix = now_unix() + 600.0;
+    lease.epoch = Some(999);
+    lease.holder = "foreign-company:other-instance".into();
+    assert!(provider.renew(&lease).is_err());
+    assert!(peer
+        .requests
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+}
+
+#[test]
+fn cad673_late204_cannot_revive_expired_admission() {
+    let peer = Peer::new(vec![reply(204, "", "")], Duration::from_millis(200));
+    let provider = HttpProvider::new(peer.url.clone(), Duration::from_millis(75));
+    assert!(provider.acquire("h", 0).is_err());
+    peer.request();
+    assert!(provider.acquire("forged", 999).is_err());
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args),
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn cad673_host_generation_absent_and_shared_writes_fenced() {
+    let peer = Peer::new(
+        vec![reply(204, "X-Lease-Epoch: 999\r\n", ""), reply(409, "", "")],
+        Duration::ZERO,
+    );
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    // Existing file-generation history must not be replaced by a fabricated
+    // host generation, or lost if this state later returns to a file provider.
+    std::fs::write(state.join("lease-epoch"), "41\n").unwrap();
+    let ctl = start_lease(
+        &state,
+        Box::new(peer.provider()),
+        HOST_RENEW_URL.into(),
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(ctl.epoch(), None);
+    assert_eq!(ctl.pm_lease().epoch(), None);
+    assert!(ctl.status_json()["epoch"].is_null());
+    assert_eq!(ctl.status_json()["epoch_available"], false);
+    assert_eq!(
+        std::fs::read_to_string(state.join("lease-epoch")).unwrap(),
+        "41\n"
+    );
+    let store = Arc::new(crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap());
+    store.install_write_fence(ctl.fence());
+    store.event_public("worker", "before", json!({})).unwrap();
+    let pm_dir = dir.path().join("pm");
+    let mut pm = crate::issue::Pm::init(&pm_dir).unwrap();
+    pm.attach_lease(ctl.pm_lease());
+    let note = pm_dir.join("note.md");
+    std::fs::write(&note, "admitted\n").unwrap();
+    pm.commit(std::slice::from_ref(&note), "host write\n")
+        .unwrap();
+    assert!(!git(&pm_dir, &["log", "-1", "--format=%B"]).contains("Lease-Epoch:"));
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    pm.flush_pending("test").unwrap();
+    assert!(!git(&pm_dir, &["log", "-1", "--format=%B"]).contains("Lease-Epoch:"));
+    let before = git(&pm_dir, &["rev-parse", "HEAD"]);
+    assert!(ctl.renew().is_err());
+    assert!(ctl.fence().tripped());
+    assert!(ctl.renew().is_err(), "a second renewal revived the fence");
+    let writers: Vec<_> = (0..4)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                store.event_public("worker", "after", json!({"forged_epoch": 999, "caller": i}))
+            })
+        })
+        .collect();
+    for writer in writers {
+        assert!(writer.join().unwrap().is_err());
+    }
+    assert_eq!(store.events("worker", 0, 100).unwrap().len(), 1);
+    std::fs::write(&note, "refused\n").unwrap();
+    assert!(pm
+        .commit(std::slice::from_ref(&note), "forged\nLease-Epoch: 999\n")
+        .is_err());
+    assert!(pm.lock().is_err());
+    assert!(pm.try_lock().is_err());
+    assert!(pm.flush_pending("test").is_err());
+    assert_eq!(git(&pm_dir, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(&pm_dir, &["diff", "--cached", "--name-only"]), "");
+}
+
+#[test]
+fn cad673_monotonic_deadline_controls_host_write_fence() {
+    let fence = Fence::default();
+    fence.set_expiry(now_unix() + 600.0);
+    *fence.expires_monotonic.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+    assert!(fence.check().unwrap().contains("deadline expired"));
+}
+
+#[test]
+fn cad673_host_ttl_cannot_exceed_bridge_policy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let hosted = Hosted {
+        lease: Some("http://lease.internal".into()),
+        lease_ttl_secs: Some(30),
+        ..Hosted::default()
+    };
+    assert!(acquire(dir.path(), &hosted)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("6s"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
