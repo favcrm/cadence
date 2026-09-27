@@ -128,12 +128,13 @@ const render = async (
   operator = true,
   boardReadOnly = false,
   signedIn = operator,
+  sessionId = "session-a",
 ) => {
   // The original component has no viewer input; keeping the baseline compilable proves its missing guard.
   await React.act(async () =>
     root.render(
       React.createElement(Permissions as React.ComponentType<any>, {
-        viewer: { readOnly, operator, boardReadOnly, signedIn },
+        viewer: { readOnly, operator, boardReadOnly, signedIn, sessionId },
       }),
     ),
   );
@@ -144,6 +145,7 @@ const fresh = async (
   operator = true,
   boardReadOnly = false,
   signedIn = operator,
+  sessionId = "session-a",
 ) => {
   await React.act(async () => root.unmount());
   root = createRoot(host);
@@ -152,7 +154,7 @@ const fresh = async (
   readCode = 503;
   reads = 0;
   gets.length = posts.length = 0;
-  await render(readOnly, operator, boardReadOnly, signedIn);
+  await render(readOnly, operator, boardReadOnly, signedIn, sessionId);
 };
 const revoke = (id: string) =>
   host.querySelector(`[data-rule="${id}"] button`) as HTMLButtonElement;
@@ -246,8 +248,55 @@ async function main() {
     await click(button("Refresh rules"));
     assert(
       text().includes("Operator read permission required") &&
-        revoke("allow/a").disabled,
-      "A server-refused read-only session cannot infer access or enable writes",
+        host.querySelectorAll("[data-rule]").length === 0 &&
+        !text().includes("/workspace/site"),
+      "A protected-read 403 hides previously loaded rules",
+    );
+    fail = false;
+    await click(button("Retry rules"));
+    assert(
+      host.querySelectorAll("[data-rule]").length === 2,
+      "Fresh protected read can recover after authorization refusal",
+    );
+    fail = true;
+    readCode = 401;
+    await click(button("Refresh rules"));
+    assert(
+      host.querySelectorAll("[data-rule]").length === 0 &&
+        !text().includes("/workspace/site"),
+      "A protected-read401 also clears protected data",
+    );
+    await fresh(true, false, true, true);
+    hold = true;
+    await click(button("Refresh rules"));
+    const firstA = gets.at(-1)!;
+    await render(true, false, true, true, "session-b");
+    const firstB = gets.at(-1)!;
+    assert(
+      !text().includes("/workspace/site"),
+      "Same-boolean readonly session change immediately hides prior rows",
+    );
+    await render(true, false, true, true, "session-a");
+    const newestA = gets.at(-1)!;
+    newestA.resolve(
+      json({
+        rules: [{ ...sample()[0], by: "fresh session A" }],
+        requests: [],
+      }),
+    );
+    await flush();
+    firstB.resolve(
+      json({ rules: [{ ...sample()[0], by: "old session B" }], requests: [] }),
+    );
+    firstA.resolve(
+      json({ rules: [{ ...sample()[0], by: "old session A" }], requests: [] }),
+    );
+    await flush();
+    assert(
+      text().includes("fresh session A") &&
+        !text().includes("old session A") &&
+        !text().includes("old session B"),
+      "Readonly A→B→A identity changes invalidate both old request lifetimes",
     );
     await fresh(true);
     assert(revoke("allow/a").disabled, "Read-only operator cannot revoke");

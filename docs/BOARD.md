@@ -1650,7 +1650,9 @@ requesting the list. The metadata operator flag reports write capability and is
 false on a read-only board; the existing protected GET still proves the caller's
 operator read permission on the HTTP/RPC path. A signed-in read-only member can
 be refused by that proof, with a retryable error and no write controls. Access
-loss hides data and invalidates pending reads, including after access recovery. Labelled local
+loss or a protected-read 401/403 hides data and invalidates pending reads;
+changing the metadata session ID starts a fresh lifetime even when sign-in
+booleans remain the same. Transient failures alone retain last-known rules. Labelled local
 search and effect/match filters retain complete command arguments, working
 folders and saved provenance; native disclosures show the exact rule ID and
 argument arrays. Exact commands and argument patterns both require the saved

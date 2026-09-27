@@ -18,6 +18,7 @@ type Viewer = {
   readOnly: boolean;
   boardReadOnly: boolean;
   signedIn: boolean;
+  sessionId: string | null;
 };
 const errorText = (error: unknown) =>
   error instanceof ApiError ? error.message : String(error);
@@ -220,8 +221,20 @@ function RuleWorkspace({
       setRules(next.rules);
       setReadError(null);
     } catch (error) {
-      if (alive.current && request.current === id)
+      if (alive.current && request.current === id) {
+        if (
+          error instanceof ApiError &&
+          (error.status === 401 || error.status === 403)
+        ) {
+          // Authorization refusal ends the protected observation; only a
+          // transient failure may retain last-known rules.
+          setRules(null);
+          setNotice(null);
+          setActionError(null);
+          setConfirm(null);
+        }
         setReadError(errorText(error));
+      }
     } finally {
       if (alive.current && request.current === id) setFetching(false);
     }
@@ -467,7 +480,10 @@ export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
       </header>
       {viewer.operator || (viewer.boardReadOnly && viewer.signedIn) ? (
         <RuleWorkspace
-          key={viewer.operator ? "operator" : "readonly-session"}
+          key={JSON.stringify([
+            viewer.sessionId,
+            viewer.operator ? "operator" : "readonly-session",
+          ])}
           readOnly={viewer.readOnly || !viewer.operator}
           flight={{ busy, begin, finish }}
         />
