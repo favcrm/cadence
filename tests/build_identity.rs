@@ -20,7 +20,7 @@ impl Checkout {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         std::fs::create_dir(&root).unwrap();
-        let this = Self { temp: temp, root };
+        let this = Self { _temp: temp, root };
         this.run(&["init", "--initial-branch=main"]);
         this.commit("initial");
         this
