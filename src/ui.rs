@@ -44,6 +44,7 @@ mod home;
 mod lane;
 mod login;
 mod operator;
+mod platform_account;
 mod read_model;
 mod stages;
 mod threads;
@@ -2868,17 +2869,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
                 .then(|| home::operator_viewer(&request, state_dir, opts));
             let session = operator::meta(&request, state_dir, opts);
+            // Display the same verified identity that attributes public
+            // board writes, never a name supplied by request fields.
+            let actor = serde_json::from_value::<crate::operator_auth::BoardUser>(
+                session["session"]["user"].clone(),
+            )
+            .map(|user| user.actor())
+            .unwrap_or(actor);
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
                     "signed_in": session["signed_in"],
+                    "hosted": session["hosted"],
                     "session": session["session"],
                     "login_hint": session["login_hint"],
                     "tab_signed_out": session["tab_signed_out"],
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
                     "operator": operator,
+                    "platform_account_configured": opts.public.as_ref().is_some_and(|board| board.issuer == "http://api.internal"),
                     "tailnet_url": opts
                         .tailnet
                         .as_ref()
@@ -2899,6 +2909,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/platform-account" => send(request, platform_account::get(opts)),
         // The serving binary's build id and nothing else — cheap, and
         // unauthenticated like `/api/health`, so a tab whose stream is
         // stuck reconnecting can compare it against its own bundle's.

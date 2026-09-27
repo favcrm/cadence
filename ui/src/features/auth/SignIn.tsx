@@ -10,6 +10,8 @@ import { closeSession } from "./session";
  */
 export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange: () => void }) {
   const [busy, setBusy] = useState(false);
+  const user = meta?.session?.user;
+  const identity = user ? `${user.name || user.email} · ${user.role}` : "operator";
   if (!meta || meta.read_only || meta.signed_in === undefined) return null;
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
@@ -39,9 +41,9 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
           });
       }}
       className="chip bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
-      title={`Signed in as the operator${meta.session ? ` (session ${meta.session.id})` : ""} — click to sign out`}
+      title={`Signed in as ${user ? `${user.name} <${user.email}> · ${user.role}` : "the operator"}${meta.session ? ` (session ${meta.session.id})` : ""} — click to sign out`}
     >
-      <span className="hidden sm:inline">operator ·&nbsp;</span>sign out
+      <span className="max-w-[12rem] truncate">{identity}</span><span className="hidden sm:inline"> · sign out</span>
     </button>
   );
 }

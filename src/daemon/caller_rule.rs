@@ -617,6 +617,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "wiki_history",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
+    // CAD-129: submitting a test run is a mutation attributed to the
+    // caller. Reading a job, its log, or the queue is not.
+    (
+        "test_submit",
+        Rule::Attributed {
+            field: "by",
+            default: Some("operator"),
+        },
+    ),
+    ("test_status", Rule::Read),
+    ("test_log", Rule::Read),
+    ("test_queue", Rule::Read),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not

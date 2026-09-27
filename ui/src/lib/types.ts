@@ -817,13 +817,15 @@ export interface AgentDetail {
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
 export interface Meta {
+  platform_account_configured?: boolean;
   read_only: boolean;
   /** CAD-313: this browser holds a live operator session. Absent on a
    *  server that predates sessions. */
   signed_in?: boolean;
   session?: {
     id: string;
-    origin: "loopback" | "tailnet";
+    origin: "loopback" | "tailnet" | "public";
+    user?: { sub: string; name: string; email: string; role: "operator" | "member"; handle: string } | null;
     created: number;
     last_used: number;
     idle_expires_at: number;
@@ -836,6 +838,8 @@ export interface Meta {
    *  session key — a new tab: each tab signs in on its own. */
   tab_signed_out?: boolean;
   actor: string;
+  /** Served through a configured public board name, not inferred from URL. */
+  hosted?: boolean;
   /** CAD-432 (only with `?operator=1`): this client may make the
    *  operator's decisions — a live session (CAD-313) plus the board's
    *  operator proof on the peer and on the board process. */
