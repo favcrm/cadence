@@ -228,6 +228,13 @@ impl Store {
 
 impl Store {
     pub fn app_run_create(&self, request: LocalRunRequest<'_>) -> Result<Value> {
+        self.app_run_create_with_context(request, None)
+    }
+    pub fn app_run_create_with_context(
+        &self,
+        request: LocalRunRequest<'_>,
+        context: Option<&super::app_contexts::ContextProof>,
+    ) -> Result<Value> {
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -240,6 +247,9 @@ impl Store {
         crate::proto::identifier(request_id, "app run request ID")?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        if let Some(proof) = context {
+            Self::app_context_proof_current_in(&tx, install_id, proof)?;
+        }
         let epoch:i64=tx.query_row("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
         let owner = self.agent_in(&tx, owner_pm)?;
         if owner.role != "pm" {
@@ -278,7 +288,12 @@ impl Store {
             }
             assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::agent_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
         }
-        let snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
+        let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
+        if let Some(proof) = context {
+            snapshot["schema"] = json!(2);
+            snapshot["context"] =
+                json!({"id":proof.id,"revision":proof.revision,"digest":proof.digest});
+        }
         let digest = material_digest(&snapshot);
         if let Some((id, existing)) = tx
             .query_row(
@@ -300,7 +315,7 @@ impl Store {
         let id = format!("run-{}", uuid::Uuid::new_v4().simple());
         tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
         tx.execute(
-            "INSERT INTO app_runs VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?)",
+            "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,project_link,owner_pm,request_id,state,approved_digest,created,updated,context_id) VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?,?)",
             params![
                 id,
                 install_id,
@@ -312,7 +327,8 @@ impl Store {
                 owner_pm,
                 request_id,
                 now(),
-                now()
+                now(),
+                context.map(|proof|proof.id.as_str())
             ],
         )?;
         for step in &workflow.steps {
@@ -348,18 +364,37 @@ impl Store {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
             .map_err(|e| Error::internal(e.to_string()))?;
+        value["context_id"] = json!(conn.query_row(
+            "SELECT context_id FROM app_runs WHERE id=?",
+            [id],
+            |r| r.get::<_, Option<String>>(0)
+        )?);
         value["steps"]=Value::Array(conn.prepare("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
         value["artifacts"]=Value::Array(conn.prepare("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
         value["reviews"]=Value::Array(conn.prepare("SELECT step_id,artifact_digest,reviewer,decision,rationale FROM app_run_reviews WHERE run_id=?")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
         Ok(value)
     }
     pub fn app_run_list(&self, install_id: Option<&str>) -> Result<Value> {
+        self.app_run_list_filtered(install_id, None)
+    }
+    pub fn app_run_list_filtered(
+        &self,
+        install_id: Option<&str>,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
+        if let Some(context) = context_id {
+            self.app_context_show(
+                install_id
+                    .ok_or_else(|| Error::rejected("context run filter requires installation"))?,
+                context,
+            )?;
+        }
         let ids = self
             .conn()
             .prepare(
-                "SELECT id FROM app_runs WHERE (?1 IS NULL OR install_id=?1) ORDER BY created",
+                "SELECT id FROM app_runs WHERE (?1 IS NULL OR install_id=?1) AND (?2 IS NULL OR context_id=?2) ORDER BY created",
             )?
-            .query_map([install_id], |r| r.get::<_, String>(0))?
+            .query_map(params![install_id,context_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(json!({"runs":ids.iter().map(|id|self.app_run_show(id)).collect::<Result<Vec<_>>>()?}))
     }
@@ -416,10 +451,37 @@ impl Store {
         self.app_run_show(id)
     }
     fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
+        Self::app_context_current_in(conn, run)?;
         let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
         if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
             return Err(Error::rejected(
                 "app capability epoch or bundle digest is stale",
+            ));
+        }
+        Ok(())
+    }
+    fn app_context_current_in(conn: &Connection, run: &Value) -> Result<()> {
+        let context = run["context_id"].as_str();
+        if let Some(id) = context {
+            let snapshot = &run["snapshot"];
+            if snapshot["schema"] != 2 || snapshot["context"]["id"].as_str() != Some(id) {
+                return Err(Error::rejected("context snapshot association is invalid"));
+            }
+            let proof = super::app_contexts::ContextProof {
+                id: id.to_string(),
+                install_id: run["install_id"].as_str().unwrap().to_string(),
+                revision: snapshot["context"]["revision"]
+                    .as_i64()
+                    .ok_or_else(|| Error::rejected("context snapshot revision is invalid"))?,
+                digest: snapshot["context"]["digest"]
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("context snapshot digest is invalid"))?
+                    .to_string(),
+            };
+            Self::app_context_proof_current_in(conn, run["install_id"].as_str().unwrap(), &proof)?;
+        } else if run["snapshot"]["schema"] != 1 || run["snapshot"].get("context").is_some() {
+            return Err(Error::rejected(
+                "context-free snapshot association is invalid",
             ));
         }
         Ok(())
@@ -528,22 +590,31 @@ impl Store {
     pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'", params![now(), id])?;
+        self.app_run_invalidate_in(&tx, id)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(super) fn app_run_invalidate_in(&self, tx: &Connection, id: &str) -> Result<()> {
+        let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state IN ('awaiting_approval','approved','running')", params![now(), id])?;
         if changed != 0 {
             tx.execute(
                 "UPDATE jobs SET state='failed',updated=? WHERE id=?",
                 params![now(), id],
             )?;
-            tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched')", [id])?;
+            // Keep an already running transport's association until its
+            // authenticated completion records failure. The run predicate
+            // already closes material/dispatch authority; erasing the step
+            // association would roll back the transport's terminal receipt.
+            tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched') AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id=app_run_steps.message_id AND m.state='running')", [id])?;
             tx.execute("UPDATE tasks SET state='failed',error='app authority or assignment is no longer current',updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![now(), id])?;
+            tx.execute("UPDATE messages SET state='failed',error='app submission authorization changed',completed=? WHERE source='app_run_dispatch' AND state IN ('queued','submitting') AND id IN (SELECT message_id FROM app_run_steps WHERE run_id=?)",params![now(),id])?;
             Self::event(
-                &tx,
+                tx,
                 Self::DAEMON_STREAM,
                 "app_run_invalidated",
                 json!({"run_id":id,"reason":"authority_or_assignment_changed"}),
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
     pub fn app_run_pending(&self) -> Result<Vec<(String, String, String)>> {

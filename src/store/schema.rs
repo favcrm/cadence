@@ -577,6 +577,25 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=21", [])?;
             tx.commit()?;
         }
+        if version < 22 {
+            // Context rows and the nullable association are additive. Keep
+            // historical snapshots, approvals and provider receipts untouched;
+            // DDL and the schema checkpoint either commit together or roll back.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::app_contexts::SCHEMA)?;
+            let columns = tx
+                .prepare("PRAGMA table_info(app_runs)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|column| column == "context_id") {
+                tx.execute_batch(
+                    "ALTER TABLE app_runs ADD COLUMN context_id TEXT REFERENCES app_contexts(id);",
+                )?;
+            }
+            tx.execute_batch("CREATE INDEX IF NOT EXISTS app_runs_context ON app_runs(install_id,context_id,created);")?;
+            tx.execute("UPDATE schema_version SET version=22", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

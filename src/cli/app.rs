@@ -8,6 +8,11 @@ use super::*;
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
+    /// Optional app-owned content settings; creates no worker or provider authority.
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -157,6 +162,46 @@ pub(crate) enum AppAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ContextAction {
+    /// Create an optional context using explicitly eligible content defaults.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        label: String,
+        /// Bounded JSON object of content defaults; empty when omitted.
+        #[arg(long)]
+        defaults: Option<PathBuf>,
+        #[arg(long)]
+        request_id: String,
+    },
+    Ls {
+        install_id: String,
+    },
+    Show {
+        install_id: String,
+        context_id: String,
+    },
+    /// Replace label and defaults at the exact observed revision.
+    Set {
+        install_id: String,
+        context_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        defaults: PathBuf,
+    },
+    /// Close unfinished eligibility while retaining historical audit.
+    Archive {
+        install_id: String,
+        context_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum CatalogAction {
     /// Approve the exact installed digest for supported local artifact steps.
     Approve {
@@ -207,6 +252,9 @@ pub(crate) enum RunAction {
         /// Optional discovery link; confers no authority.
         #[arg(long)]
         project_link: Option<String>,
+        /// Exact optional brand context; omission means a context-free run.
+        #[arg(long)]
+        context_id: Option<String>,
     },
     /// Approve the exact frozen run snapshot; does not authorize outward release.
     Approve {
@@ -224,6 +272,8 @@ pub(crate) enum RunAction {
     Ls {
         #[arg(long)]
         install_id: Option<String>,
+        #[arg(long, requires = "install_id")]
+        context_id: Option<String>,
     },
     /// Read a bounded text artifact as the operator or its assigned dependent turn.
     Artifact {
@@ -265,6 +315,7 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
             request_id,
             owner_pm,
             project_link,
+            context_id,
         } => {
             let mut params = json!({
                 "install_id": install_id,
@@ -276,6 +327,9 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
             if let Some(link) = project_link {
                 params["project_link"] = json!(link);
             }
+            if let Some(context) = context_id {
+                params["context_id"] = json!(context);
+            }
             ("app_run_create", params)
         }
         RunAction::Approve { run_id, digest } => {
@@ -284,11 +338,17 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
         RunAction::Cancel { run_id } => ("app_run_cancel", json!({"run_id":run_id})),
         RunAction::Dispatch { run_id } => ("app_run_dispatch", json!({"run_id":run_id})),
         RunAction::Show { run_id } => ("app_run_show", json!({"run_id":run_id})),
-        RunAction::Ls { install_id } => {
-            let params = match install_id {
+        RunAction::Ls {
+            install_id,
+            context_id,
+        } => {
+            let mut params = match install_id {
                 Some(id) => json!({"install_id":id}),
                 None => json!({}),
             };
+            if let Some(context) = context_id {
+                params["context_id"] = json!(context);
+            }
             ("app_run_list", params)
         }
         RunAction::Artifact {
@@ -321,6 +381,48 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
 pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
+        AppAction::Context { action } => {
+            let (method, params) = match action {
+                ContextAction::Create {
+                    install_id,
+                    label,
+                    defaults,
+                    request_id,
+                } => (
+                    "app_context_create",
+                    json!({"install_id":install_id,"label":label,"input_defaults":match defaults {Some(path)=>read_run_inputs(path)?,None=>json!({})},"request_id":request_id}),
+                ),
+                ContextAction::Ls { install_id } => {
+                    ("app_context_list", json!({"install_id":install_id}))
+                }
+                ContextAction::Show {
+                    install_id,
+                    context_id,
+                } => (
+                    "app_context_show",
+                    json!({"install_id":install_id,"context_id":context_id}),
+                ),
+                ContextAction::Set {
+                    install_id,
+                    context_id,
+                    expected_revision,
+                    label,
+                    defaults,
+                } => (
+                    "app_context_update",
+                    json!({"install_id":install_id,"context_id":context_id,"expected_revision":expected_revision,"label":label,"input_defaults":read_run_inputs(defaults)?}),
+                ),
+                ContextAction::Archive {
+                    install_id,
+                    context_id,
+                    expected_revision,
+                } => (
+                    "app_context_archive",
+                    json!({"install_id":install_id,"context_id":context_id,"expected_revision":expected_revision}),
+                ),
+            };
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Catalog { action } => {
             let (method, params) = match action {
                 CatalogAction::Approve { install_id, digest } => (

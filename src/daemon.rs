@@ -18,6 +18,7 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_contexts_rpc;
 mod app_runs_rpc;
 mod approvals_rpc;
 mod area_rpc;
@@ -2656,6 +2657,11 @@ impl Shared {
             "app_run_show" => self.rpc_app_local(method, params, peer_pid),
             "app_run_list" => self.rpc_app_local(method, params, peer_pid),
             "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
+            "app_context_create" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_list" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_show" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_update" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_archive" => self.rpc_app_context(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_show" => self.rpc_app_workspace(method, params, peer_pid),

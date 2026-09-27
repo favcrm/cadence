@@ -5,7 +5,7 @@
 //! recorded, and `workflow check`/`ls`/`show` read.
 //!
 //! The format is the plan format ([`crate::issue::plan`]) plus an
-//! `inputs:` frontmatter map — `name: { ask, optional, kind, example }`
+//! `inputs:` frontmatter map — `name: { ask, optional, kind, example, context_default }`
 //! — and `{{name}}` placeholders anywhere in the file. `plan propose
 //! --workflow` renders the file: placeholders take the `--input`
 //! values, `inputs:` drops out of the frontmatter, and the result goes
@@ -90,6 +90,8 @@ pub struct InputSpec {
     pub optional: bool,
     pub kind: Option<InputKind>,
     pub example: Option<String>,
+    /// Explicit content-only permission for installation context defaults.
+    pub context_default: bool,
 }
 
 /// A declared input shape: the value must match it at render, for every
@@ -187,6 +189,7 @@ pub fn inputs_json(tpl: &Template) -> Vec<Value> {
                     "name": name, "ask": spec.ask, "optional": spec.optional,
                     "kind": spec.kind.map(InputKind::as_str),
                     "example": spec.example,
+                    "context_default": spec.context_default,
                 })
             })
         })
@@ -324,7 +327,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
     if let Some(inputs_val) = inputs_val {
         let serde_yaml::Value::Mapping(specs) = inputs_val else {
             return Err(Error::rejected(
-                "workflow `inputs:` must be a map of name → { ask, optional, kind, example }",
+                "workflow `inputs:` must be a map of name → { ask, optional, kind, example, context_default }",
             ));
         };
         for (k, v) in specs {
@@ -348,6 +351,12 @@ fn parse_front(yaml: &str) -> Result<Front> {
                         match (sk.as_str(), sv) {
                             (Some("ask"), serde_yaml::Value::String(s)) => spec.ask = Some(s),
                             (Some("optional"), serde_yaml::Value::Bool(b)) => spec.optional = b,
+                            (Some("context_default"), serde_yaml::Value::Bool(b)) => {
+                                spec.context_default = b
+                            }
+                            (Some("context_default"), _) => {
+                                return Err(Error::rejected("context_default must be a boolean"))
+                            }
                             (Some("kind"), serde_yaml::Value::String(s)) => {
                                 let Some(kind) = InputKind::parse(s.trim()) else {
                                     return Err(Error::rejected(format!(
@@ -383,13 +392,13 @@ fn parse_front(yaml: &str) -> Result<Front> {
                             (Some(k), _) => {
                                 return Err(Error::rejected(format!(
                                     "input '{name}': unknown key '{k}' — ask, optional, \
-                                     kind, example"
+                                     kind, example, context_default"
                                 )))
                             }
                             (None, _) => {
                                 return Err(Error::rejected(format!(
                                     "input '{name}': keys must be strings — ask, optional, \
-                                     kind, example"
+                                     kind, example, context_default"
                                 )))
                             }
                         }
@@ -399,7 +408,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 _ => {
                     return Err(Error::rejected(format!(
                         "input '{name}' must be a string (the ask) or a map \
-                         {{ ask, optional, kind, example }}"
+                         {{ ask, optional, kind, example, context_default }}"
                     )))
                 }
             };
@@ -590,13 +599,63 @@ pub fn parse_template(text: &str) -> Result<Template> {
     })?;
     let front = parse_front(yaml)?;
     placeholders(text, &front.inputs)?;
-    ticket_meta(body)?;
+    let metadata = ticket_meta(body)?;
+    for (name, spec) in &front.inputs {
+        if !spec.context_default {
+            continue;
+        }
+        if front.distinct.contains(name)
+            || metadata.iter().flatten().any(|(_, value)| {
+                let mut rest = value.as_str();
+                while let Some(start) = rest.find("{{") {
+                    let inner = &rest[start + 2..];
+                    let Some(end) = inner.find("}}") else {
+                        break;
+                    };
+                    if inner[..end].trim() == name {
+                        return true;
+                    }
+                    rest = &inner[end + 2..];
+                }
+                false
+            })
+        {
+            return Err(Error::rejected(
+                "context defaults cannot reference structural workflow inputs",
+            ));
+        }
+    }
     Ok(Template {
         inputs: front.inputs,
         input_order: front.input_order,
         distinct: front.distinct,
         label: front.label,
     })
+}
+
+/// Validate only explicitly declared content defaults without supplying team
+/// inputs or rendering an execution plan. Errors deliberately omit values.
+pub fn check_context_defaults(text: &str, defaults: &BTreeMap<String, String>) -> Result<()> {
+    let template = parse_template(text)?;
+    for (name, value) in defaults {
+        let spec = template
+            .inputs
+            .get(name)
+            .filter(|spec| spec.context_default)
+            .ok_or_else(|| Error::rejected("context input is not declared safe content"))?;
+        if value.trim() != value
+            || (!spec.optional && value.is_empty())
+            || value.chars().any(bad_value_char)
+            || spec
+                .kind
+                .is_some_and(|kind| shape_problem(kind, value).is_some())
+        {
+            return Err(Error::rejected(
+                "context input does not satisfy its declared content shape",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Render `text` with `values`: every `{{name}}` becomes its value
@@ -944,6 +1003,9 @@ pub fn gate_keys(text: &str) -> Result<String> {
                 let mut key = format!("{n}{}", if s.optional { "?" } else { "!" });
                 if let Some(kind) = s.kind {
                     key.push_str(&format!(":{}", kind.as_str()));
+                }
+                if s.context_default {
+                    key.push_str(":context_default");
                 }
                 key
             })

@@ -397,6 +397,8 @@ include!("schema.rs");
 
 mod app_runs;
 
+mod app_contexts;
+
 #[test]
 fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -414,6 +416,9 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
         INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('kept-run','kept-install',1,'digest','{}','digest','grant-worker','kept-request','succeeded',1,1);
         INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('kept-effect','kept-effect-request','grant-worker','fixture','old-account','widgets.publish','{}','kept input','kept preview','[\"widgets:publish\"]','verified',1,1);
         DROP TABLE IF EXISTS connection_metadata;
+        DROP INDEX app_runs_context;
+        ALTER TABLE app_runs DROP COLUMN context_id;
+        DROP TABLE app_contexts;
         UPDATE schema_version SET version=20;
         CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
     assert!(Store::open_for_schema_tests(&path).is_err());

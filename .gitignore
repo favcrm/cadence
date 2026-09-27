@@ -22,6 +22,9 @@ docs/guides/*
 !docs/cadence/
 !docs/design/
 !docs/roles/
+!docs/guides/
+docs/guides/*
+!docs/guides/app-contexts.md
 !docs/ARCHITECTURE.md
 !docs/AUDIT.md
 !docs/BOARD.md
