@@ -255,5 +255,19 @@ fn cad667_http_install_and_reads_share_operator_authority() {
     ] {
         let (code, _, _) = common::op::raw(port, &session.request("GET", &path, ""));
         assert_eq!(code, 200);
+        let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+        let (code, _, _) = common::op::raw(
+            port,
+            &session.request_as(
+                "GET",
+                &path,
+                "",
+                &common::op::seam_headers(&w.daemon.state, "agent:catalog-http"),
+            ),
+        );
+        assert_eq!(
+            code, 403,
+            "agent read exposed workspace installation {path}"
+        );
     }
 }

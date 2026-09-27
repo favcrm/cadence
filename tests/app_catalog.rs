@@ -583,7 +583,7 @@ fn cad667_global_inventory_bounds_irrelevant_names_before_publication() {
     let f = Fixture::new();
     let record = f.install("client", "install-a");
     let before = bytes(&record);
-    for index in 0..1100 {
+    for index in 0..4100 {
         std::fs::create_dir(f.pm.dir.join(format!("irrelevant-{index}"))).unwrap();
     }
     let result = test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state));
