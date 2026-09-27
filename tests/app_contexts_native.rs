@@ -638,3 +638,111 @@ fn cad690_actual_context_restart_preserves_receipts_without_replay_or_fallback()
         .unwrap();
     assert_eq!(kickoffs, 4, "restart re-dispatched contextual work");
 }
+
+#[test]
+fn cad690_current_context_revision_rejects_actual_late_reviewer_result() {
+    let h = Contexts::new();
+    let context = h.context("Revision fence", A, "revision-fence");
+    let run = h.create(&context, "revision-held-review");
+    let id = run["id"].as_str().unwrap();
+    std::fs::write(
+        h.daemon.state.join(format!("context-hold-reviewer-{id}")),
+        "hold",
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !h
+        .daemon
+        .state
+        .join(format!("context-reviewer-{id}.held"))
+        .exists()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "real reviewer never fetched its own dependency"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let before = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(before["state"], "running");
+    assert_eq!(before["approved_digest"], before["snapshot_digest"]);
+    assert_eq!(before["artifacts"].as_array().unwrap().len(), 1);
+    assert!(before["reviews"].as_array().unwrap().is_empty());
+    let artifact = h.artifact(&before);
+    assert_eq!(artifact["text"], format!("Context draft: {A}"));
+    let reviewer = before["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["state"] == "running")
+        .expect("actual reviewer step running");
+    let emitted = h.daemon.state.join(format!(
+        "context-result-emitted-{id}-{}",
+        reviewer["step_id"].as_str().unwrap()
+    ));
+    // Counterfactual fixture: change only the persisted CAS revision, bypassing
+    // CRUD's proactive cancellation. The real authenticated completion must
+    // independently enforce current-context proof inside its SQL transaction.
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(db.execute("UPDATE app_contexts SET revision=revision+1 WHERE id=? AND install_id=? AND revision=?",
+        rusqlite::params![context["id"].as_str(), h.install["install_id"].as_str(), context["revision"].as_i64()]).unwrap(), 1);
+    drop(db);
+    assert_eq!(
+        h.daemon
+            .operator_rpc("app_run_show", json!({"run_id":id}))
+            .unwrap(),
+        before,
+        "raw revision fixture unexpectedly invalidated run before completion"
+    );
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("context-reviewer-{id}.release")),
+        "release",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let agent = h
+            .daemon
+            .operator_rpc("agent_show", json!({"alias":REVIEWER}))
+            .unwrap();
+        if emitted.exists()
+            && matches!(agent["agent"]["state"].as_str(), Some("idle" | "attention"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual reviewer finish never settled: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let finished = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(
+        finished["state"], "failed",
+        "stale-context authenticated review was accepted"
+    );
+    assert!(
+        finished["reviews"].as_array().unwrap().is_empty(),
+        "stale-context review was persisted"
+    );
+    assert_eq!(
+        finished["artifacts"], before["artifacts"],
+        "historical writer artifact was changed"
+    );
+    assert_eq!(finished["snapshot"], run["snapshot"]);
+    assert_eq!(
+        h.daemon
+            .operator_rpc("app_run_artifact", json!({"artifact_id":artifact["id"]}))
+            .unwrap(),
+        artifact
+    );
+}
