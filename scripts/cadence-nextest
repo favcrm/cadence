@@ -59,10 +59,9 @@ case "$version" in
 esac
 
 SUBCOMMAND=run
-if [ "${1:-}" = list ]; then
-    SUBCOMMAND=list
-    shift
-fi
+case "${1:-}" in
+    list|archive) SUBCOMMAND=$1; shift ;;
+esac
 
 blocked_no_tests=
 for arg in "$@"; do
@@ -128,6 +127,10 @@ command -v flock >/dev/null 2>&1 || die "flock is required for the outer suite l
 # The outer process owns the lock. Its child has an empty path and an
 # explicit review-style marker, so process-per-test nextest workers cannot
 # re-flock the same descriptor and deadlock.
+# Archive also compiles and must retain its subcommand through lock re-entry.
+if [ "$SUBCOMMAND" = archive ]; then
+    set -- archive "$@"
+fi
 exec flock "$LOCK" env \
     CADENCE_SUITE_LOCK= \
     CADENCE_REVIEW_SUITE_LOCK_HELD=1 \
