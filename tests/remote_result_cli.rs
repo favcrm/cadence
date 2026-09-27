@@ -35,6 +35,27 @@ impl Fixture {
         self.root.path().join(name)
     }
     fn run(&self, verb: &str, outbox: &Path, org: &str, input: &[u8], no_home: bool) -> Output {
+        self.run_pin(
+            verb,
+            outbox,
+            [
+                org,
+                "https://gateway.example.invalid",
+                "subject-1",
+                "agent-1",
+            ],
+            input,
+            no_home,
+        )
+    }
+    fn run_pin(
+        &self,
+        verb: &str,
+        outbox: &Path,
+        pin: [&str; 4],
+        input: &[u8],
+        no_home: bool,
+    ) -> Output {
         let mut file = tempfile::tempfile_in(self.root.path()).unwrap();
         file.write_all(input).unwrap();
         use std::io::{Seek, SeekFrom};
@@ -49,17 +70,19 @@ impl Fixture {
             .env("CADENCE_TOKEN", "credential-secret-sentinel")
             .env("CADENCE_ISSUER", "http://unreachable.invalid")
             .env("CADENCE_ORG", "different-default")
+            .env("CADENCE_ALIAS", "master")
+            .env("CADENCE_PROFILE", "malformed-default-profile")
             .args(["remote", "result", verb, "--outbox-dir"])
             .arg(outbox)
             .args([
                 "--org",
-                org,
+                pin[0],
                 "--audience",
-                "https://gateway.example.invalid",
+                pin[1],
                 "--subject",
-                "subject-1",
+                pin[2],
                 "--agent",
-                "agent-1",
+                pin[3],
             ])
             .stdin(Stdio::from(file));
         for name in ["RUSTUP_HOME", "CARGO_HOME"] {
@@ -132,7 +155,44 @@ fn exact_retry_retains_original_receipt_bytes_and_destination_conflicts() {
     let before = fs::read(f.path("outbox/results.sqlite3")).unwrap();
     assert_eq!(receipt(&f.retain("org-1", &wire("command-1"))), first);
     assert_eq!(fs::read(f.path("outbox/results.sqlite3")).unwrap(), before);
-    refusal(&f.retain("org-2", &wire("command-1")));
+    let original = [
+        "org-1",
+        "https://gateway.example.invalid",
+        "subject-1",
+        "agent-1",
+    ];
+    for (index, changed) in [
+        (0, "org-2"),
+        (1, "https://other.example.invalid"),
+        (2, "subject-2"),
+        (3, "agent-2"),
+    ] {
+        let mut pin = original;
+        pin[index] = changed;
+        refusal(&f.run_pin(
+            "retain",
+            &f.path("outbox"),
+            pin,
+            wire("command-1").to_string().as_bytes(),
+            false,
+        ));
+    }
+    let numeric = wire("command-1")
+        .to_string()
+        .replace("\"taskRevision\":1", "\"taskRevision\":1e0");
+    assert_eq!(
+        receipt(&f.run(
+            "retain",
+            &f.path("outbox"),
+            "org-1",
+            numeric.as_bytes(),
+            false
+        )),
+        first
+    );
+    let mut text_changed = wire("command-1");
+    text_changed["text"] = json!("changed-secret-marker");
+    refusal(&f.retain("org-1", &text_changed));
     let mut changed = wire("command-1");
     changed["reportedHeadSha"] = json!("b".repeat(40));
     refusal(&f.retain("org-1", &changed));
@@ -146,12 +206,16 @@ fn malformed_oversized_and_duplicate_stdin_refuse_before_creating_custody() {
     let duplicate = wire("command-1")
         .to_string()
         .replacen('{', "{\"commandId\":\"duplicate\",", 1);
+    let mut credential = wire("command-1");
+    credential["accessToken"] = json!(SECRET);
     let mut extra = wire("command-1");
     extra["actor"] = json!("operator");
     for input in [
         b"not JSON".to_vec(),
         duplicate.into_bytes(),
         extra.to_string().into_bytes(),
+        credential.to_string().into_bytes(),
+        format!("{} trailing {SECRET}", wire("command-1")).into_bytes(),
         vec![b'x'; 65_537],
         vec![0xff],
     ] {
@@ -225,4 +289,27 @@ fn concurrent_cli_retries_recover_one_stable_receipt() {
     assert_eq!(first, second);
     let rows = receipt(&f.run("pending", &f.path("outbox"), "org-1", b"", false));
     assert_eq!(rows["receipts"], json!([first]));
+}
+
+#[test]
+fn pending_refuses_symlink_database_or_journal_and_preserves_external_bytes() {
+    let f = Fixture::new();
+    receipt(&f.retain("org-1", &wire("cmd")));
+    let db = f.path("outbox/results.sqlite3");
+    let before = fs::read(&db).unwrap();
+    fs::create_dir(f.path("linked-db")).unwrap();
+    fs::set_permissions(f.path("linked-db"), fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&db, f.path("linked-db/results.sqlite3")).unwrap();
+    refusal(&f.run("pending", &f.path("linked-db"), "org-1", b"", false));
+    assert_eq!(fs::read(&db).unwrap(), before);
+    let foreign = f.path("outside-journal");
+    fs::write(&foreign, b"external-journal-secret-sentinel").unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&foreign, f.path("outbox/results.sqlite3-journal")).unwrap();
+    refusal(&f.run("pending", &f.path("outbox"), "org-1", b"", false));
+    assert_eq!(fs::read(&db).unwrap(), before);
+    assert_eq!(
+        fs::read(foreign).unwrap(),
+        b"external-journal-secret-sentinel"
+    );
 }

@@ -38,6 +38,7 @@ mod overview;
 mod plan;
 mod platform;
 mod project;
+mod remote_result;
 mod report;
 mod restore;
 mod resume;
@@ -92,6 +93,7 @@ use monitor::MonitorAction;
 use plan::PlanAction;
 use platform::PlatformAction;
 use project::ProjectCmd;
+use remote_result::RemoteAction;
 use report::ReportAction;
 use rollout::RolloutAction;
 use secret::SecretAction;
@@ -140,6 +142,11 @@ pub(crate) enum ReviewAction {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Retain or inspect explicit offline remote result custody. No network.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
     /// Authenticate to an AgenticOS issuer. Hosted Cadence RPC is not yet configured.
     Login {
         /// AgenticOS HTTPS issuer origin (no path).
@@ -3275,6 +3282,15 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
 
 pub(crate) fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+    // Offline custody never resolves daemon, org defaults or issuer credentials.
+    if let Commands::Remote { action } = &cli.command {
+        if cli.state_dir.is_some() {
+            return Err(Error::rejected(
+                "Offline results do not select daemon state; use --outbox-dir",
+            ));
+        }
+        return remote_result::run(action);
+    }
     // Remote credentials are independent of local daemon state and sandbox adoption.
     match &cli.command {
         Commands::Login {
@@ -3353,7 +3369,7 @@ pub(crate) fn run() -> Result<i32> {
         return Ok(code);
     }
     match cli.command {
-        Commands::Login { .. } | Commands::Auth { .. } => {
+        Commands::Remote { .. } | Commands::Login { .. } | Commands::Auth { .. } => {
             unreachable!("auth dispatched before state-dir")
         }
         Commands::Doctor {
