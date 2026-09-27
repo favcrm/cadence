@@ -164,6 +164,55 @@ async function main() {
     equal(seen.length, n, "unsubscribed listener hears nothing");
   }
 
+  // Explicit variants share failure/coalescing rules without changing later loads.
+  {
+    const normal = scripted<number>();
+    const fresh = scripted<number>();
+    const r = new Resource(normal.fetcher, { freshMs: 60000 });
+    r.write(() => 1);
+    const first = r.refreshUsing(fresh.fetcher);
+    const joined = r.refreshUsing(fresh.fetcher);
+    equal(fresh.calls(), 1, "explicit variants coalesce");
+    fresh.reject(new Error("variant unavailable"));
+    await Promise.all([first, joined]);
+    equal(r.get().data, 1, "failed variant retains observation");
+    equal(r.get().status, "stale", "failed variant marks shared data stale");
+    const retry = r.revalidate();
+    equal(normal.calls(), 1, "stale revalidation uses default fetcher");
+    normal.resolve(2);
+    await retry;
+    equal(r.get().data, 2, "default revalidation replaces stale observation");
+    equal(r.get().error, null, "successful revalidation clears variant error");
+    const older = r.refreshUsing(fresh.fetcher);
+    r.write(() => 3);
+    fresh.resolve(4);
+    await older;
+    equal(r.get().data, 3, "newer writes win over explicit variant response");
+    equal(normal.calls(), 2, "generation conflict trails with default fetcher");
+    normal.resolve(5);
+    await r.refresh();
+    equal(r.get().data, 5, "trailing default observation settles");
+  }
+
+  // Protected observations are retained for availability errors, purged on refusal.
+  {
+    const s = scripted<number>();
+    const r = new Resource(s.fetcher, { discardOnError: (e) => e instanceof Error && e.message === "forbidden" });
+    r.write(() => 1);
+    const availability = r.refresh(); s.reject(new Error("unavailable")); await availability;
+    equal(r.get().data, 1, "ordinary availability error retains protected observation");
+    const refused = r.refresh(); s.reject(new Error("forbidden")); await refused;
+    equal(r.get().data, null, "refusal purges protected observation");
+    equal(r.get().asOf, null, "refusal clears success freshness");
+    const unavailable = r.revalidate(); s.reject(new Error("unavailable")); await unavailable;
+    equal(r.get().data, null, "later availability error cannot resurrect purged observation");
+    equal(r.get().status, "failed", "purged observation remains a failed load");
+    const admitted = r.revalidate(); s.resolve(2); await admitted;
+    equal(r.get().data, 2, "admitted read restores a protected observation");
+    const old = r.refresh(); r.write(() => 3); s.reject(new Error("forbidden")); await old;
+    equal(r.get().data, 3, "older refusal cannot purge newer authoritative write");
+  }
+
   // Stream frames: the server names resources; `{}` means refetch all.
   equal(
     invalidatedBy('{"resources":["agents","issue","overview"]}'),

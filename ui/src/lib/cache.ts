@@ -53,6 +53,8 @@ export interface ResourceOptions<T> {
   isEmpty?: (data: T) => boolean;
   /** How long a successful load counts as fresh for `revalidate()`. */
   freshMs?: number;
+  /** Protected resources can discard observations on an access refusal. */
+  discardOnError?: (error: unknown) => boolean;
   now?: () => number;
 }
 
@@ -81,12 +83,14 @@ export class Resource<T> {
   private readonly fetcher: () => Promise<T>;
   private readonly isEmpty: (data: T) => boolean;
   private readonly freshMs: number;
+  private readonly discardOnError: (error: unknown) => boolean;
   private readonly now: () => number;
 
   constructor(fetcher: () => Promise<T>, opts: ResourceOptions<T> = {}) {
     this.fetcher = fetcher;
     this.isEmpty = opts.isEmpty ?? (() => false);
     this.freshMs = opts.freshMs ?? 0;
+    this.discardOnError = opts.discardOnError ?? (() => false);
     this.now = opts.now ?? Date.now;
   }
 
@@ -104,7 +108,14 @@ export class Resource<T> {
   observed = (): boolean => this.listeners.size > 0;
 
   /** Fetch now, or join the request already in flight. */
-  refresh = (): Promise<void> => {
+  refresh = (): Promise<void> => this.refreshUsing(this.fetcher);
+
+  /**
+   * An explicit request variant, through the same state/error lifecycle.
+   * The fetcher applies only to this run; revalidation and trailing loads
+   * keep the default fetcher. Joins any request already in flight.
+   */
+  refreshUsing = (fetcher: () => Promise<T>): Promise<void> => {
     if (this.inflight) return this.inflight;
     this.invalid = false;
     const started = this.generation;
@@ -113,7 +124,7 @@ export class Resource<T> {
       // With nothing loaded a retry is a load, not a standing failure.
       status: this.state.data === null ? "loading" : this.state.status,
     });
-    const run = this.fetcher().then(
+    const run = fetcher().then(
       (data) => {
         if (this.generation !== started) {
           // A local write landed while this was in flight: its data is
@@ -132,8 +143,11 @@ export class Resource<T> {
         // A local write since the request started is fresher than any
         // failure of it.
         if (this.generation !== started) return;
+        const discard = this.discardOnError(e);
         this.set({
-          status: this.state.data === null ? "failed" : "stale",
+          data: discard ? null : this.state.data,
+          asOf: discard ? null : this.state.asOf,
+          status: discard || this.state.data === null ? "failed" : "stale",
           error: message(e),
         });
       },

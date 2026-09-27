@@ -1716,24 +1716,36 @@ before the router (`/?tab=board&project=cadence`) redirect to their
 route. Colours are CSS variables with a light and a dark theme — system
 preference unless the header toggle stored a pick.
 
-`/setup` (CAD-327, MVP) walks environment → agent CLIs (version and
-sign-in) → master agent → first project (`cadence project new`, CAD-358)
-→ Go to Home, from `GET /api/setup`. It only shows: each check that needs
-work carries its copy-paste command, and "re-check" runs the probes
-again; nothing is applied from the browser. The master step (CAD-448)
-offers every provider `master start` accepts — claude and pi (CAD-322)
-— each marked ready when installed and signed in, with its exact
-`master start --provider <bin>` command once it is, and reports the
-master's own login (its per-provider config dir, CAD-439) with the
-login command while it has none.
-Platforms and import are listed as later. Home shows a link to `/setup`
-while a required check — state dir, tracker, daemon, master, the
-master's own login, and a master-capable CLI signed in — is not ready
-and has a fix to run: a check without one (`master` in a build without
-`master start`) never holds the link open. Dismissing it is remembered
-per browser (`localStorage`, and for the page when storage is blocked).
-A read-only board shows neither the link nor the steps — "setup runs on
-the host" — and a tailnet viewer's refused request reads the same.
+`/setup` (CAD-327, CAD-695) is a full-width readiness workspace with four
+sections: environment, agent CLIs (version and sign-in), master agent,
+and projects. It starts at the first section needing attention once
+both reports arrive, then keeps the section the user chooses. Home is a
+normal navigation link. Each failed check carries its complete selectable
+command and a copy button with success or fallback feedback. “Check again”
+requests `GET /api/setup?fresh=1` and refreshes registered projects;
+nothing is applied from the browser. Loading, missing observations and
+failed refreshes do not show current readiness. Failed refreshes, including host-only refusals, remain in the shared
+observation state across navigation; returning retries the stale report.
+A host-only refusal also discards the prior host report, so a subsequent
+availability failure cannot reveal it; only an admitted success restores it.
+A cached run shows its age and the host's cooldown; project failures remain distinct from an
+empty project list. Setup summary readiness requires the named section
+observations, including master/login even when there is no suggested fix;
+optional skill or worker CLI observations do not block it.
+
+The master section (CAD-448) offers every provider `master start` accepts,
+with its exact provider command once prerequisites are met. Host risk
+warnings remain beside those commands. Required readiness and the Home
+setup nudge retain the existing host checks: state dir, tracker, daemon,
+master, master login, and a signed-in master-capable CLI with a fix to run.
+A check without a fix never holds that nudge open. Dismissing the nudge is
+remembered per browser (`localStorage`, or for the page when storage is
+blocked). The workspace also shows UI and optional CLI observations.
+
+Unresolved access makes no Setup request. A read-only board shows host
+instructions instead of checks; an HTTP host-only refusal shows the same
+instructions. This screen does not change the server's operator and
+loopback protections.
 
 A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),
