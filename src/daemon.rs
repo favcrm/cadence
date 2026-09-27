@@ -2674,6 +2674,7 @@ impl Shared {
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),

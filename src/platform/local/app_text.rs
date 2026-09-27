@@ -2,7 +2,7 @@
 //! no SQL lock survives the checked claim or the provider's read-back.
 use super::{sha256_hex, LocalAdapter, BODY_CAP, TITLE_CAP};
 use crate::contract_fixture::Verified;
-use crate::platform::PlatformAdapter;
+use crate::platform::{AppArtifactError, PlatformAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::File;
@@ -176,7 +176,7 @@ pub(super) fn execute(
     input: &Value,
     effect_id: &str,
     expected_hash: Option<&str>,
-) -> Result<Value, String> {
+) -> Result<Value, AppArtifactError> {
     let text = parse(input)?;
     crate::proto::identifier(effect_id, "effect_id")
         .map_err(|_| "invalid app effect id".to_string())?;
@@ -233,7 +233,7 @@ pub(super) fn execute(
         "content_sha256":sha256_hex(post.as_bytes()),"published_at":crate::issue::time::iso(crate::issue::time::now_epoch()),
         "attachments":[],"result":result});
     let mut committed = false;
-    let landed = (|| {
+    let landed: Result<(), String> = (|| {
         write_file(&item, "post.md", post.as_bytes())?;
         write_file(&item, "index.json", index.to_string().as_bytes())?;
         item.sync_all()
@@ -260,7 +260,7 @@ pub(super) fn execute(
         // A sync failure after rename is uncertain, not permission to destroy
         // the already-complete item. The broker retains that uncertainty.
         if committed {
-            return Err(error);
+            return Err(AppArtifactError::Uncertain(error));
         }
         for component in ["post.md", "index.json"] {
             let component = name(component.as_bytes())?;
@@ -272,7 +272,7 @@ pub(super) fn execute(
         unsafe {
             libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), libc::AT_REMOVEDIR);
         }
-        return Err(error);
+        return Err(AppArtifactError::Refused(error));
     }
     Ok(result)
 }

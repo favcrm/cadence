@@ -14,7 +14,7 @@ pub mod custody;
 pub mod deployments;
 pub mod local;
 
-pub use adapter::PlatformAdapter;
+pub use adapter::{AppArtifactError, PlatformAdapter};
 
 use serde_json::Value;
 

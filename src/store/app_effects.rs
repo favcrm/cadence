@@ -128,8 +128,13 @@ fn child_in(conn: &Connection, id: &str) -> Result<(EffectRow, Value, String)> {
 }
 
 fn envelope(row: &EffectRow, authority: &Value, digest: &str) -> Value {
-    json!({"effect":{"effect_id":row.effect_id,"request":row.request,"state":row.state,
-        "digest":digest,"record":row.to_record(),"authority":authority}})
+    // App receipts preserve historical decisions and uncertain outcomes even
+    // after reconciliation closes. They are not legacy pending-effect v1.
+    let mut record = row.to_record();
+    record["kind"] = json!("app_artifact_effect");
+    json!({"effect":{"schema":1,"authorization_kind":"app_artifact",
+        "effect_id":row.effect_id,"request":row.request,"state":row.state,
+        "needs_you":row.needs_you,"digest":digest,"record":record,"authority":authority}})
 }
 
 /// The provider opens the existing database read-only. It cannot recover a
@@ -284,6 +289,82 @@ impl Store {
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
         let (row, authority, digest) = child_in(&self.conn(), id)?;
         Ok(envelope(&row, &authority, &digest))
+    }
+
+    /// A provider may have committed even when its confirmation failed.
+    /// Persist that distinction, independently of read-back, without replay.
+    pub fn app_effect_uncertain(&self, id: &str, outcome: &Value) -> Result<Value> {
+        if outcome["kind"] != "uncertain"
+            || outcome["error"].as_str().is_none_or(str::is_empty)
+            || !matches!(outcome["verified"], Value::Bool(_)) && outcome["verified"] != "unknown"
+        {
+            return Err(Error::rejected("invalid uncertain app artifact outcome"));
+        }
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let (row, authority, digest) = child_in(&tx, id)?;
+        if row.state != "executing" {
+            return Err(Error::rejected("app effect is not executing"));
+        }
+        let changed = tx.execute(
+            "UPDATE platform_effects SET state='reconcile',outcome=?,needs_you=1,updated_at=? WHERE effect_id=? AND state='executing' AND authorization_kind='app_artifact'",
+            params![outcome.to_string(), now(), id],
+        )?;
+        if changed != 1 {
+            return Err(Error::rejected("app effect uncertainty claim changed"));
+        }
+        Self::event(
+            &tx,
+            platform::PLATFORM_STREAM,
+            EFFECT_NEEDS_YOU_EVENT,
+            json!({"effect_id":id,"authorization_kind":"app_artifact","reason":"app artifact completion is uncertain — reconcile","verified":outcome["verified"]}),
+        )?;
+        let (row, _, _) = child_in(&tx, id)?;
+        let result = envelope(&row, &authority, &digest);
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Operator resolution changes bookkeeping only. The exact historical
+    /// child and digest survive, including when its installation is gone.
+    pub fn app_effect_resolve(&self, id: &str, digest: &str, resolution: &str) -> Result<Value> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let (row, authority, stored_digest) = child_in(&tx, id)?;
+        if digest != stored_digest {
+            return Err(Error::rejected("app effect release digest changed"));
+        }
+        let changed = match resolution {
+            "close" if row.state == "reconcile" => tx.execute(
+                "UPDATE platform_effects SET state='closed',close_reason='operator_reconciled',needs_you=0,updated_at=? WHERE effect_id=? AND state='reconcile' AND authorization_kind='app_artifact'",
+                params![now(), id],
+            )?,
+            "acknowledge" if matches!(row.state.as_str(), "done" | "failed") && row.needs_you => tx.execute(
+                "UPDATE platform_effects SET needs_you=0,updated_at=? WHERE effect_id=? AND state IN ('done','failed') AND needs_you=1 AND authorization_kind='app_artifact'",
+                params![now(), id],
+            )?,
+            "close" | "acknowledge" => {
+                return Err(Error::rejected("app effect is not eligible for this resolution"));
+            }
+            _ => return Err(Error::rejected("app effect resolution must be close or acknowledge")),
+        };
+        if changed != 1 {
+            return Err(Error::rejected("app effect resolution state changed"));
+        }
+        Self::event(
+            &tx,
+            platform::PLATFORM_STREAM,
+            if resolution == "close" {
+                EFFECT_CANCELLED_EVENT
+            } else {
+                "effect_acknowledged"
+            },
+            json!({"effect_id":id,"authorization_kind":"app_artifact","resolution":resolution,"digest":digest}),
+        )?;
+        let (resolved, _, _) = child_in(&tx, id)?;
+        let result = envelope(&resolved, &authority, &stored_digest);
+        tx.commit()?;
+        Ok(result)
     }
     pub fn app_effect_list(&self, install: Option<&str>, context: Option<&str>) -> Result<Value> {
         if context.is_some() && install.is_none() {

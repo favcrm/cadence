@@ -899,7 +899,8 @@ impl PlatformAdapter for LocalAdapter {
         expected_hash: Option<&str>,
     ) -> Result<Value, String> {
         if tool == TOOL_APP_TEXT {
-            return app_text::execute(self, input, idempotency_key, expected_hash);
+            return app_text::execute(self, input, idempotency_key, expected_hash)
+                .map_err(|error| error.to_string());
         }
         if tool != TOOL_PUBLISH {
             return Err(format!(
@@ -1037,6 +1038,23 @@ impl PlatformAdapter for LocalAdapter {
         fs::rename(&tmp, &item_dir)
             .map_err(|e| format!("cannot land {} in the outbox: {e}", item_dir.display()))?;
         Ok(result)
+    }
+
+    /// App-artifact execution preserves uncertainty after atomic landing.
+    fn execute_app_artifact(
+        &self,
+        _credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<Value, crate::platform::AppArtifactError> {
+        if tool != TOOL_APP_TEXT {
+            return Err(crate::platform::AppArtifactError::Refused(
+                "local has no reviewed app artifact tool with that name".into(),
+            ));
+        }
+        app_text::execute(self, input, idempotency_key, expected_hash)
     }
 
     /// §5.4 step 6 read-back for `local`: the outbox item is the

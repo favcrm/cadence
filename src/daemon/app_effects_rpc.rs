@@ -19,6 +19,7 @@ impl Shared {
                 "app_effect_show" => &["effect_id"],
                 "app_effect_list" => &["install_id", "context_id"],
                 "app_effect_decide" => &["effect_id", "digest", "decision"],
+                "app_effect_resolve" => &["effect_id", "digest", "resolution"],
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
         )?;
@@ -38,6 +39,21 @@ impl Shared {
                 optional_str(params, "context_id"),
             ),
             "app_effect_stage" => self.stage_app_artifact(params),
+            "app_effect_resolve" => {
+                // Historical reconciliation deliberately needs neither a live
+                // installation nor PM/custody locks. It never executes a send.
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let resolved = self.store.app_effect_resolve(
+                    required_str(params, "effect_id")?,
+                    required_str(params, "digest")?,
+                    required_str(params, "resolution")?,
+                )?;
+                self.wake();
+                Ok(resolved)
+            }
             "app_effect_decide" => {
                 let id = required_str(params, "effect_id")?;
                 let digest = required_str(params, "digest")?;
@@ -298,7 +314,7 @@ impl Shared {
                     .platforms
                     .get(provider)
                     .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
-                let result = adapter.execute(
+                let result = adapter.execute_app_artifact(
                     &bytes,
                     &row.tool,
                     &row.input,
@@ -306,20 +322,53 @@ impl Shared {
                     row.source_hash.as_deref(),
                 );
                 let verified = adapter.read_back(&row.tool, &row.input);
-                let (ok, outcome) = match result {
+                let (ok, uncertain, outcome) = match result {
                     Ok(value) => {
-                        crate::platform::refuse_leak(
+                        if crate::platform::refuse_leak(
                             "app release outcome",
                             &value.to_string(),
                             &bytes,
-                        )?;
-                        (true, json!({"result":value,"verified":verified}))
+                        )
+                        .is_err()
+                        {
+                            (
+                                false,
+                                true,
+                                json!({"kind":"uncertain","error":"provider outcome withheld","verified":verified}),
+                            )
+                        } else {
+                            (
+                                true,
+                                false,
+                                json!({"kind":"released","result":value,"verified":verified}),
+                            )
+                        }
                     }
                     Err(error) => {
-                        crate::platform::refuse_leak("app release error", &error, &bytes)?;
-                        (false, json!({"error":error,"verified":verified}))
+                        let (uncertain, error) = match error {
+                            crate::platform::AppArtifactError::Refused(error) => (false, error),
+                            crate::platform::AppArtifactError::Uncertain(error) => (true, error),
+                        };
+                        let error =
+                            if crate::platform::refuse_leak("app release error", &error, &bytes)
+                                .is_err()
+                            {
+                                "provider error withheld".to_string()
+                            } else {
+                                error
+                            };
+                        (
+                            false,
+                            uncertain,
+                            json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified}),
+                        )
                     }
                 };
+                if uncertain {
+                    let effect = self.store.app_effect_uncertain(id, &outcome)?;
+                    self.wake();
+                    return Ok(effect);
+                }
                 self.store.effect_outcome(
                     id,
                     ok,
