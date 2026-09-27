@@ -11,7 +11,7 @@ impl Shared {
         params: &Value,
         pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("app artifact release", params, pid)?;
+        let _ = pid; // Counterfactual only.
         strict_fields(
             params,
             match method {
