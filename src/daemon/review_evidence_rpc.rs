@@ -92,7 +92,7 @@ impl Shared {
                     .observed
                     .as_ref()
                     .is_some_and(|o| o.head != request.sha || o.pr_state != "OPEN")
-                || !self.store.review_export_recorded(rec)?
+                || !self.store.verdict_recorded(&rec.issue, "pass", &verdict.sha, &verdict.reviewer, &verdict.report)?
             {
                 return Err(Error::rejected(
                     "native independent PASS receipt is missing, stale or unbound",
