@@ -8,6 +8,23 @@ use super::*;
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
+    /// Run a fixture-only HMR preview from an explicitly trusted local
+    /// Cadence source checkout. This executes that checkout's known
+    /// development harness, not an installed app or its manifest.
+    Dev {
+        /// Preview directory name under app-previews/.
+        name: String,
+        /// Trusted source checkout containing scripts/app-dev.mjs.
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long, default_value_t = 3186, value_parser = clap::value_parser!(u16).range(3110..=3199))]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Existing private tailnet hostname; required when sharing.
+        #[arg(long)]
+        allow_host: Vec<String>,
+    },
     /// Install an app folder into the project: `app.md` (frontmatter
     /// `app`, `title`, `version`, `needs.connections`) plus
     /// `workflows/*.md` — every one checked like `workflow check` —
@@ -137,6 +154,15 @@ pub(crate) enum AppAction {
 pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
+        AppAction::Dev {
+            name,
+            source,
+            port,
+            host,
+            allow_host,
+        } => {
+            return run_dev(name, source, *port, host, allow_host);
+        }
         AppAction::Install { source, project } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             app::install(&pm, project, source, state_dir, "")?
@@ -204,4 +230,51 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
 
 pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
     run_app(&state_dir, action)
+}
+
+/// No production state, PM, socket or app approval is accessed here.
+pub(super) fn run_dev(
+    name: &str,
+    source: &Path,
+    port: u16,
+    host: &str,
+    allow_hosts: &[String],
+) -> Result<i32> {
+    let source = source
+        .canonicalize()
+        .map_err(|e| Error::invalid("app_dev_source", format!("trusted source checkout: {e}")))?;
+    let harness = source.join("scripts/app-dev.mjs");
+    if !harness.is_file() || !source.join("ui/package.json").is_file() {
+        return Err(Error::invalid("app_dev_source", "source must be a trusted Cadence checkout with scripts/app-dev.mjs and UI dependencies"));
+    }
+    let mut command = std::process::Command::new("node");
+    command
+        .arg(&harness)
+        .arg(name)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--host")
+        .arg(host)
+        .current_dir(&source);
+    for host in allow_hosts {
+        command.arg("--allow-host").arg(host);
+    }
+    // The preview needs tools, not a native identity, state dir, provider
+    // keys, browser cookies or the operator's daemon/session environment.
+    command.env_clear();
+    for name in [
+        "PATH",
+        "HOME",
+        "LANG",
+        "TERM",
+        "PNPM_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let status = cadence_agent::reaper::status(&mut command)
+        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
+    Ok(status.code().unwrap_or(1))
 }
