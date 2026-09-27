@@ -169,7 +169,7 @@ fn cad688_concurrent_rotate_revoke_cannot_retarget_a_replacement() {
     let first = d
         .operator_rpc(
             "connection_create",
-            create("concurrent", "cadp_concurrent_first"),
+            create("concurrent", "cadp_aaaaaaaaaaaaaaaaaaaa"),
         )
         .unwrap();
     let id = first["connection"]["id"].clone();
@@ -177,7 +177,7 @@ fn cad688_concurrent_rotate_revoke_cannot_retarget_a_replacement() {
         let rotate = scope.spawn(|| {
             d.operator_rpc(
                 "connection_rotate",
-                json!({"connection_id":id,"token":"cadp_concurrent_second"}),
+                json!({"connection_id":id,"token":"cadp_bbbbbbbbbbbbbbbbbbbb"}),
             )
         });
         let revoke =
@@ -188,14 +188,14 @@ fn cad688_concurrent_rotate_revoke_cannot_retarget_a_replacement() {
     let next = d
         .operator_rpc(
             "connection_create",
-            create("concurrent", "cadp_concurrent_third"),
+            create("concurrent", "cadp_cccccccccccccccccccc"),
         )
         .unwrap();
     assert_ne!(next["connection"]["id"], id);
     assert!(d
         .operator_rpc(
             "connection_rotate",
-            json!({"connection_id":id,"token":"cadp_concurrent_stale"})
+            json!({"connection_id":id,"token":"cadp_dddddddddddddddddddd"})
         )
         .is_err());
     assert_eq!(
@@ -475,4 +475,27 @@ fn cad688_metadata_constant_token_refuses_before_any_enrollment_write() {
             )
             .is_err());
     }
+}
+
+#[test]
+fn cad688_duplicate_enrollment_error_does_not_reflect_credential_input() {
+    let d = fixture();
+    d.operator_rpc(
+        "connection_create",
+        create("duplicate", "cadp_seed_q1w2e3r4t5y6"),
+    )
+    .unwrap();
+    let before = d.operator_rpc("connection_list", json!({})).unwrap();
+    let error = d
+        .operator_rpc("connection_create", create("duplicate", "duplicate"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("duplicate"),
+        "native error reflected credential input"
+    );
+    assert_eq!(
+        d.operator_rpc("connection_list", json!({})).unwrap(),
+        before
+    );
 }
