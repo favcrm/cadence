@@ -37,8 +37,11 @@ copy** of the store and an existing regular `cadence.lock`. Use a clean isolated
 tracker clone. Never point this at the production state or `~/pm`; this command
 refuses those production paths and state outside `/tmp`.
 
+Start with `--dry-run`, which mutates nothing (see the isolation contract
+below), then repeat the same arguments without it:
+
 ```bash
-python3 scripts/rehearse-hosted-migration.py \
+python3 scripts/rehearse-hosted-migration.py --dry-run \
   --cadence /absolute/path/to/a/reviewed/cadence \
   --source-state /tmp/my-cad529/offline-state \
   --tracker /tmp/my-cad529/tracker-source \
@@ -61,6 +64,100 @@ check fails, no success receipt is written. Keep the failed output private for
 inspection and use a new output directory on the next attempt; the tool never
 overwrites or cleans another lane's data.
 
+### Isolation contract
+
+A rehearsal reads repositories and runs the real CLI, so admission must precede
+the earliest repository/config reader. The following properties are tested on
+owned offline inputs. They do not provide filesystem custody against concurrent
+same-UID replacement between a check and a later read.
+
+**Only ordinary self-contained Git layouts are supported.** Filesystem-only
+discovery must find a real `.git` directory inside the admitted source/tracker/
+output roots before repository Git runs. A central admission check repeats for
+every `git -C` invocation and local clone source, including index discovery,
+status, snapshot and checkout. It includes the output clone before checkout.
+Recorded paths with an existing parent but no contained repository are refused:
+downstream Git could otherwise discover an ancestor outside the roots. A missing
+parent is skipped only where the export/restore path also skips Git.
+
+Metadata admission rejects inventories exceeding 10000 entries, foreign-owned
+entries, symlinks, special files, hardlinked regular files and active hooks.
+Gitfiles, linked worktrees/common directories and all object alternates are
+unsupported, including quoted alternate syntax, symlinked `info`/`alternates`,
+and symlinked object/pack directories or pack files. Prepare an ordinary owned
+offline repository separately; the rehearsal never repairs these layouts or
+modifies the original to make it acceptable.
+
+Submodules are unsupported too. Refuse `.git/modules` before config discovery
+and reject every mode-160000 gitlink in the admitted top repository's index
+before status or clone. The index probe uses nonrecursive `ls-files --stage -z`
+with optional locks/fsmonitor/split-index writes disabled; it does not enter the
+child or call the central admission method recursively. This covers old-form
+embedded repositories and external child gitdirs without a modules directory,
+as well as ordinary initialized submodules. It also applies to recorded-path
+repositories and is not implemented by ignoring dirty submodules. See Git's
+[submodule forms](https://git-scm.com/docs/gitsubmodules#_forms) and
+[ls-files options](https://git-scm.com/docs/git-ls-files#_options).
+
+Before repository Git may load config, Git parses only key names from the
+admitted config file using `config --no-includes --file ... --name-only --list`
+in private nonrepository scratch. No config values enter evidence. Includes and
+conditional includes are refused. The conservative key allowlist permits normal
+core repository metadata, `core.splitIndex`, user name/email, remote url/fetch
+and branch remote/merge. Path/command settings such as `core.worktree`,
+`core.hooksPath`, `core.attributesFile`, `core.fsmonitor` and unknown keys refuse
+admission. Unsupported-layout errors propagate as refusals, never "no repo".
+
+**The repository it reads is never written.** `git status` refreshes cached stat
+data and rewrites the index it opens, so pointing an unguarded status check at a
+live checkout mutates `.git/index`. Every git read here runs against a throwaway
+copy of the index (`GIT_INDEX_FILE`); the tracker's own metadata inventory is
+unchanged afterwards. An existing split index is refused before refresh; even a
+copied split index references live shared-index files. A full index with
+`core.splitIndex=true` remains supported because status explicitly overrides the
+actual key with `core.splitIndex=false` and uses `--no-optional-locks`. The tests
+check all metadata paths, types, modes, ownership, link counts, nanosecond mtimes,
+sizes, regular-file digests and symlink targets, not just the main index.
+The test makes the fixture live-shaped — stat data
+deliberately stale, so a refresh has something to write — and asserts that the
+plain command it replaced *does* change the index.
+
+**Children inherit nothing.** `run()` builds each child's environment from an
+allowlist (`PATH`), never from the caller's. A `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `CADENCE_STATE_DIR` or
+`CADENCE_PM_DIR` exported into the rehearsal cannot reach git or the CLI, and a
+variable added to the parent later cannot silently become inherited. `HOME` and
+`TMPDIR` point into a private scratch directory, and global/system git config is
+read from `/dev/null`. This is not cosmetic: `GIT_DIR` beats `git -C`, and with
+the caller's environment the same `cadence export` records the decoy checkout
+and its remote instead of the rehearsal's. The test proves both halves.
+
+**No credentialed URL reaches any output.** `cadence export`'s `discover_repos`
+and `cadence restore`'s `plan_remap` run `git -C <dir> remote get-url origin`
+for every value in `agents.cwd`, `jobs.repo`, `jobs.spec_path`,
+`tasks.worktree` and `tasks.spec_path`. The directory is the value itself when
+it is one, **otherwise its parent** — so a `spec_path` whose file was deleted
+still causes a read of the checkout that held it. An offline copy of a real
+store names live developer checkouts, and such a remote may embed
+`user:token@`. Two independent guards apply.
+
+First, before the export runs, the rehearsal resolves every path column by that
+same rule and refuses any source that reaches a directory outside its own
+source, tracker and output roots — so it reads no repository it does not own.
+NULL or remap those columns in the offline copy first (for example
+`UPDATE agents SET cwd=NULL;` on the copy, never on production). Second, every
+remote that does enter evidence is passed through the same `strip_credentials`
+rule as `src/backup/mod.rs`, and the manifest, exported row content, receipt and
+stdout are scanned for any URL carrying userinfo; one match refuses the run.
+
+**`--dry-run` mutates nothing.** It creates no output directory, writes no
+index, adds no file to the source state, and takes the source flock only long
+enough to learn whether a daemon holds it before releasing it — an advisory lock
+leaves nothing on disk. It still reports the tracker commit, the store
+inventory, the recorded checkout paths, and the directories, commands and checks
+a real run would use. Every refusal above (foreign owner, active daemon, dirty
+tracker, non-`/tmp` path, foreign checkout) fires in dry-run too.
+
 Validation uses small offline SQLite fixtures, including real CLI export/restore
 when an explicit existing binary is supplied:
 
@@ -69,11 +166,26 @@ CADENCE_REHEARSAL_BINARY=/absolute/path/to/cadence \
   python3 scripts/test-hosted-migration.py -v
 ```
 
-This proves the offline store/tracker preparation path, not real production
-cloud storage, lease fencing, auth, queue acceptance or rollback. The receipt
-names these unproven gates. No Rust build is required; an existing binary's
-provenance must accompany the evidence, and compilation remains subject to
-normal build-slot admission or CI.
+Negative source fixtures prove real Git can reach synthetic outside configuration
+or objects before testing refusal, then assert no Git repository command reaches
+the refused repository, no output is created and owned metadata remains
+unchanged. Python read canaries additionally cover symlinked alternate paths.
+These witnesses are distinct from physical syscall tracing and actual CLI
+export/restore evidence; synthetic export/restore controls are not real CLI proof.
+CI supplies its freshly built release CLI for the three real-CLI cases. A local
+run without `CADENCE_REHEARSAL_BINARY` reports those existing cases as skipped.
+
+This proves the bounded offline store/tracker preparation path and the tested
+admission contract, not real production cloud storage, lease fencing, auth, queue
+acceptance or rollback. The receipt names these unproven gates. No Rust build is
+required; an existing binary's provenance must accompany the evidence, and
+compilation remains subject to normal build-slot admission or CI.
+
+The metadata walk and later Git/CLI reads are separate operations. A concurrent
+same-UID writer can replace paths after admission; no immutable snapshot, syscall-
+complete host isolation or atomic all-writer freeze is claimed. Exclude every
+writer while preparing and rehearsing the owned offline inputs. Source/metadata
+comparisons are evidence of these fixtures, not a cure for that race.
 
 ## Single-writer handoff: blocking dependency
 
