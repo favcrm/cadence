@@ -145,6 +145,8 @@ jobs:
         run: python3 tests/scripts/test_test_feedback.py
       - name: Test required gate evidence policy
         run: python3 tests/scripts/test_ci_gate_evidence.py
+      - name: Test release classification and immutable reruns
+        run: python3 tests/scripts/test_release_publication_policy.py
       - name: Test assertion inventory scanner
         run: python3 tests/scripts/test_assert_inventory.py
 
@@ -786,11 +788,23 @@ jobs:
         run: |
           set -euo pipefail
           assets=(./*.tar.gz ./*.sha256 install.sh)
+          # Classify from the prerelease portion of the exact Cargo tag;
+          # a hyphen in build metadata alone is not a prerelease.
+          prerelease=false
+          latest=true
+          case "${TAG%%+*}" in *-*) prerelease=true; latest=false ;; esac
           if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$draft" = true ]; then
               gh release upload "$TAG" --clobber "${assets[@]}"
-              gh release edit "$TAG" --draft=false
+              gh release edit "$TAG" --draft=false --prerelease="$prerelease" --latest="$latest"
               exit 0
+            fi
+            # A published release is read-only, including its classification.
+            # Do not repair an incorrect pilot by mutating published metadata.
+            published_pre=$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)
+            if [ "$published_pre" != "$prerelease" ]; then
+              echo "release $TAG is already published with a different prerelease classification" >&2
+              exit 1
             fi
             mkdir ../published
             gh release download "$TAG" --dir ../published
@@ -809,11 +823,9 @@ jobs:
             echo "release $TAG is already published with identical assets"
             exit 0
           fi
-          pre=()
-          case "$TAG" in *-*) pre=(--prerelease) ;; esac
           gh release create "$TAG" --draft --verify-tag --title "cadence $TAG" \
-            --generate-notes "${pre[@]}" "${assets[@]}"
-          gh release edit "$TAG" --draft=false
+            --generate-notes --prerelease="$prerelease" --latest="$latest" "${assets[@]}"
+          gh release edit "$TAG" --draft=false --prerelease="$prerelease" --latest="$latest"
 
   # CAD-311: prove the non-x86_64 builds on every PR and queue entry, not
   # first at a tag. Plain `cargo build` (no UI embed): what differs per

@@ -5,6 +5,10 @@ describe installation **after publication**; they are not working download
 links yet. Check the [release list](https://github.com/favcrm/cadence/releases)
 for an available tag and its limitations before installing.
 
+Source is prepared for **0.1.0-beta.1**, a local CLI pilot. Its matching planned
+tag is **v0.1.0-beta.1**; no source SHA has been selected for publication. The
+planned version is not an available download or a supported production rollout.
+
 ## Platforms and prerequisites
 
 The pipeline produces `x86_64-linux`, `aarch64-linux` and `aarch64-macos`
@@ -25,7 +29,7 @@ For a pilot prerelease, copy its exact tag from the release list. GitHub's
 tag before running these commands:
 
 ```sh
-release_tag=v0.1.0-beta.1 # example only; must be an actually published tag
+release_tag=v0.1.0-beta.1 # planned pilot; use only once this tag is published
 curl -fsSL "https://github.com/favcrm/cadence/releases/download/$release_tag/install.sh" -o install.sh
 sh install.sh --version "$release_tag"
 "$HOME/.local/bin/cadence" --version
@@ -72,7 +76,7 @@ the basic installation path does not depend on `gh`.
 
 ## Updates and current limits
 
-Public stable automatic upgrades are not yet verified. Current `cadence upgrade`
+The public stable-release updater is not implemented. Current `cadence upgrade`
 and `cadence update` use the authenticated, attested internal CI channel; do not
 present them as anonymous public-release upgrades (CAD-661/CAD-561).
 
@@ -82,6 +86,10 @@ Existing installations must use their rollout owner's backup, compatibility,
 drain and restart procedure. An older binary may be incompatible with newer
 state. No running daemon is restarted by this installer.
 
-Hosted sign-in, local worker cloud delivery and production migration remain
-separate acceptance work under CAD-525/CAD-539/CAD-529. A native CLI release
-does not imply those cloud paths are operational.
+Browser/token login code is issuer-client preparation, not a working public
+cloud login, enrollment or assignment flow. Local worker teams receiving cloud
+assignments, sleep-safe accepted-to-applied result delivery and production
+migration remain separate acceptance work under CAD-525/CAD-539/CAD-529.
+The local offline outbox foundation does not establish a working remote
+transport or an applied receipt. A native CLI pilot does not establish cloud
+readiness, compatibility with existing production state or every provider.
