@@ -1724,8 +1724,9 @@ normal navigation link. Each failed check carries its complete selectable
 command and a copy button with success or fallback feedback. “Check again”
 requests `GET /api/setup?fresh=1` and refreshes registered projects;
 nothing is applied from the browser. Loading, missing observations and
-failed refreshes do not show current readiness. A cached run shows its
-age and the host's cooldown; project failures remain distinct from an
+failed refreshes do not show current readiness. Failed refreshes, including host-only refusals, remain in the shared
+observation state across navigation; returning retries the stale report.
+A cached run shows its age and the host's cooldown; project failures remain distinct from an
 empty project list.
 
 The master section (CAD-448) offers every provider `master start` accepts,

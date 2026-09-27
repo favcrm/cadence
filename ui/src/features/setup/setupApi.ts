@@ -19,16 +19,23 @@ async function fetchSetup(fresh: boolean): Promise<SetupReport> {
  * probes, bounded at 5 s each), so fresh for a minute: Home and /setup
  * share one run.
  */
-export const setupResource = cache.resource<SetupReport>("setup", () => fetchSetup(false), {
-  freshMs: 60_000,
-});
+export const setupResource = cache.resource<SetupReport>(
+  "setup",
+  () => fetchSetup(false),
+  {
+    freshMs: 60_000,
+  },
+);
 
 /**
- * Re-check on demand: its own `fresh=1` request (never a flag another
- * fetch could pick up), written into the store when it lands.
+ * Re-check's explicit fresh=1 request uses the shared observation lifecycle:
+ * errors stay stale (including host-only refusals) after navigation, and a
+ * later visit retries them. No fresh flag can leak into another fetch.
  */
 export async function recheckSetup(): Promise<SetupReport> {
-  const report = await fetchSetup(true);
-  setupResource.write(() => report);
-  return report;
+  await setupResource.refreshUsing(() => fetchSetup(true));
+  const state = setupResource.get();
+  if (state.error) throw new Error(state.error);
+  if (!state.data) throw new Error("Setup report unavailable");
+  return state.data;
 }

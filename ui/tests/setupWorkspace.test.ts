@@ -158,6 +158,11 @@ const fresh = async () => {
   await seed();
   await render();
 };
+const remount = async () => {
+  await React.act(async () => root.unmount());
+  root = createRoot(host);
+  await render();
+};
 const selection = () =>
   host.querySelector('nav button[aria-current="step"]')?.textContent ?? "";
 const chosen = require("process").argv[2] ?? "all";
@@ -289,6 +294,34 @@ async function run() {
       copied === "cadence setup" && /Copied/.test(text()),
       "Copy sends the exact command and reports success",
     );
+  }
+  if (chosen === "all" || chosen === "lifetime") {
+    report = ready();
+    projects = [{ key: "site" }];
+    fail = false;
+    projectFail = false;
+    await fresh();
+    fail = true;
+    await click(button(/^Check again/));
+    const before = setupReads;
+    await remount();
+    assert(
+      setupReads > before &&
+        !text().includes("Required checks passed") &&
+        text().includes("Sample probe failure"),
+      "Returning after a failed re-check retries the stale report without resurrecting readiness",
+    );
+    fail = false;
+    denied = true;
+    await click(button(/^Check again/));
+    await remount();
+    assert(
+      text().includes("Continue on the host") &&
+        !host.querySelector("nav") &&
+        !text().includes("state_dir observation"),
+      "Returning after host403 cannot resurrect cached host checks",
+    );
+    denied = false;
   }
   if (chosen === "all") {
     report = ready();

@@ -104,7 +104,14 @@ export class Resource<T> {
   observed = (): boolean => this.listeners.size > 0;
 
   /** Fetch now, or join the request already in flight. */
-  refresh = (): Promise<void> => {
+  refresh = (): Promise<void> => this.refreshUsing(this.fetcher);
+
+  /**
+   * An explicit request variant, through the same state/error lifecycle.
+   * The fetcher applies only to this run; revalidation and trailing loads
+   * keep the default fetcher. Joins any request already in flight.
+   */
+  refreshUsing = (fetcher: () => Promise<T>): Promise<void> => {
     if (this.inflight) return this.inflight;
     this.invalid = false;
     const started = this.generation;
@@ -113,7 +120,7 @@ export class Resource<T> {
       // With nothing loaded a retry is a load, not a standing failure.
       status: this.state.data === null ? "loading" : this.state.status,
     });
-    const run = this.fetcher().then(
+    const run = fetcher().then(
       (data) => {
         if (this.generation !== started) {
           // A local write landed while this was in flight: its data is

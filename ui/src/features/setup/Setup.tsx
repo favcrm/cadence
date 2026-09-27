@@ -395,11 +395,7 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
   const state = useQuery(setupResource),
     projectsState = useQuery(resources.projects);
   const [step, setStep] = useState<StepId>("environment");
-  const [checking, setChecking] = useState(false),
-    [recheckError, setRecheckError] = useState<string | null>(null);
-  const [reused, setReused] = useState<{ age: number; wait: number } | null>(
-    null,
-  );
+  const [checking, setChecking] = useState(false);
   const selected = useRef(false),
     flight = useRef(false);
   const panelId = useId();
@@ -408,11 +404,9 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
   const index = STEPS.findIndex((section) => section.id === step);
   const missing = report ? missingRequired(report) : [];
   const busy = checking || state.inFlight || projectsState.inFlight;
-  const stale = !!(state.error || recheckError || projectsState.error);
+  const stale = !!(state.error || projectsState.error);
   const visibleError =
-    recheckError ??
-    state.error ??
-    (step !== "project" ? projectsState.error : null);
+    state.error ?? (step !== "project" ? projectsState.error : null);
   const current = report !== null && projects !== null && !busy && !stale;
   const date = report ? new Date(report.checked_at) : null;
   const checkedAt =
@@ -444,26 +438,18 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
     if (flight.current || busy) return;
     flight.current = true;
     setChecking(true);
-    setRecheckError(null);
-    setReused(null);
     // Project registration happens on the host; refresh that observation too.
     void resources.projects.invalidate();
     try {
-      const result = await recheckSetup();
-      setReused(
-        result.ran_now
-          ? null
-          : { age: result.age_ms, wait: result.recheck_in_ms },
-      );
-    } catch (error) {
-      setRecheckError(error instanceof Error ? error.message : String(error));
+      await recheckSetup();
+    } catch {
+      // The shared setup store retains the error, including across navigation.
     } finally {
       flight.current = false;
       setChecking(false);
     }
   };
-  if (state.error === SETUP_ON_HOST || recheckError === SETUP_ON_HOST)
-    return <OnHost />;
+  if (state.error === SETUP_ON_HOST) return <OnHost />;
   const summary = !report
     ? state.error
       ? "Setup checks unavailable"
@@ -515,11 +501,11 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
           </span>
         )}
       </div>
-      {reused && (
+      {!busy && !stale && report?.ran_now === false && (
         <p className="setup-inline-status" role="status">
-          Recent report reused ({Math.max(1, Math.ceil(reused.age / 1000))}s
+          Recent report reused ({Math.max(1, Math.ceil(report.age_ms / 1000))}s
           old). The host can check again after its{" "}
-          {Math.max(1, Math.ceil(reused.wait / 1000))}s cooldown.
+          {Math.max(1, Math.ceil(report.recheck_in_ms / 1000))}s cooldown.
         </p>
       )}
       {report && visibleError && (
