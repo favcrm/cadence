@@ -417,23 +417,21 @@ impl AgenticosAdapter {
         let (code, data) =
             self.publish_request(credential, "publish", &authorization.key, &digest, &body)?;
         let result: wire::Published = typed(data)?;
-        let valid = match (code, result.decision, result.status, result.executed) {
+        let valid = matches!(
+            (code, result.decision, result.status, result.executed),
             (
                 200,
                 wire::Decision::Approved | wire::Decision::Granted,
                 wire::Status::Posted | wire::Status::Processing,
-                true,
-            ) => true,
-            (
+                true
+            ) | (
                 200,
                 wire::Decision::Approved | wire::Decision::Granted,
                 wire::Status::Failed,
-                false,
-            ) => true,
-            (202, wire::Decision::Pending, wire::Status::Pending, false) => true,
-            (409, wire::Decision::Declined, wire::Status::Declined, false) => true,
-            _ => false,
-        };
+                false
+            ) | (202, wire::Decision::Pending, wire::Status::Pending, false)
+                | (409, wire::Decision::Declined, wire::Status::Declined, false)
+        );
         if !valid
             || result.key != authorization.key
             || result
