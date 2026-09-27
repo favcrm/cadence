@@ -61,6 +61,7 @@ All routes require a live operator session and proof of the HTTP peer. A stolen 
 | `/api/app-effects` | GET | None |
 | `/api/app-effects/EFFECT_ID` | GET | None |
 | Same route plus `/decide` | POST | `digest`, `decision` (`accept` or `decline`) |
+| Same route plus `/resolve` | POST | `digest`, `resolution` (`close` or `acknowledge`) |
 | `/api/app-installations/INSTALL_ID/effects` | GET | None |
 | `/api/app-installations/INSTALL_ID/contexts/CONTEXT_ID/effects` | GET | None |
 
@@ -72,6 +73,10 @@ The effect's app-artifact authority records the exact installation, optional con
 
 The broker serializes authority mutation with the bounded Local commit and releases its SQL connection before the adapter reads its executing permit. The outbox stores an `app_artifact` item with provenance under `app-items/EFFECT_ID`. It does not invent a project, inherit a worker directory or publish attachments. The original project publication tool retains its existing behavior.
 
-An uncertain `executing` effect becomes a reconciliation item after restart. It is not automatically sent again. Operator history retains the original reviewed receipt after context or binding revocation. Retirement of a reviewer does not rewrite a historical accepted review; current installation and release authority still apply.
+Adapters report app-artifact execution errors as a known refusal or an uncertain outcome. An error after the Local item lands remains `reconcile`, including when exact readback finds the item. A process interrupted in `executing` also becomes a reconciliation item after restart. Neither case automatically sends again.
+
+Inspect the effect and resolve its exact digest with `cadence app effect resolve EFFECT_ID --digest EXACT_EFFECT_DIGEST --resolution close` for a reconciliation item, or `--resolution acknowledge` for a flagged terminal `done`/`failed` outcome. Closing retains the original authority, input, decision and outcome. Acknowledgement clears the flag and retains the terminal state. Both actions require operator proof, allow only those states, and cannot claim execution. Historical resolution remains available when the app bundle or current context is gone.
+
+App effect receipts are a separate schema-1 `app_artifact` contract. Their `record.kind` is `app_artifact_effect`, and `needs_you` is explicit in the effect envelope. Unlike the legacy connected-platform v1 pending-effect record, app receipts intentionally retain decision and outcome after reconciliation is closed. Legacy pending-effect schemas and publication behavior are unchanged. Operator history retains the original reviewed receipt after context or binding revocation. Retirement of a reviewer does not rewrite a historical accepted review; current installation and release authority still apply.
 
 These checks are broker authority and storage integrity guarantees. They do not claim filesystem confinement against a process sharing the daemon's operating-system user.

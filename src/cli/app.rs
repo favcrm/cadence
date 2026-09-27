@@ -253,8 +253,30 @@ pub(crate) enum BindingAction {
         expected_revision: u64,
     },
 }
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum ResolutionChoice {
+    Close,
+    Acknowledge,
+}
+impl ResolutionChoice {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Acknowledge => "acknowledge",
+        }
+    }
+}
 #[derive(Subcommand)]
 pub(crate) enum EffectAction {
+    /// Close an uncertain receipt or acknowledge a flagged terminal outcome.
+    /// Resolution retains history and never executes a release.
+    Resolve {
+        effect_id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum)]
+        resolution: ResolutionChoice,
+    },
     /// Stage stored accepted artifact bytes; no caller content or path is accepted.
     Stage {
         run_id: String,
@@ -349,6 +371,14 @@ fn binding_params(action: &BindingAction) -> (&'static str, serde_json::Value) {
 }
 fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
     match action {
+        EffectAction::Resolve {
+            effect_id,
+            digest,
+            resolution,
+        } => (
+            "app_effect_resolve",
+            json!({"effect_id":effect_id,"digest":digest,"resolution":resolution.as_str()}),
+        ),
         EffectAction::Stage {
             run_id,
             artifact_id,

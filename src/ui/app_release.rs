@@ -17,6 +17,7 @@ pub(super) enum Route<'a> {
     Effects(Option<&'a str>, Option<&'a str>),
     Effect(&'a str),
     Decide(&'a str),
+    Resolve(&'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -34,6 +35,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         return match parts.as_slice() {
             [id] if segment(id) => Some(Route::Effect(id)),
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
+            [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
     }
@@ -81,6 +83,7 @@ impl Route<'_> {
                 | Self::Revoke(..)
                 | Self::Stage(_)
                 | Self::Decide(_)
+                | Self::Resolve(_)
         )
     }
 }
@@ -132,6 +135,18 @@ enum Choice {
 struct Decision {
     digest: String,
     decision: Choice,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Resolution {
+    Close,
+    Acknowledge,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Resolve {
+    digest: String,
+    resolution: Resolution,
 }
 fn typed<T: serde::de::DeserializeOwned + Serialize>(
     request: &mut Request,
@@ -201,6 +216,11 @@ pub(super) fn handle(
                 let mut params = typed::<Decision>(request)?;
                 params["effect_id"] = json!(effect);
                 ("app_effect_decide", params)
+            }
+            Route::Resolve(effect) => {
+                let mut params = typed::<Resolve>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_resolve", params)
             }
             Route::Bindings(_, Some(_)) => return Err(err_response(405, "method not allowed")),
         })
