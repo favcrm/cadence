@@ -515,3 +515,62 @@
             .unwrap();
         assert_eq!(s.model_defaults().unwrap().revision, 1);
     }
+
+    #[test]
+    fn launch_role_accepts_reviewer_and_refuses_anything_else() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = cwd.to_str().unwrap();
+        s.register_agent(&NewAgent {
+            alias: "rev",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "reviewer",
+            cwd: cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        assert_eq!(s.agent("rev").unwrap().role, "reviewer");
+        let err = s
+            .register_agent(&NewAgent {
+                alias: "nope",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "qa",
+                cwd: cwd_s,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: Some("reviewer"),
+                model_policy: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pm, worker, or reviewer"),
+            "{err}"
+        );
+        assert!(s.agent_opt("nope").unwrap().is_none());
+        // team_role is a model-lookup key. "reviewer" is not one, so a
+        // caller cannot sneak the delivery designation in through it.
+        let err = s
+            .register_agent(&NewAgent {
+                alias: "sneak",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: cwd_s,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: Some("reviewer"),
+                model_policy: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown team role"), "{err}");
+        assert!(s.agent_opt("sneak").unwrap().is_none());
+    }

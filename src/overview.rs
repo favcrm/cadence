@@ -49,6 +49,15 @@ pub const BUILD_ROOT: &str = env!("CADENCE_BUILD_ROOT");
 /// the CLI share one cache, and GitHub is the only source allowed to
 /// be a network call.
 const GH_CACHE_SECS: i64 = 60;
+const GH_CACHE_MAX_SECS: i64 = 3600;
+
+/// Only the overview's display cache. Delivery observations have their
+/// own bounded scheduler and must not inherit this setting (CAD-627).
+fn gh_cache_secs(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| (GH_CACHE_SECS..=GH_CACHE_MAX_SECS).contains(n))
+        .unwrap_or(GH_CACHE_SECS)
+}
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `git log` subjects surfaced in the drift tile.
@@ -724,7 +733,10 @@ impl Audience {
             // CAD-484: an idle lane with no safe next step is the
             // operator's call too.
             "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped"
-            | "next_action" => Self::Operator,
+            | "next_action"
+            // CAD-139: a researched idea waiting on the operator, and a
+            // near-duplicate the pipeline linked instead of researching.
+            | "idea_plan" | "idea_duplicate" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -1147,6 +1159,9 @@ pub struct Options {
     pub cache_only: bool,
     /// How long to wait on a gh refresh before serving the last cache.
     pub gh_wait: Duration,
+    /// Display-cache age, clamped to 60..=3600 seconds. The default reads
+    /// CADENCE_OVERVIEW_GH_CACHE_SECS from the board/CLI environment.
+    pub gh_cache_secs: i64,
     /// Read bound on each daemon RPC.
     pub probe_timeout: Duration,
     /// The per-agent probe pass starts no probe past this budget.
@@ -1162,6 +1177,11 @@ impl Options {
             scope: Scope::default(),
             cache_only: false,
             gh_wait: GH_TIMEOUT * 2 + Duration::from_secs(1),
+            gh_cache_secs: gh_cache_secs(
+                std::env::var("CADENCE_OVERVIEW_GH_CACHE_SECS")
+                    .ok()
+                    .as_deref(),
+            ),
             probe_timeout: PROBE_TIMEOUT,
             probe_budget: PROBE_BUDGET,
         }
@@ -1759,7 +1779,10 @@ static GH_REFRESHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// The GitHub block, 60 s-cached under the state dir, waiting as long
 /// as the one-shot CLI needs.
 fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
-    github_bounded(state_dir, slugs, Options::cli().gh_wait, gh_repo)
+    let opts = Options::cli();
+    // `session` shares this cache, but keeps its existing freshness bound.
+    // The configurable display age applies only in `overview_from`.
+    github_bounded(state_dir, slugs, opts.gh_wait, GH_CACHE_SECS, gh_repo)
 }
 
 /// The GitHub block with a bounded wait (CAD-249). Returns the repos
@@ -1773,13 +1796,14 @@ fn github_bounded(
     state_dir: &Path,
     slugs: &[String],
     wait: Duration,
+    cache_secs: i64,
     fetch: GhFetch,
 ) -> (HashMap<String, Value>, Value) {
     let file = cache_file(state_dir);
     let now = now_epoch();
     let cached = read_cache(&file);
     if let Some(c) = &cached {
-        if now - c.at < GH_CACHE_SECS && c.slugs == slugs {
+        if now - c.at < cache_secs.clamp(GH_CACHE_SECS, GH_CACHE_MAX_SECS) && c.slugs == slugs {
             return (
                 c.repos.clone(),
                 json!({"state": "cached", "at": c.at, "as_of": c.at}),
@@ -2052,13 +2076,12 @@ fn probe_agent(state_dir: &Path, a: &Value, timeout: Duration, deadline: Instant
         return p;
     }
     let rpc = |method: &str| {
-        bounded_rpc(
-            state_dir,
-            method,
-            json!({"alias": alias}),
-            timeout,
-            deadline,
-        )
+        let params = if method == "agent_show" {
+            json!({"alias": alias, "active_only": true})
+        } else {
+            json!({"alias": alias})
+        };
+        bounded_rpc(state_dir, method, params, timeout, deadline)
     };
     match rpc("agent_show") {
         Ok(v) => p.show = Some(v),
@@ -2569,6 +2592,33 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     items
 }
 
+/// CAD-213: quota-blocked, retrying, and still-queued intake relay work.
+/// The poller does not wake a provider to discover this; the row is the
+/// PM's attention surface until a later sync can dispatch.
+fn relay_attention_items(state_dir: &Path, now: i64) -> Vec<Item> {
+    crate::issue::relay::attention(state_dir, now)
+        .into_iter()
+        .map(|row| {
+            let since = (row.age_secs > 0).then_some(now.saturating_sub(row.age_secs));
+            let mut item = item(
+                86,
+                "intake_relay",
+                &row.title,
+                row.age_secs,
+                &row.project,
+                None,
+                &row.command,
+            )
+            .about("report", &row.subject_id)
+            .since(since);
+            if let Some(owner) = row.owner.as_deref() {
+                item = item.for_agent(owner).owned_by(Some(owner));
+            }
+            item
+        })
+        .collect()
+}
+
 /// CAD-506 §5.4: Needs-you rows from the durable pending-effect table
 /// and the information-only draft rows (Q3). One `platform_effects`
 /// read — an operator-proven board sees all rows; a board run inside
@@ -2796,7 +2846,7 @@ fn overview_from(
             if opts.cache_only {
                 github_repos_cached(state_dir, &slugs)
             } else {
-                github_bounded(state_dir, &slugs, opts.gh_wait, gh_repo)
+                github_bounded(state_dir, &slugs, opts.gh_wait, opts.gh_cache_secs, gh_repo)
             }
         });
         // Local files only — the notes index keeps it one pass.
@@ -2852,6 +2902,7 @@ fn overview_from(
     if daemon.reachable {
         needs.extend(platform_effect_items(state_dir, now, opts.probe_timeout));
     }
+    needs.extend(relay_attention_items(state_dir, now));
 
     // ---- tracker rows ----
     // Lowercased headRefName of every open PR — an issue in review
@@ -2924,7 +2975,13 @@ fn overview_from(
                 || open_pr_branches
                     .iter()
                     .any(|b| b.starts_with(&branch_prefix));
-            if v.status == "review" && !open_pr {
+            let gate_tag = v
+                .issue
+                .front
+                .tags
+                .iter()
+                .any(|t| matches!(t.as_str(), "plan-ready" | "parked" | "idea-stale"));
+            if v.status == "review" && !open_pr && !gate_tag {
                 needs.push(
                     item(
                         70,
@@ -3129,6 +3186,45 @@ fn overview_from(
                     row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
                     needs.push(row);
                 }
+            }
+            // CAD-139: the idea pipeline stops here. The operator
+            // approves, rejects, or parks; nothing else is dispatched.
+            if v.status == "review" && v.issue.front.tags.iter().any(|t| t == "plan-ready") {
+                needs.push(
+                    item(
+                        20,
+                        "idea_plan",
+                        &format!(
+                            "idea plan ready for your decision — {id} {}",
+                            v.issue.front.title
+                        ),
+                        age,
+                        project,
+                        None,
+                        &format!("cadence idea decide {id} approve"),
+                    )
+                    .about("issue", id)
+                    .since(clock.since(v)),
+                );
+            }
+            if v.status == "backlog"
+                && v.issue.front.tags.iter().any(|t| t == "idea")
+                && v.issue.front.duplicate_of.is_some()
+            {
+                let other = v.issue.front.duplicate_of.as_deref().unwrap_or("");
+                needs.push(
+                    item(
+                        20,
+                        "idea_duplicate",
+                        &format!("{id} looks like {other} — decide whether to keep it"),
+                        age,
+                        project,
+                        None,
+                        &format!("cadence issue show {id}"),
+                    )
+                    .about("issue", id)
+                    .since(clock.since(v)),
+                );
             }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
@@ -4360,6 +4456,91 @@ mod tests {
         Ok(json!({"prs": [{"number": 2}], "ci": {"state": "success"}}))
     }
 
+    #[test]
+    fn cad627_gh_cache_setting_bounds_and_default() {
+        assert_eq!(gh_cache_secs(None), 60);
+        assert_eq!(gh_cache_secs(Some(" 300 ")), 300);
+        assert_eq!(gh_cache_secs(Some("3600")), 3600);
+        for raw in ["", "0", "59", "-1", "3601", "NaN", "9999999999999999999999"] {
+            assert_eq!(gh_cache_secs(Some(raw)), 60, "{raw}");
+        }
+    }
+
+    #[test]
+    fn cad627_gh_cache_configurable_expiry_and_stale_fallback() {
+        fn fresh(_slug: &str) -> Result<Value, String> {
+            Ok(json!({"prs": [{"number": 2}]}))
+        }
+        fn failing(_slug: &str) -> Result<Value, String> {
+            Err("fixture outage".to_string())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slugs = vec!["acme/widgets".to_string()];
+        let repos = HashMap::from([(slugs[0].clone(), json!({"prs": [{"number": 1}]}))]);
+        let old = now_epoch() - 120;
+        write_cache(&cache_file(dir.path()), &slugs, &repos, old);
+        let wait = Duration::from_secs(2);
+        let (got, state) = github_bounded(dir.path(), &slugs, wait, 300, fresh);
+        assert_eq!(state["state"], "cached");
+        assert_eq!(state["as_of"], old);
+        assert_eq!(got[&slugs[0]]["prs"][0]["number"], 1);
+        let (got, state) = github_bounded(dir.path(), &slugs, wait, 60, fresh);
+        assert_eq!(state["state"], "ok");
+        assert_eq!(got[&slugs[0]]["prs"][0]["number"], 2);
+        let expired = now_epoch() - 301;
+        write_cache(&cache_file(dir.path()), &slugs, &repos, expired);
+        let (got, state) = github_bounded(dir.path(), &slugs, wait, 300, failing);
+        assert_eq!(state["state"], "stale");
+        assert_eq!(state["as_of"], expired);
+        assert_eq!(got[&slugs[0]]["prs"][0]["number"], 1);
+        assert_eq!(read_cache(&cache_file(dir.path())).unwrap().at, expired);
+        let (got, state) = github_bounded(dir.path(), &slugs, wait, 300, fresh);
+        assert_eq!(state["state"], "ok");
+        assert_eq!(got[&slugs[0]]["prs"][0]["number"], 2);
+    }
+
+    #[test]
+    fn cad627_overview_probe_requests_active_history() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(client::socket_path(dir.path())).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let result = if req["method"] == "agent_show" {
+                    json!({"messages": [{"state": "unknown", "completed": 42.0}]})
+                } else {
+                    json!({"requests": []})
+                };
+                writeln!(stream, "{}", json!({"ok": true, "result": result})).unwrap();
+                seen.push(req);
+            }
+            seen
+        });
+        let row = json!({"alias": "w1", "provider": "fake", "endpoint_kind": "managed"});
+        let probe = probe_agent(
+            dir.path(),
+            &row,
+            Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(4),
+        );
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0]["method"], "agent_show");
+        assert_eq!(seen[0]["params"]["active_only"], true);
+        assert_eq!(fenced_since(&row, &probe), Some(42));
+        assert!(!probe.holds_drift);
+    }
+
     /// CAD-249: a gh refresh slower than the caller's wait serves the
     /// last cache as `stale` with its `as_of` inside the bound, and the
     /// refresh still lands in the cache for the next request.
@@ -4376,7 +4557,13 @@ mod tests {
         write_cache(&cache_file(dir.path()), &slugs, &repos, old);
 
         let started = Instant::now();
-        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(300), slow_gh);
+        let (got, state) = github_bounded(
+            dir.path(),
+            &slugs,
+            Duration::from_millis(300),
+            GH_CACHE_SECS,
+            slow_gh,
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
@@ -4391,7 +4578,13 @@ mod tests {
         assert_eq!(got["acme/widgets"]["prs"][0]["number"], 1);
 
         // A second request while the refresh runs starts no other one.
-        let (_, again) = github_bounded(dir.path(), &slugs, Duration::from_millis(100), slow_gh);
+        let (_, again) = github_bounded(
+            dir.path(),
+            &slugs,
+            Duration::from_millis(100),
+            GH_CACHE_SECS,
+            slow_gh,
+        );
         assert_eq!(again["state"], "stale", "{again}");
 
         // The background refresh lands; the next request is a cache hit.
@@ -4400,7 +4593,13 @@ mod tests {
             assert!(Instant::now() < deadline, "refresh never landed");
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(1), slow_gh);
+        let (got, state) = github_bounded(
+            dir.path(),
+            &slugs,
+            Duration::from_millis(1),
+            GH_CACHE_SECS,
+            slow_gh,
+        );
         assert_eq!(state["state"], "cached", "{state}");
         assert_eq!(got["acme/widgets"]["prs"][0]["number"], 2);
     }
@@ -4412,7 +4611,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let slugs = vec!["acme/gadgets".to_string()];
         let started = Instant::now();
-        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(200), slow_gh);
+        let (got, state) = github_bounded(
+            dir.path(),
+            &slugs,
+            Duration::from_millis(200),
+            GH_CACHE_SECS,
+            slow_gh,
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(got.is_empty());
         assert_eq!(state["state"], "unavailable", "{state}");
@@ -4806,6 +5011,7 @@ mod tests {
             default_owner: None,
             build: None,
             memory: None,
+            intake: None,
         };
         // Path match against BUILD_ROOT (this crate's checkout) never
         // hits the temp clone — remote match does when remote differs…
@@ -4832,6 +5038,7 @@ mod tests {
             default_owner: None,
             build: None,
             memory: None,
+            intake: None,
         };
         assert!(build_repo_match(&[other]).is_none());
     }

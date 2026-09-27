@@ -10,9 +10,10 @@
 //! module only consumes the stable issue-folder contract (`intake` tag and
 //! title/body), so it can be compiled and tested independently of that PR.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -35,6 +36,12 @@ const MAX_SUMMARY_CHARS: usize = 4_000;
 const MAX_TITLE_CHARS: usize = 180;
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAIM_SECONDS: i64 = 300;
+/// GitHub `per_page` maximum. A full page means another page may exist.
+const PAGE_SIZE: usize = 100;
+/// Stop listing rather than silently treating a longer result as complete.
+const MAX_LIST_PAGES: u32 = 10;
+/// Newest event ids survive eviction. Older ids are dropped first.
+const SEEN_EVENT_CAP: usize = 2_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayProjectConfig {
@@ -79,12 +86,21 @@ impl Default for RelayConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayState {
     #[serde(default = "default_schema")]
     pub schema: u32,
     #[serde(default)]
     pub projects: BTreeMap<String, RelayProjectState>,
+}
+
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            schema: STATE_SCHEMA,
+            projects: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -109,8 +125,60 @@ pub struct RelayProjectState {
     pub reports: BTreeMap<String, ReportReceipt>,
     #[serde(default)]
     pub actions: BTreeMap<String, PendingAction>,
+    /// Oldest first. A string entry is a pre-stamp id (array order is its
+    /// age); a new event stores `{id, at}` so eviction drops the oldest
+    /// rather than the lexicographically first id.
+    #[serde(default, deserialize_with = "deserialize_seen_events")]
+    pub seen_events: Vec<SeenEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeenEvent {
+    pub id: String,
     #[serde(default)]
-    pub seen_events: BTreeSet<String>,
+    pub at: i64,
+}
+
+fn deserialize_seen_events<'de, D>(deserializer: D) -> std::result::Result<Vec<SeenEvent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    let mut out = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        if let Some(id) = value.as_str() {
+            out.push(SeenEvent {
+                id: id.to_string(),
+                at: i64::try_from(index).unwrap_or(i64::MAX),
+            });
+            continue;
+        }
+        let event: SeenEvent = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        out.push(event);
+    }
+    Ok(out)
+}
+
+impl RelayProjectState {
+    fn has_seen(&self, id: &str) -> bool {
+        self.seen_events.iter().any(|event| event.id == id)
+    }
+
+    /// Record `id` once. When the cap is exceeded, drop the oldest stamp
+    /// (then the smallest id), never the newest event.
+    fn remember(&mut self, id: String) {
+        if self.has_seen(&id) {
+            return;
+        }
+        self.seen_events.push(SeenEvent { id, at: now() });
+        if self.seen_events.len() <= SEEN_EVENT_CAP {
+            return;
+        }
+        self.seen_events
+            .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+        let overflow = self.seen_events.len() - SEEN_EVENT_CAP;
+        self.seen_events.drain(0..overflow);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,6 +268,7 @@ pub trait GithubApi {
         &mut self,
         repo: &str,
         page: u32,
+        since: Option<&str>,
     ) -> std::result::Result<Vec<GithubIssue>, String>;
     fn list_comments(
         &mut self,
@@ -237,16 +306,34 @@ fn gh_resource(repo: &str, suffix: &str) -> String {
     format!("repos/{repo}/{suffix}")
 }
 
+fn issues_query(repo: &str, page: u32, since: Option<&str>) -> String {
+    let mut path = format!(
+        "{}?state=all&per_page={PAGE_SIZE}&page={page}",
+        gh_resource(repo, "issues")
+    );
+    // Cursor values are GitHub `updated_at` timestamps. Anything else is
+    // ignored so a corrupt cursor cannot change the request target.
+    if let Some(since) = since.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 40
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+    }) {
+        path.push_str("&since=");
+        path.push_str(since);
+    }
+    path
+}
+
 impl GithubApi for GhApi {
     fn list_issues(
         &mut self,
         repo: &str,
         page: u32,
+        since: Option<&str>,
     ) -> std::result::Result<Vec<GithubIssue>, String> {
-        let path = format!(
-            "{}?state=all&per_page=100&page={page}",
-            gh_resource(repo, "issues")
-        );
+        let path = issues_query(repo, page, since);
         let value = gh_json(&["api".into(), path])?;
         serde_json::from_value(value)
             .map_err(|_| "GitHub issues response had an unexpected shape".to_string())
@@ -259,7 +346,7 @@ impl GithubApi for GhApi {
         page: u32,
     ) -> std::result::Result<Vec<GithubComment>, String> {
         let path = format!(
-            "{}?per_page=100&page={page}",
+            "{}?per_page={PAGE_SIZE}&page={page}",
             gh_resource(repo, &format!("issues/{issue}/comments"))
         );
         let value = gh_json(&["api".into(), path])?;
@@ -291,26 +378,30 @@ impl GithubApi for GhApi {
     }
 }
 
+/// Exclusive `flock` held for the life of this value. The kernel drops it
+/// when the process dies, so a crashed sync cannot leave a stale file that
+/// blocks the next poll. The file itself may remain; ownership is the lock.
+#[derive(Debug)]
 pub struct RelayLock {
-    path: PathBuf,
-}
-
-impl Drop for RelayLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _file: fs::File,
 }
 
 pub fn acquire_lock(state_dir: &Path) -> Result<RelayLock> {
     fs::create_dir_all(state_dir)?;
     let path = state_dir.join("intake-relay.lock");
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(_) => Ok(RelayLock { path }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::rejected(
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(Error::rejected(
             "intake relay is already running; wait for the existing sync or inspect its state",
-        )),
-        Err(e) => Err(e.into()),
+        ));
     }
+    Ok(RelayLock { _file: file })
 }
 
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
@@ -600,20 +691,42 @@ fn issue_marker_map(issues: &[GithubIssue], project_key: &str) -> BTreeMap<Strin
         .collect()
 }
 
+fn list_paged<T>(
+    mut fetch: impl FnMut(u32) -> std::result::Result<Vec<T>, String>,
+    what: &str,
+) -> std::result::Result<Vec<T>, String> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_LIST_PAGES {
+        let rows = fetch(page)?;
+        let full = rows.len() >= PAGE_SIZE;
+        all.extend(rows);
+        if !full {
+            return Ok(all);
+        }
+        if page == MAX_LIST_PAGES {
+            return Err(format!(
+                "GitHub {what} list truncated at {} rows; refusing a partial read",
+                MAX_LIST_PAGES as usize * PAGE_SIZE
+            ));
+        }
+    }
+    Err(format!("GitHub {what} list truncated"))
+}
+
 fn list_all_issues<T: GithubApi>(
     api: &mut T,
     repo: &str,
+    since: Option<&str>,
 ) -> std::result::Result<Vec<GithubIssue>, String> {
-    let mut all = Vec::new();
-    for page in 1..=10 {
-        let rows = api.list_issues(repo, page)?;
-        let done = rows.len() < 100;
-        all.extend(rows);
-        if done {
-            break;
-        }
-    }
-    Ok(all)
+    list_paged(|page| api.list_issues(repo, page, since), "issue")
+}
+
+fn list_all_comments<T: GithubApi>(
+    api: &mut T,
+    repo: &str,
+    issue: u64,
+) -> std::result::Result<Vec<GithubComment>, String> {
+    list_paged(|page| api.list_comments(repo, issue, page), "comment")
 }
 
 fn receipt<'a>(state: &'a mut RelayProjectState, id: &str) -> &'a mut ReportReceipt {
@@ -694,6 +807,8 @@ fn ingest_comments<T: GithubApi>(
 ) -> (usize, Vec<String>) {
     let mut queued = 0;
     let mut errors = Vec::new();
+    let mut complete = true;
+    let mut max_updated = project_state.cursor.clone();
     for issue in issues
         .iter()
         .filter(|issue| managed_issue_for_project(issue, project_key))
@@ -703,32 +818,20 @@ fn ingest_comments<T: GithubApi>(
             .as_deref()
             .and_then(report_id_from_body)
             .unwrap_or_else(|| format!("github-{}", issue.number));
-        let mut comments = Vec::new();
-        let mut comments_ok = true;
-        for page in 1..=10 {
-            let rows = match api.list_comments(repo, issue.number, page) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    errors.push(safe_text(&error, 600));
-                    comments_ok = false;
-                    break;
-                }
-            };
-            let done = rows.len() < 100;
-            comments.extend(rows);
-            if done {
-                break;
-            }
-        }
-        if !comments_ok {
-            continue;
-        }
-        for comment in comments {
-            let event_id = format!("comment:{repo}:{}:{}", issue.number, comment.id);
-            if project_state.seen_events.contains(&event_id) {
+        let comments = match list_all_comments(api, repo, issue.number) {
+            Ok(rows) => rows,
+            Err(error) => {
+                errors.push(safe_text(&error, 600));
+                complete = false;
                 continue;
             }
-            project_state.seen_events.insert(event_id.clone());
+        };
+        for comment in comments {
+            let event_id = format!("comment:{repo}:{}:{}", issue.number, comment.id);
+            if project_state.has_seen(&event_id) {
+                continue;
+            }
+            project_state.remember(event_id.clone());
             let own = comment.body.contains("<!-- cadence-relay:")
                 || config
                     .actor
@@ -761,22 +864,20 @@ fn ingest_comments<T: GithubApi>(
                 });
         }
         if let Some(updated) = &issue.updated_at {
-            if project_state
-                .cursor
+            if max_updated
                 .as_ref()
                 .map(|old| old < updated)
                 .unwrap_or(true)
             {
-                project_state.cursor = Some(updated.clone());
+                max_updated = Some(updated.clone());
             }
         }
     }
-    // Bound the durable dedup set.  The cursor still overlaps the next poll;
-    // keeping the newest IDs is enough to suppress normal GitHub reordering.
-    while project_state.seen_events.len() > 2_000 {
-        if let Some(first) = project_state.seen_events.iter().next().cloned() {
-            project_state.seen_events.remove(&first);
-        }
+    // A failed comment page must not move the watermark past work we did
+    // not finish. The next poll's inclusive `since` overlaps this cursor,
+    // and `remember` keeps the newest event ids.
+    if complete {
+        project_state.cursor = max_updated;
     }
     (queued, errors)
 }
@@ -790,34 +891,75 @@ fn pm_alias(pm_dir: &Path, project_key: &str, config: &RelayProjectConfig) -> Op
     value["roles"]["pm"]["alias"].as_str().map(str::to_string)
 }
 
-fn quota_allows(state_dir: &Path, alias: &str) -> std::result::Result<(), String> {
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
-        .map_err(|_| "quota unknown: PM agent state is unavailable".to_string())?;
-    let agent = &show["agent"];
+/// Same bound as `automatic_quota_error`: provider evidence older than this
+/// is not a grant to wake a PM.
+const QUOTA_EVIDENCE_MAX_AGE_SECS: i64 = 300;
+
+/// `agent_show` stores `canonical_quota`, not a top-level `remaining`.
+/// `state: available` only means the account id and rate-limit object were
+/// present. Usage lives at `data.rateLimits.primary.usedPercent`, and a
+/// stale or unbound `observed_at` is not evidence.
+fn quota_decision(agent: &Value) -> std::result::Result<(), String> {
     if matches!(agent["state"].as_str(), Some("stopped" | "attention")) {
         return Err(format!(
             "PM agent is {}",
             agent["state"].as_str().unwrap_or("unavailable")
         ));
     }
-    let quota = agent
-        .get("quota")
-        .filter(|v| !v.is_null())
-        .or_else(|| agent.get("usage_limit").filter(|v| !v.is_null()))
-        .ok_or_else(|| "quota unknown: no account allowance telemetry".to_string())?;
-    if quota["state"].as_str() != Some("available") {
-        return Err(format!(
-            "quota {}",
-            quota["reason"]
-                .as_str()
-                .or(quota["state"].as_str())
-                .unwrap_or("unknown")
-        ));
+    let Some(quota) = agent.get("quota").filter(|value| value.is_object()) else {
+        return Err("quota unknown: no account allowance telemetry".to_string());
+    };
+    if quota["provider"].as_str() != agent["provider"].as_str() {
+        return Err("quota unknown: allowance provider does not match agent".to_string());
     }
-    if quota["remaining"].as_i64() == Some(0) || quota["used_percent"].as_f64() == Some(100.0) {
+    if quota["assignee"].as_str() != agent["alias"].as_str() {
+        return Err("quota unknown: allowance is not bound to this agent".to_string());
+    }
+    let Some(thread_id) = agent["thread_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Err("quota unknown: agent has no current provider thread".to_string());
+    };
+    if quota["thread_id"].as_str() != Some(thread_id) {
+        return Err("quota unknown: allowance is not bound to the current thread".to_string());
+    }
+    let Some(account_id) = quota["account_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Err("quota unknown: provider evidence has no account identity".to_string());
+    };
+    if quota.pointer("/data/accountId").and_then(Value::as_str) != Some(account_id) {
+        return Err("quota unknown: account identity is not provider-bound".to_string());
+    }
+    if !matches!(
+        quota["source"].as_str(),
+        Some("account/rateLimits/read") | Some("account/rateLimits/updated")
+    ) {
+        return Err("quota unknown: provider evidence source is not canonical".to_string());
+    }
+    if quota["state"].as_str() != Some("available") {
+        let state = quota["state"].as_str().unwrap_or("unknown");
+        return Err(format!("quota {state}"));
+    }
+    let Some(observed_at) = quota["observed_at"].as_str().and_then(time::parse_iso) else {
+        return Err("quota unknown: provider evidence has no canonical timestamp".to_string());
+    };
+    let age = i128::from(now()) - i128::from(observed_at);
+    if age < -30 || age > i128::from(QUOTA_EVIDENCE_MAX_AGE_SECS) {
+        return Err("quota unknown: provider allowance evidence is stale".to_string());
+    }
+    let Some(used) = quota
+        .pointer("/data/rateLimits/primary/usedPercent")
+        .and_then(Value::as_f64)
+    else {
+        return Err("quota unknown: no primary usedPercent".to_string());
+    };
+    if !used.is_finite() || used >= 100.0 {
         return Err("quota exhausted".to_string());
     }
     Ok(())
+}
+
+fn quota_allows(state_dir: &Path, alias: &str) -> std::result::Result<(), String> {
+    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+        .map_err(|_| "quota unknown: PM agent state is unavailable".to_string())?;
+    quota_decision(&show["agent"])
 }
 
 fn dispatch_pending(
@@ -994,7 +1136,7 @@ fn publish_local_reports<T: GithubApi>(
         .iter()
         .filter(|issue| issue.front.tags.iter().any(|tag| tag == "intake"))
         .collect();
-    let remote = match list_all_issues(api, &config.repo) {
+    let remote = match list_all_issues(api, &config.repo, None) {
         Ok(issues) => issues,
         Err(error) => {
             for issue in &reports {
@@ -1062,7 +1204,7 @@ fn publish_local_reports<T: GithubApi>(
                 // any retry decision; a failed read leaves the receipt
                 // retrying rather than risking a duplicate issue.
                 let mut unresolved = false;
-                match list_all_issues(api, &config.repo) {
+                match list_all_issues(api, &config.repo, None) {
                     Ok(after) => {
                         if let Some(remote_issue) = issue_marker_map(&after, project_key).get(&id) {
                             mark_published(r, remote_issue, source_rev);
@@ -1105,14 +1247,18 @@ fn sync_project<T: GithubApi>(
         recover_claims(project_state);
         publish_local_reports(pm_dir, project_key, config, project_state, api)
     };
-    let remote = match list_all_issues(api, &config.repo) {
-        Ok(issues) => issues,
+    let since = state
+        .projects
+        .get(project_key)
+        .and_then(|project| project.cursor.clone());
+    let listed = match list_all_issues(api, &config.repo, since.as_deref()) {
+        Ok(issues) => Some(issues),
         Err(error) => {
             errors.push(safe_text(&error, 600));
-            Vec::new()
+            None
         }
     };
-    let (queued_comments, comment_errors) = {
+    let (queued_comments, comment_errors) = if let Some(remote) = listed {
         let project_state = state.projects.entry(project_key.to_string()).or_default();
         ingest_comments(
             api,
@@ -1122,6 +1268,10 @@ fn sync_project<T: GithubApi>(
             project_state,
             &remote,
         )
+    } else {
+        // A truncated or failed issue list is not an empty discussion.
+        // Leave the cursor where it was and do not mark comments seen.
+        (0, Vec::new())
     };
     errors.extend(comment_errors);
     let dispatched = dispatch_pending(state_dir, pm_dir, project_key, config, state, dispatch);
@@ -1146,6 +1296,106 @@ fn sync_project<T: GithubApi>(
         "last_error": project_state.last_error,
         "errors": errors,
     }))
+}
+
+/// One Needs-you row for relay work the consumer could not finish:
+/// a publication that is retrying or blocked, or a comment still queued
+/// because quota, a stopped PM, or an explicit dispatch gate held it.
+/// A missing or unreadable state file yields no rows — overview must not
+/// fail closed on the relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayAttention {
+    pub project: String,
+    pub subject_id: String,
+    pub title: String,
+    pub command: String,
+    pub age_secs: i64,
+    pub owner: Option<String>,
+}
+
+fn age_since(updated_at: &str, now_epoch: i64) -> i64 {
+    time::parse_iso(updated_at)
+        .map(|at| (now_epoch - at).max(0))
+        .unwrap_or(0)
+}
+
+pub fn attention(state_dir: &Path, now_epoch: i64) -> Vec<RelayAttention> {
+    let config = load_config(state_dir).unwrap_or_default();
+    let Ok(state) = load_state(state_dir) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (project, project_state) in &state.projects {
+        let owner = config
+            .projects
+            .get(project)
+            .and_then(|item| item.pm_alias.clone())
+            .filter(|alias| !alias.is_empty());
+        let command = format!("cadence intake status {project}");
+        for receipt in project_state.reports.values() {
+            if receipt.state != "retrying" && receipt.state != "blocked" {
+                continue;
+            }
+            let reason = receipt
+                .reason
+                .as_deref()
+                .or(receipt.last_error.as_deref())
+                .unwrap_or("publication needs attention");
+            rows.push(RelayAttention {
+                project: project.clone(),
+                subject_id: receipt.report_id.clone(),
+                title: format!(
+                    "{} relay {} — {}",
+                    receipt.report_id,
+                    receipt.state,
+                    safe_text(reason, 180)
+                ),
+                command: command.clone(),
+                age_secs: age_since(&receipt.updated_at, now_epoch),
+                owner: owner.clone(),
+            });
+        }
+        for action in project_state.actions.values() {
+            if action.state != "queued" && action.state != "retrying" {
+                continue;
+            }
+            let reason = action
+                .reason
+                .as_deref()
+                .unwrap_or("unclaimed; waiting for a quota-aware dispatch");
+            rows.push(RelayAttention {
+                project: project.clone(),
+                subject_id: action.event_id.clone(),
+                title: format!(
+                    "{} comment {} — {}",
+                    action.report_id,
+                    action.state,
+                    safe_text(reason, 180)
+                ),
+                command: command.clone(),
+                age_secs: age_since(&action.updated_at, now_epoch),
+                owner: owner.clone(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.age_secs
+            .cmp(&a.age_secs)
+            .then(a.subject_id.cmp(&b.subject_id))
+    });
+    let cap = crate::issue::report::NEEDS_ME_CAP;
+    if let Some(extra) = rows.len().checked_sub(cap).filter(|n| *n > 0) {
+        rows.truncate(cap);
+        rows.push(RelayAttention {
+            project: String::new(),
+            subject_id: "intake-relay-overflow".to_string(),
+            title: format!("… {extra} more intake relay items"),
+            command: "cadence intake status".to_string(),
+            age_secs: 0,
+            owner: None,
+        });
+    }
+    rows
 }
 
 pub fn sync_once(
@@ -1327,6 +1577,7 @@ pub fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -1336,19 +1587,49 @@ mod tests {
         create_calls: usize,
         timeout_after_create: bool,
         fail_reads: bool,
+        /// Every page is a full page, including the last allowed page.
+        force_full_pages: bool,
+        fail_comments: bool,
+        saw_since: Vec<Option<String>>,
     }
 
     impl GithubApi for MockApi {
         fn list_issues(
             &mut self,
             _repo: &str,
-            _page: u32,
+            page: u32,
+            since: Option<&str>,
         ) -> std::result::Result<Vec<GithubIssue>, String> {
+            self.saw_since.push(since.map(str::to_string));
             if self.fail_reads {
-                Err("auth unavailable".to_string())
-            } else {
-                Ok(self.issues.clone())
+                return Err("auth unavailable".to_string());
             }
+            if self.force_full_pages {
+                return Ok((0..PAGE_SIZE)
+                    .map(|index| GithubIssue {
+                        number: u64::from(page) * 1_000 + index as u64,
+                        html_url: String::new(),
+                        title: "unrelated".to_string(),
+                        body: None,
+                        updated_at: Some("2026-09-20T00:00:00Z".to_string()),
+                        labels: vec![],
+                        pull_request: None,
+                    })
+                    .collect());
+            }
+            if page > 1 {
+                return Ok(Vec::new());
+            }
+            let mut issues = self.issues.clone();
+            if let Some(since) = since {
+                issues.retain(|issue| {
+                    issue
+                        .updated_at
+                        .as_deref()
+                        .is_some_and(|updated| updated >= since)
+                });
+            }
+            Ok(issues)
         }
         fn list_comments(
             &mut self,
@@ -1356,8 +1637,8 @@ mod tests {
             issue: u64,
             _page: u32,
         ) -> std::result::Result<Vec<GithubComment>, String> {
-            if self.fail_reads {
-                Err("auth unavailable".to_string())
+            if self.fail_reads || self.fail_comments {
+                Err("comments unavailable".to_string())
             } else {
                 Ok(self.comments.get(&issue).cloned().unwrap_or_default())
             }
@@ -1923,5 +2204,482 @@ mod tests {
             "<!-- cadence-relay:event=x -->\nreceipt"
         ));
         assert!(actionable_comment("please investigate this regression"));
+    }
+
+    #[test]
+    fn stale_lock_file_does_not_block_and_a_live_holder_does() {
+        let (_temp, state_dir) = temp_state();
+        fs::write(state_dir.join("intake-relay.lock"), b"dead").unwrap();
+        let held = acquire_lock(&state_dir).expect("a leftover lock file is not a holder");
+        let blocked = acquire_lock(&state_dir).expect_err("the live holder excludes a second sync");
+        assert!(blocked.to_string().contains("already running"));
+        drop(held);
+        acquire_lock(&state_dir).expect("dropping the holder releases the lock");
+    }
+
+    #[test]
+    fn detached_holder_blocks_until_it_exits() {
+        let (_temp, state_dir) = temp_state();
+        let script = state_dir.join("hold.py");
+        let lock = state_dir.join("intake-relay.lock");
+        fs::write(
+            &script,
+            format!(
+                "import fcntl, os, time, sys\nos.setsid()\nf = open({lock:?}, 'a+')\nfcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\nsys.stdout.write('held\\n')\nsys.stdout.flush()\ntime.sleep(60)\n"
+            ),
+        )
+        .unwrap();
+        let child = Command::new("python3")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Kill(Option<std::process::Child>);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = Kill(Some(child));
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.0.as_mut().unwrap().stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line.trim(), "held");
+        let blocked = acquire_lock(&state_dir).expect_err("a live detached holder blocks");
+        assert!(blocked.to_string().contains("already running"));
+        let held = child.0.take().unwrap();
+        drop(Kill(Some(held)));
+        acquire_lock(&state_dir).expect("a dead holder must not wedge the consumer");
+        assert!(lock.is_file());
+    }
+
+    #[test]
+    fn truncated_issue_list_does_not_publish() {
+        let pm_temp = tempfile::tempdir().unwrap();
+        let pm = intake_pm(&pm_temp);
+        let config = relay_config();
+        let mut api = MockApi {
+            force_full_pages: true,
+            ..Default::default()
+        };
+        let mut state = RelayProjectState::default();
+        let (published, _, errors) =
+            publish_local_reports(&pm.dir, "cadence", &config, &mut state, &mut api);
+        assert_eq!(published, 0);
+        assert_eq!(api.create_calls, 0);
+        assert!(errors.iter().any(|error| error.contains("truncated")));
+        assert_eq!(state.reports["CAD-1"].state, "retrying");
+        assert!(state.reports["CAD-1"]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not attempted"));
+    }
+
+    #[test]
+    fn comment_failure_does_not_advance_the_cursor() {
+        let mut api = MockApi {
+            fail_comments: true,
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            ..Default::default()
+        };
+        let mut project_state = RelayProjectState::default();
+        let remote = api.issues.clone();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project_state,
+            &remote,
+        );
+        assert_eq!(queued, 0);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("comments unavailable")));
+        assert!(project_state.cursor.is_none());
+        assert!(project_state.actions.is_empty());
+    }
+
+    #[test]
+    fn comment_poll_passes_the_cursor_as_since() {
+        let pm_temp = tempfile::tempdir().unwrap();
+        let pm = crate::issue::Pm::init(pm_temp.path()).unwrap();
+        let (_temp, state_dir) = temp_state();
+        let mut api = MockApi {
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            comments: [(
+                4,
+                vec![GithubComment {
+                    id: 8,
+                    body: "please look at this".to_string(),
+                    user: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mut state = RelayState::default();
+        sync_project(
+            &pm.dir,
+            &state_dir,
+            "cadence",
+            &relay_config(),
+            &mut state,
+            &mut api,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.projects["cadence"].cursor.as_deref(),
+            Some("2026-09-20T01:02:03Z")
+        );
+        api.saw_since.clear();
+        sync_project(
+            &pm.dir,
+            &state_dir,
+            "cadence",
+            &relay_config(),
+            &mut state,
+            &mut api,
+            false,
+        )
+        .unwrap();
+        assert!(
+            api.saw_since
+                .iter()
+                .any(|since| since.as_deref() == Some("2026-09-20T01:02:03Z")),
+            "second poll since values: {:?}",
+            api.saw_since
+        );
+    }
+
+    #[test]
+    fn eviction_drops_the_oldest_event_not_the_lexicographic_first() {
+        let mut state = RelayProjectState::default();
+        for index in 0..SEEN_EVENT_CAP {
+            state.seen_events.push(SeenEvent {
+                id: format!("comment:z:{index:04}"),
+                at: i64::try_from(index).unwrap(),
+            });
+        }
+        state.remember("comment:a:newest".to_string());
+        assert!(state.has_seen("comment:a:newest"));
+        assert!(!state.has_seen("comment:z:0000"));
+        assert_eq!(state.seen_events.len(), SEEN_EVENT_CAP);
+        let stamped = state
+            .seen_events
+            .iter()
+            .find(|event| event.id == "comment:a:newest")
+            .unwrap()
+            .at;
+        assert!(stamped > 1_000_000, "newest stamp was {stamped}");
+        let (_temp, state_dir) = temp_state();
+        let mut saved = RelayState::default();
+        saved.projects.insert("cadence".to_string(), state);
+        save_state(&state_dir, &saved).unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        assert_eq!(
+            project
+                .seen_events
+                .iter()
+                .find(|event| event.id == "comment:a:newest")
+                .map(|event| event.at),
+            Some(stamped),
+            "a reload must not zero the stamp"
+        );
+        project.remember("comment:z:extra".to_string());
+        assert!(project.has_seen("comment:a:newest"));
+        assert!(!project.has_seen("comment:z:0001"));
+    }
+
+    #[test]
+    fn restart_keeps_a_seen_comment_deduped() {
+        let (_temp, state_dir) = temp_state();
+        let mut api = MockApi {
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            comments: [(
+                4,
+                vec![GithubComment {
+                    id: 8,
+                    body: "please look at this".to_string(),
+                    user: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let remote = api.issues.clone();
+        let mut project = RelayProjectState::default();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 1);
+        assert!(errors.is_empty());
+        let mut saved = RelayState::default();
+        saved.projects.insert("cadence".to_string(), project);
+        save_state(&state_dir, &saved).unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 0, "a reloaded comment id must not queue again");
+        assert!(errors.is_empty());
+        assert_eq!(project.actions.len(), 1);
+        assert!(project.has_seen("comment:fake/repo:4:8"));
+    }
+
+    #[test]
+    fn legacy_seen_event_strings_stay_seen_after_load() {
+        let (_temp, state_dir) = temp_state();
+        fs::write(
+            state_dir.join(STATE_FILE),
+            r#"{"schema":1,"projects":{"cadence":{"seen_events":["comment:fake/repo:4:8","comment:fake/repo:4:9"]}}}"#,
+        )
+        .unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        assert!(project.has_seen("comment:fake/repo:4:8"));
+        assert!(project.has_seen("comment:fake/repo:4:9"));
+        let mut api = MockApi {
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            comments: [(
+                4,
+                vec![GithubComment {
+                    id: 8,
+                    body: "please look at this".to_string(),
+                    user: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let remote = api.issues.clone();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 0);
+        assert!(errors.is_empty());
+        assert!(project.actions.is_empty());
+    }
+
+    fn canonical_pm(used_percent: u64, observed_at: &str) -> Value {
+        json!({
+            "alias": "cc13-pm",
+            "provider": "codex",
+            "state": "idle",
+            "thread_id": "thread",
+            "quota": {
+                "provider": "codex",
+                "assignee": "cc13-pm",
+                "account_id": "acct",
+                "thread_id": "thread",
+                "state": "available",
+                "source": "account/rateLimits/read",
+                "observed_at": observed_at,
+                "data": {
+                    "accountId": "acct",
+                    "rateLimits": {"primary": {"usedPercent": used_percent}}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn canonical_quota_allows_only_fresh_headroom() {
+        let fresh = time::iso(now());
+        assert!(quota_decision(&canonical_pm(10, &fresh)).is_ok());
+        let exhausted = quota_decision(&canonical_pm(100, &fresh)).unwrap_err();
+        assert!(exhausted.contains("exhausted"), "{exhausted}");
+        let stale = quota_decision(&canonical_pm(10, "2020-01-01T00:00:00Z")).unwrap_err();
+        assert!(stale.contains("stale"), "{stale}");
+        let mut unbound = canonical_pm(10, &fresh);
+        unbound["quota"]["assignee"] = json!("someone-else");
+        let unbound = quota_decision(&unbound).unwrap_err();
+        assert!(unbound.contains("not bound"), "{unbound}");
+        let mut bare = canonical_pm(100, &fresh);
+        bare["quota"] = json!({"state": "available", "remaining": 0, "used_percent": 100});
+        let bare = quota_decision(&bare).unwrap_err();
+        assert!(bare.contains("quota unknown"), "{bare}");
+        assert!(quota_decision(&json!({"state": "stopped"}))
+            .unwrap_err()
+            .contains("stopped"));
+        assert!(quota_decision(&json!({"state": "idle"}))
+            .unwrap_err()
+            .contains("quota unknown"));
+    }
+
+    #[test]
+    fn unknown_or_exhausted_quota_does_not_dispatch() {
+        assert!(quota_decision(&json!({"state": "idle"}))
+            .unwrap_err()
+            .contains("quota unknown"));
+
+        let (_temp, state_dir) = temp_state();
+        let config = RelayProjectConfig {
+            enabled: true,
+            repo: "fake/repo".to_string(),
+            poll_seconds: 300,
+            dispatch: true,
+            pm_alias: Some("cc13-pm".to_string()),
+            actor: None,
+        };
+        let mut relay_state = RelayState::default();
+        relay_state
+            .projects
+            .entry("cadence".to_string())
+            .or_default()
+            .actions
+            .insert(
+                "comment:fake:4:8".to_string(),
+                PendingAction {
+                    event_id: "comment:fake:4:8".to_string(),
+                    report_id: "CAD-9".to_string(),
+                    issue_number: 4,
+                    summary: "please look".to_string(),
+                    state: "queued".to_string(),
+                    attempts: 0,
+                    reason: None,
+                    claim_owner: None,
+                    claim_until: None,
+                    updated_at: "2026-09-20T00:00:00Z".to_string(),
+                },
+            );
+        let sent = dispatch_pending(
+            &state_dir,
+            Path::new("/tmp"),
+            "cadence",
+            &config,
+            &mut relay_state,
+            true,
+        );
+        assert_eq!(sent, 0);
+        let action = &relay_state.projects["cadence"].actions["comment:fake:4:8"];
+        assert_eq!(action.state, "queued");
+        assert!(action.reason.as_deref().unwrap().contains("quota unknown"));
+        assert!(action.claim_owner.is_none());
+    }
+
+    #[test]
+    fn attention_surfaces_quota_blocked_and_retrying_work() {
+        let (_temp, state_dir) = temp_state();
+        let mut config = RelayConfig::default();
+        config.projects.insert(
+            "cadence".to_string(),
+            RelayProjectConfig {
+                enabled: true,
+                repo: "fake/repo".to_string(),
+                poll_seconds: 300,
+                dispatch: true,
+                pm_alias: Some("cc13-pm".to_string()),
+                actor: None,
+            },
+        );
+        save_config(&state_dir, &config).unwrap();
+        let mut state = RelayState::default();
+        let project = state.projects.entry("cadence".to_string()).or_default();
+        project.reports.insert(
+            "CAD-9".to_string(),
+            ReportReceipt {
+                report_id: "CAD-9".to_string(),
+                state: "retrying".to_string(),
+                attempts: 1,
+                github_number: None,
+                github_url: None,
+                source_rev: None,
+                reason: Some("publication is pending; no blind duplicate was created".to_string()),
+                last_error: Some("timed out".to_string()),
+                next_retry_at: None,
+                updated_at: "2026-09-20T00:00:00Z".to_string(),
+            },
+        );
+        project.actions.insert(
+            "comment:fake:4:8".to_string(),
+            PendingAction {
+                event_id: "comment:fake:4:8".to_string(),
+                report_id: "CAD-9".to_string(),
+                issue_number: 4,
+                summary: "please look".to_string(),
+                state: "queued".to_string(),
+                attempts: 0,
+                reason: Some("quota exhausted".to_string()),
+                claim_owner: None,
+                claim_until: None,
+                updated_at: "2026-09-20T00:00:00Z".to_string(),
+            },
+        );
+        project.actions.insert(
+            "comment:fake:4:9".to_string(),
+            PendingAction {
+                event_id: "comment:fake:4:9".to_string(),
+                report_id: "CAD-9".to_string(),
+                issue_number: 4,
+                summary: "done".to_string(),
+                state: "dispatched".to_string(),
+                attempts: 1,
+                reason: None,
+                claim_owner: None,
+                claim_until: None,
+                updated_at: "2026-09-20T00:00:00Z".to_string(),
+            },
+        );
+        save_state(&state_dir, &state).unwrap();
+        let rows = attention(&state_dir, 1_800_000_000);
+        assert!(rows.iter().any(|row| {
+            row.subject_id == "CAD-9"
+                && row.title.contains("retrying")
+                && row.owner.as_deref() == Some("cc13-pm")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.subject_id == "comment:fake:4:8" && row.title.contains("quota exhausted")
+        }));
+        assert!(rows.iter().all(|row| row.subject_id != "comment:fake:4:9"));
+    }
+
+    fn managed_remote(report_id: &str, updated_at: &str) -> GithubIssue {
+        GithubIssue {
+            number: 4,
+            html_url: String::new(),
+            title: "report".to_string(),
+            body: Some(marker("cadence", report_id)),
+            updated_at: Some(updated_at.to_string()),
+            labels: vec![GithubLabel {
+                name: RELAY_LABEL.to_string(),
+            }],
+            pull_request: None,
+        }
     }
 }

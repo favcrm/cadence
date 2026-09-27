@@ -42,9 +42,9 @@ cadence status                 # one-screen fleet overview
 cadence ui run                 # the board: 127.0.0.1:3010
 ```
 
-`cadence --help` is the full reference; `docs/CLI.md` in this checkout keeps
-the long-form catalog, and `docs/SESSION.md` describes the PM loop
-(dispatch → review → verdict → merge).
+`cadence --help` is the installed CLI reference. Start with
+[project context](docs/START-HERE.md) for contracts and source ownership, or the
+[contribution guide](CONTRIBUTING.md) for development and validation.
 
 ## What it gives you
 

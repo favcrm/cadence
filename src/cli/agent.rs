@@ -16,7 +16,8 @@ pub(crate) enum AgentAction {
         /// (test double).
         #[arg(long, default_value = registry::DEFAULT_ENDPOINT_KIND)]
         endpoint: String,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// read-only or workspace-write.

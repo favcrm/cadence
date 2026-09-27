@@ -105,6 +105,7 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/issues/*/answers", RouteClass::OperatorOnly),
     // CAD-606: board Kick off — operator-only, same gate as `issue_kickoff`.
     route("POST", "/api/issues/*/kickoff", RouteClass::OperatorOnly),
+    route("POST", "/api/ideas/*/decide", RouteClass::OperatorOnly),
     route("POST", "/api/plans/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/plans/*/reject", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
@@ -1293,6 +1294,10 @@ mod tests {
         assert!(operator_only >= 7, "the table lost operator-only routes");
         assert_eq!(
             route_class("POST", "/api/plans/CAD-1/approve"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/ideas/CAD-1/decide"),
             RouteClass::OperatorOnly
         );
         assert_eq!(

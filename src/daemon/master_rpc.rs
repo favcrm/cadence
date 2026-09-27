@@ -772,6 +772,9 @@ impl Shared {
                 if let Err(e) = self.route_wakes() {
                     tracing::debug!("master wakes: {e}");
                 }
+                if let Err(e) = self.route_ideas() {
+                    tracing::debug!("idea pipeline: {e}");
+                }
                 next = Instant::now() + every;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
