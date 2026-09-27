@@ -2959,6 +2959,196 @@ fn send_lane_provenance_is_refused_for_every_caller() {
 /// Events: the default page is the newest 50 (oldest first inside
 /// it) with the forward cursor; --after keeps forward paging.
 #[test]
+fn cad694_agent_tail_keeps_the_newest_window() {
+    cad694_assert_tail_window("agent_events", json!({"alias": "tail-owner"}));
+}
+
+#[test]
+fn cad694_job_tail_keeps_the_newest_window() {
+    cad694_assert_tail_window("job_events", json!({"job": "tail-job"}));
+}
+
+fn cad694_assert_tail_window(method: &str, identity: Value) {
+    let d = TestDaemon::start();
+    d.register_inbox("tail-owner");
+    let spec = d.dir.path().join("tail-spec.md");
+    std::fs::write(&spec, "tail contract").unwrap();
+    d.job_new(
+        "tail-owner",
+        "tail-job",
+        spec.to_str().unwrap(),
+        &"a".repeat(40),
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    // No actor runs for this mailbox. Seed exact counts so 50/51 cannot
+    // accidentally pass because a lifecycle event changed the window.
+    for count in [0usize, 1, 49, 50, 51, 92] {
+        conn.execute("DELETE FROM events WHERE alias='tail-owner'", [])
+            .unwrap();
+        for index in 0..count {
+            conn.execute(
+                "INSERT INTO events(alias,kind,payload,at,job_id) VALUES('tail-owner','fixture',?,1,'tail-job')",
+                [json!({"index": index}).to_string()],
+            )
+            .unwrap();
+        }
+        let all: Vec<i64> = conn
+            .prepare("SELECT seq FROM events WHERE alias='tail-owner' ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let expected = &all[count.saturating_sub(50)..];
+        {
+            let mut params = identity.clone();
+            params["tail"] = json!(true);
+            let page = d.rpc(method, params).unwrap();
+            let seqs: Vec<i64> = page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["seq"].as_i64().unwrap())
+                .collect();
+            assert_eq!(seqs, expected, "{method} count={count}: {page}");
+            let newest = all.last().copied().unwrap_or(0);
+            assert_eq!(page["cursor"], newest, "{method} count={count}: {page}");
+            assert_eq!(page["has_older"], count > 50, "{page}");
+            let mut forward = identity.clone();
+            forward["after"] = json!(newest);
+            let next = d.rpc(method, forward).unwrap();
+            assert!(next["events"].as_array().unwrap().is_empty(), "{next}");
+            assert_eq!(next["cursor"], newest, "{next}");
+            conn.execute(
+                "INSERT INTO events(alias,kind,payload,at,job_id) VALUES('tail-owner','epilogue','{}',2,'tail-job')",
+                [],
+            )
+            .unwrap();
+            let latest = conn.last_insert_rowid();
+            let mut forward = identity.clone();
+            forward["after"] = json!(newest);
+            let next = d.rpc(method, forward).unwrap();
+            let events = next["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "{next}");
+            assert_eq!(events[0]["seq"], latest, "{next}");
+            assert_eq!(events[0]["kind"], "epilogue", "{next}");
+            assert_eq!(next["cursor"], latest, "{next}");
+        }
+    }
+}
+
+/// Exercise the actual restart exit guard, not a copy of its predicate:
+/// historical adoption refusals are behind the captured watermark, while
+/// a refusal emitted during shutdown still makes the restart fail.
+#[test]
+fn cad694_restart_ignores_a_historical_latest_refusal() {
+    cad694_assert_restart_refusal(false);
+}
+
+#[test]
+fn cad694_restart_rejects_a_genuine_new_refusal() {
+    cad694_assert_restart_refusal(true);
+}
+
+fn cad694_assert_restart_refusal(new_refusal: bool) {
+    {
+        let d = TestDaemon::start();
+        let _reaper = DaemonReaper::new(&d.state);
+        d.register_inbox("stopped-pty");
+        d.send(
+            "stopped-pty",
+            json!({"text": "old uncertain work", "message": "old"}),
+        )
+        .unwrap();
+        if new_refusal {
+            d.send(
+                "stopped-pty",
+                json!({"text": "unprovable turn", "message": "new"}),
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute_batch(
+            "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+                pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='stopped-pty';
+             UPDATE messages SET state='unknown',turn_id='old-turn' WHERE id='old';
+             DELETE FROM events WHERE alias='stopped-pty';",
+        )
+        .unwrap();
+        for _ in 0..60 {
+            conn.execute(
+                "INSERT INTO events(alias,kind,payload,at) VALUES('stopped-pty','fixture','{}',1)",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO events(alias,kind,payload,at) VALUES('stopped-pty','turn_adopt_refused',?,1)",
+            [json!({"message": "old", "turn_id": "old-turn", "reason": "historical refusal"}).to_string()],
+        )
+        .unwrap();
+        let historical = conn.last_insert_rowid();
+        if new_refusal {
+            // No endpoint identity exists. shutdown_entries must refuse
+            // this genuinely in-flight PTY turn after cursor capture.
+            conn.execute(
+                "UPDATE messages SET state='running',turn_id='new-turn' WHERE id='new'",
+                [],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let home = TempDir::new().unwrap();
+        hold_rollout_lease(home.path(), &d.state);
+        let out = operator_cadence_at(
+            home.path(),
+            &d.state,
+            &["daemon", "restart", "--as", "operator:test"],
+        );
+        let after = d
+            .rpc("agent_show", json!({"alias": "stopped-pty"}))
+            .unwrap();
+        let events = d
+            .rpc(
+                "agent_events",
+                json!({"alias": "stopped-pty", "after": historical}),
+            )
+            .unwrap();
+        // Stop our detached replacement before any outcome assertion.
+        let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+        assert!(stop.status.success(), "owned replacement did not stop");
+        assert_eq!(after["agent"]["state"], "stopped", "{after}");
+        assert!(after["agent"]["pid"].is_null(), "{after}");
+        assert!(after["agent"]["endpoint"].is_null(), "{after}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let refusals: Vec<&Value> = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "turn_adopt_refused")
+            .collect();
+        assert_eq!(refusals.len(), usize::from(new_refusal), "{events}");
+        assert_eq!(out.status.success(), !new_refusal, "{stdout} {stderr}");
+        if new_refusal {
+            assert_eq!(refusals[0]["payload"]["message"], "new", "{events}");
+            assert!(
+                stderr.contains("restart completed but not cleanly"),
+                "{stderr}"
+            );
+        }
+        assert!(
+            after["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["state"] == "unknown"),
+            "{after}"
+        );
+    }
+}
+
+#[test]
 fn events_default_page_is_newest_with_continue_cursor() {
     let d = TestDaemon::start();
     d.register("w1");
