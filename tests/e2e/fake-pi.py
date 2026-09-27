@@ -373,6 +373,9 @@ def main():
                 state["model"] = {"id": "grok-4.7-high",
                                   "provider": "cursor",
                                   "name": "Unsafe Cursor fallback"}
+            elif MODE == "model-switch-unverified":
+                # No actual namespace is available to classify.
+                state["model"] = {"id": provider + "/" + model_id}
             elif MODE == "model-drift":
                 # Acks then reports something else — Pi's silent
                 # fallback, mid-session.

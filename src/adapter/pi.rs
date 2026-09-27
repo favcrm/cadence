@@ -1324,13 +1324,26 @@ impl PiAdapter {
             "worker"
         };
         crate::pi_policy::require_allowed(pi_policy.as_ref(), role, &want)?;
-        let model = self.checked(
+        let model = match self.checked(
             "set_model",
             json!({"provider": provider, "modelId": model_id}),
-        )?;
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                // The provider may have changed state before failing.
+                self.close();
+                return Err(error);
+            }
+        };
         // The ack is a hint like `--model` — `get_state` is the proof;
         // a silent fallback fails the command (same rule as open).
-        let state = self.checked("get_state", json!({}))?;
+        let state = match self.checked("get_state", json!({})) {
+            Ok(state) => state,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
         let reported_id = state
             .get("model")
             .and_then(|m| m.get("id").or_else(|| m.get("name")))
@@ -1340,8 +1353,17 @@ impl PiAdapter {
             .and_then(|m| m.get("provider"))
             .and_then(Value::as_str)
             .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
+        let Some(resolved_model) = reported_full.as_deref() else {
+            self.close();
+            return Err(Error::provider("pi did not report the resolved provider after set_model — transport closed (CAD-603)"));
+        };
+        if let Err(error) = crate::pi_policy::require_safe_transport(resolved_model) {
+            self.close();
+            return Err(error);
+        }
         if !(reported_full.as_deref() == Some(want.as_str()) || reported_id == Some(want.as_str()))
         {
+            self.close();
             return Err(Error::provider(format!(
                 "pi reports model {} but '{want}' was set — the provider \
                  silently fell back instead of honoring set_model (CAD-559)",

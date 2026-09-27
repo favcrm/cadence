@@ -1561,8 +1561,18 @@ fn cursor_worker_bare_id_resolves_before_any_prompt() {
 /// the next private conversation, even though the requested model was safe.
 #[test]
 fn cursor_switch_fallback_closes_before_next_private_prompt() {
+    for mode in [
+        "cursor-switch-drift",
+        "model-drift",
+        "model-switch-unverified",
+    ] {
+        rejected_switch_closes_before_next_prompt(mode);
+    }
+}
+
+fn rejected_switch_closes_before_next_prompt(mode: &str) {
     let dir = tempfile::tempdir().unwrap();
-    let (pi, _rx) = adapter("cursor-switch-drift", dir.path());
+    let (pi, _rx) = adapter(mode, dir.path());
     let mut row = agent("dev-1", json!({}));
     row.cwd = dir.path().to_string_lossy().into();
     pi.open(&row).unwrap();

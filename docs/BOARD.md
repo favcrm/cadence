@@ -139,7 +139,10 @@ pi:
   providers and completion-only providers keep their existing behavior.
   Registration, defaults, every open, next-launch changes and `/model` use
   the same restriction. A bare worker id is checked again against Pi's actual
-  resolved namespace before any conversation is sent. Use the native adapter:
+  resolved namespace before any conversation is sent.
+  A model switch verifies its resolved namespace too; unsafe, mismatched or
+  unverifiable results close the Pi transport before another prompt can run.
+  Use the native adapter:
   `cadence join <pm> cursor --model grok-4.7-high`; it delivers prompts through
   its terminal rather than a conversation argv. Installed packages and operator
   pins are not modified. A future upstream stdin fix needs a separate reviewed
