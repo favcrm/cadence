@@ -19,6 +19,16 @@ pub fn migrate(_pm: &Pm, _state_dir: &Path) -> Result<Catalog> {
     Ok(Catalog)
 }
 
+#[derive(Clone, Copy)]
+pub enum Recovery {
+    Resume,
+    Rollback,
+}
+
+pub fn recover(_pm: &Pm, _state_dir: &Path, _journal: &str, _mode: Recovery) -> Result<()> {
+    Ok(())
+}
+
 impl Catalog {
     pub fn resolve_legacy(
         &self,
