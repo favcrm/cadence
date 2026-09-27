@@ -498,6 +498,66 @@ impl AgenticosAdapter {
 }
 
 impl PlatformAdapter for AgenticosAdapter {
+    fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
+        use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
+        Some(ProviderDescriptor {
+            schema: 1,
+            provider: "agenticos".into(),
+            revision: "agenticos-connections/1".into(),
+            enrollment_shapes: vec![],
+            builtin_accounts: vec!["hosted".into()],
+            capabilities: vec![
+                CapabilityDescriptor {
+                    id: "sources.discover".into(),
+                    version: 1,
+                    tools: vec!["connections_list".into()],
+                    scopes: vec!["sources".into()],
+                    effect: "read".into(),
+                },
+                CapabilityDescriptor {
+                    id: "sources.profile".into(),
+                    version: 1,
+                    tools: vec!["connection_profile".into()],
+                    scopes: vec!["sources".into()],
+                    effect: "read".into(),
+                },
+                CapabilityDescriptor {
+                    id: "sources.posts.text".into(),
+                    version: 1,
+                    tools: vec!["connection_posts".into()],
+                    scopes: vec!["sources".into()],
+                    effect: "read".into(),
+                },
+                CapabilityDescriptor {
+                    id: "sources.insights".into(),
+                    version: 1,
+                    tools: vec!["connection_insights".into()],
+                    scopes: vec!["sources".into()],
+                    effect: "read".into(),
+                },
+                CapabilityDescriptor {
+                    id: "content.preview".into(),
+                    version: 1,
+                    tools: vec!["post_draft".into()],
+                    scopes: vec!["draft".into()],
+                    effect: "draft".into(),
+                },
+                CapabilityDescriptor {
+                    id: "social.post".into(),
+                    version: 1,
+                    tools: vec!["publish_post".into()],
+                    scopes: vec!["publish".into()],
+                    effect: "draft".into(),
+                },
+            ],
+        })
+    }
+    fn connection_registration(&self) -> Option<String> {
+        Some(crate::platform::connections::registration_digest(&format!(
+            "agenticos-registration:{}:{:?}",
+            self.base, self.deployment_pin
+        )))
+    }
     fn table(&self) -> &ToolTable {
         &self.table
     }

@@ -54,7 +54,7 @@ fn cad688_native_and_setsid_connection_management_is_operator_only() {
             .unwrap(),
         created
     );
-    let mut lane = LaneShell::spawn();
+    let mut lane = LaneShell::spawn(d.dir.path());
     plant_member_pane(&d, "connection-peer", "claude", None, lane.pid());
     let before = d.operator_rpc("connection_list", json!({})).unwrap();
     let calls = [

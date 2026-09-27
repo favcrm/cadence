@@ -23,6 +23,7 @@ mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
 mod checkup;
+mod connections_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
@@ -2705,6 +2706,13 @@ impl Shared {
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),
             "operator_secret_rotate" => self.rpc_operator_secret_rotate(params, peer_pid),
+            "connection_providers" => self.rpc_connection(method, params, peer_pid),
+            "connection_list" => self.rpc_connection(method, params, peer_pid),
+            "connection_show" => self.rpc_connection(method, params, peer_pid),
+            "connection_check" => self.rpc_connection(method, params, peer_pid),
+            "connection_create" => self.rpc_connection(method, params, peer_pid),
+            "connection_rotate" => self.rpc_connection(method, params, peer_pid),
+            "connection_revoke" => self.rpc_connection(method, params, peer_pid),
             "platform_enroll" => self.rpc_platform_enroll(params, peer_pid),
             "platform_rotate" => self.rpc_platform_rotate(params, peer_pid),
             "platform_revoke" => self.rpc_platform_revoke(params, peer_pid),

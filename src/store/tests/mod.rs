@@ -401,7 +401,7 @@ mod app_runs;
 fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cadence.sqlite3");
-    drop(Store::open(&path).unwrap());
+    drop(Store::open_for_schema_tests(&path).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("DROP TABLE platform_credentials;
         CREATE TABLE platform_credentials(platform TEXT NOT NULL,account TEXT NOT NULL,scopes TEXT NOT NULL,fingerprint TEXT NOT NULL,custody TEXT NOT NULL,exchange TEXT NOT NULL,enrolled_at REAL NOT NULL,by TEXT NOT NULL,PRIMARY KEY(platform,account));
@@ -409,7 +409,7 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
         DROP TABLE IF EXISTS connection_metadata;
         UPDATE schema_version SET version=20;
         CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
-    assert!(Store::open(&path).is_err());
+    assert!(Store::open_for_schema_tests(&path).is_err());
     assert_eq!(
         db.query_row("SELECT version FROM schema_version", [], |r| r
             .get::<_, i64>(0))
@@ -422,7 +422,7 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     db.execute_batch("DROP TRIGGER reject_connection_schema")
         .unwrap();
     drop(db);
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_for_schema_tests(&path).unwrap();
     let row = store
         .platform_credential("fixture", "old-account")
         .unwrap()
@@ -432,7 +432,7 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     assert_eq!(row.fingerprint, "old-fingerprint");
     let namespace = store.connection_workspace_id().unwrap();
     drop(store);
-    let reopened = Store::open(&path).unwrap();
+    let reopened = Store::open_for_schema_tests(&path).unwrap();
     assert_eq!(
         reopened
             .platform_credential("fixture", "old-account")

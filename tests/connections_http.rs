@@ -62,15 +62,8 @@ impl Board {
         (code, body)
     }
     fn value(&self, method: &str, path: &str, body: Value) -> Value {
-        let (code, text) = self.operator(
-            method,
-            path,
-            if method == "GET" {
-                ""
-            } else {
-                &body.to_string()
-            },
-        );
+        let encoded = body.to_string();
+        let (code, text) = self.operator(method, path, if method == "GET" { "" } else { &encoded });
         assert_eq!(code, 200, "operator {method} {path}: {text}");
         serde_json::from_str(&text).unwrap()
     }
@@ -163,6 +156,18 @@ fn cad688_http_operator_management_is_populated_strict_and_grant_free() {
             .0,
         400
     );
+    for body in [
+        json!({"token":SECRET,"scopes":null}).to_string(),
+        json!({"token":SECRET,"accept_same_uid_risk":null}).to_string(),
+        format!("{{\"{}\":\"x\"}}", SECRET),
+    ] {
+        let (code, text) = b.operator("POST", &format!("/api/connections/{id}/rotate"), &body);
+        assert_eq!(code, 400, "invalid credential schema admitted");
+        assert!(
+            !text.contains(SECRET),
+            "schema diagnostics reflected credential text"
+        );
+    }
     let rotated = b.value(
         "POST",
         &format!("/api/connections/{id}/rotate"),
