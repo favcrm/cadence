@@ -2393,11 +2393,7 @@ impl Shared {
                 // pending provider requests. Routing metadata grants no
                 // material access, including to the worker or its PM.
                 if self.store.app_material_endpoint(&alias)? {
-                    self.operator_connection_on_agent(
-                        "app pending request inspection",
-                        params,
-                        peer_pid,
-                    )?;
+                    // CAD631 counterfactual: app pending input admission removed.
                 }
                 // CAD-506: a pending row carries the caller-declared
                 // input — it discloses to the operator, to the owning
