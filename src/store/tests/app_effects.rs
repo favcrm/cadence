@@ -3,7 +3,16 @@ use super::*;
 // This is a storage receipt fixture, not an accepted-run lifecycle proof.
 // The native suite independently produces and reviews the actual artifact.
 fn child_fixture(s: &Store) -> (crate::store::EffectRow, Value) {
-    s.conn().execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant';").unwrap();
+    let present = s
+        .conn()
+        .prepare("PRAGMA table_info(platform_effects)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .any(|column| column.unwrap() == "authorization_kind");
+    if !present {
+        s.conn().execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant';").unwrap();
+    }
     s.conn()
         .execute_batch(crate::store::app_effects::SCHEMA)
         .unwrap();
@@ -135,4 +144,89 @@ fn cad692_legacy_or_missing_child_cannot_supply_app_execution_permit() {
         )
         .unwrap();
     assert!(crate::store::app_effects::read_execution_permit(&db, &row.effect_id).is_err());
+}
+
+#[test]
+fn cad692_actual_v22_migration_is_atomic_and_preserves_context_and_legacy_receipts() {
+    let (dir, s) = store();
+    let (mut legacy, _) = child_fixture(&s);
+    legacy.tool = "publish".into();
+    legacy.input = json!({"project":"legacy-project","source":"draft.md"});
+    s.effect_stage(&legacy).unwrap();
+    let ctx = s
+        .app_context_create(
+            "install-a",
+            &crate::store::app_contexts::ContextConfig::new(
+                "Existing",
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            "existing-context",
+        )
+        .unwrap();
+    let workspace = s.connection_workspace_id().unwrap();
+    let before = s
+        .effect_by_id(&legacy.effect_id)
+        .unwrap()
+        .unwrap()
+        .to_record();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TABLE app_effect_authorizations; DROP TABLE IF EXISTS app_bindings; ALTER TABLE platform_effects DROP COLUMN authorization_kind; UPDATE schema_version SET version=22;").unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_release_migration BEFORE UPDATE ON schema_version BEGIN SELECT RAISE(ABORT,'forced release migration failure'); END;").unwrap();
+    drop(conn);
+    assert!(Store::open_for_schema_tests(&db).is_err());
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        22
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('app_bindings','app_effect_authorizations')",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert!(!conn
+        .prepare("PRAGMA table_info(platform_effects)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .any(|c| c.unwrap() == "authorization_kind"));
+    conn.execute_batch("DROP TRIGGER fail_release_migration;")
+        .unwrap();
+    drop(conn);
+    let reopened = Store::open_for_schema_tests(&db).unwrap();
+    assert_eq!(
+        reopened
+            .conn()
+            .query_row("SELECT version FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        23
+    );
+    assert_eq!(reopened.connection_workspace_id().unwrap(), workspace);
+    assert_eq!(
+        reopened
+            .app_context_show("install-a", ctx["context"]["id"].as_str().unwrap())
+            .unwrap(),
+        ctx
+    );
+    assert_eq!(
+        reopened
+            .effect_by_id(&legacy.effect_id)
+            .unwrap()
+            .unwrap()
+            .to_record(),
+        before
+    );
+    assert_eq!(
+        reopened
+            .conn()
+            .query_row(
+                "SELECT authorization_kind FROM platform_effects WHERE effect_id=?",
+                [&legacy.effect_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "agent_grant"
+    );
 }
