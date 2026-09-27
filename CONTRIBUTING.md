@@ -64,6 +64,14 @@ names are project configuration, not universal commands. If identity or recipe
 configuration refuses admission, report that blocker to the operator rather
 than running an unadmitted build. A suite lock is separate from build admission.
 
+Ordinary `scripts/cadence-nextest list` can compile test binaries: it skips test
+execution and the host suite lock, so obtain build admission first. The shell
+checks [test-cadence-nextest](scripts/test-cadence-nextest) and
+[test-cadence-nextest-activation](scripts/test-cadence-nextest-activation) also
+build and run temporary Rust fixtures and need build/test admission. Source
+navigation and explicitly fake Python checks do not compile Rust; do not assume
+every script check is compilation-free.
+
 ## Fixture isolation and test tiers
 
 For ordinary hosted feedback on the retained CAD-663 and CAD-650 cases, dispatch
