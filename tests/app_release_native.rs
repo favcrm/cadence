@@ -1339,3 +1339,109 @@ fn cad692_current_binding_revision_rejects_actual_late_reviewer_result() {
         artifact
     );
 }
+
+#[test]
+fn cad692_context_free_schema3_real_review_and_explicit_local_release() {
+    let h = Release::new();
+    let binding=h.daemon.operator_rpc("app_binding_create",json!({"install_id":h.install["install_id"],"slot":"publication","connection_id":h.connection,"request_id":"context-free-binding"})).unwrap()["binding"].clone();
+    assert!(binding["context_id"].is_null());
+    let created=h.daemon.operator_rpc("app_run_create",json!({"install_id":h.install["install_id"],"workflow":"draft","inputs":{"subject":"No context needed","source":format!("CONTEXT_SOURCE={A}"),"writer":WRITER,"reviewer":REVIEWER},"request_id":"context-free-run","owner_pm":OWNER})).unwrap();
+    assert_eq!(created["snapshot"]["schema"], 3);
+    assert!(created["context_id"].is_null());
+    assert_eq!(
+        created["snapshot"].get("context"),
+        Some(&Value::Null),
+        "context-free schema3 snapshot must carry the explicit null context variant"
+    );
+    assert_eq!(
+        created["snapshot"]["publication"]["binding"]["id"],
+        binding["id"]
+    );
+    h.dispatch(&created);
+    let run = h.wait_state(created["id"].as_str().unwrap(), "succeeded");
+    assert_eq!(run["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(h.artifact(&run)["text"], format!("Context draft: {A}"));
+    assert!(h.items().as_array().unwrap().is_empty());
+    let effect = h.stage(&run, "context-free-effect");
+    assert_eq!(effect["state"], "waiting");
+    assert!(h.items().as_array().unwrap().is_empty());
+    assert_eq!(h.decide(&effect)["state"], "done");
+    let detail = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":effect["effect_id"]}))
+        .unwrap();
+    assert_eq!(
+        detail["item"]["scope"]["install_id"],
+        h.install["install_id"]
+    );
+    assert!(detail["item"]["scope"]["context_id"].is_null());
+    assert_eq!(
+        detail["item"]["post"],
+        format!("# Reviewed draft\n\nContext draft: {A}")
+    );
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    for table in [
+        "app_contexts",
+        "platform_grants",
+        "platform_account_defaults",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "context-free release created ambient context or grant authority"
+        );
+    }
+}
+
+#[test]
+fn cad692_actual_unbound_draft_cannot_inherit_later_publication_binding() {
+    let h = Release::new();
+    let created=h.daemon.operator_rpc("app_run_create",json!({"install_id":h.install["install_id"],"workflow":"draft","inputs":{"subject":"Unbound draft","source":format!("CONTEXT_SOURCE={A}"),"writer":WRITER,"reviewer":REVIEWER},"request_id":"unbound-run","owner_pm":OWNER})).unwrap();
+    assert_eq!(created["snapshot"]["schema"], 3);
+    assert!(created["snapshot"]["publication"]["binding"].is_null());
+    h.dispatch(&created);
+    let run = h.wait_state(created["id"].as_str().unwrap(), "succeeded");
+    let artifact = h.artifact(&run);
+    assert_eq!(artifact["text"], format!("Context draft: {A}"));
+    assert_eq!(run["reviews"].as_array().unwrap().len(), 1);
+    let binding=h.daemon.operator_rpc("app_binding_create",json!({"install_id":h.install["install_id"],"slot":"publication","connection_id":h.connection,"request_id":"later-binding"})).unwrap()["binding"].clone();
+    assert_eq!(binding["state"], "configured");
+    assert!(binding["context_id"].is_null());
+    let after = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":run["id"]}))
+        .unwrap();
+    assert_eq!(
+        after["snapshot"], created["snapshot"],
+        "configuration rewrote historical null binding"
+    );
+    assert_eq!(after["snapshot_digest"], created["snapshot_digest"]);
+    assert_eq!(after["state"], "succeeded");
+    let denied=h.daemon.operator_rpc("app_effect_stage",json!({"run_id":run["id"],"artifact_id":artifact["id"],"slot":"publication","request_id":"unbound-stage","title":"Cannot inherit"})).unwrap_err();
+    assert_eq!(denied.kind(), "rejected");
+    assert!(
+        denied.to_string().contains("binding"),
+        "unrelated refusal masked null binding proof: {denied}"
+    );
+    assert_eq!(h.artifact(&run), artifact);
+    assert!(h.items().as_array().unwrap().is_empty());
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    let effects: i64 = db
+        .query_row("SELECT count(*) FROM platform_effects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        effects, 0,
+        "unbound historical run staged inherited authority"
+    );
+    let fresh=h.daemon.operator_rpc("app_run_create",json!({"install_id":h.install["install_id"],"workflow":"draft","inputs":{"subject":"New approval","source":format!("CONTEXT_SOURCE={B}"),"writer":WRITER,"reviewer":REVIEWER},"request_id":"bound-new-run","owner_pm":OWNER})).unwrap();
+    assert_eq!(
+        fresh["snapshot"]["publication"]["binding"]["id"], binding["id"],
+        "new run does not visibly pin now-configured binding"
+    );
+    assert_eq!(
+        fresh["state"], "awaiting_approval",
+        "binding silently approved new execution"
+    );
+}
