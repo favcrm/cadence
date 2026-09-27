@@ -1591,6 +1591,53 @@ fn rejected_switch_closes_before_next_prompt(mode: &str) {
     );
 }
 
+#[test]
+fn empty_switch_namespace_cannot_accept_private_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("model-switch-empty-provider", dir.path());
+    let mut row = agent("dev-1", json!({}));
+    row.cwd = dir.path().to_string_lossy().into();
+    pi.open(&row).unwrap();
+    let switched = pi.session_command("model", Some("acme/demo-1"));
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let turn = pi.run_turn(&private, "unverified-switch", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(
+        !journal.contains("prompt"),
+        "unverified namespace accepted prompt: {journal}"
+    );
+    assert!(switched.is_err());
+    assert!(turn.is_err());
+}
+
+#[test]
+fn bare_open_missing_or_empty_namespace_cannot_accept_private_prompt() {
+    for mode in ["bare-open-missing-provider", "bare-open-empty-provider"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pi, _rx) = adapter(mode, dir.path());
+        std::fs::write(
+            dir.path().join("pm/pm.yaml"),
+            "pi:\n  models:\n    allow: [model-1]\n",
+        )
+        .unwrap();
+        let mut row = agent("dev-1", json!({"model": "model-1"}));
+        row.cwd = dir.path().to_string_lossy().into();
+        let opened = pi.open(&row);
+        let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+        let turn = pi.run_turn(&private, "unverified-open", &|_| {});
+        let journal =
+            std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+        pi.close();
+        assert!(
+            !journal.contains("prompt"),
+            "unverified open accepted prompt: {mode} {journal}"
+        );
+        assert!(opened.is_err());
+        assert!(turn.is_err());
+    }
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.

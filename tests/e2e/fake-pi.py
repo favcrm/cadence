@@ -197,6 +197,10 @@ if "--session" in _args:
 # `wrong-model` mode the report deliberately disagrees — the silent
 # fallback CAD-559 makes loud.
 def reported_model():
+    if MODE == "bare-open-missing-provider":
+        return {"id": "model-1"}
+    if MODE == "bare-open-empty-provider":
+        return {"id": "model-1", "provider": ""}
     if MODE == "cursor-bare":
         return {"id": "grok-4.7-high", "name": "Cursor", "provider": "cursor"}
     if MODE == "wrong-model":
@@ -376,6 +380,9 @@ def main():
             elif MODE == "model-switch-unverified":
                 # No actual namespace is available to classify.
                 state["model"] = {"id": provider + "/" + model_id}
+            elif MODE == "model-switch-empty-provider":
+                state["model"] = {"id": provider + "/" + model_id,
+                                  "provider": ""}
             elif MODE == "model-drift":
                 # Acks then reports something else — Pi's silent
                 # fallback, mid-session.
