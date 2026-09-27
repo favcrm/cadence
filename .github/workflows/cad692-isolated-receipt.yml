@@ -1,0 +1,46 @@
+name: CAD692 isolated release receipt control
+on:
+  push:
+    branches: [op-proof-cad692-receipt-control-45044ed0]
+permissions:
+  contents: read
+jobs:
+  isolated-control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 4
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 45044ed02392d6ed1e2886e81632f3549603de0e
+          persist-credentials: false
+      - name: Verify exact candidate
+        run: test "$(git rev-parse HEAD)" = 45044ed02392d6ed1e2886e81632f3549603de0e
+      - run: rustup toolchain install stable --profile minimal
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - name: Install trusted pinned runner
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/nextest
+        run: scripts/install-cadence-nextest
+      - name: Verify corrected exact release receipts, with no retries
+        env:
+          CADENCE_NEXTTEST_BIN: ${{ runner.temp }}/nextest/cargo-nextest
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/receipt-control.lock
+        run: scripts/cadence-nextest --test app_release_native --features test-seam --locked --test-threads 2 -E 'test(=cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts)'
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: isolated-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/nextest/cadence/junit.xml
+          if-no-files-found: error
+          retention-days: 14
