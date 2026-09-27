@@ -376,6 +376,12 @@ fn cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers() {
     );
     assert_eq!(w.head(), head);
     let id = std::fs::read_to_string(w.pm.dir.join(".apps/install-pending.yaml")).unwrap();
+    assert!(
+        failed
+            .to_string()
+            .contains(&format!("cadence app catalog recover {id}")),
+        "failed install did not identify its explicit recovery: {failed}"
+    );
     assert!(w
         .pm
         .dir
@@ -680,10 +686,10 @@ fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_expli
         std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         let head = w.head();
-        assert!(w
+        let failed = w
             .daemon
             .operator_rpc("app_workspace_migrate", json!({}))
-            .is_err());
+            .unwrap_err();
         assert_eq!(w.head(), head);
         let pending = w.pm.dir.join(".apps/pending.yaml");
         assert!(
@@ -693,6 +699,12 @@ fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_expli
         let pending: serde_yaml::Value =
             serde_yaml::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
         let id = pending["journal"].as_str().unwrap();
+        assert!(
+            failed
+                .to_string()
+                .contains(&format!("cadence app catalog migration-recover {id}")),
+            "failed migration did not identify its explicit recovery: {failed}"
+        );
         assert!(w
             .daemon
             .operator_rpc("app_workspace_list", json!({}))
