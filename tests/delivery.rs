@@ -33,12 +33,22 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
         for how in ["self", "detached", "detached-bare"] {
             let reply = who.rpc(how, "delivery_review_evidence", request.clone());
             assert_eq!(reply["ok"], false, "{how}: {reply}");
-            assert!(reply["error"]["message"].as_str().unwrap_or_default().contains("operator"), "{reply}");
+            assert!(
+                reply["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator"),
+                "{reply}"
+            );
         }
     }
     let mut forged = request.clone();
     forged["reviewer"] = json!("r1");
-    assert!(lf.f.d.operator_rpc("delivery_review_evidence", forged).is_err());
+    assert!(lf
+        .f
+        .d
+        .operator_rpc("delivery_review_evidence", forged)
+        .is_err());
     for (field, value) in [
         ("sha", json!("b".repeat(40))),
         ("sha", json!("a".repeat(7))),
@@ -49,16 +59,42 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
     ] {
         let mut invalid = request.clone();
         invalid["requests"][0][field] = value;
-        assert!(lf.f.d.operator_rpc("delivery_review_evidence", invalid).is_err(), "{field}");
+        assert!(
+            lf.f.d
+                .operator_rpc("delivery_review_evidence", invalid)
+                .is_err(),
+            "{field}"
+        );
     }
-    let duplicate = json!({"requests": [request["requests"][0].clone(), request["requests"][0].clone()]});
-    assert!(lf.f.d.operator_rpc("delivery_review_evidence", duplicate).is_err());
-    assert!(lf.f.d.operator_rpc("delivery_review_evidence", json!({"requests": []})).is_err());
-    assert_eq!(lf.snapshot(), before, "refused evidence changed delivery state");
+    let duplicate =
+        json!({"requests": [request["requests"][0].clone(), request["requests"][0].clone()]});
+    assert!(lf
+        .f
+        .d
+        .operator_rpc("delivery_review_evidence", duplicate)
+        .is_err());
+    assert!(lf
+        .f
+        .d
+        .operator_rpc("delivery_review_evidence", json!({"requests": []}))
+        .is_err());
+    assert_eq!(
+        lf.snapshot(),
+        before,
+        "refused evidence changed delivery state"
+    );
 
     thread::scope(|scope| {
-        let first = scope.spawn(|| lf.f.d.operator_rpc("delivery_review_evidence", request.clone()).unwrap());
-        let second = scope.spawn(|| lf.f.d.operator_rpc("delivery_review_evidence", request.clone()).unwrap());
+        let first = scope.spawn(|| {
+            lf.f.d
+                .operator_rpc("delivery_review_evidence", request.clone())
+                .unwrap()
+        });
+        let second = scope.spawn(|| {
+            lf.f.d
+                .operator_rpc("delivery_review_evidence", request.clone())
+                .unwrap()
+        });
         for proof in [first.join().unwrap(), second.join().unwrap()] {
             assert_eq!(proof["schema"], "cadence.review-evidence/1");
             assert_eq!(proof["transport_only"], true);
@@ -67,7 +103,11 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
             assert_eq!(proof["reviews"][0]["reviewer"], lf.rec()["reviewer"]);
         }
     });
-    assert_eq!(lf.snapshot(), before, "concurrent export changed delivery state");
+    assert_eq!(
+        lf.snapshot(),
+        before,
+        "concurrent export changed delivery state"
+    );
 
     // File-only forgery has no exact native verdict-stream receipt.
     let path = lf.f.d.state.join("delivery.json");
@@ -75,22 +115,55 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
     let mut records: Value = serde_json::from_slice(&original).unwrap();
     records["D-2"]["verdict"]["report"] = json!("D-2/reports/planted.md");
     std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
-    assert!(lf.f.d.operator_rpc("delivery_review_evidence", request.clone()).is_err());
+    assert!(lf
+        .f
+        .d
+        .operator_rpc("delivery_review_evidence", request.clone())
+        .is_err());
+    std::fs::write(&path, &original).unwrap();
+    let mut relabelled: Value = serde_json::from_slice(&original).unwrap();
+    let other_pr = "https://github.com/acme/app/pull/8";
+    relabelled["D-2"]["pr"] = json!(other_pr);
+    std::fs::write(&path, serde_json::to_vec(&relabelled).unwrap()).unwrap();
+    let mut replay = request.clone();
+    replay["requests"][0]["pr"] = json!(other_pr);
+    assert!(
+        lf.f.d
+            .operator_rpc("delivery_review_evidence", replay)
+            .is_err(),
+        "native receipt moved to another PR"
+    );
     std::fs::write(&path, original).unwrap();
 
     // There is deliberately no browser/HTTP export route, even for an
     // operator session. This cannot become an authenticated relay.
-    let port = start_board_gh(&lf.f.pm_dir, &lf.f.d.state, false, Some(lf.gh_dir.join("gh")));
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(lf.gh_dir.join("gh")),
+    );
     let body = request.to_string();
-    for guards in [THREAD_GUARDS.to_string(), op_guards(&sign_in(&lf.f.d.state, port))] {
-        let (status, reply) = board_http(port, &cad328_post(port, "/api/delivery/D-2/review-evidence", &guards, &body));
+    for guards in [
+        THREAD_GUARDS.to_string(),
+        op_guards(&sign_in(&lf.f.d.state, port)),
+    ] {
+        let (status, reply) = board_http(
+            port,
+            &cad328_post(port, "/api/delivery/D-2/review-evidence", &guards, &body),
+        );
         assert!(status >= 400, "{status}: {reply}");
         assert!(!reply.contains("cadence.review-evidence/1"), "{reply}");
     }
 
     lf.set_gh(&"b".repeat(40), "OPEN", false, false);
     lf.sync_of("D-2");
-    assert!(lf.f.d.operator_rpc("delivery_review_evidence", request).is_err(), "moved head retained the old proof");
+    assert!(
+        lf.f.d
+            .operator_rpc("delivery_review_evidence", request)
+            .is_err(),
+        "moved head retained the old proof"
+    );
 }
 
 /// CAD-437: `delivery ls` — issue/state/project filters apply in the
