@@ -61,7 +61,7 @@ pub fn enroll_token(params: &Value, declared: &[String]) -> Result<Enrollment> {
     let token = raw.trim();
     if token.is_empty() || token.len() > 8192 {
         return Err(Error::rejected(
-            "'token' must be 1-8192 non-whitespace chars",
+            "'token' length must be 1-8192 bytes after trimming whitespace",
         ));
     }
     if token.chars().any(char::is_whitespace) {
@@ -288,15 +288,62 @@ pub fn load_credential(
 }
 
 /// Belt-and-braces: a serialized result, event payload or error text
-/// must never contain `secret`. Callers check before the value leaves
+/// must never contain `secret` or a fragment of eight or more characters.
+/// Callers check before the value leaves
 /// the daemon; a hit is a bug — the refusal withholds the value and
 /// names only where the leak would have surfaced.
 pub fn refuse_leak(what: &str, text: &str, secret: &[u8]) -> Result<()> {
     let secret = String::from_utf8_lossy(secret);
-    if !secret.is_empty() && text.contains(secret.as_ref()) {
+    let characters: Vec<_> = secret.chars().collect();
+    let carries_secret = !secret.is_empty() && text.contains(secret.as_ref());
+    let carries_fragment = characters
+        .windows(8)
+        .any(|fragment| text.contains(&fragment.iter().collect::<String>()));
+    if carries_secret || carries_fragment {
         return Err(Error::internal(format!(
             "{what} would carry the enrolled credential — withheld"
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn leak_screen_refuses_prefix_suffix_and_interior_fragments() {
+        let credential = b"abcdefghIJKLMNOPqrstuvwx";
+        for fragment in ["abcdefgh", "IJKLMNOP", "qrstuvwx"] {
+            let error = refuse_leak("revoke reason", &format!("lost {fragment}!"), credential)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("withheld"));
+            assert!(!error.contains(fragment));
+        }
+        assert!(refuse_leak("revoke reason", "abcdefg", credential).is_ok());
+        assert!(refuse_leak("revoke reason", "unrelated", credential).is_ok());
+        assert!(refuse_leak("result", "short", b"short").is_err());
+        assert!(refuse_leak("result", "anything", b"").is_ok());
+        // Eight means characters, not UTF-8 bytes: four non-ASCII
+        // characters are not an eight-character credential fragment.
+        let unicode = "αβγδεζηθικλμ";
+        assert!(refuse_leak("reason", "αβγδ", unicode.as_bytes()).is_ok());
+        assert!(refuse_leak("reason", "αβγδεζηθ", unicode.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn token_length_refusal_names_length_without_echoing_input() {
+        for token in [String::new(), "x".repeat(8193)] {
+            let error = enroll_token(&json!({"token": token}), &[])
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("length"), "{error}");
+            assert!(error.contains("8192"), "{error}");
+            assert!(!error.contains(&"x".repeat(32)));
+        }
+        assert!(enroll_token(&json!({"token": "x".repeat(8192)}), &[]).is_ok());
+    }
 }
