@@ -782,8 +782,8 @@ impl PlatformAdapter for LocalAdapter {
                 scopes: vec!["publish".into()],
                 effect: "send".into(),
                 semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
-                input_contract: "text.publish.input@1".into(),
-                output_contract: "text.publish.receipt@1".into(),
+                input_contract: super::connections::TEXT_PUBLICATION_INPUT_V1.into(),
+                output_contract: super::connections::TEXT_PUBLICATION_RECEIPT_V1.into(),
             }],
             capabilities: vec![
                 CapabilityDescriptor {

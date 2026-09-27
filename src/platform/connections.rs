@@ -4,6 +4,10 @@ use crate::{
     error::{Error, Result},
 };
 use serde::Serialize;
+
+/// Shared schemas understood by the text publication v1 broker.
+pub const TEXT_PUBLICATION_INPUT_V1: &str = "text.publish.input@1";
+pub const TEXT_PUBLICATION_RECEIPT_V1: &str = "text.publish.receipt@1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilitySemantics {
@@ -90,6 +94,15 @@ impl ProviderDescriptor {
         }
         let mut actions = std::collections::HashSet::new();
         for mapping in &self.action_mappings {
+            if mapping.capability == "text.publish"
+                && mapping.version == 1
+                && (mapping.input_contract != TEXT_PUBLICATION_INPUT_V1
+                    || mapping.output_contract != TEXT_PUBLICATION_RECEIPT_V1)
+            {
+                return Err(Error::rejected(
+                    "provider text publication contracts are incompatible",
+                ));
+            }
             if mapping.capability.is_empty()
                 || mapping.version == 0
                 || mapping.action.is_empty()

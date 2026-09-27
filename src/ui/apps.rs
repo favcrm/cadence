@@ -382,7 +382,7 @@ fn effect_facts(state_dir: &std::path::Path) -> HashMap<String, EffectFacts> {
         return HashMap::new();
     };
     let Ok(mut stmt) =
-        conn.prepare("SELECT effect_id, task, state, input, input_summary FROM platform_effects")
+        conn.prepare("SELECT effect_id, task, state, input, input_summary FROM platform_effects WHERE authorization_kind='agent_grant'")
     else {
         return HashMap::new();
     };
