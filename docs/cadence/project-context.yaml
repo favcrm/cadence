@@ -37,3 +37,9 @@ documents:
     title: Risk and release authority
     required: true
     roles: [pm, qa, devops]
+  - id: hosted-migration
+    kind: release
+    path: docs/design/hosted-migration.md
+    title: Hosted migration rehearsal and cutover handoff
+    required: false
+    roles: [pm, qa, devops]
