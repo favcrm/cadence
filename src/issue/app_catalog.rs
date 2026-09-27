@@ -189,7 +189,9 @@ fn migrate_delivering(pm: &Pm, delivery: impl FnOnce(&Journal) -> Result<()>) ->
             journal: id,
         })?,
     )?;
-    journal.apply_delivering(&root, Recovery::Resume, delivery)?;
+    journal.apply_delivering(&root, Recovery::Resume, delivery).map_err(|error| {
+        Error::internal(format!("app catalog publication or git delivery incomplete ({}); retained migration {}; explicitly run `cadence app catalog migration-recover {}` to resume, or add `--rollback` to roll back", error.kind(), journal.id, journal.id))
+    })?;
     Ok(candidate)
 }
 
