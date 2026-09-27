@@ -86,7 +86,7 @@ jobs:
               for id in $ids; do
                 if passed=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
                     --paginate --slurp \
-                    --jq '[.[].jobs[]] as $jobs
+                    | jq -r '[.[].jobs[]] as $jobs
                           | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g
                               | [$jobs[] | select(.name == $g)] as $matching
                               | ($matching | length) > 0 and ($matching | all(.status == "completed" and .conclusion == "success")))'); then

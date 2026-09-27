@@ -20,7 +20,7 @@ class GateEvidence(unittest.TestCase):
         self.release = self.workflow.split("  release-gate:\n", 1)[1].split("\n  release-build:", 1)[0]
 
     def queue_passes(self, pages):
-        expression = re.search(r"jobs\?filter=latest&per_page=100.*?--jq '([^']+)'", self.queue, re.S)[1]
+        expression = re.search(r"jobs\?filter=latest&per_page=100.*?(?:--jq|jq -r) '([^']+)'", self.queue, re.S)[1]
         # gh --slurp returns all page objects together. Without pagination,
         # the original command only evaluates page one.
         data = pages if "--paginate --slurp" in self.queue else pages[0]
@@ -71,11 +71,19 @@ import json, os, subprocess, sys
 if "/jobs?" not in sys.argv[2]:
     print("123")
     sys.exit(0)
+if "--slurp" in sys.argv and "--jq" in sys.argv:
+    print("the --slurp option is not supported with --jq", file=sys.stderr)
+    sys.exit(1)
 pages = json.loads(os.environ["FIXTURE_PAGES"])
 data = pages if "--paginate" in sys.argv and "--slurp" in sys.argv else pages[0]
-expression = sys.argv[sys.argv.index("--jq") + 1]
-result = subprocess.run(["jq", "-r", expression], input=json.dumps(data), text=True)
-sys.exit(1 if os.environ["FIXTURE_FAIL"] == "true" else result.returncode)
+if "--jq" in sys.argv:
+    expression = sys.argv[sys.argv.index("--jq") + 1]
+    result = subprocess.run(["jq", "-r", expression], input=json.dumps(data), text=True)
+    status = result.returncode
+else:
+    print(json.dumps(data))
+    status = 0
+sys.exit(1 if os.environ["FIXTURE_FAIL"] == "true" else status)
 ''')
             gh.chmod(0o755)
             output = root / "output"
