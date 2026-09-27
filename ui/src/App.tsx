@@ -120,9 +120,6 @@ export default function App() {
   const goRoute = useCallback((r: Route) => update((c) => goTo(c, r)), []);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [projectContextLoading, setProjectContextLoading] = useState(false);
-  const [projectContextError, setProjectContextError] = useState<string | null>(null);
-  const [projectContextErrorProject, setProjectContextErrorProject] = useState<string | null>(null);
-  const [projectContextRefresh, setProjectContextRefresh] = useState(0);
   const projectContextRequest = useRef(0);
   const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
@@ -168,15 +165,12 @@ export default function App() {
   const overviewWanted = overviewOn(screen) || screen === "apps";
   const overviewWantedRef = useRef(overviewWanted);
   overviewWantedRef.current = overviewWanted;
-  // The overview shows the project context compactly; Projects → context in full.
-  const contextOn =
-    screen === "overview" || (route.screen === "projects" && route.section === "context");
+  // Repository guidance is only used by the compact overview.
+  const contextOn = screen === "overview";
 
   useEffect(() => {
     const request = ++projectContextRequest.current;
     setProjectContext(null);
-    setProjectContextError(null);
-    setProjectContextErrorProject(null);
     if (!contextOn || project === "all") {
       setProjectContextLoading(false);
       return;
@@ -192,17 +186,16 @@ export default function App() {
           observedContextRevisions.current[project] = next.snapshot.head_revision;
         }
       })
-      .catch((error) => {
+      .catch(() => {
         if (!requestIsCurrent(request, projectContextRequest.current, project, project)) return;
-        setProjectContextError(String(error?.message ?? error));
-        setProjectContextErrorProject(project);
+        setProjectContext(null);
       })
       .finally(() => {
         if (requestIsCurrent(request, projectContextRequest.current, project, project)) {
           setProjectContextLoading(false);
         }
       });
-  }, [project, contextOn, projectContextRefresh]);
+  }, [project, contextOn]);
 
   // The peek's id and the issue page's id, read through refs so the
   // stream and poll handlers stay stable. The page clears `openId`, so
@@ -809,10 +802,6 @@ export default function App() {
             onToast={say}
             navHref={hrefFor}
             project={project}
-            context={visibleContext(project, projectContext)}
-            contextLoading={projectContextLoading}
-            contextError={projectContextErrorProject === project ? projectContextError : null}
-            onRetryContext={() => setProjectContextRefresh((value) => value + 1)}
           />
         )}
         {route.screen === "apps" && !route.project && (

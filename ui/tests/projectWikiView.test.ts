@@ -63,7 +63,7 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const host = document.createElement("div");
 document.body.append(host);
 const view = createRoot(host);
-const props = { project: "cadence", context: null, contextLoading: false, contextError: null, onRetryContext: () => {}, readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
+const props = { project: "cadence", readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
 const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
 async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { view.render(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
 async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
@@ -73,7 +73,7 @@ async function run() {
   assert(host.textContent?.includes("Notes for projects/cadence/README.md"), "raw daemon text renders as Markdown");
   assert(requests.every((url) => !url.endsWith("path=") && !url.includes("path=projects&")), "tree never requests global parents");
   assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Edit" && link.href.includes("/context?") && link.href.includes("mode=edit")), "Edit stays in the Context tab");
-  assert(!host.querySelector("details")?.open && host.querySelector(".wk-pane details"), "repository references stay collapsed inside the reading pane");
+  assert(!host.textContent?.includes("Repository references") && !host.querySelector(".context-references"), "Context contains only the shared Wiki workspace");
   assert(host.querySelectorAll(".wk-bar").length === 1 && host.querySelectorAll("h1").length === 1, "one toolbar and the document heading avoid duplicate page framing");
   const files = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Project files");
   assert(files?.getAttribute("aria-expanded") === "false", "shared explorer begins collapsed for mobile");
