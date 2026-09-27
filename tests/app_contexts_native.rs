@@ -215,6 +215,7 @@ fn cad690_context_crud_native_and_setsid_requires_operator_and_exact_revision() 
         "native context guard failed: {failures:?}"
     );
     assert_eq!(h.context_show(&c), c);
+    let stale_run = h.create(&c, "pre-update-run");
     let updated=h.daemon.operator_rpc("app_context_update",json!({"install_id":h.install["install_id"],"context_id":c["id"],"expected_revision":c["revision"],"label":"Changed","input_defaults":{"source":format!("CONTEXT_SOURCE={B}")}})).unwrap()["context"].clone();
     assert!(updated["revision"].as_u64().unwrap() > c["revision"].as_u64().unwrap());
     assert_ne!(updated["digest"], c["digest"]);
