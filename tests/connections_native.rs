@@ -341,13 +341,35 @@ fn cad688_resolved_old_id_cannot_rotate_reenrolled_account() {
 fn cad688_credential_text_cannot_be_persisted_as_public_account_metadata() {
     let d = fixture();
     let before = d.operator_rpc("connection_list", json!({})).unwrap();
-    const TOKEN: &str = "cadp_metadata_private_token";
-    assert!(d
+    const TOKEN: &str = "cadp-metadata-private-token";
+    let error = d
         .operator_rpc("connection_create", create(TOKEN, TOKEN))
-        .is_err());
+        .unwrap_err();
+    assert!(!error.to_string().contains(TOKEN));
     assert_eq!(
         d.operator_rpc("connection_list", json!({})).unwrap(),
         before
+    );
+    let installed = d
+        .operator_rpc(
+            "connection_create",
+            create("safe-account", "cadp-original-secret"),
+        )
+        .unwrap();
+    assert!(d
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id":installed["connection"]["id"],"token":"safe-account"})
+        )
+        .is_err());
+    assert_eq!(
+        d.operator_rpc(
+            "connection_show",
+            json!({"connection_id":installed["connection"]["id"]})
+        )
+        .unwrap(),
+        installed,
+        "rotate persisted inherited metadata equal to new credential"
     );
     let db = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     let events: String = db
@@ -359,4 +381,57 @@ fn cad688_credential_text_cannot_be_persisted_as_public_account_metadata() {
         .unwrap()
         .join("\n");
     assert!(!events.contains(TOKEN));
+}
+
+#[test]
+fn cad688_exhausted_sqlite_revision_refuses_without_changing_custody() {
+    let d = fixture();
+    let created = d
+        .operator_rpc(
+            "connection_create",
+            create("revision-limit", "cadp-limit-original"),
+        )
+        .unwrap();
+    let id = created["connection"]["id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE platform_credentials SET credential_revision=? WHERE connection_id=?",
+        rusqlite::params![i64::MAX, id],
+    )
+    .unwrap();
+    let before = d
+        .operator_rpc("connection_show", json!({"connection_id":id}))
+        .unwrap();
+    let events = db
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert!(d
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id":id,"token":"cadp-limit-next"})
+        )
+        .is_err());
+    assert_eq!(
+        d.operator_rpc("connection_show", json!({"connection_id":id}))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        events
+    );
+    assert_eq!(
+        cadence_agent::platform::Custody::open(&d.state)
+            .unwrap()
+            .load(
+                "file",
+                &cadence_agent::platform::Key {
+                    platform: "fixture",
+                    account: "revision-limit"
+                }
+            )
+            .unwrap(),
+        b"cadp-limit-original"
+    );
 }
