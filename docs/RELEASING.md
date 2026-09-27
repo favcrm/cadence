@@ -77,6 +77,9 @@ rollback are not established by a clean install.
 
 Planned packages are Linux x86_64, Linux ARM64 (glibc 2.35 baseline) and Apple
 Silicon macOS. Intel macOS, Windows and Alpine/musl packages are not provided.
+Daemon and board evaluation is Linux-only with fresh, separate state. Apple
+Silicon macOS is limited to CLI packaging, installation and version checks;
+setup, daemon and board use is unsupported pending CAD-315.
 Real tagged-archive/platform installation results remain pending. Provider
 CLIs/authentication and tmux for terminal providers are separate prerequisites;
 list only combinations actually verified for the eventual candidate.
@@ -105,6 +108,9 @@ Cadence 0.1.0-beta.2 — local CLI pilot
 Native CLI and embedded board for local agent coordination. Supported assets:
 Linux x86_64, Linux ARM64 (glibc 2.35 baseline), Apple Silicon macOS.
 No Intel macOS, Windows or musl package.
+Daemon and board evaluation: Linux only, using fresh, separate state.
+Apple Silicon macOS: CLI packaging, installation and version checks only;
+setup, daemon and board use unsupported pending CAD-315.
 
 Provider CLIs/authentication and tmux for terminal providers are separate.
 List only provider/platform combinations actually verified for this candidate.

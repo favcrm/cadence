@@ -18,6 +18,9 @@ assets. Linux builds use Ubuntu 22.04 (glibc 2.35 baseline); these are not
 Alpine/musl builds. macOS packaging is for Apple Silicon, not Intel.
 Windows is not packaged. Clean installation evidence for each platform is
 tracked by CAD-317; packaging alone does not establish complete provider support.
+Daemon and board evaluation is limited to Linux with fresh, separate state.
+Apple Silicon macOS supports CLI packaging, installation and version checks
+only; setup, daemon and board use is unsupported pending CAD-315.
 
 The installer needs a POSIX shell, curl (or wget), tar, and one of sha256sum,
 shasum or openssl. Installing the binary does not require Node, Rust, a GitHub
@@ -55,8 +58,9 @@ export PATH="$HOME/.local/bin:$PATH"
 Installation verifies the archive and binary SHA256 digests and requested
 version before activating it. Rerunning the same version is safe; different
 bytes under an existing version and ordinary files at the executable link are
-refused. The installer does not start a daemon or configure a provider. Run
-`cadence setup` separately on a new installation when ready to create local state.
+refused. The installer does not start a daemon or configure a provider. On Linux,
+run `cadence setup` separately on a fresh installation when ready to create local
+state. Do not run setup, daemon or board commands on macOS pending CAD-315.
 
 ## Verify provenance
 
