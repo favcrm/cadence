@@ -27,7 +27,12 @@ custody availability and deployment pin status separately. Missing or mismatched
 trusted deployment metadata does not enable reviewed read/draft behavior.
 
 Local outbox is a built-in connection, with no credential enrollment. Its
-presence grants no publishing rights. Built-in references cannot be rotated or
+presence grants no publishing rights. Its reviewed `blog.publish` and
+`social.post` capabilities both map to the Local sink. AgenticOS `social.post`
+maps to its upstream approval handoff, rather than the Local sink. These shared
+capability names describe compatible purposes; each provider retains its exact
+reviewed tools, scopes and effect classification. Neither descriptor grants
+execution or substitutes for app/run/effect approval. Built-in references cannot be rotated or
 revoked through credential management. Existing app/run approvals and effect
 release policies remain separate.
 

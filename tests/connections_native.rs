@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::contract_fixture::FakePlatform;
+use cadence_agent::platform::PlatformAdapter;
 use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -257,6 +258,13 @@ impl cadence_agent::platform::PlatformAdapter for PausedDescriptor {
         self.inner.source_hash(agent, source)
     }
 }
+struct ResumeDescriptor(Arc<PausedDescriptor>);
+impl Drop for ResumeDescriptor {
+    fn drop(&mut self) {
+        *self.0.release.0.lock().unwrap() = true;
+        self.0.release.1.notify_all();
+    }
+}
 #[test]
 fn cad688_resolved_old_id_cannot_rotate_reenrolled_account() {
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -281,6 +289,7 @@ fn cad688_resolved_old_id_cannot_rotate_reenrolled_account() {
         .pause
         .store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::scope(|scope| {
+        let _release = ResumeDescriptor(adapter.clone());
         let rotate = scope.spawn(|| {
             d.operator_rpc(
                 "connection_rotate",
@@ -326,4 +335,28 @@ fn cad688_resolved_old_id_cannot_rotate_reenrolled_account() {
             "stale resolved ID changed replacement bytes"
         );
     });
+}
+
+#[test]
+fn cad688_credential_text_cannot_be_persisted_as_public_account_metadata() {
+    let d = fixture();
+    let before = d.operator_rpc("connection_list", json!({})).unwrap();
+    const TOKEN: &str = "cadp_metadata_private_token";
+    assert!(d
+        .operator_rpc("connection_create", create(TOKEN, TOKEN))
+        .is_err());
+    assert_eq!(
+        d.operator_rpc("connection_list", json!({})).unwrap(),
+        before
+    );
+    let db = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let events: String = db
+        .prepare("SELECT payload FROM events")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
+    assert!(!events.contains(TOKEN));
 }
