@@ -654,3 +654,97 @@ fn cad667_workspace_snapshot_preserves_existing_aggregate_bundle_limit() {
     assert_eq!(w.head(), before);
     assert!(!w.pm.dir.join(".apps").exists());
 }
+
+#[test]
+fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    for rollback in [false, true] {
+        let w = Workspace::new();
+        let base = w.pm.dir.join("client/apps/legacy");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            w.pm.dir.join("client/project.yaml"),
+            "key: client\nprefix: C\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("app.md"),
+            "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+        )
+        .unwrap();
+        let record = w.pm.dir.join("client/apps/legacy.yaml");
+        std::fs::write(&record,"schema: 1\napp: legacy\ninstall_id: stable-migration\nsource:\n  kind: path\n  path: /legacy\ninstalled_at: yesterday\ninstalled_by: operator\n").unwrap();
+        let original_record = std::fs::read(&record).unwrap();
+        let hook = w.pm.dir.join(".git/hooks/pre-commit");
+        let original_hook = std::fs::read(&hook).ok();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let head = w.head();
+        assert!(w
+            .daemon
+            .operator_rpc("app_workspace_migrate", json!({}))
+            .is_err());
+        assert_eq!(w.head(), head);
+        let pending = w.pm.dir.join(".apps/pending.yaml");
+        assert!(
+            pending.exists(),
+            "migration publication was exposed before failed Git delivery could be retried"
+        );
+        let pending: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+        let id = pending["journal"].as_str().unwrap();
+        assert!(w
+            .daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .is_err());
+        assert!(w
+            .daemon
+            .operator_rpc(
+                "app_workspace_show",
+                json!({"install_id":"stable-migration"})
+            )
+            .is_err());
+        assert!(
+            w.install().is_err(),
+            "new install swallowed an undelivered migration"
+        );
+        assert!(w
+            .daemon
+            .operator_rpc(
+                "app_workspace_migration_recover",
+                json!({"journal_id":id,"rollback":rollback})
+            )
+            .is_err());
+        assert!(
+            w.pm.dir.join(".apps/pending.yaml").exists(),
+            "failed recovery Git delivery removed its refusal gate"
+        );
+        match original_hook {
+            Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
+            None => std::fs::remove_file(&hook).unwrap(),
+        }
+        let delivered = w
+            .daemon
+            .operator_rpc(
+                "app_workspace_migration_recover",
+                json!({"journal_id":id,"rollback":rollback}),
+            )
+            .unwrap();
+        assert_eq!(delivered["committed"], true);
+        assert!(!w.pm.dir.join(".apps/pending.yaml").exists());
+        assert_eq!(std::fs::read(record).unwrap(), original_record);
+        if rollback {
+            assert!(!w.pm.dir.join(".apps/catalog.yaml").exists());
+        } else {
+            assert_eq!(
+                w.daemon
+                    .operator_rpc(
+                        "app_workspace_show",
+                        json!({"install_id":"stable-migration"})
+                    )
+                    .unwrap()["install_id"],
+                "stable-migration"
+            );
+        }
+    }
+}
