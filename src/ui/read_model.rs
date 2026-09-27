@@ -562,34 +562,55 @@ pub(super) fn entity_frame(text: &str) -> String {
 /// Compare rendered aggregates, not inferred issue fields. Ignore only
 /// display clocks; audience/rank/warnings and every title/body/count remain.
 fn aggregate_fp(value: &Value) -> u64 {
-    fn stable(value: &Value, now: Option<i64>) -> Value {
-        match value {
-            Value::Object(fields) => Value::Object(
-                fields
-                    .iter()
-                    .filter(|(key, _)| !matches!(key.as_str(), "generated_at" | "age" | "age_secs"))
-                    .map(|(key, value)| {
-                        // Preserve changes to WHICH review is oldest. Only its
-                        // passage-of-time increment is a display clock.
-                        let value = if key == "oldest_review_age" {
-                            match (now, value.as_i64()) {
-                                (Some(now), Some(age)) => json!(now - age),
-                                _ => value.clone(),
-                            }
-                        } else {
-                            stable(value, now)
-                        };
-                        (key.clone(), value)
-                    })
-                    .collect(),
-            ),
-            Value::Array(values) => {
-                Value::Array(values.iter().map(|value| stable(value, now)).collect())
+    let mut stable = value.clone();
+    let now = stable["generated_at"].as_i64();
+    if let Some(root) = stable.as_object_mut() {
+        root.remove("generated_at");
+    }
+    // homeNeeds sorts plans/questions first, then descending age. Keep
+    // that permutation as well as the fourteen-day Old bucket, rather
+    // than treating an action input as an arbitrary decorative clock.
+    if let Some(rows) = stable["needs_me"].as_array_mut() {
+        let mut order: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let rank = match row["kind"].as_str() {
+                    Some("plan") => 0,
+                    Some("question") => 1,
+                    _ => 2,
+                };
+                (rank, std::cmp::Reverse(row["age"].as_i64().unwrap_or(0)), i)
+            })
+            .collect();
+        order.sort();
+        let order: Vec<_> = order.into_iter().map(|(_, _, i)| i).collect();
+        for row in rows {
+            let age = row["age"].as_i64().unwrap_or(0);
+            if let Some(fields) = row.as_object_mut() {
+                fields.insert("age".into(), json!(age >= 14 * 86400));
             }
-            _ => value.clone(),
+        }
+        stable["needs_age_order"] = json!(order);
+    }
+    if let Some(projects) = stable["projects"].as_array_mut() {
+        for project in projects {
+            if let (Some(now), Some(age)) = (now, project["oldest_review_age"].as_i64()) {
+                project["oldest_review_age"] = json!(now - age);
+            }
+            // Claim age is a display clock backed by the retained since.
+            if let Some(claims) = project["claims"].as_array_mut() {
+                for claim in claims {
+                    if let Some(fields) = claim.as_object_mut() {
+                        fields.remove("age_secs");
+                    }
+                }
+            }
         }
     }
-    value_fp(&stable(value, value["generated_at"].as_i64()))
+    // Unknown/nested age fields remain: normalization follows audited
+    // consumer paths, never recursive key spelling.
+    value_fp(&stable)
 }
 
 fn aggregate_frame(
@@ -1239,6 +1260,41 @@ mod tests {
                 "actionable {path} stays in fingerprint"
             );
         }
+        let mut below = overview.clone();
+        below["needs_me"][0]["age"] = json!(14 * 86400 - 1);
+        let mut above = below.clone();
+        above["needs_me"][0]["age"] = json!(14 * 86400 + 1);
+        assert_eq!(
+            aggregate_frame(
+                project_fp,
+                project_fp,
+                Some(aggregate_fp(&below)),
+                Some(aggregate_fp(&above))
+            ),
+            frame("aggregates", &json!({"resources": ["overview"]})),
+            "otherwise identical real-shaped Needs-you row crosses Old boundary"
+        );
+        let mut reordered = overview.clone();
+        reordered["needs_me"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind": "other", "age": 11, "subject": {"kind": "issue", "id": "CAD-7"}}));
+        let mut changed_order = reordered.clone();
+        changed_order["needs_me"][0]["age"] = json!(12);
+        assert_ne!(
+            aggregate_fp(&reordered),
+            aggregate_fp(&changed_order),
+            "age-based rail ordering remains actionable"
+        );
+        let mut unknown_age = overview.clone();
+        unknown_age["future_extension"] = json!({"age": 10});
+        let mut changed_unknown = unknown_age.clone();
+        changed_unknown["future_extension"]["age"] = json!(20);
+        assert_ne!(
+            aggregate_fp(&unknown_age),
+            aggregate_fp(&changed_unknown),
+            "unknown age fields are preserved"
+        );
         let mut oldest_changed = overview.clone();
         oldest_changed["projects"][0]["oldest_review_age"] = json!(5);
         assert_ne!(

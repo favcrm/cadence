@@ -1,6 +1,7 @@
 // CAD-611: real Chromium network bytes, against an isolated board only.
 // Node >=22 (native WebSocket); no browser automation dependency.
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,6 +48,10 @@ try {
   const pending = new Map();
   const requests = new Map();
   const samples = { idle: { bytes: 0, requests: 0, paths: {} }, busy: { bytes: 0, requests: 0, paths: {} } };
+  const diagnostics = { idle: { bytesByPath: {}, sse: {} }, busy: { bytesByPath: {}, sse: {} }, overview: [] };
+  const bodyReads = [];
+  let previousOverview;
+  const fingerprint = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
   let phase = null;
   const send = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++sequence; pending.set(id, { resolve, reject }); ws.send(JSON.stringify({ id, method, params }));
@@ -67,6 +72,18 @@ try {
         samples[phase].paths[url.pathname] = (samples[phase].paths[url.pathname] ?? 0) + 1;
       }
     }
+    if (phase && message.method === 'Network.eventSourceMessageReceived') {
+      const counts = diagnostics[phase].sse;
+      const name = p.eventName || 'message';
+      counts[name] = (counts[name] ?? 0) + 1;
+      if (name === 'aggregates') {
+        try {
+          const resources = JSON.parse(p.data).resources ?? [];
+          const key = `aggregates:${resources.join(',') || 'unchanged'}`;
+          counts[key] = (counts[key] ?? 0) + 1;
+        } catch { counts.malformed = (counts.malformed ?? 0) + 1; }
+      }
+    }
     if (message.method === 'Network.responseReceived') {
       const request = requests.get(p.requestId);
       if (request) request.status = p.response.status;
@@ -76,7 +93,22 @@ try {
     // SSE never finishes: count transferred chunks. For finite reads,
     // loadingFinished includes response headers and wire-encoded body.
     if (message.method === 'Network.dataReceived' && request?.type === 'EventSource') samples[phase].bytes += p.encodedDataLength;
-    if (message.method === 'Network.loadingFinished' && request?.type !== 'EventSource' && request?.phase === phase) samples[phase].bytes += p.encodedDataLength;
+    if (message.method === 'Network.loadingFinished' && request?.type !== 'EventSource' && request?.phase === phase) {
+      samples[phase].bytes += p.encodedDataLength;
+      const bucket = diagnostics[phase].bytesByPath;
+      bucket[request.path] = (bucket[request.path] ?? 0) + p.encodedDataLength;
+      if (request.path === '/api/overview') {
+        const measuredPhase = phase;
+        bodyReads.push(send('Network.getResponseBody', { requestId: p.requestId }).then(({ body, base64Encoded }) => {
+          if (base64Encoded) body = Buffer.from(body, 'base64').toString('utf8');
+          const value = JSON.parse(body);
+          const fields = Object.fromEntries(Object.entries(value).map(([key, value]) => [key, { bytes: Buffer.byteLength(JSON.stringify(value)), hash: fingerprint(value) }]));
+          const changed = previousOverview ? Object.keys(fields).filter((key) => fields[key].hash !== previousOverview[key]?.hash) : null;
+          diagnostics.overview.push({ phase: measuredPhase, status: request.status, encodedBytes: p.encodedDataLength, fields, changed });
+          previousOverview = fields;
+        }).catch((error) => diagnostics.overview.push({ phase: measuredPhase, status: request.status, error: String(error) })));
+      }
+    }
   });
   await send('Network.enable');
   await send('Network.setCacheDisabled', { cacheDisabled: true });
@@ -90,7 +122,9 @@ try {
   phase = 'idle'; await sleep(60_000);
   phase = 'busy'; await writeFile(`${endpointFile}.busy`, 'start\n'); await sleep(60_000);
   phase = null;
+  await Promise.all(bodyReads);
   const output = {
+    diagnostics,
     scenario: '420 issues, 12 agents, 160 jobs; warmup 10s; idle 60s; twenty title changes 3s apart during busy 60s',
     measured: samples,
     targets: { idleBytesPerMinute: 50_000, busyBytesPerMinute: 2_000_000 },
