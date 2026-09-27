@@ -479,6 +479,8 @@ tests = [
     "pty_hot_restart_adopts_multiple_running_turns",
     "pty_nudge_queued_at_restart_is_cancelled_not_replayed",
     "pty_hot_restart_retires_stale_awaiting_report_rows",
+    "pty_shutdown_snapshot_setup_panic_releases_daemon",
+    "pty_shutdown_snapshot_setup_panic_child",
     "pty_shutdown_facts_before_detach_rpc",
     "pty_shutdown_facts_before_detach_signal",
     "pty_shutdown_facts_before_detach_signal_child",
