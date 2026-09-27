@@ -270,6 +270,26 @@ fn cad667_http_install_and_reads_share_operator_authority() {
             "agent read exposed workspace installation {path}"
         );
     }
+    let installed_head = w.head();
+    for prefix in ["", "setsid "] {
+        for (method, path, body) in [
+            ("POST", "/api/app-installations".to_string(), body.clone()),
+            ("GET", "/api/app-installations".to_string(), String::new()),
+            ("GET", format!("/api/app-installations/{id}"), String::new()),
+        ] {
+            let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+            let request = lane.dir.path().join(format!("http-{}.txt", lane.seq));
+            std::fs::write(&request, stolen.request(method, &path, &body)).unwrap();
+            let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}",request.display()));
+            assert_eq!(rc, 0);
+            assert_eq!(
+                response.split_whitespace().nth(1),
+                Some("403"),
+                "actual enrolled TCP peer accessed {method} {path}: {response}"
+            );
+            assert_eq!(w.head(), installed_head);
+        }
+    }
 }
 
 #[test]
