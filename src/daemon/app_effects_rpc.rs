@@ -11,7 +11,9 @@ impl Shared {
         params: &Value,
         pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("app artifact release", params, pid)?;
+        if method != "app_effect_resolve" {
+            self.operator_connection("app artifact release", params, pid)?;
+        }
         strict_fields(
             params,
             match method {
