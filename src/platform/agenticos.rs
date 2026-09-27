@@ -760,8 +760,19 @@ mod tests {
     }
 
     #[test]
-    fn publish_post_is_a_draft_handoff() {
-        let adapter = AgenticosAdapter::new("http://127.0.0.1:9").unwrap();
+    fn publish_post_handoff_requires_a_trusted_deployment_assertion() {
+        use crate::contract_fixture::{classify_call, Effect};
+        let unpinned = AgenticosAdapter::new("http://127.0.0.1:9").unwrap();
+        assert_eq!(unpinned.reported_manifest_version(), None);
+        assert_eq!(
+            classify_call(unpinned.table(), None, "publish_post"),
+            Effect::Send
+        );
+        let adapter = AgenticosAdapter::with_deployment_pin(
+            "http://127.0.0.1:9",
+            Some("agenticos-manifest@1/publish_post@2"),
+        )
+        .unwrap();
         assert_eq!(
             adapter.table().effect_of("publish_post"),
             crate::contract_fixture::Effect::Draft
@@ -769,5 +780,13 @@ mod tests {
         assert!(adapter
             .table()
             .manifest_matches(adapter.reported_manifest_version().as_deref()));
+        assert_eq!(
+            classify_call(
+                adapter.table(),
+                adapter.reported_manifest_version().as_deref(),
+                "publish_post"
+            ),
+            Effect::Draft
+        );
     }
 }
