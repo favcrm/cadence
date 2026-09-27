@@ -23,6 +23,144 @@ use tempfile::TempDir;
 const SHA: &str = "abcdef0123456789abcdef0123456789abcdef01";
 const OLD: &str = "2222222222222222222222222222222222222222";
 
+#[test]
+fn production_candidate_refuses_forged_receipt_identity_and_digest() {
+    let mut promotion = run_for(OLD);
+    promotion.id = 99;
+    promotion.event = "workflow_dispatch".into();
+    let receipt = serde_json::json!({
+        "schema": 1, "source_sha": SHA, "ci_run_id": 42,
+        "ci_run_attempt": 1, "sha256": "a".repeat(64),
+        "promotion_run_id": 99, "promotion_run_attempt": 1,
+    });
+    upgrade::parse_production_candidate(&receipt.to_string(), &promotion).unwrap();
+    for (key, value) in [
+        ("schema", serde_json::json!(2)),
+        ("source_sha", serde_json::json!("main")),
+        ("ci_run_id", serde_json::json!(0)),
+        ("ci_run_attempt", serde_json::json!(0)),
+        ("sha256", serde_json::json!("bad")),
+        ("promotion_run_id", serde_json::json!(98)),
+        ("promotion_run_attempt", serde_json::json!(2)),
+    ] {
+        let mut forged = receipt.clone();
+        forged[key] = value;
+        assert!(
+            upgrade::parse_production_candidate(&forged.to_string(), &promotion).is_err(),
+            "{key}"
+        );
+    }
+    for (event, branch, status, conclusion) in [
+        ("pull_request", "main", "completed", "success"),
+        ("workflow_dispatch", "feat/forged", "completed", "success"),
+        ("workflow_dispatch", "main", "in_progress", "success"),
+        ("workflow_dispatch", "main", "completed", "failure"),
+    ] {
+        let mut forged = promotion.clone();
+        forged.event = event.into();
+        forged.head_branch = branch.into();
+        forged.status = status.into();
+        forged.conclusion = conclusion.into();
+        assert!(upgrade::parse_production_candidate(&receipt.to_string(), &forged).is_err());
+    }
+}
+
+#[test]
+fn latest_main_requires_a_promotion_and_never_falls_back_to_green_ci() {
+    let cli = cli_env("#!/bin/sh\ncase \"$1 $2\" in\n  'auth status') exit 0 ;;\n  'run list') case \"$*\" in *'--workflow staging.yml'*) echo '[]' ;; *) echo 'unapproved CI queried' >&2; exit 3 ;; esac ;;\n  *) exit 3 ;;\nesac\n");
+    let out = cadence(&cli, &["--latest-main", "--dry-run"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("production candidate"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read_link(&cli.layout.link).unwrap(),
+        cli.layout.binary(OLD)
+    );
+}
+
+/// Exercise the real GitHub adapter, including approved-run and digest
+/// binding. No caller can replace those checks with a forged local file.
+#[test]
+fn latest_main_installs_only_the_promoted_run_attempt_and_bytes() {
+    let files = TempDir::new().unwrap();
+    write_artifact(files.path(), SHA, SHA);
+    let receipt = serde_json::json!({
+        "schema": 1, "source_sha": SHA, "ci_run_id": 42, "ci_run_attempt": 1,
+        "sha256": hex(&fake_binary(SHA)), "promotion_run_id": 99, "promotion_run_attempt": 1,
+    });
+    fs::write(
+        files.path().join("production-candidate.json"),
+        receipt.to_string(),
+    )
+    .unwrap();
+    let ci = serde_json::json!({
+        "id": 42, "run_attempt": 1, "head_sha": SHA, "head_branch": "main", "event": "push",
+        "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success",
+        "repository": {"full_name": "favcrm/cadence"}, "head_repository": {"full_name": "favcrm/cadence"},
+    });
+    let script = format!(
+        r#"#!/bin/sh
+case "$1 $2" in
+  'auth status') exit 0 ;;
+  'run list')
+    case "$*" in
+      *'--workflow staging.yml'*) echo '[{{"databaseId":99,"attempt":1,"headSha":"{OLD}","headBranch":"main","event":"workflow_dispatch","status":"completed","conclusion":"success"}}]' ;;
+      *'--event push'*) echo '[{{"databaseId":42,"attempt":1,"headSha":"{SHA}","headBranch":"main","event":"push","status":"completed","conclusion":"success"}}]' ;;
+      *) echo '[]' ;;
+    esac ;;
+  'run view')
+    if [ "$3" = 99 ]; then
+      echo '{{"jobs":[{{"name":"stage","status":"completed","conclusion":"success"}},{{"name":"promote","status":"completed","conclusion":"success"}}]}}'
+    else echo '{{"jobs":[{{"name":"test","status":"completed","conclusion":"success"}}]}}'; fi ;;
+  'run download')
+    if [ "$3" = 99 ]; then cp '{files}/production-candidate.json' "$9";
+    else cp '{files}/cadence' '{files}/cadence.sha256' '{files}/manifest.json' "$9"; fi ;;
+  'api repos/favcrm/cadence/actions/runs/42') echo '{ci}' ;;
+  'api repos/favcrm/cadence/compare/{SHA}...main') echo ahead ;;
+  'api repos/favcrm/cadence/compare/{SHA}...{OLD}') echo behind ;;
+  'api repos/favcrm/cadence/actions/runs/42/artifacts?name=cadence-{SHA}-x86_64-linux') echo '{{"artifacts":[{{"name":"cadence-{SHA}-x86_64-linux","expired":false}}]}}' ;;
+  'attestation verify') exit 0 ;;
+  *) echo "unexpected gh $*" >&2; exit 3 ;;
+esac
+"#,
+        files = files.path().display()
+    );
+    let cli = cli_env(&script);
+    let out = cadence(&cli, &["--latest-main", "--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["to_sha"], SHA);
+    assert_eq!(report["run_id"], 42);
+    // Even an attested replacement is not the binary staging approved.
+    let mut forged = receipt.clone();
+    forged["sha256"] = serde_json::json!("b".repeat(64));
+    fs::write(
+        files.path().join("production-candidate.json"),
+        forged.to_string(),
+    )
+    .unwrap();
+    let out = cadence(&cli, &["--latest-main", "--dry-run"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("digest differs"), "{}", stderr(&out));
+    fs::write(
+        files.path().join("production-candidate.json"),
+        receipt.to_string(),
+    )
+    .unwrap();
+    let rerun = script.replace("\"run_attempt\":1", "\"run_attempt\":2");
+    fs::write(cli.root.path().join("ghbin/gh"), rerun).unwrap();
+    let out = cadence(&cli, &["--latest-main", "--dry-run"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("CI run changed"), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_link(&cli.layout.link).unwrap(),
+        cli.layout.binary(OLD)
+    );
+}
+
 /// A stand-in binary: `--version` names the commit it claims to be.
 fn fake_binary(sha: &str) -> Vec<u8> {
     format!("#!/bin/sh\necho \"cadence 0.1.0+{sha}\"\n").into_bytes()

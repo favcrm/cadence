@@ -1,0 +1,118 @@
+name: staging
+
+# Validate a selected batch rather than running another full journey for
+# every merge. Dispatch on main with the successful main CI run's id.
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful main ci.yml run holding the candidate artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Preserve explicit candidates and approval waits. Main keeps merging.
+concurrency:
+  group: staging-${{ inputs.ci_run_id }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  stage:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: staging
+    outputs:
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
+      ci_run_id: ${{ steps.candidate.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.candidate.outputs.ci_run_attempt }}
+      sha256: ${{ steps.candidate.outputs.sha256 }}
+    steps:
+      # Control code always comes from the workflow's main revision.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: control
+          persist-credentials: false
+      - name: Verify candidate identity, digest and build attestation
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+        run: python3 control/scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$CI_RUN_ID" --dest "$RUNNER_TEMP/candidate"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ steps.candidate.outputs.source_sha }}
+          path: candidate-source
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          package_json_file: candidate-source/ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: candidate-source/tests/e2e/pnpm-lock.yaml
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - name: MVP journey against the exact downloadable binary
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.1
+          CARGO_BUILD_JOBS: 4
+          E2E_OUT: ${{ runner.temp }}/staging-e2e
+          CADENCE_E2E_ROOT: ${{ github.workspace }}/candidate-source
+          CADENCE_E2E_BINARY: ${{ runner.temp }}/candidate/cadence
+          CADENCE_E2E_PORT: 3186
+        run: sh control/scripts/e2e/mvp.sh --no-build
+      - name: Check the journey did not replace the candidate bytes
+        env:
+          EXPECTED: ${{ steps.candidate.outputs.sha256 }}
+        run: test "$(sha256sum "$RUNNER_TEMP/candidate/cadence" | cut -d' ' -f1)" = "$EXPECTED"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: staging-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/candidate/candidate.json
+            ${{ runner.temp }}/staging-e2e/acceptance.json
+            ${{ runner.temp }}/staging-e2e/screens
+            ${{ runner.temp }}/staging-e2e/logs
+          if-no-files-found: warn
+          retention-days: 90
+
+  # Approval records a candidate; installation/restart remains with the
+  # rollout owner. No deployment credentials and no production access.
+  promote:
+    needs: stage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Re-verify the artifact after the approval wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CI_RUN_ID: ${{ needs.stage.outputs.ci_run_id }}
+          EXPECTED_SHA: ${{ needs.stage.outputs.source_sha }}
+          EXPECTED_DIGEST: ${{ needs.stage.outputs.sha256 }}
+          EXPECTED_ATTEMPT: ${{ needs.stage.outputs.ci_run_attempt }}
+        run: |
+          python3 scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$CI_RUN_ID" --dest "$RUNNER_TEMP/approved"
+          jq -e --arg sha "$EXPECTED_SHA" --arg digest "$EXPECTED_DIGEST" --argjson attempt "$EXPECTED_ATTEMPT" \
+            '.source_sha == $sha and .sha256 == $digest and .ci_run_attempt == $attempt' "$RUNNER_TEMP/approved/candidate.json"
+          jq --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '. + {promotion_run_id: $run, promotion_run_attempt: $attempt}' "$RUNNER_TEMP/approved/candidate.json" > "$RUNNER_TEMP/production-candidate.json"
+          cat "$RUNNER_TEMP/production-candidate.json" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: production-candidate
+          path: ${{ runner.temp }}/production-candidate.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true

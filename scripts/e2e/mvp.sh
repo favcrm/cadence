@@ -29,7 +29,7 @@
 
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=${CADENCE_E2E_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}
 BUILD=1
 for arg in "$@"; do
     case "$arg" in
@@ -53,7 +53,7 @@ if [ "$BUILD" = 1 ]; then
     (cd "$ROOT/ui" && pnpm install --frozen-lockfile && pnpm build)
     (cd "$ROOT" && cargo build --release --locked --features ui)
 fi
-BIN=$ROOT/target/release/cadence
+BIN=${CADENCE_E2E_BINARY:-$ROOT/target/release/cadence}
 [ -x "$BIN" ] || { echo "mvp.sh: no $BIN — run without --no-build" >&2; exit 1; }
 
 # The local release, laid out like GitHub Releases: <dl>/<tag>/<asset>.
