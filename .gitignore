@@ -24,6 +24,8 @@ docs/*
 !docs/BOARD.md
 !docs/CHARTER.md
 !docs/START-HERE.md
+!docs/INSTALL-AGENT.md
+!docs/RELEASING.md
 docs/design/*
 docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md

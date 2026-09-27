@@ -223,6 +223,14 @@ main() {
     digest=$(recorded_sha256 "$TMP/x/cadence.sha256")
     [ "$(sha256_of "$TMP/x/cadence")" = "$digest" ] \
         || die "the binary in $ASSET does not match its cadence.sha256 — refusing to install"
+    # Refuse a mislabeled release before installing it or moving the active
+    # link. Checksums establish byte integrity, not the requested version.
+    chmod 0755 "$TMP/x/cadence"
+    version_out=$("$TMP/x/cadence" --version) || die "downloaded cadence --version failed"
+    case "$version_out" in
+        "cadence ${TAG#v}+"*) ;;
+        *) die "downloaded cadence --version reports '$version_out', expected cadence ${TAG#v}+<commit> — refusing to install" ;;
+    esac
 
     # --- install ---------------------------------------------------------------
 
