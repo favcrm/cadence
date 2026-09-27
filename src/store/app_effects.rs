@@ -153,6 +153,30 @@ pub fn read_execution_permit(path: &Path, effect_id: &str) -> Result<AppEffectPe
 }
 
 impl Store {
+    pub(super) fn app_effect_invalidate_in(
+        conn: &Connection,
+        install: &str,
+        context: Option<&str>,
+        binding: Option<&str>,
+    ) -> Result<()> {
+        let mut statement = conn.prepare("SELECT e.effect_id FROM platform_effects e JOIN app_effect_authorizations a ON a.effect_id=e.effect_id WHERE a.install_id=? AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR json_extract(a.authority,'$.binding.id')=?) AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')")?;
+        let ids = statement
+            .query_map(params![install, context, context, binding, binding], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in ids {
+            conn.execute("UPDATE platform_effects SET state='closed',close_reason='app_authority_changed',updated_at=? WHERE effect_id=? AND state IN ('waiting','decided')",params![now(),id])?;
+            Self::event(
+                conn,
+                platform::PLATFORM_STREAM,
+                EFFECT_CANCELLED_EVENT,
+                json!({"effect_id":id,"install_id":install,"authorization_kind":"app_artifact","reason":"app_authority_changed"}),
+            )?;
+        }
+        Ok(())
+    }
     pub fn app_publication_material(
         &self,
         run: &str,
@@ -393,6 +417,13 @@ fn historical_step_receipt(
         || assignment["alias"] != actor
         || assignment["identity_digest"] != identity
         || app_runs::material_digest(&assignment["identity"]) != identity
+        || !run["snapshot"]["workflow"]["steps"]
+            .as_array()
+            .is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|frozen| serde_json::to_value(&spec).is_ok_and(|actual| &actual == frozen))
+            })
     {
         return Err(Error::rejected(
             "completed step assignment receipt is invalid",

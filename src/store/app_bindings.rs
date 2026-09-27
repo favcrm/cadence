@@ -84,12 +84,56 @@ pub(crate) fn binding_current_in(
     proof: &BindingProof,
 ) -> Result<bool> {
     let row = binding_in(conn, install, &proof.id)?;
-    Ok(row["context_id"] == json!(context)
+    let mut current = row["context_id"] == json!(context)
         && row["slot"] == slot
         && row["state"] == "configured"
         && row["revision"] == proof.revision
         && row["digest"] == proof.digest
-        && row["config"] == proof.config)
+        && row["config"] == proof.config;
+    let workspace: String = conn.query_row(
+        "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    current &= proof.config["workspace_id"] == workspace;
+    if let Some(context) = context {
+        current &= conn.query_row("SELECT EXISTS(SELECT 1 FROM app_contexts WHERE install_id=? AND id=? AND revision=? AND config_digest=? AND state='active')",params![install,context,proof.config["context"]["revision"].as_i64(),proof.config["context"]["digest"].as_str()],|r|r.get::<_,bool>(0))?;
+    } else {
+        current &= proof.config["context"].is_null();
+    }
+    match proof.config["connection_kind"].as_str() {
+        Some("builtin") => {
+            let provider = proof.config["provider"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("binding provider receipt is missing"))?;
+            let account = proof.config["account"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("binding account receipt is missing"))?;
+            let expected = format!(
+                "builtin-{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{workspace}:{provider}:{account}").as_bytes()
+                )
+                .simple()
+            );
+            current &= proof.config["connection_id"] == expected
+                && proof.config["connection_revision"].is_null();
+        }
+        Some("enrolled") => {
+            let scopes = conn.query_row("SELECT scopes FROM platform_credentials WHERE connection_id=? AND credential_revision=? AND platform=? AND account=?",params![proof.config["connection_id"].as_str(),proof.config["connection_revision"].as_i64(),proof.config["provider"].as_str(),proof.config["account"].as_str()],|r|r.get::<_,String>(0)).optional()?;
+            current &= if let Some(scopes) = scopes {
+                let scopes: Vec<String> = serde_json::from_str(&scopes)?;
+                let required: Vec<String> =
+                    serde_json::from_value(proof.config["mapping"]["scopes"].clone())?;
+                required.iter().all(|scope| scopes.contains(scope))
+            } else {
+                false
+            };
+        }
+        _ => current = false,
+    }
+    Ok(current)
 }
 
 impl Store {
@@ -219,6 +263,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding update lost its revision claim"));
         }
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
         Self::event(
             &tx,
             "app_bindings",
@@ -247,6 +292,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding revoke lost its revision claim"));
         }
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
         Self::event(
             &tx,
             "app_bindings",

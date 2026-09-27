@@ -68,6 +68,10 @@ impl Shared {
                     &pm,
                     required_str(params, "install_id")?,
                     |row, files| {
+                        let _release = self
+                            .app_release_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         let digest = required_str(params, "digest")?;
                         if row["digest"].as_str() != Some(digest) {
                             return Err(Error::rejected("installation digest is stale"));
@@ -122,6 +126,14 @@ impl Shared {
                 }
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, id, |row, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let text = files.get(&format!("workflows/{name}.md")).ok_or_else(|| {
                         Error::rejected("workflow is not in this installed bundle")
                     })?;
@@ -160,7 +172,40 @@ impl Shared {
                             error
                         }
                     })?;
-                    self.store.app_run_create_with_context(
+                    let binding = workflow
+                        .publication_slot
+                        .as_deref()
+                        .map(|slot| {
+                            let manifest = crate::issue::app::parse_manifest(
+                                files.get("app.md").ok_or_else(|| {
+                                    Error::rejected("installation manifest unavailable")
+                                })?,
+                            )?;
+                            if !manifest.capabilities.contains_key(slot) {
+                                return Err(Error::rejected(
+                                    "workflow publication slot is not declared by this app",
+                                ));
+                            }
+                            let binding = self.store.app_binding_for_slot(
+                                id,
+                                context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                                slot,
+                            )?;
+                            if let Some(proof) = &binding {
+                                self.app_binding_receipt_current(
+                                    id,
+                                    context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                                    slot,
+                                    proof,
+                                    row,
+                                    files,
+                                )?;
+                            }
+                            Ok(binding)
+                        })
+                        .transpose()?
+                        .flatten();
+                    self.store.app_run_create_with_publication(
                         LocalRunRequest {
                             install_id: id,
                             bundle_digest: row["digest"].as_str().unwrap(),
@@ -171,6 +216,7 @@ impl Shared {
                             project_link: optional_str(params, "project_link"),
                         },
                         context.as_ref().map(|(_, proof)| proof),
+                        binding.as_ref(),
                     )
                 })
             }
@@ -212,9 +258,42 @@ impl Shared {
     ) -> Result<T> {
         let run = self.store.app_run_show(id)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, _| {
+        workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(&run, row, files)?;
             callback(row["digest"].as_str().unwrap())
         })
+    }
+    fn app_run_binding_current(
+        &self,
+        run: &Value,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        if let Some(binding) = run["snapshot"]["publication"]
+            .get("binding")
+            .filter(|value| !value.is_null())
+        {
+            let binding: crate::store::app_bindings::BindingProof =
+                serde_json::from_value(binding.clone())
+                    .map_err(|_| Error::rejected("run binding receipt is invalid"))?;
+            self.app_binding_receipt_current(
+                required_str(run, "install_id")?,
+                run["context_id"].as_str(),
+                required_str(&run["snapshot"]["publication"], "slot")?,
+                &binding,
+                bundle,
+                files,
+            )?;
+        }
+        Ok(())
     }
     pub(super) fn dispatch_app_run(&self, id: &str) -> Result<Value> {
         let result =
@@ -239,8 +318,18 @@ impl Shared {
     }
     fn app_artifact_current(&self, id: &str, turn: Option<(&str, &str)>) -> Result<Value> {
         let install = self.store.app_artifact_installation(id)?;
+        let run_id = self.store.app_artifact_run_id(id)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+        workspace::with_runtime_snapshot(&pm, &install, |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(&self.store.app_run_show(&run_id)?, row, files)?;
             self.store
                 .app_artifact_with_digest(id, turn, row["digest"].as_str().unwrap())
         })
@@ -252,12 +341,21 @@ impl Shared {
         let head = self.store.queued_head(alias)?;
         if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
             let admission = (|| {
-                let (_, install) = self
+                let (run_id, install) = self
                     .store
                     .app_message_installation(&message.id)?
                     .ok_or_else(|| Error::rejected("app message association is absent"))?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+                workspace::with_runtime_snapshot(&pm, &install, |row, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, row, files)?;
                     self.store.take_queued_app_proven(
                         alias,
                         Some((&message.id, row["digest"].as_str().unwrap())),
@@ -279,12 +377,21 @@ impl Shared {
         if message.source != "app_run_dispatch" {
             return Ok(());
         }
-        let (_, install) = self
+        let (run_id, install) = self
             .store
             .app_message_installation(&message.id)?
             .ok_or_else(|| Error::rejected("app association is absent"))?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+        workspace::with_runtime_snapshot(&pm, &install, |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(&self.store.app_run_show(&run_id)?, row, files)?;
             self.store
                 .app_message_admit(message, row["digest"].as_str().unwrap())
         })

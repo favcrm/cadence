@@ -596,6 +596,23 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=22", [])?;
             tx.commit()?;
         }
+        if version < 23 {
+            // The actual predecessor is merged CAD690's schema22. Legacy
+            // effects remain agent-grant records; an app child never falls
+            // back to them. DDL, discriminator and checkpoint are atomic.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::app_bindings::SCHEMA)?;
+            tx.execute_batch(super::app_effects::SCHEMA)?;
+            let columns = tx
+                .prepare("PRAGMA table_info(platform_effects)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "authorization_kind") {
+                tx.execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant' CHECK(authorization_kind IN ('agent_grant','app_artifact'));")?;
+            }
+            tx.execute("UPDATE schema_version SET version=23", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,
