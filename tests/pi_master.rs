@@ -1456,6 +1456,79 @@ fn agentic_provider_master_detached_child_refuses() {
     );
 }
 
+/// CAD-603: even an allowlisted worker cannot launch the argv-based
+/// Cursor extension. A forged role/provider and a large private briefing
+/// must never reach a provider process.
+#[test]
+fn cursor_worker_open_and_concurrent_switch_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [fake/model-1, cursor/grok-4.7-high]\n",
+    )
+    .unwrap();
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let mut row = agent(
+        "dev-1",
+        json!({"model": "cursor/grok-4.7-high", "role": "operator", "provider": "fake"}),
+    );
+    row.role = "operator".into();
+    row.cwd = dir.path().to_string_lossy().into();
+    row.instructions = Some(private.clone());
+    let err = pi
+        .open(&row)
+        .err()
+        .expect("unsafe transport must refuse")
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    assert!(!err.contains("CAD603-PRIVATE-SENTINEL"));
+    assert!(!dir.path().join("pi-rpc.jsonl").exists());
+    let mut safe = agent("dev-1", json!({}));
+    safe.cwd = row.cwd.clone();
+    pi.open(&safe).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let err = pi
+                    .session_command("model", Some("cursor/grok-4.7-high"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("native cursor"), "{err}");
+            });
+        }
+    });
+    let journal = std::fs::read_to_string(dir.path().join("pi-rpc.jsonl")).unwrap();
+    assert!(!journal.contains("set_model"), "{journal}");
+    assert!(!journal.contains("CAD603-PRIVATE-SENTINEL"));
+    pi.close();
+}
+
+#[test]
+fn cursor_worker_detached_child_refuses() {
+    if std::env::var_os("CADENCE_603_DETACHED_PROOF").is_some() {
+        cursor_worker_open_and_concurrent_switch_refuse();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cursor_worker_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_603_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.
