@@ -33,11 +33,38 @@ def validate_ci(run, repo, run_id):
 def validate_mutation(code, xml, name):
     # 100 is nextest's TEST_RUN_FAILED; compilation/setup failures have
     # different exit codes. The report must name exactly one executed test.
-    cases = list(ET.fromstring(xml).iter("testcase"))
-    if (code != 100 or len(cases) != 1 or cases[0].get("name") != name
-            or cases[0].find("failure") is None
-            or cases[0].find("error") is not None
-            or cases[0].find("skipped") is not None):
+    try:
+        report = ET.fromstring(xml)
+    except ET.ParseError as error:
+        raise ValueError("malformed mutation JUnit report") from error
+    if report.tag not in ("testsuite", "testsuites"):
+        raise ValueError("mutation report is not JUnit")
+    executed = []
+    identities = set()
+    for case in report.iter("testcase"):
+        identity = (case.get("classname"), case.get("name"))
+        if identity in identities:
+            raise ValueError("mutation report repeats a testcase identity")
+        identities.add(identity)
+        statuses = [child.tag for child in case
+                    if child.tag in ("failure", "error", "skipped")]
+        nested_statuses = [child.tag for child in case.iter()
+                           if child.tag in ("failure", "error", "skipped")]
+        if len(statuses) > 1 or nested_statuses != statuses:
+            raise ValueError("mutation testcase has conflicting statuses")
+        # Accept only the pinned nextest filter-exclusion receipt, never
+        # ignored tests or a contradictory skipped requested target.
+        if statuses == ["skipped"]:
+            reason = case.find("skipped").get("message")
+            if (case.get("name") == name or reason !=
+                    "Skipped: test does not match the provided string filters"):
+                raise ValueError("mutation report contains a non-filter or target skip")
+        else:
+            executed.append(case)
+    if (code != 100 or len(executed) != 1 or executed[0].get("name") != name
+            or executed[0].find("failure") is None
+            or executed[0].find("error") is not None
+            or executed[0].find("skipped") is not None):
         raise ValueError("mutation did not fail exactly the requested test")
 
 
