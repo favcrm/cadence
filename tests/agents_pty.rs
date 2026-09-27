@@ -6,6 +6,8 @@
 // so its own spawns need not go through `cadence_agent::reaper`.
 #![allow(clippy::disallowed_methods)]
 mod common;
+#[path = "support/source_guard.rs"]
+mod source_guard;
 use common::*;
 
 use cadence_agent::daemon;
@@ -582,26 +584,116 @@ fn mock_installers_run_concurrently_with_private_state() {
     }
 }
 
+/// CAD-643: discovery must include child modules of both shared source trees.
+#[test]
+fn mock_config_guard_finds_nested_rust_sources() {
+    let dir = TempDir::new().unwrap();
+    let common = dir.path().join("common");
+    let support = dir.path().join("support");
+    for root in [&common, &support] {
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/example.rs"), env_mutation_source()).unwrap();
+        std::fs::write(root.join("nested/ignored.txt"), env_mutation_source()).unwrap();
+    }
+    let original = common.join("mod.rs");
+    std::fs::write(&original, "// the original shared root has no mutation\n").unwrap();
+    // The old fixed-file discovery misses both offending child modules.
+    assert!(
+        source_guard::process_env_offenders(std::slice::from_ref(&original))
+            .unwrap()
+            .is_empty()
+    );
+    let sources =
+        source_guard::rust_sources(&[support.clone(), common.clone(), common.clone()]).unwrap();
+    let nested_common = common.join("nested/example.rs");
+    let nested_support = support.join("nested/example.rs");
+    assert_eq!(
+        sources,
+        vec![original, nested_common.clone(), nested_support.clone()]
+    );
+    let offenders = source_guard::process_env_offenders(&sources).unwrap();
+    let line = env_mutation_source()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        offenders,
+        vec![
+            format!("{}:2: {line}", nested_common.display()),
+            format!("{}:2: {line}", nested_support.display()),
+        ]
+    );
+}
+
+/// Construct source text without either mutating env or matching this file's scan.
+fn env_mutation_source() -> &'static str {
+    concat!(
+        "fn fixture() {\n    std::env::",
+        "set_var(\"CADENCE_FIXTURE\", \"fake\");\n}\n"
+    )
+}
+
+#[test]
+fn mock_config_guard_never_follows_source_symlinks() {
+    let dir = TempDir::new().unwrap();
+    let external = TempDir::new().unwrap();
+    let common = dir.path().join("common");
+    std::fs::create_dir(&common).unwrap();
+    let external_file = external.path().join("outside.rs");
+    std::fs::write(&external_file, env_mutation_source()).unwrap();
+    let linked_file = common.join("linked.rs");
+    std::os::unix::fs::symlink(&external_file, &linked_file).unwrap();
+    let err = source_guard::rust_sources(std::slice::from_ref(&common)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains(&linked_file.display().to_string()));
+    std::fs::remove_file(&linked_file).unwrap();
+    let linked_dir = common.join("linked-directory");
+    std::os::unix::fs::symlink(external.path(), &linked_dir).unwrap();
+    let err = source_guard::rust_sources(std::slice::from_ref(&common)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains(&linked_dir.display().to_string()));
+    // Source roots themselves must be directories, never symlink aliases.
+    let linked_root = dir.path().join("linked-root");
+    std::os::unix::fs::symlink(external.path(), &linked_root).unwrap();
+    let err = source_guard::rust_sources(std::slice::from_ref(&linked_root)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains(&linked_root.display().to_string()));
+}
+
+#[test]
+fn mock_config_guard_reports_discovery_and_source_read_errors() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing");
+    let err = source_guard::rust_sources(std::slice::from_ref(&missing)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(err.to_string().contains(&missing.display().to_string()));
+    let bad_source = dir.path().join("invalid.rs");
+    std::fs::write(&bad_source, [0xff]).unwrap();
+    let err = source_guard::process_env_offenders(std::slice::from_ref(&bad_source)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains(&bad_source.display().to_string()));
+    let err = source_guard::process_env_offenders(std::slice::from_ref(&missing)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    let err = source_guard::rust_sources(std::slice::from_ref(&bad_source)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 /// CAD-183: mock and provider configuration reaches a daemon through
 /// `test_env()` or a mock's own install dir, never the process env
 /// every test in this binary shares — so no test holds a process-wide
 /// env lock. The scan covers every source the CAD-426 split produces —
 /// each per-area binary named by split-map.toml plus the shared
-/// harness — so a binary the generator moves or adds stays guarded.
+/// harness and support trees recursively — so a moved helper stays guarded.
+/// Symlink roots and entries fail rather than hiding an unscanned source.
 #[test]
 fn mock_config_never_touches_process_env() {
-    let set = concat!("std::env::", "set_var");
-    let remove = concat!("std::env::", "remove_var");
-    let lock = concat!("ENV_", "LOCK");
-    // Not test config: `PATH` is prepended once per process so children
-    // run the binary under test, `GL_TOKEN` exists only inside the
-    // forge-credential test that sets and removes it, and
-    // `CADENCE_PI_COMMAND` is the probe's own scrub — it must not
-    // leak into the real `pi` child it spawns (status_prompt_probe is
-    // `#[ignore]`d; the removal is its whole point).
-    let exempt = ["\"PATH\"", "\"GL_TOKEN\"", "\"CADENCE_PI_COMMAND\""];
-    let mut sources = vec![std::path::PathBuf::from("tests/common/mod.rs")];
-    let map = std::fs::read_to_string("tests/split-map.toml").unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources =
+        source_guard::rust_sources(&[root.join("tests/common"), root.join("tests/support")])
+            .unwrap();
+    let map = std::fs::read_to_string(root.join("tests/split-map.toml")).unwrap();
     // The map names only what the generator split out of
     // integration.rs; hand-written binaries that share the harness
     // must be listed by hand — `test_seam` held the last live
@@ -613,30 +705,16 @@ fn mock_config_never_touches_process_env() {
         "tests/pi_master.rs",
         "tests/pi_worker.rs",
     ] {
-        sources.push(std::path::PathBuf::from(hand));
+        sources.push(root.join(hand));
     }
     sources.extend(map.lines().filter_map(|l| {
         l.strip_prefix("[binaries.")
             .and_then(|s| s.strip_suffix(']'))
-            .map(|name| std::path::PathBuf::from(format!("tests/{name}.rs")))
+            .map(|name| root.join(format!("tests/{name}.rs")))
     }));
-    let offenders: Vec<String> = sources
-        .iter()
-        .flat_map(|p| {
-            let path = p.display().to_string();
-            std::fs::read_to_string(p)
-                .unwrap()
-                .lines()
-                .enumerate()
-                .filter(|(_, l)| {
-                    l.contains(lock)
-                        || ((l.contains(set) || l.contains(remove))
-                            && !exempt.iter().any(|v| l.contains(v)))
-                })
-                .map(|(i, l)| format!("{path}:{}: {}", i + 1, l.trim()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    sources.sort();
+    sources.dedup();
+    let offenders = source_guard::process_env_offenders(&sources).unwrap();
     assert!(
         offenders.is_empty(),
         "process env mutated for test config:\n{}",

@@ -341,6 +341,9 @@ tests = [
     "cad565_message_read_refuses_forged_identity_fields",
     "cli_doctor_smoke",
     "mock_installers_run_concurrently_with_private_state",
+    "mock_config_guard_finds_nested_rust_sources",
+    "mock_config_guard_never_follows_source_symlinks",
+    "mock_config_guard_reports_discovery_and_source_read_errors",
     "mock_config_never_touches_process_env",
     "pty_send_pastes_literal_and_completes_via_report",
     "pty_claim_is_single_use_and_expires",
@@ -446,6 +449,8 @@ tests = [
     "agent_remove_force_notifies_reply_to",
 ]
 helpers = [
+    "source_guard",
+    "env_mutation_source",
     "claude_sessions",
     "forced_removals",
     "stopped_fake_agent",
