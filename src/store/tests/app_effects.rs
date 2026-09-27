@@ -147,6 +147,28 @@ fn cad692_legacy_or_missing_child_cannot_supply_app_execution_permit() {
 }
 
 #[test]
+fn cad692_legacy_waiting_projection_excludes_child_with_populated_legacy_control() {
+    let (_dir, s) = store();
+    let (row, authority) = child_fixture(&s);
+    let mut legacy = row.clone();
+    legacy.effect_id = "legacy-waiting".into();
+    legacy.request = "legacy-request".into();
+    legacy.tool = "publish".into();
+    legacy.input = json!({"project":"legacy-project","source":"draft.md"});
+    s.effect_stage(&legacy).unwrap();
+    s.app_effect_stage(&row, &authority).unwrap();
+    let projected = s.waiting_effects().unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].effect_id, legacy.effect_id);
+    assert_eq!(projected[0].input, legacy.input);
+    assert_eq!(s.platform_effects(None).unwrap().len(), 1);
+    assert_eq!(
+        s.app_effect_show(&row.effect_id).unwrap()["effect"]["state"],
+        "waiting"
+    );
+}
+
+#[test]
 fn cad692_actual_v22_migration_is_atomic_and_preserves_context_and_legacy_receipts() {
     let (dir, s) = store();
     let (mut legacy, _) = child_fixture(&s);
