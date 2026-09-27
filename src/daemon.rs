@@ -2389,6 +2389,16 @@ impl Shared {
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                // A retained app endpoint can hold private run inputs in
+                // pending provider requests. Routing metadata grants no
+                // material access, including to the worker or its PM.
+                if self.store.app_material_endpoint(&alias)? {
+                    self.operator_connection_on_agent(
+                        "app pending request inspection",
+                        params,
+                        peer_pid,
+                    )?;
+                }
                 // CAD-506: a pending row carries the caller-declared
                 // input — it discloses to the operator, to the owning
                 // agent, and to the owner's PM (CAD-370's authorised

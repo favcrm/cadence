@@ -980,6 +980,8 @@ fn cad631_app_pending_requests_do_not_grant_material_to_routing_pm() {
     // material authority, even though effective_pm still names it.
     pm.child.kill().unwrap();
     pm.child.wait().unwrap();
+    conn.execute("DELETE FROM agents WHERE alias='routing-pm'", [])
+        .unwrap();
     let mut replacement = Lane::spawn_as(&d, "routing-pm", None, "pm");
     assert!(refused(replacement.rpc(&d, "agent_requests", request.clone())).contains("operator"));
     assert!(d
