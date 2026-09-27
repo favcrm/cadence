@@ -25,7 +25,35 @@ struct ProviderDeployment {
 }
 
 fn refused() -> Error {
-    Error::Protocol("trusted provider deployment metadata refused".into())
+    Error::rejected("trusted provider deployment metadata refused")
+}
+
+fn valid_authority(authority: &str) -> bool {
+    let port_valid = |port: &str| {
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+    };
+    if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = ipv6.split_once(']') else {
+            return false;
+        };
+        return host.parse::<std::net::Ipv6Addr>().is_ok()
+            && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(port_valid));
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && port.is_none_or(port_valid)
 }
 
 impl DeploymentMetadata {
@@ -47,10 +75,7 @@ impl DeploymentMetadata {
                 .ok_or_else(refused)?;
             if !seen.insert(&entry.provider)
                 || crate::proto::identifier(&entry.provider, "Provider").is_err()
-                || authority.is_empty()
-                || !authority
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
+                || !valid_authority(authority)
                 || entry.manifest_pin.is_empty()
                 || entry.manifest_pin.len() > 256
                 || entry.manifest_pin.chars().any(char::is_control)
