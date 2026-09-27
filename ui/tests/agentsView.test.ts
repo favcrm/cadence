@@ -179,6 +179,7 @@ const loaded = <T>(data: T): import("../src/lib/cache").ResourceState<T> => ({
 let project = "all";
 let open: string | null = null;
 let openedIssue: string | null = null;
+let assignmentRetries = 0;
 let state = loaded<import("../src/lib/types").AgentsPayload>({
   daemon: "reachable",
   agents,
@@ -205,6 +206,9 @@ async function render() {
           openedIssue = id;
         },
         onRetry: () => {},
+        onRetryAssignments: () => {
+          assignmentRetries += 1;
+        },
       }),
     ),
   );
@@ -394,8 +398,36 @@ async function main() {
   assert(
     aliases().length === 0 &&
       host.textContent?.includes("assignments could not be loaded") &&
-      !host.querySelector(".agents-unassigned"),
+      host.textContent?.includes("Assignments unavailable") &&
+      !host.textContent?.includes("No agents bound") &&
+      !host.textContent?.includes("0 in demo") &&
+      !host.querySelector(".agents-tools, .agents-unassigned"),
     "missing issue index does not guess projects or claim agents are unassigned",
+  );
+  await click("Retry assignments");
+  assert(
+    assignmentRetries === 1,
+    "assignment retry invokes the issue dependency refresh",
+  );
+  issueState = { ...issueState, status: "loading", inFlight: true };
+  await render();
+  assert(
+    host.textContent?.includes("Loading assignments…") &&
+      !host.querySelector(".agents-tools"),
+    "loading assignments does not expose zero counts",
+  );
+  project = "all";
+  await render();
+  assert(
+    aliases().length === 6,
+    "All projects still works without the assignment index",
+  );
+  state = { ...state, data: null, status: "loading" };
+  await render();
+  assert(
+    host.textContent?.includes("Loading agents…") &&
+      !host.textContent?.includes("0 across all projects"),
+    "unloaded agent collection is not an empty collection",
   );
   await React.act(() => root.unmount());
   console.log("agents view checks passed");

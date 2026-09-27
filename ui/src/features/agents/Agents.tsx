@@ -877,6 +877,7 @@ export default function Agents({
   onOpenAgent: setOpen,
   onOpenIssue,
   onRetry,
+  onRetryAssignments,
 }: {
   state: ResourceState<AgentsPayload>;
   issues: ResourceState<IssueCard[]>;
@@ -885,10 +886,12 @@ export default function Agents({
   onOpenAgent: (alias: string | null) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
+  onRetryAssignments: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<AgentFilter>("all");
   const payload = state.data;
+  const scopeUnavailable = project !== "all" && issuesState.data === null;
   const issueProjects = issueIndex(issuesState.data ?? []);
   const allAgents = payload?.agents ?? [];
   const scoped = allAgents.filter((a) =>
@@ -932,15 +935,21 @@ export default function Agents({
       ? agentsEmptyCopy(project)
       : "No agents match these filters.";
   const agent = allAgents.find((a) => a.alias === open);
+  const summary = !payload
+    ? state.status === "failed"
+      ? "Agents unavailable"
+      : "Loading agents…"
+    : scopeUnavailable
+      ? issuesState.status === "failed"
+        ? "Assignments unavailable"
+        : "Loading assignments…"
+      : `${scoped.length} ${project === "all" ? "across all projects" : `in ${project}`}`;
 
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <div className="flex flex-wrap items-center gap-3 mb-2">
         <h1 className="text-section font-semibold text-ink-100">Agents</h1>
-        <span className="text-label text-ink-500">
-          {scoped.length}{" "}
-          {project === "all" ? "across all projects" : `in ${project}`}
-        </span>
+        <span className="text-label text-ink-500">{summary}</span>
         <StaleChip state={state} />
       </div>
       <p className="text-label text-ink-400 mb-5">
@@ -970,12 +979,17 @@ export default function Agents({
         failed="Could not load agents"
         onRetry={onRetry}
       />
-      {payload && project !== "all" && issuesState.data === null && (
-        <p role="status" className="text-label text-warn mb-4">
-          {issuesState.status === "failed"
-            ? "Project issue assignments could not be loaded. Select All projects to see every agent."
-            : "Loading project issue assignments…"}
-        </p>
+      {payload && scopeUnavailable && (
+        <div className="text-label text-warn mb-4 space-y-2">
+          <p role={issuesState.status === "failed" ? "alert" : "status"}>
+            {issuesState.status === "failed"
+              ? "Project issue assignments could not be loaded. Select All projects to see every agent."
+              : "Loading project issue assignments…"}
+          </p>
+          {issuesState.status === "failed" && (
+            <Button onClick={onRetryAssignments}>Retry assignments</Button>
+          )}
+        </div>
       )}
       {project !== "all" && issuesState.status === "stale" && (
         <p role="status" className="text-label text-warn mb-4">
@@ -983,7 +997,7 @@ export default function Agents({
         </p>
       )}
 
-      {payload && (
+      {payload && !scopeUnavailable && (
         <>
           <div className="agents-tools mb-4">
             <div
