@@ -940,7 +940,9 @@ fn absent_or_mismatched_deployment_pin_stages_rpc_without_upstream_traffic() {
         let d = CallDaemon::start(Arc::new(adapter));
         let mut agent = Lane::spawn(&d, "aos-no-deployment-pin");
         d.op("platform_grant", json!({"agent":"aos-no-deployment-pin","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
-        let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("no trusted pin")});
+        let mut forged_input = input("no trusted pin");
+        forged_input["deploymentPin"] = json!("agenticos-manifest@1/publish_post@2");
+        let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":forged_input});
         let out = agent.rpc(&d, "platform_call", call).unwrap();
         assert_eq!(out["result"], "staged");
         assert_eq!(
