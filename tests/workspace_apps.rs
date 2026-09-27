@@ -528,3 +528,29 @@ fn cad667_explicit_migration_recovery_has_operator_proof_and_preserves_legacy_id
         "stable-legacy"
     );
 }
+
+#[test]
+fn cad667_installed_manifest_cannot_relabel_a_stable_installation() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let manifest =
+        w.pm.dir
+            .join(".apps/installations")
+            .join(id)
+            .join("bundle/app.md");
+    let changed = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("app: blog-post", "app: substituted-app");
+    std::fs::write(manifest, changed).unwrap();
+    assert!(
+        w.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id":id}))
+            .is_err(),
+        "manifest name substituted the catalog identity"
+    );
+    assert!(w
+        .daemon
+        .operator_rpc("app_workspace_list", json!({}))
+        .is_err());
+}
