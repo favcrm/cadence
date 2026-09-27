@@ -141,7 +141,7 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
         lf.f.d
             .operator_rpc("delivery_review_evidence", replay)
             .is_err(),
-        "native receipt moved to another PR"
+        "assertion failed: native receipt moved to another PR"
     );
     std::fs::write(&path, original).unwrap();
 
