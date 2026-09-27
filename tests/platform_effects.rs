@@ -1641,6 +1641,7 @@ fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
         "forged app attribution wrote durable state"
     );
 
+    conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('older-generic-active','app-writer','generic prompt','send','running','generic-turn',0)", []).unwrap();
     conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('app-effect-active','app-writer','private kickoff','app_run_dispatch','running','active-turn',1)", []).unwrap();
     let before = db_snapshot(&d);
     for tool in ["widgets.list", "widgets.preview"] {

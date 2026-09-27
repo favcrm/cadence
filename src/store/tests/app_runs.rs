@@ -448,3 +448,28 @@ fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
         })
         .is_err());
 }
+
+#[test]
+fn cad631_generic_job_reads_do_not_reveal_private_rendered_title() {
+    let (_dir, s, run) = runtime_fixture();
+    let mut workflow: crate::store::app_runs::LocalWorkflow =
+        serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
+    workflow.title = "Private subject sentinel CAD631".into();
+    let inputs = std::collections::BTreeMap::new();
+    let created = s
+        .app_run_create(crate::store::app_runs::LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "private-title",
+            owner_pm: "lead",
+            project_link: None,
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap();
+    assert!(created.to_string().contains(&workflow.title));
+    assert!(!format!("{:?}", s.job(id).unwrap()).contains(&workflow.title));
+    assert!(!format!("{:?}", s.jobs(None, true).unwrap()).contains(&workflow.title));
+    assert!(!format!("{:?}", s.tasks_for_job(id).unwrap()).contains(&workflow.title));
+}

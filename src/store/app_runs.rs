@@ -299,7 +299,7 @@ impl Store {
             return self.app_run_show(&id);
         }
         let id = format!("run-{}", uuid::Uuid::new_v4().simple());
-        tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,workflow.title,"app-run",digest,owner_pm,now(),now()])?;
+        tx.execute("INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,state,max_revisions,created,updated) VALUES(?,?,?,?,?,'open',1,?,?)",params![id,"App run","app-run",digest,owner_pm,now(),now()])?;
         tx.execute(
             "INSERT INTO app_runs VALUES(?,?,?,?,?,?,?,?,?,'awaiting_approval',NULL,?,?)",
             params![
@@ -1103,8 +1103,9 @@ impl Store {
 impl Store {
     pub(crate) fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
         if self
-            .running_message(alias)?
-            .is_some_and(|m| m.source == "app_run_dispatch")
+            .running_messages(alias)?
+            .iter()
+            .any(|m| m.source == "app_run_dispatch")
             || task
                 .map(|id| self.app_task_owned(id))
                 .transpose()?

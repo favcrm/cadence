@@ -170,12 +170,17 @@ team and dependencies. Cancellation, revocation or material package change
 cannot silently substitute a new team or revive old work. Durable run,
 step and message associations prevent duplicate kickoffs and completion
 receipts across restart. Pending work retains its original identity.
+If that identity or authority no longer matches, the run records failure
+and keeps its existing artifacts and dispatch receipts. An interrupted
+provider turn is never automatically replayed to manufacture a review.
+Start a new run with a new request ID after restoring the intended team
+and approval; an old run's immutable snapshot cannot be reassigned.
 
 New lifecycle and HTTP management surfaces are operator-only. Worker
 artifact access proves the current dependent step and actual turn. Local
 artifact capabilities govern the broker; they do not claim shell or tool
 confinement for a worker's unrelated work.
 
-Catalog storage remains filesystem schema1. Persisted local runs use an
-additive database migration; source merge and production rollout are
-separate operations managed by the rollout owner.
+Catalog storage remains filesystem schema1. Persisted local runs add
+SQLite schema20 through an additive migration from schema19. Source merge
+and production rollout are separate operations managed by the rollout owner.
