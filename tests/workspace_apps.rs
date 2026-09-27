@@ -633,3 +633,24 @@ fn cad667_flat_text_rubrics_and_templates_keep_legacy_bundle_compatibility() {
         2
     );
 }
+
+#[test]
+fn cad667_workspace_snapshot_preserves_existing_aggregate_bundle_limit() {
+    let w = Workspace::new();
+    for index in 0..9 {
+        std::fs::write(
+            w.source()
+                .join("templates")
+                .join(format!("large-{index}.md")),
+            "x".repeat(256 * 1024),
+        )
+        .unwrap();
+    }
+    let before = w.head();
+    let refused = w
+        .install()
+        .expect_err("individually bounded files must not widen the A1 aggregate limit");
+    assert!(refused.to_string().contains("limit") || refused.to_string().contains("large"));
+    assert_eq!(w.head(), before);
+    assert!(!w.pm.dir.join(".apps").exists());
+}
