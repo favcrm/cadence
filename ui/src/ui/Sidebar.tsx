@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
 import { NAV, type Route, type Screen } from "../lib/router";
-import type { IssueCard, Project } from "../lib/types";
+import type { IssueCard, Project, Meta } from "../lib/types";
 import Link from "./Link";
 import { Logo } from "./Logo";
 import {
@@ -30,6 +30,7 @@ interface Props {
   projectsError?: string | null;
   /** CAD-313: this browser's operator session — null while unknown. */
   signedIn?: boolean | null;
+  sessionUser?: NonNullable<Meta["session"]>["user"];
 }
 
 const NAV_ICONS: Record<string, ReactNode> = {
@@ -42,7 +43,7 @@ const NAV_ICONS: Record<string, ReactNode> = {
   settings: <IconSettings />,
 };
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, sessionUser }: Props) {
   // "…" until the cards load; a stale list keeps its numbers.
   const count = (key: string) => {
     if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
@@ -102,7 +103,13 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
       </div>
       <div className="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
         <div className="slabel mb-1">session</div>
-        {signedIn === true ? "operator · signed in" : signedIn === false ? "not signed in · read only" : "…"}
+        {signedIn === true ? (
+          <div title={sessionUser?.email}>
+            <div className="truncate text-ink-300">{sessionUser?.name || sessionUser?.email || "operator"}</div>
+            {sessionUser && <div className="truncate text-micro">{sessionUser.email}</div>}
+            <div>{sessionUser?.role || "operator"} · signed in</div>
+          </div>
+        ) : signedIn === false ? "not signed in · read only" : "…"}
         <br />
         <span className="num text-micro">{location.host}</span>
       </div>

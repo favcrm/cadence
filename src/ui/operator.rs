@@ -824,6 +824,10 @@ pub(super) fn board_caller(
 /// session), `session` (its display id and expiries, never the token)
 /// and `login_hint` (the command that signs this origin in).
 pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> Value {
+    let hosted = matches!(
+        request_origin(request, opts),
+        ReqOrigin::Known(Origin::Public)
+    );
     let (hint, cookie, session) = match request_origin(request, opts) {
         ReqOrigin::Known(o) => {
             let hint = match o {
@@ -843,6 +847,7 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
     };
     json!({
         "signed_in": session.is_some(),
+        "hosted": hosted,
         "session": session,
         "login_hint": hint,
         // A cookie but no live session for this page: typically a new
