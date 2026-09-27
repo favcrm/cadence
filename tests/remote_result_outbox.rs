@@ -490,13 +490,14 @@ fn abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody() {
     }
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("outbox");
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
-        .arg("--test-threads=1")
-        .env(CHILD_DIR, &dir)
-        .output()
-        .unwrap();
+    let output = cadence_agent::reaper::output(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
+            .arg("--test-threads=1")
+            .env(CHILD_DIR, &dir),
+    )
+    .unwrap();
     assert_eq!(
         output.status.code(),
         Some(73),
@@ -521,14 +522,15 @@ fn hot_journal_foreign_schemas_preserve_database_and_journal_bytes() {
     let root = tempfile::tempdir().unwrap();
     for mode in ["wrong-schema", "trigger"] {
         let dir = root.path().join(mode);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
-            .arg("--test-threads=1")
-            .env("CADENCE_OFFLINE_OUTBOX_CRASH_FIXTURE", &dir)
-            .env("CADENCE_OFFLINE_OUTBOX_CRASH_SCHEMA", mode)
-            .output()
-            .unwrap();
+        let output = cadence_agent::reaper::output(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
+                .arg("--test-threads=1")
+                .env("CADENCE_OFFLINE_OUTBOX_CRASH_FIXTURE", &dir)
+                .env("CADENCE_OFFLINE_OUTBOX_CRASH_SCHEMA", mode),
+        )
+        .unwrap();
         assert_eq!(output.status.code(), Some(73), "{mode}");
         let db = dir.join("results.sqlite3");
         let journal = dir.join("results.sqlite3-journal");
