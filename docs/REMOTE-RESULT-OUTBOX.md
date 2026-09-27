@@ -1,11 +1,52 @@
 # Offline local result custody
 
-`remote_result_outbox` is a dormant library foundation for CAD-682. It has no
-CLI, daemon, HTTP, credential, org registry or network integration. CAD-675
-still requires the real issuer/enrollment, assignment transport and restore-safe
-cloud application protocol. The publication Outbox UI is a separate feature.
+`remote_result_outbox` provides CAD-682's immutable local custody. CAD-700 adds
+an explicit offline CLI wrapper; there is still no daemon, HTTP, credential,
+org registry or network integration. CAD-675 requires the real issuer/enrollment,
+assignment transport and restore-safe cloud application protocol. The publication
+Outbox UI is a separate feature.
 
-The small interface is `ResultCommand::parse_json`, `DestinationPin::new`, and
+## Explicit offline CLI
+
+Retain a completed result envelope from stdin using an explicit original pin:
+
+```sh
+cadence remote result retain --outbox-dir /absolute/private/results \
+  --org org-1 --audience https://gateway.example.invalid \
+  --subject subject-1 --agent agent-1 < result.json
+
+cadence remote result pending --outbox-dir /absolute/private/results \
+  --org org-1 --audience https://gateway.example.invalid \
+  --subject subject-1 --agent agent-1
+```
+
+Every selector is required; no daemon state, HOME/XDG, org default or stored/env
+credential supplies any selector. `--state-dir` is refused. These verbs dispatch
+before daemon/config/credential resolution and start no network, browser or
+provider. An inherited agent label or token supplies no extra authority.
+
+Retain reads at most 64 KiB plus one detection byte and validates the pin and
+complete strict envelope before creating/opening custody. It prints only the
+committed local_pending receipt: commandId, digest, storedAt and the original
+destination. An exact retry returns the same receipt; conflicting content or pin
+refuses without replacing bytes. No result text or credential-shaped extra field
+is echoed in output or parse errors. Text belongs in stdin, never a CLI argument.
+
+Pending requires the directory and results.sqlite3 to exist, filters the exact
+pin, and prints at most 128 receipts with that same metadata and no result text.
+It does not initialize missing custody. Protected open may create its init lock
+or recover a valid hot journal, so inspection is **not universally read-only**.
+Unsafe/foreign database and journal protections and same-UID path race limits
+below continue to apply. There is no send, acknowledgement, deletion, retarget,
+cloud queued/applied receipt, authenticated enrollment or local task mutation.
+Caller pins remain structural metadata; reported task/head remain assertions.
+
+IDs retain v1's ASCII 1–128 bound and audiences its exact canonical HTTPS origin
+rules. Unsupported issuer IDs are refused, not normalized or truncated. Genuine
+identity compatibility, issuer rotation and original-destination cloud sending
+remain owner-agreed CAD-675/AOS-62 integration dependencies.
+
+The library interface is `ResultCommand::parse_json`, `DestinationPin::new`, and
 `ResultOutbox::open`, `enqueue`, `pending_for`. The caller supplies an explicit
 absolute directory and destination. There are no environment defaults, send,
 acknowledgement, deletion or retarget methods. The directory's parent must
@@ -136,3 +177,11 @@ hot-journal foreign-schema byte preservation. It starts no daemon or network cli
 first in source; red execution was unavailable because the external author had
 no admitted native build recipe. Compilation and behavioral execution belong to
 CI plus independent review, not the standalone formatter.
+
+`tests/remote_result_cli.rs` exercises the actual freshly built CLI with isolated
+short temp roots: no-HOME and poisoned profile/org/auth defaults with an absent
+daemon and inherited master label, separate-process metadata inspection, exact
+retry bytes/receipt, each destination conflict, altered text/head, canonical
+numeric retry, malformed/oversized stdin before creation, missing custody,
+foreign/symlink database/journal unchanged bytes, and concurrent process retry.
+This is offline CLI evidence, not genuine issuer/enrollment or HTTP transport.
