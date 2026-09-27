@@ -2025,8 +2025,29 @@ fn pty_devin_trust_prompt_fails_open_fast() {
     // The pane itself survives the refused open — answering the prompt
     // lets the boot continue, and a plain resume (no unknowns to
     // reconcile, so unfence would refuse) adopts or respawns it.
+    let native = d.pane_file(&mock, "dv", "sid");
+    assert!(
+        !native.exists(),
+        "the blocked trust prompt must not have published a native session"
+    );
+    let recovery_deadline = Instant::now() + Duration::from_secs(20);
     std::fs::remove_file(&marker).unwrap();
+    // Removing the marker requests an answer; the mock acknowledges it by
+    // clearing the trust screen, acquiring its lock, then publishing .sid.
+    // Wait for that fresh acknowledgment before the single resume call.
+    while !std::fs::read_to_string(&native).is_ok_and(|sid| !sid.trim().is_empty()) {
+        assert!(
+            Instant::now() < recovery_deadline,
+            "the mock never acknowledged the answered trust prompt"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     d.operator_rpc("agent_resume", json!({"alias": "dv"}))
         .unwrap();
-    d.wait_agent("dv", "idle", 20);
+    // Both synchronization phases share the original recovery budget.
+    let remaining = recovery_deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs();
+    assert!(remaining > 0, "the trust recovery budget expired");
+    d.wait_agent("dv", "idle", remaining);
 }
