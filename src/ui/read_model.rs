@@ -88,6 +88,7 @@ pub(super) fn get(state_dir: &Path, pm_dir: &Path) -> Arc<Model> {
                 build_lock: Mutex::default(),
                 overview_builds: AtomicU64::new(0),
                 request_builds: AtomicU64::new(0),
+                collection_parses: AtomicU64::new(0),
             })
         })
         .clone()
@@ -111,6 +112,9 @@ pub(super) struct Model {
     /// build, not a cache miss, and p95 covers the latency. Background
     /// refreshes are not counted here either: they scale with wall time.
     request_builds: AtomicU64,
+    /// Issue folders [`board::load_all`] parsed on the watcher thread.
+    /// The incremental `parses` counter does not see that scan.
+    collection_parses: AtomicU64,
 }
 
 /// Runs its closure on drop — resets a flag even when a panic unwinds.
@@ -204,6 +208,114 @@ fn head_stamp(pm_dir: &Path) -> u64 {
         hash_meta(&git.join(name), &mut h);
     }
     hash_meta(&git.join("packed-refs"), &mut h);
+    h.finish()
+}
+
+/// Issue counts per project key from entries the tracker already parsed.
+fn project_counts(tracker: &Tracker) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for entry in tracker.entries.values() {
+        if let Some((issue, _)) = &entry.loaded {
+            *counts.entry(issue.project.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// A proposed plan and an intake row both render the issue title.
+/// Every other title is entity-patch data, not an aggregate input.
+fn overview_renders_title(front: &model::Front) -> bool {
+    let proposed = front.plan.as_ref().is_some_and(|p| p.state == "proposed");
+    let intake = front.status == "backlog" && front.tags.iter().any(|t| t == "intake");
+    proposed || intake
+}
+
+fn overview_issue_fp(issue: &board::Issue) -> u64 {
+    let mut front = issue.front.clone();
+    if !overview_renders_title(&front) {
+        front.title.clear();
+    }
+    let comments: Vec<Value> = issue
+        .comments
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "author": c.front.author,
+                "at": c.front.at,
+                "kind": c.front.kind,
+                "body": c.body,
+            })
+        })
+        .collect();
+    value_fp(&json!({
+        "project": issue.project,
+        "front": front,
+        "body": issue.body,
+        "comments": comments,
+        "artifacts": issue.artifacts,
+    }))
+}
+
+/// Files beside issue folders — `PROJECT.md`, project config — whose
+/// mtime can change the overview without a folder re-parse.
+fn project_side_stamp(pm_dir: &Path) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_meta(&pm_dir.join("pm.yaml"), &mut h);
+    for project in project::list(pm_dir).unwrap_or_default() {
+        project.key.hash(&mut h);
+        let dir = pm_dir.join(&project.key);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            let path = dir.join(&name);
+            if model::valid_id(&name.to_string_lossy()) && path.is_dir() {
+                continue;
+            }
+            name.hash(&mut h);
+            hash_meta(&path, &mut h);
+            if path.is_dir() {
+                hash_dir(&path, &mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Upstream refs only. A local `issue set` commit moves `HEAD` and the
+/// branch ref; it does not move `refs/remotes`, which is what the
+/// overview's behind-count row follows.
+fn upstream_stamp(pm_dir: &Path) -> u64 {
+    let git = pm_dir.join(".git");
+    let mut h = DefaultHasher::new();
+    hash_dir(&git.join("refs").join("remotes"), &mut h);
+    hash_meta(&git.join("packed-refs"), &mut h);
+    h.finish()
+}
+
+/// Everything already loaded that can change the rendered overview.
+fn overview_inputs_fp(pm: &Pm, tracker: &Tracker) -> u64 {
+    let mut parts: Vec<(String, u64)> = tracker
+        .entries
+        .iter()
+        .map(|(key, entry)| {
+            let fp = entry
+                .loaded
+                .as_ref()
+                .map(|(issue, _)| overview_issue_fp(issue))
+                .unwrap_or(0);
+            (key.clone(), fp)
+        })
+        .collect();
+    parts.sort();
+    let mut h = DefaultHasher::new();
+    notes_stamp(&pm.config.notes_dir()).hash(&mut h);
+    project_side_stamp(&pm.dir).hash(&mut h);
+    upstream_stamp(&pm.dir).hash(&mut h);
+    parts.hash(&mut h);
     h.finish()
 }
 
@@ -477,6 +589,10 @@ struct OverviewState {
     sources: Option<(Arc<overview::DaemonSources>, Instant)>,
     building: bool,
     wanted: Option<Instant>,
+    /// Fingerprint of tracker fields that can change the rendered
+    /// overview. An ordinary title edit leaves it unchanged, so the
+    /// watcher can reuse the cached aggregate without rebuilding.
+    inputs: Option<u64>,
 }
 
 // ---------- stream hub ----------
@@ -686,6 +802,7 @@ impl Model {
             "parses": lock(&self.tracker).parses,
             "overview_builds": self.overview_builds.load(Ordering::Relaxed),
             "request_builds": self.request_builds.load(Ordering::Relaxed),
+            "collection_parses": self.collection_parses.load(Ordering::Relaxed),
         })
     }
 
@@ -726,6 +843,7 @@ impl Model {
         let mut st = lock(&self.overview);
         st.value = None;
         st.sources = None;
+        st.inputs = None;
     }
 
     /// The overview's tracker input and its key — the views' key plus
@@ -778,10 +896,22 @@ impl Model {
         if !self.after_change(at) {
             return;
         }
+        let inputs = self.overview_inputs();
         let mut st = lock(&self.overview);
         if st.value.as_ref().is_none_or(|(_, b, _)| *b <= at) {
             st.value = Some((value.clone(), at, key));
+            st.inputs = inputs;
         }
+    }
+
+    /// Tracker fields that can change the rendered overview, from the
+    /// issues already loaded. Ordinary titles are left out; a proposed
+    /// plan or an intake row renders its title, so those stay in.
+    fn overview_inputs(&self) -> Option<u64> {
+        let pm = Pm::at(&self.pm_dir).ok()?;
+        let mut t = lock(&self.tracker);
+        t.refresh(&pm.dir);
+        Some(overview_inputs_fp(&pm, &t))
     }
 
     /// `/api/overview`. Served from the cache while it is servable (a
@@ -886,15 +1016,56 @@ impl Model {
         }
     }
 
+    /// Project counts from the loaded tracker, and the overview
+    /// fingerprint when its inputs moved. A title-only edit re-parses
+    /// that one folder for the entity patch and then stops: the
+    /// collection is not scanned again and the overview is not rebuilt.
     fn aggregate_fps(self: &Arc<Self>) -> (Option<u64>, Option<u64>) {
-        let projects = Pm::at(&self.pm_dir)
-            .ok()
-            .map(|pm| value_fp(&super::projects_payload(&pm)));
+        let Ok(pm) = Pm::at(&self.pm_dir) else {
+            return (None, None);
+        };
+        let (projects, inputs) = {
+            let mut t = lock(&self.tracker);
+            t.refresh(&pm.dir);
+            let projects = value_fp(&super::projects_payload(&pm, &project_counts(&t)));
+            let inputs = overview_inputs_fp(&pm, &t);
+            (projects, inputs)
+        };
         let wanted = lock(&self.overview)
             .wanted
             .is_some_and(|at| at.elapsed() < OVERVIEW_WANTED);
-        let overview = wanted.then(|| aggregate_fp(&self.overview_value(false)));
-        (projects, overview)
+        if !wanted {
+            return (Some(projects), None);
+        }
+        if let Some(fp) = self.cached_overview_aggregate(inputs) {
+            return (Some(projects), Some(fp));
+        }
+        (
+            Some(projects),
+            Some(aggregate_fp(&self.overview_value(false))),
+        )
+    }
+
+    /// The cached overview's aggregate fingerprint when `inputs` still
+    /// describes it. `None` when the cache is cold or the tracker change
+    /// can affect the rendered overview.
+    fn cached_overview_aggregate(&self, inputs: u64) -> Option<u64> {
+        let value = {
+            let st = lock(&self.overview);
+            if st.inputs != Some(inputs) {
+                return None;
+            }
+            st.value.as_ref().map(|(value, _, _)| value.clone())
+        }?;
+        Some(aggregate_fp(&value))
+    }
+
+    /// `/api/projects` from the indexed issues. Same bytes as a full
+    /// collection load; the count does not read issue bodies again.
+    pub(super) fn projects(&self, pm: &Pm) -> Value {
+        let mut t = lock(&self.tracker);
+        t.refresh(&pm.dir);
+        super::projects_payload(pm, &project_counts(&t))
     }
 
     // ---------- stream ----------
@@ -1011,6 +1182,7 @@ impl Model {
         // The change mark: whatever was read before this tick began may
         // predate the change it finds.
         let started = Instant::now();
+        let scanned = board::collection_parses();
         let tracker = dir_mtime(&self.pm_dir);
         let issues = tracker != w.tracker;
         if issues {
@@ -1074,6 +1246,10 @@ impl Model {
             // be served anything read before this tick.
             self.mark_changed(started);
             self.nudge_overview();
+        }
+        let scanned = board::collection_parses().saturating_sub(scanned);
+        if scanned > 0 {
+            self.collection_parses.fetch_add(scanned, Ordering::Relaxed);
         }
     }
 }
@@ -1333,11 +1509,61 @@ mod tests {
 
     #[test]
     fn entity_protocol_preserves_target_and_filters_covered_resources() {
-        let legacy = legacy_frame("jobs");
-        let text = entity_frame(&legacy);
-        assert!(!text.contains("\"issues\""));
-        assert!(!text.contains("\"agents\""));
-        assert!(text.contains("\"overview\""));
+        // Every legacy event kind, not only jobs. Entity clients drop
+        // collections the stream already patches, and an issues event
+        // also drops the aggregates the aggregates frame owns. Anything
+        // else — outbox, app_runs, app_outputs, workflows — must remain.
+        // A hardcoded list, so deleting one of those from the filter or
+        // from the event's resource set fails here.
+        let kept = [
+            (
+                "issues",
+                &[
+                    "workflows",
+                    "apps",
+                    "app",
+                    "app_runs",
+                    "outbox",
+                    "app_outputs",
+                ][..],
+            ),
+            (
+                "jobs",
+                &["overview", "app_runs", "outbox", "app_outputs"][..],
+            ),
+            ("agents", &["overview", "outbox", "apps", "app"][..]),
+            ("monitoring", &["overview"][..]),
+        ];
+        for (kind, expect) in kept {
+            let text = entity_frame(&legacy_frame(kind));
+            let data = text
+                .split_once("\ndata: ")
+                .map(|(_, tail)| tail.trim())
+                .unwrap();
+            let value: Value = serde_json::from_str(data).unwrap();
+            let got: Vec<&str> = value["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                got, expect,
+                "{kind} entity frame dropped a covered resource"
+            );
+            let source = event_resources(kind);
+            for dropped in ["issues", "agents", "issue"] {
+                if source.contains(&dropped) {
+                    assert!(
+                        !got.contains(&dropped),
+                        "{kind} still refetches patched collection {dropped}"
+                    );
+                }
+            }
+            if kind == "issues" {
+                assert!(!got.contains(&"projects") && !got.contains(&"overview"));
+            }
+        }
         let source = frame(
             "issue",
             &json!({"id": "CAD-1", "op": "upsert", "issue": {"id": "CAD-1"}}),
@@ -1350,6 +1576,63 @@ mod tests {
             optimized,
             entity_frame(&source),
             "stable revision for stable patch"
+        );
+    }
+
+    #[test]
+    fn ordinary_title_is_not_an_overview_input_but_status_and_rendered_titles_are() {
+        let issue = |title: &str, status: &str| {
+            let mut issue = board::Issue {
+                project: "cadence".into(),
+                dir: PathBuf::from("cadence/CAD-2"),
+                front: model::Front::new("CAD-2", title, "2026-09-01T00:00:00Z"),
+                body: "body".into(),
+                comments: vec![],
+                artifacts: vec![],
+            };
+            issue.front.status = status.into();
+            issue
+        };
+        let titled = issue("one", "doing");
+        let retitled = issue("two", "doing");
+        assert_eq!(
+            overview_issue_fp(&titled),
+            overview_issue_fp(&retitled),
+            "ordinary title edits do not move the overview input"
+        );
+        let mut done = retitled.clone();
+        done.front.status = "done".into();
+        assert_ne!(
+            overview_issue_fp(&titled),
+            overview_issue_fp(&done),
+            "status changes the overview input"
+        );
+        let mut plan = titled.clone();
+        plan.front.plan = Some(model::Plan {
+            state: "proposed".into(),
+            proposed_by: "pm".into(),
+            proposed_at: "2026-09-01T00:00:00Z".into(),
+            tickets: vec![],
+            decided_by: None,
+            decided_at: None,
+            reason: None,
+            workflow: None,
+        });
+        let mut plan_retitled = plan.clone();
+        plan_retitled.front.title = "renamed plan".into();
+        assert_ne!(
+            overview_issue_fp(&plan),
+            overview_issue_fp(&plan_retitled),
+            "a proposed plan renders its title"
+        );
+        let mut intake = issue("report", "backlog");
+        intake.front.tags = vec!["intake".into()];
+        let mut intake_retitled = intake.clone();
+        intake_retitled.front.title = "renamed report".into();
+        assert_ne!(
+            overview_issue_fp(&intake),
+            overview_issue_fp(&intake_retitled),
+            "an intake row renders its title"
         );
     }
 

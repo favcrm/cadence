@@ -3,6 +3,7 @@
 //! Everything derived is computed here; the folders store only what
 //! cannot be derived.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -177,6 +178,18 @@ pub fn find_issue(pm_dir: &Path, id: &str) -> Result<Issue> {
     )))
 }
 
+thread_local! {
+    /// Issue folders `load_all` parsed on this thread. The board watcher
+    /// publishes the delta onto the read model so a test can see a full
+    /// collection scan that the incremental tracker counter misses.
+    static COLLECTION_PARSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many issue folders [`load_all`] has parsed on this thread.
+pub(crate) fn collection_parses() -> u64 {
+    COLLECTION_PARSES.with(Cell::get)
+}
+
 /// All issues under the PM dir; `project_key` limits to one project.
 /// Unparseable issue.md files surface as a lint error — here they are
 /// skipped so one bad file cannot take down the whole board.
@@ -202,6 +215,7 @@ pub fn load_all(pm_dir: &Path, project_key: Option<&str>) -> Result<Vec<Issue>> 
             if !model::valid_id(&id) || !is_dir {
                 continue;
             }
+            COLLECTION_PARSES.with(|n| n.set(n.get().saturating_add(1)));
             if let Ok(issue) = load_issue(pm_dir, &project.key, &id) {
                 issues.push(issue);
             }

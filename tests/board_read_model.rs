@@ -509,6 +509,18 @@ fn stats(fx: &Fixture) -> (u64, u64) {
     )
 }
 
+/// Watcher cost for one board: incremental folder parses, full
+/// `load_all` scans on the watcher thread, and overview builds.
+fn watcher_cost(fx: &Fixture) -> (u64, u64, u64, u64) {
+    let s = ui::read_model_stats(&fx.state, &fx.pm);
+    (
+        s["parses"].as_u64().unwrap(),
+        s["collection_parses"].as_u64().unwrap(),
+        s["overview_builds"].as_u64().unwrap(),
+        s["request_builds"].as_u64().unwrap(),
+    )
+}
+
 /// Request-path builds allowed per run of reads against a warm, unchanged
 /// board. Zero is the steady state; one more covers a background refresh
 /// that overran the 10 s age cap on a loaded runner. Without the cache
@@ -1004,6 +1016,7 @@ fn title_only_tracker_changes_skip_aggregate_reads_but_status_and_count_changes_
     wait_for("entity stream hello", 10, || {
         stream.lock().unwrap().contains("\"entities\":true")
     });
+    let (parses, collection, overview_builds, request_builds) = watcher_cost(&fx);
     let (ok, out) = cli(
         &fx.pm,
         &fx.state,
@@ -1027,6 +1040,23 @@ fn title_only_tracker_changes_skip_aggregate_reads_but_status_and_count_changes_
             .all(|f| f["resources"] == json!([])),
         "title-only edits do not change rendered aggregates: {:?}",
         frames(&stream, "aggregates")
+    );
+    let (parses_after, collection_after, overview_after, request_after) = watcher_cost(&fx);
+    assert!(
+        parses_after - parses <= 1,
+        "title-only re-parsed the collection through the tracker: {parses} -> {parses_after}"
+    );
+    assert_eq!(
+        collection_after, collection,
+        "title-only full-scanned issue folders via load_all: {collection} -> {collection_after}"
+    );
+    assert_eq!(
+        overview_after, overview_builds,
+        "title-only rebuilt the overview: {overview_builds} -> {overview_after}"
+    );
+    assert_eq!(
+        request_after, request_builds,
+        "title-only missed the overview cache: {request_builds} -> {request_after}"
     );
     assert_eq!(initial_projects, get_json(fx.port, "/api/projects"));
     assert_eq!(

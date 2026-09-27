@@ -2617,14 +2617,15 @@ fn value_fp(value: &Value) -> u64 {
 
 /// The exact collection representation, shared with SSE aggregate change
 /// detection so config/count changes invalidate and title-only edits do not.
-fn projects_payload(pm: &Pm) -> Value {
+/// Counts come from the tracker's already-loaded issues — a title edit must
+/// not re-parse every folder to learn that the counts did not move.
+fn projects_payload(pm: &Pm, counts: &HashMap<String, usize>) -> Value {
     let projects = project::list(&pm.dir).unwrap_or_default();
-    let issues = board::load_all(&pm.dir, None).unwrap_or_default();
     let payload: Vec<Value> = projects.iter().map(|p| json!({
         "key": p.key, "prefix": p.prefix, "components": p.components,
         "tags": p.tags, "default_owner": p.default_owner,
         "repos": p.repos.iter().map(|r| json!({"path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
-        "issues": issues.iter().filter(|i| i.project == p.key).count(),
+        "issues": counts.get(&p.key).copied().unwrap_or(0),
     })).collect();
     json!({"projects": payload})
 }
@@ -3075,7 +3076,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                send(request, json_response(projects_payload(&pm)));
+                send(
+                    request,
+                    json_response(read_model::get(state_dir, pm_dir).projects(&pm)),
+                );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
