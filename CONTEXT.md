@@ -19,3 +19,54 @@ Cadence coordinates people and agents doing work through apps and projects.
 **Destination**: Where a run's output is delivered, such as a repository, an outbox or a social account. A destination is not the owner of the app.
 
 **Connection**: An explicitly authorized route to an external or local capability. Using a connection requires permission for the particular action and context.
+
+## Project delivery
+
+**Milestone**:
+A project outcome with explicit exit criteria and a target date. Its achievement
+is separate from publishing a release or changing an environment.
+_Avoid_: Release, version
+
+**Release**:
+A named delivery of a project's changes within an optional product stream.
+A published release preserves its actual shipped scope and provenance.
+_Avoid_: Milestone, build, deployment
+
+**Release stream**:
+A separately versioned product, component or maintenance delivery line within a project.
+_Avoid_: Environment, branch
+
+**Target release**:
+The one release within a stream currently intended to deliver an issue. It is a planning
+relationship and is not evidence that the issue shipped.
+_Avoid_: Fixed version, shipped version
+
+**Affected release**:
+A release identified as exhibiting a reported bug. A bug may affect several
+releases independently of where its fix is planned or shipped.
+_Avoid_: Target release
+
+**Shipped membership**:
+The issues recorded as actually delivered in a publication receipt. One issue
+can appear in multiple receipts when delivered through backports.
+_Avoid_: Completed issues, planned scope
+
+**Build**:
+An exact set of source inputs and immutable deliverables prepared for a release.
+Different builds may exist for the same planned release.
+_Avoid_: Version, deployment
+
+**Candidate**:
+An immutable proposal binding a release's intended delivered scope to exact
+builds and review evidence. A replacement candidate does not rewrite its history.
+_Avoid_: Published release
+
+**Publication receipt**:
+Evidence-backed confirmation of a release's actual distribution, shipped scope
+and provenance at a recorded time.
+_Avoid_: Merged PR, successful CI
+
+**Deployment observation**:
+A record of the release/build verified in a particular environment at a time.
+A rollback creates another observation rather than changing publication history.
+_Avoid_: Published release, desired version

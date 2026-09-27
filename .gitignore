@@ -28,3 +28,14 @@ docs/design/*
 docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md
 !docs/roles/risk-classes.md
+
+# CAD-662: reviewed release-domain contracts, not arbitrary working docs.
+!docs/adr/
+docs/adr/*
+!docs/adr/0001-project-release-ledger.md
+!docs/design/project-releases-v1/
+docs/design/project-releases-v1/*
+!docs/design/project-releases-v1/CONTRACT.md
+!docs/design/project-releases-v1/schema.json
+!docs/design/project-releases-v1/fixture.json
+!docs/design/project-releases-v1/validate.py

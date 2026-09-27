@@ -37,3 +37,9 @@ documents:
     title: Risk and release authority
     required: true
     roles: [pm, qa, devops]
+  - id: project-release-contract
+    kind: spec
+    path: docs/design/project-releases-v1/CONTRACT.md
+    title: Proposed project release ledger contract
+    required: false
+    roles: [pm, dev, qa, devops]
