@@ -2467,11 +2467,14 @@ fn cad323_master_interrupts_only_a_turn_it_dispatched() {
         ok,
         "{out}; post-call master identity: {:?}",
         f.d.operator_rpc("agent_show", json!({"alias": "master"}))
-            .map(|agent| json!({
+            .map(|reply| {
+                let agent = &reply["agent"];
+                json!({
                 "state": agent["state"], "generation": agent["generation"],
                 "pid": agent["pid"], "pid_start": agent["pid_start"],
                 "endpoint": agent["endpoint"], "session_id": agent["session_id"],
-            }))
+                })
+            })
     );
     assert_eq!(out["state"], "interrupted", "{out}");
     assert_eq!(out["message"], kickoff.as_str(), "{out}");
