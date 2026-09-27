@@ -57,6 +57,15 @@ pub(crate) enum DeliveryAction {
         /// The ticket id.
         issue: String,
     },
+    /// Export native PASS receipts over the live operator connection.
+    /// Output is unsigned transport evidence, not an offline attestation
+    /// or a GitHub approval. Does not publish a status or enqueue a PR.
+    ReviewEvidence {
+        /// JSON object: requests: [{issue, pr, sha}]. Every head must be
+        /// full lowercase 40-hex and match a standing native PASS.
+        #[arg(long)]
+        request_file: PathBuf,
+    },
     /// Decline the merge decision (or an escalated review) with a
     /// reason. Operator only.
     Decline {
@@ -139,6 +148,11 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             },
         },
         DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue, delivery::GH)?,
+        DeliveryAction::ReviewEvidence { request_file } => {
+            let request: serde_json::Value = serde_json::from_slice(&std::fs::read(request_file)?)
+                .map_err(|e| Error::rejected(format!("invalid evidence request JSON: {e}")))?;
+            client::rpc(state_dir, "delivery_review_evidence", request)?
+        }
         DeliveryAction::Decline { issue, reason } => client::rpc(
             state_dir,
             "delivery_decline",

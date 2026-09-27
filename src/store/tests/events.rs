@@ -1,3 +1,40 @@
+    #[test]
+    fn cad120_export_receipt_requires_full_scope_and_latest_native_verdict() {
+        let (_dir, store) = store();
+        let mut rec = crate::delivery::Record::new("D-2", "demo", "w1", 1);
+        rec.pr = Some("https://github.com/acme/app/pull/7".into());
+        rec.verdict = Some(crate::delivery::VerdictRec {
+            verdict: "pass".into(),
+            sha: SHA40_A.into(),
+            reviewer: "r1".into(),
+            report: "D-2/reports/native.md".into(),
+            summary: "reviewed".into(),
+            at: 2,
+        });
+        let legacy = json!({"issue": "D-2", "verdict": "pass", "sha": SHA40_A,
+                            "reviewer": "r1", "report": "D-2/reports/native.md"});
+        store.record_review_verdict(legacy.clone()).unwrap();
+        assert!(!store.review_export_recorded(&rec).unwrap());
+        let mut scoped = legacy;
+        scoped["pr"] = json!(rec.pr);
+        scoped["project"] = json!(rec.project);
+        scoped["worker"] = json!(rec.worker);
+        store.record_review_verdict(scoped.clone()).unwrap();
+        assert!(store.review_export_recorded(&rec).unwrap());
+        for field in ["pr", "project", "worker", "sha", "reviewer", "report"] {
+            let mut forged = scoped.clone();
+            forged[field] = json!("different");
+            store.record_review_verdict(forged).unwrap();
+            assert!(!store.review_export_recorded(&rec).unwrap(), "{field}");
+            store.record_review_verdict(scoped.clone()).unwrap();
+        }
+        let mut revise = scoped.clone();
+        revise["verdict"] = json!("revise");
+        store.record_review_verdict(revise).unwrap();
+        assert!(!store.review_export_recorded(&rec).unwrap(), "historical PASS survived a newer verdict");
+        store.record_review_verdict(scoped).unwrap();
+        assert!(store.review_export_recorded(&rec).unwrap());
+    }
 
     #[test]
     fn approval_evidence_is_idempotent_and_separate_from_delivery() {

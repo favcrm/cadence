@@ -487,6 +487,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("delivery_list", Rule::Read),
     (
+        "delivery_review_evidence",
+        Rule::Handler("operator_connection (CAD-120)"),
+    ),
+    (
         "delivery_observe",
         Rule::Handler("operator_connection (CAD-431)"),
     ),

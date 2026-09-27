@@ -42,6 +42,7 @@ mod operator_rpc;
 mod plans_rpc;
 mod platform_rpc;
 mod requests_rpc;
+mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
 mod test_queue_rpc;
@@ -2642,6 +2643,7 @@ impl Shared {
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),
             "answer_route" => self.rpc_answer_route(params, peer_pid),
             "delivery_list" => self.rpc_delivery_list(params),
+            "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),

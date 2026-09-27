@@ -464,6 +464,44 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// CAD-120: export requires immutable scope recorded by the native
+    /// verdict intake. Legacy receipts deliberately cannot be exported.
+    pub fn review_export_recorded(&self, record: &crate::delivery::Record) -> Result<bool> {
+        let Some(verdict) = &record.verdict else {
+            return Ok(false);
+        };
+        let Some(pr) = &record.pr else {
+            return Ok(false);
+        };
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+             AND json_extract(payload,'$.issue')=?3 \
+             AND json_extract(payload,'$.verdict')='pass' \
+             AND json_extract(payload,'$.sha')=?4 \
+             AND json_extract(payload,'$.reviewer')=?5 \
+             AND json_extract(payload,'$.report')=?6 \
+             AND json_extract(payload,'$.pr')=?7 \
+             AND json_extract(payload,'$.project')=?8 \
+             AND json_extract(payload,'$.worker')=?9 \
+             AND seq=(SELECT MAX(seq) FROM events WHERE alias=?1 AND kind=?2 \
+                      AND json_extract(payload,'$.issue')=?3)",
+            params![
+                VERDICT_STREAM,
+                VERDICT_RECORDED_EVENT,
+                record.issue,
+                verdict.sha,
+                verdict.reviewer,
+                verdict.report,
+                pr,
+                record.project,
+                record.worker
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// CAD-405: the latest work-gate approval per project.
     pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
         let conn = self.conn();
