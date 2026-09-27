@@ -295,7 +295,7 @@ fn cad690_two_contexts_real_shared_pi_reviewer_cannot_fetch_other_client() {
         run_b["snapshot"]["assignments"], run_a["snapshot"]["assignments"],
         "fixture must actually reuse the same endpoint identities"
     );
-    std::fs::write(h.daemon.state.join(format!("context-probe-{}.json",run_b["id"].as_str().unwrap())),json!({"artifact_id":artifact_a["id"],"context_id":a["id"],"install_id":h.install["install_id"],"run_id":run_a["id"]}).to_string()).unwrap();
+    std::fs::write(h.daemon.state.join(format!("context-probe-{}.json",run_b["id"].as_str().unwrap())),json!({"artifact_id":artifact_a["id"],"context_id":a["id"],"install_id":h.install["install_id"],"run_id":run_a["id"],"task_id":done_a["steps"][0]["task_id"],"canaries":[A,B]}).to_string()).unwrap();
     h.dispatch(&run_b);
     let done_b = h.wait_state(run_b["id"].as_str().unwrap(), "succeeded");
     let artifact_b = h.artifact(&done_b);
@@ -324,6 +324,10 @@ fn cad690_two_contexts_real_shared_pi_reviewer_cannot_fetch_other_client() {
         .iter()
         .all(|c| c["ok"] == false && c["error_kind"] == "rejected"));
     assert!(cases.iter().any(|c| c["detached"] == true));
+    let projections = receipt["projection_cases"].as_array().unwrap();
+    assert_eq!(projections.len(), 16);
+    assert!(projections.iter().all(|p| p["redacted"] == true));
+    assert_eq!(projections.iter().filter(|p| p["ok"] == true).count(), 10);
 
     h.daemon.operator_rpc("app_context_archive",json!({"install_id":h.install["install_id"],"context_id":a["id"],"expected_revision":a["revision"]})).unwrap();
     assert_eq!(
@@ -440,4 +444,197 @@ fn cad690_concurrent_context_updates_compare_exact_revision_without_lost_write()
         c["revision"].as_u64().unwrap() + 1
     );
     assert_eq!(h.context_show(&c), winner);
+}
+
+#[test]
+fn cad690_existing_other_installation_cannot_transfer_context_authority() {
+    let h = Contexts::new();
+    let a = h.context("First", A, "first-install-context");
+    let bundle = h.root.path().join("other-bundle");
+    std::fs::create_dir_all(bundle.join("workflows")).unwrap();
+    let manifest = std::fs::read_to_string(h.root.path().join("bundle/app.md")).unwrap();
+    let renamed = manifest.replace("app: local-content", "app: other-content");
+    assert_ne!(manifest, renamed);
+    std::fs::write(bundle.join("app.md"), renamed).unwrap();
+    std::fs::write(bundle.join("workflows/draft.md"), &h.workflow).unwrap();
+    let other = h
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":bundle}))
+        .unwrap();
+    assert_ne!(other["install_id"], h.install["install_id"]);
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":other["install_id"],"digest":other["digest"]}),
+        )
+        .unwrap();
+    let b=h.daemon.operator_rpc("app_context_create",json!({"install_id":other["install_id"],"label":"Second","input_defaults":{"source":format!("CONTEXT_SOURCE={B}")},"request_id":"second-install-context"})).unwrap()["context"].clone();
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_context_show",
+                json!({"install_id":other["install_id"],"context_id":b["id"]})
+            )
+            .unwrap()["context"],
+        b
+    );
+    let positive=h.daemon.operator_rpc("app_run_create",json!({"install_id":other["install_id"],"context_id":b["id"],"workflow":"draft","inputs":{"subject":"Other install","writer":WRITER,"reviewer":REVIEWER},"request_id":"other-positive","owner_pm":OWNER})).unwrap();
+    assert_eq!(positive["snapshot"]["context"]["id"], b["id"]);
+    for (method, params) in [
+        (
+            "app_context_show",
+            json!({"install_id":other["install_id"],"context_id":a["id"]}),
+        ),
+        (
+            "app_context_update",
+            json!({"install_id":other["install_id"],"context_id":a["id"],"expected_revision":a["revision"],"label":"Transferred","input_defaults":{"source":"x"}}),
+        ),
+        (
+            "app_context_archive",
+            json!({"install_id":other["install_id"],"context_id":a["id"],"expected_revision":a["revision"]}),
+        ),
+        (
+            "app_run_create",
+            json!({"install_id":other["install_id"],"context_id":a["id"],"workflow":"draft","inputs":{"subject":"Wrong install","writer":WRITER,"reviewer":REVIEWER},"request_id":"wrong-install","owner_pm":OWNER}),
+        ),
+    ] {
+        let error = h.daemon.operator_rpc(method, params).unwrap_err();
+        assert_eq!(error.kind(), "rejected");
+        assert!(!error.to_string().contains(A));
+    }
+    assert_eq!(
+        h.context_show(&a),
+        a,
+        "cross-install mutation touched original context"
+    );
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_context_show",
+                json!({"install_id":other["install_id"],"context_id":b["id"]})
+            )
+            .unwrap()["context"],
+        b
+    );
+}
+#[test]
+fn cad690_actual_context_restart_preserves_receipts_without_replay_or_fallback() {
+    let h = Contexts::new();
+    let a = h.context("History", A, "restart-a");
+    let b = h.context("Interrupted", B, "restart-b");
+    let run_a = h.create(&a, "restart-run-a");
+    h.dispatch(&run_a);
+    let done_a = h.wait_state(run_a["id"].as_str().unwrap(), "succeeded");
+    let artifact_a = h.artifact(&done_a);
+    let archived=h.daemon.operator_rpc("app_context_archive",json!({"install_id":h.install["install_id"],"context_id":a["id"],"expected_revision":a["revision"]})).unwrap()["context"].clone();
+    let run_b = h.create(&b, "restart-run-b");
+    let id = run_b["id"].as_str().unwrap();
+    std::fs::write(
+        h.daemon.state.join(format!("context-hold-reviewer-{id}")),
+        "hold",
+    )
+    .unwrap();
+    h.dispatch(&run_b);
+    let held = h.daemon.state.join(format!("context-reviewer-{id}.held"));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !held.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "real dependent reviewer did not hold before restart"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let partial = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(partial["state"], "running");
+    assert_eq!(partial["artifacts"].as_array().unwrap().len(), 1);
+    assert!(partial["reviews"].as_array().unwrap().is_empty());
+    let artifact_b = h.artifact(&partial);
+    assert_eq!(artifact_b["text"], format!("Context draft: {B}"));
+    let Contexts {
+        root,
+        mut daemon,
+        install,
+        workflow: _,
+    } = h;
+    let state = daemon.state.clone();
+    let _state_owner = std::mem::replace(&mut daemon.dir, tempfile::tempdir().unwrap());
+    drop(daemon);
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", root.path().join("pm").to_str().unwrap());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/app-context-pi.py");
+    opts.provider_env.set(
+        "CADENCE_PI_COMMAND",
+        format!("python3 {}", script.display()),
+    );
+    let restarted = TestDaemon::start_on_opts(state, opts);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let failed = loop {
+        let row = restarted
+            .operator_rpc("app_run_show", json!({"run_id":id}))
+            .unwrap();
+        if row["state"] == "failed" {
+            break row;
+        }
+        assert_eq!(
+            row["state"], "running",
+            "uncertain contextual review revived or completed"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "interrupted contextual run never recovered"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(failed["snapshot"], run_b["snapshot"]);
+    assert_eq!(failed["snapshot_digest"], run_b["snapshot_digest"]);
+    assert_eq!(failed["artifacts"], partial["artifacts"]);
+    assert!(failed["reviews"].as_array().unwrap().is_empty());
+    let restored_a = restarted
+        .operator_rpc("app_run_show", json!({"run_id":run_a["id"]}))
+        .unwrap();
+    assert_eq!(restored_a["state"], "succeeded");
+    assert_eq!(restored_a["snapshot"], run_a["snapshot"]);
+    assert_eq!(restored_a["reviews"], done_a["reviews"]);
+    for (context, expected) in [(&a, &archived), (&b, &b)] {
+        assert_eq!(
+            restarted
+                .operator_rpc(
+                    "app_context_show",
+                    json!({"install_id":install["install_id"],"context_id":context["id"]})
+                )
+                .unwrap()["context"],
+            *expected
+        );
+    }
+    for original in [&artifact_a, &artifact_b] {
+        assert_eq!(
+            restarted
+                .operator_rpc("app_run_artifact", json!({"artifact_id":original["id"]}))
+                .unwrap(),
+            *original,
+            "restart lost operator durable context material"
+        );
+    }
+    assert!(restarted
+        .operator_rpc("app_run_dispatch", json!({"run_id":id}))
+        .is_err());
+    let error=restarted.operator_rpc("app_run_create",json!({"install_id":install["install_id"],"context_id":a["id"],"workflow":"draft","inputs":{"subject":"No fallback","source":format!("CONTEXT_SOURCE={A}"),"writer":WRITER,"reviewer":REVIEWER},"request_id":"archived-after-restart","owner_pm":OWNER})).unwrap_err();
+    assert_eq!(error.kind(), "rejected");
+    assert!(
+        error.to_string().contains("archived"),
+        "wrong rejection hid fallback proof: {error}"
+    );
+    let db = rusqlite::Connection::open(restarted.state.join("cadence.sqlite3")).unwrap();
+    let kickoffs: i64 = db
+        .query_row(
+            "SELECT count(*) FROM messages WHERE source='app_run_dispatch'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kickoffs, 4, "restart re-dispatched contextual work");
 }

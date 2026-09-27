@@ -197,6 +197,33 @@ def run_prompt(prompt):
                                   "error_kind": answer.get("error", {}).get("kind")})
                     if answer.get("ok") is not False or answer.get("error", {}).get("kind") != "rejected" or "result" in answer:
                         raise RuntimeError("cross-context native read was not rejected")
+            projections = []
+            for detached in [False, True]:
+                reads = [
+                    ("agent_show", {"alias": ALIAS}, True),
+                    ("agent_events", {"alias": ALIAS, "tail": True}, True),
+                    ("job_show", {"job": probe["run_id"]}, True),
+                    ("task_show", {"task": probe["task_id"]}, True),
+                    ("job_events", {"job": probe["run_id"], "tail": True}, True),
+                    ("agent_requests", {"alias": ALIAS}, False),
+                    ("agent_capture", {"alias": ALIAS}, False),
+                    ("agent_probe", {"alias": ALIAS}, False),
+                ]
+                for method, params, allowed in reads:
+                    answer = frame(method, params, detached)
+                    encoded = json.dumps(answer)
+                    if any(canary in encoded for canary in probe["canaries"]):
+                        raise RuntimeError("generic projection disclosed context input")
+                    if allowed:
+                        if answer.get("ok") is not True:
+                            raise RuntimeError("populated generic projection control failed")
+                        if method == "agent_events" and not answer["result"]["events"]:
+                            raise RuntimeError("projection test lacks actual populated events")
+                    elif answer.get("ok") is not False or answer.get("error", {}).get("kind") != "rejected":
+                        raise RuntimeError("private transcript/request projection not rejected")
+                    projections.append({"method": method, "detached": detached,
+                                        "ok": answer.get("ok"), "redacted": True})
+            receipt["projection_cases"] = projections
             receipt["native_scope_cases"] = cases
             receipt["own_dependency_positive"] = True
         result = dict(
