@@ -791,7 +791,7 @@ impl Shared {
             alias,
             "provider_event",
             json!({
-                "method": method, "data": if self.store.app_material_endpoint(alias).unwrap_or(true) { json!({"app_owned":true}) } else { params },
+                "method": method, "data": if self.store.app_material_endpoint(alias).unwrap_or(true) { json!({"app_owned":true}) } else { params.clone() },
             }),
         );
         if method == "serverRequest/resolved" {
