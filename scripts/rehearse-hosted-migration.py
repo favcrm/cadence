@@ -110,7 +110,7 @@ def assert_no_credentials(label, text):
 def temporary(path):
     path = Path(path).resolve()
     if not path.is_relative_to(Path('/tmp')) or path == Path('/tmp'):
-        raise ValueError('rehearsal state/output must be inside an owned /tmp directory')
+        raise ValueError('rehearsal source/tracker/output must be inside an owned /tmp directory')
     return path
 
 
@@ -194,21 +194,35 @@ def would_read(value, cwd):
     return target.resolve()
 
 
-def refuse_foreign_checkouts(db_path, roots, cwd):
-    """Refuse a source whose path columns reach a directory outside the rehearsal.
+def refuse_foreign_checkouts(db_path, roots, iso):
+    """Refuse a source whose path columns reach a repository outside the rehearsal.
 
     `cadence export` (`discover_repos`) and `cadence restore` (`plan_remap`) run
     `git -C <dir> remote get-url origin` on every recorded path that resolves to
     a directory. An offline copy of a real store still names live developer
     checkouts, so the rehearsal would read — and could print — a remote holding
     `user:token@`. The rehearsal reads no repository it does not own.
+
+    A directory inside a root is not automatically safe: `git -C` resolves a
+    `.git` file, a linked worktree, or an ancestor repository above the root,
+    so the object store it lands in is what must be confined, not just the
+    directory the column named.
     """
     outside = []
     for value in recorded_paths(db_path):
-        resolved = would_read(value, cwd)
+        resolved = would_read(value, iso.scratch)
         if resolved is None:
             continue
         if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+            outside.append(str(resolved))
+            continue
+        try:
+            gitdir = Path(iso.run('git', '-C', str(resolved),
+                                  'rev-parse', '--absolute-git-dir'))
+        except ValueError:
+            # No repository resolves from here — the remote read fails too.
+            continue
+        if not any(gitdir == root or gitdir.is_relative_to(root) for root in roots):
             outside.append(str(resolved))
     if outside:
         outside = sorted(set(outside))
@@ -283,7 +297,10 @@ def clean_tracker(iso, tracker):
 def preflight(binary, source, tracker, output):
     """Every check that needs no lock, no child write and no output directory."""
     source, output = temporary(source), temporary(output)
-    tracker = Path(tracker).resolve()
+    # Same confinement as source/output: an allowlisted temporary root,
+    # not a list of refused live paths — any owned git root outside /tmp
+    # (including ~/pm) is rejected before a single read happens.
+    tracker = temporary(tracker)
     if tracker == (Path.home() / 'pm').resolve():
         raise ValueError('use an isolated tracker clone, never the production PM directory')
     if output.exists() or output.is_relative_to(source) or source.is_relative_to(output):
@@ -327,7 +344,7 @@ def rehearse(binary, source, tracker, output, dry_run=False):
         roots = (source, tracker, output)
         db = source / 'cadence.sqlite3'
         with source_lock(source, hold=not dry_run):
-            paths = refuse_foreign_checkouts(db, roots, iso.scratch)
+            paths = refuse_foreign_checkouts(db, roots, iso)
             before = inspect_db(db)
             if dry_run:
                 return plan(binary, source, tracker, output, sha, before, paths)

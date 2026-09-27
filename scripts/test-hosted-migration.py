@@ -327,6 +327,57 @@ class MigrationTests(unittest.TestCase):
         self.assertFalse((self.root / 'out').exists())
         self.assertEqual(index_fingerprint(outside), before)
 
+    def test_refuses_a_tracker_outside_the_temporary_roots(self):
+        # Allowlist, not denylist: any owned git root beyond /tmp is refused,
+        # not only ~/pm. /etc exists on every CI image and is outside /tmp.
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                with self.assertRaisesRegex(ValueError, '/tmp'):
+                    migration.rehearse('/usr/bin/true', self.source, '/etc',
+                                       self.root / 'out', dry_run=dry_run)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_refuses_a_gitfile_checkout_pointing_outside_the_rehearsal(self):
+        # The column value resolves inside `source`, but its `.git` file
+        # makes `git -C` land in a repository outside the rehearsal — whose
+        # `remote get-url` would print the token remote.
+        outside = self.make_repo(self.root / 'foreign-repo', remote=TOKEN_REMOTE)
+        inner = self.source / 'nested'
+        inner.mkdir()
+        (inner / '.git').write_text(f'gitdir: {outside}/.git\n')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_refuses_a_column_dir_whose_repo_is_an_ancestor_of_the_root(self):
+        # No `.git` anywhere below the value's directory — `git -C` walks
+        # up and finds a repository that contains the root itself.
+        self.make_repo(self.root)
+        sub = self.source / 'plain-subdir'
+        sub.mkdir()
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['ancestor', str(sub)])
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_accepts_a_checkout_repo_inside_the_source_root(self):
+        # Positive control: a real repository inside a root stays allowed —
+        # its own gitdir resolves inside the rehearsal.
+        inner = self.make_repo(self.source / 'nested-repo')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        plan = migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                                  self.root / 'out', dry_run=True)
+        self.assertIn(str(inner), plan['recorded_checkout_paths'])
+
     def test_refuses_a_missing_spec_path_whose_parent_is_a_live_checkout(self):
         """`discover_repos` falls back to the parent directory, so this reads it."""
         outside = self.make_repo(self.root / 'live-checkout', remote=TOKEN_REMOTE)
