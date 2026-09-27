@@ -1001,7 +1001,6 @@ fn shrink(parts: &mut Vec<Part>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::OnceLock;
 
     use serde_json::json;
     use sha2::{Digest, Sha256};
