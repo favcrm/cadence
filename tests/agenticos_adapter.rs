@@ -114,7 +114,10 @@ fn start(script: Script) -> (Door, AgenticosAdapter) {
         }
     });
     let base = format!("http://127.0.0.1:{port}");
-    let adapter = AgenticosAdapter::new(&base).unwrap();
+    // The fixture independently asserts its simulated deployment contract.
+    let adapter =
+        AgenticosAdapter::with_deployment_pin(&base, Some("agenticos-manifest@1/publish_post@2"))
+            .unwrap();
     (
         Door {
             base,
