@@ -17,11 +17,13 @@ struct Board {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
 }
-impl Board {
-    fn new() -> Self {
-        Self::start(false)
-    }
-    fn start(pi: bool) -> Self {
+struct BoardSetup {
+    root: tempfile::TempDir,
+    pm: Pm,
+    daemon: TestDaemon,
+}
+impl BoardSetup {
+    fn new(pi: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         let opts = daemon_opts();
@@ -37,30 +39,82 @@ impl Board {
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         let daemon = TestDaemon::start_opts(opts);
-        let port = (3110..3200)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap();
+        Self { root, pm, daemon }
+    }
+}
+impl Board {
+    fn new() -> Self {
+        Self::start(false)
+    }
+    fn start(pi: bool) -> Self {
+        Self::start_prepared(BoardSetup::new(pi), None, |_| {})
+    }
+    fn start_prepared(
+        setup: BoardSetup,
+        forced_port: Option<u16>,
+        after_probe: impl FnOnce(u16),
+    ) -> Self {
+        let BoardSetup { root, pm, daemon } = setup;
+        let port = forced_port.unwrap_or_else(|| {
+            (3110..3200)
+                .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+                .unwrap()
+        });
+        assert!((3110..3200).contains(&port));
+        after_probe(port);
         let stop = Arc::new(AtomicBool::new(false));
-        let opts = cadence_agent::ui::ServeOpts {
-            host: "127.0.0.1".into(),
-            port,
-            stop: Some(stop.clone()),
-            test_seam: cfg!(feature = "test-seam"),
-            ..Default::default()
-        };
-        let state = daemon.state.clone();
-        let thread = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm.dir, &opts));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Self {
+        let mut board = Self {
             root,
             daemon,
             port,
             stop,
-            thread: Some(thread),
+            thread: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "board startup deadline exhausted"
+            );
+            let (startup, ready) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port: board.port,
+                stop: Some(board.stop.clone()),
+                startup: Some(startup),
+                test_seam: cfg!(feature = "test-seam"),
+                ..Default::default()
+            };
+            let state = board.daemon.state.clone();
+            let pm_dir = pm.dir.clone();
+            board.thread = Some(std::thread::spawn(move || {
+                cadence_agent::ui::serve(&state, &pm_dir, &opts)
+            }));
+            let notification = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => ready.recv_timeout(remaining),
+                _ => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            };
+            if matches!(notification, Ok(Ok(()))) {
+                return board;
+            }
+            board.stop.store(true, Ordering::SeqCst);
+            let result = board.thread.take().unwrap().join();
+            if forced_port.is_none()
+                && matches!(notification, Ok(Err(std::io::ErrorKind::AddrInUse)))
+            {
+                match result {
+                    Ok(Err(error)) => eprintln!("board startup contention: {error}"),
+                    unexpected => panic!("board bind failure returned {unexpected:?}"),
+                }
+                board.port = board
+                    .port
+                    .checked_add(1)
+                    .filter(|port| *port < 3200)
+                    .expect("board startup exhausted permitted ports");
+                board.stop.store(false, Ordering::SeqCst);
+            } else {
+                panic!("board startup notification {notification:?}; worker {result:?}");
+            }
         }
     }
     fn operator(&self, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -73,8 +127,45 @@ impl Board {
 impl Drop for Board {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap().unwrap();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let result = thread.join();
+        if std::thread::panicking() {
+            if !matches!(&result, Ok(Ok(()))) {
+                eprintln!("board worker cleanup after primary panic: {result:?}");
+            }
+        } else {
+            result.unwrap().unwrap();
+        }
     }
+}
+
+#[test]
+fn cad691_board_readiness_requires_its_own_bound_worker() {
+    // Prepare both token domains before releasing the probed port. The hook
+    // occupies it with a real board, not a fabricated HTTP response.
+    let contender_setup = BoardSetup::new(false);
+    let own_setup = BoardSetup::new(false);
+    let mut contender = None;
+    let b = Board::start_prepared(own_setup, None, |port| {
+        let other = Board::start_prepared(contender_setup, Some(port), |_| {});
+        assert_eq!(other.port, port);
+        assert_eq!(other.operator("GET", "/api/app-runs", "").0, 200);
+        eprintln!("CAD-691: owned contender serves its own operator on probed port {port}");
+        contender = Some(other);
+    });
+    let contender = contender.expect("probe hook did not establish its owned contender");
+    // Keep this positive first: old TCP-only readiness returns a Board whose
+    // own sign-in reaches the contender and fails with HTTP403, before any
+    // distinct-port/live-worker assertion can obscure that primary failure.
+    assert_eq!(b.operator("GET", "/api/app-runs", "").0, 200);
+    assert_ne!(b.port, contender.port, "readiness borrowed another board");
+    assert!(
+        !b.thread.as_ref().unwrap().is_finished(),
+        "readiness returned after its own board worker exited"
+    );
+    assert_eq!(contender.operator("GET", "/api/app-runs", "").0, 200);
 }
 
 #[test]
