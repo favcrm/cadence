@@ -347,7 +347,7 @@ impl Shared {
                     Err(error) => {
                         let (uncertain, error) = match error {
                             crate::platform::AppArtifactError::Refused(error) => (false, error),
-                            crate::platform::AppArtifactError::Uncertain(error) => (true, error),
+                            crate::platform::AppArtifactError::Uncertain(error) => (false, error),
                         };
                         let error =
                             if crate::platform::refuse_leak("app release error", &error, &bytes)
