@@ -197,6 +197,8 @@ if "--session" in _args:
 # `wrong-model` mode the report deliberately disagrees — the silent
 # fallback CAD-559 makes loud.
 def reported_model():
+    if MODE == "cursor-bare":
+        return {"id": "grok-4.7-high", "name": "Cursor", "provider": "cursor"}
     if MODE == "wrong-model":
         return {"id": "not-the-asked-1", "name": "Wrong Model", "provider": "fake"}
     if "--model" in _args:

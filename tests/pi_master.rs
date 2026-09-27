@@ -1483,7 +1483,9 @@ fn cursor_worker_open_and_concurrent_switch_refuse() {
         .to_string();
     assert!(err.contains("native cursor"), "{err}");
     assert!(!err.contains("CAD603-PRIVATE-SENTINEL"));
-    assert!(!dir.path().join("pi-rpc.jsonl").exists());
+    let journal_path = dir.path().join("agents/pi-rpc-dev-1.jsonl");
+    assert!(!journal_path.exists());
+    assert!(!dir.path().join("agents/pi-record-dev-1.json").exists());
     let mut safe = agent("dev-1", json!({}));
     safe.cwd = row.cwd.clone();
     pi.open(&safe).unwrap();
@@ -1498,7 +1500,7 @@ fn cursor_worker_open_and_concurrent_switch_refuse() {
             });
         }
     });
-    let journal = std::fs::read_to_string(dir.path().join("pi-rpc.jsonl")).unwrap();
+    let journal = std::fs::read_to_string(journal_path).unwrap();
     assert!(!journal.contains("set_model"), "{journal}");
     assert!(!journal.contains("CAD603-PRIVATE-SENTINEL"));
     pi.close();
@@ -1527,6 +1529,32 @@ fn cursor_worker_detached_child_refuses() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn cursor_worker_bare_id_resolves_before_any_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("cursor-bare", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [grok-4.7-high]\n",
+    )
+    .unwrap();
+    let mut row = agent("dev-1", json!({"model": "grok-4.7-high"}));
+    row.cwd = dir.path().to_string_lossy().into();
+    row.instructions = Some(format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000)));
+    let err = pi
+        .open(&row)
+        .err()
+        .expect("resolved Cursor must refuse")
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    assert!(journal.contains("get_state"));
+    assert!(!journal.contains("prompt"), "{journal}");
+    // Reopen stays refused, rather than persisting a usable unsafe model.
+    assert!(pi.open(&row).is_err());
+    pi.close();
 }
 
 /// The `wrong-model` fake accepts `--model` then reports a different

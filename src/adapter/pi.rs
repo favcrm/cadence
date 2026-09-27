@@ -1830,6 +1830,14 @@ impl ProviderAdapter for PiAdapter {
             .and_then(|m| m.get("provider"))
             .and_then(Value::as_str)
             .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
+        // A bare worker id may resolve to Cursor. No conversation has
+        // crossed RPC yet: close before a turn can launch its argv child.
+        if let Some(model) = reported_full.as_deref() {
+            if let Err(error) = crate::pi_policy::require_safe_transport(model) {
+                self.close();
+                return Err(error);
+            }
+        }
         // CAD-559: Pi answers get_state with whatever model it fell
         // back to — `--model` is a hint, not a contract. Refuse the
         // launch unless the running model is the allowlisted one.
