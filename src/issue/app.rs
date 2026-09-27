@@ -2798,18 +2798,17 @@ needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
         }
     }
 
-    /// CAD-501: a publish slot bound to `agenticos` grants the hosted
-    /// account. `local` stays the built-in outbox. A connection with
-    /// no mapping still derives nothing.
+    /// Provider names alone cannot assign accounts or widen app grants.
+    /// Capability matching remains a separately reviewed resolver.
     #[test]
-    fn agenticos_binding_derives_the_hosted_grant() {
+    fn provider_binding_names_do_not_derive_unreviewed_app_grants() {
         let pm = tempfile::tempdir().unwrap();
         let apps = pm.path().join("demo").join("apps");
-        let dir = apps.join("social-content");
+        let dir = apps.join("capability-demo");
         std::fs::create_dir_all(dir.join("workflows")).unwrap();
         std::fs::write(
             dir.join("app.md"),
-            "---\napp: social-content\ntitle: Social\nversion: 0.1.0\n\
+            "---\napp: capability-demo\ntitle: Social\nversion: 0.1.0\n\
 needs:\n  connections: [publish]\n---\n\n# Guide\n",
         )
         .unwrap();
@@ -2820,31 +2819,26 @@ needs:\n  connections: [publish]\n---\n\n# Guide\n",
         )
         .unwrap();
         std::fs::write(
-            apps.join("social-content.yaml"),
-            "schema: 1\napp: social-content\ninstall_id: inst-1\n\
+            apps.join("capability-demo.yaml"),
+            "schema: 1\napp: capability-demo\ninstall_id: inst-1\n\
 source:\n  kind: path\n  path: /tmp/src\n\
 bindings:\n  publish: agenticos\n\
 team:\n  publisher: pub-1\n\
 installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         )
         .unwrap();
-        let grants = derive_grants(pm.path(), "demo", "social-content").unwrap();
-        assert_eq!(
-            grants,
-            vec![DerivedGrant {
-                agent: "pub-1".into(),
-                platform: "agenticos".into(),
-                account: "hosted".into(),
-                scopes: vec!["publish".into()],
-            }]
+        let grants = derive_grants(pm.path(), "demo", "capability-demo").unwrap();
+        assert!(
+            grants.is_empty(),
+            "provider names alone must never derive automatic grants"
         );
 
-        let yaml = apps.join("social-content.yaml");
+        let yaml = apps.join("capability-demo.yaml");
         let text = std::fs::read_to_string(&yaml)
             .unwrap()
             .replace("agenticos", "other");
         std::fs::write(&yaml, text).unwrap();
-        let grants = derive_grants(pm.path(), "demo", "social-content").unwrap();
+        let grants = derive_grants(pm.path(), "demo", "capability-demo").unwrap();
         assert!(grants.is_empty(), "{grants:?}");
     }
 
