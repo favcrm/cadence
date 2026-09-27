@@ -249,8 +249,11 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
 /// nor resume a stalled turn. The mock's one-shot `tui-once` frame
 /// pins the empty tail to exactly one sighting — one capture claims
 /// it by rename, so no write timing can show it twice (CAD-451: the
-/// old write-then-revert protocol raced the capture's read). Real
-/// persistent motion still resumes, one interval later.
+/// old write-then-revert protocol raced the capture's read).
+/// Positive recovery, message attribution and notices are covered by
+/// pty_stall_resume_rearms_and_spinner_is_not_activity; distinct-hash
+/// confirmation by the watch unit test
+/// two_distinct_novel_screens_confirm_continuous_motion.
 #[test]
 fn pty_stall_transient_sample_neither_resumes_nor_resets() {
     let d = TestDaemon::start();
@@ -341,16 +344,6 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
         "one-sample transient sent a notice"
     );
 
-    // Real motion still resumes — two DIFFERENT consecutive samples
-    // confirm too (the scrolling-pane clause: a busy pane is never
-    // starved into a false stall) — and the same recipient hears it.
-    atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "BUILD 1\n");
-    let n = captures();
-    wait_capture(n); // first differing sample — held as a candidate
-    atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "BUILD 2\n");
-    let e = d.wait_event("w1", "turn_resumed", 20);
-    assert_eq!(e["payload"]["message"], "mtr", "{e}");
-    wait_source(&d, "pm", "worker_notice", 2, 10);
     stall_sample(0);
 }
 
