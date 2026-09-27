@@ -112,7 +112,7 @@ pub struct EffectRow {
 }
 
 impl EffectRow {
-    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+    pub(super) fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
         let input: String = row.get("input")?;
         let scopes: String = row.get("scopes")?;
         let decision: Option<String> = row.get("decision")?;

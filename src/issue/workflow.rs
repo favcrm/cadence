@@ -57,11 +57,19 @@ pub const DIR: &str = "workflows";
 /// uses — "New post"; wording, like the title). Anything else refuses
 /// at parse — the same fail-loud rule the plan parser applies with
 /// `deny_unknown_fields`.
-const META_KEYS: &[&str] = &["title", "goal", "non_goals", "inputs", "distinct", "label"];
+const META_KEYS: &[&str] = &[
+    "title",
+    "goal",
+    "non_goals",
+    "inputs",
+    "distinct",
+    "label",
+    "publication_slot",
+];
 
 /// Workflow-only frontmatter keys: pulled out at parse and removed
 /// before rendering, because the plan parser denies unknown fields.
-const WORKFLOW_ONLY_KEYS: &[&str] = &["inputs", "distinct", "label"];
+const WORKFLOW_ONLY_KEYS: &[&str] = &["inputs", "distinct", "label", "publication_slot"];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
 /// the approval-affecting fields later stages add (a `reviewer:` line
@@ -168,6 +176,7 @@ pub struct Template {
     pub input_order: Vec<String>,
     pub distinct: Vec<String>,
     pub label: Option<String>,
+    pub publication_slot: Option<String>,
 }
 
 /// The declared inputs as the board renders them — file order, each
@@ -273,6 +282,7 @@ struct Front {
     input_order: Vec<String>,
     distinct: Vec<String>,
     label: Option<String>,
+    publication_slot: Option<String>,
 }
 
 fn parse_front(yaml: &str) -> Result<Front> {
@@ -315,6 +325,17 @@ fn parse_front(yaml: &str) -> Result<Front> {
             return Err(Error::rejected(
                 "workflow `label:` is one line of text — what the run is called, \
                  like \"New post\"",
+            ))
+        }
+    };
+    let publication_slot = match map.remove(serde_yaml::Value::String("publication_slot".into())) {
+        None => None,
+        Some(serde_yaml::Value::String(slot)) if crate::issue::model::valid_tag(&slot) => {
+            Some(slot)
+        }
+        Some(_) => {
+            return Err(Error::rejected(
+                "workflow publication_slot must be one static slot name",
             ))
         }
     };
@@ -451,6 +472,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
         input_order,
         distinct,
         label,
+        publication_slot,
     })
 }
 
@@ -596,6 +618,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
         input_order: front.input_order,
         distinct: front.distinct,
         label: front.label,
+        publication_slot: front.publication_slot,
     })
 }
 
@@ -956,6 +979,9 @@ pub fn gate_keys(text: &str) -> Result<String> {
         let mut d = tpl.distinct.clone();
         d.sort();
         keys.push_str(&format!(";distinct={}", d.join(",")));
+    }
+    if let Some(slot) = &tpl.publication_slot {
+        keys.push_str(&format!(";publication_slot={slot}"));
     }
     keys.push('\n');
     let metas = ticket_meta(body)?;
