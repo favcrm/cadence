@@ -86,10 +86,10 @@ impl DeploymentMetadata {
         Ok(metadata)
     }
 
-    pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {
+    pub fn pin(&self, provider: &str, _origin: &str) -> Option<&str> {
         self.providers
             .iter()
-            .find(|entry| entry.provider == provider && entry.origin == origin)
+            .find(|entry| entry.provider == provider)
             .map(|entry| entry.manifest_pin.as_str())
     }
 }
