@@ -215,7 +215,7 @@ fn cad667_http_install_and_reads_share_operator_authority() {
     };
     use std::time::{Duration, Instant};
     let w = Workspace::new();
-    let mut lane = LaneShell::spawn(w._root.path());
+    let lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
     let port = (3110..3200)
         .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
