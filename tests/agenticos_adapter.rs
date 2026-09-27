@@ -353,6 +353,50 @@ fn declined_is_refused() {
 }
 
 #[test]
+fn composition_registered_daemon_preserves_native_grant_gate_and_handoff() {
+    let (door, _) = start(Script::Posted);
+    let metadata = cadence_agent::platform::deployments::DeploymentMetadata::parse(
+        &serde_json::to_vec(&json!({"schema":1,"providers":[{
+            "provider":"agenticos","origin":door.base,
+            "manifest_pin":"agenticos-manifest@1/publish_post@2"
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut opts = cadence_agent::daemon::ServeOptions {
+        provider_deployments: Some(metadata),
+        ..Default::default()
+    };
+    cadence_agent::platform::agenticos::register_from_composition(&mut opts, &door.base, true)
+        .unwrap();
+    let daemon =
+        CallDaemon::start_with_platforms(tempfile::TempDir::new().unwrap(), opts.platforms);
+    let mut lane = Lane::spawn(&daemon, "composition-worker");
+    let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("composition-native")});
+    assert!(lane.rpc(&daemon, "platform_call", call.clone()).is_err());
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        0
+    );
+    daemon.op("platform_grant", json!({"agent":"composition-worker","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+    for _ in 0..2 {
+        let result = lane.rpc(&daemon, "platform_call", call.clone()).unwrap();
+        assert_eq!(result["result"], "executed");
+        assert_eq!(result["platform_result"]["handoff"], "draft");
+        assert_eq!(
+            result["platform_result"]["content_hash"],
+            format!(
+                "sha256:{}",
+                publish_content_digest("conn_1", "composition-native", None)
+            )
+        );
+    }
+    let state = door.state.lock().unwrap();
+    assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(state.posts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn authorization_digest_mismatch_refuses_before_publish() {
     let (door, adapter) = start(Script::Mismatch);
     assert!(adapter
@@ -515,6 +559,18 @@ impl CallDaemon {
     }
 
     fn start_on(dir: tempfile::TempDir, adapter: Arc<AgenticosAdapter>) -> Self {
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            cadence_agent::platform::agenticos::PLATFORM.to_string(),
+            adapter as Arc<dyn cadence_agent::platform::PlatformAdapter>,
+        );
+        Self::start_with_platforms(dir, platforms)
+    }
+
+    fn start_with_platforms(
+        dir: tempfile::TempDir,
+        platforms: HashMap<String, Arc<dyn PlatformAdapter>>,
+    ) -> Self {
         let state = dir.path().join("state");
         let pm = dir.path().join("pm");
         std::fs::create_dir_all(&state).unwrap();
@@ -522,11 +578,6 @@ impl CallDaemon {
         let env = cadence_agent::adapter::ProviderEnv::default();
         env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
-        let mut platforms = HashMap::new();
-        platforms.insert(
-            cadence_agent::platform::agenticos::PLATFORM.to_string(),
-            adapter as Arc<dyn cadence_agent::platform::PlatformAdapter>,
-        );
         let opts = cadence_agent::daemon::ServeOptions {
             provider_env: env,
             report_router: Some(0),

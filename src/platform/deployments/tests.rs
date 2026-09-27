@@ -30,6 +30,36 @@ fn strict_metadata_binds_exact_origin_and_rejects_forged_shapes() {
 }
 
 #[test]
+fn origin_requires_a_valid_authority_without_caller_url_components() {
+    for origin in [
+        "http://:",
+        "http://[]",
+        "http://a:b:c",
+        "http://host:99999",
+        "http://user@host",
+        "http://host/path",
+        "http://host?pin=1",
+        "http://host#pin",
+        "http://host\n",
+        "http://-host",
+    ] {
+        let invalid = serde_json::json!({"schema":1,"providers":[{"provider":"agenticos","origin":origin,"manifest_pin":"pin"}]});
+        assert!(
+            DeploymentMetadata::parse(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+            "{origin:?}"
+        );
+    }
+    for origin in [
+        "http://api.internal",
+        "http://127.0.0.1:3110",
+        "https://[::1]:443",
+    ] {
+        let valid = serde_json::json!({"schema":1,"providers":[{"provider":"agenticos","origin":origin,"manifest_pin":"pin"}]});
+        assert!(DeploymentMetadata::parse(&serde_json::to_vec(&valid).unwrap()).is_ok());
+    }
+}
+
+#[test]
 fn pinned_file_reader_refuses_writable_symlink_and_nonroot_metadata() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
