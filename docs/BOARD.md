@@ -1562,6 +1562,23 @@ oldest `review` issue's age.
 
 ## Frontend
 
+Outbox (`/outbox`) is the operator's history of posts released to the local
+publication destination. It does not imply delivery to an external channel.
+The responsive, full-width list shows newest posts first, with project,
+publication date (year and UTC), preview and attachment count. Search matches
+every term against titles, previews, project keys, publication IDs and attachment
+names; the exact project filter is local to this screen. `outbox_q` and
+`outbox_project` preserve those filters across item navigation and browser
+history without changing the shared router's project-scope rules. A direct
+`?item=<effect_id>` link reads that item independently of the list. Failed reads
+offer retry, failed collection refreshes label the retained data as stale, and
+late item responses are dropped after navigation, retry or access revocation.
+Post content uses the shared Markdown renderer and reader typography;
+attachments retain their names/sizes, with the publication ID and local folder
+inside a disclosure. An unproven viewer sees the sign-in explanation and makes
+no protected Outbox request. This view adds no publication or file-management
+actions.
+
 `ui/`: Vite + React 19 + TypeScript + Tailwind 4, pnpm. Design tokens
 per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
 Sans/Mono, teal `#2dd4bf` on interactive elements only.

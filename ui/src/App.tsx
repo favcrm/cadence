@@ -877,7 +877,7 @@ export default function App() {
             onToast={say}
           />
         )}
-        {screen === "outbox" && <Outbox operator={meta?.operator === true} />}
+        {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
