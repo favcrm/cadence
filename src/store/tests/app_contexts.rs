@@ -2,6 +2,21 @@ use super::app_runs::runtime_fixture;
 use super::*;
 
 #[test]
+fn cad690_required_context_content_default_is_nonempty_but_optional_may_be_empty() {
+    let text = include_str!("../../../apps/local-content/workflows/draft.md")
+        .replace("source: { ask:", "source: { context_default: true, ask:");
+    let defaults = std::collections::BTreeMap::from([("source".to_string(), "facts".to_string())]);
+    assert!(crate::issue::workflow::check_context_defaults(&text, &defaults).is_ok());
+    let empty = std::collections::BTreeMap::from([("source".to_string(), String::new())]);
+    assert!(crate::issue::workflow::check_context_defaults(&text, &empty).is_err());
+    let optional = text.replace(
+        "context_default: true",
+        "context_default: true, optional: true",
+    );
+    assert!(crate::issue::workflow::check_context_defaults(&optional, &empty).is_ok());
+}
+
+#[test]
 fn cad690_context_receipt_is_rechecked_in_create_and_execution_transactions() {
     use crate::store::app_contexts::ContextConfig;
     use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
