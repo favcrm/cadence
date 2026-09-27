@@ -78,9 +78,14 @@ const steps = {
     await page.goto(`${base}/setup`);
     const main = page.locator("main");
     await expectText(main, "Setup", "setup page");
-    for (const step of ["Environment", "Agent CLIs", "Master agent", "First project"]) {
+    for (const step of ["Environment", "Agent CLIs", "Master agent", "Projects"]) {
       await expectText(main, step, "setup page lists its steps");
     }
+    await main.getByRole("navigation", { name: "Setup sections" })
+      .getByRole("button", { name: /^Projects\b/ }).click();
+    await main.getByRole("heading", { name: "Projects", exact: true }).waitFor();
+    await expectText(main, "1 registered project", "setup shows the registered fixture project");
+    await main.getByRole("link", { name: "demo", exact: true }).waitFor();
     await main.getByText("Agent CLIs", { exact: true }).first().click();
     await expectText(main, "signed in", "setup page shows the detected claude CLI signed in");
     await expectText(main, "claude", "setup page lists the detected claude CLI");
