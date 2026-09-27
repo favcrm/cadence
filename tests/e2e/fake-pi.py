@@ -197,6 +197,8 @@ if "--session" in _args:
 # `wrong-model` mode the report deliberately disagrees — the silent
 # fallback CAD-559 makes loud.
 def reported_model():
+    if MODE.startswith("cursor-effort-"):
+        return {"id": "grok-4.7-high", "provider": "cursor"}
     if MODE == "bare-open-missing-provider":
         return {"id": "model-1"}
     if MODE == "bare-open-empty-provider":
@@ -363,8 +365,17 @@ def main():
                 pending_dialog = None
             continue
         if rtype == "get_state":
+            if MODE == "cursor-effort-state-error":
+                respond(rid, "get_state", False, error="synthetic state failure")
+                continue
             respond(rid, "get_state", True, data=dict(state))
         elif rtype == "set_thinking_level":
+            if MODE == "cursor-effort-refusal":
+                respond(rid, "set_thinking_level", False, error="synthetic effort refusal")
+                continue
+            if MODE == "cursor-effort-mismatch":
+                respond(rid, "set_thinking_level", True)
+                continue
             level = req.get("level")
             if level in LEVELS:
                 state["thinkingLevel"] = level

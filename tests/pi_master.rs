@@ -1666,6 +1666,47 @@ fn verified_completion_provider_bare_id_still_runs() {
     pi.close();
 }
 
+fn refused_cursor_effort_cannot_accept_prompt(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter(mode, dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [grok-4.7-high]\n",
+    )
+    .unwrap();
+    let mut row = agent(
+        "dev-1",
+        json!({"model": "grok-4.7-high", "effort": "high", "role": "operator"}),
+    );
+    row.cwd = dir.path().to_string_lossy().into();
+    let opened = pi.open(&row);
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let turn = pi.run_turn(&private, "after-effort-error", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(opened.is_err());
+    assert!(
+        !journal.contains("prompt"),
+        "failed effort setup left prompt capability: {mode} {journal}"
+    );
+    assert!(turn.is_err());
+}
+
+#[test]
+fn cursor_effort_refusal_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-refusal");
+}
+
+#[test]
+fn cursor_effort_state_error_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-state-error");
+}
+
+#[test]
+fn cursor_effort_mismatch_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-mismatch");
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.
