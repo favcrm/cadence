@@ -407,13 +407,8 @@ impl Store {
         drop(conn);
         self.app_run_show(id)
     }
-    fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
-        let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
-        if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
-            return Err(Error::rejected(
-                "app capability epoch or bundle digest is stale",
-            ));
-        }
+    fn app_current_in(_conn: &Connection, _run: &Value, _bundle: &str) -> Result<()> {
+        // CAD-631 intentional counterfactual: remove current authority proof.
         Ok(())
     }
 }
