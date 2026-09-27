@@ -1,12 +1,28 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
 import { provenanceDetail } from "./modelProvenance";
 import type { ResourceState } from "../../lib/cache";
-import { agentIsUnassigned, agentMatchesProject, issueIndex, type IssueIndex } from "../../lib/scope";
+import {
+  agentIsUnassigned,
+  agentIssueIds,
+  agentMatchesProject,
+  issueIndex,
+  type IssueIndex,
+} from "../../lib/scope";
 import { agentsEmptyCopy } from "../../lib/uxCopy";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import { IconClose } from "../../ui/icons";
+import { IconClose, IconSearch } from "../../ui/icons";
+import Button from "../../ui/Button";
+import {
+  AGENT_FILTERS,
+  agentCategory,
+  agentMatchesSearch,
+  agentOrder,
+  agentStatus,
+  type AgentFilter,
+} from "./agentView";
+import "./agents.css";
 import type {
   Agent,
   AgentDetail,
@@ -22,9 +38,10 @@ const STATE_CHIP: Record<string, string> = {
   stopped: "bg-ink-800 text-ink-400",
   attention: "bg-fail/10 text-fail",
   inbox: "bg-ink-800 text-ink-500",
-  approval: "bg-warn/10 text-warn",
+  "needs input": "bg-warn/10 text-warn",
   queued: "bg-info/10 text-info",
   "quota blocked": "bg-fail/10 text-fail",
+  error: "bg-fail/10 text-fail",
 };
 
 const STATE_DOT: Record<string, string> = {
@@ -33,31 +50,11 @@ const STATE_DOT: Record<string, string> = {
   stopped: "bg-ink-600",
   attention: "bg-fail",
   inbox: "bg-ink-700",
-  approval: "bg-warn",
+  "needs input": "bg-warn",
   queued: "bg-info",
   "quota blocked": "bg-fail",
+  error: "bg-fail",
 };
-
-/// Table order: fenced first, then working, idle, stopped, mailboxes.
-function rank(a: Agent): number {
-  if (a.fenced) return 0;
-  if (a.inbox) return 4;
-  if (a.running > 0 || a.queued > 0) return 1;
-  if (a.state === "idle") return 2;
-  return 3;
-}
-
-function stateLabel(a: Agent): string {
-  if (a.fenced) return "attention";
-  if (a.inbox) return "inbox";
-  if (a.state === "blocked_by_quota" || a.quota?.state === "blocked") {
-    return "quota blocked";
-  }
-  if (a.state === "waiting_input") return "approval";
-  if (a.running > 0) return "busy";
-  if (a.queued > 0) return "queued";
-  return a.state;
-}
 
 /// Compact silence label for the badge — "45s", "34m", "1h 5m".
 function fmtSilence(secs: number): string {
@@ -76,17 +73,35 @@ function RecoveryBlock({ text }: { text: string }) {
   );
 }
 
-const TERMINAL_TASK_STATES = new Set(["verified", "done", "cancelled", "failed"]);
+const TERMINAL_TASK_STATES = new Set([
+  "verified",
+  "done",
+  "cancelled",
+  "failed",
+]);
 
 function activeTasks(a: Agent): AgentTask[] {
-  return (a.tasks ?? []).filter((task) => !TERMINAL_TASK_STATES.has(task.task_state));
+  return (a.tasks ?? []).filter(
+    (task) => !TERMINAL_TASK_STATES.has(task.task_state),
+  );
 }
 
-function profileModel(a: Agent): { value: string; note: string; mismatch?: string; provenance?: string } {
+function profileModel(a: Agent): {
+  value: string;
+  note: string;
+  mismatch?: string;
+  provenance?: string;
+} {
   const reported = a.model_reported ?? a.model ?? null;
   const configured = a.model_configured ?? null;
-  const provenanceText = provenanceDetail(a.model_selection, a.model_lookup_role);
-  if (a.model_selection === null && (a.provider === "devin" || a.provider === "inbox")) {
+  const provenanceText = provenanceDetail(
+    a.model_selection,
+    a.model_lookup_role,
+  );
+  if (
+    a.model_selection === null &&
+    (a.provider === "devin" || a.provider === "inbox")
+  ) {
     return {
       value: reported ?? "unsupported",
       note: "model selection unsupported",
@@ -98,7 +113,9 @@ function profileModel(a: Agent): { value: string; note: string; mismatch?: strin
       value: reported,
       note: "reported",
       mismatch:
-        configured && configured !== reported ? `configured ${configured}` : undefined,
+        configured && configured !== reported
+          ? `configured ${configured}`
+          : undefined,
       provenance: provenanceText || undefined,
     };
   }
@@ -148,13 +165,19 @@ function usageText(a: Agent): { value: string; note: string; tone: string } {
   }
   const state = quota.state ?? "unknown";
   if (state === "error") {
-    return { value: "error", note: quota.message ?? quota.reason ?? "quota query failed", tone: "text-fail" };
+    return {
+      value: "error",
+      note: quota.message ?? quota.reason ?? "quota query failed",
+      tone: "text-fail",
+    };
   }
   if (state === "stale") {
     return {
       value: "stale",
       note: [
-        quota.observed_at ? `last update ${fmtTime(quota.observed_at)}` : "last update unknown",
+        quota.observed_at
+          ? `last update ${fmtTime(quota.observed_at)}`
+          : "last update unknown",
         quota.window,
         quota.source ? `source ${quota.source}` : null,
       ]
@@ -164,22 +187,33 @@ function usageText(a: Agent): { value: string; note: string; tone: string } {
     };
   }
   if (state === "blocked") {
-    return { value: "blocked", note: quota.reason ?? "provider reported a quota block", tone: "text-fail" };
+    return {
+      value: "blocked",
+      note: quota.reason ?? "provider reported a quota block",
+      tone: "text-fail",
+    };
   }
   if (state !== "available") {
-    return { value: "unknown", note: quota.reason ?? "allowance not reported", tone: "text-ink-500" };
+    return {
+      value: "unknown",
+      note: quota.reason ?? "allowance not reported",
+      tone: "text-ink-500",
+    };
   }
   // Null means unavailable; zero is a real value and must remain visible.
   const unit = quota.unit ? ` ${quota.unit}` : "";
-  const remaining = quota.remaining != null ? `${quota.remaining}${unit} remaining` : null;
+  const remaining =
+    quota.remaining != null ? `${quota.remaining}${unit} remaining` : null;
   const used = quota.used != null ? `${quota.used}${unit} used` : null;
   const limit = quota.limit != null ? `${quota.limit}${unit} limit` : null;
   const usedAgainstLimit =
     quota.used != null && quota.limit != null
       ? `${quota.used}/${quota.limit}${unit} used`
       : null;
-  const percent = quota.used_percent != null ? `${quota.used_percent}% used` : null;
-  const value = remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? "available";
+  const percent =
+    quota.used_percent != null ? `${quota.used_percent}% used` : null;
+  const value =
+    remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? "available";
   const window = quota.window ? `${quota.window}` : null;
   const reset = quota.reset_at ? `reset ${fmtTime(quota.reset_at)}` : null;
   const pool = quota.pool
@@ -193,16 +227,17 @@ function usageText(a: Agent): { value: string; note: string; tone: string } {
   const lastUpdate = quota.updated_at ?? quota.observed_at;
   return {
     value,
-    note: [
-      window,
-      reset,
-      pool,
-      poolAgents,
-      lastUpdate ? `last update ${fmtTime(lastUpdate)}` : null,
-      quota.source ? `source ${quota.source}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ") || "reported",
+    note:
+      [
+        window,
+        reset,
+        pool,
+        poolAgents,
+        lastUpdate ? `last update ${fmtTime(lastUpdate)}` : null,
+        quota.source ? `source ${quota.source}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ") || "reported",
     tone: "text-ink-300",
   };
 }
@@ -224,23 +259,30 @@ function WorkBlock({
 }) {
   const tasks = activeTasks(agent);
   const runningTaskIds = new Set(
-    (agent.running_messages ?? []).map((message) => message.task).filter(Boolean),
+    (agent.running_messages ?? [])
+      .map((message) => message.task)
+      .filter(Boolean),
   );
   const work = tasks.map((task) => ({
     task,
     live: runningTaskIds.has(task.task),
   }));
-  const blocked = agent.state === "blocked_by_quota" || agent.quota?.state === "blocked";
+  const blocked =
+    agent.state === "blocked_by_quota" ||
+    agent.quota?.state === "blocked" ||
+    agent.usage_limit?.state === "blocked";
   const approval = agent.state === "waiting_input";
   if (work.length > 0) {
     return (
       <div className="space-y-1.5 min-w-0">
         {blocked && <div className="text-fail">blocked by quota</div>}
-        {approval && <div className="text-warn">waiting for approval</div>}
+        {approval && <div className="text-warn">Waiting for input</div>}
         {work.map(({ task, live }) => (
           <div key={task.task} className="min-w-0">
             <div className="flex items-center gap-1.5 min-w-0">
-              <i className={`w-1.5 h-1.5 rounded-full shrink-0 ${live ? "bg-info" : "bg-ink-600"}`} />
+              <i
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${live ? "bg-info" : "bg-ink-600"}`}
+              />
               {task.issue && onOpenIssue ? (
                 <button
                   className="lnk num shrink-0"
@@ -258,7 +300,11 @@ function WorkBlock({
             </div>
             <div className="num text-micro text-ink-500 pl-3">
               {live ? "running" : task.task_state}
-              {task.job_title ? ` · ${task.job_title}` : task.job ? ` · ${task.job}` : ""}
+              {task.job_title
+                ? ` · ${task.job_title}`
+                : task.job
+                  ? ` · ${task.job}`
+                  : ""}
               {task.job_state ? ` · stage ${task.job_state}` : ""}
             </div>
           </div>
@@ -267,7 +313,7 @@ function WorkBlock({
     );
   }
   if (blocked) return <span className="text-fail">blocked by quota</span>;
-  if (approval) return <span className="text-warn">waiting for approval</span>;
+  if (approval) return <span className="text-warn">Waiting for input</span>;
   if (agent.running > 0) {
     const summaries = (agent.running_messages ?? [])
       .map((message) => message.summary)
@@ -279,23 +325,28 @@ function WorkBlock({
       .join(" · ");
     return (
       <span className="text-info" title={summaries || ids || "ad-hoc running"}>
-        ad-hoc running{summaries ? ` · ${summaries}` : ids ? ` · ${ids}` : ""}
+        {summaries || ids || "Running without an issue"}
       </span>
     );
   }
-  if (agent.queued > 0) return <span className="text-info">{agent.queued} queued</span>;
-  if (agent.unknown > 0) return <span className="text-fail">{agent.unknown} needs review</span>;
+  if (agent.queued > 0)
+    return <span className="text-info">{agent.queued} queued</span>;
+  if (agent.unknown > 0)
+    return <span className="text-fail">{agent.unknown} needs review</span>;
   if (agent.inbox) return <span className="text-ink-500">mailbox</span>;
-  if (agent.state === "idle") return <span className="text-ink-500">idle · no active work</span>;
+  if (agent.state === "idle")
+    return <span className="text-ink-500">idle · no active work</span>;
   if (agent.state === "stopped" && agent.state_label)
-    return <span className="text-ink-500">{agent.state_label} · resumable</span>;
-  if (agent.state === "stopped") return <span className="text-ink-500">stopped · no active work</span>;
+    return (
+      <span className="text-ink-500">{agent.state_label} · resumable</span>
+    );
+  if (agent.state === "stopped")
+    return <span className="text-ink-500">stopped · no active work</span>;
   return <span className="text-ink-500">{agent.state || "unknown"}</span>;
 }
 
-/** Issues the agent owns in doing/review with no job task on them — the
- *  ownership half of the CLI ISSUES column (scope.ts). */
-function OwnedIssues({
+/** Exact assigned/owned issue links not already shown with current work. */
+function RelatedIssues({
   agent,
   index,
   onOpenIssue,
@@ -304,12 +355,12 @@ function OwnedIssues({
   index: IssueIndex;
   onOpenIssue: (id: string) => void;
 }) {
-  const viaTask = new Set((agent.tasks ?? []).map((task) => task.issue));
-  const ids = (index.ownedBy.get(agent.alias) ?? []).filter((id) => !viaTask.has(id));
+  const viaTask = new Set(activeTasks(agent).map((task) => task.issue));
+  const ids = agentIssueIds(agent, index).filter((id) => !viaTask.has(id));
   if (ids.length === 0) return null;
   return (
-    <div className="num text-micro text-ink-500 mt-1 flex flex-wrap gap-x-1.5" title="owner of these doing/review issues">
-      owns
+    <div className="num text-micro text-ink-500 mt-1 flex flex-wrap items-center gap-x-1.5">
+      Issues
       {ids.map((id) => (
         <button
           key={id}
@@ -331,8 +382,11 @@ function ProfileBlock({ agent }: { agent: Agent }) {
   const effort = profileEffort(agent);
   const usage = usageText(agent);
   return (
-    <div className="space-y-1 min-w-[9rem]">
-      <div className="num text-ink-200 truncate" title={`${model.value} · ${model.note}`}>
+    <div className="space-y-1 min-w-0 agents-profile">
+      <div
+        className="num text-ink-200 truncate"
+        title={`${model.value} · ${model.note}`}
+      >
         {model.value}
       </div>
       <div className="num text-micro text-ink-500">
@@ -354,15 +408,19 @@ function ProfileBlock({ agent }: { agent: Agent }) {
 
 function AgentDrawer({
   alias,
+  observed,
   onClose,
   onOpenIssue,
 }: {
   alias: string;
+  observed?: Agent;
   onClose: () => void;
   onOpenIssue: (id: string) => void;
 }) {
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
     setDetail(null);
@@ -375,261 +433,439 @@ function AgentDrawer({
     return () => {
       live = false;
     };
-  }, [alias]);
+  }, [alias, retry]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+    const dialog = dialogRef.current;
+    const trigger = document.activeElement;
+    const overflow = document.body.style.overflow;
+    dialog?.showModal();
+    document.body.style.overflow = "hidden";
+    return () => {
+      dialog?.close();
+      document.body.style.overflow = overflow;
+      if (trigger instanceof HTMLElement && trigger.isConnected)
+        trigger.focus();
     };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   const a = detail?.agent;
+  // A collection observation keeps evidence available during loading/failure.
+  // Detail carries provider evidence, but not selection provenance or grouping.
+  const profile: Agent | undefined = a
+    ? {
+        group: "",
+        parked: 0,
+        ...observed,
+        ...a,
+        tasks: observed?.tasks,
+        running: detail.running.length,
+        queued: detail.queued,
+        unknown: detail.unknown,
+        fenced: detail.fenced,
+        on: detail.on ?? observed?.on ?? [],
+      }
+    : observed;
+  const fenced = detail?.fenced ?? observed?.fenced;
+  const recovery = detail?.recovery ?? observed?.recovery;
+  const resume = detail?.resume ?? observed?.resume;
   const caps = (a?.capabilities ?? {}) as Record<string, unknown>;
-  const capList = Object.entries(caps).filter(([, v]) => v === true || typeof v === "string");
+  const capList = Object.entries(caps).filter(
+    ([, v]) => v === true || typeof v === "string",
+  );
 
   return (
-    <>
-      <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
-      <aside
-        className="drawer fixed top-0 right-0 h-full w-full sm:w-[34rem] bg-ink-875 border-l border-ink-700 z-30 flex flex-col"
-        aria-label="Agent detail"
-      >
-        <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
-          <div className="min-w-0 flex-1">
-            <div className="num text-label text-ink-500">
-              {alias}
-              {a ? ` · ${a.provider} · ${a.endpoint_kind} · ${a.state}` : ""}
-            </div>
-            <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
-              {a?.role ?? "agent"}
-            </h2>
-          </div>
-          <button
-            aria-label="Close"
-            onClick={onClose}
-            className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
+    <dialog
+      ref={dialogRef}
+      className="agents-drawer bg-ink-875 border-l border-ink-700 text-ink-200"
+      aria-labelledby="agent-detail-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onClick={(event) => {
+        if (event.target !== event.currentTarget) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        if (
+          event.clientX < rect.left ||
+          event.clientX > rect.right ||
+          event.clientY < rect.top ||
+          event.clientY > rect.bottom
+        )
+          onClose();
+      }}
+    >
+      <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
+        <div className="min-w-0 flex-1">
+          <h2
+            id="agent-detail-title"
+            className="text-drawer font-semibold text-ink-100 leading-tight break-words"
           >
-            <IconClose style={{ pointerEvents: "none" }} />
-          </button>
-        </header>
+            {alias}
+          </h2>
+          <p className="text-label text-ink-400 mt-1">
+            {a?.role ?? observed?.role ?? "Agent"} ·{" "}
+            {a?.provider ?? observed?.provider ?? "Loading provider"}
+            {profile && ` / ${profile.endpoint_kind}`}
+          </p>
+          {observed && (
+            <p className="text-micro text-ink-500 mt-1">
+              Group: {observed.group_root ? "root" : observed.group}
+              {observed.team_role ? ` · Team role: ${observed.team_role}` : ""}
+            </p>
+          )}
+          {profile && (
+            <div className="mt-2">
+              <AgentState agent={profile} />
+            </div>
+          )}
+        </div>
+        <Button
+          icon={<IconClose />}
+          aria-label="Close agent details"
+          className="agents-close"
+          onClick={onClose}
+        />
+      </header>
 
-        <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
-          {err && <p className="text-secondary text-fail">{err}</p>}
-          {detail && a && (
-            <>
-              {detail.fenced && detail.recovery && (
-                <section>
-                  <div className="flex items-baseline gap-2 mb-2">
-                    <h3 className="text-cardtitle font-semibold text-fail">
-                      Fenced
-                    </h3>
-                    <span className="kicker">recovery is an operator command</span>
-                  </div>
-                  <RecoveryBlock text={detail.recovery} />
-                </section>
-              )}
-
-              <section>
-                <div className="flex items-baseline gap-2 mb-2">
-                  <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Identity
-                  </h3>
-                </div>
-                <dl className="grid grid-cols-[7rem_1fr] gap-y-1.5 text-label">
-                  {(
-                    [
-                      ["thread", a.thread_id],
-                      ["session", a.session_id],
-                      ["endpoint", a.endpoint],
-                      ["pid", a.pid],
-                      ["model", a.model],
-                      ["generation", a.generation],
-                      ["cwd", a.cwd],
-                      ["sandbox", a.sandbox],
-                    ] as [string, unknown][]
-                  )
-                    .filter(([, v]) => v !== null && v !== undefined && v !== "")
-                    .map(([k, v]) => (
-                      <div key={k} className="contents">
-                        <dt className="slabel">{k}</dt>
-                        <dd className="num text-ink-300 truncate" title={String(v)}>
-                          {String(v)}
-                        </dd>
-                      </div>
-                    ))}
-                  {detail.resume && (
-                    <div className="contents">
-                      <dt className="slabel">resume</dt>
-                      <dd>
-                        <code className="num text-micro text-accent bg-accent/10 rounded px-1.5 py-0.5">
-                          {detail.resume}
-                        </code>
-                      </dd>
-                    </div>
-                  )}
-                  {Object.entries(a.params ?? {}).map(([k, v]) => (
+      <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
+        {!detail && !err && (
+          <p role="status" className="text-label text-ink-500">
+            Loading agent details…
+          </p>
+        )}
+        {err && (
+          <div className="space-y-2">
+            <p role="alert" className="text-label text-fail">
+              Could not load agent details: {err}
+            </p>
+            <Button onClick={() => setRetry((r) => r + 1)}>
+              Retry details
+            </Button>
+          </div>
+        )}
+        {fenced && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-fail">
+              Recovery required
+            </h3>
+            <p className="text-label text-ink-400 mt-1">
+              An operator must inspect the outcome before reconciling.
+            </p>
+            <RecoveryBlock
+              text={
+                recovery ??
+                "Recovery guidance unavailable. Refresh agent details before taking action."
+              }
+            />
+          </section>
+        )}
+        {observed && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
+              Current work
+            </h3>
+            <WorkBlock agent={observed} onOpenIssue={onOpenIssue} />
+            <AgentQueue agent={observed} />
+            <div className="mt-2">
+              <AgentActivity agent={observed} />
+            </div>
+          </section>
+        )}
+        {profile && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
+              Model, effort & usage
+            </h3>
+            <ProfileBlock agent={profile} />
+          </section>
+        )}
+        {resume && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
+              Resume command
+            </h3>
+            <p className="text-label text-ink-400 mb-2">
+              {observed?.resume_hint ??
+                "For use in a terminal by the operator."}
+            </p>
+            <pre className="agents-command num text-label text-accent bg-accent/10 rounded p-3">
+              {resume}
+            </pre>
+          </section>
+        )}
+        {detail && a && (
+          <>
+            <section>
+              <div className="flex items-baseline gap-2 mb-2">
+                <h3 className="text-cardtitle font-semibold text-ink-100">
+                  Identity
+                </h3>
+              </div>
+              <dl className="grid grid-cols-[7rem_minmax(0,1fr)] gap-y-1.5 text-label">
+                {(
+                  [
+                    ["thread", a.thread_id],
+                    ["session", a.session_id],
+                    ["endpoint", a.endpoint],
+                    ["pid", a.pid],
+                    ["model", a.model],
+                    ["generation", a.generation],
+                    ["cwd", a.cwd],
+                    ["sandbox", a.sandbox],
+                  ] as [string, unknown][]
+                )
+                  .filter(([, v]) => v !== null && v !== undefined && v !== "")
+                  .map(([k, v]) => (
                     <div key={k} className="contents">
-                      <dt className="slabel" title={`param ${k}`}>
-                        {k}
-                      </dt>
+                      <dt className="slabel">{k}</dt>
                       <dd
-                        className="num text-ink-300 truncate"
-                        title={typeof v === "string" ? v : JSON.stringify(v)}
+                        className="num text-ink-300 break-words"
+                        title={String(v)}
                       >
-                        {typeof v === "string" ? v : JSON.stringify(v)}
+                        {String(v)}
                       </dd>
                     </div>
                   ))}
-                </dl>
-              </section>
+                {Object.entries(a.params ?? {}).map(([k, v]) => (
+                  <div key={k} className="contents">
+                    <dt className="slabel" title={`param ${k}`}>
+                      {k}
+                    </dt>
+                    <dd
+                      className="num text-ink-300 break-words"
+                      title={typeof v === "string" ? v : JSON.stringify(v)}
+                    >
+                      {typeof v === "string" ? v : JSON.stringify(v)}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
 
-              {(detail.tasks?.length ?? 0) > 0 && (
-                <section>
-                  <div className="flex items-baseline gap-2 mb-2">
-                    <h3 className="text-cardtitle font-semibold text-ink-100">
-                      Tasks
-                    </h3>
-                    <span className="kicker">assigned in flight</span>
-                  </div>
-                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
-                    {detail.tasks!.map((t) => (
-                      <li
-                        key={t}
-                        className="flex items-center gap-2.5 px-3 py-2.5"
-                      >
-                        <span className="num text-label text-ink-200">{t}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-
-              {(detail.on?.length ?? 0) > 0 && (
-                <section>
-                  <div className="flex items-baseline gap-2 mb-2">
-                    <h3 className="text-cardtitle font-semibold text-ink-100">
-                      Issues
-                    </h3>
-                    <span className="kicker">bound through the job</span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {detail.on!.map((id) => (
-                      <button
-                        key={id}
-                        className="lnk"
-                        onClick={() => onOpenIssue(id)}
-                      >
-                        {id}
-                      </button>
-                    ))}
-                  </div>
-                </section>
-              )}
-
-              {(detail.running.length > 0 || detail.queued > 0) && (
-                <section>
-                  <div className="flex items-baseline gap-2 mb-2">
-                    <h3 className="text-cardtitle font-semibold text-ink-100">
-                      Messages
-                    </h3>
-                    <span className="kicker">
-                      {detail.running.length} running · {detail.queued} queued ·{" "}
-                      {detail.unknown} unknown
-                    </span>
-                  </div>
-                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
-                    {detail.running.map((m) => (
-                      <li
-                        key={m.id}
-                        className="flex items-center gap-2.5 px-3 py-2.5"
-                      >
-                        <i className="w-1.5 h-1.5 rounded-full bg-info" />
-                        <span className="num text-label text-ink-200">{m.id}</span>
-                        {m.task && (
-                          <span className="num text-micro text-ink-500">
-                            task {m.task}
-                          </span>
-                        )}
-                        {m.summary && (
-                          <span className="num text-micro text-ink-400 truncate" title={m.summary}>
-                            {m.summary}
-                          </span>
-                        )}
-                        {m.created && (
-                          <span className="num text-micro text-ink-500 ml-auto">
-                            {fmtTime(m.created)}
-                          </span>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-
-              {capList.length > 0 && (
-                <section>
-                  <div className="flex items-baseline gap-2 mb-2">
-                    <h3 className="text-cardtitle font-semibold text-ink-100">
-                      Capabilities
-                    </h3>
-                    <span className="kicker">from the registry</span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {capList.map(([k, v]) => (
-                      <span
-                        key={k}
-                        className="chip bg-ink-800 text-ink-300"
-                        title={typeof v === "string" ? v : k}
-                      >
-                        {typeof v === "string" ? `${k}: ${v}` : k}
-                      </span>
-                    ))}
-                  </div>
-                </section>
-              )}
-
+            {(detail.tasks?.length ?? 0) > 0 && (
               <section>
                 <div className="flex items-baseline gap-2 mb-2">
                   <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Events
+                    Tasks
                   </h3>
-                  <span className="kicker">last {detail.events.length}</span>
+                  <span className="kicker">assigned in flight</span>
                 </div>
-                {detail.events.length ? (
-                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
-                    {detail.events.map((e) => (
-                      <li
-                        key={e.seq}
-                        className="flex items-baseline gap-2.5 px-3 py-2"
-                      >
-                        <span className="num text-micro text-ink-500 w-8 shrink-0">
-                          #{e.seq}
-                        </span>
-                        <span className="num text-label text-ink-200">
-                          {e.kind}
-                        </span>
-                        {(e.task_id || e.job_id) && (
-                          <span className="num text-micro text-ink-500">
-                            {e.task_id ?? e.job_id}
-                          </span>
-                        )}
-                        <span className="num text-micro text-ink-500 ml-auto shrink-0">
-                          {fmtTime(e.at)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-secondary text-ink-500">No events yet.</p>
-                )}
+                <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                  {detail.tasks!.map((t) => (
+                    <li
+                      key={t}
+                      className="flex items-center gap-2.5 px-3 py-2.5"
+                    >
+                      <span className="num text-label text-ink-200 break-words">
+                        {t}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
               </section>
-            </>
-          )}
+            )}
+
+            {(detail.on?.length ?? 0) > 0 && (
+              <section>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3 className="text-cardtitle font-semibold text-ink-100">
+                    Issues
+                  </h3>
+                  <span className="kicker">bound through the job</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {detail.on!.map((id) => (
+                    <button
+                      key={id}
+                      className="lnk"
+                      onClick={() => onOpenIssue(id)}
+                    >
+                      {id}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {(detail.running.length > 0 || detail.queued > 0) && (
+              <section>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3 className="text-cardtitle font-semibold text-ink-100">
+                    Messages
+                  </h3>
+                  <span className="kicker">
+                    {detail.running.length} running · {detail.queued} queued ·{" "}
+                    {detail.unknown} unknown
+                  </span>
+                </div>
+                <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                  {detail.running.map((m) => (
+                    <li
+                      key={m.id}
+                      className="flex items-center gap-2.5 px-3 py-2.5"
+                    >
+                      <i className="w-1.5 h-1.5 rounded-full bg-info" />
+                      <span className="num text-label text-ink-200 break-words">
+                        {m.id}
+                      </span>
+                      {m.task && (
+                        <span className="num text-micro text-ink-500">
+                          task {m.task}
+                        </span>
+                      )}
+                      {m.summary && (
+                        <span
+                          className="num text-micro text-ink-400 truncate"
+                          title={m.summary}
+                        >
+                          {m.summary}
+                        </span>
+                      )}
+                      {m.created && (
+                        <span className="num text-micro text-ink-500 ml-auto">
+                          {fmtTime(m.created)}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+
+            {capList.length > 0 && (
+              <section>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3 className="text-cardtitle font-semibold text-ink-100">
+                    Capabilities
+                  </h3>
+                  <span className="kicker">from the registry</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {capList.map(([k, v]) => (
+                    <span
+                      key={k}
+                      className="chip bg-ink-800 text-ink-300"
+                      title={typeof v === "string" ? v : k}
+                    >
+                      {typeof v === "string" ? `${k}: ${v}` : k}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <section>
+              <div className="flex items-baseline gap-2 mb-2">
+                <h3 className="text-cardtitle font-semibold text-ink-100">
+                  Events
+                </h3>
+                <span className="kicker">last {detail.events.length}</span>
+              </div>
+              {detail.events.length ? (
+                <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                  {detail.events.map((e) => (
+                    <li
+                      key={e.seq}
+                      className="flex flex-wrap items-baseline gap-2.5 px-3 py-2"
+                    >
+                      <span className="num text-micro text-ink-500 w-8 shrink-0">
+                        #{e.seq}
+                      </span>
+                      <span className="num text-label text-ink-200 break-words">
+                        {e.kind}
+                      </span>
+                      {(e.task_id || e.job_id) && (
+                        <span className="num text-micro text-ink-500">
+                          {e.task_id ?? e.job_id}
+                        </span>
+                      )}
+                      <span className="num text-micro text-ink-500 ml-auto shrink-0">
+                        {fmtTime(e.at)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-secondary text-ink-500">No events yet.</p>
+              )}
+            </section>
+          </>
+        )}
+      </div>
+    </dialog>
+  );
+}
+
+function AgentState({ agent }: { agent: Agent }) {
+  const st = agentStatus(agent);
+  return (
+    <span className={`chip ${STATE_CHIP[st] ?? STATE_CHIP.stopped}`}>
+      <i
+        aria-hidden="true"
+        className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[st] ?? STATE_DOT.stopped}`}
+      />
+      {st}
+    </span>
+  );
+}
+
+function AgentQueue({ agent: a }: { agent: Agent }) {
+  return (
+    <div className="text-label">
+      <span className="num text-ink-400">
+        {a.running} running · {a.queued} queued
+      </span>
+      {a.unknown > 0 && (
+        <div className="text-fail mt-1">{a.unknown} outcome unknown</div>
+      )}
+      {a.parked > 0 && (
+        <div className="text-ink-500 mt-1">{a.parked} parked</div>
+      )}
+    </div>
+  );
+}
+
+function AgentActivity({ agent: a }: { agent: Agent }) {
+  return (
+    <div className="text-label text-ink-400">
+      <span className="num">
+        {a.last_activity ? fmtTime(a.last_activity) : "No activity recorded"}
+      </span>
+      {a.stalled ? (
+        <div className="text-warn mt-1">
+          Stalled · {fmtSilence(a.silent_secs ?? 0)}
         </div>
-      </aside>
-    </>
+      ) : (a.silent_secs ?? 0) >= 60 ? (
+        <div className="text-micro text-ink-500 mt-1">
+          Silent · {fmtSilence(a.silent_secs!)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AgentIdentity({
+  agent: a,
+  onOpen,
+}: {
+  agent: Agent;
+  onOpen: () => void;
+}) {
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        className="agent-name"
+        onClick={onOpen}
+        aria-label={`Open agent ${a.alias}`}
+      >
+        {a.alias}
+      </button>
+      <p className="text-micro text-ink-500 mt-1 break-words">
+        {a.role ?? "Agent"} · {a.provider} · {a.group_root ? "root" : a.group}
+      </p>
+    </div>
   );
 }
 
@@ -641,341 +877,300 @@ export default function Agents({
   onOpenAgent: setOpen,
   onOpenIssue,
   onRetry,
+  onRetryAssignments,
 }: {
   state: ResourceState<AgentsPayload>;
-  /** Project binding joins agents to these cards (scope.ts). */
   issues: ResourceState<IssueCard[]>;
   project: string;
-  /** The agent whose drawer is open — the route's `/agents/:alias`. */
   open: string | null;
   onOpenAgent: (alias: string | null) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
+  onRetryAssignments: () => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<AgentFilter>("all");
   const payload = state.data;
-  const issues = issuesState.data ?? [];
-  const issueProjects = issueIndex(issues);
+  const scopeUnavailable = project !== "all" && issuesState.data === null;
+  const issueProjects = issueIndex(issuesState.data ?? []);
   const allAgents = payload?.agents ?? [];
-  const agents = allAgents
-    .filter((agent) => agentMatchesProject(agent, project, issueProjects))
-    .slice()
-    .sort((a, b) => rank(a) - rank(b) || a.alias.localeCompare(b.alias));
-  const globalAgents = allAgents.filter((agent) => agentIsUnassigned(agent, issueProjects));
-  const otherProjectAgents = project === "all"
-    ? []
-    : allAgents.filter((agent) => !agentMatchesProject(agent, project, issueProjects) && !agentIsUnassigned(agent, issueProjects));
-  const totals = agents.reduce(
-    (sum, agent) => ({
-      running: sum.running + agent.running,
-      queued: sum.queued + agent.queued,
-      fenced: sum.fenced + (agent.fenced ? 1 : 0),
-      parked: sum.parked + agent.parked,
-      inboxes: sum.inboxes + (agent.inbox ? 1 : 0),
-    }),
-    { running: 0, queued: 0, fenced: 0, parked: 0, inboxes: 0 },
+  const scoped = allAgents.filter((a) =>
+    agentMatchesProject(a, project, issueProjects),
   );
-  // Rows show once anything loaded (ok, empty or stale); a failed
-  // refresh keeps them and says so in the header chip.
-  const showRows = payload !== null;
-  const emptyCopy = agentsEmptyCopy(project);
+  const counts = Object.fromEntries(
+    AGENT_FILTERS.map(({ value }) => [
+      value,
+      value === "all"
+        ? scoped.length
+        : scoped.filter((a) => agentCategory(a) === value).length,
+    ]),
+  ) as Record<AgentFilter, number>;
+  const agents = scoped
+    .filter(
+      (a) =>
+        (filter === "all" || agentCategory(a) === filter) &&
+        agentMatchesSearch(a, query, issueProjects),
+    )
+    .sort(
+      (a, b) => agentOrder(a) - agentOrder(b) || a.alias.localeCompare(b.alias),
+    );
+  const globalAgents = allAgents.filter((a) =>
+    agentIsUnassigned(a, issueProjects),
+  );
+  const otherProjectAgents =
+    project === "all"
+      ? []
+      : allAgents.filter(
+          (a) =>
+            !agentMatchesProject(a, project, issueProjects) &&
+            !agentIsUnassigned(a, issueProjects),
+        );
+  const filtered = filter !== "all" || query.trim() !== "";
+  const reset = () => {
+    setQuery("");
+    setFilter("all");
+  };
+  const emptyCopy =
+    scoped.length === 0
+      ? agentsEmptyCopy(project)
+      : "No agents match these filters.";
+  const agent = allAgents.find((a) => a.alias === open);
+  const summary = !payload
+    ? state.status === "failed"
+      ? "Agents unavailable"
+      : "Loading agents…"
+    : scopeUnavailable
+      ? issuesState.status === "failed"
+        ? "Assignments unavailable"
+        : "Loading assignments…"
+      : `${scoped.length} ${project === "all" ? "across all projects" : `in ${project}`}`;
 
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
-      <div
-        className="flex flex-wrap items-end gap-x-3 gap-y-3 mb-4 reveal"
-        style={{ animationDelay: "40ms" }}
-      >
-        <h1 className="text-section font-semibold text-ink-100 leading-tight">
-          Agents
-        </h1>
-        <span className="kicker">
-          {agents.length} in {project === "all" ? "all projects" : project} · {totals?.fenced ?? 0} fenced ·{" "}
-          {totals?.queued ?? 0} queued
-        </span>
+    <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
+      <div className="flex flex-wrap items-center gap-3 mb-2">
+        <h1 className="text-section font-semibold text-ink-100">Agents</h1>
+        <span className="text-label text-ink-500">{summary}</span>
         <StaleChip state={state} />
       </div>
+      <p className="text-label text-ink-400 mb-5">
+        See current work, waiting agents, and recent activity.
+      </p>
 
-      {project !== "all" && (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
-        <div className="card mb-4 px-4 py-3 text-label text-ink-400 border-ink-700">
-          <span className="text-ink-200">
-            Scope is dispatch (a job task on an issue) or ownership (owner of a doing/review issue), the CLI ISSUES rule.
-          </span>{" "}
-          {globalAgents.length > 0 && `${globalAgents.length} global or unassigned observation${globalAgents.length === 1 ? " remains" : "s remain"}. `}
-          {otherProjectAgents.length > 0 && `${otherProjectAgents.length} other-project agent${otherProjectAgents.length === 1 ? " is" : "s are"} available in All projects.`}
-        </div>
-      )}
-
+      {project !== "all" &&
+        issuesState.data !== null &&
+        (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
+          <p className="text-label text-ink-500 mb-4">
+            Agents working on or owning active issues in {project}.{" "}
+            {otherProjectAgents.length > 0 &&
+              `${otherProjectAgents.length} in other projects are visible in All projects.`}
+          </p>
+        )}
       {payload?.daemon === "unreachable" && (
-        <div className="card mb-4 px-4 py-3 text-secondary text-warn border-warn/40">
-          daemon unreachable — the table below is the last known state.
+        <div
+          className="card mb-4 px-4 py-3 text-label text-warn border-warn/40"
+          role="status"
+        >
+          Daemon unavailable. Showing the last known agent state.
         </div>
       )}
-
       <ResourceGate
         state={state}
-        loading="loading agent observations…"
-        failed="could not load agent observations"
+        loading="Loading agents…"
+        failed="Could not load agents"
         onRetry={onRetry}
       />
-      {showRows && project !== "all" && issuesState.data === null && (
-        <div className="card mb-4 px-4 py-3 text-label text-ink-400" role="status">
-          {issuesState.status === "failed"
-            ? "issues did not load — only job-bound agents can be matched to this project"
-            : "loading issues — owner bindings to this project appear once they load"}
-        </div>
-      )}
-
-      {showRows && project !== "all" && globalAgents.length > 0 && (
-        <details className="mb-4">
-          <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
-            Global or unassigned agents · {globalAgents.length}
-          </summary>
-          <p className="text-micro text-ink-500 mt-2">
-            These agents have no exact issue binding in the current payload and are not assigned to {project}.
+      {payload && scopeUnavailable && (
+        <div className="text-label text-warn mb-4 space-y-2">
+          <p role={issuesState.status === "failed" ? "alert" : "status"}>
+            {issuesState.status === "failed"
+              ? "Project issue assignments could not be loaded. Select All projects to see every agent."
+              : "Loading project issue assignments…"}
           </p>
-          <div className="flex flex-wrap gap-1.5 mt-2">
-            {globalAgents.map((agent) => (
-              <button key={agent.alias} className="chip bg-ink-800 text-ink-300 hover:text-accent" onClick={() => setOpen(agent.alias)}>
-                {agent.alias} · {stateLabel(agent)}
-              </button>
-            ))}
-          </div>
-        </details>
+          {issuesState.status === "failed" && (
+            <Button onClick={onRetryAssignments}>Retry assignments</Button>
+          )}
+        </div>
+      )}
+      {project !== "all" && issuesState.status === "stale" && (
+        <p role="status" className="text-label text-warn mb-4">
+          Project issue assignments may be out of date.
+        </p>
       )}
 
-      {/* Phone: stacked agent cards — the table's columns don't fit 390px. */}
-      {showRows && <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
-        {agents.map((a) => {
-          const st = stateLabel(a);
-          return (
-            <article
-              key={a.alias}
-              role="button"
-              tabIndex={0}
-              onClick={() => setOpen(a.alias)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  setOpen(a.alias);
-                }
-              }}
-              className={`card w-full text-left p-3.5 space-y-2 cursor-pointer ${
-                a.fenced ? "border-fail/40" : ""
-              }`}
+      {payload && !scopeUnavailable && (
+        <>
+          <div className="agents-tools mb-4">
+            <div
+              className="agents-filters"
+              role="group"
+              aria-label="Filter agents by status"
             >
-              <div className="flex items-center gap-2">
-                <i className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[st] ?? STATE_DOT.stopped}`} />
-                <span className="num text-label text-ink-100 font-medium">
-                  {a.alias}
-                </span>
-                <span className={`chip ml-auto ${STATE_CHIP[st] ?? STATE_CHIP.stopped}`}>
-                  {st}
-                </span>
-              </div>
-              {a.fenced && <RecoveryBlock text={a.recovery ?? "fenced"} />}
-              <div className="grid grid-cols-[5.4rem_1fr] gap-y-1 text-label">
-                <span className="slabel">provider</span>
-                <span className="num text-ink-300">
-                  {a.provider}/{a.endpoint_kind}
-                </span>
-                <span className="slabel">group</span>
-                <span className="num text-ink-300">
-                  {a.group_root ? "root" : a.group}
-                </span>
-                <span className="slabel">role</span>
-                <span className="num text-ink-300">
-                  {a.role ?? "unknown"}
-                  {a.team_role ? ` · team ${a.team_role}` : ""}
-                </span>
-                <span className="slabel">model</span>
-                <div><ProfileBlock agent={a} /></div>
-                <span className="slabel">current work</span>
-                <div className="min-w-0">
-                  <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
-                  <OwnedIssues agent={a} index={issueProjects} onOpenIssue={onOpenIssue} />
-                </div>
-                {a.on.length > 0 && (
-                  <>
-                    <span className="slabel">on issue</span>
-                    <span className="flex flex-wrap gap-1.5">
-                      {a.on.map((id) => (
-                        <span
-                          key={id}
-                          role="link"
-                          className="lnk"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenIssue(id);
-                          }}
-                        >
-                          {id}
-                        </span>
-                      ))}
-                    </span>
-                  </>
-                )}
-                <span className="slabel">running</span>
-                <span className="num text-ink-300">
-                  {a.running}
-                  {a.message?.id ? ` · ${a.message.id}` : ""}
-                </span>
-                <span className="slabel">queued</span>
-                <span className={`num ${a.unknown > 0 ? "text-fail" : "text-ink-300"}`}>
-                  {a.queued}
-                  {a.unknown > 0 ? ` +${a.unknown} unk` : ""}
-                </span>
-                <span className="slabel">activity</span>
-                <span className="num text-ink-300">
-                  {a.last_activity ? fmtTime(a.last_activity) : "—"}
-                  {a.stalled
-                    ? ` · stalled ${fmtSilence(a.silent_secs ?? 0)}`
-                    : (a.silent_secs ?? 0) >= 60
-                      ? ` · silent ${fmtSilence(a.silent_secs!)}`
-                      : ""}
-                </span>
-                {(a.fenced || a.resume) && (
-                  <>
-                    <span className="slabel">recovery</span>
-                    <span>
-                      {a.fenced ? (
-                        <span className="chip bg-fail/10 text-fail">reconcile</span>
-                      ) : (
-                        <code className="num text-micro text-ink-400" title={a.resume_hint ?? "resume command"}>
-                          {a.resume}
-                        </code>
-                      )}
-                    </span>
-                  </>
-                )}
-              </div>
-            </article>
-          );
-        })}
-        {agents.length === 0 && (
-          <div className="card p-8 text-center text-ink-500">
-            {emptyCopy}
-          </div>
-        )}
-      </div>}
-
-      {showRows && <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
-        <div className="overflow-x-auto">
-        <table className="w-full min-w-[64rem] text-label">
-          <thead>
-            <tr className="border-b border-ink-700 text-left">
-              <th className="slabel font-normal px-4 py-2.5">agent</th>
-              <th className="slabel font-normal px-3 py-2.5">provider</th>
-              <th className="slabel font-normal px-3 py-2.5">state</th>
-              <th className="slabel font-normal px-3 py-2.5">group</th>
-              <th className="slabel font-normal px-3 py-2.5">model / effort / usage</th>
-              <th className="slabel font-normal px-3 py-2.5">current work</th>
-              <th className="slabel font-normal px-3 py-2.5">queue</th>
-              <th className="slabel font-normal px-3 py-2.5">last activity</th>
-              <th className="slabel font-normal px-3 py-2.5">recovery</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-ink-700/70">
-            {agents.map((a) => {
-              const st = stateLabel(a);
-              return (
-                <tr
-                  key={a.alias}
-                  onClick={() => setOpen(a.alias)}
-                  className={`cursor-pointer hover:bg-ink-850 transition-colors ${
-                    a.fenced ? "bg-fail/[.04]" : ""
-                  }`}
+              {AGENT_FILTERS.filter(
+                (f) =>
+                  f.value !== "other" || counts.other > 0 || filter === "other",
+              ).map(({ value, label }) => (
+                <button
+                  key={value}
+                  type="button"
+                  className="agents-filter"
+                  aria-pressed={filter === value}
+                  onClick={() => setFilter(value)}
                 >
-                  <td className="px-4 py-2.5 align-top">
-                    <span className="num text-ink-100">{a.alias}</span>
-                    <div className="num text-micro text-ink-500 truncate" title={a.role ?? "role unknown"}>
-                      {a.role ?? "role unknown"}
+                  {label}
+                  <span className="num">{counts[value]}</span>
+                </button>
+              ))}
+            </div>
+            <label className="agents-search" htmlFor="agents-search">
+              <IconSearch />
+              <span className="sr-only">Search agents</span>
+              <input
+                id="agents-search"
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search agents, work, or issues"
+              />
+            </label>
+          </div>
+          {filtered && (
+            <div className="flex items-center gap-3 mb-3 text-label text-ink-500">
+              <span role="status">
+                Showing {agents.length} of {scoped.length} agents
+              </span>
+              <Button variant="ghost" size="sm" onClick={reset}>
+                Clear filters
+              </Button>
+            </div>
+          )}
+          {agents.length === 0 ? (
+            <div className="card py-10 px-5 text-center text-label text-ink-500">
+              {emptyCopy}
+            </div>
+          ) : (
+            <>
+              <div className="agents-cards space-y-3">
+                {agents.map((a) => (
+                  <article key={a.alias} className="card p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <AgentIdentity
+                        agent={a}
+                        onOpen={() => setOpen(a.alias)}
+                      />
+                      <AgentState agent={a} />
                     </div>
-                    {a.fenced && <RecoveryBlock text={a.recovery ?? "fenced"} />}
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <span className="num text-ink-400">
-                      {a.provider}/{a.endpoint_kind}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <span className={`chip ${STATE_CHIP[st] ?? STATE_CHIP.stopped}`}>
-                      <i className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[st] ?? STATE_DOT.stopped}`} />
-                      {st}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <span className="num text-ink-400">
-                      {a.group_root ? "root" : a.group}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <ProfileBlock agent={a} />
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
-                  <OwnedIssues agent={a} index={issueProjects} onOpenIssue={onOpenIssue} />
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <span className={`num ${a.unknown > 0 ? "text-fail" : "text-ink-200"}`}>
-                      {a.running} running · {a.queued} queued
-                    </span>
-                    {a.unknown > 0 && <div className="num text-micro text-fail mt-0.5">{a.unknown} unknown</div>}
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    <span className="num text-ink-400">
-                      {a.last_activity ? fmtTime(a.last_activity) : "—"}
-                    </span>
-                    {a.stalled ? (
-                      <div>
-                        <span className="chip bg-warn/10 text-warn mt-1">
-                          stalled {fmtSilence(a.silent_secs ?? 0)}
-                        </span>
-                      </div>
-                    ) : (a.silent_secs ?? 0) >= 60 ? (
-                      <div className="num text-micro text-ink-500 mt-0.5">
-                        silent {fmtSilence(a.silent_secs!)}
-                      </div>
-                    ) : null}
-                  </td>
-                  <td className="px-3 py-2.5 align-top">
-                    {a.fenced ? (
-                      <span className="chip bg-fail/10 text-fail">
-                        reconcile
-                      </span>
-                    ) : a.resume ? (
-                      <code
-                        className="num text-micro text-ink-400"
-                        title={a.resume_hint ?? "resume command"}
-                      >
-                        {a.resume}
-                      </code>
-                    ) : (
-                      <span className="num text-ink-600">—</span>
+                    {a.fenced && (
+                      <p className="text-label text-fail mt-2">
+                        Recovery required · Open agent for guidance
+                      </p>
                     )}
-                  </td>
-                </tr>
-              );
-            })}
-            {agents.length === 0 && (
-              <tr>
-                <td colSpan={9} className="px-4 py-8 text-center text-ink-500">
-                  {emptyCopy}
-                </td>
-              </tr>
+                    <div className="mt-3">
+                      <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
+                      <RelatedIssues
+                        agent={a}
+                        index={issueProjects}
+                        onOpenIssue={onOpenIssue}
+                      />
+                    </div>
+                    <div className="agents-card-footer">
+                      <AgentQueue agent={a} />
+                      <AgentActivity agent={a} />
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <div className="agents-table card overflow-hidden">
+                <table className="w-full text-label">
+                  <caption className="sr-only">
+                    Agents in {project === "all" ? "all projects" : project}
+                  </caption>
+                  <thead>
+                    <tr>
+                      {[
+                        "Agent",
+                        "Status",
+                        "Current work",
+                        "Queue",
+                        "Last activity",
+                      ].map((h) => (
+                        <th
+                          key={h}
+                          scope="col"
+                          className="slabel font-normal text-left px-4 py-3"
+                        >
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-ink-700/70">
+                    {agents.map((a) => (
+                      <tr key={a.alias}>
+                        <td>
+                          <AgentIdentity
+                            agent={a}
+                            onOpen={() => setOpen(a.alias)}
+                          />
+                        </td>
+                        <td>
+                          <AgentState agent={a} />
+                          {a.fenced && (
+                            <p className="text-micro text-fail mt-2">
+                              Recovery required
+                            </p>
+                          )}
+                        </td>
+                        <td>
+                          <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
+                          <RelatedIssues
+                            agent={a}
+                            index={issueProjects}
+                            onOpenIssue={onOpenIssue}
+                          />
+                        </td>
+                        <td>
+                          <AgentQueue agent={a} />
+                        </td>
+                        <td>
+                          <AgentActivity agent={a} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {project !== "all" &&
+            issuesState.data !== null &&
+            globalAgents.length > 0 && (
+              <details className="mt-5 agents-unassigned">
+                <summary className="text-label text-ink-500 cursor-pointer">
+                  Global or unassigned agents · {globalAgents.length}
+                </summary>
+                <p className="text-label text-ink-500 my-2">
+                  These agents have no issue assignment to a project.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {globalAgents.map((a) => (
+                    <Button
+                      key={a.alias}
+                      size="sm"
+                      onClick={() => setOpen(a.alias)}
+                    >
+                      {a.alias}
+                    </Button>
+                  ))}
+                </div>
+              </details>
             )}
-          </tbody>
-        </table>
-        </div>
-      </div>}
-
-      <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
-        daemon agent_list + agent_show · binding via tasks × jobs.issue_id ·
-        fenced agents need `cadence agent unfence` / `message reconcile`.
-      </footer>
-
+        </>
+      )}
       {open && (
         <AgentDrawer
+          key={open}
           alias={open}
+          observed={agent}
           onClose={() => setOpen(null)}
           onOpenIssue={(id) => {
             setOpen(null);

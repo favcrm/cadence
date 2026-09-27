@@ -1,0 +1,205 @@
+.agents-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  justify-content: space-between;
+}
+.agents-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.agents-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.25rem;
+  padding: 0.4rem 0.65rem;
+  border-radius: 0.35rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  cursor: pointer;
+}
+.agents-filter:hover {
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+}
+.agents-filter[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  color: var(--color-accent);
+}
+.agents-filter .num {
+  font-size: var(--text-micro);
+  opacity: 0.8;
+}
+.agents-search {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  border-radius: 0.4rem;
+  padding: 0 0.75rem;
+  width: 19rem;
+  max-width: 100%;
+  color: var(--color-ink-500);
+}
+.agents-search input {
+  min-width: 0;
+  flex: 1;
+  height: 2.25rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-200);
+  background: transparent;
+  outline: none;
+}
+.agents-search:focus-within {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.agents-filter:focus-visible,
+.agent-name:focus-visible,
+.agents-page .lnk:focus-visible,
+.agents-drawer .lnk:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+  border-radius: 0.2rem;
+}
+.agent-name {
+  display: block;
+  max-width: 100%;
+  text-align: left;
+  font-weight: 500;
+  font-size: var(--text-label);
+  color: var(--color-ink-100);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.agent-name:hover {
+  color: var(--color-accent);
+}
+.agents-table table {
+  table-layout: fixed;
+}
+.agents-table th:nth-child(1) {
+  width: 22%;
+}
+.agents-table th:nth-child(2) {
+  width: 13%;
+}
+.agents-table th:nth-child(3) {
+  width: 34%;
+}
+.agents-table th:nth-child(4) {
+  width: 16%;
+}
+.agents-table th:nth-child(5) {
+  width: 15%;
+}
+.agents-table td {
+  padding: 1rem;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.agents-table tr:hover {
+  background: var(--color-ink-850);
+}
+.agents-cards {
+  display: none;
+}
+.agents-card-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+  border-top: 1px solid var(--color-ink-700);
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+}
+.agents-drawer {
+  position: fixed;
+  inset: 0 0 0 auto;
+  margin: 0;
+  padding: 0;
+  width: min(36rem, 100%);
+  max-width: 100%;
+  height: 100dvh;
+  max-height: 100dvh;
+  display: none;
+  flex-direction: column;
+  overflow-wrap: anywhere;
+}
+.agents-drawer[open] {
+  display: flex;
+}
+.agents-drawer::backdrop {
+  background: var(--color-scrim);
+}
+.agents-close {
+  width: 2.75rem;
+  min-height: 2.75rem;
+  flex-shrink: 0;
+}
+.agents-command,
+.agents-drawer pre,
+.agents-profile {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.agents-drawer .agents-profile {
+  white-space: normal;
+}
+.agents-drawer .truncate {
+  white-space: normal;
+  overflow: visible;
+}
+.agents-drawer .chip {
+  max-width: 100%;
+  white-space: normal;
+}
+.agents-drawer li {
+  flex-wrap: wrap;
+}
+.agents-drawer li > .num {
+  min-width: 0;
+}
+.agents-drawer dd {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 1199px) {
+  .agents-table {
+    display: none;
+  }
+  .agents-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 639px) {
+  .agents-tools {
+    gap: 0.75rem;
+  }
+  .agents-search {
+    width: 100%;
+    order: -1;
+  }
+  .agents-search input {
+    height: 2.75rem;
+    font-size: 1rem;
+  }
+  .agents-filter,
+  .agent-name,
+  .agents-page .lnk,
+  .agents-drawer .lnk {
+    min-height: 2.75rem;
+  }
+  .agents-page .lnk,
+  .agents-drawer .lnk {
+    display: inline-flex;
+    align-items: center;
+  }
+  .agents-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

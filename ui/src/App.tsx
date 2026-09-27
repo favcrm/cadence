@@ -865,6 +865,7 @@ export default function App() {
             onOpenAgent={openAgent}
             onOpenIssue={openIssue}
             onRetry={() => void resources.agents.refresh()}
+            onRetryAssignments={() => void resources.issues.refresh()}
           />
         )}
         {route.screen === "wiki" && (
