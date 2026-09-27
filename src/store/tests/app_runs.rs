@@ -36,6 +36,128 @@ fn cad631_material_digests_are_canonical_and_never_git_shas() {
     );
 }
 
+fn fractional_timestamp_fixture() -> (TempDir, Store, Value) {
+    let (dir, s, initial) = runtime_fixture();
+    {
+        let conn = s.write_conn().unwrap();
+        for (alias, created) in [
+            ("writer", 1_790_532_111.978_594_5_f64),
+            ("reviewer", 1_790_532_113.522_274_5_f64),
+        ] {
+            conn.execute(
+                "UPDATE agents SET created=? WHERE alias=?",
+                params![created, alias],
+            )
+            .unwrap();
+        }
+    }
+    let workflow = serde_json::from_value(initial["snapshot"]["workflow"].clone()).unwrap();
+    let inputs = std::collections::BTreeMap::new();
+    let run = s
+        .app_run_create(crate::store::app_runs::LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "fractional-timestamps",
+            owner_pm: "lead",
+            project_link: None,
+        })
+        .unwrap();
+    (dir, s, run)
+}
+
+#[test]
+fn cad701_persisted_fractional_identity_keeps_digest_and_can_dispatch() {
+    use crate::store::app_runs::material_digest;
+    let (_dir, s, run) = fractional_timestamp_fixture();
+    let id = run["id"].as_str().unwrap();
+    let (raw, digest): (String, String) = s
+        .write_conn()
+        .unwrap()
+        .query_row(
+            "SELECT snapshot,snapshot_digest FROM app_runs WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        material_digest(&serde_json::from_str(&raw).unwrap()),
+        digest
+    );
+    assert_eq!(material_digest(&run["snapshot"]), digest);
+    assert_eq!(
+        run["snapshot"]["assignments"]["s1"]["identity"]["created"]
+            .as_f64()
+            .unwrap()
+            .to_bits(),
+        1_790_532_111.978_594_5_f64.to_bits(),
+    );
+    s.app_run_decide(id, Some(&digest), false, Some("sha256:bundle"))
+        .unwrap();
+    assert_eq!(
+        s.app_run_dispatch(id, "sha256:bundle").unwrap()["state"],
+        "running"
+    );
+    assert_eq!(s.app_run_show(id).unwrap()["snapshot_digest"], digest);
+}
+
+#[test]
+fn cad701_exact_float_parsing_preserves_tamper_and_identity_refusals() {
+    let (_dir, s, run) = fractional_timestamp_fixture();
+    let id = run["id"].as_str().unwrap();
+    let digest = run["snapshot_digest"].as_str().unwrap();
+    assert!(s
+        .app_run_decide(id, Some("sha256:forged"), false, Some("sha256:bundle"))
+        .is_err());
+    let raw: String = s
+        .write_conn()
+        .unwrap()
+        .query_row("SELECT snapshot FROM app_runs WHERE id=?", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut forged: Value = serde_json::from_str(&raw).unwrap();
+    forged["workflow"]["steps"][0]["instruction"] = json!("Forged instruction");
+    s.write_conn()
+        .unwrap()
+        .execute(
+            "UPDATE app_runs SET snapshot=? WHERE id=?",
+            params![forged.to_string(), id],
+        )
+        .unwrap();
+    assert!(s
+        .app_run_decide(id, Some(digest), false, Some("sha256:bundle"))
+        .unwrap_err()
+        .to_string()
+        .contains("snapshot receipt is corrupt"));
+    s.write_conn()
+        .unwrap()
+        .execute(
+            "UPDATE app_runs SET snapshot=? WHERE id=?",
+            params![raw, id],
+        )
+        .unwrap();
+    s.app_run_decide(id, Some(digest), false, Some("sha256:bundle"))
+        .unwrap();
+    s.write_conn()
+        .unwrap()
+        .execute(
+            "UPDATE agents SET created=created+1 WHERE alias='writer'",
+            [],
+        )
+        .unwrap();
+    assert!(s
+        .app_run_dispatch(id, "sha256:bundle")
+        .unwrap_err()
+        .to_string()
+        .contains("assignment changed"));
+    assert!(s
+        .messages_for_task(run["steps"][0]["task_id"].as_str().unwrap())
+        .unwrap()
+        .is_empty());
+}
+
 pub(super) fn runtime_fixture() -> (TempDir, Store, Value) {
     let (dir, s) = store();
     for (alias, role) in [("lead", "pm"), ("writer", "worker"), ("reviewer", "worker")] {
