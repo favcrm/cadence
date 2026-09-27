@@ -85,6 +85,8 @@ const errors = new Set<string>();
 const held = new Set<string>();
 const pending: { path: string; resolve: (r: Response) => void }[] = [];
 let comments = 0;
+let enforceRevision = false;
+const historyReads: Record<string, number> = {};
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
@@ -95,6 +97,9 @@ globalThis.fetch = async (input, init) => {
   const id = path.split("/")[3];
   if (init?.method === "POST") {
     comments++;
+    const request = JSON.parse(String(init.body));
+    if (enforceRevision && request.if_rev !== details[id].rev)
+      return json({ error: "Issue changed; re-read and retry" }, 409);
     if (held.has("comment"))
       return new Promise<Response>((resolve) =>
         pending.push({ path: "comment", resolve }),
@@ -106,7 +111,8 @@ globalThis.fetch = async (input, init) => {
   if (held.has(path))
     return new Promise<Response>((resolve) => pending.push({ path, resolve }));
   if (errors.has(path)) return json({ error: `Sample failure: ${path}` }, 503);
-  if (path.endsWith("/history"))
+  if (path.endsWith("/history")) {
+    historyReads[id] = (historyReads[id] ?? 0) + 1;
     return json({
       id,
       history: [
@@ -115,10 +121,11 @@ globalThis.fetch = async (input, init) => {
           at: "2026-09-27T00:00:00Z",
           by: "operator",
           kind: "set",
-          summary: `History for ${id}`,
+          summary: `History for ${id} at ${details[id]?.rev}`,
         },
       ],
     });
+  }
   if (path.endsWith("/lane"))
     return json({ issue: id, lane: null, providers: [] });
   if (details[id]) return json(details[id]);
@@ -188,19 +195,123 @@ const write = async (value: string) => {
 const scenario = require("process").argv[2] ?? "all";
 async function run() {
   await render();
+  if (scenario === "all" || scenario === "cold_history") {
+    details["CAD-4"] = detail("CAD-4");
+    id = "CAD-4";
+    tab = "activity";
+    held.add("/api/issues/CAD-4");
+    await render();
+    assert(
+      historyReads[id] === 1,
+      "History read settles independently while initial detail waits",
+    );
+    details[id] = { ...details[id], rev: "r2" };
+    held.clear();
+    await React.act(async () =>
+      pending.splice(0).forEach((p) => p.resolve(json(details[id]))),
+    );
+    await flush();
+    assert(
+      text().includes("History for CAD-4 at r2"),
+      "Initial detail revision refreshes independently loaded old history",
+    );
+    id = "CAD-1";
+    tab = "overview";
+    await render();
+  }
+  if (scenario === "all" || scenario === "conflict") {
+    details["CAD-5"] = detail("CAD-5");
+    id = "CAD-5";
+    tab = "activity";
+    await render();
+    await write("Preserve this conflict draft");
+    details[id] = { ...details[id], rev: "r2" };
+    enforceRevision = true;
+    const before = comments;
+    await click(button(/^Post comment$/));
+    assert(
+      host.querySelector("textarea")?.value === "Preserve this conflict draft",
+      "409 preserves the comment draft",
+    );
+    assert(
+      resources.issue(id).get().data?.rev === "r2",
+      "409 re-reads detail for a current revision before manual retry",
+    );
+    assert(
+      comments === before + 1,
+      "Conflict recovery never automatically repeats a write",
+    );
+    await click(button(/^Post comment$/));
+    assert(
+      comments === before + 2 && host.querySelector("textarea")?.value === "",
+      "Manual retry sends the refreshed revision and succeeds",
+    );
+    enforceRevision = false;
+    id = "CAD-1";
+    tab = "overview";
+    await render();
+  }
+  if (scenario === "all" || scenario === "conflict_inflight") {
+    details["CAD-6"] = detail("CAD-6");
+    id = "CAD-6";
+    tab = "activity";
+    await render();
+    const oldDetail = { ...details[id] };
+    held.add("/api/issues/CAD-6");
+    await React.act(async () => {
+      void resources.issue(id).refresh();
+    });
+    await flush();
+    details[id] = { ...details[id], rev: "r2" };
+    enforceRevision = true;
+    await write("Conflict during an older read");
+    await click(button(/^Post comment$/));
+    held.clear();
+    await React.act(async () =>
+      pending.splice(0).forEach((p) => p.resolve(json(oldDetail))),
+    );
+    await flush();
+    assert(
+      resources.issue(id).get().data?.rev === "r2",
+      "409 invalidates a read that started before the conflict and waits for its fresh follow-up",
+    );
+    await click(button(/^Post comment$/));
+    assert(
+      host.querySelector("textarea")?.value === "",
+      "Conflict during a stale inflight read recovers on explicit retry",
+    );
+    enforceRevision = false;
+    id = "CAD-1";
+    tab = "overview";
+    await render();
+  }
   if (scenario === "all" || scenario === "initial") {
     details["CAD-3"] = detail("CAD-3");
     id = "CAD-3";
     held.add("/api/issues/CAD-3");
     await render();
-    assert(text().includes("Loading issue"), "Initial issue read shows loading");
+    assert(
+      text().includes("Loading issue"),
+      "Initial issue read shows loading",
+    );
     held.clear();
-    await React.act(async () => pending.splice(0).forEach(p => p.resolve(json({error:"Initial issue unavailable"},503))));
+    await React.act(async () =>
+      pending
+        .splice(0)
+        .forEach((p) =>
+          p.resolve(json({ error: "Initial issue unavailable" }, 503)),
+        ),
+    );
     await flush();
-    assert(text().includes("Issue could not be loaded.") && !text().includes("Work CAD-3"), "Initial failure does not paint an issue");
+    assert(
+      text().includes("Issue could not be loaded.") &&
+        !text().includes("Work CAD-3"),
+      "Initial failure does not paint an issue",
+    );
     await click(button(/Retry issue/));
     assert(text().includes("Work CAD-3"), "Initial failure retry recovers");
-    id = "CAD-1"; await render();
+    id = "CAD-1";
+    await render();
   }
   if (scenario === "all" || scenario === "issue") {
     errors.add("/api/issues/CAD-1");

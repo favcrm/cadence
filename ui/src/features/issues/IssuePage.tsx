@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Resource, type ResourceState } from "../../lib/cache";
-import { api, type WriteResp } from "../../lib/api";
+import { api, ApiError, type WriteResp } from "../../lib/api";
 import { fmtBytes, fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
@@ -104,8 +104,8 @@ function IssueWorkspace(props: Props) {
   const revision = useRef(detail?.rev);
   const [kickoff, setKickoff] = useState(false);
   useEffect(() => {
-    // The mount read already covers the first revision; later writes refresh history.
-    if (detail?.rev && revision.current && detail.rev !== revision.current)
+    // History and detail settle independently, including the first cold revision.
+    if (detail?.rev && detail.rev !== revision.current)
       void historyResource.invalidate();
     revision.current = detail?.rev;
   }, [detail?.rev, historyResource]);
@@ -494,6 +494,14 @@ function Activity({
     } catch (e) {
       setError(e instanceof Error ? e.message : "Comment could not be posted.");
       onError(e, "comment");
+      // Keep the draft and optimistic concurrency; the next explicit retry uses
+      // a fresh revision after another writer changed the issue. Never replay it.
+      if (e instanceof ApiError && e.status === 409) {
+        const resource = resources.issue(id);
+        await resource.invalidate();
+        // Invalidation of an older in-flight read schedules one fresh follow-up.
+        if (resource.get().inFlight) await resource.refresh();
+      }
     } finally {
       pending.current = false;
       setBusy(false);
