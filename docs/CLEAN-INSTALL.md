@@ -3,7 +3,8 @@
 `clean-install.yml` validates installation of an exact release package on native
 Ubuntu 22.04 x86-64, Ubuntu 22.04 ARM64 and macOS 14 ARM64 runners. This increment
 covers the actual installer, default and custom prefixes, package/installed
-digests and manifest, exact `--version`, exact symlink destination, and unchanged
+digests and full installed-manifest equality with the verified acquisition
+manifest, exact `--version`, exact symlink destination, and unchanged
 file and symlink inode/mtime/content on both same-version reruns.
 
 CAD-317 remains open: setup JSON, headless wizard, fake-provider operation and

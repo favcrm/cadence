@@ -653,7 +653,7 @@ def _file_state(path):
 
 
 def harness(installer, tag, sha, target, expect_sha256, mode,
-            base_url=None, root=None, evidence_path=None):
+            expected_manifest, base_url=None, root=None, evidence_path=None):
     """Install-only smoke: default prefix, a rerun, and a custom --prefix
     under its own fresh root. The first failed step stops everything;
     every step's argv/exit/stdout/stderr is recorded."""
@@ -668,6 +668,10 @@ def harness(installer, tag, sha, target, expect_sha256, mode,
     else:
         require(type(base_url) is str and base_url.startswith("file://"),
                 "candidate mode allows a file:// mirror only")
+    package_manifest = json.loads(Path(expected_manifest).read_text())
+    check_manifest(package_manifest, tag, sha, target)
+    require(package_manifest["sha256"] == expect_sha256,
+            "expected package manifest binary digest mismatch")
     installer = Path(installer).resolve()
     require(installer.is_file(), "installer missing")
     parent = Path(root or "/tmp").resolve()
@@ -680,6 +684,7 @@ def harness(installer, tag, sha, target, expect_sha256, mode,
                 "target": target, "root": str(root),
                 "path_tools": linked, "forbidden_absent": FORBIDDEN_ON_PATH,
                 "expect_binary_sha256": expect_sha256,
+                "expected_package_manifest": package_manifest,
                 "steps": [], "installs": {}, "pending": {
                     "setup": "setup --json not exercised in this increment",
                     "headless-wizard": "not exercised in this install-only increment",
@@ -747,6 +752,8 @@ def harness(installer, tag, sha, target, expect_sha256, mode,
                                     "installed inner checksum", "cadence") == expect_sha256,
                     "installed inner checksum mismatch")
             check_manifest(manifest, tag, sha, target)
+            require(manifest == package_manifest,
+                    "installed manifest differs from verified package manifest")
             require(manifest["sha256"] == expect_sha256,
                     "installed manifest sha256 mismatch")
         except ValueError as error:
@@ -850,6 +857,8 @@ def main():
     harness_parser.add_argument("--target", required=True,
                                 choices=sorted(TARGETS))
     harness_parser.add_argument("--expect-sha256", required=True)
+    harness_parser.add_argument("--expected-manifest", required=True,
+                                help="Verified acquisition manifest JSON")
     harness_parser.add_argument("--mode", default="candidate",
                                 choices=["candidate", "published"])
     harness_parser.add_argument("--base-url", default=None)
@@ -868,6 +877,7 @@ def main():
         return 0
     evidence = harness(args.installer, args.tag, args.sha, args.target,
                        args.expect_sha256, args.mode,
+                       expected_manifest=args.expected_manifest,
                        base_url=args.base_url, root=args.root,
                        evidence_path=args.out)
     print(json.dumps({"ok": evidence["ok"], "root": evidence["root"],

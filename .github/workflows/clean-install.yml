@@ -128,6 +128,7 @@ jobs:
                   '--installer', str(package / 'install.sh'), '--tag', env['PACKAGE_TAG'],
                   '--sha', env['PACKAGE_SHA'], '--target', env['PACKAGE_TARGET'],
                   '--expect-sha256', manifest['sha256'], '--mode', env['PACKAGE_MODE'],
+                  '--expected-manifest', str(package / 'manifest.json'),
                   '--out', str(evidence / 'harness.json')]
           if env['PACKAGE_MODE'] == 'candidate':
               mirror = pathlib.Path(env['RUNNER_TEMP']) / 'candidate-mirror'

@@ -376,7 +376,7 @@ class CleanInstallTests(unittest.TestCase):
                                      "BASH_ENV": "/bad"}):
             result = self.module.harness(
                 package / "install.sh", self.tag, self.sha, target,
-                binary_sha, "candidate", base_url=(root / "mirror").as_uri(),
+                binary_sha, "candidate", expected_manifest=package / "manifest.json", base_url=(root / "mirror").as_uri(),
                 root=root, evidence_path=root / "evidence.json")
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["full_cad317_acceptance"])
@@ -472,7 +472,7 @@ class CleanInstallTests(unittest.TestCase):
                 with patch.object(self.module, "run", altered):
                     result = self.module.harness(
                         package / "install.sh", self.tag, self.sha, "x86_64-linux",
-                        digest, "candidate", base_url=(root / "mirror").as_uri(), root=root)
+                        digest, "candidate", expected_manifest=package / "manifest.json", base_url=(root / "mirror").as_uri(), root=root)
                 self.assertFalse(result["ok"], result)
                 self.assertEqual(installs, 1 if scenario == "wrong-link" else 2)
                 self.assertNotIn("custom-prefix", result["installs"])
@@ -494,11 +494,47 @@ class CleanInstallTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.module.paged("repos/favcrm/cadence/jobs", "jobs")
 
+    def test_installed_manifest_must_equal_verified_package_on_each_prefix(self):
+        for forged_prefix in ("default", "custom"):
+            with self.subTest(prefix=forged_prefix), tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+                root = Path(temporary)
+                api, gh, digest, _ = self.candidate_fixture(root)
+                package = root / "package"
+                with patch.object(self.module, "api", api), patch.object(self.module, "gh", gh):
+                    self.module.acquire_candidate(self.tag, self.sha, "x86_64-linux", 7, 1, package)
+                mirror = root / "mirror" / self.tag
+                mirror.mkdir(parents=True)
+                asset = f"cadence-{self.tag}-x86_64-linux.tar.gz"
+                for name in (asset, asset + ".sha256"):
+                    (mirror / name).write_bytes((package / name).read_bytes())
+                original = self.module.run
+                seen = set()
+                def forged(argv, env=None, cwd=None, timeout=120):
+                    record = original(argv, env, cwd, timeout)
+                    if argv[0] == "sh":
+                        custom = "--prefix" in argv
+                        prefix = (Path(argv[argv.index("--prefix") + 1]) if custom
+                                  else Path(env["XDG_DATA_HOME"]) / "cadence")
+                        if prefix not in seen and custom == (forged_prefix == "custom"):
+                            seen.add(prefix)
+                            path = prefix / "releases" / self.tag / "manifest.json"
+                            manifest = json.loads(path.read_text())
+                            manifest.update(run_id=999, run_attempt=999,
+                                            rustc="forged toolchain", built_at="forged timestamp")
+                            path.write_text(json.dumps(manifest))
+                    return record
+                with patch.object(self.module, "run", forged):
+                    result = self.module.harness(
+                        package / "install.sh", self.tag, self.sha, "x86_64-linux",
+                        digest, "candidate", expected_manifest=package / "manifest.json", base_url=(root / "mirror").as_uri(), root=root)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("manifest", result["failure"]["detail"])
+
     def test_public_mode_cannot_use_candidate_mirror(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             with self.assertRaises(ValueError), patch.object(self.module, "run") as run:
                 self.module.harness("unused", self.tag, self.sha, "x86_64-linux",
-                                    "a" * 64, "published", base_url=Path(temporary).as_uri())
+                                    "a" * 64, "published", expected_manifest="unused", base_url=Path(temporary).as_uri())
             run.assert_not_called()
 
 
