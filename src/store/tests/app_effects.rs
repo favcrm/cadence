@@ -1,5 +1,101 @@
 use super::*;
 
+#[test]
+fn cad692_uncertain_outcome_and_resolution_preserve_exact_historical_authority() {
+    let (_dir, s) = store();
+    let (row, authority) = child_fixture(&s);
+    let staged = s.app_effect_stage(&row, &authority).unwrap();
+    let digest = staged["effect"]["digest"].as_str().unwrap();
+    let outcome = json!({"kind":"uncertain","error":"directory sync failed","verified":true});
+    assert!(s.app_effect_uncertain(&row.effect_id, &outcome).is_err());
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "close")
+        .is_err());
+    s.effect_decide(&row.request, true, &json!({"by":{"member":"operator","role":"operator","rule":"exact-app-artifact-release"},"at":"now"})).unwrap();
+    s.app_effect_claim(&row.effect_id, digest, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    let before = s.app_effect_show(&row.effect_id).unwrap();
+    s.app_effect_uncertain(&row.effect_id, &outcome).unwrap();
+    let uncertain = s.app_effect_show(&row.effect_id).unwrap();
+    assert_eq!(uncertain["effect"]["state"], "reconcile");
+    assert_eq!(uncertain["effect"]["record"]["outcome"], outcome);
+    assert!(s.effect_by_id(&row.effect_id).unwrap().unwrap().needs_you);
+    assert!(s
+        .app_effect_claim(&row.effect_id, digest, |_, _| Ok(true))
+        .unwrap()
+        .is_none());
+    assert!(s.app_effect_uncertain(&row.effect_id, &outcome).is_err());
+    assert!(s
+        .app_effect_resolve(&row.effect_id, "forged", "close")
+        .is_err());
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "acknowledge")
+        .is_err());
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "retry")
+        .is_err());
+    assert_eq!(s.app_effect_show(&row.effect_id).unwrap(), uncertain);
+    let closed = s
+        .app_effect_resolve(&row.effect_id, digest, "close")
+        .unwrap();
+    assert_eq!(closed["effect"]["state"], "closed");
+    assert_eq!(
+        closed["effect"]["record"]["close_reason"],
+        "operator_reconciled"
+    );
+    assert_eq!(closed["effect"]["record"]["outcome"], outcome);
+    for field in ["authority", "digest", "request"] {
+        assert_eq!(closed["effect"][field], before["effect"][field]);
+    }
+    for field in ["input", "preview", "decision", "source_hash"] {
+        assert_eq!(
+            closed["effect"]["record"][field],
+            before["effect"]["record"][field]
+        );
+    }
+    assert!(!s.effect_by_id(&row.effect_id).unwrap().unwrap().needs_you);
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "close")
+        .is_err());
+}
+
+#[test]
+fn cad692_terminal_acknowledgement_is_digest_pinned_and_never_erases_outcome() {
+    let (_dir, s) = store();
+    let (row, authority) = child_fixture(&s);
+    let staged = s.app_effect_stage(&row, &authority).unwrap();
+    let digest = staged["effect"]["digest"].as_str().unwrap();
+    s.effect_decide(&row.request, true, &json!({"by":{"member":"operator","role":"operator","rule":"exact-app-artifact-release"},"at":"now"})).unwrap();
+    s.app_effect_claim(&row.effect_id, digest, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    let outcome = json!({"kind":"refused","error":"known refusal","verified":false});
+    s.effect_outcome(&row.effect_id, false, &outcome, "known refusal")
+        .unwrap();
+    let before = s.app_effect_show(&row.effect_id).unwrap();
+    assert!(s
+        .app_effect_resolve(&row.effect_id, "forged", "acknowledge")
+        .is_err());
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "close")
+        .is_err());
+    let acknowledged = s
+        .app_effect_resolve(&row.effect_id, digest, "acknowledge")
+        .unwrap();
+    assert_eq!(acknowledged["effect"]["state"], "failed");
+    assert_eq!(
+        acknowledged["effect"]["authority"],
+        before["effect"]["authority"]
+    );
+    assert_eq!(acknowledged["effect"]["record"], before["effect"]["record"]);
+    assert_eq!(acknowledged["effect"]["digest"], before["effect"]["digest"]);
+    assert!(!s.effect_by_id(&row.effect_id).unwrap().unwrap().needs_you);
+    assert!(s
+        .app_effect_resolve(&row.effect_id, digest, "acknowledge")
+        .is_err());
+}
+
 // This is a storage receipt fixture, not an accepted-run lifecycle proof.
 // The native suite independently produces and reviews the actual artifact.
 fn child_fixture(s: &Store) -> (crate::store::EffectRow, Value) {
