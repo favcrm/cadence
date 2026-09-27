@@ -27,6 +27,8 @@ use crate::store::{scope_list, scope_name, CredentialRecord, Grant};
 /// first, so the only `by` these rows can carry is the operator.
 const OPERATOR: &str = "operator";
 
+type CredentialMetadataProjection<'a> = dyn Fn(&CredentialRecord) -> Result<Value> + 'a;
+
 impl Shared {
     /// ADR 0006's P4 residual, surfaced as a gate: how this daemon's
     /// custody is isolated from the agents it manages. `Some(mode)`
@@ -56,7 +58,7 @@ impl Shared {
     /// as `custody_risk_accepted: "same-uid"`.
     pub(super) fn rpc_platform_enroll(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("platform enroll", params, peer_pid)?;
-        self.enroll_inner(params, false)
+        self.enroll_inner(params, false, None, None, None)
     }
 
     /// `platform_rotate {platform, account, ...}` — §5.3: re-enroll
@@ -65,28 +67,19 @@ impl Shared {
     /// the exposure it refreshes was consented to already.
     pub(super) fn rpc_platform_rotate(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("platform rotate", params, peer_pid)?;
-        self.enroll_inner(params, true)
+        self.enroll_inner(params, true, None, None, None)
     }
 
-    fn enroll_inner(&self, params: &Value, rotate: bool) -> Result<Value> {
+    pub(super) fn enroll_inner(
+        &self,
+        params: &Value,
+        rotate: bool,
+        expected_id: Option<&str>,
+        allowed_scopes: Option<&[String]>,
+        metadata_projection: Option<&CredentialMetadataProjection<'_>>,
+    ) -> Result<Value> {
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let account = identifier(required_str(params, "account")?, "Account")?;
-        let declared = match params.get("scopes") {
-            Some(_) => scope_list(params, "scopes")?,
-            // Rotation without a `scopes` keeps the record's set —
-            // redeclaring is optional, losing them never is.
-            None if rotate => self
-                .store
-                .platform_credential(&platform, &account)?
-                .map(|r| r.scopes)
-                .ok_or_else(|| {
-                    Error::rejected(format!(
-                        "no credential is enrolled for {platform}/{account} — \
-                         `platform enroll` it first"
-                    ))
-                })?,
-            None => return Err(Error::rejected("Missing or non-array 'scopes'")),
-        };
         let accept_risk = params
             .get("accept_same_uid_risk")
             .and_then(Value::as_bool)
@@ -108,6 +101,29 @@ impl Shared {
         // transaction, so these pre-checks only order the refusal
         // ahead of the write.
         let existing = self.store.platform_credential(&platform, &account)?;
+        if expected_id
+            .is_some_and(|id| existing.as_ref().map(|r| r.connection_id.as_str()) != Some(id))
+        {
+            return Err(Error::rejected("connection incarnation is stale"));
+        }
+        let declared = match params.get("scopes") {
+            Some(_) => scope_list(params, "scopes")?,
+            None if rotate => existing
+                .as_ref()
+                .map(|r| r.scopes.clone())
+                .ok_or_else(|| Error::rejected(format!(
+                    "no credential is enrolled for {platform}/{account} — `platform enroll` it first"
+                )))?,
+            None => return Err(Error::rejected("Missing or non-array scopes")),
+        };
+
+        if allowed_scopes
+            .is_some_and(|allowed| declared.iter().any(|scope| !allowed.contains(scope)))
+        {
+            return Err(Error::rejected(
+                "connection scopes are not declared by reviewed capabilities",
+            ));
+        }
         if !rotate && existing.is_some() {
             return Err(Error::rejected(format!(
                 "platform '{platform}' account '{account}' is already enrolled — \
@@ -149,10 +165,52 @@ impl Shared {
                 )))
             }
         };
+        platform::refuse_leak(
+            "platform enrollment metadata",
+            &json!({"platform":platform,"account":account,"scopes":enrollment.scopes}).to_string(),
+            &enrollment.bytes,
+        )?;
         let fingerprint = crate::secret::fingerprint(&enrollment.bytes);
+        let record = CredentialRecord {
+            connection_id: existing
+                .as_ref()
+                .map(|r| r.connection_id.clone())
+                .unwrap_or_else(|| format!("conn-{}", uuid::Uuid::new_v4().simple())),
+            credential_revision: existing
+                .as_ref()
+                .map(|r| {
+                    r.credential_revision
+                        .checked_add(1)
+                        .filter(|revision| *revision <= i64::MAX as u64)
+                        .ok_or_else(|| Error::rejected("connection revision is exhausted"))
+                })
+                .transpose()?
+                .unwrap_or(1),
+            platform,
+            account,
+            scopes: enrollment.scopes,
+            fingerprint,
+            custody: self.platform_custody.tag().to_string(),
+            exchange: enrollment.exchange.to_string(),
+            enrolled_at: crate::issue::time::now_epoch() as f64,
+            by: OPERATOR.to_string(),
+        };
+        platform::refuse_leak(
+            "platform credential metadata",
+            &record.to_json().to_string(),
+            &enrollment.bytes,
+        )?;
+        platform::refuse_leak("platform credential audit",&json!({"record":record.to_json(),"old":existing.as_ref().map(CredentialRecord::to_json),"rotated":rotate,"custody_risk_accepted":risk,"response":{"state":"enrolled","account":record.to_json()},"event_kinds":["platform_connected","credential_revoked","platform_disconnected"],"stream":"audit:platforms"}).to_string(),&enrollment.bytes)?;
+        if let Some(project) = metadata_projection {
+            platform::refuse_leak(
+                "connection metadata",
+                &project(&record)?.to_string(),
+                &enrollment.bytes,
+            )?;
+        }
         let key = custody::Key {
-            platform: &platform,
-            account: &account,
+            platform: &record.platform,
+            account: &record.account,
         };
         // A rotate captures the old bytes first: if the record write
         // fails, custody is put back exactly as it was — never left
@@ -162,17 +220,7 @@ impl Shared {
             Some(record) => Some(self.platform_custody.load(&record.custody, &key)?),
             None => None,
         };
-        let custody_tag = self.platform_custody.put(&key, &enrollment.bytes)?;
-        let record = CredentialRecord {
-            platform,
-            account,
-            scopes: enrollment.scopes,
-            fingerprint,
-            custody: custody_tag.to_string(),
-            exchange: enrollment.exchange.to_string(),
-            enrolled_at: crate::issue::time::now_epoch() as f64,
-            by: OPERATOR.to_string(),
-        };
+        self.platform_custody.put(&key, &enrollment.bytes)?;
         if let Err(err) = self.store.platform_enroll(&record, rotate, risk) {
             // The record refused — custody must hold exactly what the
             // record (still) describes: the old bytes for a rotate,
@@ -186,7 +234,7 @@ impl Shared {
                     let _ = self.platform_custody.put(&key, old);
                 }
                 None => {
-                    let _ = self.platform_custody.remove(custody_tag, &key);
+                    let _ = self.platform_custody.remove(&record.custody, &key);
                 }
             }
             return Err(err);
@@ -210,6 +258,10 @@ impl Shared {
     /// transaction.
     pub(super) fn rpc_platform_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("platform revoke", params, peer_pid)?;
+        self.revoke_inner(params, None)
+    }
+
+    pub(super) fn revoke_inner(&self, params: &Value, expected_id: Option<&str>) -> Result<Value> {
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let account = identifier(required_str(params, "account")?, "Account")?;
         let reason = optional_str(params, "reason");
@@ -227,6 +279,9 @@ impl Shared {
                     "no credential is enrolled for {platform}/{account}"
                 ))
             })?;
+        if expected_id.is_some_and(|id| record.connection_id != id) {
+            return Err(Error::rejected("connection incarnation is stale"));
+        }
         let key = custody::Key {
             platform: &platform,
             account: &account,

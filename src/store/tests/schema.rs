@@ -584,7 +584,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            20,
+            22,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -614,7 +614,7 @@
         // The released v18 schema predates app_grants entirely.
         Connection::open(&db).unwrap().execute_batch(
                 "DROP TABLE app_grants;
-                 INSERT INTO platform_credentials VALUES ('mail', 'work', '[\"send\"]', 'fingerprint', 'vault-ref', 'none', 42, 'operator:test');
+                 INSERT INTO platform_credentials(platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by) VALUES ('mail', 'work', '[\"send\"]', 'fingerprint', 'vault-ref', 'none', 42, 'operator:test');
                  UPDATE schema_version SET version=18;
                  CREATE TRIGGER fail_migration BEFORE UPDATE ON schema_version
                    BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END;",

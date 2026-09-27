@@ -590,6 +590,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "platform_default_set",
         Rule::Handler("operator_connection (CAD-366)"),
     ),
+    ("connection_providers", Rule::Handler("rpc_connection")),
+    ("connection_list", Rule::Handler("rpc_connection")),
+    ("connection_show", Rule::Handler("rpc_connection")),
+    ("connection_check", Rule::Handler("rpc_connection")),
+    ("connection_create", Rule::Handler("rpc_connection")),
+    ("connection_rotate", Rule::Handler("rpc_connection")),
+    ("connection_revoke", Rule::Handler("rpc_connection")),
     ("platform_accounts", Rule::Read),
     ("platform_defaults", Rule::Read),
     (

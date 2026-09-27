@@ -49,8 +49,9 @@ jobs:
   # run for that sha would re-test identical content. On a push to main
   # this job looks for that evidence: a merge_group run of this workflow
   # on a gh-readonly-queue/main/* ref whose head is exactly this sha and
-  # whose latest attempt has fmt, clippy, test, build and ui all
-  # `success`. When found, the five gates below are skipped here and the
+  # whose complete latest-attempt inventory has at least one job per
+  # gate name and every matching job completed successfully (CAD-420).
+  # When found, the five gates below are skipped here and the
   # run only builds and attests the release. When not found (a direct or
   # admin-bypass push, a queue entry whose gates did not all pass, or a
   # failed lookup), `tested` is false and every gate runs on this push as
@@ -84,8 +85,11 @@ jobs:
                 --jq '.workflow_runs[] | select(.head_sha == $ENV.SHA and (.head_branch | startswith("gh-readonly-queue/main/"))) | .id'); then
               for id in $ids; do
                 if passed=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
-                    --jq '[.jobs[] | select(.conclusion == "success") | .name] as $ok
-                          | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g | $ok | any(.[]; . == $g))'); then
+                    --paginate --slurp \
+                    | jq -r '[.[].jobs[]] as $jobs
+                          | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g
+                              | [$jobs[] | select(.name == $g)] as $matching
+                              | ($matching | length) > 0 and ($matching | all(.status == "completed" and .conclusion == "success")))'); then
                   if [ "$passed" = true ]; then
                     tested=true
                     run_id=$id
@@ -139,6 +143,8 @@ jobs:
         run: python3 tests/scripts/test_nextest_inventory.py
       - name: Test focused ordinary feedback
         run: python3 tests/scripts/test_test_feedback.py
+      - name: Test required gate evidence policy
+        run: python3 tests/scripts/test_ci_gate_evidence.py
       - name: Test assertion inventory scanner
         run: python3 tests/scripts/test_assert_inventory.py
 
@@ -573,7 +579,8 @@ jobs:
   # code (it only reads install.sh) and is the one job that can attest
   # and write the release. Every leg needs all five gates on the tagged
   # commit (queue-evidence reports false for tags, so they always run
-  # and no need of this chain is ever skipped), and release-gate refuses
+  # and release-gate refuses any failed/cancelled/skipped/missing result),
+  # and release-gate refuses
   # a tag that is not on main or does not match Cargo.toml's version.
   #
   # Assets, per target (x86_64-linux, aarch64-linux, aarch64-macos):
@@ -585,13 +592,23 @@ jobs:
   # upgrade` keeps in a release dir. Linux builds on 22.04 runners so the
   # binary needs glibc 2.35, not 2.39.
   release-gate:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     needs: [fmt, clippy, test, build, ui]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
+      - name: Every required upstream gate succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' >> "$GITHUB_STEP_SUMMARY"
+          echo "$NEEDS_JSON" | jq -e '. as $needs | ["fmt", "clippy", "test", "build", "ui"] | all(. as $gate | $needs[$gate].result == "success")' >/dev/null || {
+            echo "Required upstream gate failed, was cancelled/skipped, or has no result; refusing release" >&2
+            exit 1
+          }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Tag names this version and is on main
         env:

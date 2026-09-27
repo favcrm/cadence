@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod agenticos;
+pub mod connections;
 pub mod custody;
 pub mod local;
 

@@ -35,9 +35,23 @@ publication and use the configured approval gate. Do not bypass it. The
 workflow also expects immutable published releases; verify the repository's
 immutability setting before the first tag rather than relying on a workflow comment.
 
-CAD-420 is still backlog: the tag release-gate currently inherits ordinary
-needs/skip behavior, rather than emitting explicit results for each failed gate.
-This preparation does not duplicate or waive that hardening work.
+CAD-420 hardens evidence reuse: the latest-attempt jobs inventory is paginated,
+each required name must exist, and every job with that name must be completed
+and successful. Successful matrix/name collisions remain valid; any failed,
+cancelled, skipped or unfinished collision refuses reuse and runs the gates here.
+API/pagination errors also fall back to running the gates.
+
+The tag-only release-gate uses `always()` to evaluate upstream results instead
+of inheriting the default success/skip behavior. It records each result and
+refuses release builds unless fmt, clippy, test, build and ui all succeeded.
+This is an explicit scheduling/result policy, not a guarantee that GitHub can
+start a job after an entire run is externally cancelled. See GitHub's
+[status check functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+
+Required check names do not establish that the workflow itself is trustworthy.
+Review changes to this workflow and its evidence predicates independently;
+these checks do not implement CAD-120's trusted external QA boundary or prevent
+an authorized workflow change from replacing a gate with a weaker job.
 
 ## Release notes to complete for the approved candidate
 

@@ -1228,12 +1228,22 @@ fn verify_ci(
 /// otherwise the state seen, for the refusal.
 fn test_passed(src: &dyn ReleaseSource, run: &Run) -> Result<std::result::Result<(), String>> {
     let jobs = src.jobs(run.id)?;
-    Ok(match jobs.iter().find(|j| j.name == TEST_JOB) {
-        Some(j) if j.conclusion == "success" => Ok(()),
-        Some(j) if j.conclusion.is_empty() => Err(format!("{TEST_JOB} ({})", j.status)),
-        Some(j) => Err(format!("{TEST_JOB} {}", j.conclusion)),
-        None => Err(format!("no `{TEST_JOB}` job")),
-    })
+    let matching: Vec<_> = jobs.iter().filter(|j| j.name == TEST_JOB).collect();
+    if matching.is_empty() {
+        return Ok(Err(format!("no `{TEST_JOB}` job")));
+    }
+    // Required checks identify a name, not a unique job: a successful
+    // collision must not hide a failed, skipped or unfinished test job.
+    Ok(
+        match matching
+            .into_iter()
+            .find(|j| j.status != "completed" || j.conclusion != "success")
+        {
+            Some(j) if j.conclusion.is_empty() => Err(format!("{TEST_JOB} ({})", j.status)),
+            Some(j) => Err(format!("{TEST_JOB} {} ({})", j.conclusion, j.status)),
+            None => Ok(()),
+        },
+    )
 }
 
 /// Steps 4–7 on the downloaded files.

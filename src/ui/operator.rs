@@ -105,6 +105,22 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/contexts/*/archive",
         RouteClass::OperatorOnly,
     ),
+    route("POST", "/api/connections", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/connections/*/rotate",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/connections/*/revoke",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/connections/*/status",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/app-runs", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/cancel", RouteClass::OperatorOnly),

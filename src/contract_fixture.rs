@@ -466,6 +466,27 @@ impl FakePlatform {
 // drives for a real adapter. The credential crosses the seam as
 // enrolled opaque bytes; the fake ignores it.
 impl crate::platform::PlatformAdapter for FakePlatform {
+    fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
+        use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
+        Some(ProviderDescriptor {
+            schema: 1,
+            provider: "fixture".into(),
+            revision: "fixture-connections/1".into(),
+            enrollment_shapes: vec!["token".into()],
+            builtin_accounts: vec![],
+            capabilities: vec![CapabilityDescriptor {
+                id: "widgets.read".into(),
+                version: 1,
+                tools: vec!["widgets.list".into()],
+                scopes: vec!["widgets:read".into()],
+                effect: "read".into(),
+                semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
+            }],
+        })
+    }
+    fn connection_registration(&self) -> Option<String> {
+        Some("fixture-connections/1".into())
+    }
     fn table(&self) -> &ToolTable {
         self.table()
     }

@@ -10,14 +10,12 @@ pub const CONFIG_BYTES: usize = 32 * 1024;
 pub const CONTEXT_LIMIT: i64 = 100;
 
 pub(super) const SCHEMA: &str = "
-CREATE TABLE app_contexts(
+CREATE TABLE IF NOT EXISTS app_contexts(
  id TEXT PRIMARY KEY, install_id TEXT NOT NULL, request_id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
  state TEXT NOT NULL CHECK(state IN ('active','archived')),
  config_json TEXT NOT NULL, config_digest TEXT NOT NULL,
  created REAL NOT NULL, updated REAL NOT NULL, UNIQUE(install_id,request_id));
-ALTER TABLE app_runs ADD COLUMN context_id TEXT REFERENCES app_contexts(id);
-CREATE INDEX app_runs_context ON app_runs(install_id,context_id,created);
 ";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

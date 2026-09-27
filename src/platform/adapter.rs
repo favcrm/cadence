@@ -31,6 +31,16 @@ pub trait PlatformAdapter: Send + Sync {
     /// to the manifest version it was reviewed against (§5.2).
     fn table(&self) -> &ToolTable;
 
+    /// Reviewed discovery metadata. Legacy adapters default unavailable.
+    fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
+        None
+    }
+
+    /// Composition receipt, not a live account/deployment health proof.
+    fn connection_registration(&self) -> Option<String> {
+        None
+    }
+
     /// The manifest version the *platform* reports now — the platform
     /// side of the pin. `None` reports nothing, so every call gates as
     /// `send` (a call argument can never assert the match).

@@ -380,7 +380,7 @@ fn cad631_v19_additive_migration_is_atomic_and_preserves_legacy_queue() {
         .unwrap();
     }
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TABLE app_run_reviews; DROP TABLE app_run_artifacts; DROP TABLE app_run_steps; DROP TABLE app_runs; DROP TABLE app_install_capabilities; UPDATE schema_version SET version=19; CREATE TRIGGER fail_app_migration BEFORE UPDATE ON schema_version BEGIN SELECT RAISE(ABORT, 'forced app migration failure'); END;").unwrap();
+    conn.execute_batch("DROP TABLE app_run_reviews; DROP TABLE app_run_artifacts; DROP TABLE app_run_steps; DROP TABLE app_runs; DROP TABLE app_contexts; DROP TABLE app_install_capabilities; UPDATE schema_version SET version=19; CREATE TRIGGER fail_app_migration BEFORE UPDATE ON schema_version BEGIN SELECT RAISE(ABORT, 'forced app migration failure'); END;").unwrap();
     drop(conn);
     assert!(Store::open_for_schema_tests(&db)
         .err()
@@ -584,7 +584,7 @@ fn cad631_v18_upgrade_commits_only_completed_migrations_before_v20_failure() {
     drop(s);
     let db = dir.path().join("t.sqlite3");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TABLE app_run_reviews; DROP TABLE app_run_artifacts; DROP TABLE app_run_steps; DROP TABLE app_runs; DROP TABLE app_install_capabilities; DROP TABLE app_grants; UPDATE schema_version SET version=18; CREATE TRIGGER fail_v20 BEFORE UPDATE ON schema_version WHEN NEW.version=20 BEGIN SELECT RAISE(ABORT, 'forced v20 migration failure'); END;").unwrap();
+    conn.execute_batch("DROP TABLE app_run_reviews; DROP TABLE app_run_artifacts; DROP TABLE app_run_steps; DROP TABLE app_runs; DROP TABLE app_contexts; DROP TABLE app_install_capabilities; DROP TABLE app_grants; UPDATE schema_version SET version=18; CREATE TRIGGER fail_v20 BEFORE UPDATE ON schema_version WHEN NEW.version=20 BEGIN SELECT RAISE(ABORT, 'forced v20 migration failure'); END;").unwrap();
     drop(conn);
     assert!(Store::open_for_schema_tests(&db)
         .err()
@@ -629,7 +629,7 @@ fn cad631_v18_upgrade_commits_only_completed_migrations_before_v20_failure() {
             .query_row("SELECT version FROM schema_version", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        20
+        crate::rollout::SCHEMA_VERSION
     );
 }
 

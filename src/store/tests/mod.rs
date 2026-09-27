@@ -398,3 +398,213 @@ include!("schema.rs");
 mod app_runs;
 
 mod app_contexts;
+
+#[test]
+fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    let initialized = Store::open_for_schema_tests(&path).unwrap();
+    reg(&initialized, "grant-worker", dir.path());
+    drop(initialized);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE platform_credentials;
+        CREATE TABLE platform_credentials(platform TEXT NOT NULL,account TEXT NOT NULL,scopes TEXT NOT NULL,fingerprint TEXT NOT NULL,custody TEXT NOT NULL,exchange TEXT NOT NULL,enrolled_at REAL NOT NULL,by TEXT NOT NULL,PRIMARY KEY(platform,account));
+        INSERT INTO platform_credentials VALUES('fixture','old-account','[\"widgets:read\"]','old-fingerprint','file','token',1,'operator');
+        INSERT INTO platform_credentials VALUES('fixture','second-account','[\"widgets:read\"]','second-fingerprint','file','token',2,'operator');
+        INSERT INTO platform_grants VALUES('grant-worker','fixture','old-account','[\"widgets:read\"]',1,'operator');
+        INSERT INTO platform_defaults VALUES('legacy-project','fixture','old-account',1,'operator');
+        INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('kept-run','kept-install',1,'digest','{}','digest','grant-worker','kept-request','succeeded',1,1);
+        INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('kept-effect','kept-effect-request','grant-worker','fixture','old-account','widgets.publish','{}','kept input','kept preview','[\"widgets:publish\"]','verified',1,1);
+        DROP TABLE IF EXISTS connection_metadata;
+        DROP INDEX app_runs_context;
+        ALTER TABLE app_runs DROP COLUMN context_id;
+        DROP TABLE app_contexts;
+        UPDATE schema_version SET version=20;
+        CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
+    assert!(Store::open_for_schema_tests(&path).is_err());
+    assert_eq!(
+        db.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        20
+    );
+    assert!(db
+        .prepare("SELECT connection_id FROM platform_credentials")
+        .is_err());
+    for name in ["connection_metadata", "platform_connection_id"] {
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name=?",
+                [name],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "{name} leaked from rollback"
+        );
+    }
+    db.execute_batch("DROP TRIGGER reject_connection_schema")
+        .unwrap();
+    drop(db);
+    let store = Store::open_for_schema_tests(&path).unwrap();
+    let row = store
+        .platform_credential("fixture", "old-account")
+        .unwrap()
+        .unwrap();
+    assert!(!row.connection_id.is_empty());
+    assert_eq!(row.credential_revision, 1);
+    assert_eq!(row.fingerprint, "old-fingerprint");
+    let second = store
+        .platform_credential("fixture", "second-account")
+        .unwrap()
+        .unwrap();
+    assert_ne!(row.connection_id, second.connection_id);
+    for table in [
+        "platform_grants",
+        "platform_defaults",
+        "app_runs",
+        "platform_effects",
+    ] {
+        assert_eq!(
+            store
+                .conn()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "{table}"
+        );
+    }
+    let namespace = store.connection_workspace_id().unwrap();
+    drop(store);
+    let reopened = Store::open_for_schema_tests(&path).unwrap();
+    assert_eq!(
+        reopened
+            .platform_credential("fixture", "old-account")
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        row.connection_id
+    );
+    assert_eq!(reopened.connection_workspace_id().unwrap(), namespace);
+}
+
+#[test]
+fn cad688_store_rotation_cannot_replace_identity_or_reset_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("test.sqlite3")).unwrap();
+    let mut record = CredentialRecord {
+        connection_id: "conn-first".into(),
+        credential_revision: 1,
+        platform: "fixture".into(),
+        account: "work".into(),
+        scopes: vec!["widgets:read".into()],
+        fingerprint: "first".into(),
+        custody: "file".into(),
+        exchange: "token".into(),
+        enrolled_at: 1.0,
+        by: "operator".into(),
+    };
+    let mut invalid = record.clone();
+    invalid.connection_id.clear();
+    assert!(store.platform_enroll(&invalid, false, None).is_err());
+    invalid = record.clone();
+    invalid.credential_revision = 0;
+    assert!(store.platform_enroll(&invalid, false, None).is_err());
+    store.platform_enroll(&record, false, None).unwrap();
+    let before = store
+        .conn()
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    for (id, revision) in [
+        ("conn-replacement", 2),
+        ("conn-first", 1),
+        ("conn-first", 3),
+    ] {
+        invalid = record.clone();
+        invalid.connection_id = id.into();
+        invalid.credential_revision = revision;
+        invalid.fingerprint = "replacement".into();
+        assert!(store.platform_enroll(&invalid, true, None).is_err());
+        let retained = store
+            .platform_credential("fixture", "work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.connection_id, "conn-first");
+        assert_eq!(retained.credential_revision, 1);
+        assert_eq!(retained.fingerprint, "first");
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+    }
+    record.credential_revision = 2;
+    record.fingerprint = "second".into();
+    store.platform_enroll(&record, true, None).unwrap();
+    assert_eq!(
+        store
+            .platform_credential("fixture", "work")
+            .unwrap()
+            .unwrap()
+            .credential_revision,
+        2
+    );
+}
+
+#[test]
+fn cad688_duplicate_connection_id_cannot_replace_another_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("test.sqlite3")).unwrap();
+    reg(&store, "keeper", dir.path());
+    let record = CredentialRecord {
+        connection_id: "conn-existing".into(),
+        credential_revision: 1,
+        platform: "fixture".into(),
+        account: "original".into(),
+        scopes: vec!["widgets:read".into()],
+        fingerprint: "original-fingerprint".into(),
+        custody: "file".into(),
+        exchange: "token".into(),
+        enrolled_at: 1.0,
+        by: "operator".into(),
+    };
+    store.platform_enroll(&record, false, None).unwrap();
+    store
+        .platform_grant_add("keeper", "fixture", "original", &record.scopes, "operator")
+        .unwrap();
+    let grants = store.platform_grants(None).unwrap();
+    let events = store
+        .conn()
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let mut collision = record.clone();
+    collision.account = "replacement".into();
+    collision.fingerprint = "replacement-fingerprint".into();
+    assert!(
+        store.platform_enroll(&collision, false, None).is_err(),
+        "unique-ID collision replaced another account"
+    );
+    assert!(store
+        .platform_credential("fixture", "replacement")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .platform_credential("fixture", "original")
+            .unwrap()
+            .unwrap()
+            .to_json(),
+        record.to_json()
+    );
+    assert_eq!(store.platform_grants(None).unwrap(), grants);
+    assert_eq!(
+        store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        events
+    );
+}
