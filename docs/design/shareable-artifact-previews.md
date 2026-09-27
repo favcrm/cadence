@@ -101,6 +101,13 @@ a bearer credential: forwarding it grants access while valid. Fragment handling
 reduces routine request/referrer exposure; browser history, extensions, copied
 links and compromised bootstrap code still require threat review.
 
+Reserve `/__preview/` for trusted bootstrap/viewer/exchange code. Serve artifact
+bytes only beneath `/content/`; the manifest cannot supply root routes, trusted
+viewer assets or endpoint responses. Reject reserved-name/path collisions during
+publication and routing. Never fall back from a missing trusted route to artifact
+HTML. Set validated Content-Type and `X-Content-Type-Options: nosniff` on all
+responses; unsupported or mismatched active types are rejected/downloaded.
+
 Untrusted HTML receives neither the signed token nor the session cookie value.
 It loads only manifest-listed assets through the gateway using the scoped cookie;
 the same authorization applies to every GET/HEAD, download, conditional request
@@ -149,7 +156,9 @@ Worker caches are separate serving mechanisms, not revocation authority.
 ## Untrusted HTML and crawler controls
 
 The trusted viewer embeds HTML in a sandboxed iframe; artifact responses also
-carry an enforced CSP sandbox. Default is static content; a reviewed interactive
+carry an enforced CSP sandbox, including direct navigation to `/content/` paths.
+Trusted bootstrap and artifact code use separate route policies. Default is
+static content; a reviewed interactive
 mode may allow scripts without allow-same-origin, top navigation, popups, forms,
 service workers or Cadence API access. Use an explicit CSP allowing only needed
 manifest assets on that exact share host, with external connections blocked.
@@ -183,6 +192,7 @@ robots.txt is not access control and can prevent crawlers observing noindex.
 | Share-authority outage or stale index | Fail closed even with warmed bytes; no cached authorization fallback |
 | Company sleeping, stopped or without lease | Published version serves; runtime wake counters and lease calls remain unchanged |
 | Hostile HTML tries parent navigation, cookie/API reads, other shares, external requests, service worker | Browser proof of isolated authority/network restrictions; no signed token in artifact DOM or requests |
+| Manifest shadows bootstrap/exchange routes; direct HTML navigation; MIME confusion | Reserved paths rejected, trusted routes never fall back to artifact HTML, sandbox/CSP on direct content navigation and nonsniff on every response |
 | Canary credential in link/exchange/cookie/header; external navigation, denial logs, analytics | No raw credential in telemetry/referrers; no-store on all responses; document already-downloaded-copy limitation |
 | Known crawler/unfurler; arbitrary automation imitates browser | Known agents blocked/generic where configured, headers present, shares not consumed; no absolute automation/indexing claim |
 
