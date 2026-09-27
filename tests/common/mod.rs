@@ -2,6 +2,7 @@
 //! provider mocks, operator-proof runners and the host-wide suite lock.
 //! Not every binary uses every helper.
 #![allow(dead_code)]
+pub(crate) mod app_release;
 
 use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
