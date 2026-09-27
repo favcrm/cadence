@@ -76,6 +76,18 @@ struct Create {
     owner_pm: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_link: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+}
+fn present_context<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(de).map(Some)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,21 +110,26 @@ fn query(request: &Request, allow_install: bool) -> Result<Value, HttpResp> {
     if !allow_install {
         return Err(err_response(400, "query parameters are unsupported"));
     }
-    let mut pairs = raw.split('&');
-    let (key, value) = pairs
-        .next()
-        .unwrap()
-        .split_once('=')
-        .ok_or_else(|| err_response(400, "expected install_id query"))?;
-    let key = super::pct_decode(key).ok_or_else(|| err_response(400, "malformed query"))?;
-    let value = super::pct_decode(value).ok_or_else(|| err_response(400, "malformed query"))?;
-    if key != "install_id" || !segment(&value) || pairs.next().is_some() {
-        return Err(err_response(
-            400,
-            "list admits one nonempty install_id query only",
-        ));
+    let mut params = serde_json::Map::new();
+    for pair in raw.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| err_response(400, "malformed app run query"))?;
+        let key =
+            super::pct_decode(key).ok_or_else(|| err_response(400, "malformed app run query"))?;
+        let value =
+            super::pct_decode(value).ok_or_else(|| err_response(400, "malformed app run query"))?;
+        if !matches!(key.as_str(), "install_id" | "context_id")
+            || !segment(&value)
+            || params.insert(key, json!(value)).is_some()
+        {
+            return Err(err_response(400, "invalid or duplicate app run selector"));
+        }
     }
-    Ok(json!({"install_id":value}))
+    if params.contains_key("context_id") && !params.contains_key("install_id") {
+        return Err(err_response(400, "context selector requires installation"));
+    }
+    Ok(Value::Object(params))
 }
 
 pub(super) fn handle(
