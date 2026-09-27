@@ -10,6 +10,10 @@
 //! Explicit local URLs and bearer transport do not establish hosted identity
 //! or an operational self-hosted token contract. Media import and other
 //! providers are not exposed through arbitrary tool/URL passthrough.
+//! Default hosted attach has no external deployment assertion and retains
+//! Cadence's Send approval gate. Trusted embedding registration may supply
+//! agenticos-manifest@1/publish_post@2 to enable reviewed read/draft effects;
+//! this is an operator deployment assertion, never live remote verification.
 mod wire;
 
 use std::time::Duration;
@@ -47,14 +51,11 @@ const ACCOUNT_APP: &str = "https://app-v2.agenticos.hk/account";
 
 const DOOR: &str = "/v1/runtime/connectors";
 
-/// Reviewed pin. The runtime door does not report a manifest version,
-/// so the adapter reports the version this table was reviewed against
-/// — the same way `local` does.
-const MANIFEST_VERSION: &str = "agenticos-connectors/2";
-
+/// Reviewed composite identity: upstream manifest version 1 and publish_post@2.
+/// The tool table is review metadata, not a report from a deployed platform.
 const TABLE_JSON: &str = r#"{
     "platform": "agenticos",
-    "manifest_version": "agenticos-connectors/2",
+    "manifest_version": "agenticos-manifest@1/publish_post@2",
     "tools": [
         {
             "tool": "connections_list",
@@ -107,6 +108,7 @@ const MEDIA_CAP: usize = 200;
 pub struct AgenticosAdapter {
     table: ToolTable,
     base: String,
+    deployment_pin: Option<String>,
     http: ureq::Agent,
 }
 
@@ -114,6 +116,14 @@ impl AgenticosAdapter {
     /// `base` is `http://` or `https://` with a host and no userinfo.
     /// A trailing slash is dropped.
     pub fn new(base: &str) -> Result<Self> {
+        Self::with_deployment_pin(base, None)
+    }
+
+    /// Trusted embedding composition's assertion about the deployed contract.
+    /// This is not live discovery. The composition owner must refresh it when
+    /// deployment changes. No URL/hosted identity/tool input infers this value.
+    /// Absent or mismatched metadata keeps the generic Cadence Send gate.
+    pub fn with_deployment_pin(base: &str, deployment_pin: Option<&str>) -> Result<Self> {
         let base = check_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
@@ -125,6 +135,7 @@ impl AgenticosAdapter {
         Ok(Self {
             table,
             base,
+            deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
         })
     }
@@ -132,7 +143,17 @@ impl AgenticosAdapter {
 
 /// Register the adapter on a daemon that already decided the base URL.
 pub fn register(opts: &mut crate::daemon::ServeOptions, base: &str) -> Result<()> {
-    let adapter = AgenticosAdapter::new(base)?;
+    register_with_deployment_pin(opts, base, None)
+}
+
+/// Explicit trusted provider composition metadata; never an app/worker input.
+/// Default registration and hosted attach supply no assertion and stay gated.
+pub fn register_with_deployment_pin(
+    opts: &mut crate::daemon::ServeOptions,
+    base: &str,
+    deployment_pin: Option<&str>,
+) -> Result<()> {
+    let adapter = AgenticosAdapter::with_deployment_pin(base, deployment_pin)?;
     opts.platforms
         .insert(PLATFORM.to_string(), std::sync::Arc::new(adapter));
     Ok(())
@@ -482,7 +503,7 @@ impl PlatformAdapter for AgenticosAdapter {
     }
 
     fn reported_manifest_version(&self) -> Option<String> {
-        Some(MANIFEST_VERSION.to_string())
+        self.deployment_pin.clone()
     }
 
     fn preview(&self, account: &str, tool: &str, input: &Value) -> String {
