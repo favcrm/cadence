@@ -828,3 +828,290 @@ fn cad692_waiting_restart_changed_trusted_local_sink_refuses_old_release() {
         "new sink inherited old approval"
     );
 }
+
+#[test]
+fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
+    let h = Release::new();
+    let c = h.context("Two releases", A, "same-artifact-context");
+    h.bind(&c, "same-artifact-binding");
+    let run = h.complete(&c, "same-artifact-run");
+    let first = h.stage(&run, "same-artifact-first");
+    assert_eq!(h.decide(&first)["state"], "done");
+    let first_item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":first["effect_id"]}))
+        .unwrap()["item"]
+        .clone();
+    let second = h.stage(&run, "same-artifact-second");
+    assert_ne!(first["effect_id"], second["effect_id"]);
+    assert_eq!(second["state"], "waiting");
+    assert_eq!(
+        h.items().as_array().unwrap().len(),
+        1,
+        "staging matched another completed item's content"
+    );
+    assert_eq!(h.decide(&second)["state"], "done");
+    let second_item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":second["effect_id"]}))
+        .unwrap()["item"]
+        .clone();
+    assert_eq!(h.items().as_array().unwrap().len(), 2);
+    assert_eq!(first_item["post"], second_item["post"]);
+    assert_eq!(first_item["effect_id"], first["effect_id"]);
+    assert_eq!(second_item["effect_id"], second["effect_id"]);
+    assert_eq!(first_item["provenance"]["effect_id"], first["effect_id"]);
+    assert_eq!(second_item["provenance"]["effect_id"], second["effect_id"]);
+    assert_eq!(
+        first_item["provenance"]["artifact_id"],
+        second_item["provenance"]["artifact_id"]
+    );
+    assert_ne!(
+        first_item["provenance"]["core_authority_digest"],
+        second_item["provenance"]["core_authority_digest"],
+        "same-body release borrowed previous effect authority"
+    );
+    assert_eq!(
+        h.daemon
+            .operator_rpc("platform_outbox", json!({"effect_id":first["effect_id"]}))
+            .unwrap()["item"],
+        first_item,
+        "second release changed first item's durable receipt"
+    );
+}
+
+#[test]
+fn cad692_full_preview_bound_rejects_before_effect_write_without_truncating_artifact() {
+    let h = Release::new();
+    let bounded = "é".repeat(5000);
+    let c = h.context("Bounded", &bounded, "preview-positive");
+    h.bind(&c, "preview-positive-binding");
+    let run = h.complete(&c, "preview-positive-run");
+    let artifact = h.artifact(&run);
+    assert_eq!(artifact["text"], format!("Context draft: {bounded}"));
+    let effect = h.stage(&run, "preview-positive-effect");
+    assert_eq!(effect["state"], "waiting");
+    assert!(effect["record"]["preview"].as_str().unwrap().len() <= 16 * 1024);
+    assert_eq!(h.decide(&effect)["state"], "done");
+    let item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":effect["effect_id"]}))
+        .unwrap();
+    assert_eq!(
+        item["item"]["post"],
+        format!("# Reviewed draft\n\nContext draft: {bounded}")
+    );
+    let huge = "x".repeat(17 * 1024);
+    let c = h.context("Too large", &huge, "preview-negative");
+    h.bind(&c, "preview-negative-binding");
+    let run = h.complete(&c, "preview-negative-run");
+    let artifact = h.artifact(&run);
+    assert_eq!(artifact["text"], format!("Context draft: {huge}"));
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    let before: i64 = db
+        .query_row("SELECT count(*) FROM platform_effects", [], |r| r.get(0))
+        .unwrap();
+    let refused=h.daemon.operator_rpc("app_effect_stage",json!({"run_id":run["id"],"artifact_id":artifact["id"],"slot":"publication","request_id":"oversized-preview","title":"Full preview"})).unwrap_err();
+    assert_eq!(refused.kind(), "rejected");
+    assert!(
+        refused.to_string().contains("preview"),
+        "wrong gate hid preview limit: {refused}"
+    );
+    let after: i64 = db
+        .query_row("SELECT count(*) FROM platform_effects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "oversized preview persisted an unreviewable effect"
+    );
+    assert_eq!(
+        h.artifact(&run),
+        artifact,
+        "preview refusal truncated source artifact"
+    );
+    assert_eq!(h.items().as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn cad692_zero_row_checked_claim_refuses_actual_operator_without_adapter_write() {
+    let h = Release::with_options(|opts, state| {
+        let state = state.to_path_buf();
+        opts.effect_execute_gate = Some(std::sync::Arc::new(move |row| {
+            assert_eq!(row.state, "decided");
+            let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+            db.execute_batch("CREATE TRIGGER reject_app_execution_claim BEFORE UPDATE OF state ON platform_effects WHEN new.authorization_kind='app_artifact' AND old.state='decided' AND new.state='executing' BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+            true
+        }));
+    });
+    let c = h.context("Claim", A, "zero-claim-context");
+    h.bind(&c, "zero-claim-binding");
+    let run = h.complete(&c, "zero-claim-run");
+    let effect = h.stage(&run, "zero-claim-effect");
+    let rejected = h
+        .daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"}),
+        )
+        .unwrap_err();
+    assert_eq!(rejected.kind(), "rejected");
+    assert!(
+        rejected.to_string().contains("claim"),
+        "checked claim oracle not reached: {rejected}"
+    );
+    let after = h
+        .daemon
+        .operator_rpc("app_effect_show", json!({"effect_id":effect["effect_id"]}))
+        .unwrap()["effect"]
+        .clone();
+    assert_eq!(
+        after["state"], "decided",
+        "zero-row claim pretended executing or successful"
+    );
+    assert_eq!(after["authority"], effect["authority"]);
+    assert!(
+        h.items().as_array().unwrap().is_empty(),
+        "zero-row claim invoked Local write"
+    );
+}
+
+#[test]
+fn cad692_claim_wins_local_commit_before_binding_revoke_and_keeps_actual_receipt() {
+    let (gate, claimed, resume) = controlled_release_gate("executing");
+    let h = Release::with_options(move |opts, _| {
+        opts.app_release_claim_gate = Some(gate);
+    });
+    let c = h.context("Claim wins", A, "commit-context");
+    let binding = h.bind(&c, "commit-binding");
+    let run = h.complete(&c, "commit-run");
+    let effect = h.stage(&run, "commit-effect");
+    std::thread::scope(|scope| {
+        let daemon = &h.daemon;
+        let effect = &effect;
+        let accept=scope.spawn(move ||daemon.operator_rpc("app_effect_decide",json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"})));
+        claimed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("actual checked-claim gate was not reached");
+        let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM platform_effects WHERE effect_id=?",
+                [effect["effect_id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "executing",
+            "trusted barrier was reached before actual checked claim"
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let install = &h.install;
+        let binding = &binding;
+        let revoke=scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            let result=daemon.operator_rpc("app_binding_revoke",json!({"install_id":install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}));
+            finished_tx.send(()).unwrap(); result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let early = finished_rx.recv_timeout(std::time::Duration::from_millis(150));
+        // Always release our own barrier before asserting, so a broken lock
+        // yields a semantic failure instead of stranding provider/RPC threads.
+        resume.send(()).unwrap();
+        let accepted = accept.join().unwrap().unwrap();
+        let revoked = revoke.join().unwrap().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "binding revoke crossed claimed Local commit lock"
+        );
+        assert_eq!(accepted["effect"]["state"], "done");
+        assert_eq!(revoked["binding"]["state"], "revoked");
+    });
+    let item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":effect["effect_id"]}))
+        .unwrap();
+    assert_eq!(
+        item["item"]["post"],
+        format!("# Reviewed draft\n\nContext draft: {A}")
+    );
+    let after = h
+        .daemon
+        .operator_rpc("app_effect_show", json!({"effect_id":effect["effect_id"]}))
+        .unwrap()["effect"]
+        .clone();
+    assert_eq!(
+        after["state"], "done",
+        "later revoke erased an actual committed result"
+    );
+    assert_eq!(after["authority"], effect["authority"]);
+}
+
+#[test]
+fn cad692_binding_revoke_wins_before_claim_and_actual_release_writes_nothing() {
+    let (gate, decided, resume) = controlled_release_gate("decided");
+    let h = Release::with_options(move |opts, _| {
+        opts.effect_execute_gate = Some(gate);
+    });
+    let c = h.context("Revoke wins", A, "revoke-context");
+    let binding = h.bind(&c, "revoke-binding");
+    let run = h.complete(&c, "revoke-run");
+    let effect = h.stage(&run, "revoke-effect");
+    std::thread::scope(|scope| {
+        let daemon = &h.daemon;
+        let effect = &effect;
+        let accept=scope.spawn(move ||daemon.operator_rpc("app_effect_decide",json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"})));
+        decided
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("actual durable-decision gate was not reached");
+        let revoked=daemon.operator_rpc("app_binding_revoke",json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}));
+        resume.send(()).unwrap();
+        assert_eq!(revoked.unwrap()["binding"]["state"], "revoked");
+        let refused = accept.join().unwrap().unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            "rejected",
+            "revocation winning before claim still executed"
+        );
+    });
+    assert!(
+        h.items().as_array().unwrap().is_empty(),
+        "revoked-before-claim release wrote Local item"
+    );
+    assert_eq!(h.artifact(&run)["text"], format!("Context draft: {A}"));
+    let after = h
+        .daemon
+        .operator_rpc("app_effect_show", json!({"effect_id":effect["effect_id"]}))
+        .unwrap()["effect"]
+        .clone();
+    assert_ne!(after["state"], "done");
+    assert_eq!(after["authority"], effect["authority"]);
+}
+
+type ReleaseGate = std::sync::Arc<dyn Fn(&cadence_agent::store::EffectRow) -> bool + Send + Sync>;
+
+fn controlled_release_gate(
+    expected: &'static str,
+) -> (
+    ReleaseGate,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let gate = std::sync::Arc::new(move |row: &cadence_agent::store::EffectRow| {
+        assert_eq!(row.state, expected);
+        if entered_tx.send(()).is_err() {
+            return false;
+        }
+        resume_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok()
+    });
+    (gate, entered_rx, resume_tx)
+}

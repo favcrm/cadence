@@ -21,13 +21,19 @@ impl Release {
         Self::with_decision_gate(false)
     }
     pub(crate) fn with_decision_gate(hold_decided: bool) -> Self {
+        Self::with_options(move |opts, _| {
+            if hold_decided {
+                opts.effect_execute_gate = Some(std::sync::Arc::new(|_| false));
+            }
+        })
+    }
+    pub(crate) fn with_options(
+        configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         pi_policy_pm(&pm.dir);
         let mut opts = daemon_opts();
-        if hold_decided {
-            opts.effect_execute_gate = Some(std::sync::Arc::new(|_| false));
-        }
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/app-release-pi.py");
@@ -43,6 +49,7 @@ impl Release {
             root.path().join("outbox"),
             "http://localhost:3119".into(),
         );
+        configure(&mut opts, &state);
         let daemon = TestDaemon::start_on_opts(state, opts);
         let connections = daemon.operator_rpc("connection_list", json!({})).unwrap();
         let connection = connections["connections"]
