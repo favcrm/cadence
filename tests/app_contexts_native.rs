@@ -679,8 +679,8 @@ fn cad690_current_context_revision_rejects_actual_late_reviewer_result() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|step| step["state"] == "running")
-        .expect("actual reviewer step running");
+        .find(|step| step["state"] == "dispatched")
+        .expect("actual reviewer step dispatched");
     let emitted = h.daemon.state.join(format!(
         "context-result-emitted-{id}-{}",
         reviewer["step_id"].as_str().unwrap()
@@ -689,6 +689,13 @@ fn cad690_current_context_revision_rejects_actual_late_reviewer_result() {
     // CRUD's proactive cancellation. The real authenticated completion must
     // independently enforce current-context proof inside its SQL transaction.
     let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    let active: i64 = db.query_row(
+        "SELECT count(*) FROM app_run_steps s JOIN tasks t ON t.id=s.task_id JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=? AND s.state='dispatched' AND t.state='dispatched' AND t.dispatch_message=m.id AND m.alias=? AND m.state='running' AND m.turn_id IS NOT NULL AND length(m.turn_id)>0",
+        rusqlite::params![id, reviewer["step_id"].as_str(), REVIEWER], |row| row.get(0)).unwrap();
+    assert_eq!(
+        active, 1,
+        "held dependency-fetch reviewer lacks an actual running assigned turn"
+    );
     assert_eq!(db.execute("UPDATE app_contexts SET revision=revision+1 WHERE id=? AND install_id=? AND revision=?",
         rusqlite::params![context["id"].as_str(), h.install["install_id"].as_str(), context["revision"].as_i64()]).unwrap(), 1);
     drop(db);
