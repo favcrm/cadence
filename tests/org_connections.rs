@@ -4,18 +4,19 @@ use std::os::unix::net::UnixListener;
 use std::process::{Command, Output};
 
 fn cli(root: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .env("HOME", root)
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_STATE_HOME", root.join("legacy"))
-        .env_remove("CADENCE_HOME")
-        .env_remove("CADENCE_STATE_DIR")
-        .env_remove("CADENCE_PM_DIR")
-        .env_remove("CADENCE_PROFILE")
-        .env_remove("CADENCE_ALIAS")
-        .args(args)
-        .output()
-        .unwrap()
+    cadence_agent::reaper::output(
+        Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("legacy"))
+            .env_remove("CADENCE_HOME")
+            .env_remove("CADENCE_STATE_DIR")
+            .env_remove("CADENCE_PM_DIR")
+            .env_remove("CADENCE_PROFILE")
+            .env_remove("CADENCE_ALIAS")
+            .args(args),
+    )
+    .unwrap()
 }
 fn ok(root: &std::path::Path, args: &[&str]) -> serde_json::Value {
     let out = cli(root, args);
@@ -131,15 +132,16 @@ fn managed_state_pin_survives_default_switch_and_reconnect() {
     add(root.path(), "new");
     ok(root.path(), &["org", "switch", "new"]);
     let original = peer(root.path(), "original");
-    let out = Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .env("HOME", root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("CADENCE_STATE_DIR", root.path().join("original/state"))
-        .env("CADENCE_PM_DIR", root.path().join("original/tracker"))
-        .env_remove("CADENCE_HOME")
-        .args(["agent", "list", "--json"])
-        .output()
-        .unwrap();
+    let out = cadence_agent::reaper::output(
+        Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("CADENCE_STATE_DIR", root.path().join("original/state"))
+            .env("CADENCE_PM_DIR", root.path().join("original/tracker"))
+            .env_remove("CADENCE_HOME")
+            .args(["agent", "list", "--json"]),
+    )
+    .unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -168,21 +170,22 @@ fn agent_and_detached_child_cannot_change_defaults_even_with_forged_state() {
         } else {
             Command::new(env!("CARGO_BIN_EXE_cadence"))
         };
-        let out = command
-            .env("HOME", root.path())
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .env("CADENCE_ALIAS", "worker")
-            .env_remove("CADENCE_HOME")
-            .env_remove("CADENCE_PM_DIR")
-            .args([
-                "--state-dir",
-                root.path().join("forged").to_str().unwrap(),
-                "org",
-                "switch",
-                "first",
-            ])
-            .output()
-            .unwrap();
+        let out = cadence_agent::reaper::output(
+            command
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("CADENCE_ALIAS", "worker")
+                .env_remove("CADENCE_HOME")
+                .env_remove("CADENCE_PM_DIR")
+                .args([
+                    "--state-dir",
+                    root.path().join("forged").to_str().unwrap(),
+                    "org",
+                    "switch",
+                    "first",
+                ]),
+        )
+        .unwrap();
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("operator action"));
     }
@@ -263,13 +266,14 @@ fn explicit_org_conflicts_with_pinned_env_and_registry_rejects_unsafe_paths() {
         .tempdir_in("/tmp")
         .unwrap();
     add(root.path(), "first");
-    let out = Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .env("HOME", root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("CADENCE_STATE_DIR", root.path().join("pinned/state"))
-        .args(["--org", "first", "agent", "list", "--json"])
-        .output()
-        .unwrap();
+    let out = cadence_agent::reaper::output(
+        Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("CADENCE_STATE_DIR", root.path().join("pinned/state"))
+            .args(["--org", "first", "agent", "list", "--json"]),
+    )
+    .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("conflict"));
     let out = cli(
@@ -292,4 +296,61 @@ fn explicit_org_conflicts_with_pinned_env_and_registry_rejects_unsafe_paths() {
             .len(),
         1
     );
+}
+
+#[test]
+fn explicit_state_dir_works_without_home_or_config_registry() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let state = root.path().join("explicit/state");
+    let out = cadence_agent::reaper::output(
+        Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CADENCE_HOME")
+            .env_remove("CADENCE_STATE_DIR")
+            .env_remove("CADENCE_PM_DIR")
+            .env_remove("CADENCE_PROFILE")
+            .env_remove("CADENCE_ALIAS")
+            .args([
+                "--state-dir",
+                state.to_str().unwrap(),
+                "agent",
+                "list",
+                "--json",
+            ]),
+    )
+    .unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains(state.join("cadence.sock").to_str().unwrap()),
+        "{error}"
+    );
+    assert!(!error.contains("HOME"));
+}
+
+#[test]
+fn registry_refuses_symlink_authority_and_oversized_records() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "first");
+    let registry = root.path().join("config/cadence/orgs.json");
+    let target = root.path().join("external.json");
+    std::fs::rename(&registry, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &registry).unwrap();
+    assert!(!cli(root.path(), &["org", "list"]).status.success());
+    std::fs::remove_file(&registry).unwrap();
+    std::fs::write(&registry, vec![b' '; 65537]).unwrap();
+    assert!(!cli(root.path(), &["org", "list"]).status.success());
+    std::fs::rename(&target, &registry).unwrap();
+    let lock = root.path().join("config/cadence/orgs.lock");
+    std::fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(root.path().join("foreign.lock"), &lock).unwrap();
+    assert!(!cli(root.path(), &["org", "list"]).status.success());
+    assert!(!root.path().join("foreign.lock").exists());
 }

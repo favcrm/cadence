@@ -28,6 +28,10 @@ The registry is `$XDG_CONFIG_HOME/cadence/orgs.json`, or
 List/inspect report local peer authority or `not_connected`; they do not claim
 verified remote credentials. Writes require the existing CLI operator proof, use
 an exclusive interprocess lock and atomically replace the file after fsync.
+Registry and lock files reject symlinks/nonregular files; registry reads/writes
+are bounded to 64 KiB. Configuration ancestors are assumed to be user-controlled: this
+client configuration is not an authorization boundary against arbitrary same-UID
+filesystem writers. Remote membership remains server-authoritative.
 
 Selection precedence:
 

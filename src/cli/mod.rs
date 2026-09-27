@@ -3232,7 +3232,15 @@ pub(crate) fn run() -> Result<i32> {
         return app::run_dev(name, source, *port, host, allow_host);
     }
     if let Commands::Org { action } = cli.command {
-        let proof_state = cli.state_dir.unwrap_or(client::state_dir()?);
+        if cli.org.is_some() {
+            return Err(Error::rejected(
+                "--org selects routed commands; pass the organization label to org commands",
+            ));
+        }
+        let proof_state = match cli.state_dir {
+            Some(dir) => dir,
+            None => client::state_dir()?,
+        };
         return org::run(action, &proof_state, cli.connection);
     }
     let state_dir = org::resolve(cli.org.as_deref(), cli.connection.as_deref(), cli.state_dir.clone())?;

@@ -94,7 +94,11 @@ impl RegistryFile {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join("orgs.lock"))?;
+        if !lock.metadata()?.is_file() {
+            return Err(Error::rejected("org registry lock must be a regular file"));
+        }
         // SAFETY: flock acts only on the descriptor owned by this guard.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -102,11 +106,26 @@ impl RegistryFile {
         Ok(Self { path, _lock: lock })
     }
     fn read(&self) -> Result<Registry> {
-        let raw = match std::fs::read(&self.path) {
-            Ok(raw) => raw,
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.path)
+        {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
             Err(e) => return Err(e.into()),
         };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 65536 {
+            return Err(Error::rejected(
+                "org registry must be a regular file no larger than 64 KiB",
+            ));
+        }
+        let mut raw = Vec::new();
+        (&mut file).take(65537).read_to_end(&mut raw)?;
+        if raw.len() > 65536 {
+            return Err(Error::rejected("org registry exceeds 64 KiB"));
+        }
         let registry: Registry = serde_json::from_slice(&raw)
             .map_err(|_| Error::rejected("invalid org registry; refusing destination selection"))?;
         for (i, c) in registry.connections.iter().enumerate() {
@@ -134,8 +153,14 @@ impl RegistryFile {
     fn write(&self, registry: &Registry) -> Result<()> {
         let dir = self.path.parent().expect("registry parent");
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-        serde_json::to_writer_pretty(&mut temp, registry)
-            .map_err(|e| Error::internal(e.to_string()))?;
+        let raw =
+            serde_json::to_vec_pretty(registry).map_err(|e| Error::internal(e.to_string()))?;
+        if raw.len() > 65536 {
+            return Err(Error::rejected(
+                "org registry exceeds 64 KiB; no configuration changed",
+            ));
+        }
+        temp.write_all(&raw)?;
         temp.as_file().sync_all()?;
         temp.persist(&self.path)
             .map_err(|e| Error::internal(e.to_string()))?;
