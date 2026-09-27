@@ -401,9 +401,8 @@ const DOC_STATE_CHIP: Record<string, string> = {
   uncompared: "bg-warn/10 text-warn",
 };
 
-/// Compact reading of the project's declared scope plus its tracked
-/// document manifest — the same `/api/projects/:key/context` payload the
-/// Context section renders in full. Only for a selected project.
+/// Compact reading of a selected project's declared scope and tracked
+/// document manifest from `/api/projects/:key/context`.
 function ProjectScope({
   project,
   projects,
