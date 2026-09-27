@@ -503,7 +503,7 @@ fn abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody() {
         Some(73),
         "crash fixture did not reach its abrupt exit"
     );
-    assert!(dir.join("results.sqlite3-journal").is_file());
+    assert_hot_private_fixture(&dir);
     let recovered = ResultOutbox::open(&dir).unwrap();
     let rows = recovered.pending_for(&pin("org")).unwrap();
     assert_eq!(rows.len(), 1);
@@ -534,9 +534,17 @@ fn hot_journal_foreign_schemas_preserve_database_and_journal_bytes() {
         assert_eq!(output.status.code(), Some(73), "{mode}");
         let db = dir.join("results.sqlite3");
         let journal = dir.join("results.sqlite3-journal");
+        assert_hot_private_fixture(&dir);
         let db_bytes = fs::read(&db).unwrap();
         let journal_bytes = fs::read(&journal).unwrap();
-        assert!(ResultOutbox::open(&dir).is_err(), "{mode}");
+        let refusal = ResultOutbox::open(&dir)
+            .err()
+            .expect("foreign schema must refuse");
+        assert!(
+            matches!(refusal, cadence_agent::Error::Internal(ref message)
+            if message == "Offline result custody is invalid; retain it for inspection"),
+            "{mode}: expected schema refusal, received {refusal:?}"
+        );
         assert_eq!(fs::read(&db).unwrap(), db_bytes, "{mode}");
         assert_eq!(fs::read(&journal).unwrap(), journal_bytes, "{mode}");
         assert_eq!(
@@ -597,4 +605,31 @@ fn schema_whitespace_cannot_hide_a_missing_not_null_constraint() {
     let before = fs::read(&path).unwrap();
     assert!(ResultOutbox::open(&dir).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+fn assert_hot_private_fixture(dir: &std::path::Path) {
+    assert_eq!(
+        fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for file in ["results.sqlite3", "results.sqlite3-journal"] {
+        let metadata = fs::symlink_metadata(dir.join(file)).unwrap();
+        assert!(metadata.is_file(), "{file}");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600, "{file}");
+    }
+    let read_only = rusqlite::Connection::open_with_flags(
+        dir.join("results.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .unwrap();
+    let failure = read_only
+        .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_err();
+    assert!(
+        matches!(failure, rusqlite::Error::SqliteFailure(code, _)
+        if code.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK),
+        "fixture must require rollback recovery rather than a generic refusal"
+    );
 }

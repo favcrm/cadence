@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -468,6 +468,7 @@ fn validate_journal_path(dir: &Path) -> Result<()> {
 fn recovery_preflight(dir: &Path, original: &Path) -> Result<()> {
     let scratch = tempfile::Builder::new()
         .prefix("recovery-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(dir)?;
     private_metadata(&fs::symlink_metadata(scratch.path())?, true)?;
     let copy = scratch.path().join(DB_NAME);

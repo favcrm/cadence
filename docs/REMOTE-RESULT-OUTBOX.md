@@ -89,7 +89,8 @@ indexes or triggers, before any writable SQLite open.
 If that preflight specifically encounters [SQLite READONLY_ROLLBACK](https://www.sqlite.org/rescode.html#readonly_rollback), a hot
 rollback journal needs recovery to inspect the schema. Existing journal paths
 receive the same private-file checks; WAL/SHM sidecars are unsupported and refused. A private disposable
-copy of the owned database and journal receives recovery and the same schema
+copy, in a scratch directory explicitly created with 0700 permissions, of the
+owned database and journal receives recovery and the same schema
 check first; each copied file is capped at 16 MiB and checked as an owned 0600
 regular file with one link. Failed preflight retains original database and
 journal bytes. Successful preflight allows SQLite to recover the original,
