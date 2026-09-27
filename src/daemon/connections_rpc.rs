@@ -168,7 +168,8 @@ impl Shared {
                         "connection enrollment shape is unsupported",
                     ));
                 }
-                let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":required_str(params,"token")?,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()),Some(&|record|self.connection_metadata_projection(record)))?;
+                let token = required_str(params, "token")?;
+                let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":token,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()),Some(&|record|self.connection_metadata_projection(record))).map_err(|error|connection_error(error,token))?;
                 let _guard = self
                     .platform_custody_lock
                     .lock()
@@ -210,7 +211,7 @@ impl Shared {
                 mapped.as_object_mut().unwrap().remove("connection_id");
                 mapped["platform"] = json!(record.platform);
                 mapped["account"] = json!(record.account);
-                required_str(params, "token")?;
+                let token = required_str(params, "token")?;
                 mapped["shape"] = json!(record.exchange);
                 self.enroll_inner(
                     &mapped,
@@ -224,7 +225,8 @@ impl Shared {
                             .collect::<Vec<_>>(),
                     ),
                     Some(&|record| self.connection_metadata_projection(record)),
-                )?;
+                )
+                .map_err(|error| connection_error(error, token))?;
                 let _guard = self
                     .platform_custody_lock
                     .lock()
@@ -239,6 +241,16 @@ impl Shared {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+fn connection_error(error: Error, token: &str) -> Error {
+    // Legacy custody errors can name an account. A supplied credential must
+    // not be reflected through that public metadata, even on a refused write.
+    if platform::refuse_leak("connection error", &error.to_string(), token.as_bytes()).is_err() {
+        Error::rejected("connection credential operation refused")
+    } else {
+        error
     }
 }
 

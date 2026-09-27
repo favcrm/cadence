@@ -111,7 +111,9 @@ impl Shared {
             None if rotate => existing
                 .as_ref()
                 .map(|r| r.scopes.clone())
-                .ok_or_else(|| Error::rejected("connection is unavailable"))?,
+                .ok_or_else(|| Error::rejected(format!(
+                    "no credential is enrolled for {platform}/{account} — `platform enroll` it first"
+                )))?,
             None => return Err(Error::rejected("Missing or non-array scopes")),
         };
 
