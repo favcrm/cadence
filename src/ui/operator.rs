@@ -111,6 +111,21 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-effects/*/decide",
         RouteClass::OperatorOnly,
     ),
+    route(
+        "POST",
+        "/api/app-installations/*/contexts",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/contexts/*/update",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/contexts/*/archive",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/connections", RouteClass::OperatorOnly),
     route(
         "POST",

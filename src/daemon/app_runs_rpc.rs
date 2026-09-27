@@ -20,10 +20,11 @@ impl Shared {
                 "request_id",
                 "owner_pm",
                 "project_link",
+                "context_id",
             ],
             "app_run_approve" => &["run_id", "digest"],
             "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
-            "app_run_list" => &["install_id"],
+            "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
             _ => return Err(Error::rejected("unknown app lifecycle method")),
         };
@@ -35,7 +36,7 @@ impl Shared {
                 "app lifecycle payload has unsupported fields",
             ));
         }
-        for field in ["project_link", "install_id"] {
+        for field in ["project_link", "install_id", "context_id"] {
             if fields.get(field).is_some_and(|value| !value.is_string()) {
                 return Err(Error::rejected(
                     "optional app references must be strings when present",
@@ -109,7 +110,7 @@ impl Shared {
                 if !crate::issue::model::valid_tag(name) {
                     return Err(Error::rejected("invalid installed workflow name"));
                 }
-                let inputs: BTreeMap<String, String> =
+                let mut inputs: BTreeMap<String, String> =
                     serde_json::from_value(params.get("inputs").cloned().unwrap_or(json!({})))
                         .map_err(|_| Error::rejected("inputs must be a string map"))?;
                 if serde_json::to_vec(&inputs)
@@ -124,16 +125,53 @@ impl Shared {
                     let text = files.get(&format!("workflows/{name}.md")).ok_or_else(|| {
                         Error::rejected("workflow is not in this installed bundle")
                     })?;
-                    let workflow = LocalWorkflow::parse(text, &inputs)?;
-                    self.store.app_run_create(LocalRunRequest {
-                        install_id: id,
-                        bundle_digest: row["digest"].as_str().unwrap(),
-                        workflow: &workflow,
-                        inputs: &inputs,
-                        request_id: required_str(params, "request_id")?,
-                        owner_pm: required_str(params, "owner_pm")?,
-                        project_link: optional_str(params, "project_link"),
-                    })
+                    let context = optional_str(params, "context_id")
+                        .map(|context| self.store.app_context_proof(id, context))
+                        .transpose()?;
+                    if let Some((config, _)) = &context {
+                        let template =
+                            crate::issue::workflow::parse_template(text).map_err(|_| {
+                                Error::rejected("contextual workflow declarations refused")
+                            })?;
+                        let defaults: BTreeMap<_, _> = config
+                            .input_defaults
+                            .iter()
+                            .filter(|(key, _)| template.inputs.contains_key(*key))
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect();
+                        crate::issue::workflow::check_context_defaults(text, &defaults)?;
+                        let mut effective = defaults;
+                        effective.extend(inputs);
+                        inputs = effective;
+                        if serde_json::to_vec(&inputs)
+                            .map_err(|e| Error::internal(e.to_string()))?
+                            .len()
+                            > 32 * 1024
+                        {
+                            return Err(Error::rejected(
+                                "effective inputs exceed encoded byte limit",
+                            ));
+                        }
+                    }
+                    let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
+                        if context.is_some() {
+                            Error::rejected("contextual workflow inputs refused")
+                        } else {
+                            error
+                        }
+                    })?;
+                    self.store.app_run_create_with_context(
+                        LocalRunRequest {
+                            install_id: id,
+                            bundle_digest: row["digest"].as_str().unwrap(),
+                            workflow: &workflow,
+                            inputs: &inputs,
+                            request_id: required_str(params, "request_id")?,
+                            owner_pm: required_str(params, "owner_pm")?,
+                            project_link: optional_str(params, "project_link"),
+                        },
+                        context.as_ref().map(|(_, proof)| proof),
+                    )
                 })
             }
             "app_run_approve" => {
@@ -153,7 +191,10 @@ impl Shared {
             }
             "app_run_dispatch" => self.dispatch_app_run(required_str(params, "run_id")?),
             "app_run_show" => self.store.app_run_show(required_str(params, "run_id")?),
-            "app_run_list" => self.store.app_run_list(optional_str(params, "install_id")),
+            "app_run_list" => self.store.app_run_list_filtered(
+                optional_str(params, "install_id"),
+                optional_str(params, "context_id"),
+            ),
             "app_run_artifact" => {
                 if fields.contains_key("token") {
                     return Err(Error::rejected("token requires its assigned message"));

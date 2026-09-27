@@ -173,7 +173,36 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     let Some(base) = resolve_base(lease_is_on(hosted), explicit.as_deref()) else {
         return Ok(());
     };
-    register(opts, &base)
+    register_from_composition(opts, &base, lease_is_on(hosted))
+}
+
+/// Trusted embedding route shared by hosted attach. A company lease alone
+/// supplies no pin; only exact image metadata can assert this deployment.
+pub fn register_from_composition(
+    opts: &mut crate::daemon::ServeOptions,
+    base: &str,
+    hosted: bool,
+) -> Result<()> {
+    register_with_loader(opts, base, hosted, super::deployments::load)
+}
+
+pub(super) fn register_with_loader(
+    opts: &mut crate::daemon::ServeOptions,
+    base: &str,
+    hosted: bool,
+    load: impl FnOnce() -> Result<Option<super::deployments::DeploymentMetadata>>,
+) -> Result<()> {
+    if !hosted {
+        return register(opts, base);
+    }
+    let metadata = match &opts.provider_deployments {
+        Some(metadata) => Some(metadata.clone()),
+        None => load()?,
+    };
+    let pin = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pin(PLATFORM, base));
+    register_with_deployment_pin(opts, base, pin)
 }
 
 /// `Some` is the origin to register. An explicit URL wins, including

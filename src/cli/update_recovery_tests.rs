@@ -285,11 +285,12 @@ fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
     let fixture = OldCli::new();
     fixture.claim("operator:cad628");
     let dist = fixture.dir.path().join("legacy dist");
-    let board = OwnedBoard(
+    let ready = fixture.dir.path().join("legacy-board-ready");
+    let mut board = OwnedBoard(
         Command::new("python3")
             .args([
                 "-c",
-                "import time; time.sleep(60)",
+                "import pathlib, sys, time; pathlib.Path(sys.argv[-1]).write_text('ready'); time.sleep(60)",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -298,8 +299,33 @@ fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
             ])
             .arg(&dist)
             .args(["--allow-host", "legacy.example"])
+            .arg(&ready)
             .spawn()
             .unwrap(),
+    );
+    // Model an already-serving board, not a child whose exec has not yet
+    // installed its argv. Empty /proc cmdline during startup is transient.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            board.0.try_wait().unwrap().is_none(),
+            "board fixture exited before readiness"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "board fixture did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        ui_run_args(board.0.id() as i32),
+        (
+            "127.0.0.1".into(),
+            3118,
+            Some(dist.clone()),
+            vec!["legacy.example".into()]
+        ),
+        "ready fixture must expose its real legacy argv before recovery"
     );
     std::fs::write(fixture.state.join("ui.pid"), board.0.id().to_string()).unwrap();
     assert!(!cadence_agent::ui::opts_present(&fixture.state));

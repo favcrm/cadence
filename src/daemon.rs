@@ -19,6 +19,7 @@
 mod agents_rpc;
 mod answer_rpc;
 mod app_bindings_rpc;
+mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_runs_rpc;
 mod approvals_rpc;
@@ -2673,6 +2674,11 @@ impl Shared {
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
+            "app_context_create" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_list" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_show" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_update" => self.rpc_app_context(method, params, peer_pid),
+            "app_context_archive" => self.rpc_app_context(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_show" => self.rpc_app_workspace(method, params, peer_pid),
@@ -3582,6 +3588,9 @@ pub struct ServeOptions {
     /// `platform` name → adapter. CAD-367/501 register real ones;
     /// tests register the shared-fixture `FakePlatform`.
     pub platforms: effect_rpc::PlatformMap,
+    /// Trusted embedding composition assertions; never deserialized from PM,
+    /// app, RPC or worker input. None reads the fixed root-owned image file.
+    pub provider_deployments: Option<crate::platform::deployments::DeploymentMetadata>,
     /// CAD-506 test seam: consulted once per accepted effect between
     /// the durable `decided` write and execution. `false` models the
     /// daemon dying inside §5.4 step 5's window — the decision is

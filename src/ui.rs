@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
+mod app_contexts;
 mod app_release;
 mod app_runs;
 mod apps;
@@ -2115,6 +2116,16 @@ fn write_route(
         send(request, resp);
         return;
     }
+    if let Some(route) = app_contexts::route(path) {
+        let writable = matches!(route, app_contexts::Route::List(_)) || !route.is_read();
+        if *method != Method::Post || !writable {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_contexts::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
     if let Some(route) = connections::route(path) {
         let writable = matches!(route, connections::Route::List) || !route.is_read();
         if *method != Method::Post || !writable {
@@ -3355,6 +3366,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                     return;
                 }
+            }
+            if let Some(route) = app_contexts::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_contexts::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
             }
             if let Some(route) = connections::route(&path) {
                 if !route.is_read() {
