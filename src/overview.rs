@@ -993,7 +993,9 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                     .map(|r| format!(" {r}"))
                     .unwrap_or_default();
                 let mut row = item(
-                    22,
+                    // A concrete, reviewed merge action outranks the
+                    // generic rank-20 "no safe next step" alert.
+                    19,
                     "merge_decision",
                     &format!(
                         "merge? {id}{number} by {} — PASS by {}: {} (+{} −{}, {} files)",
@@ -3712,6 +3714,63 @@ mod tests {
     }
 
     /// CAD-252: an agent that is both stalled and silently ended is one
+    #[test]
+    fn merge_ready_decision_survives_an_older_no_safe_next_step_alert() {
+        let state = tempfile::TempDir::new().unwrap();
+        let sha = "a".repeat(40);
+        let mut rec = crate::delivery::Record::new("DEM-2", "demo", "w1", 0);
+        rec.state = crate::delivery::State::Passed;
+        rec.pr = Some("https://github.com/acme/demo/pull/1".into());
+        rec.verdict = Some(crate::delivery::VerdictRec {
+            verdict: "pass".into(),
+            sha: sha.clone(),
+            reviewer: "r1".into(),
+            summary: "reviewed".into(),
+            report: "DEM-2/reports/r1.md".into(),
+            at: 0,
+        });
+        rec.observed = Some(crate::delivery::Observed {
+            head: sha.clone(),
+            pr_state: "OPEN".into(),
+            ci_green: true,
+            ..crate::delivery::Observed::default()
+        });
+        crate::delivery::save(
+            state.path(),
+            &std::collections::BTreeMap::from([("DEM-2".into(), rec.clone())]),
+        )
+        .unwrap();
+        let mut rows = delivery_items(state.path(), 10);
+        rows.push(
+            item(
+                20,
+                "next_action",
+                "no safe next step",
+                9,
+                "demo",
+                None,
+                "cadence issue show DEM-2",
+            )
+            .about("issue", "DEM-2"),
+        );
+        let merged = merge_by_subject(rows);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].json["kind"], "merge_decision");
+        assert_eq!(merged[0].json["merge"]["sha"], sha);
+        assert_eq!(merged[0].json["merge"]["reviewer"], "r1");
+        assert_eq!(merged[0].json["causes"][1]["cause"], "next_action");
+        rec.observed.as_mut().unwrap().ci_green = false;
+        crate::delivery::save(
+            state.path(),
+            &std::collections::BTreeMap::from([("DEM-2".into(), rec)]),
+        )
+        .unwrap();
+        assert!(
+            delivery_items(state.path(), 10).is_empty(),
+            "precedence must not bypass CI"
+        );
+    }
+
     /// row with two causes, most severe first; other subjects stay put.
     #[test]
     fn stalled_and_silent_end_merge_into_one_row() {
