@@ -1727,7 +1727,9 @@ nothing is applied from the browser. Loading, missing observations and
 failed refreshes do not show current readiness. Failed refreshes, including host-only refusals, remain in the shared
 observation state across navigation; returning retries the stale report.
 A cached run shows its age and the host's cooldown; project failures remain distinct from an
-empty project list.
+empty project list. Setup summary readiness requires the named section
+observations, including master/login even when there is no suggested fix;
+optional skill or worker CLI observations do not block it.
 
 The master section (CAD-448) offers every provider `master start` accepts,
 with its exact provider command once prerequisites are met. Host risk

@@ -10,7 +10,6 @@ import {
   inGroup,
   isReady,
   masterNeedsUnmet,
-  missingRequired,
   statusChip,
   MASTER_CLIS,
   type SetupCheck,
@@ -402,7 +401,6 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
   const report = state.data;
   const projects = projectsState.data?.map((project) => project.key) ?? null;
   const index = STEPS.findIndex((section) => section.id === step);
-  const missing = report ? missingRequired(report) : [];
   const busy = checking || state.inFlight || projectsState.inFlight;
   const stale = !!(state.error || projectsState.error);
   const visibleError =
@@ -450,6 +448,13 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
     }
   };
   if (state.error === SETUP_ON_HOST) return <OnHost />;
+  const sectionStates = STEPS.map((section) => sectionReady(section.id));
+  const attentionCount = sectionStates.filter(
+    (status) => status === "attention",
+  ).length;
+  const unknownCount = sectionStates.filter(
+    (status) => status === "unknown",
+  ).length;
   const summary = !report
     ? state.error
       ? "Setup checks unavailable"
@@ -460,16 +465,15 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
         ? "Checking readiness…"
         : projects === null
           ? "Project readiness is unknown"
-          : missing.length > 0
-            ? `${missing.length} required item${missing.length === 1 ? " needs" : "s need"} attention`
-            : projects.length === 0
-              ? "Add your first project"
-              : "Required checks passed";
-  const summaryTone: Tone = !current
-    ? "muted"
-    : missing.length > 0 || projects?.length === 0
-      ? "warn"
-      : "ok";
+          : unknownCount > 0
+            ? `${unknownCount} section${unknownCount === 1 ? "" : "s"} not checked`
+            : attentionCount > 0 && (attentionCount > 1 || projects.length > 0)
+              ? `${attentionCount} section${attentionCount === 1 ? " needs" : "s need"} attention`
+              : projects.length === 0
+                ? "Add your first project"
+                : "Required checks passed";
+  const summaryTone: Tone =
+    !current || unknownCount > 0 ? "muted" : attentionCount > 0 ? "warn" : "ok";
   return (
     <main className="setup-page">
       <header className="setup-header">

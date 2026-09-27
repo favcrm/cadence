@@ -222,6 +222,39 @@ async function run() {
       "Unsupported ready CLI does not complete the master-CLI requirement",
     );
   }
+  if (chosen === "all" || chosen === "summary") {
+    report = ready();
+    projects = [{ key: "site" }];
+    report.checks.find((c) => c.check === "master_login")!.status = "unknown";
+    await fresh();
+    assert(
+      !text().includes("Required checks passed"),
+      "Unknown master login without a fix cannot count as passed readiness",
+    );
+    report = ready();
+    report.checks.find((c) => c.check === "master")!.status = "missing";
+    await fresh();
+    assert(
+      !text().includes("Required checks passed"),
+      "Missing master without a fix cannot count as passed readiness",
+    );
+    report = ready();
+    report.checks.find((c) => c.check === "ui")!.status = "unknown";
+    await fresh();
+    assert(
+      !text().includes("Required checks passed"),
+      "Unknown required section observation cannot count as passed readiness",
+    );
+    report = ready();
+    report.checks.push(
+      check("skill", "environment", "missing", "cadence skill install"),
+    );
+    await fresh();
+    assert(
+      text().includes("Required checks passed"),
+      "Optional skill installation does not block otherwise known ready sections",
+    );
+  }
   if (chosen === "all" || chosen === "projects") {
     report = ready();
     projects = [];
