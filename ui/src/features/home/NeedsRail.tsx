@@ -14,7 +14,7 @@ import {
   type UnfenceChoice,
 } from "./needs";
 import AgentUpdates from "./AgentUpdates";
-import type { AgentUpdate } from "./agentUpdates";
+import type { AgentUpdate } from "./agentUpdateModel";
 import Button from "../../ui/Button";
 import PermissionCard from "./PermissionCard";
 import PlanCard from "./PlanCard";

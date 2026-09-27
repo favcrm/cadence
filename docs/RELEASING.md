@@ -1,15 +1,18 @@
 # First public release handoff (CAD-661)
 
-This is preparation, not publication authorization. No tag or release was
-created for this increment. Source, review, CI, installation evidence and
-release approval must be recorded before publication.
+This is preparation, not publication authorization. The immutable
+`v0.1.0-beta.1` tag failed its macOS UI build and retains a private draft;
+it has no published installation assets. This replacement prepares beta.2.
+Source, review, CI, installation evidence and release approval must be
+recorded before publication.
 
 ## Prepared version; candidate selection pending
 
-Cargo.toml and Cargo.lock are prepared as **0.1.0-beta.1**, with matching planned
-tag **v0.1.0-beta.1** and release title **Cadence 0.1.0-beta.1 — local CLI pilot**.
-No release candidate SHA is selected and no tag or release is created. Select
-a fresh reviewed exact main commit only after the version/source prerequisites
+Cargo.toml and Cargo.lock are prepared as **0.1.0-beta.2**, with matching planned
+tag **v0.1.0-beta.2** and release title **Cadence 0.1.0-beta.2 — local CLI pilot**.
+No beta.2 release candidate SHA is selected and no beta.2 tag or release is
+created. Select a fresh reviewed exact main commit only after the version/source
+prerequisites
 land and the release evidence is accepted. A preparation PR head is not the
 publication candidate. Unmerged PRs and issuer contracts are not shipped
 capabilities.
@@ -60,9 +63,14 @@ Review changes to this workflow and its evidence predicates independently;
 these checks do not implement CAD-120's trusted external QA boundary or prevent
 an authorized workflow change from replacing a gate with a weaker job.
 
+The existing macOS cross-build job also installs frozen UI dependencies and
+builds the UI on PRs and merge groups. This job is advisory under current branch
+protection; beta.2 publication additionally requires its actual macOS UI build
+to pass. The static module-name check runs in the existing required UI build.
+
 ## Proposed local pilot notes
 
-Cadence 0.1.0-beta.1 is a local CLI pilot: a native controller and embedded
+Cadence 0.1.0-beta.2 is a local CLI pilot: a native controller and embedded
 browser board for local project and coding-agent coordination. Evaluate on
 fresh, separate local state; existing production-state compatibility and schema
 rollback are not established by a clean install.
@@ -92,7 +100,7 @@ verified evidence before the environment approval. The workflow can reuse an
 existing draft, upload the artifacts and publish after approval.
 
 ```text
-Cadence 0.1.0-beta.1 — local CLI pilot
+Cadence 0.1.0-beta.2 — local CLI pilot
 
 Native CLI and embedded board for local agent coordination. Supported assets:
 Linux x86_64, Linux ARM64 (glibc 2.35 baseline), Apple Silicon macOS.
@@ -104,7 +112,7 @@ Hosted browser login, remote local worker teams and local-to-cloud migration
 are not claimed operational. Public stable-release updater is not implemented.
 
 Source SHA: <copied exact SHA>
-Tag: v0.1.0-beta.1 (planned, not created)
+Tag: v0.1.0-beta.2 (planned, not created)
 Classification: prerelease=true; latest=false (must verify actual release metadata)
 CI run and all required gate conclusions: <links/results>
 Clean installation evidence: <platform links; distinguish pre/post-publication>

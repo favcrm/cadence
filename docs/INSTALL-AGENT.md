@@ -5,8 +5,10 @@ describe installation **after publication**; they are not working download
 links yet. Check the [release list](https://github.com/favcrm/cadence/releases)
 for an available tag and its limitations before installing.
 
-Source is prepared for **0.1.0-beta.1**, a local CLI pilot. Its matching planned
-tag is **v0.1.0-beta.1**; no source SHA has been selected for publication. The
+The immutable `v0.1.0-beta.1` tag failed its macOS UI build and has no
+published installation assets. Replacement source is prepared for
+**0.1.0-beta.2**, a local CLI pilot. Its matching planned tag is
+**v0.1.0-beta.2**; no source SHA has been selected for publication. The
 planned version is not an available download or a supported production rollout.
 
 ## Platforms and prerequisites
@@ -29,7 +31,7 @@ For a pilot prerelease, copy its exact tag from the release list. GitHub's
 tag before running these commands:
 
 ```sh
-release_tag=v0.1.0-beta.1 # planned pilot; use only once this tag is published
+release_tag=v0.1.0-beta.2 # planned pilot; use only once this tag is published
 curl -fsSL "https://github.com/favcrm/cadence/releases/download/$release_tag/install.sh" -o install.sh
 sh install.sh --version "$release_tag"
 "$HOME/.local/bin/cadence" --version

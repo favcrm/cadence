@@ -10,7 +10,7 @@ import {
   appHref,
   appPurpose,
   runsSummary,
-} from "./apps";
+} from "./appViewModel";
 import type { Viewer } from "../projects/work";
 import "./apps.css";
 
