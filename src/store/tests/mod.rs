@@ -443,3 +443,68 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     );
     assert_eq!(reopened.connection_workspace_id().unwrap(), namespace);
 }
+
+#[test]
+fn cad688_store_rotation_cannot_replace_identity_or_reset_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("test.sqlite3")).unwrap();
+    let mut record = CredentialRecord {
+        connection_id: "conn-first".into(),
+        credential_revision: 1,
+        platform: "fixture".into(),
+        account: "work".into(),
+        scopes: vec!["widgets:read".into()],
+        fingerprint: "first".into(),
+        custody: "file".into(),
+        exchange: "token".into(),
+        enrolled_at: 1.0,
+        by: "operator".into(),
+    };
+    let mut invalid = record.clone();
+    invalid.connection_id.clear();
+    assert!(store.platform_enroll(&invalid, false, None).is_err());
+    invalid = record.clone();
+    invalid.credential_revision = 0;
+    assert!(store.platform_enroll(&invalid, false, None).is_err());
+    store.platform_enroll(&record, false, None).unwrap();
+    let before = store
+        .conn()
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    for (id, revision) in [
+        ("conn-replacement", 2),
+        ("conn-first", 1),
+        ("conn-first", 3),
+    ] {
+        invalid = record.clone();
+        invalid.connection_id = id.into();
+        invalid.credential_revision = revision;
+        invalid.fingerprint = "replacement".into();
+        assert!(store.platform_enroll(&invalid, true, None).is_err());
+        let retained = store
+            .platform_credential("fixture", "work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.connection_id, "conn-first");
+        assert_eq!(retained.credential_revision, 1);
+        assert_eq!(retained.fingerprint, "first");
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+    }
+    record.credential_revision = 2;
+    record.fingerprint = "second".into();
+    store.platform_enroll(&record, true, None).unwrap();
+    assert_eq!(
+        store
+            .platform_credential("fixture", "work")
+            .unwrap()
+            .unwrap()
+            .credential_revision,
+        2
+    );
+}
