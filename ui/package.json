@@ -6,11 +6,11 @@
   "packageManager": "pnpm@12.2.1",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "node scripts/check-module-names.mjs && vite build",
     "test:url-state": "pnpm test",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done"
+    "test": "node --test scripts/check-module-names.test.mjs && tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",

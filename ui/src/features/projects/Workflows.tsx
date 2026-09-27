@@ -6,9 +6,9 @@ import { useHref } from "../../lib/useLocation";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconChevron } from "../../ui/icons";
-import { appHref } from "../apps/apps";
+import { appHref } from "../apps/appViewModel";
 import RunForm from "./RunForm";
-import { approvalChip, gateBlock } from "./workflows";
+import { approvalChip, gateBlock } from "./workflowForm";
 import type { Viewer } from "./work";
 
 /**

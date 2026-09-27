@@ -53,7 +53,7 @@ import {
   unboundSlots,
   usedSlots,
   type RunFilter,
-} from "./apps";
+} from "./appViewModel";
 import type { Viewer } from "../projects/work";
 import "./apps.css";
 

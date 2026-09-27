@@ -3,7 +3,7 @@ import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent, AgentDetail } from "../../lib/types";
-import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdates";
+import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
 
 // Cap concurrent history reads across the rail; reuse in-flight loads on rerenders.

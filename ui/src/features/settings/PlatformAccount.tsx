@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { sessionHeaders } from "../../lib/sessionKey";
-import { displayAmount, safeManageUrl, type PlatformAccount as Account } from "./platformAccount";
+import { displayAmount, safeManageUrl, type PlatformAccount as Account } from "./accountDisplay";
 
 export default function PlatformAccount() {
   const [data, setData] = useState<Account | null>(null);

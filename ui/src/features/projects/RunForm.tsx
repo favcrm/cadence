@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
-import { appFieldLabel, addMissing, slugFromTopic, slugProblem, teamRole } from "../apps/apps";
+import { appFieldLabel, addMissing, slugFromTopic, slugProblem, teamRole } from "../apps/appViewModel";
 import {
   missingBlock,
   missingRequired,
@@ -12,7 +12,7 @@ import {
   refusalText,
   runFields,
   type RunField,
-} from "./workflows";
+} from "./workflowForm";
 import type { Viewer } from "./work";
 
 /** The live preview's state — the rendered plan or the named render refusal. */

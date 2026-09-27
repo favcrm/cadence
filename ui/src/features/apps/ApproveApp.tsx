@@ -3,7 +3,7 @@ import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
 import Button from "../../ui/Button";
 import type { Viewer } from "../projects/work";
-import { approveBlock, approvalPending, type GateRow } from "./apps";
+import { approveBlock, approvalPending, type GateRow } from "./appViewModel";
 
 /**
  * The operator's Approve for one app (CAD-557): POSTs the board's relay

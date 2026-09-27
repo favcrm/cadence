@@ -1,4 +1,4 @@
-import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates } from "../src/features/home/agentUpdates";
+import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates } from "../src/features/home/agentUpdateModel";
 import type { Agent, AgentDetail } from "../src/lib/types";
 function check(value: boolean, why: string) { if (!value) throw new Error(why); }
 const detail = { events: [

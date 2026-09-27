@@ -1,4 +1,4 @@
-import { displayAmount, safeManageUrl } from "../src/features/settings/platformAccount";
+import { displayAmount, safeManageUrl } from "../src/features/settings/accountDisplay";
 
 const assert = { equal(actual: unknown, expected: unknown, label = "platform account") {
   if (actual !== expected) throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);

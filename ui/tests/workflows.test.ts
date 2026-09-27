@@ -9,7 +9,7 @@ import {
   providedInputs,
   refusalText,
   runFields,
-} from "../src/features/projects/workflows";
+} from "../src/features/projects/workflowForm";
 import type { WorkflowRow } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {

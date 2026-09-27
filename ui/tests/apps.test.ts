@@ -40,7 +40,7 @@ import {
   teamRole,
   unboundSlots,
   usedSlots,
-} from "../src/features/apps/apps";
+} from "../src/features/apps/appViewModel";
 import type { HomeNeed } from "../src/features/home/needs";
 import type { AppDetail, AppRow, AppRun, AppWorkflow } from "../src/lib/types";
 
