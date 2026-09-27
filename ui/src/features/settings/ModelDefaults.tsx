@@ -4,6 +4,8 @@ import { WriteGate } from "../auth/WriteGate";
 import { api, ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
+import { IconRefresh } from "../../ui/icons";
+import "./modelDefaults.css";
 import { canonicalJson } from "./modelDefaultsCompare";
 import { modelIdProblem } from "./modelId";
 import type {
@@ -52,10 +54,9 @@ function draftsFrom(
     }
     out[provider.id] = {
       present: Boolean(stored),
-      baseline:
-        stored?.default.mode === "model" ? "model" : "provider_default",
+      baseline: stored?.default.mode === "model" ? "model" : "provider_default",
       baselineModel:
-        stored?.default.mode === "model" ? stored.default.model ?? "" : "",
+        stored?.default.mode === "model" ? (stored.default.model ?? "") : "",
       roles,
     };
   }
@@ -63,7 +64,8 @@ function draftsFrom(
 }
 
 function selector(choice: BaselineChoice | RoleChoice, model: string) {
-  if (choice === "model") return { mode: "model" as const, model: model.trim() };
+  if (choice === "model")
+    return { mode: "model" as const, model: model.trim() };
   return { mode: "provider_default" as const };
 }
 
@@ -90,7 +92,6 @@ function configFrom(
   return { schema: 1, providers: stored };
 }
 
-
 function statusCopy(status: number, code?: string): string {
   if (status === 503 || code === "daemon_unavailable") {
     return "The daemon is not reachable. Settings stay unchanged until it answers.";
@@ -102,6 +103,8 @@ function statusCopy(status: number, code?: string): string {
 }
 
 export default function ModelDefaults() {
+  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
   const [snapshot, setSnapshot] = useState<ModelDefaultsSnapshot | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -114,6 +117,7 @@ export default function ModelDefaults() {
 
   const applySnapshot = useCallback((next: ModelDefaultsSnapshot) => {
     setSnapshot(next);
+    setSaved(false);
     setDrafts(draftsFrom(next));
     setConflictRevision(null);
     setSaveError(null);
@@ -153,19 +157,16 @@ export default function ModelDefaults() {
   }, [load]);
 
   const built = useMemo(
-    () =>
-      configFrom(
-        snapshot?.providers ?? [],
-        snapshot?.roles ?? [],
-        drafts,
-      ),
+    () => configFrom(snapshot?.providers ?? [], snapshot?.roles ?? [], drafts),
     [snapshot, drafts],
   );
-  const dirty = snapshot ? canonicalJson(built) !== canonicalJson(snapshot.config) : false;
+  const dirty = snapshot
+    ? canonicalJson(built) !== canonicalJson(snapshot.config)
+    : false;
   // Read-only board, or not signed in as the operator (CAD-313).
   const gate = useContext(WriteGate);
   const readOnly = Boolean(snapshot?.read_only) || gate !== null;
-  const frozen = saving || readOnly;
+  const frozen = saving || loading || readOnly;
 
   const problems = useMemo(() => {
     const found: string[] = [];
@@ -180,7 +181,8 @@ export default function ModelDefaults() {
         const row = draft.roles[role.id];
         if (row?.choice === "model") {
           const problem = modelIdProblem(row.model);
-          if (problem) found.push(`${provider.label} ${role.label}: ${problem}`);
+          if (problem)
+            found.push(`${provider.label} ${role.label}: ${problem}`);
         }
       }
     }
@@ -191,9 +193,13 @@ export default function ModelDefaults() {
     setDrafts((current) => {
       const draft = current[id];
       if (!draft) return current;
-      return { ...current, [id]: change({ ...draft, present: true, roles: { ...draft.roles } }) };
+      return {
+        ...current,
+        [id]: change({ ...draft, present: true, roles: { ...draft.roles } }),
+      };
     });
     setSaveError(null);
+    setSaved(false);
   }
 
   async function save() {
@@ -206,6 +212,7 @@ export default function ModelDefaults() {
         config: built,
       });
       applySnapshot(next);
+      setSaved(true);
     } catch (err) {
       const apiErr = err instanceof ApiError ? err : null;
       if (apiErr?.status === 409 || apiErr?.code === "revision_conflict") {
@@ -222,137 +229,232 @@ export default function ModelDefaults() {
   }
 
   const banner = statusCopy(loadStatus ?? 0, loadCode);
+  const provider =
+    snapshot?.providers.find((item) => item.id === selectedProvider) ??
+    snapshot?.providers[0];
+  const draft = provider ? drafts[provider.id] : undefined;
+  const listId = provider ? `suggestions-${provider.id}` : undefined;
+  // Pi resolves an omitted model through the operator policy, not a native fallback.
+  const fallbackLabel =
+    provider?.id === "pi"
+      ? "Operator policy default"
+      : "Provider-native default";
+  const inheritanceHelp =
+    provider?.id === "pi"
+      ? "Inherit uses the default above. Operator policy default uses the configured Pi policy instead. Explicit model IDs must be allowed by that policy."
+      : "Inherit uses the default above. Provider-native default lets the provider choose, even when you set a specific default.";
+  const changedProviders =
+    snapshot?.providers.filter(
+      (item) =>
+        canonicalJson(built.providers[item.id]) !==
+        canonicalJson(snapshot.config.providers[item.id]),
+    ) ?? [];
+
+  function discard() {
+    if (!snapshot || frozen) return;
+    setDrafts(draftsFrom(snapshot));
+    setSaveError(null);
+    setConflictRevision(null);
+    setSaved(false);
+  }
+
+  function resetProvider() {
+    if (!provider || frozen) return;
+    setDrafts((current) => ({
+      ...current,
+      [provider.id]: {
+        present: false,
+        baseline: "provider_default",
+        baselineModel: "",
+        roles: Object.fromEntries(
+          (snapshot?.roles ?? []).map((role) => [role.id, roleDraft()]),
+        ),
+      },
+    }));
+    setSaveError(null);
+    setSaved(false);
+  }
 
   return (
-    <section className="px-4 lg:px-8 py-6 space-y-4 max-w-5xl">
-      <header className="space-y-1">
-        <h1 className="text-xl font-semibold tracking-[-.03em] text-ink-100">
-          Model defaults
-        </h1>
-        <p className="text-secondary text-ink-400">
-          Applies to new agents across all projects. The project filter does
-          not change this page. Existing agents keep the model saved on their
-          row.
-        </p>
+    <section className="model-defaults-page" aria-busy={loading || saving}>
+      <header className="model-defaults-heading">
+        <div>
+          <h1>Model defaults</h1>
+          <p>
+            Choose the default model for new agents across all projects.
+            Existing agents keep their saved model.
+          </p>
+        </div>
+        {snapshot && (
+          <span className="model-defaults-revision">
+            Saved revision {snapshot.revision}
+          </span>
+        )}
       </header>
 
       {loading && !snapshot && (
-        <p className="text-secondary text-ink-400">Loading settings…</p>
+        <p role="status" className="text-secondary text-ink-400">
+          Loading model defaults…
+        </p>
       )}
 
-      {banner && (
-        <div className="card border-warn/40 px-4 py-3 text-secondary text-warn" role="status">
-          {banner}
-          {loadError ? <div className="mt-1 text-ink-300">{loadError}</div> : null}
-        </div>
-      )}
-
-      {!banner && loadError && (
-        <div className="card border-fail/40 px-4 py-3 text-secondary text-fail" role="alert">
-          {loadError}
+      {loadError && (
+        <div
+          className={`model-defaults-notice ${banner ? "model-defaults-warning" : "model-defaults-error"}`}
+          role="alert"
+        >
+          <div>
+            <p>{banner || "Could not load model defaults."}</p>
+            <p className="text-secondary text-ink-400">{loadError}</p>
+          </div>
+          <Button
+            loading={loading}
+            icon={<IconRefresh />}
+            onClick={() => void load(true)}
+          >
+            Retry
+          </Button>
         </div>
       )}
 
       {snapshot && !banner && (
         <>
-          <div className="flex flex-wrap items-center gap-2 text-secondary">
-            <span className="chip bg-ink-800 text-ink-300">
-              revision {snapshot.revision}
-            </span>
-            {snapshot.revision === 0 &&
-              Object.keys(snapshot.config.providers).length === 0 && (
-                <span className="text-ink-400">
-                  No provider baselines are stored yet. New supported agents
-                  use each provider&apos;s native default.
-                </span>
-              )}
-            {readOnly && (
-              <span className="chip bg-warn/10 text-warn" title={gate ?? READ_ONLY_REASON}>
-                {snapshot?.read_only ? "read-only board" : "sign in to edit"}
-              </span>
-            )}
-            {dirty && <span className="chip bg-accent/15 text-accent">unsaved draft</span>}
-            {saving && <span className="text-ink-400">Saving…</span>}
-          </div>
+          {readOnly && (
+            <p className="model-defaults-access">
+              {snapshot.read_only || gate === READ_ONLY_REASON
+                ? "This board is read-only. You can inspect model defaults here."
+                : "Sign in using the top bar to edit model defaults."}
+            </p>
+          )}
 
           {conflictRevision !== null && (
-            <div className="card border-warn/40 px-4 py-3 space-y-2" role="alert">
-              <p className="text-secondary text-warn">{saveError}</p>
-              <p className="text-secondary text-ink-300">
-                Current server revision: {conflictRevision}.
-              </p>
-              <button
-                type="button"
-                className="h-9 px-3 rounded bg-ink-800 text-ink-100 text-secondary"
+            <div
+              className="model-defaults-notice model-defaults-warning"
+              role="alert"
+            >
+              <div>
+                <p>{saveError}</p>
+                <p className="text-secondary text-ink-400">
+                  Current server revision: {conflictRevision}. Reloading
+                  replaces all unsaved provider changes.
+                </p>
+              </div>
+              <Button
+                disabled={saving}
+                loading={loading}
                 onClick={() => void load(true)}
               >
                 Reload server copy
-              </button>
+              </Button>
             </div>
           )}
-
           {saveError && conflictRevision === null && (
-            <div className="card border-fail/40 px-4 py-3 text-secondary text-fail" role="alert">
+            <p
+              className="model-defaults-notice model-defaults-error"
+              role="alert"
+            >
               {saveError}
-            </div>
+            </p>
           )}
-
           {problems.length > 0 && (
-            <ul className="card border-fail/40 px-4 py-3 text-secondary text-fail space-y-1">
+            <ul
+              className="model-defaults-notice model-defaults-error model-defaults-problems"
+              aria-label="Model validation errors"
+            >
               {problems.map((problem) => (
                 <li key={problem}>{problem}</li>
               ))}
             </ul>
           )}
 
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="primary"
-              disabled={frozen || !dirty || problems.length > 0}
-              onClick={() => void save()}
-            >
-              Save defaults
-            </Button>
-            <Button disabled={frozen || !dirty} onClick={() => snapshot && setDrafts(draftsFrom(snapshot))}>
-              Cancel
-            </Button>
-          </div>
+          {snapshot.providers.length === 0 ? (
+            <div className="card model-defaults-empty">
+              <h2>No model providers available</h2>
+              <p>The server returned no providers to configure.</p>
+              <Button
+                loading={loading}
+                icon={<IconRefresh />}
+                onClick={() => void load(true)}
+              >
+                Refresh providers
+              </Button>
+            </div>
+          ) : (
+            <div className="model-defaults-workspace">
+              <nav
+                className="model-defaults-providers"
+                aria-label="Model providers"
+              >
+                <p className="slabel">Provider</p>
+                {snapshot.providers.map((item) => {
+                  const changed = changedProviders.some(
+                    (row) => row.id === item.id,
+                  );
+                  return (
+                    <button
+                      type="button"
+                      key={item.id}
+                      className="model-defaults-provider"
+                      aria-pressed={provider?.id === item.id}
+                      aria-controls="model-provider-editor"
+                      onClick={() => setSelectedProvider(item.id)}
+                    >
+                      <span>{item.label}</span>
+                      {changed ? (
+                        <span className="model-provider-state">Unsaved</span>
+                      ) : !item.eligible ? (
+                        <span className="model-provider-state">
+                          Unavailable
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+                <p className="model-defaults-nav-hint">
+                  Switching providers keeps your draft.
+                </p>
+              </nav>
 
-          <div className="space-y-4">
-            {snapshot.providers.map((provider) => {
-              const draft = drafts[provider.id];
-              if (!draft) return null;
-              const listId = `suggestions-${provider.id}`;
-              return (
-                <article key={provider.id} className="card p-4 space-y-3">
-                  <div className="flex flex-wrap items-baseline gap-2">
-                    <h2 className="text-label font-medium text-ink-100">{provider.label}</h2>
-                    <span className="num text-micro text-ink-500">
-                      {provider.kinds.join(", ") || "no endpoint"}
-                    </span>
-                  </div>
-                  {!provider.eligible && (
-                    <p className="text-secondary text-ink-400">
-                      {provider.limitation ??
-                        "Model selection is unsupported for this provider."}
+              {provider && draft && (
+                <article
+                  className="card model-defaults-editor"
+                  id="model-provider-editor"
+                  aria-labelledby="model-provider-title"
+                >
+                  <header className="model-provider-heading">
+                    <h2 id="model-provider-title">{provider.label}</h2>
+                    <p>
+                      {provider.eligible
+                        ? "Set a default model, then override it for individual team roles when needed."
+                        : provider.limitation ||
+                          "Model selection is unavailable for this provider."}
                     </p>
-                  )}
+                  </header>
                   {provider.eligible && (
                     <>
-                      <p className="text-micro text-ink-500">{provider.suggestions_note}</p>
                       <datalist id={listId}>
                         {provider.suggestions.map((model) => (
                           <option key={model} value={model} />
                         ))}
                       </datalist>
-                      <div className="grid gap-2 sm:grid-cols-[12rem_1fr] sm:items-center">
-                        <label className="slabel" htmlFor={`${provider.id}-baseline`}>
-                          Baseline
-                        </label>
-                        <div className="flex flex-wrap gap-2">
+                      <div className="model-defaults-baseline">
+                        <div>
+                          <label
+                            htmlFor={`${provider.id}-baseline`}
+                            className="model-defaults-label"
+                          >
+                            Default model
+                          </label>
+                          <p className="model-defaults-help">
+                            Used by roles that inherit this default.
+                          </p>
+                        </div>
+                        <div className="model-defaults-fields">
                           <Select
                             id={`${provider.id}-baseline`}
+                            aria-label={`${provider.label} default model`}
                             disabled={frozen}
+                            full
                             value={draft.baseline}
                             onChange={(baseline) =>
                               update(provider.id, (row) => ({
@@ -361,121 +463,170 @@ export default function ModelDefaults() {
                               }))
                             }
                             options={[
-                              { value: "provider_default", label: "Provider-native default" },
+                              {
+                                value: "provider_default",
+                                label: fallbackLabel,
+                              },
                               { value: "model", label: "Specific model" },
                             ]}
                           />
                           {draft.baseline === "model" && (
-                            <input
-                              id={`${provider.id}-baseline-model`}
-                              className="field min-w-48"
-                              list={listId}
-                              disabled={frozen}
-                              aria-label={`${provider.label} baseline model`}
-                              placeholder="previously observed model"
-                              value={draft.baselineModel}
-                              onChange={(event) =>
-                                update(provider.id, (row) => ({
-                                  ...row,
-                                  baselineModel: event.target.value,
-                                }))
-                              }
-                            />
+                            <div className="model-defaults-model-input">
+                              <label htmlFor={`${provider.id}-baseline-model`}>
+                                {provider.label} default model ID
+                              </label>
+                              <input
+                                id={`${provider.id}-baseline-model`}
+                                className="field"
+                                list={listId}
+                                disabled={frozen}
+                                placeholder="Enter a model ID"
+                                value={draft.baselineModel}
+                                onChange={(event) =>
+                                  update(provider.id, (row) => ({
+                                    ...row,
+                                    baselineModel: event.target.value,
+                                  }))
+                                }
+                              />
+                            </div>
                           )}
                         </div>
                       </div>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left text-secondary">
-                          <thead>
-                            <tr className="text-micro text-ink-500">
-                              <th className="py-1 pr-3 font-medium">Team role</th>
-                              <th className="py-1 pr-3 font-medium">Model</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {snapshot.roles.map((role) => {
-                              const row = draft.roles[role.id] ?? roleDraft();
-                              return (
-                                <tr key={role.id} className="border-t border-ink-800">
-                                  <td className="py-2 pr-3 text-ink-200">{role.label}</td>
-                                  <td className="py-2">
-                                    <div className="flex flex-wrap gap-2">
-                                      <label className="sr-only" htmlFor={`${provider.id}-${role.id}`}>
-                                        {provider.label} {role.label} model
+                      <section
+                        className="model-defaults-roles"
+                        aria-labelledby="model-role-title"
+                      >
+                        <h3 id="model-role-title">Team role overrides</h3>
+                        <p className="model-defaults-help">{inheritanceHelp}</p>
+                        <div className="model-defaults-role-list">
+                          {snapshot.roles.map((role) => {
+                            const row = draft.roles[role.id] ?? roleDraft();
+                            return (
+                              <div
+                                key={role.id}
+                                className="model-defaults-role"
+                              >
+                                <label
+                                  className="model-defaults-label"
+                                  htmlFor={`${provider.id}-${role.id}`}
+                                >
+                                  {role.label}
+                                </label>
+                                <div className="model-defaults-fields">
+                                  <Select
+                                    id={`${provider.id}-${role.id}`}
+                                    aria-label={`${provider.label} ${role.label} model`}
+                                    disabled={frozen}
+                                    full
+                                    value={row.choice}
+                                    onChange={(choice) =>
+                                      update(provider.id, (current) => ({
+                                        ...current,
+                                        roles: {
+                                          ...current.roles,
+                                          [role.id]: {
+                                            ...row,
+                                            choice: choice as RoleChoice,
+                                          },
+                                        },
+                                      }))
+                                    }
+                                    options={[
+                                      {
+                                        value: "inherit",
+                                        label: "Inherit default model",
+                                      },
+                                      {
+                                        value: "provider_default",
+                                        label: fallbackLabel,
+                                      },
+                                      {
+                                        value: "model",
+                                        label: "Specific model",
+                                      },
+                                    ]}
+                                  />
+                                  {row.choice === "model" && (
+                                    <div className="model-defaults-model-input">
+                                      <label
+                                        htmlFor={`${provider.id}-${role.id}-model`}
+                                      >
+                                        {provider.label} {role.label} model ID
                                       </label>
-                                      <Select
-                                        id={`${provider.id}-${role.id}`}
+                                      <input
+                                        id={`${provider.id}-${role.id}-model`}
+                                        className="field"
+                                        list={listId}
                                         disabled={frozen}
-                                        value={row.choice}
-                                        onChange={(choice) =>
+                                        placeholder="Enter a model ID"
+                                        value={row.model}
+                                        onChange={(event) =>
                                           update(provider.id, (current) => ({
                                             ...current,
                                             roles: {
                                               ...current.roles,
                                               [role.id]: {
                                                 ...row,
-                                                choice: choice as RoleChoice,
+                                                model: event.target.value,
                                               },
                                             },
                                           }))
                                         }
-                                        options={[
-                                          { value: "inherit", label: "Inherit provider baseline" },
-                                          { value: "provider_default", label: "Provider-native default" },
-                                          { value: "model", label: "Specific model" },
-                                        ]}
                                       />
-                                      {row.choice === "model" && (
-                                        <input
-                                          className="field min-w-48"
-                                          list={listId}
-                                          disabled={frozen}
-                                          aria-label={`${provider.label} ${role.label} model id`}
-                                          placeholder="previously observed model"
-                                          value={row.model}
-                                          onChange={(event) =>
-                                            update(provider.id, (current) => ({
-                                              ...current,
-                                              roles: {
-                                                ...current.roles,
-                                                [role.id]: { ...row, model: event.target.value },
-                                              },
-                                            }))
-                                          }
-                                        />
-                                      )}
                                     </div>
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                      <Button
-                        disabled={frozen || !draft.present}
-                        onClick={() =>
-                          setDrafts((current) => ({
-                            ...current,
-                            [provider.id]: {
-                              present: false,
-                              baseline: "provider_default",
-                              baselineModel: "",
-                              roles: Object.fromEntries(
-                                (snapshot.roles ?? []).map((role) => [role.id, roleDraft()]),
-                              ),
-                            },
-                          }))
-                        }
-                      >
-                        Reset {provider.label} to inherit
-                      </Button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </section>
+                      <footer className="model-provider-footer">
+                        <p className="model-defaults-help">
+                          {provider.suggestions_note}
+                        </p>
+                        <Button
+                          variant="ghost"
+                          disabled={frozen || !draft.present}
+                          onClick={resetProvider}
+                        >
+                          Reset {provider.label} defaults
+                        </Button>
+                      </footer>
                     </>
                   )}
                 </article>
-              );
-            })}
-          </div>
+              )}
+            </div>
+          )}
+
+          {snapshot.providers.length > 0 && (
+            <footer className="model-defaults-savebar">
+              <p role="status">
+                {saving
+                  ? "Saving defaults…"
+                  : dirty
+                    ? `Unsaved changes in ${changedProviders.length} provider${changedProviders.length === 1 ? "" : "s"}. Save applies all provider changes.`
+                    : saved
+                      ? "Model defaults saved."
+                      : "No unsaved changes."}
+              </p>
+              <div className="model-defaults-actions">
+                <Button disabled={frozen || !dirty} onClick={discard}>
+                  Discard changes
+                </Button>
+                <Button
+                  variant="primary"
+                  disabled={frozen || !dirty || problems.length > 0}
+                  loading={saving}
+                  onClick={() => void save()}
+                >
+                  Save defaults
+                </Button>
+              </div>
+            </footer>
+          )}
         </>
       )}
     </section>
