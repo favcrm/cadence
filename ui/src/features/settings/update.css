@@ -64,7 +64,7 @@
   background: var(--color-ok);
 }
 .update-dot[data-tone="info"] {
-  background: var(--color-accent);
+  background: var(--color-info);
 }
 .update-versions {
   display: grid;
@@ -124,7 +124,7 @@
   border-inline-start-color: var(--color-ok);
 }
 .update-notice[data-tone="info"] {
-  border-inline-start-color: var(--color-accent);
+  border-inline-start-color: var(--color-info);
 }
 .update-notice h2,
 .update-notice strong {
