@@ -469,6 +469,7 @@ impl crate::platform::PlatformAdapter for FakePlatform {
     fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
         use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
         Some(ProviderDescriptor {
+            action_mappings: vec![],
             schema: 1,
             provider: "fixture".into(),
             revision: "fixture-connections/1".into(),

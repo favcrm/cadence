@@ -41,6 +41,28 @@ pub trait PlatformAdapter: Send + Sync {
         None
     }
 
+    /// Reviewed internal tools require persisted app-artifact authority,
+    /// regardless of a legacy account grant held by a worker.
+    fn app_artifact_tool(&self, tool: &str) -> bool {
+        self.connection_descriptor().is_some_and(|descriptor| {
+            descriptor
+                .action_mappings
+                .iter()
+                .any(|mapping| mapping.tool == tool)
+        })
+    }
+
+    /// Translate trusted persisted text into the provider's exact input.
+    /// Unsupported providers refuse; this does not stage or publish anything.
+    fn prepare_app_text(
+        &self,
+        _title: &str,
+        _body: &str,
+        _provenance: &Value,
+    ) -> std::result::Result<Value, String> {
+        Err("provider does not support app text publication".into())
+    }
+
     /// The manifest version the *platform* reports now — the platform
     /// side of the pin. `None` reports nothing, so every call gates as
     /// `send` (a call argument can never assert the match).
