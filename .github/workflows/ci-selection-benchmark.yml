@@ -78,6 +78,7 @@ jobs:
       - name: Install pinned nextest
         if: steps.scope.outputs.mode != 'docs'
         env:
+          TMPDIR: ${{ runner.temp }}
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
         run: |
           scripts/install-cadence-nextest
