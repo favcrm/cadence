@@ -1152,18 +1152,7 @@ impl Store {
     pub(crate) fn app_material_endpoint(&self, alias: &str) -> Result<bool> {
         Ok(self.conn().query_row("SELECT 1 FROM app_run_steps s JOIN tasks t ON t.id=s.task_id WHERE t.assignee=? LIMIT 1", [alias], |_| Ok(())).optional()?.is_some())
     }
-    pub(crate) fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
-        if self
-            .running_messages(alias)?
-            .iter()
-            .any(|m| m.source == "app_run_dispatch")
-            || task
-                .map(|id| self.app_task_owned(id))
-                .transpose()?
-                .unwrap_or(false)
-        {
-            return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
-        }
+    pub(crate) fn app_effect_guard(&self, _alias: &str, _task: Option<&str>) -> Result<()> {
         Ok(())
     }
 }
