@@ -47,6 +47,7 @@ jobs:
         working-directory: mutant/ui
       - name: Install the trusted pinned test runner
         env:
+          TMPDIR: ${{ runner.temp }}
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/nextest
         run: control/scripts/install-cadence-nextest
       - name: Require an assertion failure from exactly the requested test
