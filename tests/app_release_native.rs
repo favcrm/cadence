@@ -1445,3 +1445,347 @@ fn cad692_actual_unbound_draft_cannot_inherit_later_publication_binding() {
         "binding silently approved new execution"
     );
 }
+
+fn release_needs_you(daemon: &common::TestDaemon, effect: &Value) -> bool {
+    let db = rusqlite::Connection::open(daemon.state.join("cadence.sqlite3")).unwrap();
+    db.query_row(
+        "SELECT needs_you FROM platform_effects WHERE effect_id=?",
+        [effect["effect_id"].as_str().unwrap()],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap()
+        != 0
+}
+fn resolve_release(
+    daemon: &common::TestDaemon,
+    effect: &Value,
+    resolution: &str,
+) -> cadence_agent::Result<Value> {
+    daemon.operator_rpc(
+        "app_effect_resolve",
+        json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"resolution":resolution}),
+    )
+}
+fn show_release(daemon: &common::TestDaemon, effect: &Value) -> Value {
+    daemon
+        .operator_rpc("app_effect_show", json!({"effect_id":effect["effect_id"]}))
+        .unwrap()["effect"]
+        .clone()
+}
+fn assert_release_evidence_unchanged(before: &Value, after: &Value) {
+    for key in ["effect_id", "request", "digest", "authority"] {
+        assert_eq!(before[key], after[key], "resolution changed {key}");
+    }
+    for key in ["input", "preview", "decision", "outcome", "source_hash"] {
+        assert_eq!(
+            before["record"][key], after["record"][key],
+            "resolution changed record {key}"
+        );
+    }
+}
+
+#[test]
+fn cad692_actual_local_commit_uncertainty_reconciles_and_closes_without_replay() {
+    use common::app_release::fault::{wrap, Fault};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let h = Release::with_options(move |opts, _| wrap(opts, Fault::UncertainAfterCommit, observed));
+    let context = h.context("Actual uncertain commit", A, "uncertain-commit-context");
+    let binding = h.bind(&context, "uncertain-commit-binding");
+    let run = h.complete(&context, "uncertain-commit-run");
+    let artifact = h.artifact(&run);
+    assert_eq!(run["reviews"].as_array().unwrap().len(), 1);
+    let staged = h.stage(&run, "uncertain-commit-effect");
+    assert!(h.items().as_array().unwrap().is_empty());
+    let uncertain = h.decide(&staged);
+    assert_eq!(
+        uncertain["state"], "reconcile",
+        "confirmation uncertainty became terminal failure"
+    );
+    assert!(release_needs_you(&h.daemon, &uncertain));
+    assert_eq!(uncertain["record"]["outcome"]["kind"], "uncertain");
+    assert_eq!(
+        uncertain["record"]["outcome"]["verified"], true,
+        "actual Local read-back did not find committed bytes"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let items = h.items();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    let item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":staged["effect_id"]}))
+        .unwrap();
+    assert_eq!(
+        item["item"]["post"],
+        format!("# Reviewed draft\n\nContext draft: {A}")
+    );
+    assert_eq!(item["item"]["provenance"]["artifact_id"], artifact["id"]);
+    assert_eq!(item["item"]["provenance"]["binding_id"], binding["id"]);
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"decision":"accept"})
+        )
+        .is_err());
+    assert_eq!(h.items(), items);
+    let Release {
+        root,
+        daemon,
+        install,
+        connection: _,
+    } = h;
+    let state = daemon.state.clone();
+    drop(daemon);
+    let mut opts = common::daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", root.path().join("pm").to_str().unwrap());
+    cadence_agent::platform::local::register_at(
+        &state,
+        &mut opts,
+        root.path().join("outbox"),
+        "http://localhost:3119".into(),
+    );
+    wrap(&mut opts, Fault::UncertainAfterCommit, calls.clone());
+    let restarted = common::TestDaemon::start_on_opts(state, opts);
+    let restored = show_release(&restarted, &staged);
+    assert_eq!(restored, uncertain, "restart rewrote uncertain receipt");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "restart automatically sent again"
+    );
+    assert!(restarted
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"decision":"accept"})
+        )
+        .is_err());
+    restarted.operator_rpc("app_context_archive", json!({"install_id":install["install_id"],"context_id":context["id"],"expected_revision":context["revision"]})).unwrap();
+    let bundle = root
+        .path()
+        .join("pm/.apps/installations")
+        .join(install["install_id"].as_str().unwrap())
+        .join("bundle");
+    assert!(bundle.join("app.md").is_file());
+    std::fs::remove_dir_all(bundle).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (first, second) = std::thread::scope(|scope| {
+        let one = barrier.clone();
+        let two = barrier.clone();
+        let daemon = &restarted;
+        let effect = &staged;
+        let first = scope.spawn(move || {
+            one.wait();
+            resolve_release(daemon, effect, "close")
+        });
+        let second = scope.spawn(move || {
+            two.wait();
+            resolve_release(daemon, effect, "close")
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "resolution state CAS permitted duplicate close"
+    );
+    let closed = show_release(&restarted, &staged);
+    assert_eq!(closed["state"], "closed");
+    assert_eq!(closed["record"]["close_reason"], "operator_reconciled");
+    assert!(!release_needs_you(&restarted, &closed));
+    assert_release_evidence_unchanged(&uncertain, &closed);
+    assert!(resolve_release(&restarted, &staged, "close").is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "resolution executed provider hook"
+    );
+    assert_eq!(
+        restarted
+            .operator_rpc("platform_outbox", json!({}))
+            .unwrap()["items"],
+        items
+    );
+}
+
+#[test]
+fn cad692_populated_resolution_native_setsid_forged_digest_and_state_guards() {
+    use common::app_release::fault::{wrap, Fault};
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = Release::with_options(move |opts, _| wrap(opts, Fault::UncertainAfterCommit, calls));
+    let context = h.context("Private resolution", A, "resolution-context");
+    h.bind(&context, "resolution-binding");
+    let run = h.complete(&context, "resolution-run");
+    let staged = h.stage(&run, "resolution-effect");
+    assert!(
+        resolve_release(&h.daemon, &staged, "close").is_err(),
+        "waiting effect closed through reconciliation"
+    );
+    assert!(
+        resolve_release(&h.daemon, &staged, "acknowledge").is_err(),
+        "waiting effect acknowledged"
+    );
+    assert_eq!(show_release(&h.daemon, &staged), staged);
+    let uncertain = h.decide(&staged);
+    assert_eq!(uncertain["state"], "reconcile");
+    let items = h.items();
+    let mut lane = LaneShell::spawn(h.root.path());
+    plant_member_pane(
+        &h.daemon,
+        "release-resolution-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    let mut failures = Vec::new();
+    for detached in [false, true] {
+        for resolution in ["close", "acknowledge"] {
+            for forged in [false, true] {
+                let mut params = json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"resolution":resolution});
+                if forged {
+                    params["operator"] = json!(true);
+                    params["agent"] = json!(OWNER);
+                }
+                let reply = native(
+                    &mut lane,
+                    &h.daemon.state,
+                    detached,
+                    "app_effect_resolve",
+                    params,
+                );
+                if reply["ok"] != false
+                    || reply["error"]["kind"] != "rejected"
+                    || reply.get("result").is_some()
+                {
+                    failures.push(format!(
+                        "detached={detached} forged={forged} resolution={resolution}: {reply}"
+                    ));
+                }
+                assert!(
+                    !reply.to_string().contains(A),
+                    "resolution refusal disclosed private material"
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "native app resolution operator guard failed: {failures:?}"
+    );
+    for params in [
+        json!({"effect_id":staged["effect_id"],"digest":"sha256:wrong","resolution":"close"}),
+        json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"resolution":"acknowledge"}),
+        json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"resolution":"accept"}),
+        json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"resolution":"close","body":"forged"}),
+        json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"resolution":null}),
+    ] {
+        assert!(h.daemon.operator_rpc("app_effect_resolve", params).is_err());
+        assert_eq!(
+            show_release(&h.daemon, &staged),
+            uncertain,
+            "refused resolution changed receipt"
+        );
+        assert!(release_needs_you(&h.daemon, &uncertain));
+        assert_eq!(
+            h.items(),
+            items,
+            "refused resolution wrote outward material"
+        );
+    }
+    assert_eq!(
+        resolve_release(&h.daemon, &staged, "close").unwrap()["effect"]["state"],
+        "closed"
+    );
+    assert_eq!(h.items(), items);
+}
+
+#[test]
+fn cad692_known_refusal_acknowledges_flag_without_rewriting_terminal_evidence() {
+    use common::app_release::fault::{wrap, Fault};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let h = Release::with_options(move |opts, _| wrap(opts, Fault::RefusedBeforeCommit, observed));
+    let context = h.context("Refused release", A, "refused-context");
+    h.bind(&context, "refused-binding");
+    let run = h.complete(&context, "refused-run");
+    let effect = h.stage(&run, "refused-effect");
+    let failed = h.decide(&effect);
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["record"]["outcome"]["kind"], "refused");
+    assert_eq!(failed["record"]["outcome"]["verified"], false);
+    assert!(release_needs_you(&h.daemon, &failed));
+    assert!(h.items().as_array().unwrap().is_empty());
+    assert!(resolve_release(&h.daemon, &effect, "close").is_err());
+    let mut lane = LaneShell::spawn(h.root.path());
+    plant_member_pane(&h.daemon, "release-ack-worker", "claude", None, lane.pid());
+    let mut failures = Vec::new();
+    for detached in [false, true] {
+        for forged in [false, true] {
+            let mut params = json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"resolution":"acknowledge"});
+            if forged {
+                params["operator"] = json!(true);
+                params["agent"] = json!(OWNER);
+            }
+            let reply = native(
+                &mut lane,
+                &h.daemon.state,
+                detached,
+                "app_effect_resolve",
+                params,
+            );
+            if reply["ok"] != false
+                || reply["error"]["kind"] != "rejected"
+                || reply.get("result").is_some()
+            {
+                failures.push(format!("detached={detached} forged={forged}: {reply}"));
+            }
+            assert!(!reply.to_string().contains(A));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "native terminal acknowledge operator guard failed: {failures:?}"
+    );
+    assert!(release_needs_you(&h.daemon, &failed));
+    let mut wrong = effect.clone();
+    wrong["digest"] = json!("sha256:wrong");
+    assert!(resolve_release(&h.daemon, &wrong, "acknowledge").is_err());
+    assert_eq!(show_release(&h.daemon, &effect), failed);
+    let acknowledged =
+        resolve_release(&h.daemon, &effect, "acknowledge").unwrap()["effect"].clone();
+    assert_eq!(acknowledged["state"], "failed");
+    assert!(!release_needs_you(&h.daemon, &acknowledged));
+    assert_release_evidence_unchanged(&failed, &acknowledged);
+    assert!(resolve_release(&h.daemon, &effect, "acknowledge").is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "acknowledge called provider again"
+    );
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cad692_legacy_adapter_without_typed_app_hook_refuses_without_legacy_execute() {
+    use common::app_release::fault::{wrap, Fault};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let h = Release::with_options(move |opts, _| wrap(opts, Fault::Unsupported, observed));
+    let context = h.context("Unsupported hook", A, "unsupported-context");
+    h.bind(&context, "unsupported-binding");
+    let run = h.complete(&context, "unsupported-run");
+    let effect = h.stage(&run, "unsupported-effect");
+    let failed = h.decide(&effect);
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["record"]["outcome"]["kind"], "refused");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "typed unsupported fallback called legacy execute"
+    );
+    assert!(h.items().as_array().unwrap().is_empty());
+}

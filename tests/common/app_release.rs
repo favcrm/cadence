@@ -1,7 +1,9 @@
 //! CAD692 reviewed local release proofs through real native provider turns.
 #![allow(clippy::disallowed_methods)]
+pub(crate) mod fault;
 use super::{daemon_opts, pi_policy_pm, TestDaemon};
 use cadence_agent::issue::Pm;
+pub(crate) use fault::Fault as AppFault;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -17,6 +19,15 @@ pub(crate) struct Release {
     pub(crate) connection: String,
 }
 impl Release {
+    pub(crate) fn with_app_fault(fault: AppFault) -> Self {
+        Self::with_options(move |opts, _| {
+            fault::wrap(
+                opts,
+                fault,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            );
+        })
+    }
     pub(crate) fn new() -> Self {
         Self::with_decision_gate(false)
     }
