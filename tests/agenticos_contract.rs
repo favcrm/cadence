@@ -499,3 +499,24 @@ fn lost_lease_after_authorization_is_refused_at_execution() {
     assert!(seen[0].path.ends_with("/authorize"));
     assert!(seen[1].path.ends_with("/publish"));
 }
+
+#[test]
+fn builtin_provider_metadata_preserves_only_reviewed_full_account_pairs() {
+    for (platform, account) in [("local", "local"), ("agenticos", "hosted")] {
+        assert!(cadence_agent::platform::is_builtin(platform, account));
+    }
+    for (platform, account) in [
+        ("local", "hosted"),
+        ("agenticos", "local"),
+        ("agenticos", "foreign"),
+        ("unknown", "hosted"),
+        ("unknown", "local"),
+        ("agenticos", ""),
+        ("AgenticOS", "hosted"),
+    ] {
+        assert!(
+            !cadence_agent::platform::is_builtin(platform, account),
+            "unreviewed builtin account {platform}/{account}"
+        );
+    }
+}
