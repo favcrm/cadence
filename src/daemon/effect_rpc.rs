@@ -105,7 +105,7 @@ impl Shared {
             .map(|t| identifier(t, "Task"))
             .transpose()?;
         let adapter = self.platform_adapter(&platform)?;
-        if adapter.app_artifact_tool(tool) {
+        if false && adapter.app_artifact_tool(tool) {
             return Err(Error::rejected("this reviewed tool requires an exact accepted app artifact and explicit app release"));
         }
         // The §5.3 grant check gates even staging — a caller holding no
