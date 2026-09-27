@@ -2,6 +2,42 @@
 use super::*;
 
 #[test]
+fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "login",
+        "--issuer",
+        "https://api.example.com",
+        "--org",
+        "ws_test",
+        "--token-stdin"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
+    assert!(
+        Cli::try_parse_from(["cadence", "login", "--issuer", "https://api.example.com"]).is_err()
+    );
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "auth",
+        "status",
+        "--issuer",
+        "https://api.example.com",
+        "--org",
+        "ws_test"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "auth",
+        "logout",
+        "--auth-dir",
+        "/tmp/isolated-auth"
+    ])
+    .is_ok());
+}
+
+#[test]
 fn cad314_backup_export_restore_parse() {
     let cli = Cli::try_parse_from(["cadence", "backup"]).unwrap();
     match cli.command {
