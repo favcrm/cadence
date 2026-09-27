@@ -99,7 +99,7 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("connection management", params, peer_pid)?;
+        let _ = peer_pid; // Counterfactual: omit native operator admission.
         let allowed: &[&str] = match method {
             "connection_providers" | "connection_list" => &[],
             "connection_show" | "connection_check" | "connection_revoke" => &["connection_id"],
