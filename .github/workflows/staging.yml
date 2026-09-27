@@ -31,8 +31,8 @@ permissions:
 # Preserve explicit candidates and approval waits. Main keeps merging.
 concurrency:
   group: staging-${{ github.event.pull_request.number || inputs.ci_run_id }}
-  cancel-in-progress: false
-  queue: max
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 jobs:
   # Validate this workflow's implementation before it reaches main.

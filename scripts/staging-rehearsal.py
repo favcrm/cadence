@@ -56,7 +56,7 @@ def main():
         with sqlite3.connect(directory / "cadence.sqlite3") as source:
             assert source.execute("PRAGMA quick_check").fetchall() == [("ok",)]
             schema = source.execute("SELECT version FROM schema_version").fetchone()[0]
-            rows = source.execute("SELECT id, alias, provider FROM agents ORDER BY id").fetchall()
+            rows = source.execute("SELECT alias, provider, endpoint_kind FROM agents ORDER BY alias").fetchall()
             if dest:
                 with sqlite3.connect(dest) as backup:
                     source.backup(backup)
