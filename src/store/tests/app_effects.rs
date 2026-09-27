@@ -9,11 +9,15 @@ fn child_fixture(s: &Store) -> (crate::store::EffectRow, Value) {
         .unwrap();
     let body = "server-owned body\n";
     let artifact_digest = crate::store::app_runs::artifact_digest(body.as_bytes());
-    let provenance = json!({"install_id":"install-a","context_id":null,"run_id":"run-a",
+    let mut provenance = json!({"install_id":"install-a","context_id":null,"run_id":"run-a",
         "artifact_id":"artifact-a","artifact_digest":artifact_digest,"binding_id":"binding-a",
         "binding_revision":1,"binding_digest":"binding-receipt","sink_registration":"sink-one"});
-    let authority = json!({"schema":1,"install_id":"install-a","context":null,"run_id":"run-a",
+    let mut authority = json!({"schema":1,"install_id":"install-a","context":null,"run_id":"run-a",
         "artifact_id":"artifact-a","artifact_digest":artifact_digest,"provenance":provenance});
+    provenance["effect_id"] = json!("effect-child");
+    provenance["authorization_kind"] = json!("app_artifact");
+    provenance["authority_digest"] = json!(crate::store::app_effects::authority_digest(&authority));
+    authority["provenance"] = provenance.clone();
     let row = crate::store::EffectRow {
         effect_id: "effect-child".into(),
         request: "app-release-request".into(),
@@ -44,6 +48,16 @@ fn child_fixture(s: &Store) -> (crate::store::EffectRow, Value) {
 fn cad692_app_child_claim_is_exact_cas_and_readonly_permit_requires_integrity() {
     let (dir, s) = store();
     let (row, authority) = child_fixture(&s);
+    for field in ["effect_id", "authority_digest", "authorization_kind"] {
+        let mut forged = row.clone();
+        let mut forged_authority = authority.clone();
+        forged.input["provenance"][field] = json!("forged");
+        forged_authority["provenance"] = forged.input["provenance"].clone();
+        assert!(
+            s.app_effect_stage(&forged, &forged_authority).is_err(),
+            "{field}"
+        );
+    }
     let first = s.app_effect_stage(&row, &authority).unwrap();
     let digest = first["effect"]["digest"].as_str().unwrap();
     assert_eq!(s.app_effect_stage(&row, &authority).unwrap(), first);
@@ -84,6 +98,13 @@ fn cad692_app_child_claim_is_exact_cas_and_readonly_permit_requires_integrity() 
     let permit = crate::store::app_effects::read_execution_permit(&db, &row.effect_id).unwrap();
     assert_eq!(permit.input, row.input);
     assert_eq!(permit.provenance, authority["provenance"]);
+    assert_eq!(
+        permit.authority_digest,
+        authority["provenance"]["authority_digest"]
+    );
+    assert_eq!(permit.platform, "local");
+    assert_eq!(permit.account, "local");
+    assert_eq!(permit.tool, "publish_app_text");
     s.conn()
         .execute(
             "UPDATE platform_effects SET input='{}' WHERE effect_id=?",
