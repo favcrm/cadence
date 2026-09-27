@@ -100,6 +100,30 @@ function DayPosts({ date, children }) {
     </div>
   );
 }
+function BoardLane({ label, posts, renderCard }) {
+  return (
+    <section className="board-lane">
+      <header className="row">
+        <h3>{label}</h3>
+        <span className="chip tone num">{posts.length}</span>
+      </header>
+      <div
+        className="board-lane-body"
+        role="region"
+        tabIndex={0}
+        aria-label={`${label} posts`}
+      >
+        {posts.length ? (
+          posts.map(renderCard)
+        ) : (
+          <p className="board-empty muted">
+            No posts in {label.toLowerCase()}.
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
 function Glyph({ icon }) {
   return (
     <HugeiconsIcon
@@ -621,6 +645,44 @@ export default function SocialContent() {
       scheduleRef.current.scrollTop = scrollPositions.current[mode];
   }, [view, mode]);
   const [week, setWeek] = useState(0);
+  const [calendarEdges, setCalendarEdges] = useState({
+    earlier: false,
+    later: false,
+  });
+  useEffect(() => {
+    const element = scheduleRef.current;
+    if (!element || mode !== "Calendar") return;
+    function update() {
+      const overflow = element.scrollHeight > element.clientHeight + 1;
+      setCalendarEdges({
+        earlier: overflow && element.scrollTop > 1,
+        later:
+          overflow &&
+          element.scrollTop + element.clientHeight < element.scrollHeight - 1,
+      });
+    }
+    update();
+    element.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(element);
+    return () => {
+      element.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      observer?.disconnect();
+    };
+  }, [view, mode, week, context, snapshot, scenario]);
+  function scrollCalendar(direction) {
+    const element = scheduleRef.current;
+    const day = element.querySelector(".calendar-day");
+    element.scrollBy({
+      top: direction * ((day?.getBoundingClientRect().height || 84) + 6),
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }
   const [newOnly, setNewOnly] = useState(true);
   const [selection, setSelection] = useState([]);
   const [drawer, setDrawer] = useState(null);
@@ -930,93 +992,106 @@ export default function SocialContent() {
                       {fixtureTimeZone} · local plans only
                     </p>
                     <div className="schedule-layout">
-                      <div
-                        className={`schedule-view ${mode.toLowerCase()}`}
-                        ref={scheduleRef}
-                        onScroll={(event) => {
-                          scrollPositions.current[mode] =
-                            event.currentTarget.scrollTop;
-                        }}
-                        key={mode}
-                      >
-                        {mode === "Calendar" ? (
-                          <div className="calendar-agenda">
-                            {days.map((day) => (
-                              <section
-                                className="calendar-day"
-                                key={dateKey(day)}
-                                data-date={dateKey(day)}
-                              >
-                                <header className="agenda-head">
-                                  <span className="slabel">
-                                    {day.toLocaleDateString(undefined, {
-                                      weekday: "short",
-                                      timeZone: "UTC",
-                                    })}
-                                  </span>
-                                  <strong className="num">
-                                    {day.getUTCDate()}
-                                  </strong>
-                                  <span className="chip tone num">
-                                    {postsForDay(posts, dateKey(day)).length}{" "}
+                      <div className={`schedule-pane ${mode.toLowerCase()}`}>
+                        <div
+                          className={`schedule-view ${mode.toLowerCase()}`}
+                          role="region"
+                          tabIndex={0}
+                          aria-label={
+                            mode === "Calendar"
+                              ? "Week calendar days"
+                              : "Post pipeline board"
+                          }
+                          ref={scheduleRef}
+                          onScroll={(event) => {
+                            scrollPositions.current[mode] =
+                              event.currentTarget.scrollTop;
+                          }}
+                          key={mode}
+                        >
+                          {mode === "Calendar" ? (
+                            <div className="calendar-agenda">
+                              {days.map((day) => (
+                                <section
+                                  className="calendar-day"
+                                  key={dateKey(day)}
+                                  data-date={dateKey(day)}
+                                >
+                                  <header className="agenda-head">
+                                    <span className="slabel">
+                                      {day.toLocaleDateString(undefined, {
+                                        weekday: "short",
+                                        timeZone: "UTC",
+                                      })}
+                                    </span>
+                                    <strong className="num">
+                                      {day.getUTCDate()}
+                                    </strong>
+                                    <span className="chip tone num">
+                                      {postsForDay(posts, dateKey(day)).length}{" "}
+                                      {postsForDay(posts, dateKey(day))
+                                        .length === 1
+                                        ? "post"
+                                        : "posts"}
+                                    </span>
+                                  </header>
+                                  <DayPosts date={dateKey(day)}>
+                                    {postsForDay(posts, dateKey(day)).map(card)}
                                     {postsForDay(posts, dateKey(day)).length ===
-                                    1
-                                      ? "post"
-                                      : "posts"}
-                                  </span>
-                                </header>
-                                <DayPosts date={dateKey(day)}>
-                                  {postsForDay(posts, dateKey(day)).map(card)}
-                                  {postsForDay(posts, dateKey(day)).length ===
-                                    0 && (
-                                    <p className="agenda-empty muted">
-                                      No posts planned
-                                    </p>
-                                  )}
-                                </DayPosts>
-                              </section>
-                            ))}
-                          </div>
-                        ) : (
-                          <>
-                            {Object.entries(lanes).map(([state, label]) => (
-                              <section className="board-lane" key={state}>
-                                <header className="row">
-                                  <h3>{label}</h3>
-                                  <span className="chip tone num">
-                                    {
-                                      posts.filter(
-                                        (post) =>
-                                          post.status === state &&
-                                          !post.needsYou,
-                                      ).length
-                                    }
-                                  </span>
-                                </header>
-                                {posts
-                                  .filter(
+                                      0 && (
+                                      <p className="agenda-empty muted">
+                                        No posts planned
+                                      </p>
+                                    )}
+                                  </DayPosts>
+                                </section>
+                              ))}
+                            </div>
+                          ) : (
+                            <>
+                              {Object.entries(lanes).map(([state, label]) => (
+                                <BoardLane
+                                  key={state}
+                                  label={label}
+                                  posts={posts.filter(
                                     (post) =>
                                       post.status === state && !post.needsYou,
-                                  )
-                                  .map(card)}
-                              </section>
-                            ))}
-                            {posts.some((post) => post.needsYou) && (
-                              <section className="board-lane">
-                                <h3>
-                                  Needs you{" "}
-                                  <span className="chip tone b-fail">
-                                    {
-                                      posts.filter((post) => post.needsYou)
-                                        .length
-                                    }
-                                  </span>
-                                </h3>
-                                {posts
-                                  .filter((post) => post.needsYou)
-                                  .map(card)}
-                              </section>
-                            )}
+                                  )}
+                                  renderCard={card}
+                                />
+                              ))}
+                              {posts.some((post) => post.needsYou) && (
+                                <BoardLane
+                                  label="Needs you"
+                                  posts={posts.filter((post) => post.needsYou)}
+                                  renderCard={card}
+                                />
+                              )}
+                            </>
+                          )}
+                        </div>
+                        {mode === "Calendar" && (
+                          <>
+                            <button
+                              type="button"
+                              className="btn ghost calendar-scroll-arrow earlier"
+                              hidden={!calendarEdges.earlier}
+                              disabled={!calendarEdges.earlier}
+                              aria-label="Scroll earlier calendar days"
+                              onClick={() => scrollCalendar(-1)}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              className="btn ghost calendar-scroll-arrow later"
+                              hidden={!calendarEdges.later}
+                              disabled={!calendarEdges.later}
+                              aria-label="Scroll later calendar days"
+                              onClick={() => scrollCalendar(1)}
+                            >
+                              ↓
+                            </button>
                           </>
                         )}
                       </div>

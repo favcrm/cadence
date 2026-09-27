@@ -171,14 +171,47 @@ button:active:not(:disabled) {
   --c: var(--color-ok);
 }
 .schedule-view.board {
-  grid-template-columns: repeat(6, minmax(150px, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(240px, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
+  overflow-y: hidden;
+  gap: 12px;
 }
 .board-lane {
-  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.25rem;
+  background: var(--color-ink-875);
+  overflow: hidden;
 }
-.board-lane > header,
-.board-lane > h3 {
-  margin-bottom: 12px;
+.board-lane > header {
+  flex: none;
+  margin: 0;
+  padding: 12px;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.board-lane > header h3 {
+  font-size: var(--text-body);
+}
+.board-lane-body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
+}
+.board-lane-body .post-card {
+  height: auto;
+}
+.board-empty {
+  margin: 0;
+  padding: 8px 0;
+  font-size: var(--text-secondary);
 }
 .suggestions-rail {
   display: grid;
@@ -731,6 +764,12 @@ summary {
     flex: none;
     width: 100%;
   }
+  .schedule-view.board {
+    height: 100%;
+    min-height: 0;
+    flex: none;
+    overflow-y: hidden;
+  }
   .schedule-view.calendar {
     overflow: visible;
   }
@@ -764,4 +803,62 @@ summary {
 }
 .post-footer .destinations-copy {
   line-height: 1.4;
+}
+
+.schedule-pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+.schedule-view.calendar {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.schedule-view.calendar::-webkit-scrollbar {
+  display: none;
+}
+.calendar-scroll-arrow {
+  position: absolute;
+  left: 50%;
+  translate: -50% 0;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  background: var(--color-ink-900);
+  border: 1px solid var(--color-edge);
+  opacity: 0;
+  pointer-events: none;
+}
+.calendar-scroll-arrow.earlier {
+  top: 3px;
+}
+.calendar-scroll-arrow.later {
+  bottom: 3px;
+}
+.calendar-scroll-arrow[hidden] {
+  display: none;
+}
+.schedule-pane:hover .calendar-scroll-arrow,
+.schedule-pane:focus-within .calendar-scroll-arrow {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none), (pointer: coarse) {
+  .calendar-scroll-arrow {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+@media (max-width: 600px) {
+  .schedule-pane {
+    flex: 0 0 100%;
+    min-height: 0;
+    width: 100%;
+  }
+  .schedule-view.calendar,
+  .schedule-view.board {
+    height: 100%;
+    max-height: 100%;
+  }
 }

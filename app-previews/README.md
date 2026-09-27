@@ -108,3 +108,5 @@ board source, private repository files and live API routes remain unavailable.
 The default illustrative Tuesday contains five source-derived posts, exposing
 horizontal browsing immediately. Dates/counts stay outside the scroll region;
 keyboard focus brings cards into view without changing planning semantics. Day-strip scrollbars are hidden; directional arrows appear on hover or keyboard focus when more cards exist, and remain visible on touch devices. Native wheel/touch/keyboard scrolling remains available; reduced-motion preferences disable smooth arrow scrolling.
+
+Board uses full-height pipeline columns with fixed counts/headers, explicit empty states, natural-height cards and independent vertical bodies. Narrow screens browse columns horizontally in the remaining bounded pane; the suggestions rail remains reachable below. The week calendar hides its vertical scrollbar and supplies overflow-aware up/down day controls, retaining native keyboard/wheel/touch scrolling in its labelled focusable region. Only calendar and day-strip scrollbars are hidden; board column/outer browsing keeps native scrollbars.

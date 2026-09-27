@@ -233,6 +233,21 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
     );
     await click("Board");
     assert.equal(host.querySelectorAll(".board-lane").length, 6);
+    for (const lane of host.querySelectorAll(".board-lane")) {
+      const body = lane.querySelector(".board-lane-body");
+      assert.ok(body, "each board lane owns its scroll body");
+      assert.equal(body.getAttribute("role"), "region");
+      assert.equal(body.tabIndex, 0);
+      assert.ok(
+        body
+          .getAttribute("aria-label")
+          .includes(lane.querySelector("h3").textContent),
+      );
+      assert.equal(
+        Number(lane.querySelector("header .num").textContent),
+        body.querySelectorAll(".post-card").length,
+      );
+    }
     await click("Calendar");
     const plannedDay = [...host.querySelectorAll(".calendar-day")].find((day) =>
       day.textContent.includes("Edited after approval"),
@@ -264,6 +279,19 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
         table.textContent.includes("source-3"),
       ),
       "Runs show only current-context items",
+    );
+    await click("Home");
+    await click("Board");
+    for (const lane of host.querySelectorAll(".board-lane")) {
+      const body = lane.querySelector(".board-lane-body");
+      if (!body.querySelector(".post-card")) {
+        assert.match(body.textContent, /No posts in/);
+        assert.equal(lane.querySelector("header .num").textContent, "0");
+      }
+    }
+    assert.ok(
+      host.querySelector(".board-empty"),
+      "scoped empty lanes are explicit",
     );
     await click("Settings");
     assert.match(host.textContent, /protected terms/i);
@@ -360,6 +388,37 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
       true,
       "resize removes arrows without overflow",
     );
+    const calendar = host.querySelector(".schedule-view.calendar");
+    assert.equal(calendar.tabIndex, 0);
+    assert.equal(calendar.getAttribute("aria-label"), "Week calendar days");
+    Object.defineProperties(calendar, {
+      clientHeight: { configurable: true, value: 260 },
+      scrollHeight: { configurable: true, value: 900 },
+    });
+    calendar.scrollBy = ({ top, behavior }) => {
+      assert.equal(Math.abs(top), 90, "calendar arrow advances one day row");
+      assert.equal(behavior, "auto");
+      calendar.scrollTop += top;
+      calendar.dispatchEvent(new window.Event("scroll"));
+    };
+    await act(() => window.dispatchEvent(new window.Event("resize")));
+    const calendarArrow = (direction) =>
+      host.querySelector(
+        `button[aria-label="Scroll ${direction} calendar days"]`,
+      );
+    assert.equal(calendarArrow("earlier").hidden, true);
+    assert.equal(calendarArrow("later").hidden, false);
+    await act(() => calendarArrow("later").click());
+    assert.equal(calendar.scrollTop, 90);
+    assert.equal(calendarArrow("earlier").hidden, false);
+    await act(() => {
+      calendar.scrollTop = 640;
+      calendar.dispatchEvent(new window.Event("scroll"));
+    });
+    assert.equal(calendarArrow("later").hidden, true);
+    Object.defineProperty(calendar, "clientHeight", { value: 900 });
+    await act(() => window.dispatchEvent(new window.Event("resize")));
+    assert.equal(calendarArrow("earlier").hidden, true);
   } finally {
     await act(() => root.unmount());
     await window.happyDOM.close();
