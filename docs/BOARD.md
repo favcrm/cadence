@@ -146,6 +146,8 @@ pi:
   id; missing/empty metadata or a display name cannot substitute for identity.
   Switches compare the complete resolved `provider/id`. Verified bare worker
   ids remain supported at open.
+  Candidate launch and all open initialization share one error-cleanup boundary;
+  effort/setup failure closes the transport just as model verification failure does.
   Use the native adapter:
   `cadence join <pm> cursor --model grok-4.7-high`; it delivers prompts through
   its terminal rather than a conversation argv. Installed packages and operator
