@@ -535,3 +535,149 @@ fn cad630_migration_orders_after_a_cooperating_update_and_grant_revocation() {
     );
     assert!(store.platform_grants(Some("worker-a")).unwrap().is_empty());
 }
+
+#[test]
+fn cad667_cached_catalog_refuses_removed_publication_with_intact_record() {
+    let f = Fixture::new();
+    let record = f.install("client", "install-a");
+    let catalog =
+        test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let before = bytes(&record);
+    std::fs::remove_file(f.pm.dir.join(".apps/catalog.yaml")).unwrap();
+    assert!(
+        catalog.resolve_id(&f.pm.dir, "install-a").is_err(),
+        "cached resolution outlived its published catalog"
+    );
+    assert_eq!(bytes(&record), before);
+}
+
+#[test]
+fn cad667_cached_catalog_refuses_remapping_even_when_old_record_survives() {
+    let f = Fixture::new();
+    f.install("client-a", "install-a");
+    f.install("client-b", "install-b");
+    let catalog =
+        test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let path = f.pm.dir.join(".apps/catalog.yaml");
+    let mut published: serde_yaml::Value = serde_yaml::from_slice(&bytes(&path)).unwrap();
+    published["installations"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("install-a".into()));
+    std::fs::write(path, serde_yaml::to_string(&published).unwrap()).unwrap();
+    assert!(
+        catalog.resolve_id(&f.pm.dir, "install-a").is_err(),
+        "cached identity returned despite current publication removal"
+    );
+    assert!(catalog
+        .resolve_legacy(&f.pm.dir, "client-a", "social-content")
+        .is_err());
+    assert!(app_catalog::Catalog::load(&f.pm.dir)
+        .unwrap()
+        .resolve_id(&f.pm.dir, "install-b")
+        .is_ok());
+}
+
+#[test]
+fn cad667_global_inventory_bounds_irrelevant_names_before_publication() {
+    let f = Fixture::new();
+    let record = f.install("client", "install-a");
+    let before = bytes(&record);
+    for index in 0..4100 {
+        std::fs::create_dir(f.pm.dir.join(format!("irrelevant-{index}"))).unwrap();
+    }
+    let result = test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state));
+    assert!(
+        result.is_err(),
+        "mostly irrelevant inventory bypassed the global enumeration bound"
+    );
+    assert_eq!(bytes(&record), before);
+    assert!(
+        !f.pm.dir.join(".apps").exists(),
+        "oversized inventory partially published"
+    );
+}
+
+#[test]
+fn cad667_cached_catalog_refuses_actual_storage_relocation() {
+    let f = Fixture::new();
+    let record = f.install("client-a", "install-a");
+    let cached =
+        test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let destination = f.pm.dir.join(".apps/installations/install-a");
+    std::fs::create_dir_all(destination.join("bundle")).unwrap();
+    std::fs::copy(
+        f.pm.dir.join("client-a/apps/social-content/app.md"),
+        destination.join("bundle/app.md"),
+    )
+    .unwrap();
+    std::fs::copy(&record, destination.join("record.yaml")).unwrap();
+    let path = f.pm.dir.join(".apps/catalog.yaml");
+    let mut publication: serde_yaml::Value = serde_yaml::from_slice(&bytes(&path)).unwrap();
+    publication["installations"]["install-a"]["storage"] =
+        serde_yaml::from_str("kind: workspace").unwrap();
+    std::fs::write(&path, serde_yaml::to_string(&publication).unwrap()).unwrap();
+    assert!(app_catalog::Catalog::load(&f.pm.dir)
+        .unwrap()
+        .resolve_id(&f.pm.dir, "install-a")
+        .is_ok());
+    assert!(
+        cached.resolve_id(&f.pm.dir, "install-a").is_err(),
+        "stale storage returned despite surviving old record"
+    );
+    assert!(record.exists());
+}
+
+#[test]
+fn cad667_publication_crossing_load_and_resolution_refuses_old_generation() {
+    for during_load in [true, false] {
+        let f = Fixture::new();
+        f.install("client", "install-a");
+        let cached =
+            test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state))
+                .unwrap();
+        let publish = || {
+            let path = f.pm.dir.join(".apps/catalog.yaml");
+            let mut publication: serde_yaml::Value = serde_yaml::from_slice(&bytes(&path)).unwrap();
+            publication["installations"]
+                .as_mapping_mut()
+                .unwrap()
+                .clear();
+            std::fs::write(path, serde_yaml::to_string(&publication).unwrap()).unwrap();
+        };
+        let refused = if during_load {
+            app_catalog::Catalog::load_with_observer(&f.pm.dir, publish).is_err()
+        } else {
+            cached
+                .resolve_id_with_observer(&f.pm.dir, "install-a", publish)
+                .is_err()
+        };
+        assert!(refused,"publication crossed physical validation without a final generation check: load={during_load}");
+        assert!(f.pm.dir.join("client/apps/social-content.yaml").exists());
+    }
+}
+
+#[test]
+fn cad667_global_budget_spans_smaller_project_directories_and_ignored_files() {
+    let f = Fixture::new();
+    for index in 0..50 {
+        let project = format!("client-{index}");
+        f.install(&project, &format!("install-{index}"));
+        for ignored in 0..90 {
+            std::fs::write(
+                f.pm.dir
+                    .join(&project)
+                    .join("apps")
+                    .join(format!("ignored-{ignored}.txt")),
+                "ignored",
+            )
+            .unwrap();
+        }
+    }
+    let result = test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state));
+    assert!(
+        result.is_err(),
+        "each individually small directory reset the global enumeration budget"
+    );
+    assert!(!f.pm.dir.join(".apps").exists());
+}

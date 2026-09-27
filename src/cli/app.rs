@@ -8,6 +8,11 @@ use super::*;
 /// `workflow approve`.
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
+    /// Stable workspace installation IDs; execution and approval are separate.
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
     /// Run a fixture-only HMR preview from an explicitly trusted local
     /// Cadence source checkout. This executes that checkout's known
     /// development harness, not an installed app or its manifest.
@@ -146,6 +151,26 @@ pub(crate) enum AppAction {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum CatalogAction {
+    /// Explicitly resume or roll back a retained catalog migration journal.
+    MigrationRecover {
+        journal_id: String,
+        #[arg(long)]
+        rollback: bool,
+    },
+    /// Install a validated bundle without creating a project or grants.
+    Install { source: String },
+    /// List catalogued installations. Never migrates on read.
+    Ls,
+    /// Inspect an exact stable installation ID.
+    Show { install_id: String },
+    /// Explicitly catalogue/backfill existing legacy installations.
+    Migrate,
+    /// Resume a retained installation journal after a failed delivery.
+    Recover { install_id: String },
+}
+
 /// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
 /// the tracker directly — one commit each, `Actor:` recorded, all
 /// unapproving-by-construction (a tracker write can only change the
@@ -154,6 +179,37 @@ pub(crate) enum AppAction {
 pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     use cadence_agent::issue::app;
     let result = match &action {
+        AppAction::Catalog { action } => {
+            let (method, params) = match action {
+                CatalogAction::Install { source } => {
+                    let source = if source.contains("://") || source.starts_with("git@") {
+                        source.clone()
+                    } else {
+                        std::fs::canonicalize(source)
+                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    ("app_workspace_install", json!({"source":source}))
+                }
+                CatalogAction::MigrationRecover {
+                    journal_id,
+                    rollback,
+                } => (
+                    "app_workspace_migration_recover",
+                    json!({"journal_id":journal_id,"rollback":rollback}),
+                ),
+                CatalogAction::Ls => ("app_workspace_list", json!({})),
+                CatalogAction::Show { install_id } => {
+                    ("app_workspace_show", json!({"install_id":install_id}))
+                }
+                CatalogAction::Migrate => ("app_workspace_migrate", json!({})),
+                CatalogAction::Recover { install_id } => {
+                    ("app_workspace_recover", json!({"install_id":install_id}))
+                }
+            };
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Dev {
             name,
             source,

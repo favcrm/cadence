@@ -1,6 +1,7 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
 mod fs;
+pub mod workspace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -16,6 +17,7 @@ const PENDING: &str = ".apps/pending.yaml";
 const RECORD_CAP: u64 = 64 * 1024;
 const CATALOG_CAP: u64 = 4 * 1024 * 1024;
 const MAX_INSTALLATIONS: usize = 1024;
+const MAX_INVENTORY_ENTRIES: usize = 4096;
 const JOURNAL_CAP: u64 = 32 * 1024 * 1024;
 
 /// A validated immutable identity; an app name is never its fallback.
@@ -112,7 +114,19 @@ pub struct Installation {
 /// Operator-only legacy inventory/backfill; no grant or effect is rewritten.
 pub fn migrate(pm: &Pm, state_dir: &Path) -> Result<Catalog> {
     crate::rollout::require_operator(state_dir, "app catalog migration")?;
+    migrate_authorized(pm)
+}
+
+/// Daemon backend; the caller has already proved its connection is operator.
+pub(crate) fn migrate_authorized(pm: &Pm) -> Result<Catalog> {
     let _lock = pm.lock()?;
+    migrate_locked(pm)
+}
+
+fn migrate_locked(pm: &Pm) -> Result<Catalog> {
+    migrate_delivering(pm, |_| Ok(()))
+}
+fn migrate_delivering(pm: &Pm, delivery: impl FnOnce(&Journal) -> Result<()>) -> Result<Catalog> {
     let root = Root::open(&pm.dir)?;
     no_pending(&root)?;
     let before_catalog = root.read(Path::new(CATALOG), CATALOG_CAP)?;
@@ -175,7 +189,9 @@ pub fn migrate(pm: &Pm, state_dir: &Path) -> Result<Catalog> {
             journal: id,
         })?,
     )?;
-    journal.apply(&root, Recovery::Resume)?;
+    journal.apply_delivering(&root, Recovery::Resume, delivery).map_err(|error| {
+        Error::internal(format!("app catalog publication or git delivery incomplete ({}); retained migration {}; explicitly run `cadence app catalog migration-recover {}` to resume, or add `--rollback` to roll back", error.kind(), journal.id, journal.id))
+    })?;
     Ok(candidate)
 }
 
@@ -187,8 +203,23 @@ pub enum Recovery {
 
 pub fn recover(pm: &Pm, state_dir: &Path, id: &str, mode: Recovery) -> Result<()> {
     crate::rollout::require_operator(state_dir, "app catalog recovery")?;
-    journal_id(id)?;
+    recover_authorized(pm, id, mode)
+}
+
+pub(crate) fn recover_authorized(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
     let _lock = pm.lock()?;
+    recover_locked(pm, id, mode)
+}
+fn recover_locked(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
+    recover_delivering(pm, id, mode, |_| Ok(()))
+}
+fn recover_delivering(
+    pm: &Pm,
+    id: &str,
+    mode: Recovery,
+    delivery: impl FnOnce(&Journal) -> Result<()>,
+) -> Result<()> {
+    journal_id(id)?;
     let root = Root::open(&pm.dir)?;
     let journal: Journal = decode(&required(&root, &journal_path(id), JOURNAL_CAP)?)?;
     if journal.id != id {
@@ -206,7 +237,7 @@ pub fn recover(pm: &Pm, state_dir: &Path, id: &str, mode: Recovery) -> Result<()
             })?,
         )?;
     }
-    journal.apply(&root, mode)
+    journal.apply_delivering(&root, mode, delivery)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -383,7 +414,12 @@ impl Journal {
             Recovery::Rollback => &source.before,
         }
     }
-    fn apply(&self, root: &Root, mode: Recovery) -> Result<()> {
+    fn apply_delivering(
+        &self,
+        root: &Root,
+        mode: Recovery,
+        delivery: impl FnOnce(&Journal) -> Result<()>,
+    ) -> Result<()> {
         self.verify(root)?;
         for source in &self.records {
             let target = self.target(source, mode);
@@ -419,6 +455,7 @@ impl Journal {
                 "catalog changed before migration completion",
             ));
         }
+        delivery(self)?;
         root.remove(Path::new(PENDING))?;
         Ok(())
     }
@@ -488,21 +525,63 @@ impl Catalog {
             project: entry.project.clone(),
         })
     }
+    fn require_current(&self, root: &Root) -> Result<()> {
+        no_pending(root)?;
+        let current: Catalog = decode(&required(root, Path::new(CATALOG), CATALOG_CAP)?)?;
+        current.validate()?;
+        if current != *self {
+            return Err(Error::rejected(
+                "cached catalog generation is no longer published",
+            ));
+        }
+        Ok(())
+    }
     pub fn load(root: &Path) -> Result<Self> {
+        Self::load_observed(root, || {})
+    }
+    fn load_observed(root: &Path, observed: impl FnOnce()) -> Result<Self> {
         let root = Root::open(root)?;
         no_pending(&root)?;
         let catalog: Self = decode(&required(&root, Path::new(CATALOG), CATALOG_CAP)?)?;
         catalog.validate()?;
+        observed();
         for id in catalog.installations.keys() {
             catalog.installation(&root, id)?;
         }
+        catalog.require_current(&root)?;
         Ok(catalog)
     }
+    #[cfg(feature = "test-seam")]
+    #[doc(hidden)]
+    pub fn load_with_observer(root: &Path, observed: impl FnOnce()) -> Result<Self> {
+        Self::load_observed(root, observed)
+    }
     pub fn resolve_id(&self, root: &Path, id: &str) -> Result<Installation> {
+        self.resolve_observed(root, id, || {})
+    }
+    fn resolve_observed(
+        &self,
+        root: &Path,
+        id: &str,
+        observed: impl FnOnce(),
+    ) -> Result<Installation> {
         let id = InstallationId::parse(id)?;
         let root = Root::open(root)?;
-        no_pending(&root)?;
-        self.installation(&root, &id)
+        self.require_current(&root)?;
+        observed();
+        let installation = self.installation(&root, &id)?;
+        self.require_current(&root)?;
+        Ok(installation)
+    }
+    #[cfg(feature = "test-seam")]
+    #[doc(hidden)]
+    pub fn resolve_id_with_observer(
+        &self,
+        root: &Path,
+        id: &str,
+        observed: impl FnOnce(),
+    ) -> Result<Installation> {
+        self.resolve_observed(root, id, observed)
     }
     pub fn resolve_legacy(&self, root: &Path, project: &str, name: &str) -> Result<Installation> {
         model::check_key(project)?;
@@ -544,6 +623,12 @@ fn record(text: &str, name: &str) -> Result<Record> {
     Ok(record)
 }
 fn no_pending(root: &Root) -> Result<()> {
+    if root
+        .read(Path::new(".apps/install-pending.yaml"), RECORD_CAP)?
+        .is_some()
+    {
+        return Err(Error::rejected("workspace installation is pending; use app catalog recover with the retained installation ID"));
+    }
     if root.read(Path::new(PENDING), RECORD_CAP)?.is_some() {
         return Err(Error::rejected(
             "app catalog publication is pending; recover its retained journal first",
@@ -563,7 +648,8 @@ fn journal_id(id: &str) -> Result<()> {
 }
 fn legacy_records(root: &Root) -> Result<Vec<(String, String, String)>> {
     let mut records = Vec::new();
-    for project in root.list(Path::new(""))? {
+    let mut budget = MAX_INVENTORY_ENTRIES;
+    for project in root.list(Path::new(""), &mut budget)? {
         if project.starts_with('.') || model::check_key(&project).is_err() {
             continue;
         }
@@ -583,7 +669,7 @@ fn legacy_records(root: &Root) -> Result<Vec<(String, String, String)>> {
         }
         let mut folders = HashSet::new();
         let mut files = HashSet::new();
-        for leaf in root.list(&apps)? {
+        for leaf in root.list(&apps, &mut budget)? {
             let kind = root.kind(&apps.join(&leaf))?;
             if kind == Some(libc::S_IFLNK) {
                 return Err(Error::rejected("symlinked legacy app is refused"));

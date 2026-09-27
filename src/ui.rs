@@ -2107,6 +2107,42 @@ fn write_route(
         send(request, resp);
         return;
     }
+    let catalog_recovery = path
+        .strip_prefix("/api/app-installations/migrations/")
+        .and_then(|tail| tail.strip_suffix("/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_recovery = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    if path == "/api/app-installations/migrate"
+        || catalog_recovery.is_some()
+        || install_recovery.is_some()
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let (operation, id) = if let Some(id) = catalog_recovery {
+            ("app_workspace_migration_recover", Some(id))
+        } else if let Some(id) = install_recovery {
+            ("app_workspace_recover", Some(id))
+        } else {
+            ("app_workspace_migrate", None)
+        };
+        let response = apps::workspace(&mut request, state_dir, operation, id);
+        send(request, response);
+        return;
+    }
+    if path == "/api/app-installations" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = apps::workspace(&mut request, state_dir, "app_workspace_install", None);
+        send(request, response);
+        return;
+    }
     // An app approval (CAD-557) — relayed to the daemon's
     // `app_approve`, operator-only on the board (see `apps`).
     if let Some((key, name)) = apps::approve_route(path) {
@@ -3282,6 +3318,25 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                     return;
                 }
+            }
+            if path == "/api/app-installations"
+                || path
+                    .strip_prefix("/api/app-installations/")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let id = path.strip_prefix("/api/app-installations/");
+                let method = if id.is_some() {
+                    "app_workspace_show"
+                } else {
+                    "app_workspace_list"
+                };
+                let response = apps::workspace(&mut request, state_dir, method, id);
+                send(request, response);
+                return;
             }
             // `/api/apps[/<project>/<name>[/runs|/outputs]]` — installed
             // apps: the list, or one app's guide, workflows, rubrics,
