@@ -19,7 +19,9 @@ struct Board {
 }
 impl Board {
     fn new() -> Self {
-        let release = Release::new();
+        Self::from_release(Release::new())
+    }
+    fn from_release(release: Release) -> Self {
         let port = (3110..3200)
             .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
             .unwrap();
@@ -254,4 +256,113 @@ fn cad692_actual_agent_and_setsid_http_release_refuse_stolen_operator_sessions()
         failures.is_empty(),
         "release HTTP operator peer guard failed: {failures:?}"
     );
+}
+
+#[test]
+fn cad692_http_uncertainty_resolution_is_operator_only_and_never_sends() {
+    let b = Board::from_release(Release::with_app_fault(
+        common::app_release::AppFault::UncertainAfterCommit,
+    ));
+    let (_, run, effect) = b.populate();
+    let effect_path = format!("/api/app-effects/{}", effect["effect_id"].as_str().unwrap());
+    let uncertain = b.value(
+        "POST",
+        &format!("{effect_path}/decide"),
+        json!({"digest":effect["digest"],"decision":"accept"}),
+    )["effect"]
+        .clone();
+    assert_eq!(uncertain["state"], "reconcile");
+    assert_eq!(uncertain["needs_you"], true);
+    assert_eq!(uncertain["record"]["outcome"]["verified"], true);
+    assert_eq!(b.release.items().as_array().unwrap().len(), 1);
+    let before = b.persisted();
+    let resolve = format!("{effect_path}/resolve");
+    assert_ne!(
+        b.operator(
+            "POST",
+            &resolve,
+            &json!({"digest":"wrong","resolution":"close"}).to_string()
+        )
+        .0,
+        200
+    );
+    for body in [
+        json!({"digest":effect["digest"],"resolution":"retry"}),
+        json!({"digest":effect["digest"],"resolution":"close","effect_id":"other"}),
+        json!({"digest":effect["digest"],"resolution":"close","operator":true}),
+    ] {
+        assert_eq!(b.operator("POST", &resolve, &body.to_string()).0, 400);
+    }
+    let mut lane = LaneShell::spawn(b.release.root.path());
+    plant_member_pane(
+        &b.release.daemon,
+        "resolution-http-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    let mut failures = Vec::new();
+    for prefix in ["", "setsid "] {
+        for forged in [false, true] {
+            let mut body = json!({"digest":effect["digest"],"resolution":"close"});
+            if forged {
+                body["operator"] = json!(true);
+                body["agent"] = json!("operator");
+            }
+            let session = common::op::sign_in(
+                env!("CARGO_BIN_EXE_cadence"),
+                &b.release.daemon.state,
+                b.port,
+            );
+            let wire = session.request_as("POST", &resolve, &body.to_string(), "");
+            assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
+            assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
+            let file = lane.dir.path().join(format!("resolve-{}.txt", lane.seq));
+            std::fs::write(&file, wire).unwrap();
+            let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}",b.port,file.display()));
+            assert_eq!(rc, 0);
+            if response.split_whitespace().nth(1) != Some("403") {
+                failures.push(format!("{prefix:?} forged={forged}: {response}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "uncertain HTTP resolution operator guard failed: {failures:?}"
+    );
+    assert_eq!(
+        b.persisted(),
+        before,
+        "refused resolution changed receipt/outbox"
+    );
+    let closed = b.value(
+        "POST",
+        &resolve,
+        json!({"digest":effect["digest"],"resolution":"close"}),
+    )["effect"]
+        .clone();
+    assert_eq!(closed["state"], "closed");
+    assert_eq!(closed["needs_you"], false);
+    assert_eq!(closed["authority"], uncertain["authority"]);
+    assert_eq!(closed["digest"], uncertain["digest"]);
+    assert_eq!(closed["record"]["input"], uncertain["record"]["input"]);
+    assert_eq!(
+        closed["record"]["decision"],
+        uncertain["record"]["decision"]
+    );
+    assert_eq!(closed["record"]["outcome"], uncertain["record"]["outcome"]);
+    assert_ne!(
+        b.operator(
+            "POST",
+            &format!("{effect_path}/decide"),
+            &json!({"digest":effect["digest"],"decision":"accept"}).to_string()
+        )
+        .0,
+        200
+    );
+    assert_eq!(b.release.items().as_array().unwrap().len(), 1);
+    assert!(b.release.artifact(&run)["text"]
+        .as_str()
+        .unwrap()
+        .contains(A));
 }

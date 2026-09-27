@@ -199,3 +199,101 @@ fn cad692_actual_operator_cli_binding_cas_and_exact_release_roundtrip() {
         .unwrap();
     assert_eq!(grants, 0, "CLI leaked ambient worker grants");
 }
+
+#[test]
+fn cad692_actual_operator_cli_resolves_uncertainty_and_acknowledges_without_replay() {
+    for (fault, expected, resolution, items) in [
+        (
+            common::app_release::AppFault::UncertainAfterCommit,
+            "reconcile",
+            "close",
+            1,
+        ),
+        (
+            common::app_release::AppFault::RefusedBeforeCommit,
+            "failed",
+            "acknowledge",
+            0,
+        ),
+    ] {
+        let r = Release::with_app_fault(fault);
+        let context = r.context("CLI outcome", A, "cli-outcome-context");
+        r.bind(&context, "cli-outcome-binding");
+        let run = r.complete(&context, "cli-outcome-run");
+        let effect = r.stage(&run, "cli-outcome-stage");
+        let eid = effect["effect_id"].as_str().unwrap();
+        let digest = effect["digest"].as_str().unwrap();
+        let outcome =
+            success(&r.daemon, &["effect", "accept", eid, "--digest", digest])["effect"].clone();
+        assert_eq!(outcome["state"], expected);
+        assert_eq!(outcome["needs_you"], true);
+        assert_eq!(r.items().as_array().unwrap().len(), items);
+        assert_ne!(
+            cli(
+                &r.daemon,
+                &[
+                    "effect",
+                    "resolve",
+                    eid,
+                    "--digest",
+                    "wrong",
+                    "--resolution",
+                    resolution
+                ]
+            )["rc"],
+            0
+        );
+        assert_ne!(
+            cli(
+                &r.daemon,
+                &[
+                    "effect",
+                    "resolve",
+                    eid,
+                    "--digest",
+                    digest,
+                    "--resolution",
+                    "retry"
+                ]
+            )["rc"],
+            0
+        );
+        assert_eq!(
+            success(&r.daemon, &["effect", "show", eid])["effect"],
+            outcome
+        );
+        let resolved = success(
+            &r.daemon,
+            &[
+                "effect",
+                "resolve",
+                eid,
+                "--digest",
+                digest,
+                "--resolution",
+                resolution,
+            ],
+        )["effect"]
+            .clone();
+        assert_eq!(
+            resolved["state"],
+            if resolution == "close" {
+                "closed"
+            } else {
+                "failed"
+            }
+        );
+        assert_eq!(resolved["needs_you"], false);
+        for field in ["authority", "digest"] {
+            assert_eq!(resolved[field], outcome[field]);
+        }
+        for field in ["input", "decision", "outcome"] {
+            assert_eq!(resolved["record"][field], outcome["record"][field]);
+        }
+        assert_ne!(
+            cli(&r.daemon, &["effect", "accept", eid, "--digest", digest])["rc"],
+            0
+        );
+        assert_eq!(r.items().as_array().unwrap().len(), items);
+    }
+}

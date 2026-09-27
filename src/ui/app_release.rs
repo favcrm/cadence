@@ -314,4 +314,27 @@ mod tests {
             assert!(serde_json::from_str::<Decision>(body).is_err());
         }
     }
+    #[test]
+    fn resolution_schema_cannot_request_execution_or_replace_authority() {
+        assert!(matches!(
+            route("/api/app-effects/effect-a/resolve"),
+            Some(Route::Resolve("effect-a"))
+        ));
+        assert!(serde_json::from_str::<Resolve>(r#"{"digest":"d","resolution":"close"}"#).is_ok());
+        assert!(
+            serde_json::from_str::<Resolve>(r#"{"digest":"d","resolution":"acknowledge"}"#).is_ok()
+        );
+        for body in [
+            r#"{"digest":"d","resolution":"retry"}"#,
+            r#"{"digest":"d","resolution":"accept"}"#,
+            r#"{"digest":"d","resolution":"close","operator":true}"#,
+            r#"{"digest":"d","resolution":"close","effect_id":"other"}"#,
+            r#"{"digest":"d","digest":"other","resolution":"close"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Resolve>(body).is_err(),
+                "resolution admitted {body}"
+            );
+        }
+    }
 }
