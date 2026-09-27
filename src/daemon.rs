@@ -3565,6 +3565,9 @@ pub struct ServeOptions {
     /// `platform` name → adapter. CAD-367/501 register real ones;
     /// tests register the shared-fixture `FakePlatform`.
     pub platforms: effect_rpc::PlatformMap,
+    /// Trusted embedding composition assertions; never deserialized from PM,
+    /// app, RPC or worker input. None reads the fixed root-owned image file.
+    pub provider_deployments: Option<crate::platform::deployments::DeploymentMetadata>,
     /// CAD-506 test seam: consulted once per accepted effect between
     /// the durable `decided` write and execution. `false` models the
     /// daemon dying inside §5.4 step 5's window — the decision is
