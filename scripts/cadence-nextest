@@ -104,7 +104,8 @@ run_nextest() {
         "$@"
 }
 
-# Listing is metadata-only and does not need the host suite slot.
+# Listing skips test execution and the host suite lock, but can compile test
+# binaries. Obtain build admission before ordinary listing on a shared host.
 if [ "$SUBCOMMAND" = list ]; then
     run_nextest "$@"
 fi
