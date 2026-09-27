@@ -732,7 +732,7 @@ fn agenticos_detached_enrolled_child_cannot_forge_operator_grant_authority() {
     let (door, adapter) = start(Script::Posted);
     let d = CallDaemon::start(Arc::new(adapter));
     let mut lane = Lane::spawn(&d, "aos-detached-worker");
-    let err = lane.rpc_with_prefix(&d, "platform_grant", json!({"agent":"aos-detached-worker","platform":"agenticos","account":"hosted","scopes":["publish"],"by":"operator"}), "setsid ").unwrap_err();
+    let err = lane.rpc_with_prefix(&d, "platform_grant", json!({"agent":"aos-detached-worker","platform":"agenticos","account":"hosted","scopes":["publish"]}), "setsid ").unwrap_err();
     assert!(
         err.to_string().contains("operator") || err.to_string().contains("refused"),
         "{err}"
@@ -880,12 +880,13 @@ fn agenticos_http_peer_has_no_tool_relay_even_with_forged_identity() {
             "unexpected tool relay at {path}"
         );
     }
-    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &d.state, port);
     for path in [
         "/api/platform_call",
         "/api/platform/call",
         "/v1/runtime/connectors/publish",
     ] {
+        // Replaying a session as an agent revokes it; isolate each path's operator proof.
+        let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &d.state, port);
         let body = json!({"agent":"operator","platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello")}).to_string();
         let (code, _, _) = op::raw(port, &session.request("POST", path, &body));
         assert_eq!(
@@ -910,4 +911,21 @@ fn agenticos_http_peer_has_no_tool_relay_even_with_forged_identity() {
         door.state.lock().unwrap().requests.load(Ordering::SeqCst),
         0
     );
+}
+#[test]
+fn absent_or_mismatched_deployment_pin_stages_rpc_without_upstream_traffic() {
+    for pin in [None, Some("agenticos-manifest@1/publish_post@1")] {
+        let (door, _) = start(Script::Posted);
+        let adapter = AgenticosAdapter::with_deployment_pin(&door.base, pin).unwrap();
+        let d = CallDaemon::start(Arc::new(adapter));
+        let mut agent = Lane::spawn(&d, "aos-no-deployment-pin");
+        d.op("platform_grant", json!({"agent":"aos-no-deployment-pin","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+        let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("no trusted pin")});
+        let out = agent.rpc(&d, "platform_call", call).unwrap();
+        assert_eq!(out["result"], "staged");
+        assert_eq!(
+            door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+            0
+        );
+    }
 }

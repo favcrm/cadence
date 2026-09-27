@@ -537,3 +537,35 @@ fn absent_external_deployment_assertion_gates_every_tool_as_send() {
         );
     }
 }
+#[test]
+fn trusted_registration_assertion_is_separate_from_reviewed_metadata() {
+    use cadence_agent::contract_fixture::{classify_call, Effect};
+    use cadence_agent::platform::agenticos::register_with_deployment_pin;
+    for (pin, expected) in [
+        (None, Effect::Send),
+        (Some("agenticos-manifest@1/publish_post@1"), Effect::Send),
+        (Some("agenticos-manifest@2/publish_post@2"), Effect::Send),
+        (Some("agenticos-manifest@1/publish_post@2"), Effect::Read),
+    ] {
+        let mut opts = cadence_agent::daemon::ServeOptions::default();
+        register_with_deployment_pin(&mut opts, "http://127.0.0.1:9", pin).unwrap();
+        let adapter = &opts.platforms["agenticos"];
+        assert_eq!(adapter.reported_manifest_version().as_deref(), pin);
+        let reported = adapter.reported_manifest_version();
+        assert_eq!(
+            classify_call(adapter.table(), reported.as_deref(), "connections_list"),
+            expected
+        );
+        let draft = if expected == Effect::Read {
+            Effect::Draft
+        } else {
+            Effect::Send
+        };
+        for tool in ["post_draft", "publish_post"] {
+            assert_eq!(
+                classify_call(adapter.table(), reported.as_deref(), tool),
+                draft
+            );
+        }
+    }
+}
