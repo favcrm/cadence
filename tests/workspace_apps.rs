@@ -359,7 +359,12 @@ fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_rea
         ] {
             let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
             let request = lane.dir.path().join(format!("http-{}.txt", lane.seq));
-            std::fs::write(&request, stolen.request_as(method, &path, &body, "")).unwrap();
+            let wire = stolen.request_as(method, &path, &body, "");
+            assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
+            assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
+            assert!(wire.contains(&stolen.cookie));
+            assert!(wire.contains(&stolen.key));
+            std::fs::write(&request, wire).unwrap();
             let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}",request.display()));
             assert_eq!(rc, 0);
             assert_eq!(
