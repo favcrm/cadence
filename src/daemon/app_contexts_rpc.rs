@@ -48,7 +48,7 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.operator_connection("app context management", params, peer_pid)?;
+        let _ = peer_pid; // Counterfactual: omit native operator admission.
         let allowed: &[&str] = match method {
             "app_context_create" => &["install_id", "label", "input_defaults", "request_id"],
             "app_context_list" => &["install_id"],
