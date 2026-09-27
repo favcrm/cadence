@@ -194,6 +194,42 @@ def would_read(value, cwd):
     return target.resolve()
 
 
+def foreign_git_storage(iso, directory, roots):
+    """Repo storage `git -C <directory>` reaches that escapes `roots`.
+
+    `rev-parse --absolute-git-dir` alone is not the boundary: a worktree
+    gitdir carries a `commondir` file to the real repository, and every
+    object store can name `objects/info/alternates` targets of its own.
+    Follow the whole chain — the remote read comes from the common dir's
+    config and `cat-file`/clone reads come from every alternate.
+    """
+    gitdir = Path(iso.run('git', '-C', str(directory), 'rev-parse',
+                          '--absolute-git-dir'))
+    common = Path(iso.run('git', '-C', str(directory), 'rev-parse',
+                          '--path-format=absolute', '--git-common-dir'))
+    reached = {gitdir, common}
+    pending = [gitdir / 'objects', common / 'objects']
+    seen = set(pending)
+    while pending:
+        objects = pending.pop()
+        reached.add(objects)
+        alternates = objects / 'info' / 'alternates'
+        if not alternates.is_file():
+            continue
+        for line in alternates.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            target = Path(line)
+            if not target.is_absolute():
+                target = (objects / target).resolve()
+            if target not in seen:
+                seen.add(target)
+                pending.append(target)
+    return [str(t) for t in reached
+            if not any(t == root or t.is_relative_to(root) for root in roots)]
+
+
 def refuse_foreign_checkouts(db_path, roots, iso):
     """Refuse a source whose path columns reach a repository outside the rehearsal.
 
@@ -217,12 +253,11 @@ def refuse_foreign_checkouts(db_path, roots, iso):
             outside.append(str(resolved))
             continue
         try:
-            gitdir = Path(iso.run('git', '-C', str(resolved),
-                                  'rev-parse', '--absolute-git-dir'))
+            foreign = foreign_git_storage(iso, resolved, roots)
         except ValueError:
             # No repository resolves from here — the remote read fails too.
             continue
-        if not any(gitdir == root or gitdir.is_relative_to(root) for root in roots):
+        if foreign:
             outside.append(str(resolved))
     if outside:
         outside = sorted(set(outside))
@@ -339,6 +374,14 @@ def rehearse(binary, source, tracker, output, dry_run=False):
     source, tracker, output = preflight(binary, source, tracker, output)
     with tempfile.TemporaryDirectory(prefix='cad529-isolation-') as scratch:
         iso = Isolation(scratch)
+        # The tracker is read and cloned: its storage must live inside its
+        # own root, or a `.git` file, commondir or alternates quietly turns
+        # the clone into a copy of a repository the rehearsal does not own.
+        foreign = foreign_git_storage(iso, tracker, (tracker,))
+        if foreign:
+            raise ValueError(
+                'tracker repository storage escapes its own root '
+                f'({", ".join(foreign[:3])}); pass a self-contained clone')
         # Read-only: the tracker's own index is never the one git opens.
         sha = clean_tracker(iso, tracker)
         roots = (source, tracker, output)

@@ -367,6 +367,57 @@ class MigrationTests(unittest.TestCase):
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
 
+    def test_refuses_a_commondir_escape_to_a_foreign_repo(self):
+        # `.git` is a real worktree gitdir inside `source`, but its
+        # `commondir` file sends every object/config read to a repo
+        # outside the rehearsal — `--absolute-git-dir` alone accepts it.
+        outside = self.make_repo(self.root / 'foreign-repo', remote=TOKEN_REMOTE)
+        inner = self.source / 'nested'
+        gitdir = inner / '.git'
+        gitdir.mkdir(parents=True)
+        (gitdir / 'commondir').write_text(str(outside / '.git'))
+        (gitdir / 'gitdir').write_text(str(gitdir))
+        (gitdir / 'HEAD').write_text('ref: refs/heads/main\n')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        # The escape is real: unguarded, the remote read returns the token.
+        self.assertEqual(self.git(inner, 'remote', 'get-url', 'origin'), TOKEN_REMOTE)
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_refuses_alternates_reaching_a_foreign_object_store(self):
+        # The repo and its gitdir are inside `source`, but
+        # objects/info/alternates names an object store outside — a clone
+        # or cat-file would serve foreign objects.
+        outside = self.make_repo(self.root / 'foreign-store')
+        inner = self.make_repo(self.source / 'nested-repo')
+        info = inner / '.git' / 'objects' / 'info'
+        info.mkdir(exist_ok=True)
+        (info / 'alternates').write_text(f'{outside}/.git/objects\n')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_refuses_a_tracker_gitfile_pointing_outside_its_root(self):
+        # `temporary()` only confines the tracker *path*; a `.git` file
+        # underneath still lands `clean_tracker` and `git clone` in a
+        # repository the rehearsal does not own.
+        outside = self.make_repo(self.root / 'foreign-tracker', remote=TOKEN_REMOTE)
+        fake = self.root / 'fake-tracker'
+        fake.mkdir()
+        (fake / '.git').write_text(f'gitdir: {outside}/.git\n')
+        with self.assertRaisesRegex(ValueError, 'escapes its own root'):
+            migration.rehearse('/usr/bin/true', self.source, fake,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
     def test_accepts_a_checkout_repo_inside_the_source_root(self):
         # Positive control: a real repository inside a root stays allowed —
         # its own gitdir resolves inside the rehearsal.
