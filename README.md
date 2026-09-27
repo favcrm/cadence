@@ -22,9 +22,21 @@ Build from source — a recent stable Rust toolchain via
 cargo install --path . --locked
 ```
 
-Tagged releases will ship `install.sh` with checksums and build-provenance
-attestation once the first `v*` tag is cut; until then there is nothing at
-`releases/latest`.
+[Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
+is available as an explicit-tag local CLI pilot for Linux x86_64/ARM64 and Apple
+Silicon macOS. The installer checks archive/binary digests and version; the release
+includes build-provenance attestations. Use the exact prerelease tag:
+
+```sh
+curl -fsSL https://github.com/favcrm/cadence/releases/download/v0.1.0-beta.2/install.sh -o install.sh
+sh install.sh --version v0.1.0-beta.2
+"$HOME/.local/bin/cadence" --version
+```
+
+Linux daemon/board evaluation uses fresh, separate state. macOS supports CLI
+installation/version checks only; setup, daemon and board are unsupported pending
+CAD-315. Full clean-platform setup/backup acceptance remains open under CAD-317.
+There is no stable release: `releases/latest` does not select this prerelease.
 
 See [native installation](docs/INSTALL-AGENT.md) for supported platforms,
 explicit pilot versions and provenance verification. The
