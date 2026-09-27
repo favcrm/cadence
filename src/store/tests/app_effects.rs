@@ -5,6 +5,10 @@ fn cad692_uncertain_outcome_and_resolution_preserve_exact_historical_authority()
     let (_dir, s) = store();
     let (row, authority) = child_fixture(&s);
     let staged = s.app_effect_stage(&row, &authority).unwrap();
+    assert_eq!(staged["effect"]["schema"], 1);
+    assert_eq!(staged["effect"]["authorization_kind"], "app_artifact");
+    assert_eq!(staged["effect"]["record"]["kind"], "app_artifact_effect");
+    assert_eq!(staged["effect"]["needs_you"], false);
     let digest = staged["effect"]["digest"].as_str().unwrap();
     let outcome = json!({"kind":"uncertain","error":"directory sync failed","verified":true});
     assert!(s.app_effect_uncertain(&row.effect_id, &outcome).is_err());
@@ -19,6 +23,7 @@ fn cad692_uncertain_outcome_and_resolution_preserve_exact_historical_authority()
     s.app_effect_uncertain(&row.effect_id, &outcome).unwrap();
     let uncertain = s.app_effect_show(&row.effect_id).unwrap();
     assert_eq!(uncertain["effect"]["state"], "reconcile");
+    assert_eq!(uncertain["effect"]["needs_you"], true);
     assert_eq!(uncertain["effect"]["record"]["outcome"], outcome);
     assert!(s.effect_by_id(&row.effect_id).unwrap().unwrap().needs_you);
     assert!(s
