@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import xml.etree.ElementTree as ET
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/delivery-candidate.py"
 
@@ -82,6 +83,31 @@ class CandidateTests(unittest.TestCase):
             with self.subTest(additional=additional):
                 with self.assertRaises(ValueError):
                     self.module.validate_mutation(100, f'<testsuite>{failed}{additional}</testsuite>', "guard")
+
+    def test_authentic_failure_cannot_hide_unrelated_skips_or_duplicate_identities(self):
+        report = (Path(__file__).parent / "fixtures/mutation-filtered.xml").read_text()
+        name = "cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry"
+        for variant in ("ignored", "missing_reason", "skipped_target", "duplicate_skip", "duplicate_target"):
+            with self.subTest(variant=variant):
+                root = ET.fromstring(report)
+                suite = root.find("testsuite")
+                skipped = suite.find("testcase")
+                if variant == "ignored":
+                    skipped.find("skipped").set("message", "ignored by user")
+                elif variant == "missing_reason":
+                    skipped.find("skipped").attrib.pop("message")
+                elif variant == "skipped_target":
+                    # Even a different class cannot label the requested target skipped.
+                    skipped.set("name", name)
+                    skipped.set("classname", "other")
+                elif variant == "duplicate_skip":
+                    suite.append(ET.fromstring(ET.tostring(skipped)))
+                else:
+                    duplicate = ET.fromstring(ET.tostring(skipped))
+                    duplicate.set("name", name)
+                    suite.append(duplicate)
+                with self.assertRaises(ValueError):
+                    self.module.validate_mutation(100, ET.tostring(root), name)
 
     def test_malformed_and_conflicting_failure_reports_are_rejected(self):
         for report in [

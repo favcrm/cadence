@@ -40,16 +40,26 @@ def validate_mutation(code, xml, name):
     if report.tag not in ("testsuite", "testsuites"):
         raise ValueError("mutation report is not JUnit")
     executed = []
+    identities = set()
     for case in report.iter("testcase"):
+        identity = (case.get("classname"), case.get("name"))
+        if identity in identities:
+            raise ValueError("mutation report repeats a testcase identity")
+        identities.add(identity)
         statuses = [child.tag for child in case
                     if child.tag in ("failure", "error", "skipped")]
         nested_statuses = [child.tag for child in case.iter()
                            if child.tag in ("failure", "error", "skipped")]
         if len(statuses) > 1 or nested_statuses != statuses:
             raise ValueError("mutation testcase has conflicting statuses")
-        # nextest report-skipped=all includes filtered cases. Only a pure
-        # skip is non-executed; never discard a skipped failure or error.
-        if statuses != ["skipped"]:
+        # Accept only the pinned nextest filter-exclusion receipt, never
+        # ignored tests or a contradictory skipped requested target.
+        if statuses == ["skipped"]:
+            reason = case.find("skipped").get("message")
+            if (case.get("name") == name or reason !=
+                    "Skipped: test does not match the provided string filters"):
+                raise ValueError("mutation report contains a non-filter or target skip")
+        else:
             executed.append(case)
     if (code != 100 or len(executed) != 1 or executed[0].get("name") != name
             or executed[0].find("failure") is None
