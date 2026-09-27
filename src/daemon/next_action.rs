@@ -1403,9 +1403,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|r| {
-                r["causes"].as_array().is_some_and(|causes| {
-                    causes.iter().any(|c| c["cause"] == "next_action")
-                })
+                r["causes"]
+                    .as_array()
+                    .is_some_and(|causes| causes.iter().any(|c| c["cause"] == "next_action"))
             })
             .collect();
         assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
