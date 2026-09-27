@@ -813,6 +813,7 @@ summary {
 }
 .schedule-view.calendar {
   overflow-y: auto;
+  padding-bottom: 0;
   scrollbar-width: none;
 }
 .schedule-view.calendar::-webkit-scrollbar {
