@@ -193,15 +193,6 @@ export function kickoffBlock(items: AcceptanceItem[], writeBlock: string | null)
   return writeBlock;
 }
 
-/**
- * There is no board route for human-class merge approval. `cadence audit
- * approve` records it. The button stays disabled and says why.
- */
-export function approveReason(refs: { kind: string }[]): string {
-  if (!refs.some((r) => r.kind === "pr")) return "No pull request yet";
-  return "Human-class merge approval has no board route. Record it with cadence audit approve.";
-}
-
 export function askAgentReason(agentCount: number): string | null {
   return agentCount > 0 ? null : "No lane yet";
 }
@@ -269,10 +260,6 @@ export function briefPreview(id: string, title: string, body: string, note: stri
   return `${id} — ${title}\n\n${body.trim()}\n\n— note —\n${extra || "No extra note."}`;
 }
 
-export const CI_UNAVAILABLE = "Checks are not on this board yet.";
-export const QUEUE_UNAVAILABLE = "Queue position is not on this board yet.";
-export const ROLLOUT_UNAVAILABLE = "No production build is on this page yet.";
-
 export interface TimelineRow {
   title: string;
   detail: string;
@@ -287,108 +274,17 @@ function reportTone(report: TaskReport): "done" | "warn" {
   return kind.includes("revise") || kind.includes("fail") ? "warn" : "done";
 }
 
-/** The nine delivery steps, once a lane or any ship signal exists. */
-export function deliveryStages(detail: IssueDetail): TimelineRow[] | null {
-  const agents = detail.agents ?? [];
-  const commits = detail.commits ?? [];
-  const pr = prRef(detail.refs);
-  const branch = laneBranch(detail.refs);
-  const tree = worktreePath(detail.refs);
-  const reports = detail.reports ?? [];
-  const started =
-    agents.length > 0 ||
-    commits.length > 0 ||
-    pr !== null ||
-    branch !== null ||
-    tree !== null ||
-    detail.status === "doing" ||
-    detail.status === "review" ||
-    detail.status === "done";
-  if (!started) return null;
-  const latest = commits[0];
-  const merged = detail.status === "done" || commits.some((c) => c.on_default === true);
-  const reviewTone = reports.some((r) => reportTone(r) === "warn") ? "warn" : reports.length ? "done" : "wait";
-  return [
-    {
-      title: "Claimed",
-      detail: agents.length ? agents.map((a) => `${a.alias} · ${a.state}`).join(", ") : "No agent is bound to this issue yet.",
-      at: null,
-      tone: agents.length ? "done" : "wait",
-      markdown: false,
-    },
-    {
-      title: "Worktree",
-      detail: tree ?? branch ?? "No worktree ref yet.",
-      at: null,
-      tone: tree || branch ? "done" : "wait",
-      markdown: false,
-    },
-    {
-      title: "Commits",
-      detail: latest ? `${commits.length} commits · latest ${latest.sha.slice(0, 7)}` : "No commits yet.",
-      at: latest?.at ?? null,
-      tone: commits.length ? "done" : "wait",
-      markdown: false,
-    },
-    {
-      title: "PR",
-      detail: pr ? pr.label : "Not opened.",
-      at: null,
-      tone: pr ? "done" : "wait",
-      markdown: false,
-    },
-    {
-      title: "CI",
-      detail: CI_UNAVAILABLE,
-      at: null,
-      tone: "wait",
-      markdown: false,
-    },
-    {
-      title: "Reviews",
-      detail: reports.length
-        ? reports.map((r) => `${r.agent ?? r.name}: ${r.kind ?? "report"}`).join(" · ")
-        : "No verdicts.",
-      at: reports.find((r) => r.at)?.at ?? null,
-      tone: reviewTone,
-      markdown: false,
-    },
-    {
-      title: "Queue",
-      detail: QUEUE_UNAVAILABLE,
-      at: null,
-      tone: "wait",
-      markdown: false,
-    },
-    {
-      title: "Merged",
-      detail: merged ? "Marked done, or a commit is on the default branch." : "Not merged.",
-      at: null,
-      tone: merged ? "done" : "wait",
-      markdown: false,
-    },
-    {
-      title: "Rollout",
-      detail: ROLLOUT_UNAVAILABLE,
-      at: null,
-      tone: "wait",
-      markdown: false,
-    },
-  ];
-}
-
 function timeKey(at: string | null): number {
-  if (!at) return Number.POSITIVE_INFINITY;
+  if (!at) return Number.NEGATIVE_INFINITY;
   const n = Date.parse(at);
-  return Number.isNaN(n) ? Number.POSITIVE_INFINITY : n;
+  return Number.isNaN(n) ? Number.NEGATIVE_INFINITY : n;
 }
 
 /**
- * Delivery steps, then comments, tracker history, and reports, oldest first.
+ * Real comments, tracker history, and reports, newest dated updates first.
  * An issue with none of those is an empty timeline.
  */
 export function timelineRows(detail: IssueDetail, history: IssueHistoryEntry[]): TimelineRow[] {
-  const stages = deliveryStages(detail) ?? [];
   const events: TimelineRow[] = [];
   for (const item of detail.activity) {
     if (item.kind === "comment") {
@@ -436,8 +332,11 @@ export function timelineRows(detail: IssueDetail, history: IssueHistoryEntry[]):
       markdown: Boolean(report.body),
     });
   }
-  events.sort((a, b) => timeKey(a.at) - timeKey(b.at));
-  return [...stages, ...events];
+  events.sort((a, b) => {
+    const left = timeKey(a.at), right = timeKey(b.at);
+    return left === right ? 0 : left > right ? -1 : 1;
+  });
+  return events;
 }
 
 export function laneState(agents: CardAgent[]): string {

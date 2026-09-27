@@ -3,10 +3,8 @@ import type { Meta } from "../src/lib/types";
 import type { IssueDetail, IssueHistoryEntry } from "../src/lib/types";
 import {
   acceptanceItems,
-  approveReason,
   askAgentReason,
   briefPreview,
-  deliveryStages,
   issuePath,
   kickoffBlock,
   kickoffRequest,
@@ -94,8 +92,6 @@ equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock({ ...operatorMeta
 equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock(operatorMeta)), null, "operator with acceptance can kick off");
 equal(kickoffBlock([], operatorKickoffBlock(operatorMeta)), NO_ACCEPTANCE, "operator still needs acceptance");
 
-equal(approveReason([]), "No pull request yet", "approve without a PR");
-equal(approveReason([{ kind: "pr" }]).includes("cadence audit approve"), true, "approve names the missing route");
 equal(askAgentReason(0), "No lane yet", "ask needs a lane");
 equal(askAgentReason(1), null, "a bound agent can be asked");
 
@@ -151,19 +147,7 @@ equal(briefPreview("CAD-1", "Title", "Body", "").endsWith("No extra note."), tru
 equal(peekSummary("# Title\n\nRead the goal."), "Read the goal.", "peek skips the heading");
 equal(peekSummary("<img src=x onerror=alert(1)>").includes("<img"), true, "peek summary is raw text");
 
-equal(deliveryStages(detail()), null, "a backlog issue has no delivery timeline");
-const doing = detail({
-  status: "doing",
-  agents: [{ alias: "lane-1", task: "t", task_state: "doing", state: "busy" }],
-  refs: [{ kind: "branch", label: "cadence/cad-604-issue-detail-page-with-a-very-long-name" }, { kind: "pr", url: "https://github.com/favcrm/cadence/pull/900", label: "PR #900" }],
-  commits: [{ repo: "cadence", sha: "aaa1111bbbb", at: "2026-09-26T09:40:00Z", author: "a", subject: "page" }],
-});
-const stages = deliveryStages(doing)!;
-equal(stages.map((s) => s.title), ["Claimed", "Worktree", "Commits", "PR", "CI", "Reviews", "Queue", "Merged", "Rollout"], "delivery steps");
-equal(stages[2].detail.includes("aaa1111"), true, "latest commit");
-equal(stages[3].detail, "PR #900", "pr step");
-equal(stages[4].tone, "wait", "ci is not on the board");
-
+equal(timelineRows(detail({ status: "done" }), []), [], "done alone is not merge evidence or recorded activity");
 const history: IssueHistoryEntry[] = [{ sha: "abc", at: "2026-09-26T09:00:00Z", by: "op", kind: "set", summary: "status → doing" }];
 const rows = timelineRows(
   detail({
@@ -171,8 +155,14 @@ const rows = timelineRows(
   }),
   history,
 );
-equal(rows.map((r) => r.title), ["op", "set"], "comments then tracker events, no fake stages");
-equal(rows[0].markdown, true, "comment bodies are markdown");
-equal(rows[0].detail, "hello <b>there</b>", "comment text is not rewritten");
+equal(rows.map((r) => r.title), ["set", "op"], "recent tracker events precede older comments, no fake stages");
+equal(rows[1].markdown, true, "comment bodies are markdown");
+equal(rows[1].detail, "hello <b>there</b>", "comment text is not rewritten");
 
+const mixed = timelineRows(detail({ reports: [
+  { name: "undated", body: "Undated evidence" },
+  { name: "bad-date", body: "Invalid-date evidence", at: "not-a-date" },
+  { name: "dated", body: "Recent evidence", at: "2026-09-27T12:00:00Z" },
+] }), history);
+equal(mixed.map(row => row.detail), ["Recent evidence", "status → doing", "Undated evidence", "Invalid-date evidence"], "undated and invalid-date reports remain after dated events in stable order");
 console.log("issue page checks passed");
