@@ -4193,9 +4193,24 @@ fn cli_launch_refuses_endpoint_kind_change_devin() {
     test_env().set("CADENCE_DEVIN_API_KEY", "");
     d.register_devin("dvx", None);
     d.wait_agent("dvx", "idle", 20);
+    let pane_root = d
+        .events("dvx")
+        .into_iter()
+        .rev()
+        .find(|event| event["kind"] == "pane_root")
+        .unwrap()["payload"]
+        .clone();
     d.operator_rpc("agent_stop", json!({"alias": "dvx"}))
         .unwrap();
     d.wait_agent("dvx", "stopped", 10);
+    // Stopped can be written before background pane cleanup records its result.
+    // Fence the owned generation's cleanup before comparing the whole reply.
+    d.wait_event_where(
+        "dvx",
+        "pane_tree_reaped",
+        |event| event["payload"]["root"] == pane_root,
+        10,
+    );
     let before = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
     let bin = env!("CARGO_BIN_EXE_cadence");
     let out = std::process::Command::new(bin)

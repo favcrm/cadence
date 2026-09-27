@@ -494,8 +494,9 @@ fn max_revisions_escalates_to_blocked_once() {
 #[test]
 fn job_cancel_semantics() {
     let d = TestDaemon::start();
+    let _mock = d.mock_devin();
     d.register("pm");
-    d.register_member("w1", "pm");
+    d.register_devin_opts("w1", json!({"upstream": "pm", "auto_ready": "verified"}));
     d.register_member("w2", "pm");
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "cancel semantics");
@@ -522,14 +523,20 @@ fn job_cancel_semantics() {
     let w2 = d.rpc("agent_show", json!({"alias": "w2"})).unwrap()["agent"].clone();
     assert_eq!(w2["state"], "stopped"); // operator stop, unchanged
 
-    // Running kickoff: cancel leaves it alone — it completes on its own.
+    // Hold a real PTY kickoff running until this test reports its result.
+    // Dispatch only enqueues: cancellation before running would cancel it.
     d.task_new_ac("j1", "j1-tr", "w1", format!("ok REPORT_SHA:{SHA_A}"))
         .unwrap();
     let r = d.job_dispatch("j1-tr", json!({})).unwrap();
     let k = r["message"].as_str().unwrap().to_string();
+    d.wait_message("w1", &k, &["running"], 15);
+    let token = running_token(&d, &k);
     d.operator_rpc("task_cancel", json!({"task": "j1-tr", "by": "pm"}))
         .unwrap();
     assert_eq!(d.task_state("j1-tr"), "cancelled");
+    assert_eq!(d.message_state("w1", &k), "running");
+    d.report(&k, &token, "result", &format!("done\nSHA: {SHA_A}"))
+        .unwrap();
     // The kickoff still ran to completion; the task stays cancelled.
     // The task edge commits in the message's own finish transaction, so
     // `completed` already carries any task effect — no settle sleep.

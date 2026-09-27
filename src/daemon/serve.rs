@@ -1,5 +1,7 @@
 //! CAD-534: `cadence daemon` serve RPC handlers — moved verbatim from src/daemon.rs.
 
+pub(super) mod accept_wait;
+
 use super::*;
 
 use std::io::BufReader;
