@@ -1,5 +1,6 @@
 import { createContext, useContext, type ReactNode } from "react";
 import type { WikiScope } from "./scope";
+import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
@@ -39,6 +40,24 @@ export function Crumbs({ path, hrefFor }: { path: string; hrefFor: (path: string
           )}
         </span>
       ))}
+    </div>
+  );
+}
+
+/** One breadcrumb/action layout for every Wiki and Context mode. */
+export function WikiToolbar({ path, navHref, label, children, actions }: {
+  path: string;
+  navHref: (route: Route) => string;
+  label?: string;
+  children?: ReactNode;
+  actions?: ReactNode;
+}) {
+  return (
+    <div className="wk-bar">
+      <Crumbs path={path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
+      {label && <span className="wk-editing">{label}</span>}
+      {children}
+      {actions && <div className="wk-tools">{actions}</div>}
     </div>
   );
 }

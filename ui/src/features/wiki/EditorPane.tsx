@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { sessionStore } from "../../lib/draft";
 import { navigate } from "../../lib/useLocation";
@@ -16,7 +16,7 @@ import {
 } from "./editor";
 import { diffCounts, lineDiff, type DiffLine } from "./diff";
 import Button from "../../ui/Button";
-import { Crumbs, Failure, Loading } from "./shared";
+import { Failure, Loading, WikiToolbar } from "./shared";
 
 /**
  * The editor (CAD-581): source on the left, live preview on the right.
@@ -53,11 +53,15 @@ export default function EditorPane({
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onSaved: () => void;
 }) {
+  const sourceId = useId();
+  const previewId = useId();
   const [text, setText] = useState("");
   const [baseRev, setBaseRev] = useState("");
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const activeRef = useRef(false);
   const [dirty, setDirty] = useState(false);
   const [conflict, setConflict] = useState<ConflictInfo | null>(null);
   const [serverText, setServerText] = useState<string | null>(null);
@@ -70,6 +74,7 @@ export default function EditorPane({
   const browseHref = navHref({ screen: "wiki", mode: "browse", path, query: null });
 
   useEffect(() => {
+    activeRef.current = true;
     let cancelled = false;
     setStatus("loading");
     setConflict(null);
@@ -100,6 +105,7 @@ export default function EditorPane({
         setError(message(e));
       });
     return () => {
+      activeRef.current = false;
       cancelled = true;
       window.clearTimeout(stashTimer.current);
       if (storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
@@ -108,6 +114,7 @@ export default function EditorPane({
   }, [path]);
 
   const change = (value: string) => {
+    if (readOnly || savingRef.current) return;
     setText(value);
     setDirty(true);
     const storage = sessionStore();
@@ -120,17 +127,22 @@ export default function EditorPane({
   };
 
   const save = async () => {
+    if (savingRef.current || !dirty || status !== "ready") return;
     if (readOnly) {
       onToast("err", "writes are disabled on this board — sign in as the operator to edit.");
       return;
     }
+    savingRef.current = true;
     setSaving(true);
+    window.clearTimeout(stashTimer.current);
+    pendingDraft.current = null;
+    const storage = sessionStore();
+    if (storage) stashDraft(storage, { path, text, baseRev: baseRevRef.current, at: Date.now() });
     try {
       const page = await wiki.save(path, text, baseRevRef.current);
-      window.clearTimeout(stashTimer.current);
-      pendingDraft.current = null;
-      const storage = sessionStore();
-      if (storage) dropDraft(storage, path);
+      // A newer editor may have written another draft while this request ran.
+      if (storage && readDraft(storage, path)?.text === text) dropDraft(storage, path);
+      if (!activeRef.current) return;
       setDirty(false);
       if (page?.rev) {
         setBaseRev(page.rev);
@@ -138,6 +150,7 @@ export default function EditorPane({
       onSaved();
       navigate(browseHref);
     } catch (e) {
+      if (!activeRef.current) return;
       const refused = conflictFrom(e);
       if (refused) {
         setConflict(refused);
@@ -151,7 +164,8 @@ export default function EditorPane({
         onToast("err", `save failed — ${message(e)}`);
       }
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (activeRef.current) setSaving(false);
     }
   };
 
@@ -181,25 +195,19 @@ export default function EditorPane({
 
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs
-          path={path}
-          hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
-        />
-        <span className="wk-sep">·</span>
-        <span className="wk-editing">editing</span>
-        <div className="wk-tools">
-          <Button href={browseHref}>Cancel</Button>
+      <WikiToolbar path={path} navHref={navHref} label="Editing" actions={<>
+          <span className="wk-save-state" role="status">{saving ? "Saving…" : readOnly ? "Read-only" : dirty ? "Unsaved changes" : "No changes"}</span>
+          <Button href={browseHref} disabled={saving}>Back to page</Button>
           <Button
             variant="primary"
             onClick={() => void save()}
-            disabled={saving || readOnly}
-            title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
+            loading={saving}
+            disabled={readOnly || !dirty}
+            title={readOnly ? "Sign in with editing access to edit" : undefined}
           >
             Save
           </Button>
-        </div>
-      </div>
+      </>} />
 
       {conflict && (
         <div className="wk-conflict" role="alert">
@@ -220,16 +228,13 @@ export default function EditorPane({
       )}
 
       <div className="wk-esplit">
-        <div className="wk-ehead">
-          <span>source</span>
-          <span>preview</span>
-        </div>
+        <label className="wk-ehead wk-source-head" htmlFor={sourceId}>Markdown</label>
         <textarea
+          id={sourceId}
           className="wk-esrc"
           value={text}
           spellCheck={false}
-          readOnly={readOnly}
-          aria-label="markdown source"
+          readOnly={readOnly || saving}
           onChange={(e) => change(e.target.value)}
           onKeyDown={(e) => {
             if ((e.metaKey || e.ctrlKey) && e.key === "s") {
@@ -238,14 +243,14 @@ export default function EditorPane({
             }
           }}
         />
-        <div className="wk-eprev issue-reader">
+        <div className="wk-ehead wk-preview-head" id={previewId}>Preview</div>
+        <div className="wk-eprev issue-reader" role="region" aria-labelledby={previewId}>
           <Md text={text} />
         </div>
       </div>
 
       <p className="wk-hint">
-        Drafts stay in this tab until saved. Use ⌘S or Ctrl+S to save.
-        {dirty ? " · unsaved changes" : ""}
+        Unsaved drafts stay in this tab when you leave. Use ⌘S or Ctrl+S to save.
       </p>
     </>
   );

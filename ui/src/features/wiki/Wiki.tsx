@@ -19,7 +19,7 @@ import { baseName, joinPath, parentPath } from "./paths";
 import { relTime } from "./history";
 import { kindLabel, previewKind } from "./preview";
 import {
-  Crumbs,
+  WikiToolbar,
   EmptyCard,
   Failure,
   Loading,
@@ -276,6 +276,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, 
             />
           ) : route.mode === "edit" && route.path ? (
             <EditorPane
+              key={route.path}
               path={route.path}
               navHref={navHref}
               readOnly={readOnly}
@@ -439,9 +440,7 @@ function BrowsePane({
     const writeBlocked = readOnly || locked || missingRoot;
     return (
       <>
-        <div className="wk-bar">
-          <Crumbs path={path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
-          <div className="wk-tools">
+        <WikiToolbar path={path} navHref={navHref} actions={<>
             <Button disabled={writeBlocked} onClick={() => setCreating({ kind: "page", value: "" })}>
               New page
             </Button>
@@ -455,8 +454,7 @@ function BrowsePane({
               Upload
             </Button>
             <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
-          </div>
-        </div>
+        </>} />
         {missingRoot && scope && (
           <EmptyCard title="No project context yet" action={
             <Button disabled={readOnly || busy} onClick={() => void createContext()}>Create project context</Button>
@@ -489,13 +487,10 @@ function BrowsePane({
   if (page.kind === "page") return <PagePane page={page} navHref={navHref} readOnly={readOnly} />;
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs path={page.path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
-        <div className="wk-tools">
+      <WikiToolbar path={page.path} navHref={navHref} actions={<>
           <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
           <a className="btn" href={wikiFileUrl(page.path)} download>Download</a>
-        </div>
-      </div>
+      </>} />
       <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} />
     </>
   );
@@ -541,8 +536,6 @@ function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof prev
 
 function Bar({ path, navHref }: { path: string; navHref: (route: Route) => string }) {
   return (
-    <div className="wk-bar">
-      <Crumbs path={path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
-    </div>
+    <WikiToolbar path={path} navHref={navHref} />
   );
 }

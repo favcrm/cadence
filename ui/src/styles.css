@@ -244,7 +244,7 @@ body {
 .btn-full {
   width: 100%;
 }
-.btn:hover {
+.btn:hover:not(:disabled):not([aria-disabled="true"]) {
   border-color: var(--color-edge-hover);
   background: var(--color-ink-800);
 }

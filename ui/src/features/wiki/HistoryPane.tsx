@@ -6,7 +6,7 @@ import { versionRows, versionWho, type WikiVersion } from "./history";
 import { diffLabel, unifiedDiffLines } from "./diff";
 import { DiffLines } from "./EditorPane";
 import Button from "../../ui/Button";
-import { Crumbs, Failure, Loading, Note } from "./shared";
+import { Failure, Loading, Note, WikiToolbar } from "./shared";
 
 /**
  * A page's history (CAD-581): the revision list, the diff between the
@@ -98,14 +98,7 @@ export default function HistoryPane({
 
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs
-          path={path}
-          hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
-        />
-        <span className="wk-sep">·</span>
-        <span className="wk-editing">history</span>
-        <div className="wk-tools">
+      <WikiToolbar path={path} navHref={navHref} label="History" actions={<>
           <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>Back to page</Button>
           {canCompare && <Button
             variant="primary"
@@ -115,8 +108,7 @@ export default function HistoryPane({
           >
             Restore this version
           </Button>}
-        </div>
-      </div>
+      </>} />
 
       {readOnly && canCompare && <Note warn>writes are disabled on this board — restore needs the operator.</Note>}
 

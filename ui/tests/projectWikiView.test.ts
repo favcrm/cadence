@@ -25,6 +25,8 @@ const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeo
 const requests: string[] = [];
 const writes: { path?: string; from?: string; to?: string; text?: string; if_rev?: string }[] = [];
 let conflict = false;
+let holdSave = false;
+let finishSave: (() => void) | null = null;
 let unavailable = false;
 let missing = false;
 const pagePath = "projects/cadence/README.md";
@@ -37,6 +39,7 @@ globalThis.fetch = async (input, init) => {
     const body = JSON.parse(String(init.body));
     writes.push(body);
     if (conflict) return json({ conflict: "if_rev", current_rev: "newer-rev", path: body.path });
+    if (holdSave) await new Promise<void>((resolve) => { finishSave = resolve; });
     return json({ path: body.path, rev: "saved-rev", committed: true });
   }
   if (unavailable) return json({ error: "This board needs a session" }, 403);
@@ -78,6 +81,7 @@ async function run() {
   await go("/projects/cadence/context?file=README.md&mode=edit");
   const source = host.querySelector("textarea");
   assert(source?.value === "Draft in this project", "existing Wiki draft recovery works in Context");
+  assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Back to page") && !host.textContent?.includes("Cancel"), "return action does not imply the retained draft is discarded");
   conflict = true;
   const save = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save");
   assert(save, "Save control exists");
@@ -86,7 +90,16 @@ async function run() {
   assert(source.value === "Draft in this project" && sessionStorage.getItem(draftKey(pagePath)), "a refused save preserves the draft");
   assert(writes[0]?.if_rev === "base-rev", "Save includes the base revision");
   conflict = false;
-  await React.act(async () => { save.click(); await flush(); });
+  holdSave = true;
+  await React.act(async () => {
+    save.click();
+    source.dispatchEvent(new win.KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }));
+    await flush();
+  });
+  assert(writes.length === 2, "repeated keyboard save while a request is pending sends one write");
+  assert(source.readOnly && save.getAttribute("aria-busy") === "true", "pending save shows progress and protects the submitted text");
+  await React.act(async () => { finishSave?.(); await flush(); });
+  holdSave = false;
   assert(!sessionStorage.getItem(draftKey(pagePath)) && !location.search.includes("mode=edit"), "a successful save clears the draft and returns to the project page");
   await go("/projects/cadence/context?file=README.md&mode=edit");
   await render({ readOnly: true });
@@ -98,11 +111,20 @@ async function run() {
     Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set?.call(typing, "A last second edit");
     typing.dispatchEvent(new win.Event("input", { bubbles: true }));
   });
-  assert(host.textContent?.includes("unsaved changes"), "typing marks the draft dirty");
+  assert(host.textContent?.includes("Unsaved changes"), "typing marks the draft dirty");
   await go("/projects/cadence/context?mode=search&q=brief");
   assert(sessionStorage.getItem(draftKey(pagePath))?.includes("A last second edit"), "leaving before the debounce preserves the last edit");
   assert(requests.some((url) => url.includes("/search?") && url.includes("path=projects%2Fcadence")), "search requests only this project");
   assert(host.textContent?.includes("Project brief match") && !host.textContent.includes("outside project"), "search results stay inside project");
+  const searchForm = host.querySelector(".wk-sinput");
+  const searchInput = searchForm?.querySelector("input");
+  assert(searchInput?.type === "search" && searchForm?.querySelector("button[type='submit']")?.textContent === "Search", "search has a visible native submit action");
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")?.set?.call(searchInput, "research");
+    searchInput.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { searchForm.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); await flush(); });
+  assert(location.search.includes("q=research") && requests.some((url) => url.includes("q=research") && url.includes("path=projects%2Fcadence")), "submitting search updates the URL and keeps project scope");
   await go("/projects/cadence/context?file=README.md&mode=history");
   assert(host.textContent?.includes("Saved project brief"), "real commit log renders");
   assert(!host.textContent?.includes("Restore this version"), "unsupported restore is not offered");
@@ -129,6 +151,19 @@ async function run() {
   conflict = true;
   try { await wiki.save(pagePath, "changed", "base"); throw new Error("conflict wrongly resolved"); } catch (error) { assert(error instanceof WikiError && error.status === 409, "successful conflict envelopes reject the save promise"); }
   conflict = false;
+  await go("/projects/cadence/context?file=README.md&mode=edit");
+  stashDraft(sessionStorage, { path: pagePath, text: "Pending navigation draft", baseRev: "base-rev", at: 2 });
+  await render();
+  const pendingSave = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save");
+  assert(pendingSave && !pendingSave.disabled, "pending-navigation draft can be saved");
+  holdSave = true;
+  await React.act(async () => { pendingSave.click(); await flush(); });
+  await go("/projects/cadence/context?mode=search&q=kept");
+  stashDraft(sessionStorage, { path: pagePath, text: "Newer draft in another editor", baseRev: "base-rev", at: 3 });
+  await React.act(async () => { finishSave?.(); await flush(); });
+  holdSave = false;
+  assert(location.search.includes("mode=search") && location.search.includes("q=kept"), "a completed save does not pull the operator away from a newer destination");
+  assert(sessionStorage.getItem(draftKey(pagePath))?.includes("Newer draft in another editor"), "a late save does not erase a newer draft for the same page");
   await React.act(async () => {
     view.render(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
     await flush();

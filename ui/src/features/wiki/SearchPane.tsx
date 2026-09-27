@@ -4,9 +4,12 @@ import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
 import { filterHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
 import Link from "../../ui/Link";
-import { Crumbs, EmptyCard, Failure, Loading, useWikiScope } from "./shared";
+import Button from "../../ui/Button";
+import { EmptyCard, Failure, Loading, useWikiScope, WikiToolbar } from "./shared";
 import type { WikiRoute } from "./Wiki";
 import { withinScope } from "./scope";
+
+const FILTER_LABELS: Record<TypeFilter, string> = { all: "All", pages: "Pages", images: "Images", video: "Video", pdf: "PDF" };
 
 /**
  * Search (CAD-581): the query lives in the URL (`/wiki/search/<query>`),
@@ -56,11 +59,19 @@ export default function SearchPane({
 
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs
-          path=""
-          hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
-        />
+      <WikiToolbar path="" navHref={navHref} label="Search" actions={<>
+          {TYPE_FILTERS.map((type) => (
+            <button
+              key={type}
+              type="button"
+              className={`wk-fchip${filter === type ? " on" : ""}`}
+              aria-pressed={filter === type}
+              onClick={() => setFilter(type)}
+            >
+              {FILTER_LABELS[type]}
+            </button>
+          ))}
+      </>}>
         <form
           className="wk-sinput"
           onSubmit={(e) => {
@@ -70,32 +81,23 @@ export default function SearchPane({
         >
           <input
             className="field"
+            type="search"
+            name="q"
+            enterKeyHint="search"
             value={value}
             aria-label={scope ? "Search project context" : "Search the wiki"}
-            placeholder="search pages and files…"
+            placeholder="Search pages and files…"
             onChange={(e) => setValue(e.target.value)}
           />
+          <Button type="submit">Search</Button>
         </form>
-        <div className="wk-tools">
-          {TYPE_FILTERS.map((type) => (
-            <button
-              key={type}
-              type="button"
-              className={`wk-fchip${filter === type ? " on" : ""}`}
-              aria-pressed={filter === type}
-              onClick={() => setFilter(type)}
-            >
-              {type}
-            </button>
-          ))}
-        </div>
-      </div>
+      </WikiToolbar>
 
       {error !== null ? (
         <Failure what="search failed" error={error} />
       ) : !query ? (
         <EmptyCard title={scope ? "Search project context" : "Search the wiki"}>
-          Type a word or path above — results carry the path, the file and the matching line.
+          Enter a word or path, then choose Search.
         </EmptyCard>
       ) : shown === null ? (
         <Loading what={`searching for “${query}”…`} />
