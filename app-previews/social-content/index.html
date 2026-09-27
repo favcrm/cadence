@@ -3,7 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
     <title>Social Content · Development</title>
+    <script>
+      try {
+        const theme = localStorage.getItem("cadence-theme");
+        if (theme === "light" || theme === "dark")
+          document.documentElement.setAttribute("data-theme", theme);
+      } catch {
+        /* System preference applies when storage is unavailable. */
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

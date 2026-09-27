@@ -65,6 +65,7 @@ const server = await vite.createServer({
       react: resolve(repo, "ui/node_modules/react"),
       "react-dom": resolve(repo, "ui/node_modules/react-dom"),
       "@fontsource": resolve(repo, "ui/node_modules/@fontsource"),
+      "@hugeicons": resolve(repo, "ui/node_modules/@hugeicons"),
     },
   },
   define: { __APP_DEV_REVISION__: JSON.stringify(revision) },
@@ -73,7 +74,10 @@ const server = await vite.createServer({
     port: options.port,
     strictPort: true,
     allowedHosts: options.allowedHosts,
-    fs: { strict: true, allow: [root, resolve(repo, "ui/node_modules")] },
+    fs: {
+      strict: true,
+      allow: [root, resolve(repo, "ui/node_modules"), resolve(repo, "design")],
+    },
     hmr: { port: options.port },
   },
 });

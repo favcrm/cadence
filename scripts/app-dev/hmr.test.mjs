@@ -52,6 +52,9 @@ test("real Vite preview updates CSS over HMR, blocks APIs/files, and omits inher
     assert.equal((await fetch(`${url}/api/meta`)).status, 403);
     assert.equal((await fetch(`${url}/__platform/session`)).status, 403);
     assert.equal((await fetch(`${url}/@fs${repo}/Cargo.toml`)).status, 403);
+    assert.equal((await fetch(`${url}/@fs${repo}/design/tokens.css`)).status, 200);
+    assert.equal((await fetch(`${url}/@fs${repo}/design/kit.css`)).status, 200);
+    assert.equal((await fetch(`${url}/@fs${repo}/ui/src/styles.css`)).status, 403);
     const client = await (await fetch(`${url}/@vite/client`)).text();
     const token = client.match(/const wsToken = "([^"]+)"/)[1];
     socket = new WebSocket(`ws://127.0.0.1:3198/?token=${token}`, "vite-hmr");

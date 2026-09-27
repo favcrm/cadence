@@ -75,3 +75,9 @@ evidence must be reported separately; HTTP/HMR are not proof of either.
 The CAD647 author owns persistent private port3186 and its recorded PID/log.
 Leave it available for operator review, then author/PM stops only that owned
 process. Preview cleanup never touches another lane, production3010 or tailnet.
+
+The preview imports generated `design/tokens.css` and `design/kit.css` directly.
+App-local CSS only adapts layout using canonical variables. The theme control
+cycles system/light/dark with the board's `cadence-theme` storage semantics.
+Only the canonical design directory is additionally allowed for CSS imports;
+board source, private repository files and live API routes remain unavailable.

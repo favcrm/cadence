@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 const repo = fileURLToPath(new URL("../../", import.meta.url));
 const tools = createRequire(resolve(repo, "ui/package.json"));
@@ -31,9 +31,21 @@ test("actual React view mounts and local draft flow works without a backend", as
       },
     },
   ).outputText;
+  const icons = await import(
+    pathToFileURL(
+      tools
+        .resolve("@hugeicons/core-free-icons")
+        .replace("/dist/cjs/", "/dist/esm/"),
+    ).href
+  );
   const exports = {};
   new Function("require", "exports", code)(
-    (id) => (id.startsWith(".") ? source(id) : tools(id)),
+    (id) =>
+      id === "@hugeicons/core-free-icons"
+        ? icons
+        : id.startsWith(".")
+          ? source(id)
+          : tools(id),
     exports,
   );
   const host = document.createElement("div");
@@ -52,6 +64,18 @@ test("actual React view mounts and local draft flow works without a backend", as
     await act(() => root.render(React.createElement(exports.default)));
     assert.ok(host.textContent.includes("Fixtures only"));
     assert.ok(host.textContent.includes("Harbour studio"));
+    const themeButton = host.querySelector("button[aria-label^='Theme:']");
+    for (const theme of ["light", "dark", "system"]) {
+      await act(() => themeButton.click());
+      assert.equal(
+        document.documentElement.getAttribute("data-theme"),
+        theme === "system" ? null : theme,
+      );
+      assert.equal(
+        window.localStorage.getItem("cadence-theme"),
+        theme === "system" ? null : theme,
+      );
+    }
     const { sdk } = source("./store.mjs");
     // The same app facade creates data; Reset fixtures reconciles the mounted view.
     await act(() => {
