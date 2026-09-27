@@ -97,6 +97,7 @@ export interface WorkStage {
 export interface WorkBlock {
   type: string;
   milestone: string | null;
+  milestone_source?: "field" | "tag" | "parent" | null;
   size: string | null;
   weight: number;
   stage: WorkStage | null;
@@ -113,11 +114,21 @@ export interface WorkBlock {
 
 /** `GET /api/milestones` — one (project, milestone) roll-up. */
 export interface MilestoneRow {
+  config_error?: string | null;
   project: string;
   id: string;
   title: string | null;
   exit: string | null;
   configured: boolean;
+  description?: string | null;
+  owner?: string | null;
+  start_date?: string | null;
+  target_date?: string | null;
+  status?: "planned" | "active" | "achieved" | "cancelled" | null;
+  completed_date?: string | null;
+  evidence?: string[];
+  depends_on?: string[];
+  schedule?: { state: "unscheduled" | "upcoming" | "due_today" | "overdue" | "achieved" | "cancelled"; days_remaining: number | null };
   progress: WorkProgress;
   health: { state: HealthState; reasons: HealthReason[] };
   epics: {
@@ -127,6 +138,7 @@ export interface MilestoneRow {
     stage: string | null;
     progress: number | null;
     health: HealthState;
+    task_count?: number;
   }[];
   issues: {
     id: string;
@@ -135,6 +147,17 @@ export interface MilestoneRow {
     status: string;
     size?: string | null;
     owner?: string | null;
+    blocked: boolean;
+  }[];
+  /** All scoped tasks; `issues` is the legacy list of tasks without an epic. */
+  tasks?: {
+    id: string;
+    title: string;
+    type: string;
+    status: string;
+    size?: string | null;
+    owner?: string | null;
+    parent?: string | null;
     blocked: boolean;
   }[];
 }

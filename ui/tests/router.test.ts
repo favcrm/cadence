@@ -24,8 +24,9 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 // Every MVP route matches and prints back to the same path.
 const paths: [string, Route][] = [
   ["/", { screen: "home" }],
-  ["/projects", { screen: "projects", slug: null, section: "issues" }],
-  ["/projects/cadence", { screen: "projects", slug: "cadence", section: "issues" }],
+  ["/projects", { screen: "projects", slug: null, section: "overview" }],
+  ["/projects/cadence", { screen: "projects", slug: "cadence", section: "overview" }],
+  ["/projects/cadence/issues", { screen: "projects", slug: "cadence", section: "issues" }],
   ["/projects/cadence/context", { screen: "projects", slug: "cadence", section: "context" }],
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
@@ -50,7 +51,7 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
@@ -125,7 +126,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
     },
     "?unknown=keep&tag=stale&view=list&project=old",
   );
-  equal(href, "/projects/cadence?unknown=keep&view=kanban", "projects href");
+  equal(href, "/projects/cadence/issues?unknown=keep&view=kanban", "projects href");
   const home = locationHref(
     { route: { screen: "home" }, project: "cadence", view: "list", openId: "CAD-9", filters: NO_FILTERS },
     "?view=list&tab=board",
@@ -150,7 +151,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   equal(locationHref(loc, "?tab=activity&issue=CAD-9&foo=1"), "/projects/cadence/issues/CAD-1?foo=1&tab=activity", "issue href");
   equal(readLocation("/projects/cadence/issues/CAD-1", "?tab=nope").route, { screen: "issue", project: "cadence", id: "CAD-1", tab: "overview" }, "unknown tab");
   const page = readLocation("/projects/cadence/issues/CAD-1", "");
-  equal(locationHref(withProject(page, "other")), "/projects/other?view=list", "leaving an issue for another project");
+  equal(locationHref(withProject(page, "other")), "/projects/other/issues?view=list", "leaving an issue for another project's issue list");
   equal(
     locationHref(goTo(page, { screen: "agents", alias: null })),
     "/agents?project=cadence",
@@ -169,14 +170,14 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const agents = readLocation("/agents", "?project=cadence");
   equal(
     locationHref(goTo(agents, { screen: "projects", slug: null, section: "issues" })),
-    "/projects/cadence?view=list",
+    "/projects/cadence/issues?view=list",
     "agents → projects keeps the scope as the slug",
   );
   equal(locationHref(openProject(here, "all")), "/projects?view=list&issue=CAD-3", "sidebar all projects opens the board");
   equal(
     locationHref(openProject(readLocation("/agents", "?project=kidult"), "cadence")),
-    "/projects/cadence?view=list",
-    "sidebar on agents opens the project page",
+    "/projects/cadence",
+    "sidebar on agents opens the project overview",
   );
   equal(
     locationHref(openProject(readLocation("/projects/cadence/epics", ""), "kidult")),
@@ -218,8 +219,8 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
 // Pre-router URLs redirect to their new home, keeping scope, drawer and filters.
 const legacy: [string, string][] = [
   ["?tab=overview&project=cadence", "/"],
-  ["?tab=board&view=kanban&project=cadence&tag=ui", "/projects/cadence?view=kanban&tag=ui"],
-  ["?project=cadence&view=list", "/projects/cadence?view=list"],
+  ["?tab=board&view=kanban&project=cadence&tag=ui", "/projects/cadence/issues?view=kanban&tag=ui"],
+  ["?project=cadence&view=list", "/projects/cadence/issues?view=list"],
   ["?view=list", "/projects?view=list"],
   ["?tab=plan&project=cadence", "/projects/cadence/context"],
   ["?tab=plan", "/projects?view=list"],
@@ -253,3 +254,7 @@ equal(legacyRedirect("/index.html", "?tab=agents"), "/agents", "index.html with 
 equal(legacyRedirect("/index.html", ""), "/", "bare index.html");
 
 console.log("router checks passed");
+
+// A plain Projects entry is overview; existing board bookmarks remain Issues.
+equal(readLocation("/projects", "").route, { screen: "projects", slug: null, section: "overview" }, "portfolio landing");
+equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects", slug: "cadence", section: "issues" }, "legacy issue bookmark");

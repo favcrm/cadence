@@ -32,7 +32,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  * so routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
+export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
 export type SettingsSection = "models" | "memory" | "update" | "account";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
@@ -56,7 +56,7 @@ export type Screen = Route["screen"];
 /** The main navigation — MVP screens only (Setup is reached from Home). */
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
-  { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
+  { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
@@ -167,10 +167,10 @@ export function matchRoute(pathname: string): Route {
     if (!head && !a) return { screen: "home" };
     if (head === "index.html" && !a) return { screen: "home" };
     if (head === "projects") {
-      if (!a) return { screen: "projects", slug: null, section: "issues" };
+      if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
-      if (slug && !b) return { screen: "projects", slug, section: "issues" };
-      if (slug && (b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
+      if (slug && !b) return { screen: "projects", slug, section: "overview" };
+      if (slug && (b === "overview" || b === "issues" || b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
         return { screen: "projects", slug, section: b };
       }
     }
@@ -207,7 +207,7 @@ export function routePath(route: Route): string {
     case "projects": {
       if (!route.slug) return "/projects";
       const base = `/projects/${encodeURIComponent(route.slug)}`;
-      return route.section === "issues" ? base : `${base}/${route.section}`;
+      return route.section === "overview" ? base : `${base}/${route.section}`;
     }
     case "issue":
       return `/projects/${encodeURIComponent(route.project)}/issues/${encodeURIComponent(route.id)}`;
@@ -250,7 +250,10 @@ function parseView(value: string | null): ProjectView | undefined {
 export function readLocation(pathname: string, search: string, storedView?: ProjectView): AppLocation {
   const matched = matchRoute(pathname);
   const q = new URLSearchParams(search);
-  const route = matched.screen === "issue" ? { ...matched, tab: parseIssueTab(q.get("tab")) } : matched;
+  let route = matched.screen === "issue" ? { ...matched, tab: parseIssueTab(q.get("tab")) } : matched;
+  if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
+    route = { ...route, section: "issues" };
+  }
   const onProjects = route.screen === "projects";
   const queried = q.get("project");
   return {
@@ -261,7 +264,7 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
     project:
       route.screen === "issue"
         ? route.project
-        : onProjects
+        : route.screen === "projects"
           ? (route.slug ?? "all")
           : projectFilter(route)
             ? queried || "all"
@@ -280,7 +283,7 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
 function scopedRoute(route: Route, project: string): Route {
   if (route.screen !== "projects") return route;
   const slug = project === "all" ? null : project;
-  return { screen: "projects", slug, section: slug ? route.section : "issues" };
+  return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
@@ -367,7 +370,7 @@ export function goTo(current: AppLocation, route: Route): AppLocation {
     const slug = route.slug ?? (carriedProject(current) === "all" ? null : carriedProject(current));
     return {
       ...current,
-      route: { screen: "projects", slug, section: slug ? route.section : "issues" },
+      route: { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" },
       project: slug ?? "all",
     };
   }
@@ -380,12 +383,12 @@ export function goTo(current: AppLocation, route: Route): AppLocation {
  * section when already on one). Never filters the screen you are on.
  */
 export function openProject(current: AppLocation, project: string): AppLocation {
-  const section = current.route.screen === "projects" ? current.route.section : "issues";
+  const section = current.route.screen === "projects" ? current.route.section : "overview";
   const slug = project === "all" ? null : project;
   return {
     ...current,
     project: slug ?? "all",
-    route: { screen: "projects", slug, section: slug ? section : "issues" },
+    route: { screen: "projects", slug, section: slug ? section : section === "overview" ? "overview" : "issues" },
   };
 }
 

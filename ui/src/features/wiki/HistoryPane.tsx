@@ -6,7 +6,7 @@ import { versionRows, versionWho, type WikiVersion } from "./history";
 import { diffLabel, unifiedDiffLines } from "./diff";
 import { DiffLines } from "./EditorPane";
 import Button from "../../ui/Button";
-import { Crumbs, Failure, Loading, Note } from "./shared";
+import { Failure, Loading, Note, WikiToolbar } from "./shared";
 
 /**
  * A page's history (CAD-581): the revision list, the diff between the
@@ -33,6 +33,7 @@ export default function HistoryPane({
   const [diff, setDiff] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [canCompare, setCanCompare] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -44,10 +45,11 @@ export default function HistoryPane({
       .then((resp) => {
         if (cancelled) return;
         const list = resp.entries ?? resp.history ?? [];
+        setCanCompare(resp.canCompare !== false);
         setEntries(list);
         const current = resp.rev ?? list[0]?.rev ?? null;
         setCurrentRev(current);
-        setSelected(list.find((entry) => entry.rev !== current)?.rev ?? null);
+        setSelected(resp.canCompare === false ? null : list.find((entry) => entry.rev !== current)?.rev ?? null);
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -96,27 +98,19 @@ export default function HistoryPane({
 
   return (
     <>
-      <div className="wk-bar">
-        <Crumbs
-          path={path}
-          hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
-        />
-        <span className="wk-sep">·</span>
-        <span className="wk-editing">history</span>
-        <div className="wk-tools">
+      <WikiToolbar path={path} navHref={navHref} label="History" actions={<>
           <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>Back to page</Button>
-          <Button
+          {canCompare && <Button
             variant="primary"
             disabled={readOnly || busy || !selected || selected === currentRev}
             title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
             onClick={() => void restore()}
           >
             Restore this version
-          </Button>
-        </div>
-      </div>
+          </Button>}
+      </>} />
 
-      {readOnly && <Note warn>writes are disabled on this board — restore needs the operator.</Note>}
+      {readOnly && canCompare && <Note warn>writes are disabled on this board — restore needs the operator.</Note>}
 
       {error !== null ? (
         <Failure what="could not load the history" error={error} />
@@ -125,9 +119,9 @@ export default function HistoryPane({
       ) : rows.length === 0 ? (
         <Note>no history yet — the first save commits one revision.</Note>
       ) : (
-        <div className="wk-hsplit">
+        <div className={canCompare ? "wk-hsplit" : "wk-history-log"}>
           <div className="wk-ver">
-            {rows.map((row) => (
+            {rows.map((row) => canCompare ? (
               <button
                 key={row.rev}
                 type="button"
@@ -140,9 +134,13 @@ export default function HistoryPane({
                 </span>
                 {row.summary && <span className="wk-vsum">{row.summary}</span>}
               </button>
-            ))}
+            ) : <div key={row.rev} className="wk-vrow">
+              <span className="wk-vwho">{versionWho(row)}</span>
+              <span className="wk-vwhen">{row.when}</span>
+              {row.summary && <span className="wk-vsum">{row.summary}</span>}
+            </div>)}
           </div>
-          <div className="min-w-0">
+          {canCompare && <div className="min-w-0">
             <div className="slabel wk-difflabel">
               {selected && currentRev ? diffLabel(selected, currentRev) : "pick a revision to diff"}
             </div>
@@ -153,7 +151,7 @@ export default function HistoryPane({
             ) : (
               <DiffLines lines={unifiedDiffLines(diff)} />
             )}
-          </div>
+          </div>}
         </div>
       )}
     </>

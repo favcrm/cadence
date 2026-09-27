@@ -38,9 +38,9 @@ equal(readDraft(storage, draft.path), draft, "and reads back whole");
 equal(readDraft(storage, "other.md"), null, "another page has no draft");
 equal(draftKey("a/b.md"), "cadence.wiki.draft:a/b.md", "the key namespaces the path");
 
-// An emptied editor drops the draft instead of storing an empty one.
+// Deleting all content is still a draft, so returning never restores old text.
 stashDraft(storage, { ...draft, text: "" });
-equal(readDraft(storage, draft.path), null, "an empty draft is dropped");
+equal(readDraft(storage, draft.path)?.text, "", "an empty edit is recoverable");
 
 // A blocked store never throws — the edit stays in the textarea.
 const blocked: StorageLike = {
