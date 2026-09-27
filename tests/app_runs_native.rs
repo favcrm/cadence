@@ -253,6 +253,45 @@ fn cad631_actual_native_and_setsid_completed_artifact_is_operator_only() {
         .unwrap();
     assert_eq!(receipt["text"], DRAFT);
     assert_eq!(receipt["digest"], completed["artifacts"][0]["digest"]);
+    f.daemon
+        .operator_rpc(
+            "app_local_install_revoke",
+            json!({"install_id":f.install["install_id"],"digest":f.install["digest"]}),
+        )
+        .unwrap();
+    let install_id = f.install["install_id"].as_str().unwrap();
+    let workflow = f
+        .root
+        .path()
+        .join("pm/.apps/installations")
+        .join(install_id)
+        .join("bundle/workflows/draft.md");
+    let mut text = std::fs::read_to_string(&workflow).unwrap();
+    text.push_str("\nHistorical outputs remain audit evidence after this valid edit.\n");
+    std::fs::write(workflow, text).unwrap();
+    let current = f
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":install_id}))
+        .unwrap();
+    assert_ne!(current["digest"], f.install["digest"]);
+    let historical = f
+        .daemon
+        .operator_rpc("app_run_artifact", json!({"artifact_id":id}))
+        .expect("operator durable audit must survive revoke and bundle replacement");
+    assert_eq!(historical, receipt);
+    std::fs::remove_dir_all(
+        f.root
+            .path()
+            .join("pm/.apps/installations")
+            .join(install_id)
+            .join("bundle"),
+    )
+    .unwrap();
+    let removed = f
+        .daemon
+        .operator_rpc("app_run_artifact", json!({"artifact_id":id}))
+        .expect("operator historical audit must not depend on an existing bundle");
+    assert_eq!(removed, receipt);
     let mut lane = LaneShell::spawn(f.root.path());
     plant_member_pane(&f.daemon, PEER, "claude", None, lane.pid());
     let before = f.persisted();
@@ -288,4 +327,64 @@ fn cad631_actual_native_and_setsid_completed_artifact_is_operator_only() {
         failures.is_empty(),
         "native completed artifact operator guard failed: {failures:?}"
     );
+}
+
+#[test]
+fn cad631_operator_cannot_approve_snapshot_after_valid_installed_workflow_edit() {
+    let f = LocalRun::new();
+    let id = f.install["install_id"].as_str().unwrap();
+    let path = f
+        .root
+        .path()
+        .join("pm")
+        .join(".apps/installations")
+        .join(id)
+        .join("bundle/workflows/draft.md");
+    let mut workflow = std::fs::read_to_string(&path).unwrap();
+    workflow.push_str("\nKeep the original source facts unchanged.\n");
+    std::fs::write(&path, workflow).unwrap();
+    // A valid current catalog read, rather than corrupt files/invalid setup,
+    // establishes that admission must compare the new material digest.
+    let current = f
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(current["install_id"], id);
+    assert_ne!(current["digest"], f.install["digest"]);
+    assert_eq!(f.run["snapshot"]["bundle_digest"], f.install["digest"]);
+    let error = f
+        .daemon
+        .operator_rpc(
+            "app_run_approve",
+            json!({"run_id":f.run["id"],"digest":f.run["snapshot_digest"]}),
+        )
+        .expect_err("operator approved a run whose installed material changed");
+    assert!(
+        error.to_string().contains("bundle digest is stale"),
+        "refusal must identify stale material, not invalid fixture: {error}"
+    );
+    let retained = f
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":f.run["id"]}))
+        .unwrap();
+    assert_eq!(retained["state"], "awaiting_approval");
+    assert!(retained["approved_digest"].is_null());
+    assert_eq!(retained["snapshot_digest"], f.run["snapshot_digest"]);
+    let db = rusqlite::Connection::open(f.daemon.state.join("cadence.sqlite3")).unwrap();
+    let approvals: i64 = db
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind='app_run_execution_approved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(approvals, 0, "stale approval emitted execution authority");
+    let kickoffs: i64 = db
+        .query_row(
+            "SELECT count(*) FROM messages WHERE source='app_run_dispatch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kickoffs, 0, "stale approval released execution");
 }

@@ -359,6 +359,52 @@ fn cad631_completed_pi_artifact_http_is_json_and_native_peer_scoped() {
         format!("sha256:{:x}", Sha256::digest(DRAFT.as_bytes()))
     );
     assert_eq!(receipt["digest"], completed["artifacts"][0]["digest"]);
+    b.daemon
+        .operator_rpc(
+            "app_local_install_revoke",
+            json!({"install_id":install,"digest":installed["digest"]}),
+        )
+        .unwrap();
+    let workflow = b
+        .root
+        .path()
+        .join("pm/.apps/installations")
+        .join(install)
+        .join("bundle/workflows/draft.md");
+    let mut text = std::fs::read_to_string(&workflow).unwrap();
+    text.push_str("\nHistorical outputs remain audit evidence after this valid edit.\n");
+    std::fs::write(workflow, text).unwrap();
+    let current = b
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":install}))
+        .unwrap();
+    assert_ne!(current["digest"], installed["digest"]);
+    let (status, body) = b.operator("GET", &path, "");
+    assert_eq!(
+        status, 200,
+        "operator historical artifact HTTP must survive revoke and bundle replacement: {body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        receipt
+    );
+    std::fs::remove_dir_all(
+        b.root
+            .path()
+            .join("pm/.apps/installations")
+            .join(install)
+            .join("bundle"),
+    )
+    .unwrap();
+    let (status, body) = b.operator("GET", &path, "");
+    assert_eq!(
+        status, 200,
+        "operator historical artifact HTTP must survive bundle removal: {body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        receipt
+    );
 
     // Test authority against an existing completed object, not an invented ID.
     let mut lane = LaneShell::spawn(b.root.path());

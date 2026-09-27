@@ -660,3 +660,48 @@ fn cad631_execution_approval_requires_current_bundle_not_snapshot_self_attestati
         0
     );
 }
+
+#[test]
+fn cad631_operator_audit_survives_revoke_while_worker_fetch_and_corruption_refuse() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    s.finish(&writer, "completed", &producer_result(id, &writer), None)
+        .unwrap();
+    let next = s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    let reviewer = start_local_step(&s, &next, 1, "reviewer");
+    let artifact = next["artifacts"][0]["id"].as_str().unwrap();
+    let before = s.app_artifact_for_operator(artifact).unwrap();
+    assert!(s
+        .app_artifact_with_digest(
+            artifact,
+            Some((&reviewer.id, reviewer.turn_id.as_deref().unwrap())),
+            "sha256:bundle"
+        )
+        .is_ok());
+    s.app_capability_decide("install-1", "sha256:bundle", false)
+        .unwrap();
+    assert_eq!(s.app_artifact_for_operator(artifact).unwrap(), before);
+    assert!(s
+        .app_artifact_with_digest(
+            artifact,
+            Some((&reviewer.id, reviewer.turn_id.as_deref().unwrap())),
+            "sha256:bundle"
+        )
+        .is_err());
+    s.conn()
+        .execute(
+            "UPDATE app_run_artifacts SET content=? WHERE id=?",
+            params![b"corrupted material".as_slice(), artifact],
+        )
+        .unwrap();
+    assert!(s.app_artifact_for_operator(artifact).is_err());
+}

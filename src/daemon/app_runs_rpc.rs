@@ -158,7 +158,8 @@ impl Shared {
                 if fields.contains_key("token") {
                     return Err(Error::rejected("token requires its assigned message"));
                 }
-                self.app_artifact_current(required_str(params, "artifact_id")?, None)
+                self.store
+                    .app_artifact_for_operator(required_str(params, "artifact_id")?)
             }
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }

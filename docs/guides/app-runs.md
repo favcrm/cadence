@@ -181,10 +181,17 @@ Start a new run with a new request ID after restoring the intended team
 and approval; an old run's immutable snapshot cannot be reassigned.
 
 New lifecycle and HTTP management surfaces are operator-only. Worker
-artifact access proves the current dependent step and actual turn. Local
+artifact access proves the current dependent step and actual turn.
+Operators can inspect retained artifacts after cancellation, revocation
+or package replacement; each read verifies the stored artifact's integrity.
+An audit read grants no execution authority. Local
 artifact capabilities govern the broker; they do not claim shell or tool
 confinement for a worker's unrelated work.
 
 Catalog storage remains filesystem schema1. Persisted local runs add
 SQLite schema20 through an additive migration from schema19. Source merge
 and production rollout are separate operations managed by the rollout owner.
+
+`owner_pm` is registered group and routing metadata, not material-read or
+execution authority. Reusing that alias does not grant app lifecycle decisions
+or artifact access; actual assigned worker registrations remain frozen.

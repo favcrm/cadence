@@ -559,6 +559,21 @@ impl Store {
         turn: Option<(&str, &str)>,
         current_bundle: &str,
     ) -> Result<Value> {
+        let turn =
+            turn.ok_or_else(|| Error::rejected("worker artifact fetch requires an assigned turn"))?;
+        self.app_artifact_read(id, Some(turn), Some(current_bundle))
+    }
+    /// Caller proof is supplied by the daemon's operator-only route. Audit
+    /// access is distinct from current execution or installation authority.
+    pub fn app_artifact_for_operator(&self, id: &str) -> Result<Value> {
+        self.app_artifact_read(id, None, None)
+    }
+    fn app_artifact_read(
+        &self,
+        id: &str,
+        turn: Option<(&str, &str)>,
+        current_bundle: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.conn();
         let (run_id, producer_step, digest, media_type, bytes): (
             String,
@@ -568,15 +583,21 @@ impl Store {
             Vec<u8>,
         ) = conn
             .query_row(
-                "SELECT run_id,step_id,digest,media_type,content FROM app_run_artifacts WHERE id=?",
-                [id],
+                "SELECT a.run_id,a.step_id,a.digest,a.media_type,substr(a.content,1,?2) FROM app_run_artifacts a JOIN app_run_steps s ON s.run_id=a.run_id AND s.step_id=a.step_id JOIN app_runs r ON r.id=a.run_id WHERE a.id=?1",
+                params![id, (ARTIFACT_BYTES + 1) as i64],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?
             .ok_or_else(|| Error::rejected("artifact unavailable"))?;
         let run = Self::app_run_show_in(&conn, &run_id)?;
-        Self::app_current_in(&conn, &run, current_bundle)?;
         if let Some((message, token)) = turn {
+            Self::app_current_in(
+                &conn,
+                &run,
+                current_bundle.ok_or_else(|| {
+                    Error::rejected("worker fetch requires current installation proof")
+                })?,
+            )?;
             if run["state"] != "running" || run["approved_digest"] != run["snapshot_digest"] {
                 return Err(Error::rejected(
                     "artifact run execution is no longer approved",
@@ -607,8 +628,14 @@ impl Store {
                 ));
             }
         }
-        if bytes.len() > ARTIFACT_BYTES {
-            return Err(Error::rejected("artifact exceeds its limit"));
+        if bytes.is_empty()
+            || bytes.len() > ARTIFACT_BYTES
+            || !matches!(media_type.as_str(), "text/plain" | "text/markdown")
+            || artifact_digest(&bytes) != digest
+        {
+            return Err(Error::rejected(
+                "persisted artifact integrity or bounds refused",
+            ));
         }
         let text = String::from_utf8(bytes)
             .map_err(|_| Error::internal("stored text artifact is not UTF-8"))?;
