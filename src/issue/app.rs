@@ -80,7 +80,7 @@ const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 const MAX_FILES: usize = 128;
 
 /// Largest bundle, all files together — an A1 app is text.
-const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The `app.md` definition: the frontmatter fields plus the body, the
 /// guide agents read. `needs.connections` declares the slots the app's
@@ -615,6 +615,11 @@ pub(crate) fn validate_texts(
 ) -> Result<Validated> {
     if files.len() > MAX_FILES {
         return Err(Error::rejected("app bundle exceeds its file limit"));
+    }
+    if files.iter().map(|(_, text)| text.len() as u64).sum::<u64>() > MAX_APP_BYTES {
+        return Err(Error::rejected(
+            "app bundle exceeds its aggregate byte limit",
+        ));
     }
     let mut warnings = Vec::new();
     for (name, text) in &files {

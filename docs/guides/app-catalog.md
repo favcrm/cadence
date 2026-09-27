@@ -19,6 +19,7 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 | `cadence app catalog show <install-id>` | Inspect one exact installation ID. An app name is not a substitute. |
 | `cadence app catalog migrate` | Explicitly catalogue legacy installations and backfill missing IDs, using the PM mutation and Git delivery path. |
 | `cadence app catalog recover <install-id>` | Resume delivery from that installation's retained install journal. |
+| `cadence app catalog migration-recover <journal-id> [--rollback]` | Explicitly resume migration delivery, or roll it back when `--rollback` is supplied. |
 
 These commands do not accept `--project`. New workspace installations have
 `project: null` and `project_link: null`; no project is created. Catalogued legacy
@@ -157,10 +158,11 @@ PM commit, not an upgrade or an automatic backup restore. It has no rollback
 flag. A missing journal cannot be recovered with an arbitrary app name.
 
 This public recover command handles **installation journals only**. Migration
-journals use a different format; interrupted migration recovery/rollback is not
-exposed by this CLI command. Do not pass a migration journal ID to it or edit
-catalog files to bypass a pending-publication refusal. Preserve the error and
-journal details for a separately scoped recovery investigation.
+journals use a different format; use the separate `migration-recover <journal-id>` command, with explicit
+`--rollback` only when choosing restoration of verified preimages. Do not pass a
+migration journal ID to the installation `recover` command or edit catalog files
+to bypass a pending-publication refusal. Retain the journal and error if
+divergence prevents recovery.
 
 ## Explicit catalog migration recovery
 

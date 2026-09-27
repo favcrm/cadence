@@ -454,7 +454,7 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        let _ = peer_pid; // COUNTERFACTUAL: connection-bound catalog guard absent.
+        self.operator_connection("workspace app catalog", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "app_workspace_install" => &["source"],
             "app_workspace_migration_recover" => &["journal_id", "rollback"],

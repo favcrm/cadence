@@ -1935,17 +1935,11 @@ fn write_route(
     // CAD-313: every other write is admitted HERE by its class in
     // `operator::WRITE_ROUTES` (unlisted: operator-only) before any
     // handler runs; the handlers below check no caller themselves.
-    let caller = if path == "/api/app-installations" {
-        Some(operator::Caller::Operator(
-            "operator (counterfactual)".into(),
-        ))
-    } else {
-        match operator::admit(&request, method.as_str(), path, state_dir, opts) {
-            Ok(caller) => caller,
-            Err(resp) => {
-                send(request, resp);
-                return;
-            }
+    let caller = match operator::admit(&request, method.as_str(), path, state_dir, opts) {
+        Ok(caller) => caller,
+        Err(resp) => {
+            send(request, resp);
+            return;
         }
     };
     // CAD-561: the operator's Update button — the same pipeline the CLI
@@ -3285,7 +3279,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     .strip_prefix("/api/app-installations/")
                     .is_some_and(|id| !id.is_empty() && !id.contains('/'))
             {
-                // COUNTERFACTUAL: catalog HTTP read guard absent.
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
                 let id = path.strip_prefix("/api/app-installations/");
                 let method = if id.is_some() {
                     "app_workspace_show"

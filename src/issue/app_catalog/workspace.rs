@@ -74,7 +74,7 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
         }
         let text = required(root, &path, crate::issue::plan::MAX_PLAN_BYTES as u64)?;
         bytes += text.len();
-        if bytes > JOURNAL_CAP as usize / 2 {
+        if bytes > app::MAX_APP_BYTES as usize {
             return Err(Error::rejected(
                 "app bundle exceeds its aggregate byte limit",
             ));
@@ -92,9 +92,13 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                 if matches!(name.as_str(), "workflows" | "rubrics" | "templates") =>
             {
                 for leaf in root.list(&path, &mut budget)? {
-                    if !leaf.ends_with(".md") || !model::valid_tag(leaf.trim_end_matches(".md")) {
+                    if leaf.starts_with('.')
+                        || (name == "workflows"
+                            && (!leaf.ends_with(".md")
+                                || !model::valid_tag(leaf.trim_end_matches(".md"))))
+                    {
                         return Err(Error::rejected(
-                            "app bundle entries must be flat named Markdown files",
+                            "workflows must be named Markdown files and all bundle entries must be visible flat text files",
                         ));
                     }
                     add(format!("{name}/{leaf}"), path.join(leaf))?;
@@ -191,7 +195,7 @@ pub(crate) fn install(pm: &Pm, state: &Path, source: &str) -> Result<Value> {
     root.mkdir(Path::new(".apps"))?;
     root.mkdir(Path::new(".apps/install-journals"))?;
     root.put(&journal_path(&id), &text)?;
-    root.put(Path::new(INSTALL_PENDING), &id.to_string())?;
+    root.put(Path::new(INSTALL_PENDING), &id)?;
     let foreign = apply(pm, &root, &journal)?;
     let mut row = describe(&root, &catalog, &id)?;
     row["committed"] = json!(true);
@@ -267,7 +271,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         let valid = name == "app.md"
             || (components.len() == 2
                 && matches!(components[0],std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(components[1],std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf|leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))));
+                && matches!(components[1],std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| !leaf.starts_with('.') && (!name.starts_with("workflows/") || (leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))))));
         if !valid || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
@@ -369,6 +373,11 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             .get("app.md")
             .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
     )?;
+    if manifest.app != entry.app || manifest.app != record.app {
+        return Err(Error::rejected(
+            "installed manifest identity differs from catalog and record",
+        ));
+    }
     catalog.require_current(root)?;
     let reread: Record = decode(&required(root, &path, RECORD_CAP)?)?;
     if serde_yaml::to_value(&reread).map_err(|e| Error::internal(e.to_string()))?
@@ -402,34 +411,54 @@ pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     describe(&root, &catalog, &id)
 }
 
-/// Delivered migration holds the same PM lock through publication and Git.
-pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
-    let _lock = pm.lock()?;
-    let catalog = migrate_locked(pm)?;
-    let mut paths = vec![pm.dir.join(CATALOG)];
-    if let Some(id) = &catalog.last_migration {
-        paths.push(pm.dir.join(super::journal_path(id)));
-    }
-    for (id, entry) in &catalog.installations {
-        if matches!(entry.storage, Storage::Legacy { .. }) {
-            paths.push(pm.dir.join(entry.paths(id).1));
-        }
-    }
-    let foreign = write::commit(
+/// Delivery happens before pending is removed, under the same PM lock.
+fn commit_migration(pm: &Pm, journal: &Journal) -> Result<Vec<String>> {
+    let mut paths = vec![
+        pm.dir.join(CATALOG),
+        pm.dir.join(super::journal_path(&journal.id)),
+    ];
+    paths.extend(
+        journal
+            .records
+            .iter()
+            .map(|record| pm.dir.join(record.path())),
+    );
+    Ok(write::commit(
         pm,
         &paths,
-        "workspace app catalog migration",
+        &format!("workspace app catalog migration {}", journal.id),
         &[],
         "operator",
-    )?;
+    )?
+    .into_iter()
+    .filter(|path| path != PENDING)
+    .collect())
+}
+pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
+    let _lock = pm.lock()?;
+    let mut foreign = None;
+    let catalog = migrate_delivering(pm, |journal| {
+        foreign = Some(commit_migration(pm, journal)?);
+        Ok(())
+    })?;
+    let foreign = match foreign {
+        Some(foreign) => foreign,
+        None => write::commit(
+            pm,
+            &[pm.dir.join(CATALOG)],
+            "workspace app catalog unchanged",
+            &[],
+            "operator",
+        )?,
+    };
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(&catalog)?),"installations":catalog.installations.len(),"committed":true,"foreign_files":foreign,"executable":false}),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(&catalog)?),"journal_id":catalog.last_migration,"installations":catalog.installations.len(),"committed":true,"foreign_files":foreign,"executable":false}),
     )
 }
-
 pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
     let _lock = pm.lock()?;
-    recover_locked(
+    let mut foreign = Vec::new();
+    recover_delivering(
         pm,
         id,
         if rollback {
@@ -437,25 +466,10 @@ pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Val
         } else {
             Recovery::Resume
         },
-    )?;
-    let root = Root::open(&pm.dir)?;
-    let journal: Journal = decode(&required(&root, &super::journal_path(id), JOURNAL_CAP)?)?;
-    let mut paths = vec![pm.dir.join(CATALOG), pm.dir.join(super::journal_path(id))];
-    paths.extend(
-        journal
-            .records
-            .iter()
-            .map(|record| pm.dir.join(record.path())),
-    );
-    let foreign = write::commit(
-        pm,
-        &paths,
-        &format!(
-            "workspace app migration {id} {}",
-            if rollback { "rolled back" } else { "resumed" }
-        ),
-        &[],
-        "operator",
+        |journal| {
+            foreign = commit_migration(pm, journal)?;
+            Ok(())
+        },
     )?;
     Ok(
         json!({"schema":1,"workspace":"default","journal_id":id,"rollback":rollback,"committed":true,"foreign_files":foreign,"executable":false}),

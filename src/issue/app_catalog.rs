@@ -124,6 +124,9 @@ pub(crate) fn migrate_authorized(pm: &Pm) -> Result<Catalog> {
 }
 
 fn migrate_locked(pm: &Pm) -> Result<Catalog> {
+    migrate_delivering(pm, |_| Ok(()))
+}
+fn migrate_delivering(pm: &Pm, delivery: impl FnOnce(&Journal) -> Result<()>) -> Result<Catalog> {
     let root = Root::open(&pm.dir)?;
     no_pending(&root)?;
     let before_catalog = root.read(Path::new(CATALOG), CATALOG_CAP)?;
@@ -186,7 +189,7 @@ fn migrate_locked(pm: &Pm) -> Result<Catalog> {
             journal: id,
         })?,
     )?;
-    journal.apply(&root, Recovery::Resume)?;
+    journal.apply_delivering(&root, Recovery::Resume, delivery)?;
     Ok(candidate)
 }
 
@@ -206,6 +209,14 @@ pub(crate) fn recover_authorized(pm: &Pm, id: &str, mode: Recovery) -> Result<()
     recover_locked(pm, id, mode)
 }
 fn recover_locked(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
+    recover_delivering(pm, id, mode, |_| Ok(()))
+}
+fn recover_delivering(
+    pm: &Pm,
+    id: &str,
+    mode: Recovery,
+    delivery: impl FnOnce(&Journal) -> Result<()>,
+) -> Result<()> {
     journal_id(id)?;
     let root = Root::open(&pm.dir)?;
     let journal: Journal = decode(&required(&root, &journal_path(id), JOURNAL_CAP)?)?;
@@ -224,7 +235,7 @@ fn recover_locked(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
             })?,
         )?;
     }
-    journal.apply(&root, mode)
+    journal.apply_delivering(&root, mode, delivery)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -401,7 +412,12 @@ impl Journal {
             Recovery::Rollback => &source.before,
         }
     }
-    fn apply(&self, root: &Root, mode: Recovery) -> Result<()> {
+    fn apply_delivering(
+        &self,
+        root: &Root,
+        mode: Recovery,
+        delivery: impl FnOnce(&Journal) -> Result<()>,
+    ) -> Result<()> {
         self.verify(root)?;
         for source in &self.records {
             let target = self.target(source, mode);
@@ -437,6 +453,7 @@ impl Journal {
                 "catalog changed before migration completion",
             ));
         }
+        delivery(self)?;
         root.remove(Path::new(PENDING))?;
         Ok(())
     }
@@ -506,9 +523,15 @@ impl Catalog {
             project: entry.project.clone(),
         })
     }
-    // COUNTERFACTUAL CAD-667: current-generation enforcement temporarily absent.
     fn require_current(&self, root: &Root) -> Result<()> {
-        let _ = (self, root);
+        no_pending(root)?;
+        let current: Catalog = decode(&required(root, Path::new(CATALOG), CATALOG_CAP)?)?;
+        current.validate()?;
+        if current != *self {
+            return Err(Error::rejected(
+                "cached catalog generation is no longer published",
+            ));
+        }
         Ok(())
     }
     pub fn load(root: &Path) -> Result<Self> {
