@@ -843,7 +843,9 @@ fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
     h.bind(&c, "same-artifact-binding");
     let run = h.complete(&c, "same-artifact-run");
     let first = h.stage(&run, "same-artifact-first");
-    assert_eq!(h.decide(&first)["state"], "done");
+    let first_done = h.decide(&first);
+    assert_eq!(first_done["state"], "done");
+    assert_eq!(first_done["record"]["outcome"]["verified"], true);
     let first_item = h
         .daemon
         .operator_rpc("platform_outbox", json!({"effect_id":first["effect_id"]}))
@@ -857,7 +859,9 @@ fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
         1,
         "staging matched another completed item's content"
     );
-    assert_eq!(h.decide(&second)["state"], "done");
+    let second_done = h.decide(&second);
+    assert_eq!(second_done["state"], "done");
+    assert_eq!(second_done["record"]["outcome"]["verified"], true);
     let second_item = h
         .daemon
         .operator_rpc("platform_outbox", json!({"effect_id":second["effect_id"]}))
@@ -875,10 +879,39 @@ fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
     );
     assert!(first_item["provenance"]["authority_digest"].is_string());
     assert!(second_item["provenance"]["authority_digest"].is_string());
-    assert_ne!(
-        first_item["provenance"]["authority_digest"], second_item["provenance"]["authority_digest"],
-        "same-body release borrowed previous effect authority"
+    // The accepted run/artifact/binding authority is identical. Effect identity
+    // is pinned separately by provenance, the full release and encoded input.
+    assert_eq!(
+        first_item["provenance"]["authority_digest"],
+        second_item["provenance"]["authority_digest"]
     );
+    for receipt in [&first_done, &second_done] {
+        assert!(receipt["digest"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+    assert_ne!(
+        first_done["digest"], second_done["digest"],
+        "second release borrowed the first effect's decision digest"
+    );
+    for item in [&first_item, &second_item] {
+        assert!(item["input_digest"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+    assert_ne!(
+        first_item["input_digest"], second_item["input_digest"],
+        "second release borrowed the first effect's encoded input receipt"
+    );
+    for receipt in [&first_done, &second_done] {
+        assert_eq!(
+            h.daemon
+                .operator_rpc("app_effect_show", json!({"effect_id":receipt["effect_id"]}))
+                .unwrap()["effect"],
+            *receipt,
+            "second release changed an exact durable effect receipt"
+        );
+    }
     assert_eq!(
         h.daemon
             .operator_rpc("platform_outbox", json!({"effect_id":first["effect_id"]}))
