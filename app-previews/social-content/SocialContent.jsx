@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { studio } from "./store.mjs";
+import { postsForDay } from "./calendar.mjs";
 import { fixtureWeek, fixtureTimeZone } from "./fixtures.mjs";
 import { HugeiconsIcon } from "@hugeicons/react";
 import CubeIcon from "@hugeicons/core-free-icons/CubeIcon";
@@ -200,6 +201,12 @@ function Editor({ post, source, run, act, onClose, readonly }) {
         </span>
         {post.needsYou && <span className="badge b-fail">{post.needsYou}</span>}
       </div>
+      {(dirty || planDirty) && (
+        <p className="notice editor-unsaved" role="status">
+          Unsaved caption / planning edits. Save or discard them before another
+          material action.
+        </p>
+      )}
       <div className="editor-grid">
         <section className="editor-fields">
           <div className="card pad">
@@ -242,7 +249,7 @@ function Editor({ post, source, run, act, onClose, readonly }) {
             <div className="row">
               <button
                 className="btn btn-primary"
-                disabled={readonly || post.lease || !dirty}
+                disabled={readonly || post.lease || !dirty || planDirty}
                 onClick={() =>
                   change(
                     () => studio.edit(post.id, caption, post.revision),
@@ -274,7 +281,7 @@ function Editor({ post, source, run, act, onClose, readonly }) {
               </button>
               <button
                 className="btn"
-                disabled={readonly}
+                disabled={readonly || dirty || planDirty}
                 onClick={() =>
                   change(
                     () =>
@@ -305,7 +312,13 @@ function Editor({ post, source, run, act, onClose, readonly }) {
               />
               <button
                 className="btn"
-                disabled={readonly || !instruction.trim() || post.lease}
+                disabled={
+                  readonly ||
+                  !instruction.trim() ||
+                  post.lease ||
+                  dirty ||
+                  planDirty
+                }
                 onClick={() =>
                   change(
                     () => studio.ask(post.id, instruction, post.revision),
@@ -321,7 +334,9 @@ function Editor({ post, source, run, act, onClose, readonly }) {
             </p>
             <button
               className="btn btn-sm"
-              disabled={readonly || post.history.length < 2}
+              disabled={
+                readonly || post.history.length < 2 || dirty || planDirty
+              }
               onClick={() =>
                 change(
                   () => studio.undo(post.id, post.revision),
@@ -366,7 +381,7 @@ function Editor({ post, source, run, act, onClose, readonly }) {
             </div>
             <button
               className="btn"
-              disabled={readonly || !planDirty}
+              disabled={readonly || !planDirty || dirty}
               onClick={() =>
                 change(
                   () =>
@@ -381,6 +396,22 @@ function Editor({ post, source, run, act, onClose, readonly }) {
             >
               Save local plan
             </button>
+            <button
+              className="btn"
+              disabled={!planDirty}
+              onClick={() => {
+                setTime(post.scheduleAt);
+                setDestinations(post.destinations);
+              }}
+            >
+              Discard local plan
+            </button>
+            {(dirty || planDirty) && (
+              <p className="muted">
+                Save or discard the current caption / planning edits before
+                another material action.
+              </p>
+            )}
             <p className="muted">
               Planning only. No external scheduler or delivery is created.
             </p>
@@ -510,6 +541,12 @@ export default function SocialContent() {
   const [context, setContext] = useState("all");
   const [scenario, setScenario] = useState("normal");
   const [mode, setMode] = useState("Calendar");
+  const scheduleRef = useRef(null);
+  const scrollPositions = useRef({ Calendar: 0, Board: 0 });
+  useEffect(() => {
+    if (scheduleRef.current)
+      scheduleRef.current.scrollTop = scrollPositions.current[mode];
+  }, [view, mode]);
   const [week, setWeek] = useState(0);
   const [newOnly, setNewOnly] = useState(true);
   const [selection, setSelection] = useState([]);
@@ -558,6 +595,15 @@ export default function SocialContent() {
   const posts = snapshot.posts.filter(
     (post) => context === "all" || post.brand === context,
   );
+  const visibleRuns = snapshot.runs
+    .map((run) => ({
+      ...run,
+      totalItems: run.items.length,
+      items: run.items.filter((item) =>
+        posts.some((post) => post.id === item.postId),
+      ),
+    }))
+    .filter((run) => run.items.length);
   const needs = posts.filter(
     (post) => post.needsYou || post.status === "waiting",
   );
@@ -579,8 +625,13 @@ export default function SocialContent() {
         <small className="num muted">
           {post.scheduleAt.slice(11) || "Unplanned"} · {post.id}
         </small>
-        <span>{post.caption.slice(0, 70)}</span>
-        <Badge post={post} />
+        <span>{post.caption}</span>
+        <span className="post-footer">
+          <Badge post={post} />
+          <small className="muted destinations-copy">
+            {post.destinations.join(" + ")}
+          </small>
+        </span>
       </button>
     );
   }
@@ -660,7 +711,7 @@ export default function SocialContent() {
           </small>
         </div>
         <div className="body no-rail">
-          <main className="content app-content">
+          <main className="content app-content" data-view={view}>
             <nav className="tabs app-tabs" aria-label="Content studio sections">
               {sections.map((section) => (
                 <button
@@ -687,7 +738,12 @@ export default function SocialContent() {
                 id="context"
                 className="field context-select"
                 value={context}
-                onChange={(e) => setContext(e.target.value)}
+                onChange={(e) => {
+                  setContext(e.target.value);
+                  setSelection([]);
+                  setDrawer(null);
+                  setNotice("");
+                }}
               >
                 <option value="all">All brand contexts</option>
                 <option>Kura Ramen</option>
@@ -790,30 +846,51 @@ export default function SocialContent() {
                     <div className="schedule-layout">
                       <div
                         className={`schedule-view ${mode.toLowerCase()}`}
+                        ref={scheduleRef}
+                        onScroll={(event) => {
+                          scrollPositions.current[mode] =
+                            event.currentTarget.scrollTop;
+                        }}
                         key={mode}
                       >
                         {mode === "Calendar" ? (
-                          days.map((day) => (
-                            <section
-                              className="calendar-day card"
-                              key={dateKey(day)}
-                            >
-                              <header>
-                                <span className="slabel">
-                                  {day.toLocaleDateString(undefined, {
-                                    weekday: "short",
-                                    timeZone: "UTC",
-                                  })}
-                                </span>
-                                <span className="num">{day.getUTCDate()}</span>
-                              </header>
-                              {posts
-                                .filter((post) =>
-                                  post.scheduleAt.startsWith(dateKey(day)),
-                                )
-                                .map(card)}
-                            </section>
-                          ))
+                          <div className="calendar-agenda">
+                            {days.map((day) => (
+                              <section
+                                className="calendar-day"
+                                key={dateKey(day)}
+                                data-date={dateKey(day)}
+                              >
+                                <header className="agenda-head">
+                                  <span className="slabel">
+                                    {day.toLocaleDateString(undefined, {
+                                      weekday: "short",
+                                      timeZone: "UTC",
+                                    })}
+                                  </span>
+                                  <strong className="num">
+                                    {day.getUTCDate()}
+                                  </strong>
+                                  <span className="chip tone num">
+                                    {postsForDay(posts, dateKey(day)).length}{" "}
+                                    {postsForDay(posts, dateKey(day)).length ===
+                                    1
+                                      ? "post"
+                                      : "posts"}
+                                  </span>
+                                </header>
+                                <div className="day-posts">
+                                  {postsForDay(posts, dateKey(day)).map(card)}
+                                  {postsForDay(posts, dateKey(day)).length ===
+                                    0 && (
+                                    <p className="agenda-empty muted">
+                                      No posts planned
+                                    </p>
+                                  )}
+                                </div>
+                              </section>
+                            ))}
+                          </div>
                         ) : (
                           <>
                             {Object.entries(lanes).map(([state, label]) => (
@@ -965,10 +1042,15 @@ export default function SocialContent() {
                           let run;
                           if (
                             act(() => {
-                              run = studio.batch(
-                                selection,
-                                context === "all" ? "" : context,
-                              );
+                              if (
+                                !selection.every((id) =>
+                                  sources.some((source) => source.id === id),
+                                )
+                              )
+                                throw new Error(
+                                  "Selection changed context. Select visible sources again.",
+                                );
+                              run = studio.batch(selection);
                             })
                           ) {
                             setSelection([]);
@@ -1039,7 +1121,7 @@ export default function SocialContent() {
                     <h2>
                       Runs <span className="kicker">local fixture batches</span>
                     </h2>
-                    {snapshot.runs.length === 0 ? (
+                    {visibleRuns.length === 0 ? (
                       <div className="empty">
                         <p>
                           Select Library source cards to start a fixture batch.
@@ -1052,7 +1134,7 @@ export default function SocialContent() {
                         </button>
                       </div>
                     ) : (
-                      snapshot.runs.map((run) => (
+                      visibleRuns.map((run) => (
                         <section className="card pad run-card" key={run.id}>
                           <div className="row">
                             <h3>
@@ -1061,7 +1143,8 @@ export default function SocialContent() {
                             <span className="badge b-info">{run.status}</span>
                           </div>
                           <p className="muted">
-                            {run.items.length} copied ·{" "}
+                            {run.items.length} of {run.totalItems} items in this
+                            context · copied ·{" "}
                             {
                               run.items.filter(
                                 (item) =>

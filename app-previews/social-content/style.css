@@ -155,7 +155,7 @@ button:active:not(:disabled) {
   border-radius: 0.25rem;
   overflow-wrap: anywhere;
 }
-.post-card > span:not(.badge) {
+.post-card > span:not(.badge):not(.post-footer) {
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -576,4 +576,159 @@ summary {
   align-items: center;
   flex-wrap: nowrap;
   gap: 6px;
+}
+/* The schedule consumes the remaining pane; time content scrolls within it. */
+.app-shell {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+.app-shell > .main,
+.app-shell .body {
+  min-height: 0;
+}
+.app-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+.app-content > :not(.schedule-layout) {
+  flex-shrink: 0;
+}
+.app-content[data-view="Home"] {
+  overflow: hidden;
+}
+.schedule-layout {
+  flex: 1;
+  min-height: 0;
+}
+.schedule-view {
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+}
+.schedule-view.calendar {
+  display: block;
+  position: relative;
+}
+.suggestions-rail {
+  max-height: 100%;
+  overflow-y: auto;
+  min-height: 0;
+  align-content: start;
+}
+/* One row per day; cards have planning times, never invented durations. */
+.calendar-agenda {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  gap: 6px;
+}
+.calendar-agenda .calendar-day {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 12px;
+  flex: 1 0 auto;
+  min-height: 80px;
+  padding: 6px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.25rem;
+}
+.calendar-day > .agenda-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+.agenda-head > strong {
+  font-size: var(--text-section);
+  color: var(--color-ink-200);
+}
+.day-posts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  align-items: start;
+}
+.day-posts .post-card {
+  margin: 0;
+  min-height: 64px;
+  padding: 6px;
+  gap: 4px;
+}
+.day-posts .post-card > span:not(.badge):not(.post-footer) {
+  -webkit-line-clamp: 2;
+}
+.destinations-copy {
+  font-size: var(--text-micro);
+}
+.agenda-empty {
+  display: block;
+  margin: 0;
+  align-self: center;
+}
+.editor-unsaved {
+  margin-inline: 24px;
+}
+@media (max-width: 1100px) and (min-width: 601px) {
+  .schedule-layout {
+    grid-template-columns: minmax(0, 1fr) 230px;
+  }
+  .suggestions-rail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 600px) {
+  .schedule-layout {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .schedule-view {
+    height: auto;
+    max-height: none;
+    overflow-x: auto;
+    flex: none;
+    width: 100%;
+  }
+  .schedule-view.calendar {
+    overflow: visible;
+  }
+  .calendar-agenda .calendar-day {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .calendar-day > .agenda-head {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+  .day-posts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .suggestions-rail {
+    height: auto;
+    max-height: none;
+    flex: none;
+    width: 100%;
+    overflow: visible;
+  }
+}
+
+.post-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.day-posts .post-card > span:not(.badge):not(.post-footer) {
+  font-size: var(--text-secondary);
+  line-height: 1.35;
+}
+.post-footer .destinations-copy {
+  line-height: 1.4;
 }

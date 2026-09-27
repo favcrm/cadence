@@ -106,3 +106,22 @@ test("hold and repeated review clear local approval/outbox; lease and undo never
   assert.equal(get().approvalRevision, null);
   assert.equal(get().outbox, null);
 });
+
+test("day agenda preserves dates, chronological card order and crowded-day records", async () => {
+  const { postsForDay } = await import(
+    "../../app-previews/social-content/calendar.mjs"
+  );
+  const posts = [
+    { id: "late", scheduleAt: "2026-12-31T18:45" },
+    { id: "early", scheduleAt: "2026-12-31T09:30" },
+    { id: "same", scheduleAt: "2026-12-31T18:45" },
+    { id: "next", scheduleAt: "2027-01-01T09:30" },
+  ];
+  assert.deepEqual(
+    postsForDay(posts, "2026-12-31").map((post) => post.id),
+    ["early", "late", "same"],
+  );
+  assert.equal(postsForDay(posts, "2027-01-01")[0].id, "next");
+  assert.deepEqual(postsForDay(posts, "2027-01-02"), []);
+  assert.equal(posts.length, 4);
+});

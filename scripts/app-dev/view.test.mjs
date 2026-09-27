@@ -86,6 +86,13 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
   async function field(selector, value) {
     const element = host.querySelector(selector);
     assert.ok(element, selector);
+    if (element.tagName === "SELECT") {
+      await act(() => {
+        element.value = value;
+        element.dispatchEvent(new window.Event("change", { bubbles: true }));
+      });
+      return;
+    }
     const key = Object.keys(element).find((k) => k.startsWith("__reactProps$"));
     await act(() => element[key].onChange({ target: { value } }));
   }
@@ -160,10 +167,44 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
       studio.read().sources.find((s) => s.id === item.sourceId).text,
     );
     await field("#caption", "Human caption for the scheduled fixture");
+    const button = (text) =>
+      [...host.querySelectorAll("button")].find(
+        (value) => value.textContent.trim() === text,
+      );
+    await field(
+      "#schedule-at",
+      `${source("./fixtures.mjs").fixtureWeek}T14:30`,
+    );
+    assert.ok(
+      button("Save revision").disabled,
+      "unsaved planning blocks caption save",
+    );
+    assert.ok(
+      button("Save local plan").disabled,
+      "unsaved caption blocks planning save",
+    );
+    assert.ok(
+      button("Use fixture image").disabled,
+      "material action cannot discard unsaved caption/planning",
+    );
+    await click("Discard local plan");
+    assert.equal(
+      host.querySelector("#caption").value,
+      "Human caption for the scheduled fixture",
+    );
     await click("Save revision");
     await field(
       "#schedule-at",
       `${source("./fixtures.mjs").fixtureWeek}T14:30`,
+    );
+    await field("#caption", "Unsaved second caption");
+    assert.ok(button("Save revision").disabled);
+    assert.ok(button("Save local plan").disabled);
+    await click("Discard");
+    assert.equal(
+      host.querySelector("#schedule-at").value,
+      `${source("./fixtures.mjs").fixtureWeek}T14:30`,
+      "discard caption preserves unsaved planning",
     );
     await click("Save local plan");
     await click("Mark reviewed");
@@ -192,8 +233,68 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
     );
     await click("Board");
     assert.equal(host.querySelectorAll(".board-lane").length, 6);
+    await click("Calendar");
+    const plannedDay = [...host.querySelectorAll(".calendar-day")].find((day) =>
+      day.textContent.includes("Edited after approval"),
+    );
+    assert.equal(plannedDay.dataset.date, source("./fixtures.mjs").fixtureWeek);
+    assert.ok(plannedDay.textContent.includes("14:30"));
+    await click("Library");
+    await field("#context", "Kura Ramen");
+    await act(() =>
+      host.querySelector('[aria-label="Select source source-3"]').click(),
+    );
+    await field("#context", "Velvet Padel");
+    assert.ok(
+      button("Draft posts").disabled,
+      "context change clears hidden selection",
+    );
+    await act(() =>
+      host.querySelector('[aria-label="Select source source-4"]').click(),
+    );
+    await click("Draft 1 posts");
+    const contextRun = studio.read().runs[0];
+    assert.equal(
+      studio.read().posts.find((post) => post.id === contextRun.items[0].postId)
+        .brand,
+      "Velvet Padel",
+    );
+    assert.ok(
+      ![...host.querySelectorAll(".run-card tbody")].some((table) =>
+        table.textContent.includes("source-3"),
+      ),
+      "Runs show only current-context items",
+    );
     await click("Settings");
     assert.match(host.textContent, /protected terms/i);
+    studio.reset();
+    for (let hour = 9; hour < 16; hour++) {
+      const id = studio.batch(["source-3"]).items[0].postId;
+      studio.material(
+        id,
+        {
+          scheduleAt: `${source("./fixtures.mjs").fixtureWeek}T${String(hour).padStart(2, "0")}:00`,
+        },
+        1,
+      );
+    }
+    await act(() =>
+      root.render(React.createElement(View, { key: "crowded-week" })),
+    );
+    const busyDay = host.querySelector(".calendar-day");
+    assert.equal(
+      busyDay.querySelectorAll(".day-posts .post-card").length,
+      8,
+      "busy day retains all cards in normal wrapping layout",
+    );
+    const times = [
+      ...busyDay.querySelectorAll(".post-card > small:first-child"),
+    ].map((value) => value.textContent.slice(0, 5));
+    assert.deepEqual(
+      times,
+      [...times].sort(),
+      "day cards ordered by planned time",
+    );
   } finally {
     await act(() => root.unmount());
     await window.happyDOM.close();

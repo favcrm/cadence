@@ -35,14 +35,19 @@ provider credentials or NODE_OPTIONS. Dependencies must already be installed.
 
 ## Boundary and ownership
 
-Home opens the current Hong Kong planning week with Calendar/Board and a needs /
-suggestions rail. Library is an immutable source-media grid: select sources,
+Home opens the current Hong Kong planning week with a full-height day-row
+Calendar/Board and a needs /
+suggestions rail. Each calendar row is a day; cards show time, state and
+destinations, wrap on busy days and stack in a narrow agenda. Empty days are
+explicit; there are no invented durations or hourly slots. Library is an immutable source-media grid: select sources,
 Draft N posts, inspect the resulting fixture batch in Runs, then open its editor.
 A source can have multiple derived drafts. Optional brand context persists across
 app navigation; no site or project is mandatory.
 
 Caption/media/time/destination changes create a material revision and invalidate
-local review, approval and staged simulation. Choose a local plan, mark reviewed,
+local review, approval and staged simulation. Cross-field actions require saving
+or explicitly discarding unsaved caption/planning changes. Context changes clear
+selection and Runs show only matching items, preserving original source brands. Choose a local plan, mark reviewed,
 approve the current local revision, then stage in the fixture outbox. Planning
 uses plain Hong Kong calendar date/time, never an external scheduler. Published
 seed records and verification mismatches are illustrative; external receipts

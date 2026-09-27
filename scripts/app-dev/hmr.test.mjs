@@ -13,6 +13,7 @@ test("real Vite preview updates CSS over HMR, blocks APIs/files, and omits inher
   for (const file of [
     "SocialContent.jsx",
     "SecondaryViews.jsx",
+    "calendar.mjs",
     "store.mjs",
     "fixtures.mjs",
     "sdk.mjs",

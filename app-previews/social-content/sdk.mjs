@@ -41,7 +41,7 @@ export function createStudioFixture(seed) {
   }
   return {
     read: () => structuredClone(state),
-    batch(sourceIds, brand = "") {
+    batch(sourceIds) {
       const selected = [...new Set(sourceIds)].map((id) =>
         state.sources.find((s) => s.id === id),
       );
@@ -62,7 +62,7 @@ export function createStudioFixture(seed) {
         const value = {
           id: `fixture-${++sequence}`,
           sourceId: source.id,
-          brand: brand || source.brand,
+          brand: source.brand,
           caption: source.text,
           media: [...source.media],
           revision: 1,
