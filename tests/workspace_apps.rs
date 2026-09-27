@@ -464,3 +464,67 @@ fn cad667_workspace_source_credentials_refuse_before_clone_or_persistence() {
         assert!(!w.pm.dir.join(".apps").exists());
     }
 }
+
+#[test]
+fn cad667_explicit_migration_recovery_has_operator_proof_and_preserves_legacy_identity() {
+    let w = Workspace::new();
+    let base = w.pm.dir.join("client/apps/legacy");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        w.pm.dir.join("client/project.yaml"),
+        "key: client\nprefix: C\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("app.md"),
+        "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+    )
+    .unwrap();
+    let record = w.pm.dir.join("client/apps/legacy.yaml");
+    std::fs::write(&record,"schema: 1\napp: legacy\ninstall_id: stable-legacy\nsource:\n  kind: path\n  path: /legacy\ninstalled_at: yesterday\ninstalled_by: operator\n").unwrap();
+    let before = std::fs::read(&record).unwrap();
+    let migrated = w
+        .daemon
+        .operator_rpc("app_workspace_migrate", json!({}))
+        .expect("explicit delivered migration");
+    assert_eq!(migrated["committed"], true);
+    let catalog: serde_yaml::Value =
+        serde_yaml::from_slice(&std::fs::read(w.pm.dir.join(".apps/catalog.yaml")).unwrap())
+            .unwrap();
+    let journal = catalog["last_migration"].as_str().unwrap();
+    std::fs::write(
+        w.pm.dir.join(".apps/pending.yaml"),
+        format!("schema: 1\njournal: {journal}\n"),
+    )
+    .unwrap();
+    let head = w.head();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "migration-worker", "claude", None, lane.pid());
+    let denied = lane.rpc(
+        &w.daemon.state,
+        "app_workspace_migration_recover",
+        json!({"journal_id":journal,"rollback":false}),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(
+        denied.to_string().contains("operator"),
+        "wrong migration caller boundary: {denied}"
+    );
+    assert_eq!(w.head(), head);
+    let recovered = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_migration_recover",
+            json!({"journal_id":journal,"rollback":false}),
+        )
+        .expect("public migration recovery must exist");
+    assert_eq!(recovered["committed"], true);
+    assert!(!w.pm.dir.join(".apps/pending.yaml").exists());
+    assert_eq!(std::fs::read(record).unwrap(), before);
+    assert_eq!(
+        w.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id":"stable-legacy"}))
+            .unwrap()["install_id"],
+        "stable-legacy"
+    );
+}
