@@ -723,7 +723,7 @@ fn mvp_journey_end_to_end() {
         master["confined"], true,
         "Landlock confines the master: {master}"
     );
-    for alias in ["w1", "r1"] {
+    for (alias, role) in [("w1", "worker"), ("r1", "reviewer")] {
         j.ok(&[
             "agent",
             "register",
@@ -732,6 +732,8 @@ fn mvp_journey_end_to_end() {
             "claude",
             "--endpoint",
             "managed",
+            "--role",
+            role,
             "--cwd",
             &repo,
         ]);
