@@ -808,6 +808,28 @@ fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_expli
                     .unwrap()["install_id"],
                 "stable-migration"
             );
+            let before_rollback = w.head();
+            let result = w
+                .daemon
+                .operator_rpc(
+                    "app_workspace_migration_recover",
+                    json!({"journal_id":id,"rollback":true}),
+                )
+                .unwrap();
+            assert_eq!(result["committed"], true);
+            assert_ne!(w.head(), before_rollback);
+            assert!(!w.pm.dir.join(".apps/catalog.yaml").exists());
+            let tracked = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&w.pm.dir)
+                .args(["ls-files", "--", ".apps/catalog.yaml"])
+                .output()
+                .unwrap();
+            assert!(tracked.status.success());
+            assert!(
+                tracked.stdout.is_empty(),
+                "rollback omitted the tracked catalog deletion"
+            );
         }
     }
 }
