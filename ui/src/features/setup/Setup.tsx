@@ -409,6 +409,10 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
   const missing = report ? missingRequired(report) : [];
   const busy = checking || state.inFlight || projectsState.inFlight;
   const stale = !!(state.error || recheckError || projectsState.error);
+  const visibleError =
+    recheckError ??
+    state.error ??
+    (step !== "project" ? projectsState.error : null);
   const current = report !== null && projects !== null && !busy && !stale;
   const date = report ? new Date(report.checked_at) : null;
   const checkedAt =
@@ -518,14 +522,9 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
           {Math.max(1, Math.ceil(reused.wait / 1000))}s cooldown.
         </p>
       )}
-      {stale && (
+      {report && visibleError && (
         <div className="setup-error" role="alert">
-          <span>
-            {report
-              ? "Showing last known observations."
-              : "Could not load readiness observations."}{" "}
-            {recheckError ?? state.error ?? projectsState.error}
-          </span>
+          <span>Showing last known observations. {visibleError}</span>
         </div>
       )}
       <div className="setup-layout">
