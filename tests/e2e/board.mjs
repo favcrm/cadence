@@ -339,7 +339,7 @@ const steps = {
     const response = await enqueued;
     if (!response.ok()) throw new Error(`merge failed: HTTP ${response.status()}`);
     const receipt = await response.json();
-    if (receipt.state !== "enqueued" || receipt.head !== sha || receipt.pr !== pr) {
+    if (receipt.state !== "enqueued" || receipt.head !== sha || receipt.pr_ref !== pr) {
       throw new Error("merge receipt does not enqueue the displayed PR at its reviewed head");
     }
     return {};
