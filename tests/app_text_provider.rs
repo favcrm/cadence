@@ -38,12 +38,25 @@ fn reviewed_text_mapping_is_provider_owned_exact_and_app_only() {
             .resolve_action(capability, version, action, resource)
             .is_err());
     }
-    for field in ["tool", "scope", "effect", "duplicate"] {
+    for field in [
+        "tool",
+        "scope",
+        "effect",
+        "input_contract",
+        "output_contract",
+        "duplicate",
+    ] {
         let mut invalid = descriptor.clone();
         match field {
             "tool" => invalid.action_mappings[0].tool = "invented".into(),
             "scope" => invalid.action_mappings[0].scopes.push("other".into()),
             "effect" => invalid.action_mappings[0].effect = "draft".into(),
+            "input_contract" => {
+                invalid.action_mappings[0].input_contract = "text.publish.input@999".into()
+            }
+            "output_contract" => {
+                invalid.action_mappings[0].output_contract = "text.publish.receipt@999".into()
+            }
             _ => invalid
                 .action_mappings
                 .push(invalid.action_mappings[0].clone()),
