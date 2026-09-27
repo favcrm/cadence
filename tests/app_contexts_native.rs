@@ -368,17 +368,33 @@ fn cad690_archive_during_actual_writer_turn_rejects_late_material_and_preserves_
         .daemon
         .operator_rpc("app_run_show", json!({"run_id":id}))
         .unwrap();
-    let message = after_dispatch["steps"]
+    let step = after_dispatch["steps"]
         .as_array()
         .unwrap()
         .iter()
         .find(|s| s["message_id"].is_string())
-        .unwrap()["message_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    h.daemon
-        .wait_message(WRITER, &message, &["completed", "failed", "cancelled"], 25);
+        .unwrap();
+    let emitted = h.daemon.state.join(format!(
+        "context-result-emitted-{id}-{}",
+        step["step_id"].as_str().unwrap()
+    ));
+    let result_deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let agent = h
+            .daemon
+            .operator_rpc("agent_show", json!({"alias":WRITER}))
+            .unwrap();
+        if emitted.exists()
+            && matches!(agent["agent"]["state"].as_str(), Some("idle" | "attention"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < result_deadline,
+            "actual late provider result never settled: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     let final_run = h
         .daemon
         .operator_rpc("app_run_show", json!({"run_id":id}))

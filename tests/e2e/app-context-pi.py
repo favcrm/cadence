@@ -224,6 +224,7 @@ def run_prompt(prompt):
     )
     pi.live_turn = False
     pi.finish_turn("stop", text)
+    (STATE / ("context-result-emitted-" + kickoff["run_id"] + "-" + kickoff["step_id"])).write_text("emitted")
 
 
 pi.run_prompt = run_prompt
