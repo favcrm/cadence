@@ -94,7 +94,7 @@ impl RegistryFile {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(dir.join("orgs.lock"))?;
         if !lock.metadata()?.is_file() {
             return Err(Error::rejected("org registry lock must be a regular file"));
@@ -108,7 +108,7 @@ impl RegistryFile {
     fn read(&self) -> Result<Registry> {
         let mut file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&self.path)
         {
             Ok(file) => file,

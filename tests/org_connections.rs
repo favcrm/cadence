@@ -3,20 +3,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Output};
 
+fn cli_command(root: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    command
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("legacy"))
+        .env_remove("CADENCE_HOME")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_PROFILE")
+        .env_remove("CADENCE_ALIAS")
+        .args(args);
+    command
+}
 fn cli(root: &std::path::Path, args: &[&str]) -> Output {
-    cadence_agent::reaper::output(
-        Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .env("HOME", root)
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_STATE_HOME", root.join("legacy"))
-            .env_remove("CADENCE_HOME")
-            .env_remove("CADENCE_STATE_DIR")
-            .env_remove("CADENCE_PM_DIR")
-            .env_remove("CADENCE_PROFILE")
-            .env_remove("CADENCE_ALIAS")
-            .args(args),
-    )
-    .unwrap()
+    cadence_agent::reaper::output(&mut cli_command(root, args)).unwrap()
 }
 fn ok(root: &std::path::Path, args: &[&str]) -> serde_json::Value {
     let out = cli(root, args);
@@ -353,4 +355,40 @@ fn registry_refuses_symlink_authority_and_oversized_records() {
     std::os::unix::fs::symlink(root.path().join("foreign.lock"), &lock).unwrap();
     assert!(!cli(root.path(), &["org", "list"]).status.success());
     assert!(!root.path().join("foreign.lock").exists());
+}
+
+#[test]
+fn fifo_registry_and_lock_fail_promptly_without_waiting_for_a_peer() {
+    use std::os::unix::ffi::OsStrExt;
+    for filename in ["orgs.json", "orgs.lock"] {
+        let root = tempfile::Builder::new()
+            .prefix("org-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        add(root.path(), "first");
+        let path = root.path().join("config/cadence").join(filename);
+        std::fs::remove_file(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a terminated path under this fixture's owned directory.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let mut command = cli_command(root.path(), &["org", "list"]);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cadence_agent::reaper::spawn(&mut command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{filename} blocked instead of refusing a FIFO");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(!out.status.success());
+    }
 }

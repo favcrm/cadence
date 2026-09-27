@@ -3243,7 +3243,11 @@ pub(crate) fn run() -> Result<i32> {
         };
         return org::run(action, &proof_state, cli.connection);
     }
-    let state_dir = org::resolve(cli.org.as_deref(), cli.connection.as_deref(), cli.state_dir.clone())?;
+    let state_dir = org::resolve(
+        cli.org.as_deref(),
+        cli.connection.as_deref(),
+        cli.state_dir.clone(),
+    )?;
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
