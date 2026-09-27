@@ -1,6 +1,6 @@
 //! CAD-546 / ADR 0006: the built-in `local` platform — the connected-
 //! platform contract's own proof vehicle. No network, no real
-//! credential: the one declared tool `publish` is a `send`, so every
+//! credential: legacy `publish` and internal `publish_app_text` are `send`, so every
 //! post lands only through the shared effect gate — staged with its
 //! preview, held in Needs-you, released by the operator's press alone.
 //!
@@ -24,6 +24,11 @@
 //! item. Re-executing under the same `effect_id` replays the recorded
 //! outcome only when the input is byte-identical — a collision under
 //! a different input is refused.
+//!
+//! App text has a separate typed scope under `<outbox>/app-items/<effect_id>`.
+//! Its execution requires the persisted executing app-artifact child, exact
+//! accepted material and sink receipt. It never creates a project or a worker
+//! grant. The broker holds the shared release mutex through atomic commit.
 //!
 //! The adapter holds no credential itself. Custody still rides the
 //! real gate: the operator enrolls a placeholder token for
@@ -52,6 +57,7 @@ use sha2::{Digest, Sha256};
 
 use crate::contract_fixture::{ToolTable, Verified};
 use crate::platform::adapter::PlatformAdapter;
+mod app_text;
 
 /// The platform name `ServeOptions::platforms` registers this adapter
 /// under — `platform_call {platform:"local", …}` reaches it.
@@ -62,21 +68,27 @@ pub const BUILTIN_ACCOUNT: super::BuiltinAccount = super::BuiltinAccount {
     account: super::BUILTIN_LOCAL_ACCOUNT,
 };
 
-/// The one tool the `local` table declares — everything else gates as
-/// `send` too, but `execute` refuses it: publishing is all `local` does.
+/// Legacy project/attachment publication remains independently compatible.
 const TOOL_PUBLISH: &str = "publish";
+const TOOL_APP_TEXT: &str = "publish_app_text";
 
 /// The reviewed tool table, declared in code — `local` is built-in, so
 /// the table and its pin live with the adapter itself.
 const TABLE_JSON: &str = r#"{
     "platform": "local",
-    "manifest_version": "cadence-local/1",
+    "manifest_version": "cadence-local/2",
     "tools": [
         {
             "tool": "publish",
             "effect": "send",
             "scopes": ["publish"],
             "label": "Publish a markdown post into the local outbox"
+        },
+        {
+            "tool": "publish_app_text",
+            "effect": "send",
+            "scopes": ["publish"],
+            "label": "Release an independently reviewed app artifact to the local outbox"
         }
     ]
 }"#;
@@ -743,15 +755,45 @@ struct Attachment {
 }
 
 impl PlatformAdapter for LocalAdapter {
+    fn prepare_app_text(
+        &self,
+        title: &str,
+        body: &str,
+        provenance: &Value,
+    ) -> Result<Value, String> {
+        app_text::prepare(title, body, provenance)
+    }
     fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
-        use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
+        use crate::platform::connections::{
+            BoundActionMapping, CapabilityDescriptor, ProviderDescriptor,
+        };
         Some(ProviderDescriptor {
             schema: 1,
             provider: "local".into(),
-            revision: "cadence-local/1".into(),
+            revision: "cadence-local/2".into(),
             enrollment_shapes: vec![],
             builtin_accounts: vec!["local".into()],
+            action_mappings: vec![BoundActionMapping {
+                capability: "text.publish".into(),
+                version: 1,
+                action: "publish".into(),
+                resource_kind: "connection_account".into(),
+                tool: TOOL_APP_TEXT.into(),
+                scopes: vec!["publish".into()],
+                effect: "send".into(),
+                semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
+                input_contract: super::connections::TEXT_PUBLICATION_INPUT_V1.into(),
+                output_contract: super::connections::TEXT_PUBLICATION_RECEIPT_V1.into(),
+            }],
             capabilities: vec![
+                CapabilityDescriptor {
+                    id: "text.publish".into(),
+                    version: 1,
+                    tools: vec![TOOL_APP_TEXT.into()],
+                    scopes: vec!["publish".into()],
+                    effect: "send".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
+                },
                 CapabilityDescriptor {
                     id: "blog.publish".into(),
                     version: 1,
@@ -772,10 +814,11 @@ impl PlatformAdapter for LocalAdapter {
         })
     }
     fn connection_registration(&self) -> Option<String> {
-        Some(crate::platform::connections::registration_digest(&format!(
-            "cadence-local/1:{}",
-            self.outbox.display()
-        )))
+        let mut destination = b"cadence-local/2\0".to_vec();
+        destination.extend_from_slice(self.outbox.as_os_str().as_bytes());
+        Some(crate::platform::connections::registration_digest_bytes(
+            &destination,
+        ))
     }
     fn table(&self) -> &ToolTable {
         &self.table
@@ -788,6 +831,9 @@ impl PlatformAdapter for LocalAdapter {
     }
 
     fn preview(&self, account: &str, tool: &str, input: &Value) -> String {
+        if tool == TOOL_APP_TEXT {
+            return app_text::preview(account, input);
+        }
         if tool != TOOL_PUBLISH {
             return format!("local/{tool}: no such tool — the table declares only publish");
         }
@@ -852,6 +898,10 @@ impl PlatformAdapter for LocalAdapter {
         idempotency_key: &str,
         expected_hash: Option<&str>,
     ) -> Result<Value, String> {
+        if tool == TOOL_APP_TEXT {
+            return app_text::execute(self, input, idempotency_key, expected_hash)
+                .map_err(|error| error.to_string());
+        }
         if tool != TOOL_PUBLISH {
             return Err(format!(
                 "local has no tool '{tool}' — the table declares only publish"
@@ -990,11 +1040,31 @@ impl PlatformAdapter for LocalAdapter {
         Ok(result)
     }
 
+    /// App-artifact execution preserves uncertainty after atomic landing.
+    fn execute_app_artifact(
+        &self,
+        _credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<Value, crate::platform::AppArtifactError> {
+        if tool != TOOL_APP_TEXT {
+            return Err(crate::platform::AppArtifactError::Refused(
+                "local has no reviewed app artifact tool with that name".into(),
+            ));
+        }
+        app_text::execute(self, input, idempotency_key, expected_hash)
+    }
+
     /// §5.4 step 6 read-back for `local`: the outbox item is the
     /// platform record — find an index for this exact input whose
     /// `post.md` still renders to the approved content and whose
     /// recorded attachments are all still byte-intact.
     fn read_back(&self, tool: &str, input: &Value) -> Verified {
+        if tool == TOOL_APP_TEXT {
+            return app_text::read_back(self, input);
+        }
         if tool != TOOL_PUBLISH {
             return Verified::False;
         }

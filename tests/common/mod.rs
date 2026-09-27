@@ -2,6 +2,7 @@
 //! provider mocks, operator-proof runners and the host-wide suite lock.
 //! Not every binary uses every helper.
 #![allow(dead_code)]
+pub(crate) mod app_release;
 
 use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
@@ -1061,6 +1062,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         platforms: Default::default(),
         provider_deployments: None,
         effect_execute_gate: None,
+        app_release_claim_gate: None,
         // CAD-546: no `local` outbox — a test that registers the
         // adapter pins its own root via `platform::local::register_at`.
         outbox_dir: None,

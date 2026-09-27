@@ -112,7 +112,7 @@ pub struct EffectRow {
 }
 
 impl EffectRow {
-    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+    pub(super) fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
         let input: String = row.get("input")?;
         let scopes: String = row.get("scopes")?;
         let decision: Option<String> = row.get("decision")?;
@@ -333,7 +333,7 @@ impl Store {
         match agent {
             Some(agent) => {
                 let mut stmt = conn.prepare(
-                    "SELECT * FROM platform_effects WHERE agent=?1 \
+                    "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
                      ORDER BY staged_at, effect_id",
                 )?;
                 for r in stmt.query_map(params![agent], EffectRow::from_row)? {
@@ -342,7 +342,7 @@ impl Store {
             }
             None => {
                 let mut stmt =
-                    conn.prepare("SELECT * FROM platform_effects ORDER BY staged_at, effect_id")?;
+                    conn.prepare("SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id")?;
                 for r in stmt.query_map([], EffectRow::from_row)? {
                     out.push(r?);
                 }
@@ -655,7 +655,7 @@ impl Store {
     pub fn waiting_effects(&self) -> Result<Vec<EffectRow>> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT * FROM platform_effects WHERE state='waiting' ORDER BY staged_at")?;
+            .prepare("SELECT * FROM platform_effects WHERE state='waiting' AND authorization_kind='agent_grant' ORDER BY staged_at")?;
         let rows = stmt.query_map([], EffectRow::from_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }

@@ -247,6 +247,7 @@ impl Store {
         for run in runs {
             self.app_run_invalidate_in(&tx, &run)?;
         }
+        Self::app_effect_invalidate_in(&tx, install, Some(id), None)?;
         Self::event(
             &tx,
             Self::DAEMON_STREAM,

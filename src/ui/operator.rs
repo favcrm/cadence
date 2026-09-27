@@ -92,6 +92,32 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
+        "/api/app-effects/*/resolve",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/bindings",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/bindings/*/update",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/bindings/*/revoke",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/app-runs/*/effects", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/app-effects/*/decide",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-installations/*/contexts",
         RouteClass::OperatorOnly,
     ),

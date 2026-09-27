@@ -47,9 +47,12 @@ pub struct LocalWorkflow {
     pub source_digest: String,
     pub title: String,
     pub steps: Vec<LocalStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_slot: Option<String>,
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
+        let publication_slot = workflow::parse_template(text)?.publication_slot;
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -142,6 +145,7 @@ impl LocalWorkflow {
             source_digest: artifact_digest(text.as_bytes()),
             title: parsed.title,
             steps,
+            publication_slot,
         })
     }
 }
@@ -209,6 +213,7 @@ impl Store {
             [id],
             |r| r.get(0),
         )?;
+        Self::app_effect_invalidate_in(&tx, id, None, None)?;
         Self::event(
             &tx,
             Self::DAEMON_STREAM,
@@ -235,6 +240,14 @@ impl Store {
         request: LocalRunRequest<'_>,
         context: Option<&super::app_contexts::ContextProof>,
     ) -> Result<Value> {
+        self.app_run_create_with_publication(request, context, None)
+    }
+    pub fn app_run_create_with_publication(
+        &self,
+        request: LocalRunRequest<'_>,
+        context: Option<&super::app_contexts::ContextProof>,
+        binding: Option<&super::app_bindings::BindingProof>,
+    ) -> Result<Value> {
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -249,6 +262,25 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         if let Some(proof) = context {
             Self::app_context_proof_current_in(&tx, install_id, proof)?;
+        }
+        if let Some(proof) = binding {
+            let slot = workflow
+                .publication_slot
+                .as_deref()
+                .ok_or_else(|| Error::rejected("binding requires a selected publication slot"))?;
+            if proof.config["bundle_digest"] != bundle_digest
+                || !super::app_bindings::binding_current_in(
+                    &tx,
+                    install_id,
+                    context.map(|c| c.id.as_str()),
+                    slot,
+                    proof,
+                )?
+            {
+                return Err(Error::rejected(
+                    "publication binding is stale or belongs to a different scope",
+                ));
+            }
         }
         let epoch:i64=tx.query_row("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
         let owner = self.agent_in(&tx, owner_pm)?;
@@ -293,6 +325,13 @@ impl Store {
             snapshot["schema"] = json!(2);
             snapshot["context"] =
                 json!({"id":proof.id,"revision":proof.revision,"digest":proof.digest});
+        }
+        if let Some(slot) = &workflow.publication_slot {
+            snapshot["schema"] = json!(3);
+            if context.is_none() {
+                snapshot["context"] = Value::Null;
+            }
+            snapshot["publication"] = json!({"slot":slot,"binding":binding});
         }
         let digest = material_digest(&snapshot);
         if let Some((id, existing)) = tx
@@ -360,7 +399,7 @@ impl Store {
         let conn = self.conn();
         Self::app_run_show_in(&conn, id)
     }
-    fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
+    pub(super) fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -450,8 +489,52 @@ impl Store {
         drop(conn);
         self.app_run_show(id)
     }
-    fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
+    pub(super) fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
         Self::app_context_current_in(conn, run)?;
+        if material_digest(&run["snapshot"]) != run["snapshot_digest"] {
+            return Err(Error::rejected(
+                "immutable app run snapshot receipt is corrupt",
+            ));
+        }
+        if run["snapshot"]["schema"] == 3 {
+            let slot = run["snapshot"]["publication"]["slot"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("publication snapshot slot is missing"))?;
+            if run["snapshot"]["workflow"]["publication_slot"].as_str() != Some(slot) {
+                return Err(Error::rejected(
+                    "publication slot differs from its frozen workflow",
+                ));
+            }
+            match run["snapshot"]["publication"].get("binding") {
+                Some(Value::Null) => {}
+                Some(value) => {
+                    let proof: super::app_bindings::BindingProof =
+                        serde_json::from_value(value.clone()).map_err(|_| {
+                            Error::rejected("publication binding snapshot is invalid")
+                        })?;
+                    if proof.config["bundle_digest"] != bundle
+                        || !super::app_bindings::binding_current_in(
+                            conn,
+                            run["install_id"].as_str().unwrap(),
+                            run["context_id"].as_str(),
+                            slot,
+                            &proof,
+                        )?
+                    {
+                        return Err(Error::rejected("publication binding snapshot is stale"));
+                    }
+                }
+                None => return Err(Error::rejected("publication binding snapshot is missing")),
+            }
+        } else if run["snapshot"].get("publication").is_some()
+            || run["snapshot"]["workflow"]
+                .get("publication_slot")
+                .is_some()
+        {
+            return Err(Error::rejected(
+                "legacy snapshot cannot carry publication authority",
+            ));
+        }
         let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
         if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
             return Err(Error::rejected(
@@ -464,7 +547,9 @@ impl Store {
         let context = run["context_id"].as_str();
         if let Some(id) = context {
             let snapshot = &run["snapshot"];
-            if snapshot["schema"] != 2 || snapshot["context"]["id"].as_str() != Some(id) {
+            if !matches!(snapshot["schema"].as_u64(), Some(2 | 3))
+                || snapshot["context"]["id"].as_str() != Some(id)
+            {
                 return Err(Error::rejected("context snapshot association is invalid"));
             }
             let proof = super::app_contexts::ContextProof {
@@ -479,7 +564,10 @@ impl Store {
                     .to_string(),
             };
             Self::app_context_proof_current_in(conn, run["install_id"].as_str().unwrap(), &proof)?;
-        } else if run["snapshot"]["schema"] != 1 || run["snapshot"].get("context").is_some() {
+        } else if !((run["snapshot"]["schema"] == 1 && run["snapshot"].get("context").is_none())
+            || (run["snapshot"]["schema"] == 3
+                && run["snapshot"].get("context").is_some_and(Value::is_null)))
+        {
             return Err(Error::rejected(
                 "context-free snapshot association is invalid",
             ));
@@ -1042,6 +1130,16 @@ impl Store {
 }
 
 impl Store {
+    pub fn app_artifact_run_id(&self, id: &str) -> Result<String> {
+        self.conn()
+            .query_row(
+                "SELECT run_id FROM app_run_artifacts WHERE id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("artifact unavailable"))
+    }
     pub fn app_artifact_installation(&self, id: &str) -> Result<String> {
         self.conn().query_row("SELECT r.install_id FROM app_run_artifacts a JOIN app_runs r ON r.id=a.run_id WHERE a.id=?",[id],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("artifact unavailable"))
     }

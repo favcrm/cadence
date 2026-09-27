@@ -79,6 +79,12 @@ impl Shared {
                 .store
                 .app_context_show(install, required_str(params, "context_id")?),
             "app_context_archive" => {
+                // Archive remains available for historical orphaned installs.
+                // Take release then only SQL, never acquire PM/custody later.
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let result = self.store.app_context_archive(
                     install,
                     required_str(params, "context_id")?,
@@ -98,6 +104,10 @@ impl Shared {
                 let config = ContextConfig::new(required_str(params, "label")?, defaults)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 let result = workspace::with_runtime_snapshot(&pm, install, |_, files| {
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     validate_defaults(files, &config.input_defaults)?;
                     if method == "app_context_create" {
                         self.store.app_context_create(

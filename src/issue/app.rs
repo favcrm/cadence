@@ -93,8 +93,36 @@ pub struct Manifest {
     pub title: String,
     pub version: String,
     pub connections: Vec<String>,
+    pub capabilities: BTreeMap<String, CapabilityNeed>,
     pub summary: Option<String>,
     pub guide: String,
+}
+
+/// The app names the result it needs. Reviewed providers own exact tools,
+/// scopes and preparation; none of those are selected by bundle bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityNeed {
+    pub schema: u32,
+    pub capability: String,
+    pub version: u32,
+    pub action: String,
+    pub resource_kind: String,
+    pub effect: String,
+}
+impl CapabilityNeed {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != 1
+            || self.capability != "text.publish"
+            || self.version != 1
+            || self.action != "publish"
+            || self.resource_kind != "connection_account"
+            || self.effect != "send"
+        {
+            return Err(Error::rejected("unsupported app capability contract: text.publish@1 / publish / connection_account / send is required"));
+        }
+        Ok(())
+    }
 }
 
 /// `apps/<name>.yaml` — the install record beside the content folder:
@@ -325,6 +353,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         }
     };
     let mut connections = Vec::new();
+    let mut capabilities = BTreeMap::new();
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
             return Err(Error::rejected(
@@ -333,10 +362,24 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if k != "connections" {
+            if !matches!(k, "connections" | "capabilities") {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`"
                 )));
+            }
+        }
+        if let Some(value) = needs.get(serde_yaml::Value::String("capabilities".into())) {
+            capabilities =
+                serde_yaml::from_value::<BTreeMap<String, CapabilityNeed>>(value.clone())
+                    .map_err(|e| Error::rejected(format!("app.md needs.capabilities: {e}")))?;
+            if capabilities.len() > 1 {
+                return Err(Error::rejected(
+                    "an app supports at most one publication capability slot",
+                ));
+            }
+            for (slot, declaration) in &capabilities {
+                check_name(slot, "publication slot")?;
+                declaration.validate()?;
             }
         }
         if let Some(list) = needs.get(serde_yaml::Value::String("connections".to_string())) {
@@ -361,11 +404,17 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             }
         }
     }
+    if capabilities.keys().any(|slot| connections.contains(slot)) {
+        return Err(Error::rejected(
+            "a publication slot cannot also be a legacy connection slot",
+        ));
+    }
     Ok(Manifest {
         app,
         title,
         version,
         connections,
+        capabilities,
         summary,
         guide: body.to_string(),
     })
@@ -650,6 +699,7 @@ fn validate_contents(
                     title: String::new(),
                     version: String::new(),
                     connections: vec![],
+                    capabilities: BTreeMap::new(),
                     summary: None,
                     guide: String::new(),
                 }
@@ -660,6 +710,7 @@ fn validate_contents(
             title: String::new(),
             version: String::new(),
             connections: vec![],
+            capabilities: BTreeMap::new(),
             summary: None,
             guide: String::new(),
         },
@@ -675,6 +726,15 @@ fn validate_contents(
         let (errs, ns, _) = workflow::check_text(text, agents, agent_sources);
         errors.extend(errs.into_iter().map(|e| format!("{rel}: {e}")));
         notes.extend(ns.into_iter().map(|n| format!("{rel}: {n}")));
+        if let Ok(template) = workflow::parse_template(text) {
+            if let Some(slot) = template.publication_slot {
+                if !manifest.capabilities.contains_key(&slot) {
+                    errors.push(format!(
+                        "{rel}: publication_slot '{slot}' is not declared in needs.capabilities"
+                    ));
+                }
+            }
+        }
         match workflow_slots(text) {
             Ok(slots) => {
                 for slot in slots {
@@ -799,6 +859,12 @@ fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) 
     let files = bundle_files(&dir)?;
     let mut keys = format!("app={}\n", manifest.app);
     keys.push_str(&format!("slots={}\n", manifest.connections.join(",")));
+    if !manifest.capabilities.is_empty() {
+        keys.push_str(&format!(
+            "capabilities={}\n",
+            serde_json::to_string(&manifest.capabilities)?
+        ));
+    }
     for slot in &manifest.connections {
         keys.push_str(&format!(
             "bind.{slot}={}\n",
@@ -2750,6 +2816,29 @@ pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cad692_publication_declaration_is_provider_neutral_and_bounded() {
+        let good = "---\napp: studio\ntitle: Studio\nversion: '1'\nneeds:\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n---\nGuide\n";
+        let manifest = parse_manifest(good).unwrap();
+        assert_eq!(
+            manifest.capabilities["publication"].capability,
+            "text.publish"
+        );
+        assert!(manifest.connections.is_empty());
+        for bad in [
+            good.replace("effect: send", "effect: send, tool: publish_app_text"),
+            good.replace("effect: send", "effect: send, provider: local"),
+            good.replace("version: 1, action:", "version: 2, action:"),
+            good.replace(
+                "capabilities:",
+                "connections: [publication]\n  capabilities:",
+            ),
+            good.replace("effect: send", "effect: draft"),
+        ] {
+            assert!(parse_manifest(&bad).is_err(), "{bad}");
+        }
+    }
 
     const APP_MD: &str = "---\napp: content-studio\ntitle: Content studio\nversion: 0.1.0\n\
 needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";

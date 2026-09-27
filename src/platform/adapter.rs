@@ -25,6 +25,36 @@ use serde_json::Value;
 
 use crate::contract_fixture::{ToolTable, Verified};
 
+/// An app-artifact send distinguishes a known refusal from a write whose
+/// completion cannot be confirmed. Uncertainty must never trigger a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppArtifactError {
+    Refused(String),
+    Uncertain(String),
+}
+
+impl From<String> for AppArtifactError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl From<&str> for AppArtifactError {
+    fn from(message: &str) -> Self {
+        Self::Refused(message.into())
+    }
+}
+
+impl std::fmt::Display for AppArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(message) | Self::Uncertain(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AppArtifactError {}
+
 /// One platform's adapter — the proxy's outward leg.
 pub trait PlatformAdapter: Send + Sync {
     /// The adapter's declared tool table, reviewed like code and pinned
@@ -39,6 +69,28 @@ pub trait PlatformAdapter: Send + Sync {
     /// Composition receipt, not a live account/deployment health proof.
     fn connection_registration(&self) -> Option<String> {
         None
+    }
+
+    /// Reviewed internal tools require persisted app-artifact authority,
+    /// regardless of a legacy account grant held by a worker.
+    fn app_artifact_tool(&self, tool: &str) -> bool {
+        self.connection_descriptor().is_some_and(|descriptor| {
+            descriptor
+                .action_mappings
+                .iter()
+                .any(|mapping| mapping.tool == tool)
+        })
+    }
+
+    /// Translate trusted persisted text into the provider's exact input.
+    /// Unsupported providers refuse; this does not stage or publish anything.
+    fn prepare_app_text(
+        &self,
+        _title: &str,
+        _body: &str,
+        _provenance: &Value,
+    ) -> std::result::Result<Value, String> {
+        Err("provider does not support app text publication".into())
     }
 
     /// The manifest version the *platform* reports now — the platform
@@ -65,6 +117,22 @@ pub trait PlatformAdapter: Send + Sync {
         idempotency_key: &str,
         expected_hash: Option<&str>,
     ) -> std::result::Result<Value, String>;
+
+    /// Execute only with the persisted app-artifact authority checked by the
+    /// broker and the adapter. Legacy execution support is not permission to
+    /// publish an app artifact; a provider must explicitly implement this hook.
+    fn execute_app_artifact(
+        &self,
+        _credential: &[u8],
+        _tool: &str,
+        _input: &Value,
+        _idempotency_key: &str,
+        _expected_hash: Option<&str>,
+    ) -> std::result::Result<Value, AppArtifactError> {
+        Err(AppArtifactError::Refused(
+            "provider does not support app artifact execution".into(),
+        ))
+    }
 
     /// §5.4 step 6 read-back: does platform state match the approved
     /// input? `Verified::Unknown` where the platform offers none.

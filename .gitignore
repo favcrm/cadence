@@ -43,3 +43,4 @@ docs/roles/*
 !docs/guides/
 docs/guides/*
 !docs/guides/connections.md
+!docs/guides/app-artifact-release.md

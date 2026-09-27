@@ -530,6 +530,7 @@ impl PlatformAdapter for AgenticosAdapter {
     fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
         use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
         Some(ProviderDescriptor {
+            action_mappings: vec![],
             schema: 1,
             provider: "agenticos".into(),
             revision: "agenticos-connections/1".into(),

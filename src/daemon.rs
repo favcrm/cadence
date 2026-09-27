@@ -18,7 +18,9 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_bindings_rpc;
 mod app_contexts_rpc;
+mod app_effects_rpc;
 mod app_runs_rpc;
 mod approvals_rpc;
 mod area_rpc;
@@ -415,6 +417,10 @@ pub struct Shared {
     /// no reviewed table means no classification, so no call.
     platforms: effect_rpc::PlatformMap,
     effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// Serializes an app's checked execution claim through bounded Local
+    /// commit/readback against binding/context/custody mutations.
+    app_release_lock: Mutex<()>,
+    app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
     /// alongside the adapter so the read serves what the write lands.
@@ -569,6 +575,8 @@ impl Shared {
             platform_custody_lock: Mutex::new(()),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
+            app_release_lock: Mutex::new(()),
+            app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             lease,
             seam,
@@ -2657,6 +2665,16 @@ impl Shared {
             "app_run_show" => self.rpc_app_local(method, params, peer_pid),
             "app_run_list" => self.rpc_app_local(method, params, peer_pid),
             "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
+            "app_binding_create" => self.rpc_app_binding(method, params, peer_pid),
+            "app_binding_update" => self.rpc_app_binding(method, params, peer_pid),
+            "app_binding_revoke" => self.rpc_app_binding(method, params, peer_pid),
+            "app_binding_show" => self.rpc_app_binding(method, params, peer_pid),
+            "app_binding_list" => self.rpc_app_binding(method, params, peer_pid),
+            "app_effect_stage" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),
@@ -3580,6 +3598,11 @@ pub struct ServeOptions {
     /// recorded, the run never starts, and a restart reconciles the
     /// row. Production leaves it unset (always executes).
     pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// Trusted test callback after the exact app executing claim, before
+    /// Local commit, while the release lock remains held and SQL is dropped.
+    /// False preserves executing uncertainty for restart reconciliation.
+    /// Production leaves this unset; it is never controlled by RPC fields.
+    pub app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root —
     /// `platform_outbox` lists it. `platform::local::register` sets it
     /// with the adapter; a daemon without the `local` platform leaves

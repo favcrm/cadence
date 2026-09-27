@@ -608,3 +608,6 @@ fn cad688_duplicate_connection_id_cannot_replace_another_credential() {
         events
     );
 }
+
+mod app_bindings;
+mod app_effects;

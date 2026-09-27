@@ -39,6 +39,7 @@ use crate::issue::{board, context, history, model, project, write as issue_write
 use crate::proc::{self, BoundedError};
 
 mod app_contexts;
+mod app_release;
 mod app_runs;
 mod apps;
 mod connections;
@@ -2135,6 +2136,15 @@ fn write_route(
         send(request, response);
         return;
     }
+    if let Some(route) = app_release::route(path) {
+        if *method != Method::Post || !route.is_write() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_release::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
     if let Some(route) = app_runs::route(path) {
         let writable = matches!(route, app_runs::Route::List) || !route.is_read();
         if *method != Method::Post || !writable {
@@ -3380,6 +3390,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
                 let response = connections::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
+            }
+            if let Some(route) = app_release::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_release::handle(&mut request, state_dir, route, false);
                 send(request, response);
                 return;
             }

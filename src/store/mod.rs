@@ -60,7 +60,9 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+pub mod app_bindings;
 pub mod app_contexts;
+pub mod app_effects;
 pub mod app_runs;
 mod plans;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};

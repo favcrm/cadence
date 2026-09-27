@@ -105,6 +105,9 @@ impl Shared {
             .map(|t| identifier(t, "Task"))
             .transpose()?;
         let adapter = self.platform_adapter(&platform)?;
+        if adapter.app_artifact_tool(tool) {
+            return Err(Error::rejected("this reviewed tool requires an exact accepted app artifact and explicit app release"));
+        }
         // The §5.3 grant check gates even staging — a caller holding no
         // grant on the account learns that before a row exists.
         self.check_grant(&agent, &platform, &account, &adapter, tool)?;
@@ -549,6 +552,11 @@ impl Shared {
         reason: Option<String>,
         named_alias: &str,
     ) -> Result<Value> {
+        if self.store.app_effect_is_child(&row.effect_id)? {
+            return Err(Error::rejected(
+                "app artifact effects require the app release lifecycle",
+            ));
+        }
         if named_alias != row.agent {
             return Err(Self::foreign_request(
                 "agent respond",
@@ -663,6 +671,11 @@ impl Shared {
     /// longer loads closes the row instead of firing; a platform error
     /// lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
+        if self.store.app_effect_is_child(&row.effect_id)? {
+            return Err(Error::rejected(
+                "app artifact effects require an exact app execution claim",
+            ));
+        }
         let adapter = match self.platforms.get(&row.platform).cloned() {
             Some(a) => a,
             None => {
@@ -893,6 +906,11 @@ impl Shared {
         let Some(row) = self.store.effect_by_request(handle)? else {
             return Ok(None);
         };
+        if self.store.app_effect_is_child(&row.effect_id)? {
+            return Err(Error::rejected(
+                "app artifact effects are not worker requests",
+            ));
+        }
         if row.agent != caller {
             return Err(Self::foreign_request("request_wait", caller, &row.agent));
         }
@@ -906,6 +924,11 @@ impl Shared {
         let Some(row) = self.store.effect_by_request(handle)? else {
             return Ok(None);
         };
+        if self.store.app_effect_is_child(&row.effect_id)? {
+            return Err(Error::rejected(
+                "app artifact effects are not worker requests",
+            ));
+        }
         if row.agent != caller {
             return Err(Self::foreign_request("request_close", caller, &row.agent));
         }
