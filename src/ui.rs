@@ -2102,6 +2102,33 @@ fn write_route(
         send(request, resp);
         return;
     }
+    let catalog_recovery = path
+        .strip_prefix("/api/app-installations/migrations/")
+        .and_then(|tail| tail.strip_suffix("/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_recovery = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    if path == "/api/app-installations/migrate"
+        || catalog_recovery.is_some()
+        || install_recovery.is_some()
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let (operation, id) = if let Some(id) = catalog_recovery {
+            ("app_workspace_migration_recover", Some(id))
+        } else if let Some(id) = install_recovery {
+            ("app_workspace_recover", Some(id))
+        } else {
+            ("app_workspace_migrate", None)
+        };
+        let response = apps::workspace(&mut request, state_dir, operation, id);
+        send(request, response);
+        return;
+    }
     if path == "/api/app-installations" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));

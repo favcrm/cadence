@@ -198,8 +198,15 @@ pub enum Recovery {
 
 pub fn recover(pm: &Pm, state_dir: &Path, id: &str, mode: Recovery) -> Result<()> {
     crate::rollout::require_operator(state_dir, "app catalog recovery")?;
-    journal_id(id)?;
+    recover_authorized(pm, id, mode)
+}
+
+pub(crate) fn recover_authorized(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
     let _lock = pm.lock()?;
+    recover_locked(pm, id, mode)
+}
+fn recover_locked(pm: &Pm, id: &str, mode: Recovery) -> Result<()> {
+    journal_id(id)?;
     let root = Root::open(&pm.dir)?;
     let journal: Journal = decode(&required(&root, &journal_path(id), JOURNAL_CAP)?)?;
     if journal.id != id {

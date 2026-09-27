@@ -457,6 +457,7 @@ impl Shared {
         self.operator_connection("workspace app catalog", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "app_workspace_install" => &["source"],
+            "app_workspace_migration_recover" => &["journal_id", "rollback"],
             "app_workspace_show" | "app_workspace_recover" => &["install_id"],
             _ => &[],
         };
@@ -476,6 +477,18 @@ impl Shared {
             "app_workspace_list" => workspace::list(&pm),
             "app_workspace_show" => workspace::show(&pm, required_str(params, "install_id")?),
             "app_workspace_migrate" => workspace::migrate(&pm),
+            "app_workspace_migration_recover" => {
+                let rollback = params
+                    .get("rollback")
+                    .map(|value| {
+                        value
+                            .as_bool()
+                            .ok_or_else(|| Error::rejected("rollback must be a boolean"))
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                workspace::migration_recover(&pm, required_str(params, "journal_id")?, rollback)
+            }
             "app_workspace_recover" => {
                 workspace::recover(&pm, &self.state_dir, required_str(params, "install_id")?)
             }

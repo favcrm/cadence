@@ -161,3 +161,7 @@ journals use a different format; interrupted migration recovery/rollback is not
 exposed by this CLI command. Do not pass a migration journal ID to it or edit
 catalog files to bypass a pending-publication refusal. Preserve the error and
 journal details for a separately scoped recovery investigation.
+
+## Explicit catalog migration recovery
+
+`cadence app catalog migration-recover <journal-id>` explicitly resumes a retained migration journal; add `--rollback` only when choosing restoration of its verified preimages. This is separate from `recover <install-id>`, which retries installation delivery. Both require operator authority and the daemon, retain divergence refusal, and use normal scoped PM Git delivery. HTTP equivalents are `POST /api/app-installations/migrate` with `{}`, `POST /api/app-installations/<install-id>/recover` with `{}`, and `POST /api/app-installations/migrations/<journal-id>/recover` with `{"rollback": false}` (or explicit `true`). No endpoint grants approval or execution authority.

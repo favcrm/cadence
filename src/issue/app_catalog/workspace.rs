@@ -426,3 +426,38 @@ pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
         json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(&catalog)?),"installations":catalog.installations.len(),"committed":true,"foreign_files":foreign,"executable":false}),
     )
 }
+
+pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
+    let _lock = pm.lock()?;
+    recover_locked(
+        pm,
+        id,
+        if rollback {
+            Recovery::Rollback
+        } else {
+            Recovery::Resume
+        },
+    )?;
+    let root = Root::open(&pm.dir)?;
+    let journal: Journal = decode(&required(&root, &super::journal_path(id), JOURNAL_CAP)?)?;
+    let mut paths = vec![pm.dir.join(CATALOG), pm.dir.join(super::journal_path(id))];
+    paths.extend(
+        journal
+            .records
+            .iter()
+            .map(|record| pm.dir.join(record.path())),
+    );
+    let foreign = write::commit(
+        pm,
+        &paths,
+        &format!(
+            "workspace app migration {id} {}",
+            if rollback { "rolled back" } else { "resumed" }
+        ),
+        &[],
+        "operator",
+    )?;
+    Ok(
+        json!({"schema":1,"workspace":"default","journal_id":id,"rollback":rollback,"committed":true,"foreign_files":foreign,"executable":false}),
+    )
+}

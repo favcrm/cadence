@@ -735,7 +735,40 @@ pub(super) fn workspace(
     method: &str,
     id: Option<&str>,
 ) -> HttpResp {
-    let params = if method == "app_workspace_install" {
+    let params = if method == "app_workspace_migration_recover" {
+        let bytes = match read_body(request, BODY_CAP) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return err_response(400, "recovery body must be an object"),
+        };
+        let Some(fields) = value.as_object() else {
+            return err_response(400, "recovery body must be an object");
+        };
+        if fields.keys().any(|key| key != "rollback")
+            || fields
+                .get("rollback")
+                .is_some_and(|value| !value.is_boolean())
+        {
+            return err_response(400, "recovery body admits only boolean rollback");
+        };
+        json!({"journal_id":id,"rollback":value.get("rollback").and_then(Value::as_bool).unwrap_or(false)})
+    } else if method == "app_workspace_migrate" || method == "app_workspace_recover" {
+        let bytes = match read_body(request, BODY_CAP) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        if !approve_body_ok(&bytes) {
+            return err_response(400, "catalog operation requires an empty object");
+        };
+        if let Some(id) = id {
+            json!({"install_id":id})
+        } else {
+            json!({})
+        }
+    } else if method == "app_workspace_install" {
         let bytes = match read_body(request, BODY_CAP) {
             Ok(bytes) => bytes,
             Err(response) => return response,

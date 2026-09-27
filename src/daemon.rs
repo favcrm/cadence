@@ -2609,7 +2609,8 @@ impl Shared {
             | "app_workspace_list"
             | "app_workspace_show"
             | "app_workspace_migrate"
-            | "app_workspace_recover" => self.rpc_app_workspace(method, params, peer_pid),
+            | "app_workspace_recover"
+            | "app_workspace_migration_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
             "app_revoke" => self.rpc_app_revoke(params, peer_pid),
             "app_set_team" => self.rpc_app_set_team(params, peer_pid),

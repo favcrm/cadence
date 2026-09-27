@@ -153,6 +153,12 @@ pub(crate) enum AppAction {
 
 #[derive(Subcommand)]
 pub(crate) enum CatalogAction {
+    /// Explicitly resume or roll back a retained catalog migration journal.
+    MigrationRecover {
+        journal_id: String,
+        #[arg(long)]
+        rollback: bool,
+    },
     /// Install a validated bundle without creating a project or grants.
     Install { source: String },
     /// List catalogued installations. Never migrates on read.
@@ -186,6 +192,13 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     };
                     ("app_workspace_install", json!({"source":source}))
                 }
+                CatalogAction::MigrationRecover {
+                    journal_id,
+                    rollback,
+                } => (
+                    "app_workspace_migration_recover",
+                    json!({"journal_id":journal_id,"rollback":rollback}),
+                ),
                 CatalogAction::Ls => ("app_workspace_list", json!({})),
                 CatalogAction::Show { install_id } => {
                     ("app_workspace_show", json!({"install_id":install_id}))
