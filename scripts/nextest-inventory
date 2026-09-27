@@ -21,6 +21,25 @@ die() {
     exit 1
 }
 
+# CI retains only the first build; an output marker excludes stale/partial
+# evidence if preservation fails. Capture I/O never changes inventory gates.
+# Other callers need no destination; CI uses the default target directory.
+TIMINGS_REPORT=${CADENCE_INVENTORY_TIMINGS_REPORT:-}
+TIMINGS_SOURCE="$ROOT/target/cargo-timings/cargo-timing.html"
+capture=false
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'timings_available=false\n' >> "$GITHUB_OUTPUT" ||
+        echo "inventory build timings unavailable: cannot publish capture status" >&2
+fi
+if [ -n "$TIMINGS_REPORT" ]; then
+    if mkdir -p "$(dirname -- "$TIMINGS_REPORT")" &&
+        rm -f "$TIMINGS_REPORT" "$TIMINGS_REPORT.tmp" "$TIMINGS_SOURCE"; then
+        capture=true
+    else
+        echo "inventory build timings unavailable: cannot prepare capture paths" >&2
+    fi
+fi
+
 command -v jq >/dev/null 2>&1 || die "jq is required to parse nextest list JSON"
 
 case "$TARGET" in
@@ -45,8 +64,24 @@ esac
 # cargo warnings and the final summary cannot masquerade as test names.
 # Fixed target arguments are selected above, so this unquoted expansion is
 # deliberately a two-argument Cargo invocation for either inventory mode.
-cargo test --manifest-path "$ROOT/Cargo.toml" $CARGO_TARGET_ARGS --locked "$@" -- --list >"$TMP/cargo.list" ||
-    die "cargo inventory for $TARGET failed"
+cargo_failed=false
+cargo test --manifest-path "$ROOT/Cargo.toml" $CARGO_TARGET_ARGS --locked --timings "$@" -- --list >"$TMP/cargo.list" ||
+    cargo_failed=true
+if [ "$capture" = true ]; then
+    if [ ! -s "$TIMINGS_SOURCE" ]; then
+        echo "inventory build timings unavailable: Cargo did not produce a report" >&2
+    elif cp "$TIMINGS_SOURCE" "$TIMINGS_REPORT.tmp" &&
+        mv "$TIMINGS_REPORT.tmp" "$TIMINGS_REPORT"; then
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            printf 'timings_available=true\n' >> "$GITHUB_OUTPUT" ||
+                echo "inventory build timings unavailable: cannot publish capture status" >&2
+        fi
+    else
+        rm -f "$TIMINGS_REPORT.tmp" || :
+        echo "inventory build timings unavailable: cannot retain complete report" >&2
+    fi
+fi
+[ "$cargo_failed" = false ] || die "cargo inventory for $TARGET failed"
 awk '
     /^[[:space:]]*[^[:space:]].*: test[[:space:]]*$/ {
         sub(/^[[:space:]]+/, ""); sub(/[[:space:]]*: test[[:space:]]*$/, ""); print
