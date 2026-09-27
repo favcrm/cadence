@@ -141,109 +141,84 @@ fn handle(mut req: tiny_http::Request, state: &Mutex<State>) {
     let _ = req.as_reader().take(64 * 1024).read_to_string(&mut body);
     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
 
-    if method == "GET" {
-        if path.starts_with("/v1/runtime/connectors/connections") {
-            respond(
-                req,
-                200,
-                json!({"ok":true,"data":{"connections":[],"cursor":null}}),
-            );
-            return;
-        }
-        let key = path.rsplit('/').next().unwrap_or("");
-        let guard = state.lock().unwrap();
-        match guard.records.get(key) {
-            Some(rec) => {
-                let data = rec.data.clone();
-                drop(guard);
-                respond(req, 200, json!({"ok": true, "data": data}));
-            }
-            None => {
-                drop(guard);
-                respond(
-                    req,
-                    404,
-                    json!({"ok": false, "error": {"code": "not_found", "message": "not_found"}}),
-                );
-            }
-        }
+    if method == "GET" && path == "/v1/runtime/connectors/connections" {
+        respond(
+            req,
+            200,
+            json!({"ok":true,"data":{"connections":[],"cursor":null}}),
+        );
         return;
     }
-
-    if method != "POST" || !path.starts_with("/v1/runtime/connectors/publish") {
+    let authorize = path == "/v1/runtime/connectors/publish/authorize";
+    if method != "POST" || !(authorize || path == "/v1/runtime/connectors/publish") {
         respond(
             req,
             404,
-            json!({"ok": false, "error": {"code": "not_found", "message": "not_found"}}),
+            json!({"ok":false,"error":{"code":"not_found","message":"not_found"}}),
         );
         return;
     }
-    if !parsed.is_object() {
+    if !parsed.is_object() || key_hdr.is_none() {
         respond(
             req,
             400,
-            json!({"ok": false, "error": {"code": "invalid_request", "message": "invalid_request"}}),
+            json!({"ok":false,"error":{"code":"invalid_request","message":"invalid_request"}}),
         );
         return;
     }
-    let Some(key) = key_hdr else {
-        respond(
-            req,
-            400,
-            json!({"ok": false, "error": {"code": "invalid_request", "message": "invalid_request"}}),
-        );
-        return;
-    };
+    let key = key_hdr.unwrap();
     let digest = digest_hdr.unwrap_or_default();
     let mut guard = state.lock().unwrap();
-    guard.posts.fetch_add(1, Ordering::SeqCst);
     *guard.last_auth.lock().unwrap() = auth;
     *guard.last_key.lock().unwrap() = Some(key.clone());
     *guard.last_digest.lock().unwrap() = Some(digest.clone());
-    if let Some(prev) = guard.records.get(&key) {
-        if prev.digest != digest {
+    let script = guard.script;
+    if authorize {
+        let decision = match script {
+            Script::Pending => "pending",
+            Script::Declined => "declined",
+            _ => "approved",
+        };
+        let attested = if matches!(script, Script::Mismatch) {
+            "0".repeat(64)
+        } else {
+            digest
+        };
+        let repeated = guard.records.contains_key(&key);
+        guard.records.entry(key.clone()).or_insert_with(|| Rec {
+            digest: attested.clone(),
+            data: json!({"key":key,"decision":decision,"executed":false,"status":"pending","permalink":null,"repeated":false}),
+        });
+        drop(guard);
+        respond(
+            req,
+            200,
+            json!({"ok":true,"data":{"key":key,"decision":decision,"grantId":null,"contentDigest":attested,"repeated":repeated}}),
+        );
+        return;
+    }
+    guard.posts.fetch_add(1, Ordering::SeqCst);
+    if let Some(previous) = guard
+        .records
+        .get(&key)
+        .filter(|record| record.data["status"] != "pending")
+    {
+        if previous.digest != digest {
             drop(guard);
             respond(
                 req,
                 409,
-                json!({"ok": false, "error": {"code": "digest_mismatch", "message": "digest_mismatch"}}),
+                json!({"ok":false,"error":{"code":"digest_mismatch","message":"digest_mismatch"}}),
             );
             return;
         }
-        let mut data = prev.data.clone();
+        let mut data = previous.data.clone();
         data["repeated"] = json!(true);
         drop(guard);
-        respond(req, 200, json!({"ok": true, "data": data}));
+        respond(req, 200, json!({"ok":true,"data":data}));
         return;
     }
-    let script = guard.script;
-    let (status, decision, post_status, permalink, receipt) = match script {
-        Script::Pending => (202, "pending", "pending", Value::Null, Value::Null),
-        Script::Declined => (409, "declined", "declined", Value::Null, Value::Null),
-        Script::Posted => (
-            200,
-            "approved",
-            "posted",
-            json!("https://example.test/p/1"),
-            json!(digest),
-        ),
-        Script::Mismatch => (
-            200,
-            "approved",
-            "posted",
-            json!("https://example.test/p/1"),
-            json!("0000000000000000000000000000000000000000000000000000000000000000"),
-        ),
-    };
-    let data = json!({
-        "key": key,
-        "decision": decision,
-        "executed": post_status == "posted",
-        "status": post_status,
-        "permalink": permalink,
-        "repeated": false,
-        "contentDigest": receipt,
-    });
+    let data = json!({"key":key,"decision":"approved","executed":true,"status":"posted","permalink":"https://example.test/p/1","repeated":false});
     guard.records.insert(
         key,
         Rec {
@@ -253,7 +228,7 @@ fn handle(mut req: tiny_http::Request, state: &Mutex<State>) {
     );
     guard.writes.fetch_add(1, Ordering::SeqCst);
     drop(guard);
-    respond(req, status, json!({"ok": true, "data": data}));
+    respond(req, 200, json!({"ok":true,"data":data}));
 }
 
 fn input(caption: &str) -> Value {
@@ -317,25 +292,24 @@ fn declined_is_refused() {
     assert_eq!(out["permalink"], Value::Null);
     assert_eq!(
         adapter.read_back("publish_post", &input("hello")),
-        Verified::False
+        Verified::Unknown
     );
 }
 
 #[test]
-fn receipt_mismatch_fails_verification() {
-    let (_door, adapter) = start(Script::Mismatch);
-    let out = adapter
+fn authorization_digest_mismatch_refuses_before_publish() {
+    let (door, adapter) = start(Script::Mismatch);
+    assert!(adapter
         .execute(&[], "publish_post", &input("hello"), KEY, None)
-        .unwrap();
-    assert_eq!(out["ledger"], "published");
-    assert_eq!(out["verified"], false);
+        .is_err());
     assert_eq!(
-        out["detail"],
-        "receipt does not match the approved revision"
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        1
     );
+    assert_eq!(door.state.lock().unwrap().posts.load(Ordering::SeqCst), 0);
     assert_eq!(
         adapter.read_back("publish_post", &input("hello")),
-        Verified::False
+        Verified::Unknown
     );
 }
 
@@ -354,13 +328,13 @@ fn retry_returns_the_recorded_outcome_once() {
         )
         .unwrap();
     assert_eq!(first["ledger"], "published");
-    assert_eq!(first["verified"], true);
+    assert_eq!(first["verified"], "unknown");
     assert_eq!(first["permalink"], "https://example.test/p/1");
     assert_eq!(first["repeated"], false);
     assert_eq!(first["platform_ref"], derived_key("hello"));
     assert_eq!(
         adapter.read_back("publish_post", &input("hello")),
-        Verified::True
+        Verified::Unknown
     );
     let second = adapter
         .execute(
@@ -375,7 +349,7 @@ fn retry_returns_the_recorded_outcome_once() {
     assert_eq!(second["permalink"], first["permalink"]);
     assert_eq!(second["platform_ref"], first["platform_ref"]);
     assert_eq!(door.state.lock().unwrap().writes.load(Ordering::SeqCst), 1);
-    assert_eq!(door.state.lock().unwrap().posts.load(Ordering::SeqCst), 1);
+    assert_eq!(door.state.lock().unwrap().posts.load(Ordering::SeqCst), 2);
 
     // A different caption is a different revision, so a different key
     // and a second row. The first key is never reused against new bytes.
@@ -703,8 +677,8 @@ fn two_platform_calls_share_one_agenticos_row() {
     );
     assert_eq!(
         state.posts.load(Ordering::SeqCst),
-        1,
-        "a repeat publish_post posted again instead of mirroring the row"
+        2,
+        "each repeat must reconcile through the supported authenticated POST"
     );
     assert_eq!(state.writes.load(Ordering::SeqCst), 1);
 }
@@ -811,6 +785,38 @@ fn concurrent_agenticos_rpc_calls_and_actual_daemon_restart_share_the_durable_ro
         derived_key("hello")
     );
     assert_eq!(door.state.lock().unwrap().writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_rpc_handoff_rechecks_approval_after_actual_daemon_restart() {
+    for decision in [Script::Posted, Script::Declined] {
+        let (door, adapter) = start(Script::Pending);
+        let mut d = CallDaemon::start(Arc::new(adapter));
+        let mut agent = Lane::spawn(&d, "aos-restart-approval");
+        d.op("platform_grant", json!({"agent":"aos-restart-approval","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+        let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("approval restart")});
+        let first = agent.rpc(&d, "platform_call", call.clone()).unwrap();
+        assert_eq!(first["platform_result"]["status"], "pending");
+        assert_eq!(door.state.lock().unwrap().posts.load(Ordering::SeqCst), 0);
+        assert_eq!(door.state.lock().unwrap().records.len(), 1);
+        // The upstream owner changes approval; the caller's scoped identity stays the same.
+        door.state.lock().unwrap().script = decision;
+        d = d.restart(Arc::new(AgenticosAdapter::new(&door.base).unwrap()));
+        let second = agent.rpc(&d, "platform_call", call).unwrap();
+        assert_eq!(
+            second["platform_result"]["platform_ref"],
+            first["platform_result"]["platform_ref"]
+        );
+        assert_eq!(door.state.lock().unwrap().records.len(), 1);
+        if matches!(decision, Script::Declined) {
+            assert_eq!(second["platform_result"]["status"], "declined");
+            assert_eq!(door.state.lock().unwrap().posts.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(second["platform_result"]["status"], "posted");
+            assert_eq!(second["platform_result"]["verified"], "unknown");
+            assert_eq!(door.state.lock().unwrap().writes.load(Ordering::SeqCst), 1);
+        }
+    }
 }
 
 #[test]
