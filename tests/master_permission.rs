@@ -3,7 +3,11 @@
 //! unit-tested in `src/master_perm.rs`. These prove a wrong caller
 //! cannot file or decide, a single-use grant is exact, a planted
 //! grant cannot cover the never-list, and HTTP is as strict as RPC.
+//!
+//! The whole binary is seam-only. Without the feature the imports and
+//! `refused` would be unused, and default clippy denies that.
 
+#![cfg(feature = "test-seam")]
 #![allow(clippy::disallowed_methods)]
 #![allow(clippy::duplicate_mod)]
 mod board_common;

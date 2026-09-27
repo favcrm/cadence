@@ -1236,7 +1236,9 @@ fn master_reads_nothing_outside_its_views() {
         let text = out.to_string();
         assert!(!ok && !text.contains(&token), "{out}");
         assert!(
-            text.contains("master/tmp") || text.contains("Permission denied"),
+            text.contains("master/tmp")
+                || text.contains("Permission denied")
+                || text.contains("never requestable"),
             "{out}"
         );
     }

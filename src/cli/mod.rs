@@ -3102,6 +3102,31 @@ pub(crate) fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
 /// approved is run by the daemon. Returns `Some` when that happened
 /// (or the daemon refused a never-list command). `None` means the
 /// normal verb should run.
+/// The master's stdin ban lives in the command handler (`NO_STDIN`).
+/// These shapes never reach a grant: there is no file to run, and the
+/// handler refuses before it writes.
+fn master_stdin_stays_local(cli: &Cli) -> bool {
+    if !cadence_agent::master::caller_is_master() {
+        return false;
+    }
+    let stdin_file = |file: Option<&std::path::Path>| {
+        file.is_none_or(|p| p.as_os_str() == "-" || p.as_os_str().is_empty())
+    };
+    match &cli.command {
+        Commands::Report {
+            text: None,
+            file,
+            action: None,
+            ..
+        } => stdin_file(file.as_deref()),
+        Commands::Report {
+            action: Some(report::ReportAction::File { file, .. }),
+            ..
+        } => stdin_file(file.as_deref()),
+        _ => false,
+    }
+}
+
 fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     if std::env::var("CADENCE_ALIAS").ok().as_deref() != Some(cadence_agent::master::ALIAS) {
         return None;
@@ -3116,6 +3141,20 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
             | master::MasterAction::UseGrant { .. },
     } = &cli.command
     {
+        return None;
+    }
+    // The daemon launches the master's provider as `cadence confine`.
+    // That wrapper inherits CADENCE_ALIAS=master. It is not a tool
+    // command, and there is no daemon to ask yet when the provider
+    // itself is what is starting.
+    if let Commands::Confine { .. } = &cli.command {
+        return None;
+    }
+    // Bare `cadence report` and `report --file -` are not on the
+    // allowlist, but the command handler refuses them locally with
+    // NO_STDIN before anything is written. A grant lookup must not
+    // replace that refusal with "daemon not reachable".
+    if master_stdin_stays_local(cli) {
         return None;
     }
     let mut argv = vec!["cadence".to_string()];

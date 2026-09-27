@@ -1764,7 +1764,12 @@ mod tests {
         let cwd = fs::canonicalize(dir.path()).unwrap();
         let req = ask(
             dir.path(),
-            &["cadence".into(), "issue".into(), "comment".into(), "T".into()],
+            &[
+                "cadence".into(),
+                "issue".into(),
+                "comment".into(),
+                "T".into(),
+            ],
             &cwd,
             "need a ticket",
             "master",
