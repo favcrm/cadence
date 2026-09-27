@@ -1944,25 +1944,6 @@ pub struct DerivedGrant {
     pub scopes: Vec<String>,
 }
 
-/// The platform and account a slot binding grants on. `local` is the
-/// built-in outbox. `agenticos` is the hosted company account. Any
-/// other connection name has no account mapping yet (CAD-585).
-fn grant_target(conn: &str) -> Option<(&'static str, &'static str)> {
-    if conn == crate::platform::local::PLATFORM {
-        Some((
-            crate::platform::local::PLATFORM,
-            crate::platform::BUILTIN_LOCAL_ACCOUNT,
-        ))
-    } else if conn == crate::platform::agenticos::PLATFORM {
-        Some((
-            crate::platform::agenticos::PLATFORM,
-            crate::platform::agenticos::HOSTED_ACCOUNT,
-        ))
-    } else {
-        None
-    }
-}
-
 /// The grants an app's approval derives (CAD-577): for every workflow
 /// step that declares `uses: <slot>` and an `agent: {{role}}`, the
 /// agent the app's default team assigns to that role gets the slot's
@@ -2045,17 +2026,16 @@ pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec
                     continue;
                 };
                 // CAD-577 derives grants for the built-in `local`
-                // connection (account `local`). CAD-501 does the same
-                // for `agenticos` on the hosted account — the company
-                // is bound by the host, so there is no enrolled
-                // account to guess. Every other connection still waits
-                // for CAD-585's mapping and derives nothing.
-                let Some((platform, account)) = grant_target(conn) else {
+                // connection (account `local`). The generic
+                // connection→account mapping lands with CAD-585; until
+                // then a slot bound to any other connection derives no
+                // grant rather than guessing an account.
+                if conn != crate::platform::local::PLATFORM {
                     continue;
-                };
+                }
                 match out
                     .iter_mut()
-                    .find(|g| g.agent == agent && g.platform == platform)
+                    .find(|g| g.agent == agent && g.platform == conn)
                 {
                     Some(g) => {
                         if !g.scopes.contains(slot) {
@@ -2064,8 +2044,8 @@ pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec
                     }
                     None => out.push(DerivedGrant {
                         agent: agent.clone(),
-                        platform: platform.to_string(),
-                        account: account.to_string(),
+                        platform: conn.to_string(),
+                        account: crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
                         scopes: vec![slot.clone()],
                     }),
                 }

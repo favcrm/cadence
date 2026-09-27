@@ -87,28 +87,15 @@ The Review verdict passed — confirm it is a PASS recorded against the
 run's head before staging anything; a REVISE goes back, it never
 reaches this step.
 
-The `publish` slot names the connection (`cadence app show`). Stage one
-post per destination in {{destinations}}.
-
-When the slot is bound to `agenticos`, each post is a Cadence draft
-handoff, not a send — AgenticOS owns the approval. `platform_call` with
-platform `agenticos`, account `hosted`, tool `publish_post`, and input
-`connectionId` (that destination's AgenticOS connection), `caption` (the
-body of `social/{{slug}}/caption-<destination>.md`), and `mediaKey` when
-the run has an image. Report the ledger for each handoff: waiting in
-AgenticOS (with its deep link), published (permalink receipt), or
-refused. This step never posts to the provider.
-
-When the slot is bound to `local` (the default), stage one `publish`
-send per destination: `platform_call` with platform `local`, account
-`local` (the built-in outbox — no enrollment), tool `publish`, and
-input naming the project, a title naming the destination
-(`{{slug}} — <destination>`), the caption body from
-`social/{{slug}}/caption-<destination>.md`, and the run's image as an
-attachment when one exists. Report each staged effect id. The
-operator's release in Needs-you moves each post to the outbox — this
-step never publishes directly.
+Stage one `publish` send per destination in {{destinations}} on the
+`publish` slot: `platform_call` with platform `local`, account `local`
+(the built-in outbox — no enrollment), tool `publish`, and input naming
+the project, a title naming the destination (`{{slug}} — <destination>`),
+the caption body from `social/{{slug}}/caption-<destination>.md`, and
+the run's image as an attachment when one exists. Report each staged
+effect id. The operator's release in Needs-you moves each post to the
+outbox — this step never publishes directly.
 
 ### Acceptance
-- [ ] one publish per destination is staged on the `publish` slot — a waiting row per destination (Needs-you for `local`, waiting in AgenticOS for `agenticos`), its preview the caption
-- [ ] every staged effect id, or each AgenticOS handoff key, is reported back
+- [ ] one `publish` send per destination is staged on the `publish` slot — a waiting row per destination in Needs-you, its preview the caption
+- [ ] every staged effect id is reported back

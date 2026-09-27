@@ -57,6 +57,11 @@ use crate::platform::adapter::PlatformAdapter;
 /// under — `platform_call {platform:"local", …}` reaches it.
 pub const PLATFORM: &str = "local";
 
+pub const BUILTIN_ACCOUNT: super::BuiltinAccount = super::BuiltinAccount {
+    platform: PLATFORM,
+    account: super::BUILTIN_LOCAL_ACCOUNT,
+};
+
 /// The one tool the `local` table declares — everything else gates as
 /// `send` too, but `execute` refuses it: publishing is all `local` does.
 const TOOL_PUBLISH: &str = "publish";

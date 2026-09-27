@@ -27,13 +27,23 @@ pub use custody::{Custody, Key};
 /// from the board with no CLI setup.
 pub const BUILTIN_LOCAL_ACCOUNT: &str = "local";
 
+/// Provider-owned account metadata; composition reviews this exact allowlist.
+/// This is credential selection, not capability matching or grant derivation.
+pub struct BuiltinAccount {
+    pub platform: &'static str,
+    pub account: &'static str,
+}
+
+const BUILTIN_ACCOUNTS: &[BuiltinAccount] = &[local::BUILTIN_ACCOUNT, agenticos::BUILTIN_ACCOUNT];
+
 /// Is `(platform, account)` a built-in account that needs no
 /// enrollment? `local/local` (CAD-577) and hosted `agenticos/hosted`
 /// (CAD-501): the gate treats them as connected, with no credential
 /// bytes to load. Every other account still enrolls.
 pub fn is_builtin(platform: &str, account: &str) -> bool {
-    (platform == local::PLATFORM && account == BUILTIN_LOCAL_ACCOUNT)
-        || (platform == agenticos::PLATFORM && account == agenticos::HOSTED_ACCOUNT)
+    BUILTIN_ACCOUNTS
+        .iter()
+        .any(|known| known.platform == platform && known.account == account)
 }
 
 /// What `platform enroll` produces for one exchange — the credential

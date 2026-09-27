@@ -1,33 +1,17 @@
-//! CAD-501 / ADR 0006 §5.2: the AgenticOS platform adapter.
-//!
-//! Publish is a Cadence `draft`, not a second approval gate. AgenticOS
-//! owns the send: `execute` posts to the runtime door
-//! (`POST /v1/runtime/connectors/publish`) with an idempotency key and
-//! the expected content hash, and the CompanyControl ledger answers
-//! waiting, published (with a receipt), or refused. Cadence mirrors
-//! that answer; it does not press again.
-//!
-//! The draft gate mints a fresh `call-<uuid>` on every `platform_call`
-//! and passes no expected hash. This adapter ignores that uuid. The
-//! door key is `agenticos-publish-v1-<digest>` (connection, caption,
-//! media), which is what CompanyControl dedupes on, and the pin is
-//! that same digest. A repeat of the same revision refreshes the
-//! existing row — the gate never calls `read_back` for a draft — and
-//! returns its mirrored status. The live door has no status GET, so a
-//! missing route falls through to one idempotent POST of the same key.
-//!
-//! Hosted containers call `http://api.internal` with no credential —
-//! the host binds the company. A self-hosted daemon that has enrolled
-//! a CAD-366 scoped token sends it as `Authorization: Bearer`. There
-//! is no consent-exchange adapter: the merged contract (AgenticOS
-//! PR #102) keeps OAuth on the AgenticOS API, not on this board.
-//! Destination discovery and the Connections page stay with CAD-585.
-//!
-//! Image generation is not on this door, so this table does not
-//! declare it.
+//! AgenticOS provider implementation of the generic PlatformAdapter interface.
+//! Reviewed against AOS-57 publish@2: authorize attests the canonical ledger
+//! key and exact content digest before publish. Pending/declined never publish.
+//! Every retry repeats supported authenticated POSTs; no cache or status GET.
+//! The upstream durable ledger owns approval, deduplication and restart recovery.
+//! Provider-reported posting is not provider-content verification: receipts and
+//! credentialless read_back remain Unknown. Identical content intentionally
+//! deduplicates; distinct intentions with identical bytes cannot be expressed.
+//! Hosted identity comes from the upstream company/instance/lease binding.
+//! Explicit local URLs and bearer transport do not establish hosted identity
+//! or an operational self-hosted token contract. Media import and other
+//! providers are not exposed through arbitrary tool/URL passthrough.
+mod wire;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -46,6 +30,11 @@ pub const PLATFORM: &str = "agenticos";
 /// `local`/`local`).
 pub const HOSTED_ACCOUNT: &str = "hosted";
 
+pub const BUILTIN_ACCOUNT: super::BuiltinAccount = super::BuiltinAccount {
+    platform: PLATFORM,
+    account: HOSTED_ACCOUNT,
+};
+
 /// Base URL inside a hosted container. `CADENCE_AGENTICOS_URL`
 /// overrides it; a daemon that is not hosted does not register this
 /// adapter at all.
@@ -61,11 +50,11 @@ const DOOR: &str = "/v1/runtime/connectors";
 /// Reviewed pin. The runtime door does not report a manifest version,
 /// so the adapter reports the version this table was reviewed against
 /// — the same way `local` does.
-const MANIFEST_VERSION: &str = "agenticos-connectors/1";
+const MANIFEST_VERSION: &str = "agenticos-connectors/2";
 
 const TABLE_JSON: &str = r#"{
     "platform": "agenticos",
-    "manifest_version": "agenticos-connectors/1",
+    "manifest_version": "agenticos-connectors/2",
     "tools": [
         {
             "tool": "connections_list",
@@ -112,14 +101,6 @@ const CAPTION_CAP: usize = 8000;
 const CONNECTION_CAP: usize = 80;
 const MEDIA_CAP: usize = 200;
 
-/// One publish the adapter has already handed off, so `read_back` can
-/// re-check the receipt without inventing a second write.
-struct Handoff {
-    key: String,
-    digest: String,
-    verified: Verified,
-}
-
 /// The AgenticOS adapter. `base` is the runtime origin (`http://api.internal`
 /// when hosted). Custody bytes, when present, are a scoped bearer token;
 /// empty bytes are the hosted path.
@@ -127,7 +108,6 @@ pub struct AgenticosAdapter {
     table: ToolTable,
     base: String,
     http: ureq::Agent,
-    handoffs: Mutex<HashMap<String, Handoff>>,
 }
 
 impl AgenticosAdapter {
@@ -146,7 +126,6 @@ impl AgenticosAdapter {
             table,
             base,
             http: ureq::Agent::new_with_config(config),
-            handoffs: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -279,6 +258,7 @@ struct PublishInput {
 }
 
 fn parse_publish(input: &Value) -> std::result::Result<PublishInput, String> {
+    arguments(input, &["connectionId", "caption", "mediaKey"])?;
     let connection_id = input
         .get("connectionId")
         .and_then(Value::as_str)
@@ -296,7 +276,7 @@ fn parse_publish(input: &Value) -> std::result::Result<PublishInput, String> {
         return Err("caption must be 1-8000 characters".into());
     }
     let media_key = match input.get("mediaKey") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) if valid_media_key(s) => Some(s.clone()),
         Some(_) => {
             return Err(
@@ -332,26 +312,44 @@ fn bearer(credential: &[u8]) -> std::result::Result<Option<String>, String> {
     Ok(Some(format!("Bearer {token}")))
 }
 
+fn typed<T: serde::de::DeserializeOwned>(data: Value) -> std::result::Result<T, String> {
+    serde_json::from_value(data)
+        .map_err(|_| "agenticos response does not match the reviewed contract".into())
+}
+fn arguments(input: &Value, allowed: &[&str]) -> std::result::Result<(), String> {
+    let object = input.as_object().ok_or("tool input must be an object")?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("unsupported tool argument: only reviewed fields are accepted".into());
+    }
+    Ok(())
+}
+fn safe_https(url: &str) -> bool {
+    url.parse::<ureq::http::Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("https")
+            && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+    })
+}
+fn mirrored(
+    key: &str,
+    digest: &str,
+    decision: wire::Decision,
+    status: wire::Status,
+    permalink: Option<String>,
+    repeated: bool,
+) -> Value {
+    let (ledger, detail, verified) = match status {
+        wire::Status::Declined => ("refused", "refused in AgenticOS", Verified::False),
+        wire::Status::Failed => ("refused", "publish failed in AgenticOS", Verified::False),
+        wire::Status::Posted => (
+            "published",
+            "AgenticOS reports posted; provider content is not verified",
+            Verified::Unknown,
+        ),
+        _ => ("waiting", "waiting in AgenticOS", Verified::Unknown),
+    };
+    json!({"platform_ref":key,"handoff":"draft","ledger":ledger,"detail":detail,"decision":decision,"status":status,"permalink":permalink,"content_hash":format!("sha256:{digest}"),"repeated":repeated,"verified":verified,"deep_link":ACCOUNT_APP})
+}
 impl AgenticosAdapter {
-    fn remember(&self, digest: &str, key: &str, verified: Verified) {
-        self.handoffs.lock().unwrap().insert(
-            digest.to_string(),
-            Handoff {
-                key: key.to_string(),
-                digest: digest.to_string(),
-                verified,
-            },
-        );
-    }
-
-    fn recall(&self, digest: &str) -> Option<Handoff> {
-        self.handoffs.lock().unwrap().get(digest).map(|h| Handoff {
-            key: h.key.clone(),
-            digest: h.digest.clone(),
-            verified: h.verified,
-        })
-    }
-
     fn publish(
         &self,
         credential: &[u8],
@@ -365,170 +363,118 @@ impl AgenticosAdapter {
             &post.caption,
             post.media_key.as_deref(),
         );
-        // The live gate passes `expected_hash = None`. The pin of this
-        // revision is the digest just computed; a caller-supplied hash
-        // must match it or nothing is posted.
-        let computed = format!("sha256:{digest}");
-        let pin = expected_hash.unwrap_or(computed.as_str());
-        let expected = normalize_hash(pin)
-            .ok_or_else(|| "expected content hash must be sha256:<64 hex>".to_string())?;
-        if expected != digest {
+        if expected_hash.is_some_and(|raw| normalize_hash(raw).as_deref() != Some(digest.as_str()))
+        {
             return Err("expected content hash does not match this revision — not posted".into());
         }
-        let key = publish_idempotency_key(&digest);
-        if !valid_key(&key) {
-            return Err("derived idempotency key is not a CompanyControl key".into());
-        }
-        // `execute_immediate` never calls `read_back`. A second
-        // `platform_call` of this revision returns the row already
-        // handed off, refreshed when the door offers a status GET.
-        if let Some(saved) = self.recall(&digest) {
-            if let Some(view) = self.refresh(&saved.key, &digest) {
-                self.remember(&digest, &saved.key, view.verified);
-                let mut result = view.into_result(&saved.key, &digest);
-                result["repeated"] = json!(true);
-                return Ok(result);
-            }
-        }
-        let auth = bearer(credential)?;
-        let url = format!("{base}{DOOR}/publish", base = self.base);
-        let mut body = json!({
-            "connectionId": post.connection_id,
-            "caption": post.caption,
-        });
-        if let Some(media) = &post.media_key {
+        let request_key = publish_idempotency_key(&digest);
+        let mut body = json!({"connectionId":post.connection_id,"caption":post.caption});
+        if let Some(media) = post.media_key {
             body["mediaKey"] = json!(media);
         }
-        let mut req = self
+        let (code, data) = self.publish_request(
+            credential,
+            "publish/authorize",
+            &request_key,
+            &digest,
+            &body,
+        )?;
+        if code != 200 {
+            return Err("agenticos authorization HTTP status is not successful".into());
+        }
+        let authorization: wire::Authorization = typed(data)?;
+        if !valid_key(&authorization.key)
+            || authorization.content_digest.as_deref() != Some(digest.as_str())
+        {
+            return Err(
+                "agenticos authorization key or content digest does not match the approved input"
+                    .into(),
+            );
+        }
+        match authorization.decision {
+            wire::Decision::Pending => {
+                return Ok(mirrored(
+                    &authorization.key,
+                    &digest,
+                    authorization.decision,
+                    wire::Status::Pending,
+                    None,
+                    authorization.repeated,
+                ))
+            }
+            wire::Decision::Declined => {
+                return Ok(mirrored(
+                    &authorization.key,
+                    &digest,
+                    authorization.decision,
+                    wire::Status::Declined,
+                    None,
+                    authorization.repeated,
+                ))
+            }
+            _ => {}
+        }
+        let (code, data) =
+            self.publish_request(credential, "publish", &authorization.key, &digest, &body)?;
+        let result: wire::Published = typed(data)?;
+        let valid = match (code, result.decision, result.status, result.executed) {
+            (
+                200,
+                wire::Decision::Approved | wire::Decision::Granted,
+                wire::Status::Posted | wire::Status::Processing,
+                true,
+            ) => true,
+            (
+                200,
+                wire::Decision::Approved | wire::Decision::Granted,
+                wire::Status::Failed,
+                false,
+            ) => true,
+            (202, wire::Decision::Pending, wire::Status::Pending, false) => true,
+            (409, wire::Decision::Declined, wire::Status::Declined, false) => true,
+            _ => false,
+        };
+        if !valid
+            || result.key != authorization.key
+            || result
+                .permalink
+                .as_deref()
+                .is_some_and(|url| !safe_https(url))
+        {
+            return Err(
+                "agenticos execution HTTP status, state or canonical key is inconsistent".into(),
+            );
+        }
+        Ok(mirrored(
+            &result.key,
+            &digest,
+            result.decision,
+            result.status,
+            result.permalink,
+            result.repeated,
+        ))
+    }
+    fn publish_request(
+        &self,
+        credential: &[u8],
+        path: &str,
+        key: &str,
+        digest: &str,
+        body: &Value,
+    ) -> std::result::Result<(u16, Value), String> {
+        let url = format!("{}{DOOR}/{path}", self.base);
+        let mut request = self
             .http
             .post(&url)
-            .header("idempotency-key", &key)
-            .header("content-digest", &digest);
-        if let Some(auth) = &auth {
-            req = req.header("authorization", auth);
+            .header("idempotency-key", key)
+            .header("content-digest", digest);
+        if let Some(auth) = bearer(credential)? {
+            request = request.header("authorization", &auth);
         }
-        let mut resp = req
-            .send_json(&body)
-            .map_err(|e| scrub(credential, format!("agenticos publish failed: {e}")))?;
-        let bytes = resp
-            .body_mut()
-            .with_config()
-            .limit(BODY_CAP as u64)
-            .read_to_vec()
-            .map_err(|e| scrub(credential, format!("agenticos publish read failed: {e}")))?;
-        let payload: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| "agenticos publish response is not JSON".to_string())?;
-        if payload.get("ok").and_then(Value::as_bool) == Some(false) {
-            let code = payload["error"]["code"].as_str().unwrap_or("error");
-            return Err(scrub(
-                credential,
-                format!("agenticos publish refused: {code}"),
-            ));
-        }
-        let data = payload.get("data").cloned().unwrap_or(payload);
-        let view = ledger_view(&data, &digest);
-        self.remember(&digest, &key, view.verified);
-        Ok(view.into_result(&key, &digest))
-    }
-
-    /// Re-read a handoff the door remembers. A 404 falls back to a
-    /// second POST of the same key — the live door has no status
-    /// route, and a missing route is not a receipt mismatch.
-    fn refresh(&self, key: &str, digest: &str) -> Option<Ledger> {
-        let url = format!("{base}{DOOR}/publish/{key}", base = self.base);
-        let mut resp = self.http.get(&url).call().ok()?;
-        if resp.status().as_u16() == 404 {
-            return None;
-        }
-        let bytes = resp
-            .body_mut()
-            .with_config()
-            .limit(BODY_CAP as u64)
-            .read_to_vec()
-            .ok()?;
-        let payload: Value = serde_json::from_slice(&bytes).ok()?;
-        if payload.get("ok").and_then(Value::as_bool) == Some(false) {
-            return None;
-        }
-        let data = payload.get("data").cloned().unwrap_or(payload);
-        Some(ledger_view(&data, digest))
-    }
-}
-
-struct Ledger {
-    name: &'static str,
-    detail: String,
-    verified: Verified,
-    decision: String,
-    status: String,
-    permalink: Option<String>,
-    repeated: bool,
-}
-
-impl Ledger {
-    fn into_result(self, key: &str, digest: &str) -> Value {
-        json!({
-            "platform_ref": key,
-            "handoff": "draft",
-            "ledger": self.name,
-            "detail": self.detail,
-            "decision": self.decision,
-            "status": self.status,
-            "permalink": self.permalink,
-            "content_hash": format!("sha256:{digest}"),
-            "repeated": self.repeated,
-            "verified": self.verified,
-            "deep_link": ACCOUNT_APP,
-        })
-    }
-}
-
-fn ledger_view(data: &Value, expected_hex: &str) -> Ledger {
-    let decision = data["decision"].as_str().unwrap_or("").to_string();
-    let status = data["status"].as_str().unwrap_or("").to_string();
-    let permalink = data["permalink"].as_str().map(str::to_string);
-    let repeated = data["repeated"].as_bool().unwrap_or(false);
-    let receipt = data["contentDigest"].as_str();
-    let (name, verified, detail) = if decision == "declined" || status == "declined" {
-        (
-            "refused",
-            Verified::False,
-            "refused in AgenticOS".to_string(),
-        )
-    } else if status == "failed" {
-        (
-            "refused",
-            Verified::False,
-            "publish failed in AgenticOS".to_string(),
-        )
-    } else if status == "posted" {
-        match receipt {
-            Some(got) if got != expected_hex => (
-                "published",
-                Verified::False,
-                "receipt does not match the approved revision".to_string(),
-            ),
-            _ => (
-                "published",
-                Verified::True,
-                "published in AgenticOS".to_string(),
-            ),
-        }
-    } else {
-        (
-            "waiting",
-            Verified::Unknown,
-            "waiting in AgenticOS".to_string(),
-        )
-    };
-    Ledger {
-        name,
-        detail,
-        verified,
-        decision,
-        status,
-        permalink,
-        repeated,
+        let mut response = request
+            .send_json(body)
+            .map_err(|e| scrub(credential, format!("agenticos handoff failed: {e}")))?;
+        self.response(credential, &mut response, "handoff")
     }
 }
 
@@ -584,29 +530,10 @@ impl PlatformAdapter for AgenticosAdapter {
         }
     }
 
-    fn read_back(&self, tool: &str, input: &Value) -> Verified {
-        if tool != "publish_post" {
-            return Verified::Unknown;
-        }
-        let Ok(post) = parse_publish(input) else {
-            return Verified::Unknown;
-        };
-        let digest = publish_content_digest(
-            &post.connection_id,
-            &post.caption,
-            post.media_key.as_deref(),
-        );
-        let Some(saved) = self.recall(&digest) else {
-            return Verified::Unknown;
-        };
-        match self.refresh(&saved.key, &digest) {
-            Some(view) => {
-                let verified = view.verified;
-                self.remember(&digest, &saved.key, verified);
-                verified
-            }
-            None => saved.verified,
-        }
+    fn read_back(&self, _tool: &str, _input: &Value) -> Verified {
+        // This interface carries no current credential. There is no supported
+        // authenticated status/read-back contract; never return a cached receipt.
+        Verified::Unknown
     }
 
     fn source_hash(&self, _agent: &str, _source: &str) -> Option<String> {
@@ -617,86 +544,141 @@ impl PlatformAdapter for AgenticosAdapter {
 impl AgenticosAdapter {
     fn draft(&self, credential: &[u8], input: &Value) -> std::result::Result<Value, String> {
         let post = parse_publish(input)?;
-        let url = format!("{base}{DOOR}/draft", base = self.base);
-        let mut body = json!({
-            "connectionId": post.connection_id,
-            "caption": post.caption,
-        });
-        if let Some(media) = &post.media_key {
+        let mut body = json!({"connectionId":post.connection_id,"caption":post.caption});
+        if let Some(media) = post.media_key {
             body["mediaKey"] = json!(media);
         }
-        let data = self.round_trip(credential, self.http.post(&url), &body)?;
-        Ok(json!({
-            "handoff": "draft",
-            "platform_ref": data["connectionId"].as_str().unwrap_or(""),
-            "preview": data,
-        }))
+        let url = format!("{}{DOOR}/draft", self.base);
+        let mut request = self.http.post(&url);
+        if let Some(auth) = bearer(credential)? {
+            request = request.header("authorization", &auth);
+        }
+        let mut response = request
+            .send_json(&body)
+            .map_err(|e| scrub(credential, format!("agenticos draft failed: {e}")))?;
+        let (code, data) = self.response(credential, &mut response, "draft")?;
+        let draft: wire::Draft = typed(data)?;
+        if code != 200
+            || draft.connection_id != post.connection_id
+            || draft.caption != post.caption
+            || draft.display_name.is_empty()
+            || draft
+                .media_url
+                .as_deref()
+                .is_some_and(|url| !safe_https(url))
+        {
+            return Err("agenticos draft response is inconsistent with the request".into());
+        }
+        Ok(json!({"handoff":"draft","platform_ref":draft.connection_id,"preview":draft}))
     }
-
     fn connection_view(
         &self,
         credential: &[u8],
         input: &Value,
         view: &str,
     ) -> std::result::Result<Value, String> {
-        let id = input
-            .get("connectionId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty() && js_len(s) <= CONNECTION_CAP)
-            .ok_or("connection view needs a connectionId")?;
-        if !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err("connectionId contains characters that cannot go in a path".into());
-        }
+        arguments(input, &["connectionId"])?;
+        let id = input["connectionId"]
+            .as_str()
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= CONNECTION_CAP
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            })
+            .ok_or("connection view needs a valid connectionId")?;
         self.get(
             credential,
             &format!("{DOOR}/connections/{id}/{view}"),
             input,
         )
     }
-
     fn get(
         &self,
         credential: &[u8],
         path: &str,
-        _input: &Value,
+        input: &Value,
     ) -> std::result::Result<Value, String> {
-        let url = format!("{base}{path}", base = self.base);
-        let mut req = self.http.get(&url);
-        if let Some(auth) = bearer(credential)? {
-            req = req.header("authorization", &auth);
+        let list = path == format!("{DOOR}/connections");
+        let url = format!("{}{path}", self.base);
+        let mut request = self.http.get(&url);
+        if list {
+            arguments(input, &["cursor", "limit"])?;
+            if let Some(cursor) = input.get("cursor") {
+                let cursor = cursor
+                    .as_str()
+                    .filter(|v| !v.is_empty() && v.len() <= 1024)
+                    .ok_or("cursor must be a nonempty bounded string")?;
+                request = request.query("cursor", cursor);
+            }
+            if let Some(limit) = input.get("limit") {
+                let limit = limit
+                    .as_u64()
+                    .filter(|v| (1..=100).contains(v))
+                    .ok_or("limit must be an integer from 1 to 100")?;
+                request = request.query("limit", limit.to_string());
+            }
         }
-        let mut resp = req
+        if let Some(auth) = bearer(credential)? {
+            request = request.header("authorization", &auth);
+        }
+        let mut response = request
             .call()
             .map_err(|e| scrub(credential, format!("agenticos read failed: {e}")))?;
-        self.decode(credential, &mut resp, "read")
-    }
-
-    fn round_trip(
-        &self,
-        credential: &[u8],
-        mut req: ureq::RequestBuilder<ureq::typestate::WithBody>,
-        body: &Value,
-    ) -> std::result::Result<Value, String> {
-        if let Some(auth) = bearer(credential)? {
-            req = req.header("authorization", &auth);
+        let (code, data) = self.response(credential, &mut response, "read")?;
+        if code != 200 {
+            return Err("agenticos read HTTP status is not successful".into());
         }
-        let mut resp = req
-            .send_json(body)
-            .map_err(|e| scrub(credential, format!("agenticos draft failed: {e}")))?;
-        self.decode(credential, &mut resp, "draft")
+        if list {
+            let page: wire::Connections = typed(data.clone())?;
+            if page.connections.len() > 100
+                || page.connections.iter().any(|c| {
+                    c.id.is_empty()
+                        || c.display_name.is_empty()
+                        || c.created_at.is_empty()
+                        || c.updated_at.is_empty()
+                })
+                || page
+                    .cursor
+                    .as_deref()
+                    .is_some_and(|v| v.is_empty() || v.len() > 1024)
+            {
+                return Err("agenticos connection page is malformed".into());
+            }
+        } else if path.ends_with("/profile") {
+            let profile: wire::Profile = typed(data.clone())?;
+            if profile
+                .accounts
+                .iter()
+                .any(|a| a.external_id.is_empty() || a.name.is_empty())
+            {
+                return Err("agenticos profile is malformed".into());
+            }
+        } else if path.ends_with("/posts") {
+            let posts: wire::Posts = typed(data.clone())?;
+            if posts.posts.iter().any(|p| {
+                p.id.is_empty() || p.permalink.as_deref().is_some_and(|url| !safe_https(url))
+            }) {
+                return Err("agenticos post metadata is malformed".into());
+            }
+        } else {
+            let insights: wire::Insights = typed(data.clone())?;
+            if insights.insights.iter().any(|i| i.name.is_empty()) {
+                return Err("agenticos insights are malformed".into());
+            }
+        }
+        // Quoted provider text remains untrusted metadata, never instructions.
+        Ok(data)
     }
-
-    fn decode(
+    fn response(
         &self,
         credential: &[u8],
-        resp: &mut ureq::http::Response<ureq::Body>,
+        response: &mut ureq::http::Response<ureq::Body>,
         what: &str,
-    ) -> std::result::Result<Value, String> {
-        let code = resp.status().as_u16();
-        let bytes = resp
+    ) -> std::result::Result<(u16, Value), String> {
+        let code = response.status().as_u16();
+        let bytes = response
             .body_mut()
             .with_config()
             .limit(BODY_CAP as u64)
@@ -704,15 +686,30 @@ impl AgenticosAdapter {
             .map_err(|e| scrub(credential, format!("agenticos {what} read failed: {e}")))?;
         let payload: Value = serde_json::from_slice(&bytes)
             .map_err(|_| format!("agenticos {what} response is not JSON"))?;
-        if payload.get("ok").and_then(Value::as_bool) == Some(false) || !(200..300).contains(&code)
-        {
-            let err = payload["error"]["code"].as_str().unwrap_or("error");
+        let object = payload
+            .as_object()
+            .ok_or("agenticos response envelope is malformed")?;
+        if object.len() != 2 {
+            return Err("agenticos response envelope is malformed".into());
+        }
+        if object.get("ok").and_then(Value::as_bool) == Some(false) {
+            let error = payload["error"]["code"]
+                .as_str()
+                .filter(|code| {
+                    code.len() <= 80 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+                .unwrap_or("error");
             return Err(scrub(
                 credential,
-                format!("agenticos {what} refused: {err}"),
+                format!("agenticos {what} refused: {error}"),
             ));
         }
-        Ok(payload.get("data").cloned().unwrap_or(payload))
+        if object.get("ok").and_then(Value::as_bool) != Some(true)
+            || !object.get("data").is_some_and(Value::is_object)
+        {
+            return Err("agenticos response envelope is malformed".into());
+        }
+        Ok((code, payload["data"].clone()))
     }
 }
 
