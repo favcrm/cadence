@@ -5,6 +5,7 @@ use common::app_release::{Release, A, B, OWNER, REVIEWER, WRITER};
 use common::{plant_member_pane, LaneShell};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::{Duration, Instant};
 fn native(
     lane: &mut LaneShell,
     state: &Path,
@@ -1221,4 +1222,120 @@ fn cad692_operator_archives_historical_context_after_private_install_bundle_remo
     );
     assert!(h.daemon.operator_rpc("app_effect_decide",json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"})).is_err(),"removed bundle inherited release authority");
     assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cad692_current_binding_revision_rejects_actual_late_reviewer_result() {
+    let h = Release::new();
+    let context = h.context("Revision fence", A, "revision-fence");
+    let binding = h.bind(&context, "revision-held-binding");
+    let run = h.create(&context, "revision-held-review");
+    let id = run["id"].as_str().unwrap();
+    std::fs::write(
+        h.daemon.state.join(format!("context-hold-reviewer-{id}")),
+        "hold",
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !h
+        .daemon
+        .state
+        .join(format!("context-reviewer-{id}.held"))
+        .exists()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "real reviewer never fetched its own dependency"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let before = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(before["state"], "running");
+    assert_eq!(before["approved_digest"], before["snapshot_digest"]);
+    assert_eq!(before["artifacts"].as_array().unwrap().len(), 1);
+    assert!(before["reviews"].as_array().unwrap().is_empty());
+    let artifact = h.artifact(&before);
+    assert_eq!(artifact["text"], format!("Context draft: {A}"));
+    let reviewer = before["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["state"] == "dispatched")
+        .expect("actual reviewer step dispatched");
+    let emitted = h.daemon.state.join(format!(
+        "context-result-emitted-{id}-{}",
+        reviewer["step_id"].as_str().unwrap()
+    ));
+    // Counterfactual fixture: change only the persisted CAS revision, bypassing
+    // CRUD's proactive cancellation. The real authenticated completion must
+    // independently enforce current-binding proof inside its SQL transaction.
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    let active: i64 = db.query_row(
+        "SELECT count(*) FROM app_run_steps s JOIN tasks t ON t.id=s.task_id JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=? AND s.state='dispatched' AND t.state='dispatched' AND t.dispatch_message=m.id AND m.alias=? AND m.state='running' AND m.turn_id IS NOT NULL AND length(m.turn_id)>0",
+        rusqlite::params![id, reviewer["step_id"].as_str(), REVIEWER], |row| row.get(0)).unwrap();
+    assert_eq!(
+        active, 1,
+        "held dependency-fetch reviewer lacks an actual running assigned turn"
+    );
+    assert_eq!(db.execute("UPDATE app_bindings SET revision=revision+1 WHERE id=? AND install_id=? AND revision=?",
+        rusqlite::params![binding["id"].as_str(), h.install["install_id"].as_str(), binding["revision"].as_i64()]).unwrap(), 1);
+    drop(db);
+    assert_eq!(
+        h.daemon
+            .operator_rpc("app_run_show", json!({"run_id":id}))
+            .unwrap(),
+        before,
+        "raw revision fixture unexpectedly invalidated run before completion"
+    );
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("context-reviewer-{id}.release")),
+        "release",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let agent = h
+            .daemon
+            .operator_rpc("agent_show", json!({"alias":REVIEWER}))
+            .unwrap();
+        if emitted.exists()
+            && matches!(agent["agent"]["state"].as_str(), Some("idle" | "attention"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual reviewer finish never settled: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let finished = h
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(
+        finished["state"], "failed",
+        "stale-binding authenticated review was accepted"
+    );
+    assert!(
+        finished["reviews"].as_array().unwrap().is_empty(),
+        "stale-binding review was persisted"
+    );
+    assert_eq!(
+        finished["artifacts"], before["artifacts"],
+        "historical writer artifact was changed"
+    );
+    assert_eq!(finished["snapshot"], run["snapshot"]);
+    assert_eq!(
+        h.daemon
+            .operator_rpc("app_run_artifact", json!({"artifact_id":artifact["id"]}))
+            .unwrap(),
+        artifact
+    );
 }
