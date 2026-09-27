@@ -1115,3 +1115,110 @@ fn controlled_release_gate(
     });
     (gate, entered_rx, resume_tx)
 }
+#[test]
+fn cad692_claim_wins_local_commit_before_context_archive_and_keeps_actual_receipt() {
+    let (gate, claimed, resume) = controlled_release_gate("executing");
+    let h = Release::with_options(move |opts, _| {
+        opts.app_release_claim_gate = Some(gate);
+    });
+    let c = h.context("Claim wins", A, "commit-context");
+    h.bind(&c, "commit-binding");
+    let run = h.complete(&c, "commit-run");
+    let effect = h.stage(&run, "commit-effect");
+    std::thread::scope(|scope| {
+        let daemon = &h.daemon;
+        let effect = &effect;
+        let accept=scope.spawn(move ||daemon.operator_rpc("app_effect_decide",json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"})));
+        claimed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("actual checked-claim gate was not reached");
+        let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM platform_effects WHERE effect_id=?",
+                [effect["effect_id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "executing",
+            "trusted barrier was reached before actual checked claim"
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let install = &h.install;
+        let context = &c;
+        let revoke=scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            let result=daemon.operator_rpc("app_context_archive",json!({"install_id":install["install_id"],"context_id":context["id"],"expected_revision":context["revision"]}));
+            finished_tx.send(()).unwrap(); result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let early = finished_rx.recv_timeout(std::time::Duration::from_millis(150));
+        // Always release our own barrier before asserting, so a broken lock
+        // yields a semantic failure instead of stranding provider/RPC threads.
+        resume.send(()).unwrap();
+        let accepted = accept.join().unwrap().unwrap();
+        let revoked = revoke.join().unwrap().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "context archive crossed claimed Local commit lock"
+        );
+        assert_eq!(accepted["effect"]["state"], "done");
+        assert_eq!(revoked["context"]["state"], "archived");
+    });
+    let item = h
+        .daemon
+        .operator_rpc("platform_outbox", json!({"effect_id":effect["effect_id"]}))
+        .unwrap();
+    assert_eq!(
+        item["item"]["post"],
+        format!("# Reviewed draft\n\nContext draft: {A}")
+    );
+    let after = h
+        .daemon
+        .operator_rpc("app_effect_show", json!({"effect_id":effect["effect_id"]}))
+        .unwrap()["effect"]
+        .clone();
+    assert_eq!(
+        after["state"], "done",
+        "later archive erased an actual committed result"
+    );
+    assert_eq!(after["authority"], effect["authority"]);
+}
+
+#[test]
+fn cad692_operator_archives_historical_context_after_private_install_bundle_removed() {
+    let h = Release::new();
+    let context = h.context("Removed installation", A, "removed-install-context");
+    h.bind(&context, "removed-install-binding");
+    let run = h.complete(&context, "removed-install-run");
+    let artifact = h.artifact(&run);
+    let effect = h.stage(&run, "removed-install-effect");
+    let bundle = h
+        .root
+        .path()
+        .join("pm/.apps/installations")
+        .join(h.install["install_id"].as_str().unwrap())
+        .join("bundle");
+    assert!(
+        bundle.join("app.md").is_file(),
+        "private fixture bundle removal control is absent"
+    );
+    std::fs::remove_dir_all(&bundle).unwrap();
+    let archived=h.daemon.operator_rpc("app_context_archive",json!({"install_id":h.install["install_id"],"context_id":context["id"],"expected_revision":context["revision"]})).unwrap()["context"].clone();
+    assert_eq!(
+        archived["state"], "archived",
+        "historical archive incorrectly requires current installed bundle"
+    );
+    assert_eq!(archived["id"], context["id"]);
+    assert_eq!(
+        h.artifact(&run),
+        artifact,
+        "historical archive lost actual accepted bytes"
+    );
+    assert!(h.daemon.operator_rpc("app_effect_decide",json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"})).is_err(),"removed bundle inherited release authority");
+    assert!(h.items().as_array().unwrap().is_empty());
+}
