@@ -192,9 +192,7 @@ pub(super) fn register_with_loader(
     hosted: bool,
     load: impl FnOnce() -> Result<Option<super::deployments::DeploymentMetadata>>,
 ) -> Result<()> {
-    if !hosted {
-        return register(opts, base);
-    }
+    let _ = hosted; // Counterfactual: remove hosted-only assertion consumption.
     let metadata = match &opts.provider_deployments {
         Some(metadata) => Some(metadata.clone()),
         None => load()?,
