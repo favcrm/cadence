@@ -72,10 +72,10 @@ const refused = wikiErrorFrom(409, { error: "conflict", code: "conflict", rev: "
 equal(refused.status, 409, "a refusal keeps its status");
 const conflict = conflictFrom(refused);
 equal(conflict, { rev: "f0c33d8", author: "master", at: null }, "the conflict carries the winning rev");
-equal(conflictText(conflict!), "changed since you opened it — master saved rev f0c33d8", "the banner line");
+equal(conflictText(conflict!), "master updated this page since you opened it. Your draft is kept.", "the banner explains draft preservation without exposing revision ids");
 
 // A conflict body with no author still reads.
-equal(conflictText(conflictFrom(wikiErrorFrom(409, { rev: "9" }))!), "changed since you opened it — saved rev 9", "no author");
+equal(conflictText(conflictFrom(wikiErrorFrom(409, { rev: "9" }))!), "This page changed since you opened it. Your draft is kept.", "no author");
 
 // A different failure is not a conflict — the toast path, not the banner.
 equal(conflictFrom(wikiErrorFrom(500, { error: "boom" })), null, "a 500 is not a conflict");

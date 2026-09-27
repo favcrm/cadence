@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
-import { filterHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
+import { filterHits, groupHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { EmptyCard, Failure, Loading, useWikiScope, WikiToolbar } from "./shared";
@@ -55,7 +55,7 @@ export default function SearchPane({
     };
   }, [query, scope?.root]);
 
-  const shown = hits ? filterHits(hits, filter) : null;
+  const shown = hits ? groupHits(filterHits(hits, filter)) : null;
 
   return (
     <>
@@ -108,20 +108,29 @@ export default function SearchPane({
         </EmptyCard>
       ) : (
         <div className="wk-sres">
-          {shown.map((hit, index) => (
-            <div key={`${hit.path}:${hit.line ?? index}`} className="card wk-srow">
-              <div className="wk-spath num">{scope ? hit.path.slice(scope.root.length + 1) : hit.path}{hit.line ? ` · line ${hit.line}` : ""}</div>
-              <Link
-                className="wk-sname lnk"
-                href={navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null })}
-              >
-                {hit.name}
-              </Link>
-              <div className="wk-snip">
-                {snippetParts(hit.snippet, query).map((part, i) =>
-                  part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
-                )}
+          {shown.map((file) => (
+            <div key={file.path} className="card wk-srow">
+              <div className="wk-spath num">{scope ? file.path.slice(scope.root.length + 1) : file.path}</div>
+              <div className="wk-sheading">
+                <Link
+                  className="wk-sname lnk"
+                  href={navHref({ screen: "wiki", mode: "browse", path: file.path, query: null })}
+                >
+                  {file.name}
+                </Link>
+                <span className="wk-smatches">{file.matches.length} {file.matches.length === 1 ? "match" : "matches"}</span>
               </div>
+              <div className="wk-sexcerpts">
+                {file.matches.slice(0, 3).map((hit, index) => (
+                  <div key={index} className="wk-snip">
+                    {hit.line != null && <span className="wk-sline num">Line {hit.line}</span>}
+                    <span>{snippetParts(hit.snippet, query).map((part, i) =>
+                      part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,
+                    )}</span>
+                  </div>
+                ))}
+              </div>
+              {file.matches.length > 3 && <div className="wk-smatches wk-smore">{file.matches.length - 3} more {file.matches.length === 4 ? "match" : "matches"} in this file</div>}
             </div>
           ))}
         </div>

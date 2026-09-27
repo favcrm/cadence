@@ -49,7 +49,13 @@ globalThis.fetch = async (input, init) => {
     return json({ path, entries: [{ path: `${path}/README.md`, name: "README.md", kind: "text" }, { path: `${path}/research`, name: "research", kind: "dir" }, { path: `${path}/logo.png`, name: "logo.png", kind: "blob", mime: "image/png" }] });
   }
   if (url.pathname.endsWith("/file")) return json({ path, kind: "text", text: `# Project brief\n\nNotes for ${path}`, rev: "base-rev" });
-  if (url.pathname.endsWith("/search")) return json({ matches: [{ path: pagePath, line: 3, text: "Project brief match" }, { path: "projects/other/private.md", line: 1, text: "outside project" }] });
+  if (url.pathname.endsWith("/search")) return json({ matches: [
+    { path: pagePath, line: 3, text: "Project brief match" },
+    { path: "projects/other/private.md", line: 1, text: "outside project" },
+    { path: pagePath, line: 7, text: "Second brief match" },
+    { path: pagePath, line: 12, text: "Third brief match" },
+    { path: pagePath, line: 15, text: "Fourth brief match" },
+  ] });
   if (url.pathname.endsWith("/history")) return json({ path, commits: [{ sha: "commit1", at: 1, actor: "master", subject: "Saved project brief" }] });
   throw new Error(`Unexpected request: ${url}`);
 };
@@ -81,22 +87,45 @@ async function run() {
   await go("/projects/cadence/context?file=README.md&mode=edit");
   const source = host.querySelector("textarea");
   assert(source?.value === "Draft in this project", "existing Wiki draft recovery works in Context");
+  const editorViews = host.querySelector("[aria-label='Editor view']");
+  const writeView = editorViews?.querySelector("button:first-child");
+  const previewView = editorViews?.querySelector("button:last-child");
+  assert(writeView instanceof HTMLElement && previewView instanceof HTMLElement, "mobile editor exposes native view controls");
+  await React.act(() => previewView.click());
+  assert(previewView.getAttribute("aria-pressed") === "true" && writeView.getAttribute("aria-pressed") === "false", "view switch announces the selected pane");
+  assert(host.querySelector("textarea") === source && source.value === "Draft in this project", "preview retains the same textarea and draft");
+  assert(host.querySelector(".wk-eprev")?.textContent === "Draft in this project", "preview renders the current unsaved text");
+  await React.act(() => writeView.click());
+  assert(host.querySelector("textarea") === source && source.value === "Draft in this project", "switching back to Write preserves the draft");
   assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Back to page") && !host.textContent?.includes("Cancel"), "return action does not imply the retained draft is discarded");
   conflict = true;
   const save = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Save");
   assert(save, "Save control exists");
   await React.act(async () => { save.click(); await flush(); });
-  assert(host.textContent?.includes("changed since you opened it"), "HTTP 200 conflict envelope is shown as a refusal");
+  assert(host.textContent?.includes("This page changed since you opened it. Your draft is kept.") && !host.textContent.includes("newer-rev"), "HTTP 200 conflict shows clear copy without an internal revision id");
   assert(source.value === "Draft in this project" && sessionStorage.getItem(draftKey(pagePath)), "a refused save preserves the draft");
   assert(writes[0]?.if_rev === "base-rev", "Save includes the base revision");
+  const compare = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Compare changes");
+  assert(compare, "conflict offers a clear comparison action");
+  await React.act(() => compare.click());
+  assert(host.querySelector(".wk-diff")?.textContent?.includes("Draft in this project"), "comparison includes the retained draft");
+  const discard = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Discard draft and reload");
+  assert(discard, "the draft-discarding action names its consequence");
+  await React.act(async () => { discard.click(); await flush(); });
+  assert(source.value.includes("Notes for projects/cadence/README.md") && !sessionStorage.getItem(draftKey(pagePath)) && save.disabled, "explicit discard loads the server copy, clears the draft and disables Save");
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")?.set?.call(source, "Draft in this project");
+    source.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  await React.act(() => previewView.click());
   conflict = false;
   holdSave = true;
   await React.act(async () => {
-    save.click();
+    previewView.dispatchEvent(new win.KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }));
     source.dispatchEvent(new win.KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }));
     await flush();
   });
-  assert(writes.length === 2, "repeated keyboard save while a request is pending sends one write");
+  assert(writes.length === 2, "keyboard save from Preview works and repeated shortcuts send one pending write");
   assert(source.readOnly && save.getAttribute("aria-busy") === "true", "pending save shows progress and protects the submitted text");
   await React.act(async () => { finishSave?.(); await flush(); });
   holdSave = false;
@@ -116,6 +145,9 @@ async function run() {
   assert(sessionStorage.getItem(draftKey(pagePath))?.includes("A last second edit"), "leaving before the debounce preserves the last edit");
   assert(requests.some((url) => url.includes("/search?") && url.includes("path=projects%2Fcadence")), "search requests only this project");
   assert(host.textContent?.includes("Project brief match") && !host.textContent.includes("outside project"), "search results stay inside project");
+  assert(host.querySelectorAll(".wk-srow").length === 1 && host.textContent.includes("4 matches"), "search renders one page with a count of its matches");
+  assert(host.querySelectorAll(".wk-snip").length === 3 && !host.textContent.includes("Fourth brief match") && host.textContent.includes("1 more match in this file"), "search keeps excerpts compact without hiding the existence of further matches");
+  assert(host.querySelector(".wk-sline")?.textContent === "Line 3" && host.querySelector("mark")?.textContent === "brief", "grouped excerpts preserve line numbers and query highlighting");
   const searchForm = host.querySelector(".wk-sinput");
   const searchInput = searchForm?.querySelector("input");
   assert(searchInput?.type === "search" && searchForm?.querySelector("button[type='submit']")?.textContent === "Search", "search has a visible native submit action");

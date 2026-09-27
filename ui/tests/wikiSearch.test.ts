@@ -1,4 +1,4 @@
-import { filterHits, hitKind, snippetParts, TYPE_FILTERS, type SearchHit } from "../src/features/wiki/search";
+import { filterHits, groupHits, hitKind, snippetParts, TYPE_FILTERS, type SearchHit } from "../src/features/wiki/search";
 import { blobPage } from "../src/features/wiki/api";
 import { extOf, kindLabel, previewKind } from "../src/features/wiki/preview";
 import { relTime, versionRows, versionWho } from "../src/features/wiki/history";
@@ -27,6 +27,14 @@ equal(filterHits(hits, "images").map((h) => h.name), ["board-v5.png"], "images")
 equal(filterHits(hits, "video").map((h) => h.name), ["demo-cut.mp4"], "video");
 equal(filterHits(hits, "pdf").map((h) => h.name), ["spec-draft.pdf"], "pdf");
 equal(filterHits([], "images"), [], "an empty result stays empty");
+
+const repeated = [hits[0], hits[1], { ...hits[0], line: 8, snippet: "another tokens match" }];
+const grouped = groupHits(repeated);
+equal(grouped.map((file) => file.path), [hits[0].path, hits[1].path], "interleaved matches render one result per file in server order");
+equal(grouped[0].matches.map((hit) => hit.snippet), [hits[0].snippet, "another tokens match"], "grouping retains each excerpt and its order");
+equal(grouped[0].matches[1].line, 8, "grouping preserves matching line numbers");
+equal(groupHits(filterHits(repeated, "images")).map((file) => file.name), [hits[1].name], "type filters still select the right files");
+equal(groupHits([]), [], "no matches produce no grouped results");
 
 // The snippet's query occurrences are the only marked parts.
 equal(snippetParts("every mockup starts from the real tokens", "tokens"), [

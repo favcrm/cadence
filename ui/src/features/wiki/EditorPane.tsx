@@ -55,6 +55,8 @@ export default function EditorPane({
 }) {
   const sourceId = useId();
   const previewId = useId();
+  const previewLabelId = useId();
+  const [editorView, setEditorView] = useState<"write" | "preview">("write");
   const [text, setText] = useState("");
   const [baseRev, setBaseRev] = useState("");
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -80,6 +82,7 @@ export default function EditorPane({
     setConflict(null);
     setServerText(null);
     setShowDiff(false);
+    setEditorView("write");
     const storage = sessionStore();
     const draft = storage ? readDraft(storage, path) : null;
     wiki
@@ -181,11 +184,23 @@ export default function EditorPane({
       setConflict(null);
       setShowDiff(false);
       setDirty(false);
-      onToast("ok", "reloaded the server's copy — the draft was dropped");
+      onToast("ok", "Latest version loaded. Your draft was discarded.");
     } catch (e) {
       onToast("err", `reload failed — ${message(e)}`);
     }
   };
+
+  // Save remains available when the mobile preview has keyboard focus.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "s") {
+        event.preventDefault();
+        void save();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   if (status === "loading") return <Loading what="loading the page…" />;
   if (status === "error") return <Failure what="could not open the page" error={error} />;
@@ -213,8 +228,8 @@ export default function EditorPane({
         <div className="wk-conflict" role="alert">
           <IconWarning size={13} />
           <span className="min-w-0">{conflictText(conflict)}</span>
-          <Button size="sm" onClick={() => setShowDiff((s) => !s)}>review diff</Button>
-          <Button size="sm" onClick={() => void reload()}>reload</Button>
+          <Button size="sm" onClick={() => setShowDiff((s) => !s)}>{showDiff ? "Hide comparison" : "Compare changes"}</Button>
+          <Button size="sm" onClick={() => void reload()}>Discard draft and reload</Button>
         </div>
       )}
 
@@ -227,24 +242,24 @@ export default function EditorPane({
         </div>
       )}
 
-      <div className="wk-esplit">
+      <div className="wk-editor-views" role="group" aria-label="Editor view">
+        <button type="button" aria-pressed={editorView === "write"} aria-controls={sourceId} onClick={() => setEditorView("write")}>Write</button>
+        <button type="button" aria-pressed={editorView === "preview"} aria-controls={previewId} onClick={() => setEditorView("preview")}>Preview</button>
+      </div>
+
+      <div className="wk-esplit" data-view={editorView}>
         <label className="wk-ehead wk-source-head" htmlFor={sourceId}>Markdown</label>
         <textarea
           id={sourceId}
           className="wk-esrc"
+          aria-label="Markdown"
           value={text}
           spellCheck={false}
           readOnly={readOnly || saving}
           onChange={(e) => change(e.target.value)}
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-              e.preventDefault();
-              void save();
-            }
-          }}
         />
-        <div className="wk-ehead wk-preview-head" id={previewId}>Preview</div>
-        <div className="wk-eprev issue-reader" role="region" aria-labelledby={previewId}>
+        <div className="wk-ehead wk-preview-head" id={previewLabelId}>Preview</div>
+        <div id={previewId} className="wk-eprev issue-reader" role="region" aria-labelledby={previewLabelId}>
           <Md text={text} />
         </div>
       </div>
