@@ -194,6 +194,25 @@ async function main() {
     equal(r.get().data, 5, "trailing default observation settles");
   }
 
+  // Protected observations are retained for availability errors, purged on refusal.
+  {
+    const s = scripted<number>();
+    const r = new Resource(s.fetcher, { discardOnError: (e) => e instanceof Error && e.message === "forbidden" });
+    r.write(() => 1);
+    const availability = r.refresh(); s.reject(new Error("unavailable")); await availability;
+    equal(r.get().data, 1, "ordinary availability error retains protected observation");
+    const refused = r.refresh(); s.reject(new Error("forbidden")); await refused;
+    equal(r.get().data, null, "refusal purges protected observation");
+    equal(r.get().asOf, null, "refusal clears success freshness");
+    const unavailable = r.revalidate(); s.reject(new Error("unavailable")); await unavailable;
+    equal(r.get().data, null, "later availability error cannot resurrect purged observation");
+    equal(r.get().status, "failed", "purged observation remains a failed load");
+    const admitted = r.revalidate(); s.resolve(2); await admitted;
+    equal(r.get().data, 2, "admitted read restores a protected observation");
+    const old = r.refresh(); r.write(() => 3); s.reject(new Error("forbidden")); await old;
+    equal(r.get().data, 3, "older refusal cannot purge newer authoritative write");
+  }
+
   // Stream frames: the server names resources; `{}` means refetch all.
   equal(
     invalidatedBy('{"resources":["agents","issue","overview"]}'),

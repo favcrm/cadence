@@ -356,6 +356,35 @@ async function run() {
     );
     denied = false;
   }
+  if (chosen === "all" || chosen === "refusal") {
+    report = ready();
+    projects = [{ key: "site" }];
+    fail = false;
+    projectFail = false;
+    denied = false;
+    await fresh();
+    denied = true;
+    await click(button(/^Check again/));
+    denied = false;
+    fail = true;
+    await remount();
+    assert(
+      !text().includes("state_dir observation") &&
+        !host.querySelector(".setup-checks") &&
+        !text().includes("Required checks passed"),
+      "Host403 followed by an unavailable read cannot resurrect protected observations",
+    );
+    assert(
+      setupResource.get().data === null,
+      "Host refusal removes the report from the shared cache used by Home",
+    );
+    fail = false;
+    await remount();
+    assert(
+      text().includes("Required checks passed"),
+      "A successful admitted read restores readiness after host refusal",
+    );
+  }
   if (chosen === "all") {
     report = ready();
     report.checks.find((c) => c.check === "master")!.status = "missing";

@@ -1726,6 +1726,8 @@ requests `GET /api/setup?fresh=1` and refreshes registered projects;
 nothing is applied from the browser. Loading, missing observations and
 failed refreshes do not show current readiness. Failed refreshes, including host-only refusals, remain in the shared
 observation state across navigation; returning retries the stale report.
+A host-only refusal also discards the prior host report, so a subsequent
+availability failure cannot reveal it; only an admitted success restores it.
 A cached run shows its age and the host's cooldown; project failures remain distinct from an
 empty project list. Setup summary readiness requires the named section
 observations, including master/login even when there is no suggested fix;

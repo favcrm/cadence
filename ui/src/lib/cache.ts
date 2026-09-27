@@ -53,6 +53,8 @@ export interface ResourceOptions<T> {
   isEmpty?: (data: T) => boolean;
   /** How long a successful load counts as fresh for `revalidate()`. */
   freshMs?: number;
+  /** Protected resources can discard observations on an access refusal. */
+  discardOnError?: (error: unknown) => boolean;
   now?: () => number;
 }
 
@@ -81,12 +83,14 @@ export class Resource<T> {
   private readonly fetcher: () => Promise<T>;
   private readonly isEmpty: (data: T) => boolean;
   private readonly freshMs: number;
+  private readonly discardOnError: (error: unknown) => boolean;
   private readonly now: () => number;
 
   constructor(fetcher: () => Promise<T>, opts: ResourceOptions<T> = {}) {
     this.fetcher = fetcher;
     this.isEmpty = opts.isEmpty ?? (() => false);
     this.freshMs = opts.freshMs ?? 0;
+    this.discardOnError = opts.discardOnError ?? (() => false);
     this.now = opts.now ?? Date.now;
   }
 
@@ -139,8 +143,11 @@ export class Resource<T> {
         // A local write since the request started is fresher than any
         // failure of it.
         if (this.generation !== started) return;
+        const discard = this.discardOnError(e);
         this.set({
-          status: this.state.data === null ? "failed" : "stale",
+          data: discard ? null : this.state.data,
+          asOf: discard ? null : this.state.asOf,
+          status: discard || this.state.data === null ? "failed" : "stale",
           error: message(e),
         });
       },

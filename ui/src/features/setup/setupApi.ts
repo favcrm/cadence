@@ -24,6 +24,9 @@ export const setupResource = cache.resource<SetupReport>(
   () => fetchSetup(false),
   {
     freshMs: 60_000,
+    // Once refused, no later availability error may reveal the prior host report.
+    discardOnError: (error) =>
+      error instanceof Error && error.message === SETUP_ON_HOST,
   },
 );
 
