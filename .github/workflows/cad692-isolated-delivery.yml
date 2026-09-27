@@ -1,5 +1,7 @@
 name: CAD692 isolated delivery control
-on: workflow_dispatch
+on:
+  push:
+    branches: [op-proof-cad692-delivery-control-5ad8ad39]
 permissions:
   contents: read
 jobs:
