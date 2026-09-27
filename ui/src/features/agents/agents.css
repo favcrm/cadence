@@ -128,6 +128,7 @@
   max-height: 100dvh;
   display: none;
   flex-direction: column;
+  overflow-wrap: anywhere;
 }
 .agents-drawer[open] {
   display: flex;
@@ -149,9 +150,19 @@
 .agents-drawer .agents-profile {
   white-space: normal;
 }
-.agents-drawer .agents-profile .truncate {
+.agents-drawer .truncate {
   white-space: normal;
   overflow: visible;
+}
+.agents-drawer .chip {
+  max-width: 100%;
+  white-space: normal;
+}
+.agents-drawer li {
+  flex-wrap: wrap;
+}
+.agents-drawer li > .num {
+  min-width: 0;
 }
 .agents-drawer dd {
   overflow-wrap: anywhere;
