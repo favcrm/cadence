@@ -16,6 +16,11 @@ impl Shared {
         let descriptor = adapter
             .connection_descriptor()
             .ok_or_else(|| Error::rejected("connection provider management is unavailable"))?;
+        if descriptor.provider != provider {
+            return Err(Error::rejected(
+                "provider descriptor identity is inconsistent",
+            ));
+        }
         descriptor.validate(adapter.table())?;
         Ok(descriptor)
     }
@@ -62,6 +67,12 @@ impl Shared {
         Ok(
             json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
+    }
+    fn connection_metadata_projection(&self, record: &CredentialRecord) -> Result<Value> {
+        let mut projection =
+            self.connection_record(&record.platform, &record.account, Some(record))?;
+        projection["status"]["custody_available"] = json!([false, true]);
+        Ok(projection)
     }
     fn connection_list_locked(&self) -> Result<Vec<Value>> {
         let mut rows = vec![self.connection_record("local", "local", None)?];
@@ -120,10 +131,10 @@ impl Shared {
                 let mut rows = Vec::new();
                 for (provider, adapter) in &self.platforms {
                     let descriptor = self.connection_descriptor(provider).ok();
-                    rows.push(json!({"provider":provider,"descriptor":descriptor,"available":descriptor.is_some(),"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default())))}));
+                    rows.push(json!({"provider":provider,"descriptor":descriptor,"descriptor_available":descriptor.is_some(),"manifest_status":match (adapter.table().manifest_version.as_deref(),adapter.reported_manifest_version()) {(Some(a),Some(b)) if a==b=>"matched",(_,None)=>"missing",_=>"mismatched"},"reviewed_pin":adapter.table().manifest_version,"reported_pin":adapter.reported_manifest_version(),"network_checked":false,"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default())))}));
                 }
                 if !self.platforms.contains_key("local") {
-                    rows.push(json!({"provider":"local","descriptor":Value::Null,"available":false,"registration_digest":Value::Null}));
+                    rows.push(json!({"provider":"local","descriptor":Value::Null,"descriptor_available":false,"manifest_status":"missing","reviewed_pin":Value::Null,"reported_pin":Value::Null,"network_checked":false,"registration_digest":Value::Null}));
                 }
                 rows.sort_by(|a, b| a["provider"].as_str().cmp(&b["provider"].as_str()));
                 Ok(json!({"providers":rows}))
@@ -157,7 +168,7 @@ impl Shared {
                         "connection enrollment shape is unsupported",
                     ));
                 }
-                let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":required_str(params,"token")?,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()))?;
+                let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":required_str(params,"token")?,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()),Some(&|record|self.connection_metadata_projection(record)))?;
                 let _guard = self
                     .platform_custody_lock
                     .lock()
@@ -212,6 +223,7 @@ impl Shared {
                             .flat_map(|c| c.scopes.clone())
                             .collect::<Vec<_>>(),
                     ),
+                    Some(&|record| self.connection_metadata_projection(record)),
                 )?;
                 let _guard = self
                     .platform_custody_lock

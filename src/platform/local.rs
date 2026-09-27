@@ -758,6 +758,7 @@ impl PlatformAdapter for LocalAdapter {
                     tools: vec!["publish".into()],
                     scopes: vec!["publish".into()],
                     effect: "send".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
                 },
                 CapabilityDescriptor {
                     id: "social.post".into(),
@@ -765,6 +766,7 @@ impl PlatformAdapter for LocalAdapter {
                     tools: vec!["publish".into()],
                     scopes: vec!["publish".into()],
                     effect: "send".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
                 },
             ],
         })

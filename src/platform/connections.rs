@@ -5,12 +5,21 @@ use crate::{
 };
 use serde::Serialize;
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySemantics {
+    LocalMarkdownSink,
+    UpstreamApprovalHandoff,
+    MetadataRead,
+    PreviewOnly,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct CapabilityDescriptor {
     pub id: String,
     pub version: u32,
     pub tools: Vec<String>,
     pub scopes: Vec<String>,
     pub effect: String,
+    pub semantics: CapabilitySemantics,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderDescriptor {
@@ -23,7 +32,8 @@ pub struct ProviderDescriptor {
 }
 impl ProviderDescriptor {
     pub fn validate(&self, table: &ToolTable) -> Result<()> {
-        if self.schema != 1
+        if table.manifest_version.as_deref().is_none_or(str::is_empty)
+            || self.schema != 1
             || self.provider != table.platform
             || self.revision.is_empty()
             || self.capabilities.is_empty()

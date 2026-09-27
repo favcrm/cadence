@@ -513,6 +513,7 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["connections_list".into()],
                     scopes: vec!["sources".into()],
                     effect: "read".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
                 },
                 CapabilityDescriptor {
                     id: "sources.profile".into(),
@@ -520,6 +521,7 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["connection_profile".into()],
                     scopes: vec!["sources".into()],
                     effect: "read".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
                 },
                 CapabilityDescriptor {
                     id: "sources.posts.text".into(),
@@ -527,6 +529,7 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["connection_posts".into()],
                     scopes: vec!["sources".into()],
                     effect: "read".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
                 },
                 CapabilityDescriptor {
                     id: "sources.insights".into(),
@@ -534,6 +537,7 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["connection_insights".into()],
                     scopes: vec!["sources".into()],
                     effect: "read".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
                 },
                 CapabilityDescriptor {
                     id: "content.preview".into(),
@@ -541,6 +545,7 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["post_draft".into()],
                     scopes: vec!["draft".into()],
                     effect: "draft".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::PreviewOnly,
                 },
                 CapabilityDescriptor {
                     id: "social.post".into(),
@@ -548,6 +553,8 @@ impl PlatformAdapter for AgenticosAdapter {
                     tools: vec!["publish_post".into()],
                     scopes: vec!["publish".into()],
                     effect: "draft".into(),
+                    semantics:
+                        crate::platform::connections::CapabilitySemantics::UpstreamApprovalHandoff,
                 },
             ],
         })

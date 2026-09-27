@@ -18,7 +18,7 @@ cadence connection check CONNECTION_ID
 The commands require the running daemon and proven operator authority. There
 is no privileged offline fallback. JSON receipts describe the provider's
 reviewed capabilities, exact account, connection ID and credential revision.
-Unknown or unavailable providers stay unavailable. A declaration is not proof
+Provider output separates `descriptor_available` from `manifest_status`, reviewed and reported pins. Neither field proves upstream connectivity. Unknown or unavailable providers stay unavailable. A declaration is not proof
 that the deployed service has the reviewed contract.
 
 Check inspects local configuration. It does not send a provider effect or

@@ -480,6 +480,7 @@ impl crate::platform::PlatformAdapter for FakePlatform {
                 tools: vec!["widgets.list".into()],
                 scopes: vec!["widgets:read".into()],
                 effect: "read".into(),
+                semantics: crate::platform::connections::CapabilitySemantics::MetadataRead,
             }],
         })
     }

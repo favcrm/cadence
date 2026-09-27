@@ -538,6 +538,9 @@ impl Store {
         identifier(&record.platform, "Platform")?;
         identifier(&record.account, "Account")?;
         identifier(&record.connection_id, "Connection id")?;
+        if record.credential_revision > i64::MAX as u64 {
+            return Err(Error::rejected("connection revision exceeds storage bound"));
+        }
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let existing: Option<(String, String, u64)> = tx
@@ -589,9 +592,9 @@ impl Store {
             }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO platform_credentials
+            "INSERT INTO platform_credentials
              (platform, account, scopes, fingerprint, custody, exchange, enrolled_at, by, connection_id, credential_revision)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(platform,account) DO UPDATE SET scopes=excluded.scopes,fingerprint=excluded.fingerprint,custody=excluded.custody,exchange=excluded.exchange,enrolled_at=excluded.enrolled_at,by=excluded.by,connection_id=excluded.connection_id,credential_revision=excluded.credential_revision",
             params![
                 record.platform,
                 record.account,
