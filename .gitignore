@@ -27,4 +27,5 @@ docs/*
 docs/design/*
 docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md
+!docs/design/shareable-artifact-previews.md
 !docs/roles/risk-classes.md
