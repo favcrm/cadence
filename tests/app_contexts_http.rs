@@ -100,13 +100,20 @@ impl Board {
             "app_grants",
             "platform_grants",
             "platform_effects",
-            "events",
         ] {
             let count: i64 = db
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
             counts.insert(table.into(), json!(count));
         }
+        let context_events: i64 = db
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind LIKE 'app_context_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        counts.insert("context_events".into(), json!(context_events));
         json!({"counts":counts,"contexts":self.value("GET",&self.path(),json!({}))})
     }
 }
