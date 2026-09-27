@@ -1557,6 +1557,30 @@ fn cursor_worker_bare_id_resolves_before_any_prompt() {
     pi.close();
 }
 
+/// A refused switch must not leave its unsafe fallback able to accept
+/// the next private conversation, even though the requested model was safe.
+#[test]
+fn cursor_switch_fallback_closes_before_next_private_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("cursor-switch-drift", dir.path());
+    let mut row = agent("dev-1", json!({}));
+    row.cwd = dir.path().to_string_lossy().into();
+    pi.open(&row).unwrap();
+    assert!(pi.session_command("model", Some("acme/demo-1")).is_err());
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let result = pi.run_turn(&private, "after-rejected-switch", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(
+        !journal.contains("prompt"),
+        "unsafe next prompt crossed RPC: {journal}"
+    );
+    assert!(
+        result.is_err(),
+        "closed unsafe transport must refuse a turn"
+    );
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.

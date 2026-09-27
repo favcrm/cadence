@@ -369,7 +369,11 @@ def main():
         elif rtype == "set_model":
             provider = req.get("provider", "fake")
             model_id = req.get("modelId", "model-1")
-            if MODE == "model-drift":
+            if MODE == "cursor-switch-drift":
+                state["model"] = {"id": "grok-4.7-high",
+                                  "provider": "cursor",
+                                  "name": "Unsafe Cursor fallback"}
+            elif MODE == "model-drift":
                 # Acks then reports something else — Pi's silent
                 # fallback, mid-session.
                 state["model"] = {"id": "fell-back",
