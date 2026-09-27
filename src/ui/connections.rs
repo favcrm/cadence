@@ -2,7 +2,7 @@
 use super::{err_response, json_response, read_body, HttpResp};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::Path;
 use tiny_http::{Header, Request};
 

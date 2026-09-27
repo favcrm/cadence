@@ -181,7 +181,12 @@ impl Shared {
                 .unwrap_or_else(|| format!("conn-{}", uuid::Uuid::new_v4().simple())),
             credential_revision: existing
                 .as_ref()
-                .map(|r| r.credential_revision + 1)
+                .map(|r| {
+                    r.credential_revision
+                        .checked_add(1)
+                        .ok_or_else(|| Error::rejected("connection revision is exhausted"))
+                })
+                .transpose()?
                 .unwrap_or(1),
             platform,
             account,

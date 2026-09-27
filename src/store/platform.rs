@@ -537,14 +537,15 @@ impl Store {
     ) -> Result<()> {
         identifier(&record.platform, "Platform")?;
         identifier(&record.account, "Account")?;
+        identifier(&record.connection_id, "Connection id")?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let existing: Option<String> = tx
+        let existing: Option<(String, String, u64)> = tx
             .query_row(
-                "SELECT fingerprint FROM platform_credentials \
+                "SELECT fingerprint,connection_id,credential_revision FROM platform_credentials \
                  WHERE platform=?1 AND account=?2",
                 params![record.platform, record.account],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         match (existing, rotated) {
@@ -564,7 +565,14 @@ impl Store {
                     record.platform, record.account
                 )))
             }
-            (Some(old), true) => {
+            (Some((old, id, revision)), true) => {
+                if record.connection_id != id
+                    || revision.checked_add(1) != Some(record.credential_revision)
+                {
+                    return Err(Error::rejected(
+                        "connection rotation receipt is stale or inconsistent",
+                    ));
+                }
                 Self::event(
                     &tx,
                     PLATFORM_STREAM,
@@ -574,7 +582,11 @@ impl Store {
                            "by": record.by}),
                 )?;
             }
-            (None, _) => {}
+            (None, _) => {
+                if record.credential_revision != 1 {
+                    return Err(Error::rejected("new connection revision must be one"));
+                }
+            }
         }
         tx.execute(
             "INSERT OR REPLACE INTO platform_credentials

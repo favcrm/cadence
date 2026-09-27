@@ -71,7 +71,6 @@ pub fn registration_digest(value: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[test]
     fn capability_metadata_must_match_reviewed_tools_exactly() {
         use crate::platform::PlatformAdapter;

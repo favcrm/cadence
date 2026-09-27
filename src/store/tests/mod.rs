@@ -401,11 +401,18 @@ mod app_runs;
 fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cadence.sqlite3");
-    drop(Store::open_for_schema_tests(&path).unwrap());
+    let initialized = Store::open_for_schema_tests(&path).unwrap();
+    reg(&initialized, "grant-worker", dir.path());
+    drop(initialized);
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("DROP TABLE platform_credentials;
         CREATE TABLE platform_credentials(platform TEXT NOT NULL,account TEXT NOT NULL,scopes TEXT NOT NULL,fingerprint TEXT NOT NULL,custody TEXT NOT NULL,exchange TEXT NOT NULL,enrolled_at REAL NOT NULL,by TEXT NOT NULL,PRIMARY KEY(platform,account));
         INSERT INTO platform_credentials VALUES('fixture','old-account','[\"widgets:read\"]','old-fingerprint','file','token',1,'operator');
+        INSERT INTO platform_credentials VALUES('fixture','second-account','[\"widgets:read\"]','second-fingerprint','file','token',2,'operator');
+        INSERT INTO platform_grants VALUES('grant-worker','fixture','old-account','[\"widgets:read\"]',1,'operator');
+        INSERT INTO platform_defaults VALUES('legacy-project','fixture','old-account',1,'operator');
+        INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('kept-run','kept-install',1,'digest','{}','digest','grant-worker','kept-request','succeeded',1,1);
+        INSERT INTO platform_effects(effect_id,request,agent,platform,account,tool,input,input_summary,preview,scopes,state,staged_at,updated_at) VALUES('kept-effect','kept-effect-request','grant-worker','fixture','old-account','widgets.publish','{}','kept input','kept preview','[\"widgets:publish\"]','verified',1,1);
         DROP TABLE IF EXISTS connection_metadata;
         UPDATE schema_version SET version=20;
         CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
@@ -419,6 +426,18 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     assert!(db
         .prepare("SELECT connection_id FROM platform_credentials")
         .is_err());
+    for name in ["connection_metadata", "platform_connection_id"] {
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name=?",
+                [name],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "{name} leaked from rollback"
+        );
+    }
     db.execute_batch("DROP TRIGGER reject_connection_schema")
         .unwrap();
     drop(db);
@@ -430,6 +449,27 @@ fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
     assert!(!row.connection_id.is_empty());
     assert_eq!(row.credential_revision, 1);
     assert_eq!(row.fingerprint, "old-fingerprint");
+    let second = store
+        .platform_credential("fixture", "second-account")
+        .unwrap()
+        .unwrap();
+    assert_ne!(row.connection_id, second.connection_id);
+    for table in [
+        "platform_grants",
+        "platform_defaults",
+        "app_runs",
+        "platform_effects",
+    ] {
+        assert_eq!(
+            store
+                .conn()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "{table}"
+        );
+    }
     let namespace = store.connection_workspace_id().unwrap();
     drop(store);
     let reopened = Store::open_for_schema_tests(&path).unwrap();

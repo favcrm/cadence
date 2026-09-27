@@ -34,9 +34,12 @@ impl Shared {
             (_, None) => "missing",
             _ => "mismatched",
         };
-        let registration = adapter
-            .and_then(|a| a.connection_registration())
-            .map(|r| crate::platform::connections::registration_digest(&r));
+        let registration = adapter.and_then(|a| a.connection_registration()).map(|r| {
+            crate::platform::connections::registration_digest(&format!(
+                "{r}:{}",
+                serde_json::to_string(&descriptor).unwrap_or_default()
+            ))
+        });
         let builtin = record.is_none();
         let id = match record {
             Some(r) => r.connection_id.clone(),
@@ -117,7 +120,7 @@ impl Shared {
                 let mut rows = Vec::new();
                 for (provider, adapter) in &self.platforms {
                     let descriptor = self.connection_descriptor(provider).ok();
-                    rows.push(json!({"provider":provider,"descriptor":descriptor,"available":descriptor.is_some(),"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&r))}));
+                    rows.push(json!({"provider":provider,"descriptor":descriptor,"available":descriptor.is_some(),"registration_digest":adapter.connection_registration().map(|r|crate::platform::connections::registration_digest(&format!("{r}:{}",serde_json::to_string(&descriptor).unwrap_or_default())))}));
                 }
                 if !self.platforms.contains_key("local") {
                     rows.push(json!({"provider":"local","descriptor":Value::Null,"available":false,"registration_digest":Value::Null}));
@@ -134,7 +137,7 @@ impl Shared {
                 if method == "connection_list" {
                     return Ok(json!({"connections":rows}));
                 }
-                let id = required_str(params, "connection_id")?;
+                let id = connection_id(params)?;
                 let row = rows
                     .into_iter()
                     .find(|r| r["id"] == id)
@@ -170,7 +173,7 @@ impl Shared {
                 Ok(json!({"connection":self.connection_record(&provider,&account,Some(&record))?}))
             }
             "connection_rotate" | "connection_revoke" => {
-                let id = required_str(params, "connection_id")?;
+                let id = connection_id(params)?;
                 let record = self
                     .store
                     .connection_credential(id)?
@@ -225,4 +228,17 @@ impl Shared {
             _ => unreachable!(),
         }
     }
+}
+
+fn connection_id(params: &Value) -> Result<&str> {
+    let id = required_str(params, "connection_id")?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(Error::rejected("connection ID is invalid"));
+    }
+    Ok(id)
 }
