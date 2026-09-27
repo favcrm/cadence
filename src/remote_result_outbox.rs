@@ -296,6 +296,7 @@ impl ResultOutbox {
         private_metadata(&lock.metadata()?, false)?;
         // Initialization only: ordinary writes serialize through SQLite IMMEDIATE.
         acquire_init_lock(&lock)?;
+        validate_journal_path(dir)?;
         let path = dir.join(DB_NAME);
         let created = match OpenOptions::new()
             .write(true)
@@ -323,7 +324,20 @@ impl ResultOutbox {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?;
             read_only.busy_timeout(Duration::from_secs(5))?;
-            verify_schema(&read_only)?;
+            match read_only.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
+                Ok(_) => verify_schema(&read_only)?,
+                Err(rusqlite::Error::SqliteFailure(code, _))
+                    if code.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
+                {
+                    // A valid hot rollback journal needs writes even to inspect
+                    // schema. Recover only a bounded private copy first, leaving
+                    // original foreign DB/journal bytes untouched on refusal.
+                    recovery_preflight(dir, &path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut conn = Connection::open_with_flags(
             &path,
@@ -421,6 +435,87 @@ impl ResultOutbox {
         }
         rows.into_iter().map(decode_row).collect()
     }
+}
+
+// Offline v1 normally occupies less than 5 MiB. The larger explicit recovery
+// copy bound tolerates SQLite page overhead while refusing unbounded input.
+const MAX_RECOVERY_FILE_BYTES: u64 = 16 * 1024 * 1024;
+fn validate_journal_path(dir: &Path) -> Result<()> {
+    for name in ["results.sqlite3-wal", "results.sqlite3-shm"] {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+            Ok(_) => return Err(corrupt()),
+        }
+    }
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("results.sqlite3-journal"))
+    {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            private_metadata(&metadata, false)?;
+            if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+                return Err(corrupt());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+fn recovery_preflight(dir: &Path, original: &Path) -> Result<()> {
+    let scratch = tempfile::Builder::new()
+        .prefix("recovery-")
+        .tempdir_in(dir)?;
+    private_metadata(&fs::symlink_metadata(scratch.path())?, true)?;
+    let copy = scratch.path().join(DB_NAME);
+    copy_private_file(original, &copy)?;
+    copy_private_file(
+        &dir.join("results.sqlite3-journal"),
+        &scratch.path().join("results.sqlite3-journal"),
+    )?;
+    let conn = Connection::open_with_flags(
+        &copy,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    // The first schema read performs recovery on the disposable copy only.
+    verify_schema(&conn)?;
+    let app: u32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if app != APPLICATION_ID || version != SCHEMA_VERSION {
+        return Err(corrupt());
+    }
+    // Copy/recovery/schema failures retain originals. This preflight is not
+    // an authoritative data snapshot and cannot exclude same-UID replacement.
+    Ok(())
+}
+fn copy_private_file(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)?;
+    let metadata = input.metadata()?;
+    private_metadata(&metadata, false)?;
+    if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+        return Err(corrupt());
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(destination)?;
+    let copied = std::io::copy(
+        &mut input.by_ref().take(MAX_RECOVERY_FILE_BYTES + 1),
+        &mut output,
+    )?;
+    if copied != metadata.len() || copied > MAX_RECOVERY_FILE_BYTES {
+        return Err(corrupt());
+    }
+    Ok(())
 }
 
 fn acquire_init_lock(file: &File) -> Result<()> {

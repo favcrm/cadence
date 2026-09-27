@@ -453,3 +453,114 @@ fn fifo_database_path_is_refused_before_a_blocking_read_open() {
     assert!(observed.expect("FIFO validation blocked before checking file type"));
     assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
 }
+
+#[test]
+fn abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody() {
+    const CHILD_DIR: &str = "CADENCE_OFFLINE_OUTBOX_CRASH_FIXTURE";
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        let dir = std::path::PathBuf::from(dir);
+        let outbox = ResultOutbox::open(&dir).unwrap();
+        outbox.enqueue(&pin("org"), &command("committed")).unwrap();
+        drop(outbox);
+        let conn = rusqlite::Connection::open(dir.join("results.sqlite3")).unwrap();
+        if let Ok(mode) = std::env::var("CADENCE_OFFLINE_OUTBOX_CRASH_SCHEMA") {
+            match mode.as_str() {
+                "wrong-schema" => conn.execute_batch("DROP TABLE pending_results; CREATE TABLE pending_results(command_id TEXT, destination TEXT, payload TEXT, digest TEXT, stored_at_ms INTEGER)").unwrap(),
+                "trigger" => conn.execute_batch("CREATE TRIGGER unexpected AFTER INSERT ON pending_results BEGIN UPDATE pending_results SET digest='changed' WHERE command_id=NEW.command_id; END").unwrap(),
+                _ => panic!("unknown fixture mode"),
+            }
+        }
+        conn.execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE")
+            .unwrap();
+        for n in 0..40 {
+            conn.execute(
+                "INSERT INTO pending_results VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    format!("uncommitted-{n}"),
+                    "dirty",
+                    "x".repeat(32_768),
+                    "dirty",
+                    1
+                ],
+            )
+            .unwrap();
+        }
+        // A real abrupt child exit omits Connection drop/transaction rollback.
+        std::process::exit(73);
+    }
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("outbox");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
+        .arg("--test-threads=1")
+        .env(CHILD_DIR, &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "crash fixture did not reach its abrupt exit"
+    );
+    assert!(dir.join("results.sqlite3-journal").is_file());
+    let recovered = ResultOutbox::open(&dir).unwrap();
+    let rows = recovered.pending_for(&pin("org")).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].receipt().command_id(), "committed");
+    assert_eq!(rows[0].command(), &command("committed"));
+    assert_eq!(
+        recovered
+            .enqueue(&pin("org"), &command("committed"))
+            .unwrap(),
+        *rows[0].receipt()
+    );
+}
+
+#[test]
+fn hot_journal_foreign_schemas_preserve_database_and_journal_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    for mode in ["wrong-schema", "trigger"] {
+        let dir = root.path().join(mode);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("abrupt_exit_rolls_back_a_later_write_and_retains_committed_custody")
+            .arg("--test-threads=1")
+            .env("CADENCE_OFFLINE_OUTBOX_CRASH_FIXTURE", &dir)
+            .env("CADENCE_OFFLINE_OUTBOX_CRASH_SCHEMA", mode)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{mode}");
+        let db = dir.join("results.sqlite3");
+        let journal = dir.join("results.sqlite3-journal");
+        let db_bytes = fs::read(&db).unwrap();
+        let journal_bytes = fs::read(&journal).unwrap();
+        assert!(ResultOutbox::open(&dir).is_err(), "{mode}");
+        assert_eq!(fs::read(&db).unwrap(), db_bytes, "{mode}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes, "{mode}");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            3,
+            "no recovery scratch is retained"
+        );
+    }
+}
+
+#[test]
+fn unsafe_existing_journal_and_wal_paths_are_refused_without_touching_targets() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("outbox");
+    drop(ResultOutbox::open(&dir).unwrap());
+    let target = root.path().join("untouched");
+    fs::write(&target, b"keep foreign bytes").unwrap();
+    let journal = dir.join("results.sqlite3-journal");
+    std::os::unix::fs::symlink(&target, &journal).unwrap();
+    assert!(ResultOutbox::open(&dir).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"keep foreign bytes");
+    fs::remove_file(&journal).unwrap();
+    fs::write(dir.join("results.sqlite3-wal"), b"unsupported WAL").unwrap();
+    assert!(ResultOutbox::open(&dir).is_err());
+    assert_eq!(
+        fs::read(dir.join("results.sqlite3-wal")).unwrap(),
+        b"unsupported WAL"
+    );
+}

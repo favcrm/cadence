@@ -85,6 +85,18 @@ at offset 68 in its [database header](https://www.sqlite.org/fileformat.html#the
 An existing file also receives a read-only preflight requiring the exact v1
 table constraints and implicit primary-key index, with no extra tables, views,
 indexes or triggers, before any writable SQLite open.
+If that preflight specifically encounters [SQLite READONLY_ROLLBACK](https://www.sqlite.org/rescode.html#readonly_rollback), a hot
+rollback journal needs recovery to inspect the schema. Existing journal paths
+receive the same private-file checks; WAL/SHM sidecars are unsupported and refused. A private disposable
+copy of the owned database and journal receives recovery and the same schema
+check first; each copied file is capped at 16 MiB and checked as an owned 0600
+regular file with one link. Failed preflight retains original database and
+journal bytes. Successful preflight allows SQLite to recover the original,
+whose exact schema is checked again before the returned handle can enqueue.
+Copy/recovery/schema failures retain originals. The preflight is not an
+authoritative data snapshot or an atomic defense against a hostile same-UID
+writer. Supported concurrent enqueue never changes the schema; contention can
+still require refusal and a later retry.
 These public identifiers prevent accidental foreign-file use; they are not
 cryptographic identity or protection against a hostile owner of the same UID.
 
@@ -117,7 +129,8 @@ handles for codec/golden, malformed/forged fields, exact byte limits, reopened
 receipts, identical/conflicting concurrent retries, capacity races, immutable
 destination selection, corruption retention, privacy/symlinks and unchanged
 foreign-file bytes/SHA, copied-header wrong schemas/triggers, bounded lock
-contention and FIFO refusal. It starts no daemon or network client. Tests were written
+contention and FIFO refusal, actual abrupt-child-exit rollback recovery, and
+hot-journal foreign-schema byte preservation. It starts no daemon or network client. Tests were written
 first in source; red execution was unavailable because the external author had
 no admitted native build recipe. Compilation and behavioral execution belong to
 CI plus independent review, not the standalone formatter.
