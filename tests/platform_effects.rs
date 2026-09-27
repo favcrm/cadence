@@ -940,6 +940,55 @@ fn agent_requests_scoped_to_owner_pm_and_operator() {
     assert_eq!(own["requests"], json!([]));
 }
 
+#[test]
+fn cad631_app_pending_requests_do_not_grant_material_to_routing_pm() {
+    let d = Daemon::start(HashMap::new());
+    let mut pm = Lane::spawn_as(&d, "routing-pm", None, "pm");
+    let mut worker = Lane::spawn_as(
+        &d,
+        "request-worker",
+        Some(r#"{"broker_approvals":true,"upstream":"routing-pm"}"#),
+        "worker",
+    );
+    const PRIVATE: &str = "cad631-private-pending-request";
+    worker.rpc(&d, "request_open", json!({"alias":"request-worker", "request":"private-request", "tool":"bash", "input_summary":PRIVATE})).unwrap();
+    let request = json!({"alias":"request-worker"});
+    assert!(
+        pm.rpc(&d, "agent_requests", request.clone())
+            .unwrap()
+            .to_string()
+            .contains(PRIVATE),
+        "legacy PM positive control did not expose the actual pending input"
+    );
+
+    // Persist the historical assignment seam only; the real pending
+    // request above remains intact across the authority change.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('request-app-job','app-run','routing-pm','completed',1,1);
+        INSERT INTO tasks(id,job_id,assignee,state,created,updated) VALUES('request-app-task','request-app-job','request-worker','completed',1,1);
+        INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('request-app-job','app-install',1,'digest','{}','digest','routing-pm','request-private','succeeded',1,1);
+        INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('request-app-job','s1','request-app-task','{}','identity','succeeded');").unwrap();
+    for result in [
+        pm.rpc(&d, "agent_requests", request.clone()),
+        worker.rpc(&d, "agent_requests", request.clone()),
+    ] {
+        let error = refused(result);
+        assert!(error.contains("operator"), "{error}");
+        assert!(!error.contains(PRIVATE));
+    }
+    // Replacing the PM process under the same routing alias creates no
+    // material authority, even though effective_pm still names it.
+    pm.child.kill().unwrap();
+    pm.child.wait().unwrap();
+    let mut replacement = Lane::spawn_as(&d, "routing-pm", None, "pm");
+    assert!(refused(replacement.rpc(&d, "agent_requests", request.clone())).contains("operator"));
+    assert!(d
+        .op("agent_requests", request)
+        .unwrap()
+        .to_string()
+        .contains(PRIVATE));
+}
+
 /// An agent may retire its own waiting row; it may not retire a row in
 /// `reconcile` — that state is exactly the ambiguity only a human
 /// resolves (§5.4 step 8).
