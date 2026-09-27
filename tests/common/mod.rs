@@ -1073,6 +1073,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         slots: Some(cadence_agent::slots::SlotConfig::default()),
         slot_clock: None,
         release_shutdown_snapshot: None,
+        #[cfg(feature = "test-seam")]
+        after_done_write_failure: None,
         // CAD-199: the agent-gc timer stays off unless a test pins it.
         agent_gc: Some(daemon::AgentGcSetting::default()),
         // CAD-96: idle auto-stop is ON by default in production; test
@@ -4754,7 +4756,17 @@ impl LoopFixture {
     /// [`Self::dispatched`] from `plan` (epic D-1, first ticket D-2).
     /// The project's repo has the GitHub remote the loop's PRs live in.
     pub fn dispatched_plan(plan_md: &str) -> LoopFixture {
-        let f = PlanFixture::start_routed();
+        Self::dispatched_plan_with(
+            plan_md,
+            daemon::ServeOptions {
+                report_router: Some(1),
+                ..daemon_opts()
+            },
+        )
+    }
+
+    pub fn dispatched_plan_with(plan_md: &str, opts: daemon::ServeOptions) -> LoopFixture {
+        let f = PlanFixture::start_with(opts);
         let yaml = f.pm_dir.join("demo/project.yaml");
         let text = std::fs::read_to_string(&yaml).unwrap();
         let mut project: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();

@@ -424,6 +424,8 @@ pub struct Shared {
     /// cost tiers from — the pi-devin cache file wins fresh every call;
     /// only the spawned CLI path memoizes ([`crate::devin_catalog`]).
     devin_catalog: crate::devin_catalog::CatalogCache,
+    #[cfg(feature = "test-seam")]
+    after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Shared {
@@ -561,6 +563,8 @@ impl Shared {
             outbox_dir: opts.outbox_dir.clone(),
             lease,
             seam,
+            #[cfg(feature = "test-seam")]
+            after_done_write_failure: opts.after_done_write_failure.clone(),
             devin_catalog: crate::devin_catalog::CatalogCache::default(),
         });
         // Holds dropped by boot-time revalidation get their release
@@ -3433,6 +3437,10 @@ pub struct ServeOptions {
     /// waits on the same barrier so the marker is written after that
     /// detach.
     pub release_shutdown_snapshot: Option<Arc<Barrier>>,
+    /// Test-only scheduling of a second writer after the failed done
+    /// transaction releases its tracker lock. Never present in release.
+    #[cfg(feature = "test-seam")]
+    pub after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
     /// CAD-199 agent-gc timer: `Some` is verbatim (tests keep daemons
     /// hermetic this way); `None` reads `[host]
     /// agent_gc_older_than_secs` from pm.yaml each check — unset is off.

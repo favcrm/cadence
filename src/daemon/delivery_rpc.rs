@@ -862,6 +862,10 @@ impl Shared {
             }
             Ok(Some(status)) => TicketDone::Kept { status },
             Err(e) => {
+                #[cfg(feature = "test-seam")]
+                if let Some(pause) = &self.after_done_write_failure {
+                    pause();
+                }
                 let why = e.to_string();
                 notices.push(Notice {
                     issue: id.clone(),
