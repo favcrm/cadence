@@ -238,7 +238,6 @@ impl Shared {
             .app_binding_for_slot(install, context, slot)?
             .ok_or_else(|| Error::rejected("publication binding is absent or revoked"))?;
         if current.id != proof.id
-            || current.revision != proof.revision
             || current.digest != proof.digest
             || current.config != proof.config
         {
