@@ -207,3 +207,123 @@ fn cad688_concurrent_rotate_revoke_cannot_retarget_a_replacement() {
         next
     );
 }
+
+struct PausedDescriptor {
+    inner: FakePlatform,
+    pause: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::Sender<()>,
+    release: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+impl cadence_agent::platform::PlatformAdapter for PausedDescriptor {
+    fn table(&self) -> &cadence_agent::contract_fixture::ToolTable {
+        self.inner.table()
+    }
+    fn reported_manifest_version(&self) -> Option<String> {
+        self.inner.reported_manifest_version()
+    }
+    fn connection_descriptor(
+        &self,
+    ) -> Option<cadence_agent::platform::connections::ProviderDescriptor> {
+        if self.pause.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            let (lock, cv) = &self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+        }
+        self.inner.connection_descriptor()
+    }
+    fn connection_registration(&self) -> Option<String> {
+        self.inner.connection_registration()
+    }
+    fn preview(&self, account: &str, tool: &str, input: &Value) -> String {
+        self.inner.preview(account, tool, input)
+    }
+    fn execute(
+        &self,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        key: &str,
+        hash: Option<&str>,
+    ) -> Result<Value, String> {
+        self.inner.execute(credential, tool, input, key, hash)
+    }
+    fn read_back(&self, tool: &str, input: &Value) -> cadence_agent::contract_fixture::Verified {
+        self.inner.read_back(tool, input)
+    }
+    fn source_hash(&self, agent: &str, source: &str) -> Option<String> {
+        self.inner.source_hash(agent, source)
+    }
+}
+#[test]
+fn cad688_resolved_old_id_cannot_rotate_reenrolled_account() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let adapter = Arc::new(PausedDescriptor {
+        inner: FakePlatform::standard(),
+        pause: std::sync::atomic::AtomicBool::new(false),
+        entered: entered_tx,
+        release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let mut opts = daemon_opts();
+    opts.test_seam = false;
+    opts.platforms.insert("fixture".into(), adapter.clone());
+    let d = TestDaemon::start_opts(opts);
+    let first = d
+        .operator_rpc(
+            "connection_create",
+            create("paused-account", "cadp_paused_original"),
+        )
+        .unwrap();
+    let id = first["connection"]["id"].clone();
+    adapter
+        .pause
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::scope(|scope| {
+        let rotate = scope.spawn(|| {
+            d.operator_rpc(
+                "connection_rotate",
+                json!({"connection_id":id,"token":"cadp_paused_stale"}),
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        d.operator_rpc("connection_revoke", json!({"connection_id":id}))
+            .unwrap();
+        let replacement = d
+            .operator_rpc(
+                "connection_create",
+                create("paused-account", "cadp_paused_replacement"),
+            )
+            .unwrap();
+        assert_ne!(replacement["connection"]["id"], id);
+        *adapter.release.0.lock().unwrap() = true;
+        adapter.release.1.notify_all();
+        assert!(rotate.join().unwrap().is_err());
+        assert_eq!(
+            d.operator_rpc(
+                "connection_show",
+                json!({"connection_id":replacement["connection"]["id"]})
+            )
+            .unwrap(),
+            replacement,
+            "stale resolved ID changed replacement metadata"
+        );
+        let custody = cadence_agent::platform::Custody::open(&d.state).unwrap();
+        assert_eq!(
+            custody
+                .load(
+                    "file",
+                    &cadence_agent::platform::Key {
+                        platform: "fixture",
+                        account: "paused-account"
+                    }
+                )
+                .unwrap(),
+            b"cadp_paused_replacement",
+            "stale resolved ID changed replacement bytes"
+        );
+    });
+}
