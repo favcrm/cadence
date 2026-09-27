@@ -19,6 +19,9 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const Wiki = (require("../src/features/wiki/Wiki") as typeof import("../src/features/wiki/Wiki")).default;
 const Context = (require("../src/features/projects/Context") as typeof import("../src/features/projects/Context")).default;
+const UploadPane = (require("../src/features/wiki/UploadPane") as typeof import("../src/features/wiki/UploadPane")).default;
+const FolderPane = (require("../src/features/wiki/FolderPane") as typeof import("../src/features/wiki/FolderPane")).default;
+const { WikiScopeContext } = require("../src/features/wiki/shared") as typeof import("../src/features/wiki/shared");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
 const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeof import("../src/features/wiki/editor");
@@ -204,6 +207,94 @@ async function run() {
   assert(host.querySelectorAll(".wk-bar").length === 1 && host.querySelectorAll("h1").length === 1, "global Wiki uses the same single-toolbar reader");
   assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent?.trim() === "Files"), "global Wiki uses the same collapsible explorer");
   assert(Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Edit")?.disabled, "shared reader respects read-only access in Wiki");
+
+  const apiModule = require("../src/features/wiki/api");
+  const originalUpload = apiModule.uploadFile;
+  const uploads: string[] = [];
+  apiModule.uploadFile = async (_dir: string, file: File) => { uploads.push(file.name); };
+  await React.act(async () => {
+    view.render(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
+    await flush();
+  });
+  await React.act(async () => {
+    const drop = new win.Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", { value: { files: [new win.File(["notes"], "notes.md")] } });
+    host.querySelector(".wk-dropwrap")?.dispatchEvent(drop);
+    await flush();
+  });
+  assert(uploads.length === 0 && !host.querySelector(".wk-uprow"), "a read-only file drop neither queues nor starts an upload");
+  const uploadProps = { dir: "projects/cadence", navHref: () => "/", readOnly: false, onToast: () => {}, onUploaded: () => {} };
+  let releaseUpload: (() => void) | null = null;
+  apiModule.uploadFile = async (_dir: string, file: File) => {
+    uploads.push(file.name);
+    if (uploads.length === 1) await new Promise<void>((resolve) => { releaseUpload = resolve; });
+  };
+  await React.act(() => view.render(React.createElement(UploadPane, uploadProps)));
+  const choose = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Choose files");
+  const picker = host.querySelector("input[type='file']");
+  assert(choose && picker, "upload has a native Choose files button");
+  let pickerOpened = false;
+  picker.addEventListener("click", () => { pickerOpened = true; });
+  await React.act(() => choose.click());
+  assert(pickerOpened, "Choose files opens the native picker");
+  await React.act(async () => {
+    Object.defineProperty(picker, "files", { configurable: true, value: [new win.File(["one"], "one.md"), new win.File(["two"], "two.md")] });
+    picker.dispatchEvent(new win.Event("change", { bubbles: true }));
+    await flush();
+  });
+  const clearUploads = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Clear completed uploads");
+  assert(Number(uploads.length) === 1 && clearUploads?.disabled, "uploads are sequential and an active queue cannot be cleared");
+  await React.act(() => view.render(React.createElement(UploadPane, { ...uploadProps, readOnly: true })));
+  await React.act(async () => { releaseUpload?.(); await flush(); });
+  assert(Number(uploads.length) === 1, "becoming read-only pauses remaining queued uploads");
+  await React.act(async () => { view.render(React.createElement(UploadPane, uploadProps)); await flush(); });
+  await React.act(flush);
+  assert(uploads.join(",") === "one.md,two.md" && host.querySelectorAll(".wk-uprow.done").length === 2 && !clearUploads.disabled, "the queue resumes without losing either completed row");
+  await React.act(() => clearUploads.click());
+  assert(!host.querySelector(".wk-uprow"), "completed uploads can be cleared");
+  apiModule.uploadFile = originalUpload;
+
+  const folderErrors: string[] = [];
+  const folderProps = { entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
+  const renderFolder = async (readOnly = false) => {
+    await React.act(() => view.render(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
+  };
+  await renderFolder();
+  assert(host.querySelector(".wk-flist") && host.querySelector("[aria-label='List view']")?.getAttribute("aria-pressed") === "true", "folder defaults to a compact list");
+  const actions = host.querySelector<HTMLButtonElement>("[aria-label='README.md actions']");
+  assert(actions, "each file has an action button");
+  await React.act(() => actions.click());
+  assert(actions.getAttribute("aria-expanded") === "true" && host.querySelector(".wk-fmenu"), "file actions announce their expanded state");
+  await React.act(() => window.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  assert(!host.querySelector(".wk-fmenu") && document.activeElement === actions, "Escape closes file actions and returns focus to the trigger");
+  await React.act(() => actions.click());
+  const rename = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Rename");
+  assert(rename, "Rename is offered for a page");
+  await React.act(() => rename.click());
+  const name = host.querySelector<HTMLInputElement>("input[name='name']");
+  assert(name && host.querySelector("label")?.htmlFor === name.id && host.textContent?.includes("Rename README.md"), "Rename identifies the file and labels its input");
+  const beforeRename = writes.length;
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")?.set?.call(name, "brief.md");
+    name.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { host.querySelector("form")?.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); await flush(); });
+  assert(writes[beforeRename]?.from === pagePath && writes[beforeRename]?.to === "projects/cadence/brief.md", "submitting Rename keeps the page in its folder");
+  await React.act(() => actions.click());
+  const move = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Move");
+  assert(move, "Move is offered for a page");
+  await React.act(() => move.click());
+  const destination = host.querySelector<HTMLInputElement>("input[name='destination']");
+  assert(destination && destination.getAttribute("aria-describedby") && host.querySelector("label")?.htmlFor === destination.id, "Move labels and explains the destination path");
+  const beforeMove = writes.length;
+  await React.act(() => {
+    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")?.set?.call(destination, "projects/other/private.md");
+    destination.dispatchEvent(new win.Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { host.querySelector("form")?.dispatchEvent(new win.Event("submit", { bubbles: true, cancelable: true })); await flush(); });
+  assert(writes.length === beforeMove && folderErrors.some((error) => error.includes("inside this project")), "Move cannot leave the selected project's context");
+  await renderFolder(true);
+  assert(host.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled && destination.disabled, "an open file form becomes disabled when the board is read-only");
   await React.act(() => view.unmount());
   console.log("project Wiki interaction checks passed");
 }
