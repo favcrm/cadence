@@ -33,6 +33,7 @@ mod memory;
 mod message;
 mod milestone;
 mod monitor;
+mod org;
 mod overview;
 mod plan;
 mod platform;
@@ -122,6 +123,12 @@ pub(crate) struct Cli {
     /// Runtime state directory (socket, database, logs).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
+    /// Organization label for this command only.
+    #[arg(long, global = true)]
+    org: Option<String>,
+    /// Named connection within the selected organization.
+    #[arg(long, global = true)]
+    connection: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -138,6 +145,11 @@ pub(crate) enum ReviewAction {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Manage organization and connection defaults.
+    Org {
+        #[command(subcommand)]
+        action: org::OrgAction,
+    },
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
     /// WAL growth, per-user pipe pressure, orphaned processes from
@@ -3219,10 +3231,11 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
-    let state_dir = match &cli.state_dir {
-        Some(dir) => dir.clone(),
-        None => client::state_dir()?,
-    };
+    if let Commands::Org { action } = cli.command {
+        let proof_state = cli.state_dir.unwrap_or(client::state_dir()?);
+        return org::run(action, &proof_state, cli.connection);
+    }
+    let state_dir = org::resolve(cli.org.as_deref(), cli.connection.as_deref(), cli.state_dir.clone())?;
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
@@ -3235,6 +3248,7 @@ pub(crate) fn run() -> Result<i32> {
         return Ok(code);
     }
     match cli.command {
+        Commands::Org { .. } => unreachable!("org dispatched before destination resolution"),
         Commands::Doctor {
             host,
             json,

@@ -1,0 +1,295 @@
+//! CAD-657: destination isolation is observable at the actual Unix RPC peer.
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::process::{Command, Output};
+
+fn cli(root: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("legacy"))
+        .env_remove("CADENCE_HOME")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_PROFILE")
+        .env_remove("CADENCE_ALIAS")
+        .args(args)
+        .output()
+        .unwrap()
+}
+fn ok(root: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let out = cli(root, args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+fn add(root: &std::path::Path, name: &str) {
+    let state = root.join(name).join("state");
+    let tracker = root.join(name).join("tracker");
+    ok(
+        root,
+        &[
+            "org",
+            "add",
+            name,
+            "--local-state-dir",
+            state.to_str().unwrap(),
+            "--tracker-dir",
+            tracker.to_str().unwrap(),
+        ],
+    );
+}
+fn peer(root: &std::path::Path, name: &str) -> std::thread::JoinHandle<()> {
+    let state = root.join(name).join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let socket = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = socket.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "agent_list");
+        writeln!(
+            stream,
+            "{{\"ok\":true,\"result\":{{\"agents\":[],\"destination\":\"{name}\"}}}}",
+            name = state
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+        .unwrap();
+    })
+}
+#[test]
+fn local_selection_and_explicit_override_reach_only_selected_peer() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "first");
+    add(root.path(), "second");
+    ok(root.path(), &["org", "switch", "first"]);
+    let first = peer(root.path(), "first");
+    assert_eq!(
+        ok(root.path(), &["agent", "list", "--json"])["destination"],
+        "first"
+    );
+    first.join().unwrap();
+    let second = peer(root.path(), "second");
+    assert_eq!(
+        ok(root.path(), &["--org", "second", "agent", "list", "--json"])["destination"],
+        "second"
+    );
+    second.join().unwrap();
+    assert_eq!(ok(root.path(), &["org", "inspect"])["org"], "first");
+}
+#[test]
+fn remote_selection_and_missing_local_peer_never_fall_back() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "local");
+    ok(
+        root.path(),
+        &[
+            "org",
+            "add",
+            "acme",
+            "--connection",
+            "cloud",
+            "--endpoint",
+            "https://example.com",
+            "--org-id",
+            "company-acme",
+        ],
+    );
+    ok(
+        root.path(),
+        &["org", "switch", "acme", "--connection", "cloud"],
+    );
+    let out = cli(root.path(), &["agent", "list", "--json"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("remote transport is not implemented"));
+    let out = cli(root.path(), &["--org", "local", "agent", "list", "--json"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("/local/state/cadence.sock"));
+}
+#[test]
+fn managed_state_pin_survives_default_switch_and_reconnect() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "original");
+    add(root.path(), "new");
+    ok(root.path(), &["org", "switch", "new"]);
+    let original = peer(root.path(), "original");
+    let out = Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("CADENCE_STATE_DIR", root.path().join("original/state"))
+        .env("CADENCE_PM_DIR", root.path().join("original/tracker"))
+        .env_remove("CADENCE_HOME")
+        .args(["agent", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["destination"],
+        "original"
+    );
+    original.join().unwrap();
+}
+
+#[test]
+fn agent_and_detached_child_cannot_change_defaults_even_with_forged_state() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "first");
+    ok(root.path(), &["org", "switch", "first"]);
+    for detached in [false, true] {
+        let mut command = if detached {
+            let mut c = Command::new("setsid");
+            c.arg(env!("CARGO_BIN_EXE_cadence"));
+            c
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_cadence"))
+        };
+        let out = command
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("CADENCE_ALIAS", "worker")
+            .env_remove("CADENCE_HOME")
+            .env_remove("CADENCE_PM_DIR")
+            .args([
+                "--state-dir",
+                root.path().join("forged").to_str().unwrap(),
+                "org",
+                "switch",
+                "first",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("operator action"));
+    }
+}
+
+#[test]
+fn concurrent_adds_preserve_both_connections() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| add(root.path(), "first"));
+        scope.spawn(|| add(root.path(), "second"));
+    });
+    assert_eq!(
+        ok(root.path(), &["org", "list"])["connections"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn selected_tracker_is_isolated_and_switch_does_not_move_inflight_rpc() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "first");
+    add(root.path(), "second");
+    ok(root.path(), &["org", "switch", "first"]);
+    assert_eq!(
+        ok(root.path(), &["issue", "init"])["pm_dir"],
+        root.path().join("first/tracker").to_str().unwrap()
+    );
+    assert!(!root.path().join("second/tracker").exists());
+    let state = root.path().join("first/state");
+    std::fs::create_dir_all(&state).unwrap();
+    let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let peer = scope.spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            ready_tx.send(()).unwrap();
+            finish_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            writeln!(
+                stream,
+                "{{\"ok\":true,\"result\":{{\"agents\":[],\"destination\":\"first\"}}}}"
+            )
+            .unwrap();
+        });
+        let command = scope.spawn(|| ok(root.path(), &["agent", "list", "--json"]));
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        ok(root.path(), &["org", "switch", "second"]);
+        finish_tx.send(()).unwrap();
+        assert_eq!(command.join().unwrap()["destination"], "first");
+        peer.join().unwrap();
+    });
+    assert_eq!(
+        ok(root.path(), &["issue", "init"])["pm_dir"],
+        root.path().join("second/tracker").to_str().unwrap()
+    );
+}
+
+#[test]
+fn explicit_org_conflicts_with_pinned_env_and_registry_rejects_unsafe_paths() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "first");
+    let out = Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("CADENCE_STATE_DIR", root.path().join("pinned/state"))
+        .args(["--org", "first", "agent", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("conflict"));
+    let out = cli(
+        root.path(),
+        &[
+            "org",
+            "add",
+            "unsafe",
+            "--local-state-dir",
+            "/tmp/../other",
+            "--tracker-dir",
+            "/tmp/tracker",
+        ],
+    );
+    assert!(!out.status.success());
+    assert_eq!(
+        ok(root.path(), &["org", "list"])["connections"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
