@@ -5,7 +5,7 @@ use crate::proto::identifier;
 use crate::store::CredentialRecord;
 
 impl Shared {
-    fn connection_descriptor(
+    pub(super) fn connection_descriptor(
         &self,
         provider: &str,
     ) -> Result<crate::platform::connections::ProviderDescriptor> {
@@ -74,7 +74,7 @@ impl Shared {
         projection["status"]["custody_available"] = json!([false, true]);
         Ok(projection)
     }
-    fn connection_list_locked(&self) -> Result<Vec<Value>> {
+    pub(super) fn connection_list_locked(&self) -> Result<Vec<Value>> {
         let mut rows = vec![self.connection_record("local", "local", None)?];
         for (provider, adapter) in &self.platforms {
             if let Some(descriptor) = adapter.connection_descriptor() {

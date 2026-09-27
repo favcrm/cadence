@@ -333,7 +333,7 @@ impl Store {
         match agent {
             Some(agent) => {
                 let mut stmt = conn.prepare(
-                    "SELECT * FROM platform_effects WHERE agent=?1 \
+                    "SELECT * FROM platform_effects WHERE agent=?1 AND authorization_kind='agent_grant' \
                      ORDER BY staged_at, effect_id",
                 )?;
                 for r in stmt.query_map(params![agent], EffectRow::from_row)? {
@@ -342,7 +342,7 @@ impl Store {
             }
             None => {
                 let mut stmt =
-                    conn.prepare("SELECT * FROM platform_effects ORDER BY staged_at, effect_id")?;
+                    conn.prepare("SELECT * FROM platform_effects WHERE authorization_kind='agent_grant' ORDER BY staged_at, effect_id")?;
                 for r in stmt.query_map([], EffectRow::from_row)? {
                     out.push(r?);
                 }
