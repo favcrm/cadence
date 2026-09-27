@@ -88,6 +88,17 @@ and symlinked object/pack directories or pack files. Prepare an ordinary owned
 offline repository separately; the rehearsal never repairs these layouts or
 modifies the original to make it acceptable.
 
+Submodules are unsupported too. Refuse `.git/modules` before config discovery
+and reject every mode-160000 gitlink in the admitted top repository's index
+before status or clone. The index probe uses nonrecursive `ls-files --stage -z`
+with optional locks/fsmonitor/split-index writes disabled; it does not enter the
+child or call the central admission method recursively. This covers old-form
+embedded repositories and external child gitdirs without a modules directory,
+as well as ordinary initialized submodules. It also applies to recorded-path
+repositories and is not implemented by ignoring dirty submodules. See Git's
+[submodule forms](https://git-scm.com/docs/gitsubmodules#_forms) and
+[ls-files options](https://git-scm.com/docs/git-ls-files#_options).
+
 Before repository Git may load config, Git parses only key names from the
 admitted config file using `config --no-includes --file ... --name-only --list`
 in private nonrepository scratch. No config values enter evidence. Includes and

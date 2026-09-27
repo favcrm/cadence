@@ -249,6 +249,12 @@ def guard_git_repo(iso, directory, roots):
             raise UnsupportedGitLayout('symlinked, linked or special repository metadata is unsupported')
         if path.parent == gitdir / 'hooks' and not path.name.endswith('.sample'):
             raise UnsupportedGitLayout('active repository hooks are unsupported')
+        if path == gitdir / 'modules':
+            raise UnsupportedGitLayout('repository submodule metadata is unsupported')
+        if path.parent == gitdir and path.name.startswith('sharedindex.'):
+            # Even nonrecursive ls-files updates a shared-index mtime when
+            # loading it. Refuse before the index admission probe below.
+            raise UnsupportedGitLayout('repository uses a split index and is unsupported')
         if path != gitdir and (path.name == 'commondir' or path == gitdir / 'objects/info/alternates'):
             raise UnsupportedGitLayout('common directories and object alternates are unsupported')
     config = gitdir / 'config'
@@ -273,6 +279,21 @@ def guard_git_repo(iso, directory, roots):
             branch = name.startswith('branch.') and name.rsplit('.', 1)[-1] in {'remote', 'merge'}
             if name not in allowed and not remote and not branch:
                 raise UnsupportedGitLayout('Git config key is outside the conservative allowlist')
+    # status may spawn a child reader for an initialized gitlink. That child
+    # can have an old-form .git directory or an external gitdir even when
+    # the parent's .git/modules directory is absent. Probe the admitted top
+    # index only, never recurse into children or call iso.run (which would
+    # recurse into this admission). No filenames/config values are emitted.
+    listed = subprocess.run(
+        ['git', '--no-optional-locks', '-C', str(gitdir.parent),
+         '-c', 'core.fsmonitor=false', '-c', 'gc.auto=0',
+         '-c', 'core.splitIndex=false', 'ls-files', '--stage', '-z'],
+        capture_output=True, check=False, env=iso.env(),
+        stdin=subprocess.DEVNULL, cwd=iso.scratch)
+    if listed.returncode:
+        raise UnsupportedGitLayout('repository index cannot be admitted')
+    if any(entry.startswith(b'160000 ') for entry in listed.stdout.split(b'\0')):
+        raise UnsupportedGitLayout('repository submodule gitlinks are unsupported')
     return gitdir
 
 

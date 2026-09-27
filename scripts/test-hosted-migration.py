@@ -775,6 +775,107 @@ class MigrationTests(unittest.TestCase):
 
     # ---------- real CLI ----------
 
+    def test_initialized_submodules_refuse_before_child_config_reader(self):
+        for context in ('tracker', 'recorded_path'):
+            for layout in ('modules', 'old_form', 'external_gitdir'):
+                with self.subTest(context=context, layout=layout):
+                    f = MigrationTests()
+                    f.setUp()
+                    self.addCleanup(f.doCleanups)
+                    repo = f.tracker if context == 'tracker' else f.make_repo(f.source / 'inner')
+                    child_source = f.make_repo(f.root / 'child-source')
+                    child = repo / 'sub'
+                    if layout == 'modules':
+                        f.git(repo, '-c', 'protocol.file.allow=always', 'submodule',
+                              'add', '-q', child_source.as_uri(), 'sub')
+                        f.git(repo, 'config', '--remove-section', 'submodule.sub')
+                        child_gitdir = repo / '.git/modules/sub'
+                    else:
+                        f.make_repo(child)
+                        sha = f.git(child, 'rev-parse', 'HEAD')
+                        f.git(repo, 'update-index', '--add', '--cacheinfo', f'160000,{sha},sub')
+                        child_gitdir = child / '.git'
+                        if layout == 'external_gitdir':
+                            external = f.root / 'external-child-gitdir'
+                            child_gitdir.rename(external)
+                            child_gitdir.write_text(f'gitdir: {external}\n')
+                            child_gitdir = external
+                        self.assertFalse((repo / '.git/modules').exists())
+                    f.git(repo, '-c', 'user.name=Rehearsal', '-c', 'user.email=rehearsal@example.invalid',
+                          '-c', 'core.hooksPath=/dev/null', 'commit', '-qam', 'gitlink fixture')
+                    outside = f.root / 'outside-child-config'
+                    outside.write_text('[user]\n name = Synthetic outside child configuration\n')
+                    with (child_gitdir / 'config').open('a') as config:
+                        config.write(f'\n[include]\n path = {outside}\n')
+                    # Non-vacuous child-config witness; top-level config has no
+                    # submodule keys, and the parent is genuinely clean.
+                    self.assertEqual(f.git(child, 'config', 'user.name'), 'Synthetic outside child configuration')
+                    self.assertEqual(f.git(repo, 'status', '--porcelain'), '')
+                    self.assertIn('160000 ', f.git(repo, 'ls-files', '--stage'))
+                    if context == 'recorded_path':
+                        with sqlite3.connect(f.db) as db:
+                            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('child-parent', str(repo)))
+                    before = git_inventory(repo)
+                    calls = []
+                    real = subprocess.run
+                    def observed(args, *a, **kw):
+                        calls.append(tuple(str(arg) for arg in args))
+                        return real(args, *a, **kw)
+                    with patch.object(migration.subprocess, 'run', side_effect=observed):
+                        with self.assertRaisesRegex(ValueError, 'submodule'):
+                            migration.rehearse('/usr/bin/true', f.source, f.tracker,
+                                               f.root / 'out', dry_run=True)
+                    self.assertFalse(any('-C' in call and call[call.index('-C') + 1] == str(repo)
+                                         and ('status' in call or 'clone' in call) for call in calls), calls)
+                    self.assertFalse(any('-C' in call and call[call.index('-C') + 1] == str(child)
+                                         for call in calls), calls)
+                    self.assertEqual(git_inventory(repo), before)
+                    self.assertFalse((f.root / 'out').exists())
+
+    def test_recorded_split_index_refuses_before_index_admission_probe(self):
+        repo = self.make_repo(self.source / 'split-recorded-repo')
+        self.git(repo, 'update-index', '--split-index')
+        shared = list((repo / '.git').glob('sharedindex.*'))
+        self.assertTrue(shared)
+        for path in shared:
+            stamp = path.stat().st_mtime_ns - 5_000_000_000
+            os.utime(path, ns=(stamp, stamp))
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('split', str(repo)))
+        before = git_inventory(repo)
+        calls = []
+        real = subprocess.run
+        def observed(args, *a, **kw):
+            calls.append(tuple(str(arg) for arg in args))
+            return real(args, *a, **kw)
+        with patch.object(migration.subprocess, 'run', side_effect=observed):
+            with self.assertRaisesRegex(ValueError, 'split index'):
+                migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                                   self.root / 'out', dry_run=True)
+        self.assertFalse(any('-C' in call and call[call.index('-C') + 1] == str(repo)
+                             for call in calls), calls)
+        self.assertEqual(git_inventory(repo), before)
+        # The new safe-looking probe would still touch a live shared index
+        # without early refusal, independently of status/optional locks.
+        subprocess.run(['git', '--no-optional-locks', '-C', str(repo),
+                        '-c', 'core.fsmonitor=false', '-c', 'gc.auto=0',
+                        '-c', 'core.splitIndex=false', 'ls-files', '--stage', '-z'],
+                       check=True, capture_output=True, env=self.iso.env(), cwd=self.iso.scratch)
+        self.assertNotEqual(git_inventory(repo), before)
+
+    def test_recorded_config_only_split_index_preserves_whole_metadata(self):
+        repo = self.make_repo(self.source / 'full-recorded-repo')
+        self.git(repo, 'config', 'core.splitIndex', 'true')
+        self.assertFalse(list((repo / '.git').glob('sharedindex.*')))
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)', ('full', str(repo)))
+        before = git_inventory(repo)
+        plan = migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                                 self.root / 'out', dry_run=True)
+        self.assertEqual(plan['recorded_checkout_paths'], [str(repo)])
+        self.assertEqual(git_inventory(repo), before)
+        self.assertFalse((self.root / 'out').exists())
+
     @unittest.skipUnless(os.environ.get('CADENCE_REHEARSAL_BINARY'), 'real CLI binary not supplied')
     def test_real_export_restore_and_tracker_snapshot(self):
         self.live_shaped()
