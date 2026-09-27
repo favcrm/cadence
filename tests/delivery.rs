@@ -3238,7 +3238,7 @@ fn delivery_failed_done_write_does_not_adopt_a_second_writers_status() {
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let release_rx = Mutex::new(release_rx);
     let paused = AtomicBool::new(false);
-    let lf = LoopFixture::dispatched_plan_with(
+    let mut lf = LoopFixture::dispatched_plan_with(
         LOOP_PLAN,
         daemon::ServeOptions {
             report_router: Some(1),
@@ -3281,7 +3281,7 @@ fn delivery_failed_done_write_does_not_adopt_a_second_writers_status() {
 
 #[test]
 fn delivery_busy_before_status_read_requires_operator_resolution() {
-    let lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
     let head = "a".repeat(40);
     lf.pass_on("D-2", &head, LOOP_PR);
     let lock = lf.f.pm_dir.join(".write.lock");
@@ -3299,7 +3299,7 @@ fn delivery_busy_before_status_read_requires_operator_resolution() {
 
 #[test]
 fn delivery_permanent_done_write_failure_stops_after_three_attempts() {
-    let lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
     let head = "a".repeat(40);
     lf.pass_on("D-2", &head, LOOP_PR);
     let (hook, runs) = refuse_done_commits(&lf);
