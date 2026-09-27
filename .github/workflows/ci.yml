@@ -139,6 +139,8 @@ jobs:
         run: python3 tests/scripts/test_nextest_inventory.py
       - name: Test focused ordinary feedback
         run: python3 tests/scripts/test_test_feedback.py
+      - name: Test assertion inventory scanner
+        run: python3 tests/scripts/test_assert_inventory.py
 
   clippy:
     needs: [queue-evidence]
