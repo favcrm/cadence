@@ -1,4 +1,6 @@
 import { resources } from "../../lib/resources";
+import { useEffect, useState } from "react";
+import { workspaceApps, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import Link from "../../ui/Link";
@@ -26,7 +28,7 @@ import "./apps.css";
  * the cards; the empty state names the install command, scoped to the
  * selected project when there is one.
  */
-export default function Apps({ project }: { project: string; viewer: Viewer }) {
+export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
   const state = useQuery(resources.apps);
   // The Needs-you rail's own rows, when the board has read the overview
   // (the app page asks for it; the list never fetches it itself).
@@ -49,6 +51,7 @@ export default function Apps({ project }: { project: string; viewer: Viewer }) {
         failed="could not load apps"
         onRetry={() => void resources.apps.invalidate()}
       />
+      {viewer.operator && !viewer.readOnly && <WorkspaceCatalog />}
       {state.data && rows.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
           No apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
@@ -65,6 +68,42 @@ export default function Apps({ project }: { project: string; viewer: Viewer }) {
       </ul>
     </main>
   );
+}
+
+/** Workspace installations remain visible independently of the legacy project filter. */
+function WorkspaceCatalog() {
+  const [rows, setRows] = useState<Installation[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setRows(null);
+    setError(null);
+    void workspaceApps.installations(controller.signal).then(value => {
+      if (!controller.signal.aborted) setRows(value.filter(row => row.storage_kind === "workspace"));
+    }).catch((cause: unknown) => {
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
+    });
+    return () => controller.abort();
+  }, [revision]);
+  return <section aria-label="Workspace apps" className="mb-5">
+    <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Workspace apps</h2>
+    {error ? <div className="card px-4 py-3 text-label text-ink-400" role="alert">
+      {error} <Button onClick={() => setRevision(value => value + 1)}>Retry</Button>
+    </div> : rows === null ? <p className="text-label text-ink-400" role="status">Loading workspace apps…</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
+      No workspace apps installed. Install a package with <code>cadence app catalog install &lt;path|git-url&gt;</code>.
+    </div> : <ul className="space-y-2.5">{rows.map(row => <li key={row.install_id} className="card px-3.5 py-3 min-w-0">
+      <div className="app-card-layout">
+        <AppIcon label={row.title || row.name} />
+        <div className="min-w-0 flex-1">
+          <Link href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>
+          <span className="chip ml-2">{row.approved === true ? "Approved for drafting" : "Needs approval"}</span>
+          <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
+        </div>
+        <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">Open app</Button>
+      </div>
+    </li>)}</ul>}
+  </section>;
 }
 
 /** A monogram tile — the app's first letter, on the board's accent. */

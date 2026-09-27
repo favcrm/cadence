@@ -33,6 +33,7 @@ const paths: [string, Route][] = [
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
   ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
+  ["/app-installations/install-social", { screen: "workspaceApp", installId: "install-social" }],
   ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
@@ -52,6 +53,10 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
+equal(projectScope({ screen: "workspaceApp", installId: "install-social" }), "none", "workspace app has no project scope");
+for (const path of ["/app-installations", "/app-installations/..", "/app-installations/a%2Fb", "/app-installations/a/extra"]) {
+  equal(matchRoute(path).screen, "notFound", `invalid installation route ${path}`);
+}
 for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
