@@ -50,15 +50,21 @@ async function expectText(locator, text, what) {
 
 /** Open the Needs-you row of `kind` whose title mentions `issue`. */
 async function needRow(page, kind, issue) {
+  // CAD-625 puts operator decisions on the Agent updates panel's
+  // Decisions tab. Open that tab as the operator would.
+  const panel = page.locator('section[aria-label="agent updates"]:visible');
+  await panel.waitFor({ timeout: TIMEOUT });
+  const decisions = panel.getByRole("button", { name: /^Decisions\b/ });
+  if ((await decisions.getAttribute("aria-pressed")) !== "true") await decisions.click();
   // CAD-574 groups PR decisions behind an initially closed disclosure.
   // Follow the same interaction as an operator before locating its row.
   if (kind === "merge_decision") {
-    const group = page.locator('section[aria-label="needs you"] section[data-need-group="prs"]');
+    const group = panel.locator('section[data-need-group="prs"]');
     await group.first().waitFor({ timeout: TIMEOUT });
     const toggle = group.first().locator('button[aria-expanded]').first();
     if ((await toggle.getAttribute("aria-expanded")) === "false") await toggle.click();
   }
-  const row = page.locator(`section[aria-label="needs you"] li[data-need="${kind}"]`, {
+  const row = panel.locator(`li[data-need="${kind}"]`, {
     hasText: issue,
   });
   await row.first().waitFor({ timeout: TIMEOUT });
