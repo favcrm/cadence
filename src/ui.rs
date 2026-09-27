@@ -1936,7 +1936,9 @@ fn write_route(
     // `operator::WRITE_ROUTES` (unlisted: operator-only) before any
     // handler runs; the handlers below check no caller themselves.
     let caller = if path == "/api/app-installations" {
-        operator::Caller::Operator("operator (counterfactual)".into())
+        Some(operator::Caller::Operator(
+            "operator (counterfactual)".into(),
+        ))
     } else {
         match operator::admit(&request, method.as_str(), path, state_dir, opts) {
             Ok(caller) => caller,

@@ -134,7 +134,7 @@ pub(crate) fn install(pm: &Pm, state: &Path, source: &str) -> Result<Value> {
             "the tracker cannot be its own installation source",
         ));
     }
-    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &HashSet::new());
+    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
     let source_root = Root::open(&source_dir)?;
     let files = snapshot(&source_root, Path::new(""), true)?;
     let validated = app::validate_texts(
@@ -246,7 +246,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
     if observed != journal.before_catalog && observed.as_deref() != Some(&journal.after_catalog) {
         return Err(Error::rejected("catalog diverged after install staging; retained journal requires operator investigation"));
     }
-    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &HashSet::new());
+    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
     let validated = app::validate_texts(
         journal
             .files
