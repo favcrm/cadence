@@ -47,6 +47,7 @@ impl Workspace {
 #[test]
 fn cad667_operator_installs_lists_and_inspects_without_project_or_grants() {
     let w = Workspace::new();
+    std::fs::write(w.pm.dir.join("foreign.txt"), "unrelated private draft").unwrap();
     let result = w
         .install()
         .expect("project-free operator install must exist");
@@ -56,6 +57,22 @@ fn cad667_operator_installs_lists_and_inspects_without_project_or_grants() {
     assert!(result["project"].is_null());
     assert_eq!(result["approved"], false);
     assert_eq!(result["committed"], true);
+    assert!(result["foreign_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("foreign.txt")));
+    let committed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&w.pm.dir)
+        .args(["ls-files", "foreign.txt"])
+        .output()
+        .unwrap();
+    assert!(committed.status.success());
+    assert!(
+        committed.stdout.is_empty(),
+        "installation committed unrelated PM dirt"
+    );
     assert!(w
         .pm
         .dir
@@ -357,6 +374,49 @@ fn cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers() {
         Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
         None => std::fs::remove_file(&hook).unwrap(),
     }
+    let journal_path =
+        w.pm.dir
+            .join(".apps/install-journals")
+            .join(format!("{id}.yaml"));
+    let journal_bytes = std::fs::read(&journal_path).unwrap();
+    for mode in ["extra-file", "record-id", "workflow"] {
+        let mut journal: serde_yaml::Value = serde_yaml::from_slice(&journal_bytes).unwrap();
+        match mode {
+            "extra-file" => {
+                journal["files"].as_mapping_mut().unwrap().insert(
+                    serde_yaml::Value::String("../escape.md".into()),
+                    serde_yaml::Value::String("forged".into()),
+                );
+            }
+            "record-id" => {
+                let mut record: serde_yaml::Value =
+                    serde_yaml::from_str(journal["record"].as_str().unwrap()).unwrap();
+                record["install_id"] = serde_yaml::Value::String("foreign-installation".into());
+                journal["record"] =
+                    serde_yaml::Value::String(serde_yaml::to_string(&record).unwrap());
+            }
+            _ => {
+                journal["files"]["workflows/blog-post.md"] =
+                    serde_yaml::Value::String("not a valid reviewed workflow".into());
+            }
+        }
+        std::fs::write(&journal_path, serde_yaml::to_string(&journal).unwrap()).unwrap();
+        assert!(
+            w.daemon
+                .operator_rpc("app_workspace_recover", json!({"install_id":id}))
+                .is_err(),
+            "altered journal accepted: {mode}"
+        );
+        assert_eq!(w.head(), head);
+        assert!(!w
+            .pm
+            .dir
+            .join(".apps/installations")
+            .join(&id)
+            .join("escape.md")
+            .exists());
+    }
+    std::fs::write(&journal_path, journal_bytes).unwrap();
     let recovered = w
         .daemon
         .operator_rpc("app_workspace_recover", json!({"install_id":id}))
