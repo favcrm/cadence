@@ -201,6 +201,8 @@ function RuleWorkspace({
   const [scope, setScope] = useState("");
   const alive = useRef(false);
   const request = useRef(0);
+  const tools = useRef<HTMLDivElement>(null);
+  const restoreAfterWrite = useRef(false);
   const filterId = useId();
   const blocked = useWriteBlock(readOnly);
   const load = useCallback(async () => {
@@ -236,10 +238,19 @@ function RuleWorkspace({
   useEffect(() => {
     setConfirm(null);
   }, [readOnly, query, effect, scope]);
+  useLayoutEffect(() => {
+    if (flight.busy || !restoreAfterWrite.current || (!notice && !actionError))
+      return;
+    restoreAfterWrite.current = false;
+    tools.current
+      ?.querySelector<HTMLButtonElement>(".permission-refresh")
+      ?.focus();
+  }, [flight.busy, notice, actionError]);
   const disabled =
     !!blocked || !!flight.busy || fetching || !!readError || rules === null;
   const revoke = async (rule: MasterPermissionRule) => {
     if (disabled || confirm !== rule.id || !flight.begin(rule.id)) return;
+    restoreAfterWrite.current = true;
     ++request.current;
     setFetching(true);
     setConfirm(null);
@@ -275,7 +286,7 @@ function RuleWorkspace({
   };
   return (
     <>
-      <div className="permissions-tools">
+      <div className="permissions-tools" ref={tools}>
         <div className="permission-filter permission-search">
           <label htmlFor={`${filterId}-query`}>Search rules</label>
           <div className="permission-search-field">
@@ -319,6 +330,7 @@ function RuleWorkspace({
           />
         </div>
         <Button
+          className="permission-refresh"
           icon={<IconRefresh />}
           disabled={!!flight.busy}
           onClick={() => void load()}

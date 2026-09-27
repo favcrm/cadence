@@ -331,6 +331,10 @@ async function main() {
         revoke("allow/a"),
       "Server rejection retains the rule and honest feedback",
     );
+    assert(
+      document.activeElement === button("Refresh rules"),
+      "A rejected revoke returns keyboard focus to refresh",
+    );
     await click(revoke("allow/a"));
     await click(button("Confirm revoke"));
     fail = true;
@@ -345,6 +349,10 @@ async function main() {
     assert(
       revoke("deny/b").disabled,
       "Failed follow-up blocks remaining writes",
+    );
+    assert(
+      document.activeElement === button("Retry rules"),
+      "A committed revoke with failed refresh keeps keyboard focus on retry",
     );
     rules = [sample()[1]];
     fail = false;

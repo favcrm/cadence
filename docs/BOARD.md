@@ -1656,6 +1656,7 @@ Loading, empty, filtered-empty, initial failure and stale observations remain
 distinct and retryable. Read-only operators can inspect and refresh. Revocation
 confirms the precise rule inline, explains that removing a deny removes a
 restriction, prevents concurrent writes and refreshes after the POST settles.
+Cancel returns focus to its rule; settled writes return focus to Refresh/Retry.
 A successful revoke remains distinct from a failed follow-up read; stale data
 cannot revoke another rule. Existing RPC/HTTP operator proofs, API shapes and
 rule policy remain unchanged. Live permission decisions stay in Home.
