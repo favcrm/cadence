@@ -18,6 +18,7 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_runs_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -2605,6 +2606,15 @@ impl Shared {
                 "approvals": self.store.work_approvals()?,
             })),
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
+            "app_local_install_approve"
+            | "app_local_install_revoke"
+            | "app_run_create"
+            | "app_run_approve"
+            | "app_run_cancel"
+            | "app_run_dispatch"
+            | "app_run_show"
+            | "app_run_list"
+            | "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_show" => self.rpc_app_workspace(method, params, peer_pid),

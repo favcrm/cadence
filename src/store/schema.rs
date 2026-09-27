@@ -569,6 +569,12 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 20 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::app_runs::SCHEMA)?;
+            tx.execute("UPDATE schema_version SET version=20", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

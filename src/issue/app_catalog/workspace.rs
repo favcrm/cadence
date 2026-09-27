@@ -482,3 +482,26 @@ pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Val
         json!({"schema":1,"workspace":"default","journal_id":id,"rollback":rollback,"committed":true,"foreign_files":foreign,"executable":false}),
     )
 }
+
+/// Runtime admission uses the same descriptor-confined installation lookup.
+/// The callback runs under PM -> SQLite lock ordering, never the reverse.
+pub(crate) fn with_runtime_snapshot<T>(
+    pm: &Pm,
+    id: &str,
+    callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
+) -> Result<T> {
+    let id = InstallationId::parse(id)?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    no_pending(&root)?;
+    let description = describe(&root, &catalog, &id)?;
+    let (bundle, _) = catalog.installations[&id].paths(&id);
+    let files = snapshot(&root, &bundle, false)?;
+    if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
+        return Err(Error::rejected(
+            "installation changed during runtime admission",
+        ));
+    }
+    callback(&description, &files)
+}

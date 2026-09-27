@@ -1,0 +1,169 @@
+//! Operator-owned local app lifecycle and turn-bound dependency artifacts.
+use super::*;
+use crate::issue::app_catalog::workspace;
+use crate::store::app_runs::LocalWorkflow;
+use std::collections::BTreeMap;
+
+impl Shared {
+    pub(super) fn rpc_app_local(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let allowed: &[&str] = match method {
+            "app_local_install_approve" | "app_local_install_revoke" => &["install_id", "digest"],
+            "app_run_create" => &[
+                "install_id",
+                "workflow",
+                "inputs",
+                "request_id",
+                "owner_pm",
+                "project_link",
+            ],
+            "app_run_approve" => &["run_id", "digest"],
+            "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
+            "app_run_list" => &["install_id"],
+            "app_run_artifact" => &["artifact_id", "message", "token"],
+            _ => return Err(Error::rejected("unknown app lifecycle method")),
+        };
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app lifecycle payload must be an object"))?;
+        if fields.keys().any(|k| !allowed.contains(&k.as_str())) {
+            return Err(Error::rejected(
+                "app lifecycle payload has unsupported fields",
+            ));
+        }
+        if method == "app_run_artifact" && fields.contains_key("message") {
+            let caller = self.agent_caller(peer_pid, "app dependency artifact")?;
+            let AgentCaller::Agent(alias) = caller else {
+                return Err(Error::rejected(
+                    "dependency artifact requires its assigned worker",
+                ));
+            };
+            let message = required_str(params, "message")?;
+            let token = required_str(params, "token")?;
+            if self.store.message(message)?.map(|m| m.alias) != Some(alias) {
+                return Err(Error::rejected("artifact turn belongs to another worker"));
+            }
+            return self.app_artifact_current(
+                required_str(params, "artifact_id")?,
+                Some((message, token)),
+            );
+        }
+        self.operator_connection("app local lifecycle", params, peer_pid)?;
+        match method {
+            "app_local_install_approve" | "app_local_install_revoke" => {
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(
+                    &pm,
+                    required_str(params, "install_id")?,
+                    |row, _| {
+                        let digest = required_str(params, "digest")?;
+                        if row["digest"].as_str() != Some(digest) {
+                            return Err(Error::rejected("installation digest is stale"));
+                        }
+                        self.store.app_capability_decide(
+                            required_str(params, "install_id")?,
+                            digest,
+                            method == "app_local_install_approve",
+                        )
+                    },
+                )
+            }
+            "app_run_create" => {
+                let id = required_str(params, "install_id")?;
+                let name = required_str(params, "workflow")?;
+                if !crate::issue::model::valid_tag(name) {
+                    return Err(Error::rejected("invalid installed workflow name"));
+                }
+                let inputs: BTreeMap<String, String> =
+                    serde_json::from_value(params.get("inputs").cloned().unwrap_or(json!({})))
+                        .map_err(|_| Error::rejected("inputs must be a string map"))?;
+                if serde_json::to_vec(&inputs)
+                    .map_err(|e| Error::internal(e.to_string()))?
+                    .len()
+                    > 32 * 1024
+                {
+                    return Err(Error::rejected("inputs exceed encoded byte limit"));
+                }
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(&pm, id, |row, files| {
+                    let text = files.get(&format!("workflows/{name}.md")).ok_or_else(|| {
+                        Error::rejected("workflow is not in this installed bundle")
+                    })?;
+                    let workflow = LocalWorkflow::parse(text, &inputs)?;
+                    self.store.app_run_create(
+                        id,
+                        row["digest"].as_str().unwrap(),
+                        &workflow,
+                        &inputs,
+                        required_str(params, "request_id")?,
+                        required_str(params, "owner_pm")?,
+                        optional_str(params, "project_link"),
+                    )
+                })
+            }
+            "app_run_approve" => {
+                let id = required_str(params, "run_id")?;
+                self.with_app_run_current(id, |_| {
+                    self.store
+                        .app_run_decide(id, Some(required_str(params, "digest")?), false)
+                })
+            }
+            "app_run_cancel" => {
+                self.store
+                    .app_run_decide(required_str(params, "run_id")?, None, true)
+            }
+            "app_run_dispatch" => self.dispatch_app_run(required_str(params, "run_id")?),
+            "app_run_show" => self.store.app_run_show(required_str(params, "run_id")?),
+            "app_run_list" => self.store.app_run_list(optional_str(params, "install_id")),
+            "app_run_artifact" => {
+                if fields.contains_key("token") {
+                    return Err(Error::rejected("token requires its assigned message"));
+                }
+                self.app_artifact_current(required_str(params, "artifact_id")?, None)
+            }
+            _ => Err(Error::rejected("unknown app lifecycle method")),
+        }
+    }
+    fn with_app_run_current<T>(
+        &self,
+        id: &str,
+        callback: impl FnOnce(&str) -> Result<T>,
+    ) -> Result<T> {
+        let run = self.store.app_run_show(id)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, _| {
+            callback(row["digest"].as_str().unwrap())
+        })
+    }
+    pub(super) fn dispatch_app_run(&self, id: &str) -> Result<Value> {
+        let result =
+            self.with_app_run_current(id, |digest| self.store.app_run_dispatch(id, digest))?;
+        for step in result["snapshot"]["workflow"]["steps"].as_array().unwrap() {
+            self.notify_agent(step["assignee"].as_str().unwrap());
+        }
+        self.wake();
+        Ok(result)
+    }
+    pub(super) fn advance_app_runs(&self) {
+        if self.draining() {
+            return;
+        }
+        if let Ok(runs) = self.store.app_run_pending() {
+            for (id, _, _) in runs {
+                let _ = self.dispatch_app_run(&id);
+            }
+        }
+    }
+    fn app_artifact_current(&self, id: &str, turn: Option<(&str, &str)>) -> Result<Value> {
+        let install = self.store.app_artifact_installation(id)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &install, |row, _| {
+            self.store
+                .app_artifact_with_digest(id, turn, row["digest"].as_str().unwrap())
+        })
+    }
+}
