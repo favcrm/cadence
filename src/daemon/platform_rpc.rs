@@ -101,11 +101,7 @@ impl Shared {
         // transaction, so these pre-checks only order the refusal
         // ahead of the write.
         let existing = self.store.platform_credential(&platform, &account)?;
-        if expected_id
-            .is_some_and(|id| existing.as_ref().map(|r| r.connection_id.as_str()) != Some(id))
-        {
-            return Err(Error::rejected("connection incarnation is stale"));
-        }
+        let _ = expected_id; // Counterfactual: omit locked incarnation recheck.
         let declared = match params.get("scopes") {
             Some(_) => scope_list(params, "scopes")?,
             None if rotate => existing
