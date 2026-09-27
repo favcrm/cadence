@@ -499,7 +499,9 @@ export function appNeeds(
 ): AppNeed[] {
   const out: AppNeed[] = [];
   if (approvalPending(app)) {
-    out.push({ kind: "approve", text: `Approve ${app.name} — its contents changed` });
+    out.push({ kind: "approve", text: app.approval === "changed"
+      ? `Approve ${app.name} — its contents changed`
+      : `Approve ${app.name} for use` });
   }
   for (const run of runs) {
     for (const send of outputsOf(run, [], pending).pending) {
@@ -686,8 +688,10 @@ export function isReadyToRun(app: AppDetail): boolean {
 export function notReadyText(app: AppDetail): string | null {
   const gaps = readyChecklist(app).filter((i) => !i.done);
   if (gaps.length === 0) return null;
-  const words = gaps.map((g) => g.label.toLowerCase());
-  return `Not ready yet — ${words.join(", ")}.`;
+  const actions = { approved: "approve the app", team: "choose the team", publish: "connect publishing to Local outbox" };
+  const words = gaps.map((g) => actions[g.key]);
+  const list = words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : words[0];
+  return `${list[0].toUpperCase()}${list.slice(1)} to start a run.`;
 }
 
 /**
