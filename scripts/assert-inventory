@@ -42,9 +42,18 @@ def mask_src(text: str) -> str:
             out.append(" " * (j - i))
             i = j
         elif text.startswith("/*", i):
-            j = text.find("*/", i)
-            j = n if j < 0 else j + 2
-            out.append(" " * (j - i))
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            # Rust comments nest; retain newlines for fn boundary scanning.
+            out.append("".join("\n" if c == "\n" else " " for c in text[i:j]))
             i = j
         elif text[i] == '"':
             j = i + 1
