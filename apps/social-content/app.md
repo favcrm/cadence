@@ -78,7 +78,15 @@ on it matches a protected term verbatim.
 
 `needs.connections` declares one slot, `publish`, bound to the `local`
 outbox by default (`cadence app set` rebinds it — a structural change
-the operator re-approves). Publish stages one `publish` send per
-destination on that slot: each lands in Needs-you as a waiting row with
-the caption as its preview, and only the operator's press releases it to
-the outbox. No step, and no agent, ever publishes directly.
+the operator re-approves).
+
+When the slot is bound to `agenticos`, publish hands each destination
+to AgenticOS as a Cadence draft. AgenticOS owns the approval. The row
+shows waiting in AgenticOS, then published with a receipt, or refused.
+Cadence does not press a second time, and no step posts to the
+provider itself.
+
+When the slot stays on `local`, publish stages one `publish` send per
+destination: each lands in Needs-you as a waiting row with the caption
+as its preview, and only the operator's press releases it to the
+outbox. No step, and no agent, ever publishes directly.

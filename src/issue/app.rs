@@ -1944,6 +1944,25 @@ pub struct DerivedGrant {
     pub scopes: Vec<String>,
 }
 
+/// The platform and account a slot binding grants on. `local` is the
+/// built-in outbox. `agenticos` is the hosted company account. Any
+/// other connection name has no account mapping yet (CAD-585).
+fn grant_target(conn: &str) -> Option<(&'static str, &'static str)> {
+    if conn == crate::platform::local::PLATFORM {
+        Some((
+            crate::platform::local::PLATFORM,
+            crate::platform::BUILTIN_LOCAL_ACCOUNT,
+        ))
+    } else if conn == crate::platform::agenticos::PLATFORM {
+        Some((
+            crate::platform::agenticos::PLATFORM,
+            crate::platform::agenticos::HOSTED_ACCOUNT,
+        ))
+    } else {
+        None
+    }
+}
+
 /// The grants an app's approval derives (CAD-577): for every workflow
 /// step that declares `uses: <slot>` and an `agent: {{role}}`, the
 /// agent the app's default team assigns to that role gets the slot's
@@ -2026,16 +2045,17 @@ pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec
                     continue;
                 };
                 // CAD-577 derives grants for the built-in `local`
-                // connection (account `local`). The generic
-                // connection→account mapping lands with CAD-585; until
-                // then a slot bound to any other connection derives no
-                // grant rather than guessing an account.
-                if conn != crate::platform::local::PLATFORM {
+                // connection (account `local`). CAD-501 does the same
+                // for `agenticos` on the hosted account — the company
+                // is bound by the host, so there is no enrolled
+                // account to guess. Every other connection still waits
+                // for CAD-585's mapping and derives nothing.
+                let Some((platform, account)) = grant_target(conn) else {
                     continue;
-                }
+                };
                 match out
                     .iter_mut()
-                    .find(|g| g.agent == agent && g.platform == conn)
+                    .find(|g| g.agent == agent && g.platform == platform)
                 {
                     Some(g) => {
                         if !g.scopes.contains(slot) {
@@ -2044,8 +2064,8 @@ pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec
                     }
                     None => out.push(DerivedGrant {
                         agent: agent.clone(),
-                        platform: conn.to_string(),
-                        account: crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
+                        platform: platform.to_string(),
+                        account: account.to_string(),
                         scopes: vec![slot.clone()],
                     }),
                 }
@@ -2776,6 +2796,56 @@ needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
         ] {
             assert!(parse_manifest(bad).is_err(), "{bad}");
         }
+    }
+
+    /// CAD-501: a publish slot bound to `agenticos` grants the hosted
+    /// account. `local` stays the built-in outbox. A connection with
+    /// no mapping still derives nothing.
+    #[test]
+    fn agenticos_binding_derives_the_hosted_grant() {
+        let pm = tempfile::tempdir().unwrap();
+        let apps = pm.path().join("demo").join("apps");
+        let dir = apps.join("social-content");
+        std::fs::create_dir_all(dir.join("workflows")).unwrap();
+        std::fs::write(
+            dir.join("app.md"),
+            "---\napp: social-content\ntitle: Social\nversion: 0.1.0\n\
+needs:\n  connections: [publish]\n---\n\n# Guide\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflows").join("post.md"),
+            "---\ntitle: Post\ngoal: Publish\ninputs:\n  publisher: { ask: Who }\n---\n\n\
+## Publish\nagent: {{publisher}}\nuses: publish\n\nStage it.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            apps.join("social-content.yaml"),
+            "schema: 1\napp: social-content\ninstall_id: inst-1\n\
+source:\n  kind: path\n  path: /tmp/src\n\
+bindings:\n  publish: agenticos\n\
+team:\n  publisher: pub-1\n\
+installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
+        )
+        .unwrap();
+        let grants = derive_grants(pm.path(), "demo", "social-content").unwrap();
+        assert_eq!(
+            grants,
+            vec![DerivedGrant {
+                agent: "pub-1".into(),
+                platform: "agenticos".into(),
+                account: "hosted".into(),
+                scopes: vec!["publish".into()],
+            }]
+        );
+
+        let yaml = apps.join("social-content.yaml");
+        let text = std::fs::read_to_string(&yaml)
+            .unwrap()
+            .replace("agenticos", "other");
+        std::fs::write(&yaml, text).unwrap();
+        let grants = derive_grants(pm.path(), "demo", "social-content").unwrap();
+        assert!(grants.is_empty(), "{grants:?}");
     }
 
     #[test]
