@@ -566,3 +566,35 @@ fn unsafe_existing_journal_and_wal_paths_are_refused_without_touching_targets() 
         b"unsupported WAL"
     );
 }
+
+#[test]
+fn schema_whitespace_cannot_hide_a_missing_not_null_constraint() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("outbox");
+    drop(ResultOutbox::open(&dir).unwrap());
+    let path = dir.join("results.sqlite3");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name='pending_results'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let forged = ddl.replace("destination TEXT NOT NULL", "destination TEXTNOTNULL");
+    assert_ne!(forged, ddl);
+    conn.execute_batch("DROP TABLE pending_results").unwrap();
+    conn.execute_batch(&forged).unwrap();
+    let not_null: i64 = conn
+        .query_row(
+            "SELECT [notnull] FROM pragma_table_info('pending_results') WHERE name='destination'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(not_null, 0);
+    drop(conn);
+    let before = fs::read(&path).unwrap();
+    assert!(ResultOutbox::open(&dir).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+}

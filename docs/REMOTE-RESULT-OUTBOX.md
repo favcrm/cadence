@@ -83,7 +83,8 @@ application/version and rollback-journal format **before** a writable SQLite
 open. SQLite specifies big-endian user version at offset 60 and application ID
 at offset 68 in its [database header](https://www.sqlite.org/fileformat.html#the_database_header).
 An existing file also receives a read-only preflight requiring the exact v1
-table constraints and implicit primary-key index, with no extra tables, views,
+table DDL (exactly the library’s own spelling, without whitespace folding),
+constraints and implicit primary-key index, with no extra tables, views,
 indexes or triggers, before any writable SQLite open.
 If that preflight specifically encounters [SQLite READONLY_ROLLBACK](https://www.sqlite.org/rescode.html#readonly_rollback), a hot
 rollback journal needs recovery to inspect the schema. Existing journal paths

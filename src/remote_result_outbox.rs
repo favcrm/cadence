@@ -554,13 +554,10 @@ fn verify_schema(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // The exact v1 DDL fixes affinity/nullability/PK, and excludes all triggers,
-    // views, extra tables/indexes and other mutating objects. This is format
+    // views, extra tables/indexes and other mutating objects. Compare the exact
+    // own DDL: stripping whitespace can confuse TEXT NOT NULL with TEXTNOTNULL.
+    // This is format
     // compatibility, not protection against a hostile same-UID file owner.
-    let expected_sql: String = SCHEMA_SQL
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
     if objects.len() != 2 {
         return Err(corrupt());
     }
@@ -573,17 +570,11 @@ fn verify_schema(conn: &Connection) -> Result<()> {
         return Err(corrupt());
     }
     let (kind, name, table, sql) = &objects[1];
-    let actual_sql: String = sql
-        .as_deref()
-        .ok_or_else(corrupt)?
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
+    let actual_sql = sql.as_deref().ok_or_else(corrupt)?;
     if kind != "table"
         || name != "pending_results"
         || table != "pending_results"
-        || actual_sql != expected_sql
+        || actual_sql != SCHEMA_SQL
     {
         return Err(corrupt());
     }
