@@ -1,0 +1,644 @@
+{
+  "contract": "cadence.project-releases.v1",
+  "policies": [
+    {
+      "id": "policy-semver",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "scheme": "semver",
+      "created_at": "2026-09-27T00:00:00Z"
+    },
+    {
+      "id": "policy-calendar",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "scheme": "calendar",
+      "created_at": "2026-09-27T00:00:00Z"
+    },
+    {
+      "id": "policy-named",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "scheme": "named",
+      "created_at": "2026-09-27T00:00:00Z"
+    }
+  ],
+  "releases": [
+    {
+      "id": "rel-maintenance",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "policy_id": "policy-semver",
+      "version": "0.1.1",
+      "version_key": "0.1.1",
+      "title": "Synthetic 0.1.1",
+      "owner": "pm_fixture",
+      "state": "published",
+      "archived": false,
+      "target_date": "2026-10-09",
+      "revision": 1,
+      "notes": "Synthetic fixture; not a published product.",
+      "limitations": [
+        "No operational evidence asserted"
+      ],
+      "milestone_ids": [
+        "cloud-outcome"
+      ],
+      "candidate_id": "candidate-maintenance",
+      "publication_id": "pub-maintenance"
+    },
+    {
+      "id": "rel-mainline",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "policy_id": "policy-semver",
+      "version": "0.2.0",
+      "version_key": "0.2.0",
+      "title": "Synthetic 0.2.0",
+      "owner": "pm_fixture",
+      "state": "published",
+      "archived": false,
+      "target_date": "2026-10-09",
+      "revision": 1,
+      "notes": "Synthetic fixture; not a published product.",
+      "limitations": [
+        "No operational evidence asserted"
+      ],
+      "milestone_ids": [
+        "cloud-outcome"
+      ],
+      "candidate_id": "candidate-mainline",
+      "publication_id": "pub-mainline"
+    },
+    {
+      "id": "rel-next",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "policy_id": "policy-semver",
+      "version": "0.3.0-rc.1",
+      "version_key": "0.3.0-rc.1",
+      "title": "Synthetic 0.3.0-rc.1",
+      "owner": "pm_fixture",
+      "state": "planned",
+      "archived": false,
+      "target_date": "2026-10-09",
+      "revision": 2,
+      "notes": "Synthetic fixture; not a published product.",
+      "limitations": [
+        "No operational evidence asserted"
+      ],
+      "milestone_ids": [
+        "cloud-outcome"
+      ],
+      "candidate_id": null,
+      "publication_id": null
+    },
+    {
+      "id": "rel-report",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "policy_id": "policy-calendar",
+      "version": "2026.09.0",
+      "version_key": "2026.09.0",
+      "title": "Synthetic 2026.09.0",
+      "owner": "pm_fixture",
+      "state": "published",
+      "archived": false,
+      "target_date": "2026-10-09",
+      "revision": 1,
+      "notes": "Synthetic fixture; not a published product.",
+      "limitations": [
+        "No operational evidence asserted"
+      ],
+      "milestone_ids": [
+        "cloud-outcome"
+      ],
+      "candidate_id": "candidate-report",
+      "publication_id": "pub-report"
+    },
+    {
+      "id": "rel-named",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "policy_id": "policy-named",
+      "version": "Autumn Review",
+      "version_key": "Autumn Review",
+      "title": "Synthetic Autumn Review",
+      "owner": "pm_fixture",
+      "state": "planned",
+      "archived": false,
+      "target_date": "2026-10-09",
+      "revision": 1,
+      "notes": "Synthetic fixture; not a published product.",
+      "limitations": [
+        "No operational evidence asserted"
+      ],
+      "milestone_ids": [
+        "cloud-outcome"
+      ],
+      "candidate_id": null,
+      "publication_id": null
+    }
+  ],
+  "issue_links": [
+    {
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "issue_id": "EX-1",
+      "issue_type": "bug",
+      "release_id": "rel-mainline",
+      "kind": "target"
+    },
+    {
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "issue_id": "EX-2",
+      "issue_type": "task",
+      "release_id": "rel-mainline",
+      "kind": "target"
+    },
+    {
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "issue_id": "EX-3",
+      "issue_type": "task",
+      "release_id": "rel-next",
+      "kind": "target"
+    },
+    {
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "issue_id": "EX-1",
+      "issue_type": "bug",
+      "release_id": "rel-maintenance",
+      "kind": "affected"
+    }
+  ],
+  "builds": [
+    {
+      "id": "build-maintenance",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "sources": [
+        {
+          "kind": "git",
+          "repository": "https://github.com/example/synthetic",
+          "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "synthetic-cli.tar.gz",
+          "location": "https://artifacts.example.com/maintenance",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "size": 123
+        }
+      ],
+      "manifest_ref": "fixture://manifest-maintenance",
+      "dimensions": [
+        {
+          "name": "product",
+          "value": "0.1.1"
+        },
+        {
+          "name": "remote_protocol",
+          "value": "1"
+        },
+        {
+          "name": "database_schema",
+          "value": "19"
+        },
+        {
+          "name": "runtime_image",
+          "value": "synthetic-image-reference"
+        }
+      ],
+      "declared_compatibility": [
+        {
+          "dimension": "database_schema",
+          "constraint": "declared >=19",
+          "evidence_ref": "fixture://compatibility",
+          "enforced": false
+        }
+      ],
+      "manifest_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    },
+    {
+      "id": "build-mainline",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "sources": [
+        {
+          "kind": "git",
+          "repository": "https://github.com/example/synthetic",
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "synthetic-cli.tar.gz",
+          "location": "https://artifacts.example.com/mainline",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "size": 123
+        }
+      ],
+      "manifest_ref": "fixture://manifest-mainline",
+      "dimensions": [
+        {
+          "name": "product",
+          "value": "0.2.0"
+        },
+        {
+          "name": "remote_protocol",
+          "value": "1"
+        },
+        {
+          "name": "database_schema",
+          "value": "19"
+        },
+        {
+          "name": "runtime_image",
+          "value": "synthetic-image-reference"
+        }
+      ],
+      "declared_compatibility": [
+        {
+          "dimension": "database_schema",
+          "constraint": "declared >=19",
+          "evidence_ref": "fixture://compatibility",
+          "enforced": false
+        }
+      ],
+      "manifest_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    },
+    {
+      "id": "build-report",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "sources": [
+        {
+          "kind": "content",
+          "location": "orgfs:/reports/draft",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      ],
+      "artifacts": [
+        {
+          "name": "report.pdf",
+          "location": "orgfs:/reports/snapshot",
+          "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "size": 456
+        }
+      ],
+      "manifest_ref": "fixture://report-manifest",
+      "dimensions": [],
+      "declared_compatibility": [],
+      "manifest_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    }
+  ],
+  "candidates": [
+    {
+      "id": "candidate-maintenance",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-maintenance",
+      "policy_id": "policy-semver",
+      "version": "0.1.1",
+      "target_scope_issues": [
+        "EX-1"
+      ],
+      "build_ids": [
+        "build-maintenance"
+      ],
+      "proposed_shipped_issues": [
+        "EX-1"
+      ],
+      "notes": "Reviewed synthetic scope; no real publication.",
+      "limitations": [],
+      "review_ref": "fixture://independent-review-maintenance",
+      "snapshot_sha256": "e4b5d064622e89b1c736fbe5ae94fb1e4649977fc0c42ff4489ae97745eb461e"
+    },
+    {
+      "id": "candidate-mainline",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-mainline",
+      "policy_id": "policy-semver",
+      "version": "0.2.0",
+      "target_scope_issues": [
+        "EX-1",
+        "EX-2",
+        "EX-3"
+      ],
+      "build_ids": [
+        "build-mainline"
+      ],
+      "proposed_shipped_issues": [
+        "EX-1",
+        "EX-2"
+      ],
+      "notes": "Reviewed synthetic scope; no real publication.",
+      "limitations": [
+        "EX-3 deferred to next release"
+      ],
+      "review_ref": "fixture://independent-review-mainline",
+      "snapshot_sha256": "15b05f31416dc02ca99779490c9fb5fceaaac0eeb5fda3c3ed24efa52e4372af"
+    },
+    {
+      "id": "candidate-report",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "release_id": "rel-report",
+      "policy_id": "policy-calendar",
+      "version": "2026.09.0",
+      "target_scope_issues": [],
+      "build_ids": [
+        "build-report"
+      ],
+      "proposed_shipped_issues": [],
+      "notes": "Reviewed synthetic scope; no real publication.",
+      "limitations": [],
+      "review_ref": "fixture://independent-review-report",
+      "snapshot_sha256": "f63346f3d6d77ed155d98b682e9442d84956ea7709a8a9d1f1a6b0ff2ed59b25"
+    }
+  ],
+  "publications": [
+    {
+      "id": "pub-maintenance",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-maintenance",
+      "candidate_id": "candidate-maintenance",
+      "policy_id": "policy-semver",
+      "version": "0.1.1",
+      "version_key": "0.1.1",
+      "build_ids": [
+        "build-maintenance"
+      ],
+      "shipped_issues": [
+        "EX-1"
+      ],
+      "candidate_sha256": "e4b5d064622e89b1c736fbe5ae94fb1e4649977fc0c42ff4489ae97745eb461e",
+      "published_at": "2026-09-27T00:00:00Z",
+      "publisher": "publisher_fixture",
+      "evidence": {
+        "kind": "github",
+        "repository": "https://github.com/example/synthetic",
+        "upstream_release_id": "gh-maintenance",
+        "tag": "v0.1.1",
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "url": "https://github.com/example/synthetic/releases/tag/v0.1.1",
+        "upstream_published_at": "2026-09-27T00:00:00Z",
+        "assets": [
+          {
+            "upstream_id": "asset-maintenance",
+            "name": "synthetic-cli.tar.gz",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "size": 123
+          }
+        ],
+        "verification_ref": "fixture://synthetic-not-verified"
+      }
+    },
+    {
+      "id": "pub-mainline",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-mainline",
+      "candidate_id": "candidate-mainline",
+      "policy_id": "policy-semver",
+      "version": "0.2.0",
+      "version_key": "0.2.0",
+      "build_ids": [
+        "build-mainline"
+      ],
+      "shipped_issues": [
+        "EX-1",
+        "EX-2"
+      ],
+      "candidate_sha256": "15b05f31416dc02ca99779490c9fb5fceaaac0eeb5fda3c3ed24efa52e4372af",
+      "published_at": "2026-09-27T00:00:00Z",
+      "publisher": "publisher_fixture",
+      "evidence": {
+        "kind": "github",
+        "repository": "https://github.com/example/synthetic",
+        "upstream_release_id": "gh-mainline",
+        "tag": "v0.2.0",
+        "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "url": "https://github.com/example/synthetic/releases/tag/v0.2.0",
+        "upstream_published_at": "2026-09-27T00:00:00Z",
+        "assets": [
+          {
+            "upstream_id": "asset-mainline",
+            "name": "synthetic-cli.tar.gz",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "size": 123
+          }
+        ],
+        "verification_ref": "fixture://synthetic-not-verified"
+      }
+    },
+    {
+      "id": "pub-report",
+      "context": {
+        "authority_id": "issuer-fixture",
+        "mode": "remote",
+        "organization_id": "org_fixture",
+        "project": "example",
+        "stream": "reports"
+      },
+      "release_id": "rel-report",
+      "candidate_id": "candidate-report",
+      "policy_id": "policy-calendar",
+      "version": "2026.09.0",
+      "version_key": "2026.09.0",
+      "build_ids": [
+        "build-report"
+      ],
+      "shipped_issues": [],
+      "candidate_sha256": "f63346f3d6d77ed155d98b682e9442d84956ea7709a8a9d1f1a6b0ff2ed59b25",
+      "published_at": "2026-09-27T00:00:00Z",
+      "publisher": "publisher_fixture",
+      "evidence": {
+        "kind": "manual",
+        "attestation_id": "attestation-report",
+        "destination": "orgfs:/shared/report",
+        "attester": "publisher_fixture",
+        "verification_ref": "fixture://synthetic-not-verified"
+      }
+    }
+  ],
+  "deployments": [
+    {
+      "id": "deploy-first",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-maintenance",
+      "build_id": "build-maintenance",
+      "environment": "staging-fixture",
+      "observed_at": "2026-09-27T01:00:00Z",
+      "verification_ref": "fixture://synthetic-environment-probe",
+      "previous_id": null,
+      "rollback_to_id": null
+    },
+    {
+      "id": "deploy-second",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-mainline",
+      "build_id": "build-mainline",
+      "environment": "staging-fixture",
+      "observed_at": "2026-09-27T02:00:00Z",
+      "verification_ref": "fixture://synthetic-environment-probe",
+      "previous_id": "deploy-first",
+      "rollback_to_id": null
+    },
+    {
+      "id": "deploy-rollback",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "release_id": "rel-maintenance",
+      "build_id": "build-maintenance",
+      "environment": "staging-fixture",
+      "observed_at": "2026-09-27T03:00:00Z",
+      "verification_ref": "fixture://synthetic-environment-probe",
+      "previous_id": "deploy-second",
+      "rollback_to_id": "deploy-first"
+    }
+  ],
+  "audit_events": [
+    {
+      "id": "audit-retarget",
+      "context": {
+        "authority_id": "local-tracker-fixture",
+        "mode": "local",
+        "organization_id": null,
+        "project": "example",
+        "stream": "cli"
+      },
+      "record_id": "rel-next",
+      "actor_id": "pm_fixture",
+      "action": "release.retargeted",
+      "at": "2026-09-27T00:00:00Z",
+      "before_revision": 1,
+      "after_revision": 2,
+      "reason": "EX-3 deferred; publication membership retained",
+      "idempotency_key": "operation-fixture-retarget"
+    }
+  ]
+}

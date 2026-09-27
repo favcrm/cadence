@@ -1,0 +1,404 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {"const": "cadence.project-releases.v1"},
+    "policies": {"type": "array", "items": {"$ref": "#/$defs/policy"}},
+    "releases": {"type": "array", "items": {"$ref": "#/$defs/release"}},
+    "issue_links": {"type": "array", "items": {"$ref": "#/$defs/issue_link"}},
+    "builds": {"type": "array", "items": {"$ref": "#/$defs/build"}},
+    "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
+    "publications": {"type": "array", "items": {"$ref": "#/$defs/publication"}},
+    "deployments": {"type": "array", "items": {"$ref": "#/$defs/deployment"}},
+    "audit_events": {"type": "array", "items": {"$ref": "#/$defs/audit_event"}}
+  },
+  "required": [
+    "contract",
+    "policies",
+    "releases",
+    "issue_links",
+    "builds",
+    "candidates",
+    "publications",
+    "deployments",
+    "audit_events"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:project-releases:v1",
+  "$defs": {
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "authority_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "mode": {"enum": ["local", "remote"]},
+        "organization_id": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]},
+        "project": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"},
+        "stream": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]}
+      },
+      "required": ["authority_id", "mode", "organization_id", "project", "stream"],
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "local"}}},
+          "then": {"properties": {"organization_id": {"type": "null"}}},
+          "else": {
+            "properties": {"organization_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}}
+          }
+        }
+      ]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "scheme": {"enum": ["semver", "calendar", "named"]},
+        "created_at": {"type": "string", "format": "date-time"}
+      },
+      "required": ["id", "context", "scheme", "created_at"]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "policy_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 300},
+        "version_key": {"type": "string", "minLength": 1, "maxLength": 300},
+        "title": {"type": "string", "minLength": 1, "maxLength": 300},
+        "owner": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "state": {"enum": ["planned", "candidate", "published"]},
+        "archived": {"type": "boolean"},
+        "target_date": {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]},
+        "revision": {"type": "integer", "minimum": 1},
+        "notes": {"type": "string", "maxLength": 20000},
+        "limitations": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+        "milestone_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+          "uniqueItems": true
+        },
+        "candidate_id": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]},
+        "publication_id": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]}
+      },
+      "required": [
+        "id",
+        "context",
+        "policy_id",
+        "version",
+        "version_key",
+        "title",
+        "owner",
+        "state",
+        "archived",
+        "target_date",
+        "revision",
+        "notes",
+        "limitations",
+        "milestone_ids",
+        "candidate_id",
+        "publication_id"
+      ]
+    },
+    "issue_link": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "context": {"$ref": "#/$defs/context"},
+        "issue_id": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{0,15}-[1-9][0-9]{0,8}$"},
+        "issue_type": {"enum": ["task", "bug", "spike", "epic"]},
+        "release_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "kind": {"enum": ["target", "affected"]}
+      },
+      "required": ["context", "issue_id", "issue_type", "release_id", "kind"]
+    },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "git"},
+            "repository": {"type": "string", "minLength": 1, "maxLength": 300},
+            "commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"}
+          },
+          "required": ["kind", "repository", "commit"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "content"},
+            "location": {"type": "string", "minLength": 1, "maxLength": 300},
+            "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+          },
+          "required": ["kind", "location", "sha256"]
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 300},
+        "location": {"type": "string", "minLength": 1, "maxLength": 300},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "size": {"type": "integer", "minimum": 0}
+      },
+      "required": ["name", "location", "sha256", "size"]
+    },
+    "dimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"enum": ["product", "remote_protocol", "database_schema", "runtime_image"]},
+        "value": {"type": "string", "minLength": 1, "maxLength": 300}
+      },
+      "required": ["name", "value"]
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {"enum": ["product", "remote_protocol", "database_schema", "runtime_image"]},
+        "constraint": {"type": "string", "minLength": 1, "maxLength": 300},
+        "evidence_ref": {"type": "string", "minLength": 1, "maxLength": 300},
+        "enforced": {"const": false}
+      },
+      "required": ["dimension", "constraint", "evidence_ref", "enforced"]
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}, "minItems": 1},
+        "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}, "minItems": 1},
+        "manifest_ref": {"type": "string", "minLength": 1, "maxLength": 300},
+        "manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "dimensions": {"type": "array", "items": {"$ref": "#/$defs/dimension"}},
+        "declared_compatibility": {"type": "array", "items": {"$ref": "#/$defs/compatibility"}}
+      },
+      "required": [
+        "id",
+        "context",
+        "sources",
+        "artifacts",
+        "manifest_ref",
+        "manifest_sha256",
+        "dimensions",
+        "declared_compatibility"
+      ]
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "release_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "policy_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 300},
+        "target_scope_issues": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{0,15}-[1-9][0-9]{0,8}$"},
+          "uniqueItems": true
+        },
+        "build_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "proposed_shipped_issues": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{0,15}-[1-9][0-9]{0,8}$"},
+          "uniqueItems": true
+        },
+        "notes": {"type": "string", "maxLength": 20000},
+        "limitations": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+        "review_ref": {"type": "string", "minLength": 1, "maxLength": 300},
+        "snapshot_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      },
+      "required": [
+        "id",
+        "context",
+        "release_id",
+        "policy_id",
+        "version",
+        "target_scope_issues",
+        "build_ids",
+        "proposed_shipped_issues",
+        "notes",
+        "limitations",
+        "review_ref",
+        "snapshot_sha256"
+      ]
+    },
+    "github_asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "upstream_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 300},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "size": {"type": "integer", "minimum": 0}
+      },
+      "required": ["upstream_id", "name", "sha256", "size"]
+    },
+    "evidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "github"},
+            "repository": {"type": "string", "minLength": 1, "maxLength": 300},
+            "upstream_release_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+            "tag": {"type": "string", "minLength": 1, "maxLength": 300},
+            "commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+            "url": {"type": "string", "minLength": 1, "maxLength": 300},
+            "upstream_published_at": {"type": "string", "format": "date-time"},
+            "assets": {"type": "array", "items": {"$ref": "#/$defs/github_asset"}, "minItems": 1},
+            "verification_ref": {"type": "string", "minLength": 1, "maxLength": 300}
+          },
+          "required": [
+            "kind",
+            "repository",
+            "upstream_release_id",
+            "tag",
+            "commit",
+            "url",
+            "upstream_published_at",
+            "assets",
+            "verification_ref"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "manual"},
+            "attestation_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+            "destination": {"type": "string", "minLength": 1, "maxLength": 300},
+            "attester": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+            "verification_ref": {"type": "string", "minLength": 1, "maxLength": 300}
+          },
+          "required": ["kind", "attestation_id", "destination", "attester", "verification_ref"]
+        }
+      ]
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "release_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "candidate_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "policy_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 300},
+        "version_key": {"type": "string", "minLength": 1, "maxLength": 300},
+        "build_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "shipped_issues": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{0,15}-[1-9][0-9]{0,8}$"},
+          "uniqueItems": true
+        },
+        "candidate_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "published_at": {"type": "string", "format": "date-time"},
+        "publisher": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "evidence": {"$ref": "#/$defs/evidence"}
+      },
+      "required": [
+        "id",
+        "context",
+        "release_id",
+        "candidate_id",
+        "policy_id",
+        "version",
+        "version_key",
+        "build_ids",
+        "shipped_issues",
+        "candidate_sha256",
+        "published_at",
+        "publisher",
+        "evidence"
+      ]
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "release_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "build_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "environment": {"type": "string", "minLength": 1, "maxLength": 300},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "verification_ref": {"type": "string", "minLength": 1, "maxLength": 300},
+        "previous_id": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]},
+        "rollback_to_id": {"anyOf": [{"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}, {"type": "null"}]}
+      },
+      "required": [
+        "id",
+        "context",
+        "release_id",
+        "build_id",
+        "environment",
+        "observed_at",
+        "verification_ref",
+        "previous_id",
+        "rollback_to_id"
+      ]
+    },
+    "audit_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "context": {"$ref": "#/$defs/context"},
+        "record_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "actor_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"},
+        "action": {
+          "enum": [
+            "release.created",
+            "release.retargeted",
+            "candidate.created",
+            "publication.recorded",
+            "deployment.observed",
+            "release.editorial_corrected",
+            "release.archived",
+            "policy.selected"
+          ]
+        },
+        "at": {"type": "string", "format": "date-time"},
+        "before_revision": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "after_revision": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+        "idempotency_key": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$"}
+      },
+      "required": [
+        "id",
+        "context",
+        "record_id",
+        "actor_id",
+        "action",
+        "at",
+        "before_revision",
+        "after_revision",
+        "reason",
+        "idempotency_key"
+      ]
+    }
+  },
+  "description": "Proposed shape contract only: not issuer, authorization, signature or immutable-storage verification."
+}
