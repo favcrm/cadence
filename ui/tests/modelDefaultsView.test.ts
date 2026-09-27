@@ -213,6 +213,15 @@ async function main() {
   await choose("codex-baseline", "Specific model");
   await fill("codex-baseline-model", "codex-custom");
   await click(button("Pi"));
+  assert(
+    host.textContent?.includes("Operator policy default") &&
+      host.textContent?.includes("Pi policy") &&
+      !host.textContent?.includes("lets the provider choose"),
+    "Pi fallback is explained as operator policy, not provider choice",
+  );
+  await choose("pi-baseline", "Specific model");
+  await choose("pi-baseline", "Operator policy default");
+  await choose("pi-developer", "Operator policy default");
   await choose("pi-developer", "Specific model");
   await fill("pi-developer-model", "pi-custom");
   await click(button("CodexUnsaved"));
@@ -229,6 +238,7 @@ async function main() {
   assert(saves[0].expected_revision === 4, "Save retains optimistic revision");
   assert(
     saves[0].config.providers.codex.default.model === "codex-custom" &&
+      saves[0].config.providers.pi.default.mode === "provider_default" &&
       saves[0].config.providers.pi.roles.developer.model === "pi-custom",
     "Save applies both provider drafts with role override",
   );

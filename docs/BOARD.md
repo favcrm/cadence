@@ -1607,8 +1607,10 @@ Settings → Models is a full-width provider workspace. A compact provider
 selector opens one editor at a time and keeps drafts for every provider.
 The default model applies to newly registered agents across projects; existing
 agents keep their saved selection. A role can inherit that configured default,
-use the provider-native default, or select a specific model. Suggestions remain
-previously observed IDs, not a provider catalog. Unavailable providers retain
+use the provider-native default, or select a specific model. Pi is the exception:
+its default option is labelled Operator policy default and uses the configured
+Pi policy fallback; explicit model IDs still require that policy's allowlist.
+Suggestions remain previously observed IDs, not a provider catalog. Unavailable providers retain
 their limitation text. Save applies all provider drafts with the current
 expected revision; reset omits that provider and discard restores all saved
 values. Read-only/sign-in gates, validation, failed-save drafts and revision

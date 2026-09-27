@@ -234,6 +234,15 @@ export default function ModelDefaults() {
     snapshot?.providers[0];
   const draft = provider ? drafts[provider.id] : undefined;
   const listId = provider ? `suggestions-${provider.id}` : undefined;
+  // Pi resolves an omitted model through the operator policy, not a native fallback.
+  const fallbackLabel =
+    provider?.id === "pi"
+      ? "Operator policy default"
+      : "Provider-native default";
+  const inheritanceHelp =
+    provider?.id === "pi"
+      ? "Inherit uses the default above. Operator policy default uses the configured Pi policy instead. Explicit model IDs must be allowed by that policy."
+      : "Inherit uses the default above. Provider-native default lets the provider choose, even when you set a specific default.";
   const changedProviders =
     snapshot?.providers.filter(
       (item) =>
@@ -456,7 +465,7 @@ export default function ModelDefaults() {
                             options={[
                               {
                                 value: "provider_default",
-                                label: "Provider-native default",
+                                label: fallbackLabel,
                               },
                               { value: "model", label: "Specific model" },
                             ]}
@@ -489,11 +498,7 @@ export default function ModelDefaults() {
                         aria-labelledby="model-role-title"
                       >
                         <h3 id="model-role-title">Team role overrides</h3>
-                        <p className="model-defaults-help">
-                          Inherit uses the default above. Provider-native
-                          default lets the provider choose, even when you set a
-                          specific default.
-                        </p>
+                        <p className="model-defaults-help">{inheritanceHelp}</p>
                         <div className="model-defaults-role-list">
                           {snapshot.roles.map((role) => {
                             const row = draft.roles[role.id] ?? roleDraft();
@@ -534,7 +539,7 @@ export default function ModelDefaults() {
                                       },
                                       {
                                         value: "provider_default",
-                                        label: "Provider-native default",
+                                        label: fallbackLabel,
                                       },
                                       {
                                         value: "model",
