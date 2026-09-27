@@ -7,7 +7,6 @@ import type { SseEvent } from "./sse";
 export class LiveUpdates {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private readonly pending = new Set<string>();
-  private seen = false;
   private live = false;
   private last = 0;
   private entities = false;
@@ -21,8 +20,9 @@ export class LiveUpdates {
   }) {}
   private now = () => (this.opts.now ?? Date.now)();
   opened = () => {
-    if (this.seen) this.opts.resync();
-    this.seen = true;
+    // The watcher baselines at subscription, not at the initial HTTP
+    // read. First open must close that interval just like reconnects.
+    this.opts.resync();
     this.live = true;
     this.last = this.now();
   };
