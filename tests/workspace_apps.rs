@@ -305,6 +305,51 @@ fn cad667_http_install_and_reads_share_operator_authority() {
             "agent read exposed workspace installation {path}"
         );
     }
+}
+
+#[test]
+fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_read() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
+    let port = (3110..3200)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let row = w.install().unwrap();
+    let id = row["install_id"].as_str().unwrap();
+    let body = json!({"source":w.source()}).to_string();
     let installed_head = w.head();
     for prefix in ["", "setsid "] {
         for (method, path, body) in [
@@ -355,7 +400,8 @@ fn cad667_cli_catalog_namespace_preserves_legacy_offline_reads() {
         "legacy ls must retain its existing behavior"
     );
     let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
-    assert!(legacy.as_array().is_some());
+    assert!(legacy["apps"].as_array().is_some());
+    assert_eq!(legacy["count"], 0);
 }
 
 #[test]
