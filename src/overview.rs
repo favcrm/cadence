@@ -736,7 +736,9 @@ impl Audience {
             | "next_action"
             // CAD-139: a researched idea waiting on the operator, and a
             // near-duplicate the pipeline linked instead of researching.
-            | "idea_plan" | "idea_duplicate" => Self::Operator,
+            | "idea_plan" | "idea_duplicate"
+            // CAD-615: the master wants to run a command.
+            | "master_permission" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -3561,6 +3563,38 @@ fn overview_from(
                 "a pane is busy — restart only when idle"
             });
         }
+    }
+
+    // CAD-615: a pending permission request is the operator's to decide.
+    for req in crate::master_perm::board_requests(state_dir, now).unwrap_or_default() {
+        let age = (now - req.created).max(0);
+        let command = req.argv.join(" ");
+        let title = if req.decision_label.is_empty() {
+            format!(
+                "master wants to run: {command} — risk {}",
+                match req.risk {
+                    crate::master_perm::Risk::Low => "low",
+                    crate::master_perm::Risk::Medium => "medium",
+                    crate::master_perm::Risk::High => "high",
+                }
+            )
+        } else {
+            format!("{} — {command}", req.decision_label)
+        };
+        let mut row = item(
+            if req.status == "pending" { 15 } else { 40 },
+            "master_permission",
+            &title,
+            age,
+            "",
+            None,
+            &format!("cadence master allow-once {}", req.id),
+        )
+        .about("permission", &req.id)
+        .since(Some(req.created));
+        row.json["permission"] = crate::master_perm::request_json(&req);
+        row.json["reason"] = json!(req.reason);
+        needs.push(row);
     }
 
     classify_needs(

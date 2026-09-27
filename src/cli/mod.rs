@@ -3098,6 +3098,94 @@ pub(crate) fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
     ))
 }
 
+/// When this process is the master, an exact argv the operator
+/// approved is run by the daemon. Returns `Some` when that happened
+/// (or the daemon refused a never-list command). `None` means the
+/// normal verb should run.
+fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
+    if std::env::var("CADENCE_ALIAS").ok().as_deref() != Some(cadence_agent::master::ALIAS) {
+        return None;
+    }
+    if std::env::var_os("CADENCE_GRANT_TOKEN").is_some() {
+        return None;
+    }
+    if let Commands::Master {
+        action:
+            master::MasterAction::AskPermission { .. }
+            | master::MasterAction::PeekGrant { .. }
+            | master::MasterAction::UseGrant { .. },
+    } = &cli.command
+    {
+        return None;
+    }
+    // The daemon launches the master's provider as `cadence confine`.
+    // That wrapper inherits CADENCE_ALIAS=master. It is not a tool
+    // command, and there is no daemon to ask yet when the provider
+    // itself is what is starting.
+    if let Commands::Confine { .. } = &cli.command {
+        return None;
+    }
+    // The tracker's pre-commit hook runs `cadence issue lint` with the
+    // committer's environment. A master commit inherits
+    // CADENCE_ALIAS=master. Sending that through a permission RPC
+    // deadlocks the commit (the daemon is inside it) or refuses it
+    // when the socket is a different daemon. Lint is read-only and
+    // must finish for every tracker write, including verdicts.
+    if let Commands::Issue {
+        action: cadence_agent::issue::cli::IssueAction::Lint { .. },
+    } = &cli.command
+    {
+        return None;
+    }
+    // `report` and `report file` file done reports, verdicts and ideas.
+    // They are allowlisted for the master, or the local handler refuses
+    // stdin (`NO_STDIN`). A grant lookup must not sit in front of them:
+    // the process the daemon is waiting on is this one, and a permission
+    // RPC from inside that wait never returns.
+    if let Commands::Report { .. } = &cli.command {
+        return None;
+    }
+    let mut argv = vec!["cadence".to_string()];
+    argv.extend(std::env::args().skip(1));
+    let cwd = std::env::current_dir().ok()?;
+    match cadence_agent::master_perm::classify(&argv, &cwd, &[], std::slice::from_ref(&state_dir)) {
+        cadence_agent::master_perm::Class::Allowlisted => return None,
+        cadence_agent::master_perm::Class::Never { why } => {
+            eprintln!("{why} — a grant or a rule cannot allow it");
+            return Some(1);
+        }
+        _ => {}
+    }
+    match client::rpc(
+        state_dir,
+        "master_permission_use",
+        json!({"argv": argv, "cwd": cwd}),
+    ) {
+        Ok(out) if out["applied"].as_bool() == Some(true) => {
+            let stdout = out["stdout"].as_str().unwrap_or("");
+            let stderr = out["stderr"].as_str().unwrap_or("");
+            if !stdout.is_empty() {
+                print!("{stdout}");
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+                if !stderr.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            Some(out["code"].as_i64().unwrap_or(1) as i32)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("{e}");
+            Some(1)
+        }
+    }
+}
+
 pub(crate) fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
@@ -3131,14 +3219,20 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_dev(name, source, *port, host, allow_host);
     }
-    let state_dir = match cli.state_dir {
-        Some(dir) => dir,
+    let state_dir = match &cli.state_dir {
+        Some(dir) => dir.clone(),
         None => client::state_dir()?,
     };
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
         cadence_agent::sandbox::adopt(&state_dir)?;
+    }
+    // CAD-615: the master retrying an approved command. The daemon
+    // runs it and this process prints the output. No grant, or an
+    // allowlisted command, falls through to the normal verb.
+    if let Some(code) = permission_replay(&state_dir, &cli) {
+        return Ok(code);
     }
     match cli.command {
         Commands::Doctor {

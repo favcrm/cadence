@@ -125,6 +125,27 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // fail closed the same way; listed for the reader).
     route("POST", "/api/needs/dismiss", RouteClass::OperatorOnly),
     route("POST", "/api/needs/snooze", RouteClass::OperatorOnly),
+    // CAD-615: permission decisions. OperatorOnly, same as the RPCs.
+    route(
+        "POST",
+        "/api/master/permissions/*/allow-once",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/*/always",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/*/reject",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/rules/*/revoke",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
@@ -306,6 +327,43 @@ pub(super) fn admit(
         }
     }
     Ok(Some(caller))
+}
+
+/// Operator-only read of `/api/master/permissions`. The board relays
+/// the list over its own daemon connection, so the HTTP peer must be
+/// the operator — the same caller check as an OperatorOnly write,
+/// without the write content-type guard (a same-origin GET does not
+/// send one).
+pub(super) fn admit_operator_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<(), HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false)?;
+    match &caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "GET /api/master/permissions is the operator's decision — this request comes \
+                 from agent '{alias}'; decide from the operator's browser"
+            ),
+        )),
+        Caller::Named(named) if !named.operator => Err(guard_fail(
+            "member_role",
+            &format!(
+                "GET /api/master/permissions needs the board owner's role — this session is \
+                 {}'s, mapped `member`",
+                named.actor
+            ),
+        )),
+        Caller::Named(_) => Ok(()),
+        Caller::Operator(_) => super::home::prove_operator_peer(
+            request,
+            state_dir,
+            opts,
+            "GET /api/master/permissions",
+        ),
+    }
 }
 
 /// A public session's user as a board caller (CAD-526): what a verified

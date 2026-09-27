@@ -16,6 +16,7 @@ import {
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdates";
 import Button from "../../ui/Button";
+import PermissionCard from "./PermissionCard";
 import PlanCard from "./PlanCard";
 import Link from "../../ui/Link";
 
@@ -28,6 +29,7 @@ const KIND_CHIP: Record<string, string> = {
   plan: "bg-warn/10 text-warn",
   question: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
+  master_permission: "bg-warn/10 text-warn",
   merge: "bg-ok/15 text-ok",
 };
 
@@ -274,7 +276,7 @@ function NeedItem({
   onHide: (key: string) => void;
 }) {
   const block = useWriteBlock(readOnly);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(need.kind === "master_permission");
   const [menu, setMenu] = useState(false);
   const [pick, setPick] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -314,7 +316,13 @@ function NeedItem({
   };
 
   const expandLabel =
-    action.type === "plan" ? "Review plan" : action.type === "answer" ? "Answer" : "Review merge";
+    action.type === "plan"
+      ? "Review plan"
+      : action.type === "answer"
+        ? "Answer"
+        : action.type === "permission"
+          ? "Decide"
+          : "Review merge";
   return (
     <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
       <div className="flex items-center gap-2 min-w-0">
@@ -344,7 +352,10 @@ function NeedItem({
           >
             Ask master
           </button>
-          {(action.type === "plan" || action.type === "answer" || action.type === "merge") && (
+          {(action.type === "plan" ||
+            action.type === "answer" ||
+            action.type === "merge" ||
+            action.type === "permission") && (
             <button
               className="lnk text-label shrink-0"
               aria-expanded={open}
@@ -464,6 +475,16 @@ function NeedItem({
           onDone={(t) => {
             setDone(`answered: ${t}`);
             setOpen(false);
+          }}
+        />
+      )}
+      {open && action.type === "permission" && (
+        <PermissionCard
+          card={action}
+          readOnly={readOnly}
+          onDone={(t) => {
+            setDone(t);
+            refresh();
           }}
         />
       )}
