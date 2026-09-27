@@ -1059,6 +1059,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-506: no platform adapters — a platform call in a test
         // daemon fails closed unless the test registers one.
         platforms: Default::default(),
+        provider_deployments: None,
         effect_execute_gate: None,
         // CAD-546: no `local` outbox — a test that registers the
         // adapter pins its own root via `platform::local::register_at`.

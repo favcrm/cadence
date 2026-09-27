@@ -7,10 +7,18 @@ const CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin
 fn nonhosted_registration_never_loads_image_metadata() {
     let mut opts = crate::daemon::ServeOptions::default();
     crate::platform::agenticos::register_with_loader(
-        &mut opts, "http://localhost:3110", false,
-        || -> Result<Option<DeploymentMetadata>> { panic!("nonhosted composition must not inspect image metadata") },
-    ).unwrap();
-    assert_eq!(opts.platforms["agenticos"].reported_manifest_version(), None);
+        &mut opts,
+        "http://localhost:3110",
+        false,
+        || -> Result<Option<DeploymentMetadata>> {
+            panic!("nonhosted composition must not inspect image metadata")
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        opts.platforms["agenticos"].reported_manifest_version(),
+        None
+    );
 }
 
 #[test]

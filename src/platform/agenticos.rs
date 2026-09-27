@@ -183,13 +183,25 @@ pub fn register_from_composition(
     base: &str,
     hosted: bool,
 ) -> Result<()> {
+    register_with_loader(opts, base, hosted, super::deployments::load)
+}
+
+pub(super) fn register_with_loader(
+    opts: &mut crate::daemon::ServeOptions,
+    base: &str,
+    hosted: bool,
+    load: impl FnOnce() -> Result<Option<super::deployments::DeploymentMetadata>>,
+) -> Result<()> {
+    if !hosted {
+        return register(opts, base);
+    }
     let metadata = match &opts.provider_deployments {
         Some(metadata) => Some(metadata.clone()),
-        None => super::deployments::load()?,
+        None => load()?,
     };
     let pin = metadata
         .as_ref()
-        .and_then(|metadata| hosted.then(|| metadata.pin(PLATFORM, base)).flatten());
+        .and_then(|metadata| metadata.pin(PLATFORM, base));
     register_with_deployment_pin(opts, base, pin)
 }
 
