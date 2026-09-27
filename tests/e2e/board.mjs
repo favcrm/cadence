@@ -295,8 +295,28 @@ const steps = {
     const row = await needRow(page, "question", issue);
     await row.getByRole("button", { name: /^Answer/ }).click();
     if (summary) await expectText(row, summary, "the master's summary on the question");
+    // Refresh removes completed needs. Verify the committed answer, rather
+    // than racing the transient acknowledgement on the removed row.
+    const answered = page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === `/api/issues/${encodeURIComponent(issue)}/answers`,
+      { timeout: TIMEOUT },
+    );
     await row.getByRole("button", { name: option, exact: true }).click();
-    await expectText(row, `answered: ${option}`, "the question after answering");
+    const response = await answered;
+    if (!response.ok()) throw new Error(`answer failed: HTTP ${response.status()}`);
+    const request = response.request().postDataJSON();
+    const receipt = await response.json();
+    const reports = receipt.issue?.reports ?? [];
+    const answer = reports.find((report) =>
+      report.kind === "answer" && report.agent === "operator" &&
+      report.answers === request.question && report.body?.trim() === option,
+    );
+    const question = reports.find((report) => report.name === request.question);
+    if (request.text !== option || !answer || question?.kind !== "question" ||
+        question.open !== false || !question.answered_by?.includes(answer.name)) {
+      throw new Error("answer receipt does not contain the selected operator answer and closed question");
+    }
     return {};
   },
 
@@ -310,8 +330,18 @@ const steps = {
     await expectText(row, pr, "the merge row names the PR");
     await expectText(row, verdict, "the merge row carries the verdict");
     await expectText(row, sha.slice(0, 12), "the merge is pinned to the reviewed head");
+    const enqueued = page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === `/api/delivery/${encodeURIComponent(issue)}/merge`,
+      { timeout: TIMEOUT },
+    );
     await row.getByRole("button", { name: "Merge", exact: true }).click();
-    await expectText(row, "merge enqueued", "the merge row after Merge");
+    const response = await enqueued;
+    if (!response.ok()) throw new Error(`merge failed: HTTP ${response.status()}`);
+    const receipt = await response.json();
+    if (receipt.state !== "enqueued" || receipt.head !== sha || receipt.pr !== pr) {
+      throw new Error("merge receipt does not enqueue the displayed PR at its reviewed head");
+    }
     return {};
   },
 
