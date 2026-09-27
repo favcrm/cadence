@@ -1,0 +1,90 @@
+.issue-workspace {
+  overflow-wrap: anywhere;
+}
+.issue-workspace .section-nav {
+  margin-top: 0.75rem;
+}
+.issue-read-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+}
+.issue-read-notice p {
+  margin: 0.25rem 0 0;
+}
+.issue-read-notice strong {
+  color: var(--color-ink-100);
+}
+.issue-acceptance-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+  font-size: var(--text-secondary);
+  color: var(--color-ink-400);
+}
+.issue-acceptance-progress strong {
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.issue-workspace [data-testid="lane-card"],
+.issue-workspace [data-testid="lane-conversation"] {
+  padding: 1rem;
+  display: grid;
+  gap: 0.875rem;
+}
+.issue-workspace [data-testid="lane-card"] h2,
+.issue-workspace [data-testid="lane-conversation"] h2 {
+  margin: 0;
+  font-size: var(--text-cardtitle);
+  font-weight: 600;
+}
+.issue-workspace [data-testid="lane-card"] dd {
+  min-width: 0;
+}
+.issue-workspace [data-testid="lane-card"] dt {
+  color: var(--color-ink-500);
+}
+.issue-workspace [data-testid="lane-conversation"] textarea {
+  width: 100%;
+  min-height: 6rem;
+}
+.issue-workspace [data-testid="lane-conversation"] li + li {
+  margin-top: 1rem;
+}
+.issue-pr-form {
+  display: flex;
+  align-items: end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.issue-pr-form label {
+  flex: 1 1 16rem;
+}
+.issue-link-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+}
+.issue-link-form > :first-child {
+  grid-column: 1 / -1;
+}
+@media (max-width: 640px) {
+  .issue-workspace .btn,
+  .issue-workspace .field {
+    min-height: 2.75rem;
+  }
+}

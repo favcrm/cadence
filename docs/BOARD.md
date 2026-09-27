@@ -1562,6 +1562,18 @@ oldest `review` issue's age.
 
 ## Frontend
 
+Issue details (`/projects/<project>/issues/<id>`) use shared section links and a
+full-width workspace. Overview renders the original Markdown body once, with a
+compact acceptance count; checklists and dispatch permission still use the
+existing parser and operator gate. Activity shows actual recorded events,
+newest dated updates first, with undated reports last. Issue status alone is
+not merge evidence. Issue, lane and history failures expose retry and identify
+retained information as last known; failed reads do not become empty states.
+Issue navigation resets local forms and dialogs. Comments have a labeled editor,
+preview, single-flight pending feedback, and retain drafts after failure.
+Pull request links lead to GitHub for live checks/queue; recorded review reports
+remain visible even before a PR exists. The board has no merge-approval action.
+
 Outbox (`/outbox`) is the operator's history of posts released to the local
 publication destination. It does not imply delivery to an external channel.
 The responsive, full-width list shows newest posts first, with project,
