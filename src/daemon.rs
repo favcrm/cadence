@@ -3535,7 +3535,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 
 /// `serve` with per-instance options — in-process test daemons pass
 /// their mock commands here instead of through the shared environment.
-pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
+pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     // Before the marker is consumed and before recover() writes. A
     // direct `daemon run` of a different build by a non-holder must
@@ -3560,6 +3560,10 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // consumed and before the store opens — a daemon that cannot hold
     // it refuses here having written nothing but the singleton lock.
     let hosted = hosted_config(&opts)?;
+    // CAD-501: a hosted daemon (or one with CADENCE_AGENTICOS_URL)
+    // registers the AgenticOS adapter before the store opens. An
+    // unconfigured daemon leaves it unregistered and fails closed.
+    crate::platform::agenticos::attach(&mut opts, &hosted)?;
     let lease = crate::lease::acquire(state_dir, &hosted)?;
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;

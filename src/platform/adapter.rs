@@ -17,8 +17,9 @@
 //!
 //! Adapters register per platform name in
 //! [`crate::daemon::ServeOptions::platforms`]; CAD-367 lands
-//! Cloudflare's, CAD-501 AgenticOS's. A platform with no registered
-//! adapter refuses every call — the gate fails closed.
+//! Cloudflare's, and CAD-501 registers AgenticOS when the daemon is
+//! hosted. A platform with no registered adapter refuses every call —
+//! the gate fails closed.
 
 use serde_json::Value;
 

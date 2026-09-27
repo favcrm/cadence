@@ -8,6 +8,7 @@
 //! fingerprint; every result, event and refusal carries handles only.
 
 pub mod adapter;
+pub mod agenticos;
 pub mod custody;
 pub mod local;
 
@@ -26,12 +27,23 @@ pub use custody::{Custody, Key};
 /// from the board with no CLI setup.
 pub const BUILTIN_LOCAL_ACCOUNT: &str = "local";
 
+/// Provider-owned account metadata; composition reviews this exact allowlist.
+/// This is credential selection, not capability matching or grant derivation.
+pub struct BuiltinAccount {
+    pub platform: &'static str,
+    pub account: &'static str,
+}
+
+const BUILTIN_ACCOUNTS: &[BuiltinAccount] = &[local::BUILTIN_ACCOUNT, agenticos::BUILTIN_ACCOUNT];
+
 /// Is `(platform, account)` a built-in account that needs no
-/// enrollment? Today only `local/local` (CAD-577): the gate treats it
-/// as always connected, with no credential bytes to load. Every real
-/// platform's custody and enrollment rules are unchanged.
+/// enrollment? `local/local` (CAD-577) and hosted `agenticos/hosted`
+/// (CAD-501): the gate treats them as connected, with no credential
+/// bytes to load. Every other account still enrolls.
 pub fn is_builtin(platform: &str, account: &str) -> bool {
-    platform == local::PLATFORM && account == BUILTIN_LOCAL_ACCOUNT
+    BUILTIN_ACCOUNTS
+        .iter()
+        .any(|known| known.platform == platform && known.account == account)
 }
 
 /// What `platform enroll` produces for one exchange — the credential
@@ -81,9 +93,10 @@ pub fn enroll_token(params: &Value, declared: &[String]) -> Result<Enrollment> {
 /// §5.3, exchange shape 2 — the consent exchange: the platform's
 /// device-code/OTP flow, run by the operator, mints a scoped
 /// credential for the daemon. The adapter that knows a platform's
-/// flow registers in [`CONSENT_ADAPTERS`]; no adapter is registered
-/// yet (CAD-501 lands AgenticOS's), so a consent enroll names the
-/// missing adapter and refuses.
+/// flow registers in [`CONSENT_ADAPTERS`]. AgenticOS does not: its
+/// hosted door binds the company with no credential, and a
+/// self-hosted grant is an enrolled scoped token (`shape: "token"`),
+/// not a board consent exchange (CAD-501).
 pub type ConsentExchange = fn(&ConsentRequest) -> Result<ConsentOutcome>;
 
 pub struct ConsentRequest<'a> {
@@ -132,7 +145,8 @@ pub fn enroll_consent(
     let exchange = consent_adapter(platform).ok_or_else(|| {
         Error::rejected(format!(
             "no consent-exchange adapter is registered for platform '{platform}' — \
-             CAD-501 lands AgenticOS's; enroll a scoped token with `shape: \"token\"`"
+             AgenticOS's hosted door needs none; enroll a scoped token with \
+             `shape: \"token\"`"
         ))
     })?;
     let outcome = exchange(&ConsentRequest {

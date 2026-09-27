@@ -651,9 +651,10 @@ fn personal_and_misdeclared_tokens_are_not_enrollable() {
 fn consent_exchange_is_the_adapter_seam() {
     let d = Daemon::start();
     // `accept_same_uid_risk` carries the calls past the custody gate
-    // so the adapter seam itself is exercised. No consent adapter is
-    // registered yet (CAD-501 lands the first) — the refusal names
-    // that seam instead of admitting a token.
+    // so the adapter seam itself is exercised. AgenticOS does not
+    // register a consent adapter (CAD-501: the hosted door binds the
+    // company, and a self-hosted grant is a scoped token) — the
+    // refusal names that seam instead of admitting a token.
     let err = refused(d.op(
         "platform_enroll",
         json!({"platform": "agenticos", "account": "acme",
