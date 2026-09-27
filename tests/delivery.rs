@@ -3029,13 +3029,20 @@ fn delivery_agent_cannot_mark_ticket_done() {
 
 /// CAD-449: a tracker write that fails is retried, never lost, and
 /// leaves nothing staged. A tracker locked by another writer and a
-/// failing commit hook each leave the ticket `pending` with a Needs-you
-/// row; `issue.md` is back as it was and unstaged, so the next writer's
+/// failing commit hook preserves rollback and bounded retry; busy
+/// before status is read requires the operator. A Needs-you row carries
+/// each unresolved outcome; `issue.md` is back as it was and unstaged, so the next writer's
 /// commit carries no `status: done`; the router pass marks it done once
 /// the tracker takes writes again, and the row goes.
 #[test]
 fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
-    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let mut lf = LoopFixture::dispatched_plan_with(
+        LOOP_PLAN,
+        daemon::ServeOptions {
+            report_router: Some(3600),
+            ..daemon_opts()
+        },
+    );
     for id in ["D-3", "D-4"] {
         let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
         assert!(ok, "{id}: {sent}");
@@ -3059,40 +3066,27 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         })
     };
 
-    // A stale tracker lock.
-    lf.pass_on("D-2", &a, LOOP_PR);
+    // Busy before a status read has no safe retry precondition.
+    lf.pass_on_with_hint("D-2", &a, LOOP_PR, true);
     let d2_status = lf.f.front("D-2").status;
     let lock = lf.f.pm_dir.join(".write.lock");
     std::fs::write(&lock, "").unwrap();
     lf.set_gh(&a, "MERGED", true, false);
     let row2 = lf.sync_of("D-2");
-    assert_eq!(row2["ticket"]["outcome"], "pending", "{row2}");
+    assert_eq!(row2["ticket"]["outcome"], "refused", "{row2}");
     assert!(
         row2["ticket"]["why"].as_str().unwrap().contains("locked"),
         "{row2}"
     );
     assert_eq!(lf.f.front("D-2").status, d2_status);
-    assert!(row(&lf, "D-2"), "{:#?}", lf.f.needs_me());
+    assert!(row(&lf, "D-2"));
     std::fs::remove_file(&lock).unwrap();
-    lf.wait_of("D-2", "marked by a retry", |r| {
-        r["ticket_done"]["outcome"] == "marked"
-    });
-    assert_eq!(lf.f.front("D-2").status, "done");
-    assert_eq!(lf.done_commits("D-2").len(), 1);
-    assert!(!row(&lf, "D-2"), "{:#?}", lf.f.needs_me());
-    assert_eq!(lf.daemon_events("ticket_done_pending").len(), 1);
-    let comments = lf.f.pm_dir.join("demo/D-2/comments");
-    assert!(
-        std::fs::read_dir(&comments).unwrap().any(|e| {
-            std::fs::read_to_string(e.unwrap().path())
-                .unwrap()
-                .contains("marked done after a retry")
-        }),
-        "no comment says D-2's first write failed"
-    );
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    assert_eq!(lf.f.front("D-2").status, d2_status);
+    assert!(lf.done_commits("D-2").is_empty());
 
     // A failing commit hook.
-    lf.pass_on("D-3", &b, "https://github.com/acme/app/pull/8");
+    lf.pass_on_with_hint("D-3", &b, "https://github.com/acme/app/pull/8", true);
     let d3_status = lf.f.front("D-3").status;
     let hooks = String::from_utf8(git(&["rev-parse", "--git-path", "hooks"]).stdout).unwrap();
     let hooks = lf.f.pm_dir.join(hooks.trim());
@@ -3113,6 +3107,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     // Past the done write and its comment (both refused by the hook),
     // a router retry fails too — and no comment follows it to re-stage
     // the index, so what the retry left staged is what it left.
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while std::fs::read_to_string(&runs)
         .unwrap_or_default()
@@ -3162,6 +3157,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         !comment.contains("demo/D-3/issue.md"),
         "w1's comment committed D-3's status: {comment}"
     );
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
     lf.wait_of("D-3", "marked by a retry", |r| {
         r["ticket_done"]["outcome"] == "marked"
     });
@@ -3173,7 +3169,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     // hand: the retry never overwrites that. A commit-msg hook refuses
     // only the done write, so the operator's own write goes through.
     let c = "c".repeat(40);
-    lf.pass_on("D-4", &c, "https://github.com/acme/app/pull/9");
+    lf.pass_on_with_hint("D-4", &c, "https://github.com/acme/app/pull/9", true);
     let d4_status = lf.f.front("D-4").status;
     let msg_hook = hooks.join("commit-msg");
     std::fs::write(
@@ -3195,6 +3191,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     let (ok, out) = lf.f.cli(&["issue", "set", "D-4", "status=review"]);
     assert!(ok, "{out}");
     std::fs::remove_file(&msg_hook).unwrap();
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
     let rec = lf.wait_of("D-4", "settled", |r| {
         r["ticket_done"]["outcome"] != "pending"
     });
@@ -3205,6 +3202,159 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     assert_eq!(lf.f.front("D-4").status, "review");
     assert!(lf.done_commits("D-4").is_empty());
     assert!(!row(&lf, "D-4"), "{:#?}", lf.f.needs_me());
+}
+
+// CAD-474: refuse only the done commit, allowing independent tracker
+// writers and daemon comments through. The counter measures done attempts.
+fn refuse_done_commits(lf: &LoopFixture) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let hooks = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&lf.f.pm_dir)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .unwrap();
+    assert!(hooks.status.success());
+    let dir =
+        lf.f.pm_dir
+            .join(String::from_utf8(hooks.stdout).unwrap().trim());
+    std::fs::create_dir_all(&dir).unwrap();
+    let hook = dir.join("commit-msg");
+    let runs = lf.f.tmp.path().join("done-attempts");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nif grep -q 'set status=done — ' \"$1\"; then\n echo x >> '{}'\n exit 1\nfi\nexit 0\n", runs.display()
+    )).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (hook, runs)
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn delivery_failed_done_write_does_not_adopt_a_second_writers_status() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    let paused = AtomicBool::new(false);
+    let mut lf = LoopFixture::dispatched_plan_with(
+        LOOP_PLAN,
+        daemon::ServeOptions {
+            report_router: Some(1),
+            after_done_write_failure: Some(Arc::new(move || {
+                if !paused.swap(true, Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap();
+                }
+            })),
+            ..daemon_opts()
+        },
+    );
+    let head = "a".repeat(40);
+    lf.pass_on("D-2", &head, LOOP_PR);
+    let original = lf.f.front("D-2").status;
+    let (hook, _) = refuse_done_commits(&lf);
+    lf.set_gh(&head, "MERGED", true, false);
+    let result = thread::scope(|scope| {
+        let syncing = scope.spawn(|| lf.sync_of("D-2"));
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // Independent CLI transaction after the failed write released lock.
+        let changed = lf.f.cli(&["issue", "set", "D-2", "status=review"]);
+        release_tx.send(()).unwrap();
+        assert!(changed.0, "{}", changed.1);
+        syncing.join().unwrap()
+    });
+    std::fs::remove_file(hook).unwrap();
+    assert_eq!(result["ticket"]["from"], original, "{result}");
+    let rec = lf.wait_of("D-2", "second writer retained", |r| {
+        r["ticket_done"]["outcome"] == "kept"
+    });
+    assert_eq!(rec["ticket_done"]["status"], "review", "{rec}");
+    assert_eq!(lf.f.front("D-2").status, "review");
+    assert!(lf.done_commits("D-2").is_empty());
+}
+
+#[test]
+fn delivery_busy_before_status_read_requires_operator_resolution() {
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let head = "a".repeat(40);
+    lf.pass_on("D-2", &head, LOOP_PR);
+    let lock = lf.f.pm_dir.join(".write.lock");
+    std::fs::write(&lock, "").unwrap();
+    lf.set_gh(&head, "MERGED", true, false);
+    let result = lf.sync_of("D-2");
+    std::fs::remove_file(lock).unwrap();
+    assert_eq!(result["ticket"]["outcome"], "refused", "{result}");
+    let changed = lf.f.cli(&["issue", "set", "D-2", "status=review"]);
+    assert!(changed.0, "{}", changed.1);
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    assert_eq!(lf.f.front("D-2").status, "review");
+    assert!(lf.done_commits("D-2").is_empty());
+}
+
+#[test]
+fn delivery_known_failed_status_survives_transient_tracker_contention() {
+    let mut lf = LoopFixture::dispatched_plan_with(
+        LOOP_PLAN,
+        daemon::ServeOptions {
+            report_router: Some(3600),
+            ..daemon_opts()
+        },
+    );
+    let head = "a".repeat(40);
+    lf.pass_on_with_hint("D-2", &head, LOOP_PR, true);
+    let original = lf.f.front("D-2").status;
+    let (hook, _) = refuse_done_commits(&lf);
+    lf.set_gh(&head, "MERGED", true, false);
+    assert_eq!(lf.sync_of("D-2")["ticket"]["outcome"], "pending");
+    std::fs::remove_file(hook).unwrap();
+    let lock = lf.f.pm_dir.join(".write.lock");
+    std::fs::write(&lock, "").unwrap();
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    let pending = lf.wait_of("D-2", "known-status busy retry", |r| {
+        r["ticket_done"]["attempts"] == 2
+    });
+    std::fs::remove_file(lock).unwrap();
+    assert_eq!(pending["ticket_done"]["from"], original, "{pending}");
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    lf.wait_of("D-2", "healed third attempt", |r| {
+        r["ticket_done"]["outcome"] == "marked"
+    });
+    assert_eq!(lf.f.front("D-2").status, "done");
+    assert_eq!(lf.done_commits("D-2").len(), 1);
+}
+
+#[test]
+fn delivery_permanent_done_write_failure_stops_after_three_attempts() {
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let head = "a".repeat(40);
+    lf.pass_on("D-2", &head, LOOP_PR);
+    let (hook, runs) = refuse_done_commits(&lf);
+    lf.set_gh(&head, "MERGED", true, false);
+    let result = lf.sync_of("D-2");
+    assert_eq!(result["ticket"]["outcome"], "pending", "{result}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let settled = loop {
+        let rec = lf.rec_of("D-2");
+        if rec["ticket_done"]["outcome"] == "refused" || Instant::now() >= deadline {
+            break rec;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    std::fs::remove_file(hook).unwrap();
+    assert_eq!(settled["ticket_done"]["outcome"], "refused", "{settled}");
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 3);
+    // Even after the failure heals, refusal waits for the operator.
+    for _ in 0..3 {
+        lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 3);
+    assert_ne!(lf.f.front("D-2").status, "done");
+    assert!(lf.done_commits("D-2").is_empty());
 }
 
 // ==== CAD-445: the master wakes when work can move on ====
