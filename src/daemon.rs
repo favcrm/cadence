@@ -682,7 +682,7 @@ impl Shared {
                     text: "The provider compacted this session's context; the next turn \
                            carries a continuity pack.",
                     payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT,
-                                         "trigger": params.get("trigger")})),
+                                         "trigger": if self.store.app_material_endpoint(alias).unwrap_or(true) { None } else { params.get("trigger") }})),
                     message_id: None,
                 },
             ) {
@@ -3958,6 +3958,28 @@ mod tests {
             })
             .unwrap();
         shared
+    }
+
+    #[test]
+    fn cad631_retained_app_provider_events_do_not_publish_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('private-job','app-run','w1','done',1,1);
+            INSERT INTO tasks(id,job_id,assignee,state,created,updated) VALUES('private-task','private-job','w1','done',1,1);
+            INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('private-job','private-install',1,'digest','{}','digest','w1','request','succeeded',1,1);
+            INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('private-job','s1','private-task','{}','identity','succeeded');").unwrap();
+        for method in [
+            "item/completed",
+            "cadence/tool_use",
+            "cadence/session_compacted",
+        ] {
+            shared.on_provider_event("w1", method, json!({"item":{"text":"private-event-sentinel"},"trigger":"private-event-sentinel"}));
+        }
+        let events = shared.store.events("w1", 0, 100).unwrap();
+        assert!(!format!("{events:?}").contains("private-event-sentinel"));
+        let entries = shared.store.thread_entries("w1", 0, 100).unwrap();
+        assert!(!format!("{entries:?}").contains("private-event-sentinel"));
     }
 
     /// The one-second board poll needs running rows, not thousands of
