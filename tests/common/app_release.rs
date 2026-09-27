@@ -13,8 +13,10 @@ pub(crate) const REVIEWER: &str = "release-reviewer";
 pub(crate) const A: &str = "CLIENT_A_PRIVATE_FACTS";
 pub(crate) const B: &str = "CLIENT_B_PRIVATE_FACTS";
 pub(crate) struct Release {
-    pub(crate) root: tempfile::TempDir,
+    // Fields drop in declaration order: stop/join our daemon while its
+    // socket and state still exist, then remove the owning temp directory.
     pub(crate) daemon: TestDaemon,
+    pub(crate) root: tempfile::TempDir,
     pub(crate) install: Value,
     pub(crate) connection: String,
 }
