@@ -45,6 +45,10 @@ impl Shared {
 
     fn idea_pass(self: &std::sync::Arc<Self>, pm: &issue::Pm) -> Result<bool> {
         let mut records = idea::load(&self.state_dir)?;
+        // What this pass loaded. A concurrent writer (the stale-plan
+        // test backdates `plan_ready_at` while a pass is still
+        // committing) must not be overwritten when we save.
+        let loaded = records.clone();
         let projects = project::list(&pm.dir).unwrap_or_default();
         let mut issues = Vec::new();
         for project in &projects {
@@ -73,10 +77,34 @@ impl Shared {
                 waiting = true;
             }
         }
+        self.honor_backdated_plan(&loaded, &mut records);
         if !records.is_empty() {
             idea::save(&self.state_dir, &records)?;
         }
         Ok(waiting)
+    }
+
+    /// A pass loads the pipeline, then spends a long time committing
+    /// comments. The stale-plan test backdates `plan_ready_at` on disk
+    /// during that window. Saving the loaded timestamp would put the
+    /// fresh value back and the plan would never go stale. When disk
+    /// moved during the pass, disk wins.
+    fn honor_backdated_plan(
+        &self,
+        loaded: &BTreeMap<String, idea::Record>,
+        records: &mut BTreeMap<String, idea::Record>,
+    ) {
+        let Ok(fresh) = idea::load(&self.state_dir) else {
+            return;
+        };
+        for (id, rec) in records.iter_mut() {
+            let (Some(orig), Some(disk)) = (loaded.get(id), fresh.get(id)) else {
+                continue;
+            };
+            if disk.plan_ready_at != orig.plan_ready_at {
+                rec.plan_ready_at = disk.plan_ready_at;
+            }
+        }
     }
 
     /// `true` when this idea is waiting on a research or plan turn that
