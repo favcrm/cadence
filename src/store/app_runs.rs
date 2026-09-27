@@ -249,6 +249,7 @@ impl Store {
         for step in &workflow.steps {
             let agent = self.agent_in(&tx, &step.assignee)?;
             if !agent.enabled
+                || agent.role != "worker"
                 || !matches!(
                     (agent.provider.as_str(), agent.endpoint_kind.as_str()),
                     ("codex", "managed" | "managed-ws")

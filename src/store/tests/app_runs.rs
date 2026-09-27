@@ -426,3 +426,25 @@ fn cad631_authority_loss_invalidates_once_and_keeps_material_receipts() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn cad631_pm_in_owner_group_is_not_an_execution_worker() {
+    let (_dir, s, run) = runtime_fixture();
+    s.conn()
+        .execute("UPDATE agents SET role='pm' WHERE alias='writer'", [])
+        .unwrap();
+    let workflow: crate::store::app_runs::LocalWorkflow =
+        serde_json::from_value(run["snapshot"]["workflow"].clone()).unwrap();
+    let inputs = std::collections::BTreeMap::new();
+    assert!(s
+        .app_run_create(crate::store::app_runs::LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "pm-is-not-worker",
+            owner_pm: "lead",
+            project_link: None,
+        })
+        .is_err());
+}
