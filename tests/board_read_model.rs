@@ -83,11 +83,12 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) + std::process::id() as usize;
+    (0..89)
+        .map(|offset| 3110 + ((start + offset) % 89) as u16)
+        .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .expect("no isolated board port available")
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -249,6 +250,7 @@ fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
             let opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                dist: std::env::var_os("CADENCE_BUDGET_DIST").map(PathBuf::from),
                 stop: Some(stop),
                 // CAD-482: attach unconditionally under the feature —
                 // the token is read lazily per request, so a board may
@@ -507,6 +509,18 @@ fn stats(fx: &Fixture) -> (u64, u64) {
     )
 }
 
+/// Watcher cost for one board: incremental folder parses, full
+/// `load_all` scans on the watcher thread, and overview builds.
+fn watcher_cost(fx: &Fixture) -> (u64, u64, u64, u64) {
+    let s = ui::read_model_stats(&fx.state, &fx.pm);
+    (
+        s["parses"].as_u64().unwrap(),
+        s["collection_parses"].as_u64().unwrap(),
+        s["overview_builds"].as_u64().unwrap(),
+        s["request_builds"].as_u64().unwrap(),
+    )
+}
+
 /// Request-path builds allowed per run of reads against a warm, unchanged
 /// board. Zero is the steady state; one more covers a background refresh
 /// that overran the 10 s age cap on a loaded runner. Without the cache
@@ -559,13 +573,13 @@ fn board_reads_p95_under_budget_on_a_400_issue_tracker() {
 
 /// Collect a board stream's bytes in the background.
 fn stream_into(port: u16) -> std::sync::Arc<std::sync::Mutex<String>> {
+    stream_into_path(port, "/api/stream")
+}
+
+fn stream_into_path(port: u16, path: &str) -> std::sync::Arc<std::sync::Mutex<String>> {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(
-        s,
-        "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-    )
-    .unwrap();
+    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
     s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let out = buf.clone();
     thread::spawn(move || {
@@ -910,4 +924,174 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
         builds_after - builds
     );
     assert!(p < P95_BUDGET, "running-turn overview p95 {p:?}");
+}
+
+fn get_validated(port: u16, path: &str, etag: Option<&str>) -> (u16, String, String) {
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    let condition = etag
+        .map(|tag| format!("If-None-Match: {tag}\r\n"))
+        .unwrap_or_default();
+    write!(
+        socket,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{condition}\r\n"
+    )
+    .unwrap();
+    let mut bytes = String::new();
+    socket.read_to_string(&mut bytes).unwrap();
+    let (head, body) = bytes.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let etag = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("etag")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    (status, etag, body.to_owned())
+}
+
+#[test]
+fn collection_validators_omit_unchanged_bytes_and_move_after_writes() {
+    let fx = fixture(20, 0);
+    let (status, before, body) = get_validated(fx.port, "/api/issues", None);
+    assert_eq!(status, 200);
+    assert!(!before.is_empty());
+    assert!(body.len() > 1000);
+    let (status, same, body) = get_validated(fx.port, "/api/issues", Some(&before));
+    assert_eq!(status, 304);
+    assert_eq!(same, before);
+    assert!(body.is_empty(), "unchanged collection transfers no body");
+    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-3", "status=done"]);
+    assert!(ok, "{out}");
+    let (status, after, body) = get_validated(fx.port, "/api/issues", Some(&before));
+    assert_eq!(status, 200);
+    assert_ne!(after, before);
+    assert!(body.contains("done"));
+    // A public validator cannot bypass the operator proof on a guarded
+    // collection. The server performs route authorization before 304.
+    let (status, _, _) = get_validated(fx.port, "/api/outbox", Some(&after));
+    assert_eq!(status, 403);
+}
+
+// CAD-611 MEASUREMENT FIXTURE — copy this section to the pinned baseline
+// tree for exactly the same scenario. Explicit, ignored, admitted runner only.
+#[test]
+#[ignore = "controlled browser measurement; admitted runner only"]
+fn board_live_measurement_fixture() {
+    assert!(
+        std::env::var_os("CADENCE_BUDGET_DIST").is_some(),
+        "built UI dist required"
+    );
+    let fx = fixture(ISSUES, JOBS);
+    let endpoint = std::env::var("CADENCE_BUDGET_ENDPOINT_FILE").expect("endpoint file required");
+    std::fs::write(&endpoint, format!("http://127.0.0.1:{}", fx.port)).unwrap();
+    // Browser warms up and measures idle, then starts this fixed busy
+    // workload explicitly. No wall-clock guess about Chrome startup.
+    wait_for("browser busy measurement trigger", 180, || {
+        Path::new(&format!("{endpoint}.busy")).exists()
+    });
+    for step in 0..20 {
+        let id = format!("CAD-{}", step + 2);
+        let (ok, out) = cli(
+            &fx.pm,
+            &fx.state,
+            &["issue", "set", &id, "title=network budget changed"],
+        );
+        assert!(ok, "{out}");
+        thread::sleep(Duration::from_secs(3));
+    }
+    thread::sleep(Duration::from_secs(15));
+}
+
+#[test]
+fn title_only_tracker_changes_skip_aggregate_reads_but_status_and_count_changes_invalidate() {
+    let fx = fixture(12, 0);
+    let initial = get_json(fx.port, "/api/overview");
+    let initial_projects = get_json(fx.port, "/api/projects");
+    let stream = stream_into_path(fx.port, "/api/stream?entities=1");
+    wait_for("entity stream hello", 10, || {
+        stream.lock().unwrap().contains("\"entities\":true")
+    });
+    let (parses, collection, overview_builds, request_builds) = watcher_cost(&fx);
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &["issue", "set", "CAD-2", "title=ordinary title changed"],
+    );
+    assert!(ok, "{out}");
+    wait_for("title patch and checked aggregate checkpoint", 15, || {
+        frames(&stream, "issue")
+            .iter()
+            .any(|f| f["id"] == "CAD-2" && f["issue"]["title"] == "ordinary title changed")
+            && !frames(&stream, "aggregates").is_empty()
+    });
+    assert!(frames(&stream, "issues").iter().all(|f| !f["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r == "projects" || r == "overview")));
+    assert!(
+        frames(&stream, "aggregates")
+            .iter()
+            .all(|f| f["resources"] == json!([])),
+        "title-only edits do not change rendered aggregates: {:?}",
+        frames(&stream, "aggregates")
+    );
+    let (parses_after, collection_after, overview_after, request_after) = watcher_cost(&fx);
+    assert!(
+        parses_after - parses <= 1,
+        "title-only re-parsed the collection through the tracker: {parses} -> {parses_after}"
+    );
+    assert_eq!(
+        collection_after, collection,
+        "title-only full-scanned issue folders via load_all: {collection} -> {collection_after}"
+    );
+    assert_eq!(
+        overview_after, overview_builds,
+        "title-only rebuilt the overview: {overview_builds} -> {overview_after}"
+    );
+    assert_eq!(
+        request_after, request_builds,
+        "title-only missed the overview cache: {request_builds} -> {request_after}"
+    );
+    assert_eq!(initial_projects, get_json(fx.port, "/api/projects"));
+    assert_eq!(
+        initial["projects"][0]["open_by_status"],
+        get_json(fx.port, "/api/overview")["projects"][0]["open_by_status"]
+    );
+    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-2", "status=done"]);
+    assert!(ok, "{out}");
+    wait_for("status aggregate update", 15, || {
+        frames(&stream, "aggregates").iter().any(|f| {
+            f["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "overview")
+        })
+    });
+    assert_ne!(
+        initial["projects"][0]["open_by_status"],
+        get_json(fx.port, "/api/overview")["projects"][0]["open_by_status"]
+    );
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &["issue", "new", "new counted issue", "--project", "cadence"],
+    );
+    assert!(ok, "{out}");
+    wait_for("project count aggregate update", 15, || {
+        frames(&stream, "aggregates").iter().any(|f| {
+            f["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "projects")
+        })
+    });
+    assert_ne!(initial_projects, get_json(fx.port, "/api/projects"));
 }
