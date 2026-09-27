@@ -1,6 +1,4 @@
-//! CAD-534: `cadence daemon` monitors RPC handlers — moved verbatim from src/daemon.rs; the
-//! item→file map is src/daemon/split-map.toml
-//! (scripts/split-daemon regenerates it).
+//! CAD-534: `cadence daemon` monitors RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
 

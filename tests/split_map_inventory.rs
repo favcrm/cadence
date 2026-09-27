@@ -3,6 +3,11 @@
 //! manifest lists for it. A test deleted in a move (rev-300's mut1 on
 //! CAD-537) or one added without a manifest entry fails here instead of
 //! going silent.
+//!
+//! CAD-621 retired the one-shot daemon/CLI generators and their manifests.
+//! This guard still consumes tests/split-map*.toml and the doctor/host test
+//! inventory; scripts/split-doctor-host --check also remains a CI gate.
+//! See docs/SPLIT-MANIFESTS.md for the retained manifest policy.
 
 use std::collections::BTreeSet;
 use std::path::Path;
