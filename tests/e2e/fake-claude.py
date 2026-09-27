@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 LOG_DIR = sys.argv[1]
 ARGV = sys.argv[2:]
@@ -123,6 +124,16 @@ def cadence(*args, stdin=None, quiet=False):
     return run(["cadence", *args], stdin=stdin, quiet=quiet)
 
 
+def master_file(*args, body):
+    # The master's TMPDIR is its writable master/tmp. Follow the same
+    # file-input boundary as its real provider; the CLI refuses stdin.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md",
+                                     dir=os.environ["TMPDIR"]) as staged:
+        staged.write(body)
+        staged.flush()
+        return cadence(*args, "--file", staged.name)
+
+
 def as_json(text):
     try:
         return json.loads(text)
@@ -137,7 +148,7 @@ plan_tickets = []
 
 def master_turn(text):
     if "plan a CSV export" in text:
-        rc, out, err = cadence("plan", "propose", "--project", "demo", "--file", "-", stdin=PLAN)
+        rc, out, err = master_file("plan", "propose", "--project", "demo", body=PLAN)
         got = as_json(out) or {}
         if rc != 0 or "epic" not in got:
             return "I could not propose the plan: " + (err or out).strip()
@@ -170,7 +181,7 @@ def master_turn(text):
         report = re.search(r"Report: \S+/reports/(\S+)", text).group(1)
         summary = ("%s asks which delimiter the CSV export uses. Options: comma or "
                    "semicolon. I recommend comma, the RFC 4180 default." % issue)
-        rc, out, err = cadence("master", "escalate", issue, report, "--file", "-", stdin=summary)
+        rc, out, err = master_file("master", "escalate", issue, report, body=summary)
         return "Escalated %s to you: %s" % (issue, "ok" if rc == 0 else (err or out).strip())
     return "Noted."
 
