@@ -1,85 +1,466 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { api, ApiError, type MasterPermissionRule } from "../../lib/api";
+import Button from "../../ui/Button";
+import Select from "../../ui/Select";
+import { IconChevron, IconRefresh, IconSearch } from "../../ui/icons";
+import { useWriteBlock } from "../auth/WriteGate";
+import "./permissions.css";
 
-function ruleLine(rule: MasterPermissionRule): string {
-  const head = rule.argv.join(" ");
-  const tail = rule.tail.length > 0 ? ` ${rule.tail.join(" ")}` : "";
-  return `${head}${tail}`;
+type Viewer = { operator: boolean; readOnly: boolean };
+const errorText = (error: unknown) =>
+  error instanceof ApiError ? error.message : String(error);
+// Quotes preserve argument boundaries. This is a display, never an executable shell command.
+const argument = (value: string) =>
+  /^[\w./:@=+*-]+$/.test(value) ? value : JSON.stringify(value);
+const command = (rule: MasterPermissionRule) =>
+  [...rule.argv, ...(rule.scope === "prefix" ? rule.tail : [])]
+    .map(argument)
+    .join(" ");
+const scopeLabel = (rule: MasterPermissionRule) =>
+  rule.scope === "exact" ? "Exact command" : "Argument pattern";
+function savedDate(at: number) {
+  const date = new Date(at * 1000);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
-/**
- * Settings → Master permissions (CAD-615). Lists the operator-owned
- * rules in `agents/master/permissions.yaml` with who saved them and
- * when, and revokes one. The daemon refuses anyone but the operator.
- */
-export default function MasterPermissions() {
-  const [rules, setRules] = useState<MasterPermissionRule[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    api
-      .permissionRules()
-      .then((out) => {
-        setRules(out.rules);
-        setError(null);
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)));
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const revoke = (id: string) => {
-    setBusy(id);
-    api
-      .permissionRevoke(id)
-      .then(() => load())
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(null));
-  };
-
+function RuleRow({
+  rule,
+  confirming,
+  disabled,
+  busy,
+  onConfirm,
+  onCancel,
+  onRevoke,
+}: {
+  rule: MasterPermissionRule;
+  confirming: boolean;
+  disabled: boolean;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRevoke: () => void;
+}) {
+  const id = useId();
+  const row = useRef<HTMLLIElement>(null);
+  const wasConfirming = useRef(false);
+  useLayoutEffect(() => {
+    if (confirming)
+      row.current
+        ?.querySelector<HTMLButtonElement>(".permission-confirm .btn")
+        ?.focus();
+    else if (wasConfirming.current)
+      row.current
+        ?.querySelector<HTMLButtonElement>(".permission-revoke")
+        ?.focus();
+    wasConfirming.current = confirming;
+  }, [confirming]);
+  const date = savedDate(rule.at);
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9" data-settings="permissions">
-      <h1 className="text-section font-semibold text-ink-100">Master permissions</h1>
-      <p className="text-body text-ink-400 mt-2 max-w-2xl">
-        Rules the operator saved for the master. A deny wins over an allow. Revoke takes effect on the next check.
-      </p>
-      {error ? (
-        <p className="text-micro text-fail mt-3" role="alert">
-          {error}
+    <li
+      ref={row}
+      className="permission-row"
+      data-rule={rule.id}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && confirming) {
+          event.preventDefault();
+          onCancel();
+        }
+      }}
+    >
+      <div className="permission-row-main">
+        <div className="permission-row-labels">
+          <span className="permission-effect" data-effect={rule.effect}>
+            {rule.effect === "allow" ? "Allow" : "Deny"}
+          </span>
+          <span>{scopeLabel(rule)}</span>
+        </div>
+        <code className="permission-command">{command(rule)}</code>
+        <p className="permission-folder">
+          <span>Working folder</span> <code>{rule.cwd || "Not recorded"}</code>
         </p>
-      ) : null}
-      {rules === null ? (
-        <p className="text-micro text-ink-500 mt-4">Loading…</p>
-      ) : rules.length === 0 ? (
-        <p className="text-micro text-ink-500 mt-4">No permission rules.</p>
-      ) : (
-        <ul className="mt-4 space-y-2 max-w-3xl">
-          {rules.map((rule) => (
-            <li key={rule.id} className="rounded border border-ink-800 px-3 py-2" data-rule={rule.id}>
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="chip shrink-0 bg-ink-800 text-ink-300">{rule.effect}</span>
-                <span className="chip shrink-0 bg-ink-800 text-ink-400">{rule.scope}</span>
-                <span className="min-w-0 flex-1 truncate text-secondary text-ink-200" title={ruleLine(rule)}>
-                  {ruleLine(rule)}
-                </span>
-                <button
-                  type="button"
-                  className="lnk text-label shrink-0"
-                  disabled={busy === rule.id}
-                  onClick={() => revoke(rule.id)}
-                >
-                  {busy === rule.id ? "Revoking…" : "Revoke"}
-                </button>
+        <div className="permission-provenance">
+          <span>Saved by {rule.by || "Not recorded"}</span>
+          {date ? (
+            <time dateTime={date.toISOString()} title={date.toISOString()}>
+              {date.toLocaleDateString(undefined, {
+                year: "numeric",
+                month: "short",
+                day: "numeric",
+                timeZone: "UTC",
+              })}
+            </time>
+          ) : (
+            <span>Date not recorded</span>
+          )}
+          <details className="permission-details">
+            <summary>
+              Rule details <IconChevron />
+            </summary>
+            <dl>
+              <div>
+                <dt>Rule ID</dt>
+                <dd>
+                  <code>{rule.id}</code>
+                </dd>
               </div>
-              <p className="text-micro text-ink-500 mt-1">
-                {rule.by} · {new Date(rule.at * 1000).toISOString()}
-              </p>
-            </li>
+              <div>
+                <dt>Match</dt>
+                <dd>
+                  {rule.scope === "exact"
+                    ? "Every command argument and the working folder must match exactly."
+                    : "The command head matches literally. Each remaining argument must match its saved pattern, with the same argument count and exact working folder. A trailing * matches only at a path boundary."}
+                </dd>
+              </div>
+              <div>
+                <dt>Command arguments</dt>
+                <dd>
+                  <code>{JSON.stringify(rule.argv)}</code>
+                </dd>
+              </div>
+              {rule.scope === "prefix" && (
+                <div>
+                  <dt>Argument patterns</dt>
+                  <dd>
+                    <code>{JSON.stringify(rule.tail)}</code>
+                  </dd>
+                </div>
+              )}
+              <div>
+                <dt>Saved at</dt>
+                <dd>{date ? date.toISOString() : "Not recorded"}</dd>
+              </div>
+            </dl>
+          </details>
+        </div>
+      </div>
+      <div className="permission-row-actions">
+        {confirming ? (
+          <div
+            className="permission-confirm"
+            aria-describedby={`${id}-confirm`}
+          >
+            <p id={`${id}-confirm`}>
+              Revoke this {rule.effect} rule?{" "}
+              {rule.effect === "deny"
+                ? "This removes this restriction; an allow rule may then apply."
+                : "The master may need permission again."}{" "}
+              Takes effect on the next check.
+            </p>
+            <div>
+              <Button onClick={onCancel}>Cancel</Button>
+              <Button variant="danger" disabled={disabled} onClick={onConfirm}>
+                Confirm revoke
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <Button
+            className="permission-revoke"
+            size="sm"
+            disabled={disabled}
+            loading={busy}
+            aria-label={`Revoke ${rule.effect} rule ${rule.id}`}
+            onClick={onRevoke}
+          >
+            {busy ? "Revoking…" : "Revoke"}
+          </Button>
+        )}
+      </div>
+    </li>
+  );
+}
+
+type Flight = {
+  busy: string | null;
+  begin: (id: string) => boolean;
+  finish: () => void;
+};
+/** Mounted only for proven operator access; access recovery gets a new read lifetime. */
+function RuleWorkspace({
+  readOnly,
+  flight,
+}: {
+  readOnly: boolean;
+  flight: Flight;
+}) {
+  const [rules, setRules] = useState<MasterPermissionRule[] | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [fetching, setFetching] = useState(true);
+  const [confirm, setConfirm] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [effect, setEffect] = useState("");
+  const [scope, setScope] = useState("");
+  const alive = useRef(false);
+  const request = useRef(0);
+  const filterId = useId();
+  const blocked = useWriteBlock(readOnly);
+  const load = useCallback(async () => {
+    const id = ++request.current;
+    setFetching(true);
+    setConfirm(null);
+    try {
+      const next = await api.permissionRules();
+      if (!alive.current || request.current !== id) return;
+      setRules(next.rules);
+      setReadError(null);
+    } catch (error) {
+      if (alive.current && request.current === id)
+        setReadError(errorText(error));
+    } finally {
+      if (alive.current && request.current === id) setFetching(false);
+    }
+  }, []);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      ++request.current;
+    };
+  }, []);
+  useEffect(() => {
+    // A write invalidates earlier reads. Refresh only after its POST settles,
+    // including a write begun before operator access was lost and recovered.
+    ++request.current;
+    setFetching(true);
+    if (!flight.busy) void load();
+  }, [flight.busy, load]);
+  useEffect(() => {
+    setConfirm(null);
+  }, [readOnly, query, effect, scope]);
+  const disabled =
+    !!blocked || !!flight.busy || fetching || !!readError || rules === null;
+  const revoke = async (rule: MasterPermissionRule) => {
+    if (disabled || confirm !== rule.id || !flight.begin(rule.id)) return;
+    ++request.current;
+    setFetching(true);
+    setConfirm(null);
+    setNotice(null);
+    setActionError(null);
+    try {
+      await api.permissionRevoke(rule.id);
+      if (!alive.current) return;
+      setRules(
+        (previous) => previous?.filter((saved) => saved.id !== rule.id) ?? null,
+      );
+      setNotice(`Rule revoked: ${rule.id}. Takes effect on the next check.`);
+    } catch (error) {
+      if (alive.current) setActionError(errorText(error));
+    } finally {
+      flight.finish();
+    }
+  };
+  const filtered = !!(query.trim() || effect || scope);
+  const visible = (rules ?? []).filter(
+    (rule) =>
+      (!effect || effect === rule.effect) &&
+      (!scope || scope === rule.scope) &&
+      [rule.id, rule.by, rule.cwd, ...rule.argv, ...rule.tail]
+        .join(" ")
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
+  );
+  const clear = () => {
+    setQuery("");
+    setEffect("");
+    setScope("");
+  };
+  return (
+    <>
+      <div className="permissions-tools">
+        <div className="permission-filter permission-search">
+          <label htmlFor={`${filterId}-query`}>Search rules</label>
+          <div className="permission-search-field">
+            <IconSearch size={14} />
+            <input
+              id={`${filterId}-query`}
+              type="search"
+              className="field"
+              placeholder="Command, folder, ID or author"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </div>
+        </div>
+        <div className="permission-filter">
+          <label htmlFor={`${filterId}-effect`}>Effect</label>
+          <Select
+            id={`${filterId}-effect`}
+            value={effect}
+            onChange={setEffect}
+            options={[
+              { value: "", label: "All effects" },
+              { value: "allow", label: "Allow" },
+              { value: "deny", label: "Deny" },
+            ]}
+            full
+          />
+        </div>
+        <div className="permission-filter">
+          <label htmlFor={`${filterId}-scope`}>Match</label>
+          <Select
+            id={`${filterId}-scope`}
+            value={scope}
+            onChange={setScope}
+            options={[
+              { value: "", label: "All matches" },
+              { value: "exact", label: "Exact command" },
+              { value: "prefix", label: "Argument pattern" },
+            ]}
+            full
+          />
+        </div>
+        <Button
+          icon={<IconRefresh />}
+          disabled={!!flight.busy}
+          onClick={() => void load()}
+        >
+          {readError ? "Retry rules" : "Refresh rules"}
+        </Button>
+      </div>
+      {blocked && (
+        <p className="permission-access">
+          {blocked} Saved rules remain available to inspect.
+        </p>
+      )}
+      <p className="permission-feedback" role="status">
+        {notice}
+      </p>
+      {actionError && (
+        <p className="permission-error" role="alert">
+          <strong>Couldn’t revoke the rule.</strong> {actionError}
+        </p>
+      )}
+      {readError && (
+        <div className="permission-error" role="alert">
+          <strong>
+            {rules === null ? "Rules unavailable." : "Last known rules."}
+          </strong>{" "}
+          {readError}{" "}
+          {rules !== null &&
+            "Refresh to verify the remaining rules before revoking."}
+        </div>
+      )}
+      <div className="permission-results">
+        <span>
+          {rules === null
+            ? readError
+              ? "Rules haven’t been loaded"
+              : flight.busy
+                ? "Waiting for revocation…"
+                : "Loading saved rules…"
+            : `${readError ? "Last known · " : ""}${visible.length} of ${rules.length} saved ${rules.length === 1 ? "rule" : "rules"}${fetching ? " · Refreshing…" : ""}`}
+        </span>
+        {filtered && (
+          <Button variant="ghost" size="sm" onClick={clear}>
+            Clear filters
+          </Button>
+        )}
+      </div>
+      {rules === null ? (
+        <div className="permission-state" aria-busy={fetching}>
+          <h2>
+            {readError
+              ? "Couldn’t load saved rules"
+              : flight.busy
+                ? "Waiting for revocation…"
+                : "Loading rules…"}
+          </h2>
+          <p>
+            {readError
+              ? "Use Retry rules to try again."
+              : flight.busy
+                ? "The saved rules will refresh when the current revoke request finishes."
+                : "Reading the operator’s saved rules for the master."}
+          </p>
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="permission-state">
+          <h2>
+            {readError
+              ? "No last known matches"
+              : filtered
+                ? "No matching rules"
+                : "No saved rules"}
+          </h2>
+          <p>
+            {readError
+              ? "Retry to check the current rules."
+              : filtered
+                ? "Try another search or clear the filters."
+                : "Saved allow and deny rules appear here. Respond to live permission requests in Home."}
+          </p>
+          {filtered && <Button onClick={clear}>Show all rules</Button>}
+        </div>
+      ) : (
+        <ul className="permission-list" role="list" aria-busy={fetching}>
+          {visible.map((rule) => (
+            <RuleRow
+              key={rule.id}
+              rule={rule}
+              confirming={confirm === rule.id}
+              disabled={disabled}
+              busy={flight.busy === rule.id}
+              onRevoke={() => {
+                if (!disabled) {
+                  setConfirm(rule.id);
+                  setActionError(null);
+                }
+              }}
+              onCancel={() => setConfirm(null)}
+              onConfirm={() => void revoke(rule)}
+            />
           ))}
         </ul>
+      )}
+    </>
+  );
+}
+
+/** Saved rules only. Live permission-request decisions stay in Home. */
+export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
+  const locked = useRef(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const begin = useCallback((id: string) => {
+    if (locked.current) return false;
+    locked.current = true;
+    setBusy(id);
+    return true;
+  }, []);
+  const finish = useCallback(() => {
+    locked.current = false;
+    setBusy(null);
+  }, []);
+  return (
+    <main className="permissions-workspace" data-settings="permissions">
+      <header className="permissions-heading">
+        <h1>Master permissions</h1>
+        <p>
+          Saved command rules for the master. A deny takes precedence over an
+          allow; every rule applies within its working folder.
+        </p>
+      </header>
+      {viewer.operator ? (
+        <RuleWorkspace
+          readOnly={viewer.readOnly}
+          flight={{ busy, begin, finish }}
+        />
+      ) : (
+        <div className="permission-state">
+          <h2>Operator access required</h2>
+          <p>
+            Sign in as the operator to inspect and revoke saved rules. Live
+            permission requests appear in Home.
+          </p>
+        </div>
       )}
     </main>
   );

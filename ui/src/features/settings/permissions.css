@@ -1,0 +1,285 @@
+.permissions-workspace {
+  padding: 1.5rem 2rem 2rem;
+  min-inline-size: 0;
+}
+.permissions-heading {
+  margin-block-end: 1.5rem;
+}
+.permissions-heading h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-ink-100);
+  margin-block-end: 0.35rem;
+}
+.permissions-heading p {
+  max-inline-size: 80ch;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--color-ink-400);
+}
+.permissions-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+}
+.permission-filter {
+  display: grid;
+  gap: 0.375rem;
+  flex: 0 1 11rem;
+  min-inline-size: 0;
+}
+.permission-filter label {
+  font-size: 0.75rem;
+  color: var(--color-ink-400);
+}
+.permission-search {
+  flex: 1 1 22rem;
+}
+.permission-search-field {
+  position: relative;
+}
+.permission-search-field > svg {
+  position: absolute;
+  inset-inline-start: 0.65rem;
+  inset-block-start: 50%;
+  transform: translateY(-50%);
+  color: var(--color-ink-500);
+  pointer-events: none;
+}
+.permission-search-field input {
+  inline-size: 100%;
+  padding-inline-start: 2rem;
+}
+.permission-access,
+.permission-feedback,
+.permission-error {
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.permission-access {
+  color: var(--color-ink-400);
+  margin-block-start: 1rem;
+}
+.permission-feedback {
+  color: var(--color-ok);
+}
+.permission-feedback:not(:empty) {
+  margin-block-start: 1rem;
+}
+.permission-error {
+  margin-block-start: 1rem;
+  color: var(--color-ink-300);
+  padding: 0.75rem 1rem;
+  border-inline-start: 2px solid var(--color-warn);
+  background: var(--color-ink-850);
+}
+.permission-error strong {
+  color: var(--color-warn);
+  font-weight: 500;
+}
+.permission-results {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  min-block-size: 3rem;
+  color: var(--color-ink-500);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+.permission-list {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+}
+.permission-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.5rem;
+  padding: 1.125rem;
+}
+.permission-row + .permission-row {
+  border-block-start: 1px solid var(--color-ink-700);
+}
+.permission-row-main {
+  flex: 1;
+  min-inline-size: 0;
+}
+.permission-row-labels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  margin-block-end: 0.5rem;
+  font-size: 0.6875rem;
+  color: var(--color-ink-400);
+}
+.permission-effect {
+  padding: 0.15rem 0.45rem;
+  border-radius: 0.25rem;
+}
+.permission-effect[data-effect="allow"] {
+  color: var(--color-ok);
+  background: color-mix(in srgb, var(--color-ok) 9%, transparent);
+}
+.permission-effect[data-effect="deny"] {
+  color: var(--color-fail);
+  background: color-mix(in srgb, var(--color-fail) 9%, transparent);
+}
+.permission-command {
+  display: block;
+  color: var(--color-ink-100);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.permission-folder {
+  margin-block-start: 0.5rem;
+  color: var(--color-ink-400);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.permission-folder span {
+  color: var(--color-ink-500);
+  margin-inline-end: 0.35rem;
+}
+.permission-provenance {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  margin-block-start: 0.35rem;
+  color: var(--color-ink-500);
+  font-size: 0.6875rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.permission-details {
+  flex: 1 1 100%;
+  color: var(--color-ink-400);
+}
+.permission-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-block-size: 1.75rem;
+  cursor: pointer;
+  list-style: none;
+}
+.permission-details summary::-webkit-details-marker {
+  display: none;
+}
+.permission-details[open] summary svg {
+  transform: rotate(180deg);
+}
+.permission-details summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+  border-radius: 0.125rem;
+}
+.permission-details dl {
+  display: grid;
+  gap: 0.65rem;
+  margin-block-start: 0.5rem;
+  font-size: 0.75rem;
+  padding-block-start: 0.75rem;
+  border-block-start: 1px solid var(--color-ink-700);
+}
+.permission-details dl > div {
+  display: grid;
+  grid-template-columns: 9rem minmax(0, 1fr);
+  gap: 0.75rem;
+}
+.permission-details dt {
+  color: var(--color-ink-500);
+}
+.permission-details dd {
+  white-space: pre-wrap;
+}
+.permission-row-actions {
+  flex: 0 0 auto;
+}
+.permission-confirm {
+  inline-size: min(24rem, 100%);
+  max-inline-size: 24rem;
+}
+.permission-confirm p {
+  color: var(--color-ink-300);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  margin-block-end: 0.75rem;
+}
+.permission-confirm > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.permission-state {
+  padding: 2rem 1.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--color-ink-400);
+}
+.permission-state h2 {
+  color: var(--color-ink-200);
+  font-weight: 600;
+  margin-block-end: 0.35rem;
+}
+.permission-state .btn {
+  margin-block-start: 1rem;
+}
+@media (max-width: 900px) {
+  .permission-row {
+    flex-wrap: wrap;
+  }
+  .permission-row-actions:has(.permission-confirm) {
+    flex-basis: 100%;
+  }
+}
+@media (max-width: 600px) {
+  .permissions-workspace {
+    padding: 1.25rem 1rem 2rem;
+  }
+  .permission-filter {
+    flex: 1 1 calc(50% - 0.75rem);
+  }
+  .permission-search {
+    flex-basis: 100%;
+  }
+  .permissions-tools > .btn {
+    flex: 1 1 100%;
+  }
+  .permission-filter .field,
+  .permission-filter .select-trigger,
+  .permissions-workspace .btn,
+  .permission-details summary {
+    min-block-size: 2.75rem;
+  }
+  .permission-search-field input {
+    font-size: 1rem;
+  }
+  .permission-row {
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1rem;
+  }
+  .permission-row-actions {
+    inline-size: 100%;
+  }
+  .permission-details dl > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.15rem;
+  }
+  .permission-confirm {
+    inline-size: 100%;
+  }
+}

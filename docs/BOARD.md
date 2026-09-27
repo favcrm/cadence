@@ -1644,6 +1644,22 @@ while the reader is at the end; Jump to latest resumes following. Results separa
 health-confirmed success, rollback, a no-op, failure and an unconfirmed outcome.
 The existing update API, pipeline and permissions are unchanged.
 
+Settings → Master permissions is a full-width saved-rule workspace. Proven
+operator access is required before reading; access loss hides the data and
+invalidates pending reads, including after access recovery. Labelled local
+search and effect/match filters retain complete command arguments, working
+folders and saved provenance; native disclosures show the exact rule ID and
+argument arrays. Exact commands and argument patterns both require the saved
+working folder; argument patterns retain the daemon's literal head, matching
+argument count and path-boundary wildcard semantics. Deny takes precedence.
+Loading, empty, filtered-empty, initial failure and stale observations remain
+distinct and retryable. Read-only operators can inspect and refresh. Revocation
+confirms the precise rule inline, explains that removing a deny removes a
+restriction, prevents concurrent writes and refreshes after the POST settles.
+A successful revoke remains distinct from a failed follow-up read; stale data
+cannot revoke another rule. Existing RPC/HTTP operator proofs, API shapes and
+rule policy remain unchanged. Live permission decisions stay in Home.
+
 Settings → Models is a full-width provider workspace. A compact provider
 selector opens one editor at a time and keeps drafts for every provider.
 The default model applies to newly registered agents across projects; existing

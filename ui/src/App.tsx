@@ -905,7 +905,7 @@ export default function App() {
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
-        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions />}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ readOnly, operator: meta?.operator === true }} />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {
