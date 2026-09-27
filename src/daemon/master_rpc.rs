@@ -1450,6 +1450,7 @@ mod tests {
     /// per-pass cap directly so partial fixture setup cannot create extra passes.
     #[test]
     fn report_router_caps_each_pass_and_retains_the_backlog() {
+        use crate::daemon::ServeOptions;
         use crate::store::NewAgent;
 
         const REFLECTION: &str = "## Expected\ne\n## Evidence\nv\n## Cause\nc\n\
@@ -1476,7 +1477,7 @@ mod tests {
                 alias: ALIAS,
                 provider: "fake",
                 endpoint_kind: "fake",
-                role: "master",
+                role: "worker",
                 cwd: root.path().to_str().unwrap(),
                 sandbox: "read-only",
                 instructions: None,
