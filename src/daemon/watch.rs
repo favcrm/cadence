@@ -191,7 +191,37 @@ impl Default for StallWatch {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum StallTransition {
+    Resume(Instant, u64),
+    Stall(u64, Duration),
+    Emit,
+}
+
 impl StallWatch {
+    /// Decide the running turn's stall episode at `now`. The caller applies
+    /// the returned event after releasing the watch lock.
+    fn stall_transition(&mut self, running: bool, budget: u64, now: Instant) -> StallTransition {
+        let silent = now.duration_since(self.activity);
+        if !running {
+            StallTransition::Emit
+        } else if let Some(stalled_at) = self.stalled_at {
+            if self.activity > stalled_at {
+                let episode = self.episodes;
+                self.stalled_at = None;
+                StallTransition::Resume(stalled_at, episode)
+            } else {
+                StallTransition::Emit
+            }
+        } else if budget > 0 && silent >= Duration::from_secs(budget) {
+            self.episodes += 1;
+            self.stalled_at = Some(self.activity);
+            StallTransition::Stall(self.episodes, silent)
+        } else {
+            StallTransition::Emit
+        }
+    }
+
     /// Fold a landed screen for a running turn. Sampling, probe bookkeeping
     /// and episode effects remain with the caller; only confirmed non-menu
     /// changes after the first baseline advance activity to `now`.
@@ -704,31 +734,9 @@ impl Shared {
                 }
             }
         }
-        let silent = w.activity.elapsed();
         // Everything the lock decided, applied after it's dropped —
         // event writes take the store mutex and never run under `w`.
-        enum After {
-            Resume(Instant, u64),
-            Stall(u64, Duration),
-            Emit,
-        }
-        let after = if running.is_none() {
-            After::Emit
-        } else if let Some(stalled_at) = w.stalled_at {
-            if w.activity > stalled_at {
-                let episode = w.episodes;
-                w.stalled_at = None;
-                After::Resume(stalled_at, episode)
-            } else {
-                After::Emit
-            }
-        } else if budget > 0 && silent >= Duration::from_secs(budget) {
-            w.episodes += 1;
-            w.stalled_at = Some(w.activity);
-            After::Stall(w.episodes, silent)
-        } else {
-            After::Emit
-        };
+        let after = w.stall_transition(running.is_some(), budget, Instant::now());
         drop(w);
         if let Some(line) = menu_rise {
             self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
@@ -747,13 +755,13 @@ impl Shared {
             self.delivery_stalled_fired(&agent, tracked.as_ref(), &msg_id, queued_secs, &probe);
         }
         match after {
-            After::Resume(at, episode) => {
+            StallTransition::Resume(at, episode) => {
                 self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
             }
-            After::Stall(episode, silent) => {
+            StallTransition::Stall(episode, silent) => {
                 self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
             }
-            After::Emit => {}
+            StallTransition::Emit => {}
         }
     }
 
@@ -1364,6 +1372,153 @@ pub(super) const PANE_TREE_KINDS: &[&str] = &[
     "pane_tree_reaped",
     "pane_tree_reap_refused",
 ];
+
+#[cfg(test)]
+mod stall_transition_tests {
+    use super::*;
+
+    fn watch_at(activity: Instant) -> StallWatch {
+        StallWatch {
+            activity,
+            ..StallWatch::default()
+        }
+    }
+
+    #[test]
+    fn stall_begins_at_exact_budget_boundary() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        let due = start + Duration::from_secs(2);
+        assert_eq!(
+            w.stall_transition(true, 2, due - Duration::from_nanos(1)),
+            StallTransition::Emit
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 0);
+        assert_eq!(
+            w.stall_transition(true, 2, due),
+            StallTransition::Stall(1, Duration::from_secs(2))
+        );
+        assert_eq!(w.stalled_at, Some(start));
+        assert_eq!(w.activity, start);
+        assert_eq!(w.episodes, 1);
+    }
+
+    #[test]
+    fn zero_budget_does_not_start_an_episode() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 0, start + Duration::from_secs(100)),
+            StallTransition::Emit
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 0);
+    }
+
+    #[test]
+    fn no_running_turn_preserves_episode_state() {
+        let start = Instant::now();
+        for stalled_at in [None, Some(start)] {
+            let activity = start + Duration::from_secs(1);
+            let mut w = watch_at(activity);
+            w.stalled_at = stalled_at;
+            w.episodes = 4;
+            assert_eq!(
+                w.stall_transition(false, 1, start + Duration::from_secs(100)),
+                StallTransition::Emit
+            );
+            assert_eq!(w.stalled_at, stalled_at);
+            assert_eq!(w.activity, activity);
+            assert_eq!(w.episodes, 4);
+        }
+    }
+
+    #[test]
+    fn ongoing_stall_fires_once_without_newer_activity() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 1, start + Duration::from_secs(1)),
+            StallTransition::Stall(1, Duration::from_secs(1))
+        );
+        for age in [10, 20] {
+            assert_eq!(
+                w.stall_transition(true, 1, start + Duration::from_secs(age)),
+                StallTransition::Emit
+            );
+            assert_eq!(w.stalled_at, Some(start));
+            assert_eq!(w.episodes, 1);
+        }
+    }
+
+    #[test]
+    fn resume_requires_strictly_newer_activity() {
+        let start = Instant::now();
+        let stalled_at = start + Duration::from_secs(2);
+        let mut w = watch_at(start + Duration::from_secs(1));
+        w.stalled_at = Some(stalled_at);
+        w.episodes = 7;
+        let now = start + Duration::from_secs(100);
+        for activity in [start + Duration::from_secs(1), stalled_at] {
+            w.activity = activity;
+            assert_eq!(w.stall_transition(true, 1, now), StallTransition::Emit);
+            assert_eq!(w.stalled_at, Some(stalled_at));
+            assert_eq!(w.episodes, 7);
+        }
+        w.activity = stalled_at + Duration::from_nanos(1);
+        assert_eq!(
+            w.stall_transition(true, 1, now),
+            StallTransition::Resume(stalled_at, 7)
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 7);
+    }
+
+    #[test]
+    fn resumed_turn_rearms_at_new_activity_budget() {
+        let start = Instant::now();
+        let mut w = watch_at(start);
+        assert_eq!(
+            w.stall_transition(true, 2, start + Duration::from_secs(2)),
+            StallTransition::Stall(1, Duration::from_secs(2))
+        );
+        let activity = start + Duration::from_secs(3);
+        w.activity = activity;
+        assert_eq!(
+            w.stall_transition(true, 2, activity),
+            StallTransition::Resume(start, 1)
+        );
+        let due = activity + Duration::from_secs(2);
+        assert_eq!(
+            w.stall_transition(true, 2, due - Duration::from_nanos(1)),
+            StallTransition::Emit
+        );
+        assert_eq!(
+            w.stall_transition(true, 2, due),
+            StallTransition::Stall(2, Duration::from_secs(2))
+        );
+        assert_eq!(w.stalled_at, Some(activity));
+        assert_eq!(w.episodes, 2);
+    }
+
+    #[test]
+    fn zero_budget_does_not_suppress_existing_episode_resume() {
+        let start = Instant::now();
+        let mut w = watch_at(start + Duration::from_secs(1));
+        w.stalled_at = Some(start);
+        w.episodes = 5;
+        let now = start + Duration::from_secs(100);
+        assert_eq!(
+            w.stall_transition(true, 0, now),
+            StallTransition::Resume(start, 5)
+        );
+        assert_eq!(w.stalled_at, None);
+        assert_eq!(w.episodes, 5);
+        assert_eq!(w.stall_transition(true, 0, now), StallTransition::Emit);
+        assert_eq!(w.episodes, 5);
+    }
+}
 
 #[cfg(test)]
 mod screen_activity_tests {
