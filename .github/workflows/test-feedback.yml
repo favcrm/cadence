@@ -1,0 +1,70 @@
+name: test-feedback
+
+# Ordinary feedback for retained blockers: assertion failure is a red job.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full lowercase 40-character commit SHA in this repository
+        required: true
+        type: string
+      case:
+        description: Exactly one retained test
+        required: true
+        type: choice
+        options:
+          - cad663-stale-turn
+          - cad650-master-interrupt
+
+permissions:
+  contents: read
+
+jobs:
+  test-feedback:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REVISION: ${{ inputs.revision }}
+      CASE: ${{ inputs.case }}
+      CONTROL_SHA: ${{ github.sha }}
+      EVIDENCE: test-feedback-evidence
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Validate inputs before candidate checkout
+        run: python3 control/scripts/test-feedback.py validate --revision "$REVISION" --case "$CASE" --control-sha "$CONTROL_SHA" --output "$EVIDENCE"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.revision }}
+          path: candidate
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          package_json_file: candidate/ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+        working-directory: candidate/ui
+      - name: Install the trusted pinned test runner
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/nextest
+        run: control/scripts/install-cadence-nextest
+      - name: Run the ordinary test once
+        env:
+          CADENCE_NEXTTEST_BIN: ${{ runner.temp }}/nextest/cargo-nextest
+        run: python3 control/scripts/test-feedback.py run --revision "$REVISION" --case "$CASE" --control-sha "$CONTROL_SHA" --candidate "$GITHUB_WORKSPACE/candidate" --output "$EVIDENCE"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: test-feedback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-feedback-evidence
+          if-no-files-found: warn
+          retention-days: 14
