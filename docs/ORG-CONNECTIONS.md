@@ -45,8 +45,10 @@ Selection precedence:
 Each command reads one locked snapshot, then binds state and tracker in its own
 process. Later switches cannot redirect that command. Existing managed workers
 already receive `CADENCE_STATE_DIR` (PTY, Claude and Pi adapters); this binding
-continues to win when commands reconnect. A managed alias missing that binding
-is rejected instead of consulting the user's default. Switching never edits agent,
+continues to win when commands reconnect. Legacy managed callers without that variable retain explicit `--state-dir`
+or existing HOME/XDG state resolution, with their existing tracker binding. Any
+managed alias bypasses the org registry entirely and rejects explicit org/connection
+overrides. Alias presence does not authenticate an actor; daemon proofs still apply. Switching never edits agent,
 team, message, turn or review records. Selected local commands print the label,
 connection and runtime path to stderr; structured stdout remains compatible.
 

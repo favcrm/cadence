@@ -46,9 +46,12 @@ fn add(root: &std::path::Path, name: &str) {
     );
 }
 fn peer(root: &std::path::Path, name: &str) -> std::thread::JoinHandle<()> {
-    let state = root.join(name).join("state");
-    std::fs::create_dir_all(&state).unwrap();
+    peer_at(&root.join(name).join("state"), name)
+}
+fn peer_at(state: &std::path::Path, destination: &str) -> std::thread::JoinHandle<()> {
+    std::fs::create_dir_all(state).unwrap();
     let socket = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    let destination = destination.to_owned();
     std::thread::spawn(move || {
         let (mut stream, _) = socket.accept().unwrap();
         let mut line = String::new();
@@ -57,14 +60,8 @@ fn peer(root: &std::path::Path, name: &str) -> std::thread::JoinHandle<()> {
         assert_eq!(request["method"], "agent_list");
         writeln!(
             stream,
-            "{{\"ok\":true,\"result\":{{\"agents\":[],\"destination\":\"{name}\"}}}}",
-            name = state
-                .parent()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
+            "{}",
+            serde_json::json!({"ok": true, "result": {"agents": [], "destination": destination}})
         )
         .unwrap();
     })
@@ -391,4 +388,100 @@ fn fifo_registry_and_lock_fail_promptly_without_waiting_for_a_peer() {
         let out = child.wait_with_output().unwrap();
         assert!(!out.status.success());
     }
+}
+
+#[test]
+fn managed_explicit_state_without_state_env_ignores_selected_org_and_preserves_tracker() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "operator-org");
+    ok(root.path(), &["org", "switch", "operator-org"]);
+    let original = peer(root.path(), "original");
+    let state = root.path().join("original/state");
+    let mut command = cli_command(
+        root.path(),
+        &[
+            "--state-dir",
+            state.to_str().unwrap(),
+            "agent",
+            "list",
+            "--all",
+            "--json",
+        ],
+    );
+    command.env("CADENCE_ALIAS", "worker");
+    let out = cadence_agent::reaper::output(&mut command).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["destination"],
+        "original"
+    );
+    original.join().unwrap();
+    let mut command = cli_command(
+        root.path(),
+        &["--state-dir", state.to_str().unwrap(), "issue", "init"],
+    );
+    command.env("CADENCE_ALIAS", "worker");
+    let out = cadence_agent::reaper::output(&mut command).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["pm_dir"],
+        root.path().join("pm").to_str().unwrap()
+    );
+    assert!(!root.path().join("operator-org/tracker").exists());
+}
+
+#[test]
+fn managed_legacy_home_xdg_without_state_env_ignores_selected_org_and_overrides() {
+    let root = tempfile::Builder::new()
+        .prefix("org-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    add(root.path(), "operator-org");
+    ok(root.path(), &["org", "switch", "operator-org"]);
+    let original = peer_at(&root.path().join("legacy/cadence"), "legacy");
+    let mut command = cli_command(root.path(), &["agent", "list", "--all", "--json"]);
+    command.env("CADENCE_ALIAS", "worker");
+    let out = cadence_agent::reaper::output(&mut command).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["destination"],
+        "legacy"
+    );
+    original.join().unwrap();
+    let mut command = cli_command(root.path(), &["issue", "init"]);
+    command.env("CADENCE_ALIAS", "worker");
+    let out = cadence_agent::reaper::output(&mut command).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["pm_dir"],
+        root.path().join("pm").to_str().unwrap()
+    );
+    assert!(!root.path().join("operator-org/tracker").exists());
+    let mut command = cli_command(
+        root.path(),
+        &["--org", "operator-org", "agent", "list", "--all", "--json"],
+    );
+    command.env("CADENCE_ALIAS", "worker");
+    let out = cadence_agent::reaper::output(&mut command).unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("managed callers cannot override"));
 }

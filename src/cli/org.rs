@@ -333,12 +333,18 @@ pub(super) fn resolve(
     connection: Option<&str>,
     state: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    if std::env::var_os("CADENCE_ALIAS").is_some()
-        && std::env::var_os("CADENCE_STATE_DIR").is_none()
-    {
-        return Err(Error::rejected(
-            "managed caller is missing its pinned CADENCE_STATE_DIR; refusing user defaults",
-        ));
+    if std::env::var_os("CADENCE_ALIAS").is_some() {
+        if org.is_some() || connection.is_some() {
+            return Err(Error::rejected(
+                "managed callers cannot override their destination with --org/--connection",
+            ));
+        }
+        // Legacy panes and actor-test fixtures can bind via --state-dir or
+        // isolated HOME/XDG without exporting CADENCE_STATE_DIR. Preserve
+        // that resolution, including existing tracker env, but never consult
+        // the operator's org defaults. The daemon still derives authority
+        // from the actual connection; an alias is not authentication.
+        return state.map(Ok).unwrap_or_else(client::state_dir);
     }
     let pinned = state.is_some()
         || [
