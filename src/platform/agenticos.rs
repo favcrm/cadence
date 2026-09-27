@@ -7,6 +7,15 @@
 //! waiting, published (with a receipt), or refused. Cadence mirrors
 //! that answer; it does not press again.
 //!
+//! The draft gate mints a fresh `call-<uuid>` on every `platform_call`
+//! and passes no expected hash. This adapter ignores that uuid. The
+//! door key is `agenticos-publish-v1-<digest>` (connection, caption,
+//! media), which is what CompanyControl dedupes on, and the pin is
+//! that same digest. A repeat of the same revision refreshes the
+//! existing row — the gate never calls `read_back` for a draft — and
+//! returns its mirrored status. The live door has no status GET, so a
+//! missing route falls through to one idempotent POST of the same key.
+//!
 //! Hosted containers call `http://api.internal` with no credential —
 //! the host binds the company. A self-hosted daemon that has enrolled
 //! a CAD-366 scoped token sends it as `Authorization: Bearer`. There
@@ -231,6 +240,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The CompanyControl send key for one revision. The draft gate's
+/// `call-<uuid>` is not used: two identical `platform_call`s must hit
+/// one row. The alphabet is the door's `^[A-Za-z0-9_-]{8,128}$` — a
+/// colon is rejected. Prefix plus a 64-hex digest is 86 characters.
+pub fn publish_idempotency_key(digest_hex: &str) -> String {
+    format!("agenticos-publish-v1-{digest_hex}")
+}
+
 fn valid_key(key: &str) -> bool {
     (8..=128).contains(&key.len())
         && key
@@ -339,25 +356,38 @@ impl AgenticosAdapter {
         &self,
         credential: &[u8],
         input: &Value,
-        idempotency_key: &str,
+        _call_key: &str,
         expected_hash: Option<&str>,
     ) -> std::result::Result<Value, String> {
-        if !valid_key(idempotency_key) {
-            return Err("idempotency key must be 8-128 letters, digits, '_' or '-'".into());
-        }
         let post = parse_publish(input)?;
         let digest = publish_content_digest(
             &post.connection_id,
             &post.caption,
             post.media_key.as_deref(),
         );
-        if let Some(expected) = expected_hash {
-            let expected = normalize_hash(expected)
-                .ok_or_else(|| "expected content hash must be sha256:<64 hex>".to_string())?;
-            if expected != digest {
-                return Err(
-                    "expected content hash does not match this revision — not posted".into(),
-                );
+        // The live gate passes `expected_hash = None`. The pin of this
+        // revision is the digest just computed; a caller-supplied hash
+        // must match it or nothing is posted.
+        let computed = format!("sha256:{digest}");
+        let pin = expected_hash.unwrap_or(computed.as_str());
+        let expected = normalize_hash(pin)
+            .ok_or_else(|| "expected content hash must be sha256:<64 hex>".to_string())?;
+        if expected != digest {
+            return Err("expected content hash does not match this revision — not posted".into());
+        }
+        let key = publish_idempotency_key(&digest);
+        if !valid_key(&key) {
+            return Err("derived idempotency key is not a CompanyControl key".into());
+        }
+        // `execute_immediate` never calls `read_back`. A second
+        // `platform_call` of this revision returns the row already
+        // handed off, refreshed when the door offers a status GET.
+        if let Some(saved) = self.recall(&digest) {
+            if let Some(view) = self.refresh(&saved.key, &digest) {
+                self.remember(&digest, &saved.key, view.verified);
+                let mut result = view.into_result(&saved.key, &digest);
+                result["repeated"] = json!(true);
+                return Ok(result);
             }
         }
         let auth = bearer(credential)?;
@@ -372,7 +402,7 @@ impl AgenticosAdapter {
         let mut req = self
             .http
             .post(&url)
-            .header("idempotency-key", idempotency_key)
+            .header("idempotency-key", &key)
             .header("content-digest", &digest);
         if let Some(auth) = &auth {
             req = req.header("authorization", auth);
@@ -397,14 +427,14 @@ impl AgenticosAdapter {
         }
         let data = payload.get("data").cloned().unwrap_or(payload);
         let view = ledger_view(&data, &digest);
-        self.remember(&digest, idempotency_key, view.verified);
-        Ok(view.into_result(idempotency_key, &digest))
+        self.remember(&digest, &key, view.verified);
+        Ok(view.into_result(&key, &digest))
     }
 
-    /// Re-read a handoff the door remembers. A 404 falls back to the
-    /// outcome `execute` stored — the live door has no status route
-    /// yet, and a missing route is not a receipt mismatch.
-    fn refresh(&self, key: &str, digest: &str) -> Option<Verified> {
+    /// Re-read a handoff the door remembers. A 404 falls back to a
+    /// second POST of the same key — the live door has no status
+    /// route, and a missing route is not a receipt mismatch.
+    fn refresh(&self, key: &str, digest: &str) -> Option<Ledger> {
         let url = format!("{base}{DOOR}/publish/{key}", base = self.base);
         let mut resp = self.http.get(&url).call().ok()?;
         if resp.status().as_u16() == 404 {
@@ -421,7 +451,7 @@ impl AgenticosAdapter {
             return None;
         }
         let data = payload.get("data").cloned().unwrap_or(payload);
-        Some(ledger_view(&data, digest).verified)
+        Some(ledger_view(&data, digest))
     }
 }
 
@@ -569,7 +599,14 @@ impl PlatformAdapter for AgenticosAdapter {
         let Some(saved) = self.recall(&digest) else {
             return Verified::Unknown;
         };
-        self.refresh(&saved.key, &digest).unwrap_or(saved.verified)
+        match self.refresh(&saved.key, &digest) {
+            Some(view) => {
+                let verified = view.verified;
+                self.remember(&digest, &saved.key, verified);
+                verified
+            }
+            None => saved.verified,
+        }
     }
 
     fn source_hash(&self, _agent: &str, _source: &str) -> Option<String> {
