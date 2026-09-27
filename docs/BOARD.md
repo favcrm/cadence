@@ -90,6 +90,7 @@ fail-closed on both:
 ```yaml
 pi:
   providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
+  agentic_providers: []                   # additional model provider namespaces
   models:
     allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
     master_allow: ["openrouter/z-ai/glm-5.3-flash"]   # optional role list (CAD-575)
@@ -111,6 +112,24 @@ pi:
   applicable list) allows nothing — a pi registration, start, or
   relaunch refuses rather than fall back. `model_policy:
   provider_default` is refused outright for pi.
+- Agentic Pi providers execute their own tools rather than returning
+  completions to Pi's harness. The Cursor package registers `cursor`
+  and runs `agent --print --trust --workspace`; its tools bypass Pi's
+  `--tools` and the master's `pi-guard`. `cursor` is always classified
+  agentic. Declare other such **model provider namespaces** in
+  `agentic_providers`; these are not npm package pins. Agentic models
+  are refused for the Pi master at resolution, every open, `agent set`
+  and `/model`, even when included in `master_allow`. Master models
+  must use `provider/id`, so classification happens before launch.
+  Currently the master is the only role whose tool policy depends on
+  `pi-guard`. Pi workers may still use allowed agentic models; only
+  inherited OS confinement governs their child tools. The native
+  Cadence Cursor adapter is separate and unchanged. `pi-devin` streams
+  completions and leaves Pi executing the tools, so it remains compatible
+  with this gate (its credential/confinement limitations above still apply).
+  Pinned extensions still load in every role; declare any additional
+  tool-executing provider before allowing its models. Per-role package
+  loading is a separate hardening step.
 - `models.default.{master,worker}` fills a start that names no model.
   After launch the adapter asks `get_state` what model is actually
   running; a provider answering with a different one fails the open

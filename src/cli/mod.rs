@@ -128,6 +128,16 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ReviewAction {
+    /// Print historical sightings without modifying the flake ledger.
+    Flakes {
+        /// Exact test name to select.
+        #[arg(long)]
+        test: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
@@ -1215,9 +1225,13 @@ pub(crate) enum Commands {
     /// the base head. Writes a
     /// Markdown+JSON report under the state dir — never posts a
     /// status, never merges, never pushes.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Review {
+        #[command(subcommand)]
+        action: Option<ReviewAction>,
         /// PR number (or anything `gh pr view` accepts).
-        pr: String,
+        #[arg(required = true)]
+        pr: Option<String>,
         /// owner/name — else resolved through `gh repo view`.
         #[arg(long)]
         repo: Option<String>,
@@ -3497,6 +3511,7 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Test { action } => test_cmd::run(&state_dir, &action),
         Commands::BuildSlot { action } => build_slot::run(state_dir, action),
         Commands::Review {
+            action,
             pr,
             repo,
             full,
@@ -3505,17 +3520,22 @@ pub(crate) fn run() -> Result<i32> {
             stress,
             keep,
             json,
-        } => review::run(
-            state_dir,
-            pr,
-            repo,
-            full,
-            no_full,
-            no_suite_lock,
-            stress,
-            keep,
-            json,
-        ),
+        } => match action {
+            Some(ReviewAction::Flakes { test }) => {
+                cadence_agent::review::print_flakes(state_dir, test).map(|()| 0)
+            }
+            None => review::run(
+                state_dir,
+                pr.expect("clap requires PR without a subcommand"),
+                repo,
+                full,
+                no_full,
+                no_suite_lock,
+                stress,
+                keep,
+                json,
+            ),
+        },
         Commands::Session { action } => session::run(state_dir, action),
         Commands::Audit {
             action,
