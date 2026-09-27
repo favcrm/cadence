@@ -247,6 +247,40 @@ async function main() {
       ?.textContent?.includes("Autumn launch"),
     "newest post first",
   );
+  a.preview = "A reviewed campaign?";
+  await React.act(async () => {
+    await resources.outbox.refresh();
+  });
+  await move("/outbox?outbox_q=campaign?&outbox_project=site&source=app");
+  assert(
+    host.querySelector("input")?.value === "campaign?",
+    "literal raw question mark remains part of search",
+  );
+  const rawLink = host.querySelector(".outbox-post-link");
+  assert(
+    rawLink && host.querySelectorAll(".outbox-post-link").length === 1,
+    "raw-query exact project and search find the post",
+  );
+  const rawParams = new URL(rawLink.getAttribute("href")!, "http://localhost")
+    .searchParams;
+  assert(
+    rawParams.get("outbox_q") === "campaign?" &&
+      rawParams.get("outbox_project") === "site" &&
+      rawParams.get("source") === "app",
+    "opening preserves raw search and every later parameter",
+  );
+  await click(rawLink);
+  await click(host.querySelector(".outbox-detail > a"));
+  assert(
+    host.querySelector("input")?.value === "campaign?" &&
+      new URLSearchParams(location.search).get("source") === "app",
+    "back preserves raw search and unrelated source",
+  );
+  await click(button("Clear filters")!);
+  assert(
+    location.search === "?source=app",
+    "clearing raw-query filters preserves later unrelated parameter",
+  );
   await move("/outbox?outbox_q=missing");
   assert(
     host.textContent?.includes("No matching posts") &&

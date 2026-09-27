@@ -28,7 +28,8 @@ export default function Outbox({
   onOpenIssue?: (id: string) => void;
 }) {
   const href = useHref();
-  const search = href.split("?")[1] ?? "";
+  const queryStart = href.indexOf("?");
+  const search = queryStart >= 0 ? href.slice(queryStart + 1) : "";
   const filters = readOutboxFilters(search);
   // A direct item link does not depend on the collection being available.
   const operatorOutbox = operator ? resources.outbox : null;
@@ -335,7 +336,7 @@ function OutboxDetailView({
         <article className="card outbox-detail-card">
           <header className="outbox-detail-heading">
             <div className="flex justify-between items-center gap-3">
-              <span className="text-micro font-medium text-accent">
+              <span className="text-micro font-medium text-ink-400">
                 Published locally
               </span>
               <Button
