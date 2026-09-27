@@ -27,6 +27,8 @@ use crate::store::{scope_list, scope_name, CredentialRecord, Grant};
 /// first, so the only `by` these rows can carry is the operator.
 const OPERATOR: &str = "operator";
 
+type CredentialMetadataProjection<'a> = dyn Fn(&CredentialRecord) -> Result<Value> + 'a;
+
 impl Shared {
     /// ADR 0006's P4 residual, surfaced as a gate: how this daemon's
     /// custody is isolated from the agents it manages. `Some(mode)`
@@ -74,7 +76,7 @@ impl Shared {
         rotate: bool,
         expected_id: Option<&str>,
         allowed_scopes: Option<&[String]>,
-        metadata_projection: Option<&dyn Fn(&CredentialRecord) -> Result<Value>>,
+        metadata_projection: Option<&CredentialMetadataProjection<'_>>,
     ) -> Result<Value> {
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let account = identifier(required_str(params, "account")?, "Account")?;

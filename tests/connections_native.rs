@@ -2,7 +2,6 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::contract_fixture::FakePlatform;
-use cadence_agent::platform::PlatformAdapter;
 use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -249,13 +248,20 @@ impl cadence_agent::platform::PlatformAdapter for PausedDescriptor {
         key: &str,
         hash: Option<&str>,
     ) -> Result<Value, String> {
-        self.inner.execute(credential, tool, input, key, hash)
+        cadence_agent::platform::PlatformAdapter::execute(
+            &self.inner,
+            credential,
+            tool,
+            input,
+            key,
+            hash,
+        )
     }
     fn read_back(&self, tool: &str, input: &Value) -> cadence_agent::contract_fixture::Verified {
         self.inner.read_back(tool, input)
     }
     fn source_hash(&self, agent: &str, source: &str) -> Option<String> {
-        self.inner.source_hash(agent, source)
+        cadence_agent::platform::PlatformAdapter::source_hash(&self.inner, agent, source)
     }
 }
 struct ResumeDescriptor(Arc<PausedDescriptor>);
