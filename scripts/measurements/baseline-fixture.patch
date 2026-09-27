@@ -1,0 +1,62 @@
+--- a/tests/board_read_model.rs
++++ b/tests/board_read_model.rs
+@@ -83,11 +83,12 @@
+ }
+ 
+ fn free_port() -> u16 {
+-    TcpListener::bind("127.0.0.1:0")
+-        .unwrap()
+-        .local_addr()
+-        .unwrap()
+-        .port()
++    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++    let start = NEXT.fetch_add(1, Ordering::Relaxed) + std::process::id() as usize;
++    (0..89)
++        .map(|offset| 3110 + ((start + offset) % 89) as u16)
++        .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
++        .expect("no isolated board port available")
+ }
+ 
+ fn get(port: u16, path: &str) -> (u16, String) {
+@@ -249,6 +250,7 @@
+             let opts = ui::ServeOpts {
+                 host: "127.0.0.1".to_string(),
+                 port,
++                dist: std::env::var_os("CADENCE_BUDGET_DIST").map(PathBuf::from),
+                 stop: Some(stop),
+                 // CAD-482: attach unconditionally under the feature —
+                 // the token is read lazily per request, so a board may
+@@ -911,3 +913,33 @@
+     );
+     assert!(p < P95_BUDGET, "running-turn overview p95 {p:?}");
+ }
++
++// CAD-611 MEASUREMENT FIXTURE — copy this section to the pinned baseline
++// tree for exactly the same scenario. Explicit, ignored, admitted runner only.
++#[test]
++#[ignore = "controlled browser measurement; admitted runner only"]
++fn board_live_measurement_fixture() {
++    assert!(
++        std::env::var_os("CADENCE_BUDGET_DIST").is_some(),
++        "built UI dist required"
++    );
++    let fx = fixture(ISSUES, JOBS);
++    let endpoint = std::env::var("CADENCE_BUDGET_ENDPOINT_FILE").expect("endpoint file required");
++    std::fs::write(&endpoint, format!("http://127.0.0.1:{}", fx.port)).unwrap();
++    // Browser warms up and measures idle, then starts this fixed busy
++    // workload explicitly. No wall-clock guess about Chrome startup.
++    wait_for("browser busy measurement trigger", 180, || {
++        Path::new(&format!("{endpoint}.busy")).exists()
++    });
++    for step in 0..20 {
++        let id = format!("CAD-{}", step + 2);
++        let (ok, out) = cli(
++            &fx.pm,
++            &fx.state,
++            &["issue", "set", &id, "title=network budget changed"],
++        );
++        assert!(ok, "{out}");
++        thread::sleep(Duration::from_secs(3));
++    }
++    thread::sleep(Duration::from_secs(15));
++}
