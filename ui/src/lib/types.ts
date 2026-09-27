@@ -817,6 +817,7 @@ export interface AgentDetail {
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
 export interface Meta {
+  platform_account_configured?: boolean;
   read_only: boolean;
   /** CAD-313: this browser holds a live operator session. Absent on a
    *  server that predates sessions. */
