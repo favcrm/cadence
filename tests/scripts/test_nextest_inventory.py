@@ -31,14 +31,19 @@ assert not pathlib.Path('cargo-args.json').exists(), 'unexpected additional Carg
 pathlib.Path('cargo-args.json').write_text(json.dumps(sys.argv[1:]))
 if os.environ.get('MAKE_REPORT', 'yes') == 'yes':
     pathlib.Path('target/cargo-timings/cargo-timing.html').write_text('first build')
-print('case_one: test')
+for name in json.loads(os.environ.get('CARGO_CASES', '["case_one"]')):
+    print(name + ': test')
 sys.exit(int(os.environ.get('CARGO_EXIT', '0')))
 """)
         self.fake("scripts/cadence-nextest", """import json, os, pathlib, sys
 pathlib.Path('nextest-args.json').write_text(json.dumps(sys.argv[1:]))
 pathlib.Path('target/cargo-timings/cargo-timing.html').write_text('later build')
 name = os.environ.get('NEXTEST_CASE', 'case_one')
-print(json.dumps({'rust-suites': {'suite': {'testcases': {name: {}}}}}))
+suites = json.loads(os.environ.get('NEXTEST_SUITES', json.dumps({'suite': [name]})))
+print(json.dumps({'rust-suites': {
+    suite: {'testcases': {case: {} for case in cases}}
+    for suite, cases in suites.items()
+}}))
 """)
 
     def fake(self, relative, body):
@@ -126,6 +131,46 @@ print(json.dumps({'rust-suites': {'suite': {'testcases': {name: {}}}}}))
         self.assertEqual(cargo, ["test", "--manifest-path", str(self.root / "Cargo.toml"), "--locked", "--timings", *selectors[1:], "--features", "test-seam", "--", "--list"])
         self.assertEqual(nextest, ["list", "--locked", *selectors[1:], "--features", "test-seam", "--message-format", "json"])
         self.assertNotIn("--all-targets", cargo + nextest)
+
+    def check_case_occurrences(self, cargo_cases, nextest_suites, expected_count=None):
+        for selectors in (["all-targets"], ["selected", "--lib", "--bins", "--test", "board_context"]):
+            with self.subTest(selectors=selectors):
+                # Each scope is a separate invocation; the fake Cargo still
+                # refuses an unexpected second build within that invocation.
+                for filename in ("cargo-args.json", "nextest-args.json"):
+                    (self.root / filename).unlink(missing_ok=True)
+                result = self.run_inventory(
+                    selectors=selectors,
+                    CARGO_CASES=json.dumps(cargo_cases),
+                    NEXTEST_SUITES=json.dumps(nextest_suites),
+                )
+                if expected_count is None:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("inventories differ", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout,
+                        f"inventory: target={selectors[0]} tests={expected_count} "
+                        "runner=cargo-nextest retries=0 equal=yes\n")
+                self.assertEqual(self.retained.read_text(), "first build")
+                self.assertEqual(self.source.read_text(), "later build")
+
+    def test_missing_same_named_case_in_another_binary_fails(self):
+        self.check_case_occurrences(["shared", "shared"], {"one": ["shared"]})
+
+    def test_extra_same_named_case_in_another_binary_fails(self):
+        self.check_case_occurrences(["shared"], {"one": ["shared"], "two": ["shared"]})
+
+    def test_matching_same_named_cases_count_each_occurrence(self):
+        self.check_case_occurrences(
+            ["shared", "shared"], {"one": ["shared"], "two": ["shared"]}, expected_count=2,
+        )
+
+    def test_unordered_cases_across_binaries_compare_deterministically(self):
+        self.check_case_occurrences(
+            ["zeta", "alpha", "middle"], {"one": ["zeta", "alpha"], "two": ["middle"]},
+            expected_count=3,
+        )
 
 
 if __name__ == "__main__":

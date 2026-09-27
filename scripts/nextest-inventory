@@ -92,14 +92,14 @@ awk '
     /^[[:space:]]*[^[:space:]].*: test[[:space:]]*$/ {
         sub(/^[[:space:]]+/, ""); sub(/[[:space:]]*: test[[:space:]]*$/, ""); print
     }
-' "$TMP/cargo.list" | sort -u >"$TMP/cargo.names"
+' "$TMP/cargo.list" | sort >"$TMP/cargo.names"
 
 # nextest's documented JSON list exposes each suite's `testcases` map.
 "$ROOT/scripts/cadence-nextest" list $NEXTEST_TARGET_ARGS --locked "$@" --message-format json \
     >"$TMP/nextest.json" || die "pinned nextest list failed"
 jq -er '
-    [."rust-suites"[]?.testcases? | keys[]] | unique | .[]
-' "$TMP/nextest.json" | sort -u >"$TMP/nextest.names" ||
+    [."rust-suites"[]?.testcases? | keys[]] | .[]
+' "$TMP/nextest.json" | sort >"$TMP/nextest.names" ||
     die "nextest list did not contain a parseable rust-suites testcases map"
 
 [ -s "$TMP/cargo.names" ] || die "cargo inventory is empty"
