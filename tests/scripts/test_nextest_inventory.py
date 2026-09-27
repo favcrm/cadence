@@ -46,14 +46,14 @@ print(json.dumps({'rust-suites': {'suite': {'testcases': {name: {}}}}}))
         path.write_text("#!/usr/bin/env python3\n" + body)
         path.chmod(0o755)
 
-    def run_inventory(self, **extra):
+    def run_inventory(self, selectors=None, **extra):
         env = os.environ.copy()
         env.update(extra)
         env["PATH"] = str(self.root) + os.pathsep + env["PATH"]
         env["CADENCE_INVENTORY_TIMINGS_REPORT"] = str(self.retained)
         env["GITHUB_OUTPUT"] = str(self.root / "outputs")
         return subprocess.run(
-            ["sh", "scripts/nextest-inventory", "all-targets", "--features", "test-seam"],
+            ["sh", "scripts/nextest-inventory", *(selectors or ["all-targets"]), "--features", "test-seam"],
             cwd=self.root, env=env, capture_output=True, text=True,
         )
 
@@ -116,6 +116,16 @@ print(json.dumps({'rust-suites': {'suite': {'testcases': {name: {}}}}}))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("inventories differ", result.stderr)
         self.assertEqual(self.retained.read_text(), "first build")
+
+    def test_selected_scope_reaches_both_backends_without_all_targets(self):
+        selectors = ["selected", "--lib", "--bins", "--test", "board_context"]
+        result = self.run_inventory(selectors=selectors)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cargo = json.loads((self.root / "cargo-args.json").read_text())
+        nextest = json.loads((self.root / "nextest-args.json").read_text())
+        self.assertEqual(cargo, ["test", "--manifest-path", str(self.root / "Cargo.toml"), "--locked", "--timings", *selectors[1:], "--features", "test-seam", "--", "--list"])
+        self.assertEqual(nextest, ["list", "--locked", *selectors[1:], "--features", "test-seam", "--message-format", "json"])
+        self.assertNotIn("--all-targets", cargo + nextest)
 
 
 if __name__ == "__main__":

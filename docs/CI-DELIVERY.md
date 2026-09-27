@@ -79,10 +79,46 @@ one failed test. Compilation/setup failure, zero tests, a skipped test,
 an error or a different failed test makes the experiment fail. Ordinary
 CI must still prove the original implementation passes the test.
 
+## PR test selection and review coverage
+
+The required `test` job reads its selection policy from the PR base.
+A missing base policy or any uncertainty runs the full suite. Ordinary
+documentation edits omit Rust execution in this job; fmt, clippy, build
+and UI remain required. Documentation used as test data (including
+AGENTS.md and docs/AUDIT.md), deleted files and referenced files use the
+full fallback. This is a test-job saving, not removal of every Rust build.
+
+An isolated top-level integration test edit runs its Cargo target plus
+all lib/bin tests and the split-map inventory contract. A reference from
+another tracked source makes the file shared. Production source, shared
+fixtures, manifests, workflows, tools and unknown paths run all targets.
+The selection is deliberately conservative, not a Rust dependency graph.
+Non-PR events retain all targets; exact-SHA main queue-evidence reuse is
+unchanged. Inventory parity, pinned nextest, zero retries, default-feature
+refusal proofs and doctests remain for every Rust selection. Each run
+keeps its plan beside its JUnit timing artifact.
+
+`cadence review` runs the configured lib/bin/board baseline once, plus
+the existing gates, new-test stress and isolated failure comparisons.
+Reports label this `review-baseline`; it is not full CI coverage. The
+legacy `full_suite` key and `--no-full` option remain compatible; the
+option now skips that configured baseline. Older project recipes default
+to `full`. Recipes still come from the base revision.
+
+The manually dispatched `CI selection benchmark` compares full and
+selected jobs against identical source for two supplied existing paths
+(an eligible isolated integration test and ordinary documentation).
+Its artifacts explicitly label these as replay scenarios, not live PR
+before/after measurements. Job start/end timestamps measure wall time;
+sum job durations for runner minutes. Add unchanged required-job costs
+and a full merge-group run when estimating a landing. Do not describe
+replay timings as measurements of a production-code PR: those changes
+currently receive the full fallback.
+
 ## Remaining delivery work
 
-CAD-479 owns affected-test selection for PRs; the queue retains the full
-suite. Timing artifacts from CAD-638 provide evidence for balanced
+CAD-479 tracks measurement of affected-test selection; the queue retains
+the full suite. Timing artifacts from CAD-638 provide evidence for balanced
 shards. Neither optimization is a reason to reduce required coverage.
 Independent review remains required by AGENTS.md; a required GitHub
 review bridge must report both PR-head and merge-group checks before
