@@ -1870,11 +1870,22 @@ fn master_start_resolves_the_pi_model_gate() {
     );
     // The flag and the lockdown reached the child argv.
     let argv_file = f.d.state.join("master/cwd/pi-argv.json");
-    for _ in 0..100 {
-        if argv_file.exists() {
+    // The argv record precedes the provider handshake. A session id is
+    // committed with the model only after open() verifies get_state;
+    // unlike idle, it persists while the bootstrap turn starts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "Pi master did not become ready");
+        let ready = f.d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+        if ready["agent"]["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
     let argv: Vec<String> =
         serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
@@ -1886,6 +1897,7 @@ fn master_start_resolves_the_pi_model_gate() {
     assert!(argv.iter().any(|a| a == "--no-extensions"), "{argv:?}");
     // And get_state verified the launch: the reported model is the
     // requested one, never a provider fallback.
+    let show = f.d.rpc("agent_show", json!({"alias": "master"})).unwrap();
     assert_eq!(
         show["agent"]["model"].as_str(),
         Some("devin/swe-2-high"),
