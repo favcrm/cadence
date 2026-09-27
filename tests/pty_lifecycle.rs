@@ -845,6 +845,7 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool, panic_before_setup: bo
     let mut opts = daemon_opts();
     opts.release_shutdown_snapshot = Some(Arc::clone(&barrier));
     let mut d = TestDaemon::start_opts(opts);
+    assert!(!panic_before_setup, "CAD-478 injected setup panic");
     let mut gate = ShutdownSnapshotGate {
         daemon: &d,
         snapshot: SnapshotGate {
@@ -852,7 +853,6 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool, panic_before_setup: bo
         },
         shutdown_requested: false,
     };
-    assert!(!panic_before_setup, "CAD-478 injected setup panic");
     let mock = d.mock_devin();
     let (token1, token2, pane_pid) = park_idle_labelled_turns(&d, &mock);
     let screen_before = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
