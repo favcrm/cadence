@@ -151,10 +151,9 @@ pub fn migrate(pm: &Pm, state_dir: &Path) -> Result<Catalog> {
     let candidate = journal.candidate(&root)?;
     if old.installations == candidate.installations
         && journal.records.iter().all(|r| r.before == r.after)
+        && journal.before_catalog.is_some()
     {
-        if journal.before_catalog.is_some() {
-            return Ok(old);
-        }
+        return Ok(old);
     }
     journal.after_catalog = yaml(&candidate)?;
     journal.verify(&root)?;
