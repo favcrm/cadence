@@ -1417,7 +1417,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "issue".into(),
-            "new".into(),
+            "comment".into(),
             "Title".into(),
         ];
         let req = ask(
@@ -1435,7 +1435,7 @@ mod tests {
         let other = vec![
             "cadence".into(),
             "issue".into(),
-            "new".into(),
+            "comment".into(),
             "Other".into(),
         ];
         let err = take(dir.path(), None, &other, &cwd, &[], &[dir.path()], 1_001)
@@ -1496,7 +1496,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "issue".into(),
-            "new".into(),
+            "comment".into(),
             "Once".into(),
         ];
         let req = ask(
@@ -1574,7 +1574,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "wiki".into(),
-            "put".into(),
+            "edit".into(),
             "agents/master/knowledge/a.md".into(),
         ];
         let req = ask(
@@ -1637,7 +1637,7 @@ mod tests {
         let sibling = vec![
             "cadence".into(),
             "wiki".into(),
-            "put".into(),
+            "edit".into(),
             "agents/master/knowledge/b.md".into(),
         ];
         assert!(peek(
@@ -1677,7 +1677,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "issue".into(),
-            "new".into(),
+            "comment".into(),
             "Read".into(),
         ];
         let req = ask(
@@ -1732,7 +1732,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "issue".into(),
-            "new".into(),
+            "comment".into(),
             "Later".into(),
         ];
         let req = ask(
@@ -1764,7 +1764,7 @@ mod tests {
         let cwd = fs::canonicalize(dir.path()).unwrap();
         let req = ask(
             dir.path(),
-            &["cadence".into(), "issue".into(), "new".into(), "T".into()],
+            &["cadence".into(), "issue".into(), "comment".into(), "T".into()],
             &cwd,
             "need a ticket",
             "master",
@@ -1847,7 +1847,7 @@ mod tests {
         let argv = vec![
             "cadence".into(),
             "wiki".into(),
-            "put".into(),
+            "edit".into(),
             "agents/master/knowledge/a.md".into(),
         ];
         let req = ask(
@@ -1875,7 +1875,7 @@ mod tests {
         let crossed = vec![
             "cadence".into(),
             "wiki".into(),
-            "put".into(),
+            "edit".into(),
             "agents/master/knowledge/../knowledge/b.md".into(),
         ];
         assert!(
@@ -1895,7 +1895,7 @@ mod tests {
             id: "mr-wide".into(),
             effect: Effect::Allow,
             scope: Scope::Prefix,
-            argv: vec!["cadence".into(), "wiki".into(), "put".into()],
+            argv: vec!["cadence".into(), "wiki".into(), "edit".into()],
             tail: vec!["agents/master/knowledge*".into()],
             cwd: cwd.to_string_lossy().into_owned(),
             by: "operator".into(),
@@ -1905,7 +1905,7 @@ mod tests {
         let mid = vec![
             "cadence".into(),
             "wiki".into(),
-            "put".into(),
+            "edit".into(),
             "agents/master/knowledgeX".into(),
         ];
         assert!(
