@@ -30,6 +30,14 @@ pub fn recover(_pm: &Pm, _state_dir: &Path, _journal: &str, _mode: Recovery) -> 
 }
 
 impl Catalog {
+    pub fn load(_root: &Path) -> Result<Self> {
+        Err(Error::rejected("installation catalog is not implemented"))
+    }
+
+    pub fn resolve_id(&self, _root: &Path, _id: &str) -> Result<Installation> {
+        Err(Error::rejected("installation catalog is not implemented"))
+    }
+
     pub fn resolve_legacy(
         &self,
         _root: &Path,

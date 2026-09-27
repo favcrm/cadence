@@ -75,6 +75,77 @@ fn cad630_migration_preserves_two_same_name_legacy_installations_and_their_recor
 }
 
 #[test]
+fn cad630_exact_id_lookup_has_no_package_name_or_foreign_workspace_fallback() {
+    let f = Fixture::new();
+    f.install("client-a", "install-a");
+    f.install("client-b", "install-b");
+    test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let catalog = app_catalog::Catalog::load(&f.pm.dir).unwrap();
+    assert_eq!(
+        catalog
+            .resolve_id(&f.pm.dir, "install-a")
+            .unwrap()
+            .project
+            .as_deref(),
+        Some("client-a")
+    );
+    assert_eq!(
+        catalog
+            .resolve_id(&f.pm.dir, "install-b")
+            .unwrap()
+            .project
+            .as_deref(),
+        Some("client-b")
+    );
+    for guessed in ["social-content", "unknown-id", "../install-a", "/install-a"] {
+        assert!(
+            catalog.resolve_id(&f.pm.dir, guessed).is_err(),
+            "guessed ID resolved: {guessed}"
+        );
+    }
+    for forged in ["../client-a", "/client-a", "client-c"] {
+        assert!(catalog
+            .resolve_legacy(&f.pm.dir, forged, "social-content")
+            .is_err());
+    }
+    let path = f.pm.dir.join(".apps/catalog.yaml");
+    let altered = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("workspace: default", "workspace: foreign");
+    std::fs::write(&path, altered).unwrap();
+    assert!(
+        app_catalog::Catalog::load(&f.pm.dir).is_err(),
+        "forged workspace accepted"
+    );
+}
+
+#[test]
+fn cad630_cached_catalog_refuses_removed_or_reinstalled_identity_and_dangling_records() {
+    for remove in [false, true] {
+        let f = Fixture::new();
+        let record = f.install("client", "install-a");
+        let catalog =
+            test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state))
+                .unwrap();
+        if remove {
+            std::fs::remove_file(&record).unwrap();
+        } else {
+            std::fs::write(
+                &record,
+                String::from_utf8(bytes(&record))
+                    .unwrap()
+                    .replace("install-a", "replacement-id"),
+            )
+            .unwrap();
+        }
+        assert!(catalog.resolve_id(&f.pm.dir, "install-a").is_err());
+        assert!(catalog
+            .resolve_legacy(&f.pm.dir, "client", "social-content")
+            .is_err());
+    }
+}
+
+#[test]
 fn cad630_migration_refuses_agent_and_unproven_callers_before_catalog_writes() {
     for who in [Asserted::Agent("worker".into()), Asserted::Unproven] {
         let f = Fixture::new();
