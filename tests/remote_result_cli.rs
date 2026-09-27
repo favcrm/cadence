@@ -95,7 +95,13 @@ impl Fixture {
                 .env("HOME", self.path("home"))
                 .env("XDG_CONFIG_HOME", self.path("config"));
         }
-        cadence_agent::reaper::output(&mut command).unwrap()
+        // output() intentionally nulls stdin; spawn preserves this fixture's
+        // payload while retaining registered child ownership.
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cadence_agent::reaper::spawn(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
     }
     fn retain(&self, org: &str, value: &Value) -> Output {
         self.run(
