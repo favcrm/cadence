@@ -349,6 +349,10 @@ pub struct ServeOpts {
     /// command line — a test's board on a thread of the runner stops
     /// with its test instead of serving for the rest of the run.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// An in-process owner's startup notification: success follows binding
+    /// and initialization; a bind failure carries its I/O kind. Never set
+    /// from the command line. Other startup failures disconnect the channel.
+    pub startup: Option<std::sync::mpsc::Sender<std::result::Result<(), std::io::ErrorKind>>>,
     /// CAD-526: this board's public AgenticOS name, when configured.
     /// Requests that carry its Host are the platform sign-in surface —
     /// `__platform/*` routes and `__Host-aos-board-session` reads —
@@ -627,6 +631,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync_every: None,
         delivery_sync: None,
         stop: None,
+        startup: None,
         public: eff.board.clone(),
         // CAD-482: `ui run`/`ui start`'s fixture child arms from its
         // environment; in-process fixtures set the field directly.
@@ -3713,8 +3718,15 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     } else {
         Default::default()
     };
-    let server = Server::http(format!("{}:{}", opts.host, opts.port))
-        .map_err(|e| Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port)))?;
+    let server = Server::http(format!("{}:{}", opts.host, opts.port)).map_err(|e| {
+        if let Some(startup) = opts.startup.take() {
+            let kind = e
+                .downcast_ref::<std::io::Error>()
+                .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+            let _ = startup.send(Err(kind));
+        }
+        Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
+    })?;
     // CAD-446: merge decisions appear without a terminal — this process
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
@@ -3746,6 +3758,9 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             opts.seam.is_some(),
         )
     });
+    if let Some(startup) = opts.startup.take() {
+        let _ = startup.send(Ok(()));
+    }
     let opts = &opts;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     loop {

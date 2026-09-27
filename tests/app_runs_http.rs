@@ -63,28 +63,59 @@ impl Board {
         assert!((3110..3200).contains(&port));
         after_probe(port);
         let stop = Arc::new(AtomicBool::new(false));
-        let opts = cadence_agent::ui::ServeOpts {
-            host: "127.0.0.1".into(),
-            port,
-            stop: Some(stop.clone()),
-            test_seam: cfg!(feature = "test-seam"),
-            ..Default::default()
-        };
-        let state = daemon.state.clone();
-        let thread = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm.dir, &opts));
-        let board = Self {
+        let mut board = Self {
             root,
             daemon,
             port,
             stop,
-            thread: Some(thread),
+            thread: None,
         };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "board startup deadline exhausted"
+            );
+            let (startup, ready) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port: board.port,
+                stop: Some(board.stop.clone()),
+                startup: Some(startup),
+                test_seam: cfg!(feature = "test-seam"),
+                ..Default::default()
+            };
+            let state = board.daemon.state.clone();
+            let pm_dir = pm.dir.clone();
+            board.thread = Some(std::thread::spawn(move || {
+                cadence_agent::ui::serve(&state, &pm_dir, &opts)
+            }));
+            let notification = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => ready.recv_timeout(remaining),
+                _ => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            };
+            if matches!(notification, Ok(Ok(()))) {
+                return board;
+            }
+            board.stop.store(true, Ordering::SeqCst);
+            let result = board.thread.take().unwrap().join();
+            if forced_port.is_none()
+                && matches!(notification, Ok(Err(std::io::ErrorKind::AddrInUse)))
+            {
+                match result {
+                    Ok(Err(error)) => eprintln!("board startup contention: {error}"),
+                    unexpected => panic!("board bind failure returned {unexpected:?}"),
+                }
+                board.port = board
+                    .port
+                    .checked_add(1)
+                    .filter(|port| *port < 3200)
+                    .expect("board startup exhausted permitted ports");
+                board.stop.store(false, Ordering::SeqCst);
+            } else {
+                panic!("board startup notification {notification:?}; worker {result:?}");
+            }
         }
-        board
     }
     fn operator(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         let session =
@@ -96,7 +127,10 @@ impl Board {
 impl Drop for Board {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let result = self.thread.take().unwrap().join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let result = thread.join();
         if std::thread::panicking() {
             if !matches!(&result, Ok(Ok(()))) {
                 eprintln!("board worker cleanup after primary panic: {result:?}");
