@@ -9,6 +9,9 @@ import {
 test("immutable source selection creates attributed batch items and multiple independent drafts", () => {
   const sdk = createStudioFixture(studioFixture);
   const before = sdk.read().sources;
+  const originalCount = sdk
+    .read()
+    .posts.filter((post) => post.sourceId === "source-3").length;
   const run = sdk.batch(["source-3", "source-4"]);
   assert.equal(run.items.length, 2);
   for (const item of run.items) {
@@ -22,7 +25,7 @@ test("immutable source selection creates attributed batch items and multiple ind
   sdk.batch(["source-3"]);
   assert.equal(
     sdk.read().posts.filter((p) => p.sourceId === "source-3").length,
-    3,
+    originalCount + 2,
   );
   assert.deepEqual(sdk.read().sources, before);
   const copy = sdk.read();

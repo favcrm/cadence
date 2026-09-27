@@ -127,22 +127,6 @@ button:active:not(:disabled) {
   padding-bottom: 8px;
   min-width: 0;
 }
-.schedule-view.calendar {
-  grid-template-columns: repeat(7, minmax(95px, 1fr));
-}
-.calendar-day {
-  min-height: 180px;
-  padding: 5px;
-  background: var(--color-ink-900);
-}
-.calendar-day > header {
-  display: flex;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--color-ink-700);
-  padding: 4px 3px 7px;
-  margin-bottom: 5px;
-  font-size: var(--text-label);
-}
 .post-card {
   display: grid;
   gap: 5px;
@@ -618,7 +602,7 @@ summary {
   min-height: 0;
   align-content: start;
 }
-/* One row per day; cards have planning times, never invented durations. */
+/* One row per day; distinct fixed-width cards scroll horizontally, never wrap into another row. */
 .calendar-agenda {
   display: flex;
   flex-direction: column;
@@ -630,8 +614,8 @@ summary {
   grid-template-columns: 76px minmax(0, 1fr);
   gap: 12px;
   flex: 1 0 auto;
-  min-height: 80px;
-  padding: 6px;
+  min-height: 84px;
+  padding: 3px;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.25rem;
 }
@@ -649,17 +633,29 @@ summary {
   color: var(--color-ink-200);
 }
 .day-posts {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  display: flex;
+  flex-wrap: nowrap;
   gap: 8px;
-  align-items: start;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-width: 0;
+  align-items: flex-start;
 }
 .day-posts .post-card {
+  flex: 0 0 240px;
+  width: 240px;
+  height: 80px;
+  min-height: 80px;
   margin: 0;
-  min-height: 64px;
-  padding: 6px;
-  gap: 4px;
+  padding: 4px;
+  gap: 2px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
 }
+.day-posts .post-card > small:first-child {
+  line-height: 1.3;
+}
+
 .day-posts .post-card > span:not(.badge):not(.post-footer) {
   -webkit-line-clamp: 2;
 }
@@ -706,9 +702,6 @@ summary {
     align-items: center;
     gap: 12px;
   }
-  .day-posts {
-    grid-template-columns: minmax(0, 1fr);
-  }
   .suggestions-rail {
     height: auto;
     max-height: none;
@@ -720,7 +713,7 @@ summary {
 
 .post-footer {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
 }

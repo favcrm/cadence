@@ -120,3 +120,16 @@ export const studioFixture = {
     },
   ],
 };
+
+// Illustrative busy Tuesday: distinct source-derived records, not generated posts or sends.
+const tuesday = new Date(monday);
+tuesday.setUTCDate(tuesday.getUTCDate() + 1);
+for (const [index, source] of sources.slice(0, 4).entries()) {
+  const base = structuredClone(studioFixture.posts[index]);
+  studioFixture.posts.push({
+    ...base,
+    id: `fixture-${sources.length + index + 1}`,
+    lease: false,
+    scheduleAt: `${tuesday.toISOString().slice(0, 10)}T${["09:00", "11:00", "13:00", "18:45"][index]}`,
+  });
+}

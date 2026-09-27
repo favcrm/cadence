@@ -38,7 +38,8 @@ provider credentials or NODE_OPTIONS. Dependencies must already be installed.
 Home opens the current Hong Kong planning week with a full-height day-row
 Calendar/Board and a needs /
 suggestions rail. Each calendar row is a day; cards show time, state and
-destinations, wrap on busy days and stack in a narrow agenda. Empty days are
+destinations, remain distinct fixed-width cards in a horizontally scrollable day strip, including
+narrow screens. Empty days are
 explicit; there are no invented durations or hourly slots. Library is an immutable source-media grid: select sources,
 Draft N posts, inspect the resulting fixture batch in Runs, then open its editor.
 A source can have multiple derived drafts. Optional brand context persists across
@@ -103,3 +104,7 @@ App-local CSS only adapts layout using canonical variables. The theme control
 cycles system/light/dark with the board's `cadence-theme` storage semantics.
 Only the canonical design directory is additionally allowed for CSS imports;
 board source, private repository files and live API routes remain unavailable.
+
+The default illustrative Tuesday contains five source-derived posts, exposing
+horizontal browsing immediately. Dates/counts stay outside the scroll region;
+keyboard focus brings cards into view without changing planning semantics.

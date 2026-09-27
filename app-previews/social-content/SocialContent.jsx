@@ -621,6 +621,12 @@ export default function SocialContent() {
         className={`post-card card status-${post.status}`}
         key={post.id}
         onClick={() => openPost(post.id)}
+        onFocus={(event) =>
+          event.currentTarget.scrollIntoView?.({
+            block: "nearest",
+            inline: "nearest",
+          })
+        }
       >
         <small className="num muted">
           {post.scheduleAt.slice(11) || "Unplanned"} · {post.id}
@@ -629,7 +635,14 @@ export default function SocialContent() {
         <span className="post-footer">
           <Badge post={post} />
           <small className="muted destinations-copy">
-            {post.destinations.join(" + ")}
+            {post.destinations
+              .map(
+                (destination) =>
+                  ({ instagram: "IG", facebook: "FB", web: "Web" })[
+                    destination
+                  ],
+              )
+              .join(" · ")}
           </small>
         </span>
       </button>
@@ -879,7 +892,12 @@ export default function SocialContent() {
                                       : "posts"}
                                   </span>
                                 </header>
-                                <div className="day-posts">
+                                <div
+                                  className="day-posts"
+                                  tabIndex={0}
+                                  role="region"
+                                  aria-label={`Posts planned for ${dateKey(day)}`}
+                                >
                                   {postsForDay(posts, dateKey(day)).map(card)}
                                   {postsForDay(posts, dateKey(day)).length ===
                                     0 && (

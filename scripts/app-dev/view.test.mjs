@@ -282,10 +282,17 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
       root.render(React.createElement(View, { key: "crowded-week" })),
     );
     const busyDay = host.querySelector(".calendar-day");
+    const busyRegion = busyDay.querySelector(".day-posts");
+    assert.equal(busyRegion.getAttribute("role"), "region");
+    assert.equal(busyRegion.tabIndex, 0);
+    assert.equal(
+      busyRegion.getAttribute("aria-label"),
+      `Posts planned for ${source("./fixtures.mjs").fixtureWeek}`,
+    );
     assert.equal(
       busyDay.querySelectorAll(".day-posts .post-card").length,
       8,
-      "busy day retains all cards in normal wrapping layout",
+      "busy day retains all cards in one horizontal region",
     );
     const times = [
       ...busyDay.querySelectorAll(".post-card > small:first-child"),
