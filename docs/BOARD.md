@@ -1603,6 +1603,19 @@ panel. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 
+Settings → Models is a full-width provider workspace. A compact provider
+selector opens one editor at a time and keeps drafts for every provider.
+The default model applies to newly registered agents across projects; existing
+agents keep their saved selection. A role can inherit that configured default,
+use the provider-native default, or select a specific model. Suggestions remain
+previously observed IDs, not a provider catalog. Unavailable providers retain
+their limitation text. Save applies all provider drafts with the current
+expected revision; reset omits that provider and discard restores all saved
+values. Read-only/sign-in gates, validation, failed-save drafts and revision
+conflicts remain visible. Initial read failure offers Retry; loading and an
+empty provider list are distinct. Labels and responsive role rows use shared
+controls, theme tokens and keyboard focus.
+
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/overview` (the team overview: needs, drift, monitors, projects),
 `/projects[/:slug[/epics|/milestones|/context]]`, `/agents[/:alias]`, `/setup` and
