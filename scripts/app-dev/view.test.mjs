@@ -302,6 +302,64 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
       [...times].sort(),
       "day cards ordered by planned time",
     );
+    Object.defineProperties(busyRegion, {
+      clientWidth: { configurable: true, value: 500 },
+      scrollWidth: { configurable: true, value: 1984 },
+    });
+    busyRegion.scrollBy = ({ left, behavior }) => {
+      assert.equal(Math.abs(left), 248, "advance one card plus its gap");
+      assert.equal(
+        behavior,
+        "auto",
+        "reduced motion disables smooth scrolling",
+      );
+      busyRegion.scrollLeft += left;
+      busyRegion.dispatchEvent(new window.Event("scroll"));
+    };
+    window.matchMedia = () => ({ matches: true });
+    await act(() => window.dispatchEvent(new window.Event("resize")));
+    const dayLabel = source("./fixtures.mjs").fixtureWeek;
+    const arrow = (direction) =>
+      busyDay.querySelector(
+        `button[aria-label="Scroll ${direction} posts for ${dayLabel}"]`,
+      );
+    assert.equal(
+      arrow("later").hidden,
+      false,
+      "overflow exposes the next-card button",
+    );
+    const laterNode = arrow("later");
+    assert.equal(arrow("earlier").hidden, true, "no backward arrow at start");
+    await act(() => arrow("later").click());
+    assert.equal(busyRegion.scrollLeft, 248);
+    assert.equal(
+      arrow("earlier").hidden,
+      false,
+      "backward arrow appears after advancing",
+    );
+    await act(() => arrow("earlier").click());
+    assert.equal(busyRegion.scrollLeft, 0);
+    await act(() => {
+      busyRegion.scrollLeft = 1484;
+      busyRegion.dispatchEvent(new window.Event("scroll"));
+    });
+    assert.equal(
+      arrow("later").hidden,
+      true,
+      "forward arrow disappears at the end",
+    );
+    assert.equal(
+      arrow("later"),
+      laterNode,
+      "direction updates retain the same button node",
+    );
+    Object.defineProperty(busyRegion, "clientWidth", { value: 1984 });
+    await act(() => window.dispatchEvent(new window.Event("resize")));
+    assert.equal(
+      arrow("earlier").hidden,
+      true,
+      "resize removes arrows without overflow",
+    );
   } finally {
     await act(() => root.unmount());
     await window.happyDOM.close();

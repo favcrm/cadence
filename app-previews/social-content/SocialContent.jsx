@@ -27,6 +27,79 @@ const lanes = {
   published: "Published",
 };
 const started = new Date().toLocaleTimeString();
+function DayPosts({ date, children }) {
+  const strip = useRef(null);
+  const [edges, setEdges] = useState({ earlier: false, later: false });
+  useEffect(() => {
+    const element = strip.current;
+    function update() {
+      const overflow = element.scrollWidth > element.clientWidth + 1;
+      setEdges({
+        earlier: overflow && element.scrollLeft > 1,
+        later:
+          overflow &&
+          element.scrollLeft + element.clientWidth < element.scrollWidth - 1,
+      });
+    }
+    update();
+    element.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(element);
+    return () => {
+      element.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      observer?.disconnect();
+    };
+  }, [date, children]);
+  function advance(direction) {
+    const element = strip.current;
+    const card = element.querySelector(".post-card");
+    const step =
+      (card?.getBoundingClientRect().width || 240) +
+      (Number.parseFloat(window.getComputedStyle(element).gap) || 8);
+    element.scrollBy({
+      left: direction * step,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+    });
+  }
+  return (
+    <div className="day-strip">
+      <div
+        ref={strip}
+        className="day-posts"
+        tabIndex={0}
+        role="region"
+        aria-label={`Posts planned for ${date}`}
+      >
+        {children}
+      </div>
+      <button
+        type="button"
+        className="btn ghost day-scroll-arrow earlier"
+        hidden={!edges.earlier}
+        disabled={!edges.earlier}
+        aria-label={`Scroll earlier posts for ${date}`}
+        onClick={() => advance(-1)}
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        className="btn ghost day-scroll-arrow later"
+        hidden={!edges.later}
+        disabled={!edges.later}
+        aria-label={`Scroll later posts for ${date}`}
+        onClick={() => advance(1)}
+      >
+        ›
+      </button>
+    </div>
+  );
+}
 function Glyph({ icon }) {
   return (
     <HugeiconsIcon
@@ -892,12 +965,7 @@ export default function SocialContent() {
                                       : "posts"}
                                   </span>
                                 </header>
-                                <div
-                                  className="day-posts"
-                                  tabIndex={0}
-                                  role="region"
-                                  aria-label={`Posts planned for ${dateKey(day)}`}
-                                >
+                                <DayPosts date={dateKey(day)}>
                                   {postsForDay(posts, dateKey(day)).map(card)}
                                   {postsForDay(posts, dateKey(day)).length ===
                                     0 && (
@@ -905,7 +973,7 @@ export default function SocialContent() {
                                       No posts planned
                                     </p>
                                   )}
-                                </div>
+                                </DayPosts>
                               </section>
                             ))}
                           </div>

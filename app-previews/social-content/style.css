@@ -632,6 +632,10 @@ summary {
   font-size: var(--text-section);
   color: var(--color-ink-200);
 }
+.day-strip {
+  position: relative;
+  min-width: 0;
+}
 .day-posts {
   display: flex;
   flex-wrap: nowrap;
@@ -640,6 +644,42 @@ summary {
   overflow-y: hidden;
   min-width: 0;
   align-items: flex-start;
+  scrollbar-width: none;
+}
+.day-posts::-webkit-scrollbar {
+  display: none;
+}
+.day-scroll-arrow {
+  position: absolute;
+  top: 50%;
+  translate: 0 -50%;
+  width: 28px;
+  height: 32px;
+  padding: 0;
+  background: var(--color-ink-900);
+  border: 1px solid var(--color-edge);
+  opacity: 0;
+  pointer-events: none;
+}
+.day-scroll-arrow[hidden] {
+  display: none;
+}
+.day-scroll-arrow.earlier {
+  left: 2px;
+}
+.day-scroll-arrow.later {
+  right: 2px;
+}
+.day-strip:hover .day-scroll-arrow,
+.day-strip:focus-within .day-scroll-arrow {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none), (pointer: coarse) {
+  .day-scroll-arrow {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 .day-posts .post-card {
   flex: 0 0 240px;

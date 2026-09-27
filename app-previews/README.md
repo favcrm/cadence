@@ -107,4 +107,4 @@ board source, private repository files and live API routes remain unavailable.
 
 The default illustrative Tuesday contains five source-derived posts, exposing
 horizontal browsing immediately. Dates/counts stay outside the scroll region;
-keyboard focus brings cards into view without changing planning semantics.
+keyboard focus brings cards into view without changing planning semantics. Day-strip scrollbars are hidden; directional arrows appear on hover or keyboard focus when more cards exist, and remain visible on touch devices. Native wheel/touch/keyboard scrolling remains available; reduced-motion preferences disable smooth arrow scrolling.
