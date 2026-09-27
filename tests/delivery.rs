@@ -944,11 +944,12 @@ fn master_start_defaults_to_the_first_accepted_provider() {
 /// through the daemon, and the question shows in the operator's Needs-you
 /// with the master's summary until answered. An `escalate` report is not a
 /// kind — a forged one is rejected by `report file` and by lint and never
-/// reaches Needs-you; a worker cannot escalate. The router queues at most
-/// five reports per pass and counts the rest.
+/// reaches Needs-you; a worker cannot escalate. The router's five-per-pass
+/// cap is covered by the deterministic router unit test.
 #[test]
 fn master_escalation_reaches_the_operator_needs_you() {
-    // A long period: every pass below is an operator's ping.
+    // A long period keeps periodic scans out; explicit pings and CLI report
+    // notifications can each trigger the asynchronous router.
     let f = PlanFixture::start_with(daemon::ServeOptions {
         report_router: Some(3600),
         ..daemon_opts()
@@ -1089,42 +1090,6 @@ fn master_escalation_reaches_the_operator_needs_you() {
     ]);
     assert!(ok, "{out}");
     assert!(!f.needs_me().iter().any(|r| r["kind"] == "question"));
-
-    // The router's cap: seven done reports, five per pass.
-    for n in 0..7 {
-        let (ok, out) = f.cli(&["issue", "new", &format!("Task {n}"), "--project", "demo"]);
-        assert!(ok, "{out}");
-        let id = out["id"].as_str().unwrap().to_string();
-        let done = f.file(
-            &format!("done-{n}.md"),
-            &format!("---\nkind: done\n---\n{REFLECTION}"),
-        );
-        let (ok, out) = f.cli_as(
-            "w1",
-            &[
-                "report", "file", "--task", &id, "--kind", "done", "--file", &done,
-            ],
-        );
-        assert!(ok, "{out}");
-    }
-    ping();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while from_router(&f) < 6 {
-        assert!(Instant::now() < deadline, "first pass never routed");
-        thread::sleep(Duration::from_millis(50));
-    }
-    thread::sleep(Duration::from_millis(600));
-    assert_eq!(from_router(&f), 6, "one question + five reports");
-    let summary =
-        f.d.operator_rpc("master_summary", json!({"since": "1h"}))
-            .unwrap();
-    assert_eq!(summary["routing_backlog"], 2, "{summary}");
-    ping();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while from_router(&f) < 8 {
-        assert!(Instant::now() < deadline, "second pass never routed");
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 /// `cadence confine` (CAD-439) run directly: the listed paths work,

@@ -1446,6 +1446,103 @@ pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// CLI report filing also pings the asynchronous router. Exercise the
+    /// per-pass cap directly so partial fixture setup cannot create extra passes.
+    #[test]
+    fn report_router_caps_each_pass_and_retains_the_backlog() {
+        use crate::store::NewAgent;
+
+        const REFLECTION: &str = "## Expected\ne\n## Evidence\nv\n## Cause\nc\n\
+            ## Correction\nnone\n## Lesson\nnone\n## Next\nnone\n";
+        let root = tempfile::tempdir().unwrap();
+        let pm = issue::Pm::init(&root.path().join("pm")).unwrap();
+        std::fs::create_dir_all(pm.dir.join("demo")).unwrap();
+        std::fs::write(pm.dir.join("demo/project.yaml"), "key: demo\nprefix: D\n").unwrap();
+        let yaml = pm.dir.join("pm.yaml");
+        let mut config = std::fs::read_to_string(&yaml).unwrap();
+        config.push_str("host:\n  question_escalate_after_secs: 0\n");
+        std::fs::write(yaml, config).unwrap();
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+        let shared = Shared::new(&state, &opts).unwrap();
+        // No serve/router/actor thread: report timestamps follow registration,
+        // and the real store keeps each routed message available for inspection.
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: ALIAS,
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "master",
+                cwd: root.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        let new_issue = |title: &str| {
+            issue::write::new_issue(
+                &pm,
+                root.path(),
+                Some("demo"),
+                title,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                &[],
+                None,
+                None,
+                "operator",
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let from_router = || {
+            shared
+                .store
+                .messages(ALIAS)
+                .unwrap()
+                .iter()
+                .filter(|message| message.source == "report")
+                .count()
+        };
+        let question = new_issue("Pricing page");
+        task_report::file(&pm,
+            &format!("---\nagent: w1\noptions: [ship now, wait for legal]\nimpact: blocks the task\n---\n{REFLECTION}"),
+            Some(&question), Some(task_report::Kind::Question), "w1",
+        ).unwrap();
+        assert_eq!(shared.route_reports().unwrap(), 1);
+        assert_eq!(from_router(), 1);
+        for n in 0..7 {
+            let id = new_issue(&format!("Task {n}"));
+            task_report::file(
+                &pm,
+                &format!("---\nagent: w1\n---\n{REFLECTION}"),
+                Some(&id),
+                Some(task_report::Kind::Done),
+                "w1",
+            )
+            .unwrap();
+        }
+        assert_eq!(shared.route_reports().unwrap(), 5);
+        assert_eq!(from_router(), 6, "one question + five reports");
+        assert_eq!(shared.router_backlog.load(Ordering::SeqCst), 2);
+        assert_eq!(shared.route_reports().unwrap(), 2);
+        assert_eq!(from_router(), 8);
+        assert_eq!(shared.router_backlog.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.route_reports().unwrap(), 0);
+        assert_eq!(from_router(), 8, "later passes must not duplicate reports");
+    }
+
     #[test]
     fn identity_diagnostic_bounds_and_sanitizes_the_reason() {
         let error = Error::rejected(format!("failed\n\t{}", "é".repeat(300)));
