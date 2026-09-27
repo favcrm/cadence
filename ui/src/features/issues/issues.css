@@ -84,7 +84,8 @@
 }
 @media (max-width: 640px) {
   .issue-workspace .btn,
-  .issue-workspace .field {
+  .issue-workspace .field,
+  .issue-workspace .select-trigger {
     min-height: 2.75rem;
   }
 }
