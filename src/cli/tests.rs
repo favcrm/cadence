@@ -1060,6 +1060,7 @@ fn overview_commands_all_parse() {
         None,
         &[],
         None,
+        None,
         "t",
     )
     .unwrap();
@@ -1074,6 +1075,7 @@ fn overview_commands_all_parse() {
         None,
         None,
         &[],
+        None,
         None,
         "t",
     )
