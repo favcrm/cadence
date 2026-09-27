@@ -45,6 +45,7 @@ mod platform_rpc;
 mod requests_rpc;
 mod serve;
 mod slots_rpc;
+mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
 mod watch;
@@ -2653,6 +2654,12 @@ impl Shared {
             "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),
             "wiki_search" => self.rpc_wiki_search(params, peer_pid),
             "wiki_history" => self.rpc_wiki_history(params, peer_pid),
+            // CAD-129: the deterministic test queue. Submit is attributed
+            // to the caller; status, log and the queue summary are reads.
+            "test_submit" => self.rpc_test_submit(params),
+            "test_status" => self.rpc_test_status(params),
+            "test_log" => self.rpc_test_log(params),
+            "test_queue" => self.rpc_test_queue(),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -3595,6 +3602,38 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_slot_watch());
     }
+    // CAD-129: cargo test jobs. Limits are published before the thread
+    // starts so a submit that races the first tick still keys on the
+    // same CARGO_BUILD_JOBS. Joined on shutdown so an owned child is
+    // waited, not left as a zombie.
+    let test_limits = crate::test_queue::Limits::from_slot_config(&resolve_slot_config(&opts));
+    if let Err(e) = crate::test_queue::publish_limits(&shared.state_dir, &test_limits) {
+        eprintln!("cadence: test queue limits: {e}");
+    }
+    let test_watch = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let runner = crate::test_queue::runner_for(&shared.state_dir);
+            let mut worker =
+                match crate::test_queue::Worker::new(&shared.state_dir, test_limits, runner) {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        eprintln!("cadence: test queue: {e}");
+                        return;
+                    }
+                };
+            while !shared.closing.load(Ordering::SeqCst) {
+                if let Err(e) = worker.tick() {
+                    eprintln!("cadence: test queue: {e}");
+                }
+                let deadline = Instant::now() + Duration::from_millis(200);
+                while !shared.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            worker.shutdown();
+        })
+    };
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
     {
@@ -3642,6 +3681,7 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // or at the end of the tick it is in. Joining before the actors stop
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
+    let _ = test_watch.join();
     // CAD-538: the heartbeat must be quiet before the flush and the
     // release — a late renew would rewrite the lease file a release
     // just removed, and a renewal's writes are post-marker state.
