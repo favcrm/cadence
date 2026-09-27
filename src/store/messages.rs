@@ -734,6 +734,9 @@ impl Store {
             None
         };
         if let Some(task) = task_id {
+            if source != "app_run_dispatch" {
+                Self::refuse_app_task(tx, task)?;
+            }
             self.task_in(tx, task)?;
         }
         if let Some(old) = self.message_in(tx, id)? {

@@ -61,6 +61,21 @@ impl LocalWorkflow {
         let mut steps = Vec::new();
         for (n, ticket) in parsed.tickets.iter().enumerate() {
             let meta: BTreeMap<_, _> = metadata[n].iter().cloned().collect();
+            if meta.len() != metadata[n].len() {
+                return Err(Error::rejected("duplicate local step metadata"));
+            }
+            for line in ticket
+                .description
+                .lines()
+                .take_while(|line| !line.trim().is_empty())
+            {
+                if let Some((key, _)) = line.split_once(':') {
+                    if !matches!(key.trim(), "action" | "uses" | "tries" | "reviewer") {
+                        return Err(Error::rejected("unsupported local step directive"));
+                    }
+                }
+            }
+
             if meta.contains_key("tries")
                 || meta.contains_key("reviewer")
                 || meta.contains_key("uses")
@@ -132,30 +147,30 @@ impl LocalWorkflow {
 }
 
 pub(super) const SCHEMA: &str = "
-CREATE TABLE app_install_capabilities(
+CREATE TABLE IF NOT EXISTS app_install_capabilities(
  install_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL CHECK(epoch>0),
  digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked')),
  created REAL NOT NULL);
-CREATE TABLE app_runs(
+CREATE TABLE IF NOT EXISTS app_runs(
  id TEXT PRIMARY KEY, install_id TEXT NOT NULL, epoch INTEGER NOT NULL,
  bundle_digest TEXT NOT NULL, snapshot TEXT NOT NULL, snapshot_digest TEXT NOT NULL,
  project_link TEXT, owner_pm TEXT NOT NULL, request_id TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('awaiting_approval','approved','running','succeeded','failed','cancelled')),
  approved_digest TEXT, created REAL NOT NULL, updated REAL NOT NULL,
  UNIQUE(install_id,request_id));
-CREATE TABLE app_run_steps(
+CREATE TABLE IF NOT EXISTS app_run_steps(
  run_id TEXT NOT NULL REFERENCES app_runs(id), step_id TEXT NOT NULL,
  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id), spec TEXT NOT NULL,
  identity_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','dispatched','succeeded','failed')),
  message_id TEXT UNIQUE, result_digest TEXT,
  PRIMARY KEY(run_id,step_id));
-CREATE TABLE app_run_artifacts(
+CREATE TABLE IF NOT EXISTS app_run_artifacts(
  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL,
  message_id TEXT NOT NULL UNIQUE, turn_id TEXT NOT NULL, producer TEXT NOT NULL,
  digest TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL,
  created REAL NOT NULL, UNIQUE(run_id,step_id),
  FOREIGN KEY(run_id,step_id) REFERENCES app_run_steps(run_id,step_id));
-CREATE TABLE app_run_reviews(
+CREATE TABLE IF NOT EXISTS app_run_reviews(
  run_id TEXT NOT NULL, step_id TEXT NOT NULL, artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
  artifact_digest TEXT NOT NULL, reviewer TEXT NOT NULL, message_id TEXT UNIQUE NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('approve','revise')), rationale TEXT NOT NULL,
@@ -412,6 +427,13 @@ impl Store {
         {
             return Err(Error::rejected("run execution approval is absent or stale"));
         }
+        for assignment in run["snapshot"]["assignments"].as_object().unwrap().values() {
+            let alias = assignment["alias"].as_str().unwrap();
+            let worker = self.agent_in(&tx, alias)?;
+            if Self::agent_identity(&worker) != assignment["identity"] {
+                return Err(Error::rejected("registered app assignment changed"));
+            }
+        }
         let rows=tx.prepare("SELECT step_id,task_id,spec,identity_digest FROM app_run_steps WHERE run_id=? AND state='pending' ORDER BY step_id")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (step_id, task_id, spec, generation) in rows {
             let step: LocalStep =
@@ -489,6 +511,25 @@ impl Store {
         drop(conn);
         self.app_run_show(id)
     }
+    /// Authority loss is terminal; existing artifacts and turn receipts remain
+    /// immutable. This never retries uncertain provider work.
+    pub fn app_run_invalidate(&self, id: &str) -> Result<()> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'", params![now(), id])?;
+        if changed != 0 {
+            tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched')", [id])?;
+            tx.execute("UPDATE tasks SET state='failed',error='app authority or assignment is no longer current',updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![now(), id])?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "app_run_invalidated",
+                json!({"run_id":id,"reason":"authority_or_assignment_changed"}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn app_run_pending(&self) -> Result<Vec<(String, String, String)>> {
         Ok(self
             .conn()
@@ -535,10 +576,8 @@ impl Store {
             let generation = self.agent_in(&conn, &msg.alias)?.generation;
             let assigned = &run["snapshot"]["assignments"][&step.id];
             if step.assignee != msg.alias
-                || !Self::identity_matches(
-                    &assigned["identity"],
-                    &self.agent_in(&conn, &msg.alias)?,
-                )
+                || material_digest(&Self::agent_identity(&self.agent_in(&conn, &msg.alias)?))
+                    != assigned["identity_digest"].as_str().unwrap()
                 || !step.dependencies.contains(&producer_step)
                 || !local_token_current(
                     assigned["provider"].as_str().unwrap(),
@@ -601,15 +640,16 @@ impl Store {
         message: &Message,
         status: &str,
         result: &Value,
-        authenticated: bool,
+        proof: &AppCompletionProof,
     ) -> Result<bool> {
         let Some(task_id) = message.task_id.as_deref() else {
             return Ok(false);
         };
         let Some((run_id,step_id,spec,generation,state,message_id))=tx.query_row("SELECT run_id,step_id,spec,identity_digest,state,message_id FROM app_run_steps WHERE task_id=?",[task_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?))).optional()? else{return Ok(false)};
-        if !authenticated {
+        if matches!(proof, AppCompletionProof::OperatorReconcile) {
             return Ok(true);
-        }; // reconciliation is transport history only
+        }
+        // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
             || message_id.as_deref() != Some(&message.id)
             || message.source != "app_run_dispatch"
@@ -634,11 +674,23 @@ impl Store {
                 )
                 .map(|_| true);
         }
+        let AppCompletionProof::ActiveEndpoint { turn_id } = proof else {
+            return self
+                .app_step_failed_in(
+                    tx,
+                    &run_id,
+                    &step_id,
+                    task_id,
+                    "material completion lacks a proven active endpoint turn",
+                )
+                .map(|_| true);
+        };
         let token = current
             .turn_id
             .as_deref()
             .ok_or_else(|| Error::rejected("app material result needs its active turn"))?;
-        if result.get("turn_id").and_then(Value::as_str) != Some(token)
+        if turn_id != token
+            || result.get("turn_id").and_then(Value::as_str) != Some(token)
             || material_digest(&Self::agent_identity(&worker)) != generation
             || message.alias != step.assignee
             || task.assignee.as_deref() != Some(&step.assignee)
@@ -1009,5 +1061,48 @@ impl Store {
             )
             .optional()?
             .unwrap_or(json!({"state":"unapproved"})))
+    }
+}
+
+pub(super) enum AppCompletionProof {
+    ActiveEndpoint { turn_id: String },
+    Unproven,
+    OperatorReconcile,
+}
+impl Store {
+    pub(super) fn app_completion_proof(
+        &self,
+        conn: &Connection,
+        message: &Message,
+        result: &Value,
+    ) -> Result<AppCompletionProof> {
+        let current = self.message_in(conn, &message.id)?;
+        if let Some(current) = current.filter(|m| {
+            m.source == "app_run_dispatch" && m.state == "running" && m.alias == message.alias
+        }) {
+            if let Some(turn) = current
+                .turn_id
+                .filter(|turn| result.get("turn_id").and_then(Value::as_str) == Some(turn.as_str()))
+            {
+                return Ok(AppCompletionProof::ActiveEndpoint { turn_id: turn });
+            }
+        }
+        Ok(AppCompletionProof::Unproven)
+    }
+}
+
+impl Store {
+    pub(crate) fn app_effect_guard(&self, alias: &str, task: Option<&str>) -> Result<()> {
+        if self
+            .running_message(alias)?
+            .is_some_and(|m| m.source == "app_run_dispatch")
+            || task
+                .map(|id| self.app_task_owned(id))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
+        }
+        Ok(())
     }
 }

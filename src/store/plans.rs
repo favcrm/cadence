@@ -404,6 +404,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, pm_alias)?;
         if let Ok(existing) = self.job_in(&tx, id) {
+            Self::refuse_app_job(&tx, id)?;
             let same = existing.pm_alias == pm_alias
                 && existing.spec_path == spec_path
                 && existing.spec_sha256.as_deref() == Some(spec_sha256)

@@ -1833,8 +1833,24 @@ impl Shared {
             "stop_reason": result.stop_reason,
             "error": result.error,
         });
-        self.store
-            .finish(message, &status, &stored, result.error.as_deref())?;
+        if message.source == "app_run_dispatch" && status == "completed" {
+            let (run, _) = self
+                .store
+                .app_message_installation(&message.id)?
+                .ok_or_else(|| Error::rejected("app completion association is absent"))?;
+            let recorded = self.with_app_run_current(&run, |digest| {
+                self.store.app_message_admit(message, digest)?;
+                self.store
+                    .finish(message, &status, &stored, result.error.as_deref())
+            });
+            if recorded.is_err() {
+                // Preserve transport evidence without accepting stale material.
+                self.store.finish(message, "failed", &json!({"status":"failed","turn_id":stored["turn_id"],"reason":"app authority changed before material acceptance"}), Some("app authority changed before material acceptance"))?;
+            }
+        } else {
+            self.store
+                .finish(message, &status, &stored, result.error.as_deref())?;
+        }
         self.notify_routed_target(message, &stored);
         self.wake();
         Ok(())

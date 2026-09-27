@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
+use common::{daemon_opts, pi_policy_pm, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,9 +19,21 @@ struct Board {
 }
 impl Board {
     fn new() -> Self {
+        Self::start(false)
+    }
+    fn start(pi: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         let opts = daemon_opts();
+        if pi {
+            pi_policy_pm(&pm.dir);
+            let fixture =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/app-run-pi.py");
+            opts.provider_env.set(
+                "CADENCE_PI_COMMAND",
+                format!("python3 {}", fixture.display()),
+            );
+        }
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         let daemon = TestDaemon::start_opts(opts);
@@ -261,4 +273,128 @@ fn cad631_operator_http_run_management_keeps_approval_explicit() {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["approved"],
         false
     );
+}
+
+#[test]
+fn cad631_completed_pi_artifact_http_is_json_and_native_peer_scoped() {
+    use sha2::{Digest, Sha256};
+    const OWNER: &str = "http-local-pm";
+    const WRITER: &str = "http-local-writer";
+    const REVIEWER: &str = "http-local-reviewer";
+    const DRAFT: &str = "Lunch is served from noon to 3pm.";
+    let b = Board::start(true);
+    b.daemon.fixture_rpc("agent_register", json!({"alias":OWNER,"provider":"inbox","endpoint_kind":"inbox","role":"pm","cwd":b.daemon.dir.path()})).unwrap();
+    for alias in [WRITER, REVIEWER] {
+        b.daemon.register_pi(
+            alias,
+            json!({"upstream":OWNER,"model":"fake/model-1","effort":"high"}),
+        );
+        b.daemon.wait_agent(alias, "idle", 20);
+    }
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/local-content");
+    let installed = b
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":source}))
+        .unwrap();
+    let install = installed["install_id"].as_str().unwrap();
+    b.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":install,"digest":installed["digest"]}),
+        )
+        .unwrap();
+    let created = b.daemon.operator_rpc("app_run_create", json!({"install_id":install,"workflow":"draft","inputs":{"subject":"Lunch menu","source":DRAFT,"writer":WRITER,"reviewer":REVIEWER},"request_id":"http-artifact-1","owner_pm":OWNER})).unwrap();
+    let run_id = created["id"].as_str().unwrap();
+    b.daemon
+        .operator_rpc(
+            "app_run_approve",
+            json!({"run_id":run_id,"digest":created["snapshot_digest"]}),
+        )
+        .unwrap();
+    b.daemon
+        .operator_rpc("app_run_dispatch", json!({"run_id":run_id}))
+        .unwrap();
+    std::fs::write(b.daemon.state.join("app-run-release-writer"), "release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let completed = loop {
+        let run = b
+            .daemon
+            .operator_rpc("app_run_show", json!({"run_id":run_id}))
+            .unwrap();
+        if run["state"] == "succeeded" {
+            break run;
+        }
+        assert!(
+            !matches!(run["state"].as_str(), Some("failed" | "cancelled")),
+            "provider run failed: {run}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "provider run did not complete: {run}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let artifact_id = completed["artifacts"][0]["id"].as_str().unwrap();
+    let path = format!("/api/app-run-artifacts/{artifact_id}");
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+    let (status, headers, body) = common::op::raw(b.port, &session.request("GET", &path, ""));
+    assert_eq!(status, 200, "completed artifact HTTP: {body}");
+    let headers = headers.to_ascii_lowercase();
+    assert!(
+        headers.contains("content-type: application/json"),
+        "unsafe artifact content type: {headers}"
+    );
+    assert!(
+        headers.contains("x-content-type-options: nosniff"),
+        "artifact lacks nosniff: {headers}"
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_str(&body).expect("artifact must be valid JSON");
+    assert_eq!(receipt["id"], artifact_id);
+    assert_eq!(receipt["text"], DRAFT);
+    assert_eq!(receipt["media_type"], "text/markdown");
+    assert_eq!(receipt["size"], DRAFT.len());
+    assert_eq!(
+        receipt["digest"],
+        format!("sha256:{:x}", Sha256::digest(DRAFT.as_bytes()))
+    );
+    assert_eq!(receipt["digest"], completed["artifacts"][0]["digest"]);
+
+    // Test authority against an existing completed object, not an invented ID.
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(
+        &b.daemon,
+        "completed-artifact-http-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    let mut failures = Vec::new();
+    for prefix in ["", "setsid "] {
+        let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+        let wire = stolen.request_as("GET", &path, "", "");
+        assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
+        assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
+        assert!(wire.contains(&stolen.cookie));
+        assert!(wire.contains(&stolen.key));
+        let file = lane.dir.path().join(format!("artifact-{}.txt", lane.seq));
+        std::fs::write(&file, wire).unwrap();
+        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+        assert_eq!(rc, 0);
+        let status = response.split_whitespace().nth(1).unwrap_or("missing");
+        eprintln!("completed native artifact prefix={prefix:?} status={status}");
+        if status != "403" {
+            failures.push(format!("{prefix:?}: {status}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "completed artifact native access failures: {failures:?}"
+    );
+    let retained = b
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":run_id}))
+        .unwrap();
+    assert_eq!(retained["state"], "succeeded");
+    assert_eq!(retained["artifacts"], completed["artifacts"]);
 }

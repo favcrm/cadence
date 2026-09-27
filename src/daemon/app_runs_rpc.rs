@@ -149,7 +149,7 @@ impl Shared {
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }
     }
-    fn with_app_run_current<T>(
+    pub(super) fn with_app_run_current<T>(
         &self,
         id: &str,
         callback: impl FnOnce(&str) -> Result<T>,
@@ -175,7 +175,9 @@ impl Shared {
         }
         if let Ok(runs) = self.store.app_run_pending() {
             for (id, _, _) in runs {
-                let _ = self.dispatch_app_run(&id);
+                if let Err(Error::Rejected(_)) = self.dispatch_app_run(&id) {
+                    let _ = self.store.app_run_invalidate(&id);
+                }
             }
         }
     }

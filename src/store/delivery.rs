@@ -369,6 +369,9 @@ impl Store {
                 "Unexpected provider completion status: {status}"
             )));
         }
+        // Capture the active endpoint proof before the terminal UPDATE.
+        // RPC explicit app reports additionally prove their native caller.
+        let app_proof = self.app_completion_proof(tx, message, result)?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
             params![status, result.to_string(), error, now(), message.id],
@@ -436,7 +439,9 @@ impl Store {
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
-        if !self.app_run_finished_in(tx, message, status, result, true)? && status == "completed" {
+        if !self.app_run_finished_in(tx, message, status, result, &app_proof)?
+            && status == "completed"
+        {
             self.task_on_completed(tx, message, result)?;
         }
         Ok(routed)
@@ -871,8 +876,13 @@ impl Store {
         // An operator reconcile to `completed` behaves like a normal
         // completion for the task — same SHA rules: an explicit `sha`
         // field on the result, else a `SHA:` line in the note, else NULL.
-        if !self.app_run_finished_in(&tx, &message, status, &result, false)?
-            && status == "completed"
+        if !self.app_run_finished_in(
+            &tx,
+            &message,
+            status,
+            &result,
+            &super::app_runs::AppCompletionProof::OperatorReconcile,
+        )? && status == "completed"
         {
             self.task_on_completed(&tx, &message, &result)?;
         }

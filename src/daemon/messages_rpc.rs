@@ -330,6 +330,17 @@ impl Shared {
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
+        if message.source == "app_run_dispatch" {
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Agent(ref alias) if alias == &message.alias => {}
+                caller_rule::Who::Operator => {}
+                _ => {
+                    return Err(Error::rejected(
+                        "app mail requires its assigned worker or operator",
+                    ))
+                }
+            }
+        }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
             if caller != message.alias {
                 return Err(Error::rejected(format!(
@@ -926,10 +937,23 @@ impl Shared {
                         "turn_id": token, "via": "pty_report",
                         "sha": sha,
                     });
-                    match self
-                        .store
-                        .finish_running(&message.id, "completed", &stored, None)?
-                    {
+                    let completion = if message.source == "app_run_dispatch" {
+                        let (run, _) = self
+                            .store
+                            .app_message_installation(&message.id)?
+                            .ok_or_else(|| {
+                                Error::rejected("app completion association is absent")
+                            })?;
+                        self.with_app_run_current(&run, |digest| {
+                            self.store.app_message_admit(&message, digest)?;
+                            self.store
+                                .finish_running(&message.id, "completed", &stored, None)
+                        })?
+                    } else {
+                        self.store
+                            .finish_running(&message.id, "completed", &stored, None)?
+                    };
+                    match completion {
                         Ok(finished) => {
                             self.notify_routed_target(&finished, &stored);
                             // The report frees the actor's one turn — wake

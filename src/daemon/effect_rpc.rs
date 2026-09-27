@@ -69,6 +69,8 @@ impl Shared {
     /// for the platform.
     pub(super) fn rpc_platform_call(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let agent = self.request_caller(params, peer_pid, "platform call")?;
+        self.store
+            .app_effect_guard(&agent, optional_str(params, "task"))?;
         // The caller is the connection — `agent`/`alias` are request
         // fields only where they name a target; a platform call has no
         // such field, so any present is refused, even one naming the
