@@ -256,13 +256,19 @@ pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Re
     let agentic = provider == "cursor"
         || policy.is_some_and(|p| p.agentic_providers.iter().any(|p| p == provider));
     if role == "master" && agentic {
+        let guidance = if provider == "cursor" {
+            "the native cursor provider (CAD-603) or a completion-only Pi provider"
+        } else {
+            "a completion-only provider"
+        };
         return Err(Error::rejected(format!(
             "pi master model '{model}' uses an agentic provider whose own tools \
-             bypass Pi's tool allowlist and pi-guard — use a completion-only \
-             provider even when this model is on master_allow (CAD-602)"
+             bypass Pi's tool allowlist and pi-guard — use {guidance} \
+             even when this model is on master_allow (CAD-602)"
         )));
     }
     let key = policy.map(|p| p.models.allow_key(role)).unwrap_or("allow");
+    require_safe_transport(model)?;
     let allow: &[String] = policy.map(|p| p.models.allow_for(role)).unwrap_or(&[]);
     if allow.iter().any(|m| m == model) {
         return Ok(());
@@ -277,6 +283,23 @@ pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Re
          {listed}) — the operator pins the pi model set in pm.yaml \
          [pi].models.{key} (CAD-559, CAD-575)"
     )))
+}
+
+/// CAD-603: allowlisting does not fix the Cursor extension's argv
+/// prompt exposure or Linux argument limit. Check resolved ids too.
+pub fn require_safe_transport(model: &str) -> Result<()> {
+    if model
+        .split_once('/')
+        .is_some_and(|(provider, _)| provider == "cursor")
+    {
+        return Err(Error::rejected(format!(
+            "pi model '{model}' uses Cursor's unsafe argv prompt transport \
+             (prompt exposure and E2BIG) — use the native cursor provider: \
+             cadence join <pm> cursor --model {} (CAD-603)",
+            model.strip_prefix("cursor/").unwrap_or(model)
+        )));
+    }
+    Ok(())
 }
 
 /// One operator-pinned provider package: its install dir (the confined
@@ -623,7 +646,11 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("agentic"));
-            require_allowed(Some(&policy), "worker", model).unwrap();
+            if model.starts_with("cursor/") {
+                assert!(require_allowed(Some(&policy), "worker", model).is_err());
+            } else {
+                require_allowed(Some(&policy), "worker", model).unwrap();
+            }
         }
         for model in ["devin/model", "openrouter/model"] {
             resolve_model(Some(&policy), "master", Some(model)).unwrap();
@@ -648,6 +675,22 @@ mod tests {
                 .to_string()
                 .contains("agentic_providers"));
         }
+    }
+
+    #[test]
+    fn cursor_transport_refuses_all_roles_and_defaults() {
+        let (_dir, pm) = pm_with("pi:\n  models:\n    allow: [cursor/model, devin/model]\n    default: {worker: cursor/model}\n");
+        let policy = read(&pm).unwrap().unwrap();
+        for role in ["master", "worker", "operator", "reviewer", ""] {
+            assert!(resolve_model(Some(&policy), role, Some("cursor/model")).is_err());
+            resolve_model(Some(&policy), role, Some("devin/model")).unwrap();
+        }
+        assert!(resolve_model(Some(&policy), "worker", None).is_err());
+        assert!(require_safe_transport("cursor/model")
+            .unwrap_err()
+            .to_string()
+            .contains("native cursor"));
+        require_safe_transport("notcursor/model").unwrap();
     }
 
     #[test]

@@ -197,6 +197,18 @@ if "--session" in _args:
 # `wrong-model` mode the report deliberately disagrees — the silent
 # fallback CAD-559 makes loud.
 def reported_model():
+    if MODE.startswith("cursor-effort-"):
+        return {"id": "grok-4.7-high", "provider": "cursor"}
+    if MODE == "bare-open-missing-provider":
+        return {"id": "model-1"}
+    if MODE == "bare-open-empty-provider":
+        return {"id": "model-1", "provider": ""}
+    if MODE == "bare-open-missing-id":
+        return {"name": "model-1", "provider": "fake"}
+    if MODE == "bare-open-empty-id":
+        return {"id": "", "name": "model-1", "provider": "fake"}
+    if MODE == "cursor-bare":
+        return {"id": "grok-4.7-high", "name": "Cursor", "provider": "cursor"}
     if MODE == "wrong-model":
         return {"id": "not-the-asked-1", "name": "Wrong Model", "provider": "fake"}
     if "--model" in _args:
@@ -353,8 +365,17 @@ def main():
                 pending_dialog = None
             continue
         if rtype == "get_state":
+            if MODE == "cursor-effort-state-error":
+                respond(rid, "get_state", False, error="synthetic state failure")
+                continue
             respond(rid, "get_state", True, data=dict(state))
         elif rtype == "set_thinking_level":
+            if MODE == "cursor-effort-refusal":
+                respond(rid, "set_thinking_level", False, error="synthetic effort refusal")
+                continue
+            if MODE == "cursor-effort-mismatch":
+                respond(rid, "set_thinking_level", True)
+                continue
             level = req.get("level")
             if level in LEVELS:
                 state["thinkingLevel"] = level
@@ -367,7 +388,25 @@ def main():
         elif rtype == "set_model":
             provider = req.get("provider", "fake")
             model_id = req.get("modelId", "model-1")
-            if MODE == "model-drift":
+            if MODE == "cursor-switch-drift":
+                state["model"] = {"id": "grok-4.7-high",
+                                  "provider": "cursor",
+                                  "name": "Unsafe Cursor fallback"}
+            elif MODE == "model-switch-unverified":
+                # No actual namespace is available to classify.
+                state["model"] = {"id": provider + "/" + model_id}
+            elif MODE == "model-switch-empty-provider":
+                state["model"] = {"id": provider + "/" + model_id,
+                                  "provider": ""}
+            elif MODE == "model-switch-missing-id":
+                state["model"] = {"name": provider + "/" + model_id,
+                                  "provider": provider}
+            elif MODE == "model-switch-empty-id":
+                state["model"] = {"id": "", "provider": provider}
+            elif MODE == "model-switch-full-id":
+                state["model"] = {"id": provider + "/" + model_id,
+                                  "provider": "fake"}
+            elif MODE == "model-drift":
                 # Acks then reports something else — Pi's silent
                 # fallback, mid-session.
                 state["model"] = {"id": "fell-back",

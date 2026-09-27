@@ -122,7 +122,7 @@ pi:
   and `/model`, even when included in `master_allow`. Master models
   must use `provider/id`, so classification happens before launch.
   Currently the master is the only role whose tool policy depends on
-  `pi-guard`. Pi workers may still use allowed agentic models; only
+  `pi-guard`. Pi workers may still use other allowed agentic models; only
   inherited OS confinement governs their child tools. The native
   Cadence Cursor adapter is separate and unchanged. `pi-devin` streams
   completions and leaves Pi executing the tools, so it remains compatible
@@ -130,6 +130,32 @@ pi:
   Pinned extensions still load in every role; declare any additional
   tool-executing provider before allowing its models. Per-role package
   loading is a separate hardening step.
+- **Pi Cursor transport is refused for every role (CAD-603).** The inspected
+  `@netandreus/pi-cursor-provider@0.1.4` puts the serialized conversation in
+  one positional argument to `agent --print`, exposing it in process arguments
+  and failing with `E2BIG` once that argument exceeds Linux's limit. Neither
+  `models.allow` nor role metadata can opt out. This intentionally narrows
+  CAD-602's worker compatibility for Cursor only; other agentic worker
+  providers and completion-only providers keep their existing behavior.
+  Registration, defaults, every open, next-launch changes and `/model` use
+  the same restriction. A bare worker id is checked again against Pi's actual
+  resolved namespace before any conversation is sent.
+  A model switch verifies its resolved namespace too; unsafe, mismatched or
+  unverifiable results close the Pi transport before another prompt can run.
+  Both open and switch require a nonempty actual provider namespace and model
+  id; missing/empty metadata or a display name cannot substitute for identity.
+  Switches compare the complete resolved `provider/id`. Verified bare worker
+  ids remain supported at open.
+  Candidate launch and all open initialization share one error-cleanup boundary;
+  effort/setup failure closes the transport just as model verification failure does.
+  Use the native adapter:
+  `cadence join <pm> cursor --model grok-4.7-high`; it delivers prompts through
+  its terminal rather than a conversation argv. Installed packages and operator
+  pins are not modified. A future upstream stdin fix needs a separate reviewed
+  transport capability change before Pi Cursor can be enabled again. Cursor's
+  [official output documentation](https://docs.cursor.com/en/cli/reference/output-format)
+  recognizes piped stdin; that capability alone does not fix this extension's
+  existing argv implementation.
 - `models.default.{master,worker}` fills a start that names no model.
   After launch the adapter asks `get_state` what model is actually
   running; a provider answering with a different one fails the open

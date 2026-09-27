@@ -3140,7 +3140,38 @@ fn cad602_agentic_model_rpc_and_http_refuse() {
         .iter()
         .find(|m| m["id"] == "cursor/grok-4.7-high")
         .unwrap();
-    assert_eq!(cursor["allowed_for"], json!(["worker"]), "{cursor}");
+    // CAD-603 narrows CAD-602's worker preservation for unsafe Cursor.
+    assert_eq!(cursor["allowed_for"], json!([]), "{cursor}");
+    // The worker registration and persisted next-launch gates enforce
+    // the same transport restriction even for an operator caller.
+    let err = d
+        .operator_rpc(
+            "agent_register",
+            json!({
+                "alias": "wk603", "provider": "pi", "endpoint_kind": "managed",
+                "cwd": f.tmp.path().join("repo").to_string_lossy(),
+                "params": "{\"model\":\"cursor/grok-4.7-high\",\"role\":\"operator\"}"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    d.register_pi("wk603", json!({"model": "fake/model-1"}));
+    let err = d
+        .operator_rpc(
+            "agent_set",
+            json!({
+                "alias": "wk603", "patch": {"model": "cursor/grok-4.7-high"}, "next_launch": true
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    let worker = d.rpc("agent_show", json!({"alias": "wk603"})).unwrap();
+    assert_eq!(
+        worker["agent"]["params"]["model"], "fake/model-1",
+        "{worker}"
+    );
     let err = d
         .operator_rpc(
             "agent_set",
@@ -3151,6 +3182,15 @@ fn cad602_agentic_model_rpc_and_http_refuse() {
     assert!(err.contains("agentic"), "{err}");
     let mut wk = ManagedWorker::start(d, "wk602");
     for src in ["self", "child"] {
+        let frame = wk.rpc(
+            src,
+            "agent_set",
+            json!({
+                "alias": "wk603", "patch": {"model": "cursor/grok-4.7-high"},
+                "next_launch": true, "role": "operator"
+            }),
+        );
+        assert_eq!(frame["ok"], false, "{frame}");
         let frame = wk.rpc(
             src,
             "master_command",

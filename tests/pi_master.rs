@@ -1646,6 +1646,257 @@ fn agentic_provider_master_detached_child_refuses() {
     );
 }
 
+/// CAD-603: even an allowlisted worker cannot launch the argv-based
+/// Cursor extension. A forged role/provider and a large private briefing
+/// must never reach a provider process.
+#[test]
+fn cursor_worker_open_and_concurrent_switch_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [fake/model-1, cursor/grok-4.7-high]\n",
+    )
+    .unwrap();
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let mut row = agent(
+        "dev-1",
+        json!({"model": "cursor/grok-4.7-high", "role": "operator", "provider": "fake"}),
+    );
+    row.role = "operator".into();
+    row.cwd = dir.path().to_string_lossy().into();
+    row.instructions = Some(private.clone());
+    let err = pi
+        .open(&row)
+        .err()
+        .expect("unsafe transport must refuse")
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    assert!(!err.contains("CAD603-PRIVATE-SENTINEL"));
+    let journal_path = dir.path().join("agents/pi-rpc-dev-1.jsonl");
+    assert!(!journal_path.exists());
+    assert!(!dir.path().join("agents/pi-record-dev-1.json").exists());
+    let mut safe = agent("dev-1", json!({}));
+    safe.cwd = row.cwd.clone();
+    pi.open(&safe).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let err = pi
+                    .session_command("model", Some("cursor/grok-4.7-high"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("native cursor"), "{err}");
+            });
+        }
+    });
+    let journal = std::fs::read_to_string(journal_path).unwrap();
+    assert!(!journal.contains("set_model"), "{journal}");
+    assert!(!journal.contains("CAD603-PRIVATE-SENTINEL"));
+    pi.close();
+}
+
+#[test]
+fn cursor_worker_detached_child_refuses() {
+    if std::env::var_os("CADENCE_603_DETACHED_PROOF").is_some() {
+        cursor_worker_open_and_concurrent_switch_refuse();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cursor_worker_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_603_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cursor_worker_bare_id_resolves_before_any_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("cursor-bare", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [grok-4.7-high]\n",
+    )
+    .unwrap();
+    let mut row = agent("dev-1", json!({"model": "grok-4.7-high"}));
+    row.cwd = dir.path().to_string_lossy().into();
+    row.instructions = Some(format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000)));
+    let err = pi
+        .open(&row)
+        .err()
+        .expect("resolved Cursor must refuse")
+        .to_string();
+    assert!(err.contains("native cursor"), "{err}");
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    assert!(journal.contains("get_state"));
+    assert!(!journal.contains("prompt"), "{journal}");
+    // Reopen stays refused, rather than persisting a usable unsafe model.
+    assert!(pi.open(&row).is_err());
+    pi.close();
+}
+
+/// A refused switch must not leave its unsafe fallback able to accept
+/// the next private conversation, even though the requested model was safe.
+#[test]
+fn cursor_switch_fallback_closes_before_next_private_prompt() {
+    for mode in [
+        "cursor-switch-drift",
+        "model-drift",
+        "model-switch-unverified",
+        "model-switch-empty-provider",
+        "model-switch-missing-id",
+        "model-switch-empty-id",
+        "model-switch-full-id",
+    ] {
+        rejected_switch_closes_before_next_prompt(mode);
+    }
+}
+
+fn rejected_switch_closes_before_next_prompt(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter(mode, dir.path());
+    let mut row = agent("dev-1", json!({}));
+    row.cwd = dir.path().to_string_lossy().into();
+    pi.open(&row).unwrap();
+    assert!(pi.session_command("model", Some("acme/demo-1")).is_err());
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let result = pi.run_turn(&private, "after-rejected-switch", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(
+        !journal.contains("prompt"),
+        "unsafe next prompt crossed RPC: {journal}"
+    );
+    assert!(
+        result.is_err(),
+        "closed unsafe transport must refuse a turn"
+    );
+}
+
+#[test]
+fn empty_switch_namespace_cannot_accept_private_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("model-switch-empty-provider", dir.path());
+    let mut row = agent("dev-1", json!({}));
+    row.cwd = dir.path().to_string_lossy().into();
+    pi.open(&row).unwrap();
+    let switched = pi.session_command("model", Some("acme/demo-1"));
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let turn = pi.run_turn(&private, "unverified-switch", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(
+        !journal.contains("prompt"),
+        "unverified namespace accepted prompt: {journal}"
+    );
+    assert!(switched.is_err());
+    assert!(turn.is_err());
+}
+
+#[test]
+fn bare_open_missing_or_empty_namespace_cannot_accept_private_prompt() {
+    for mode in [
+        "bare-open-missing-provider",
+        "bare-open-empty-provider",
+        "bare-open-missing-id",
+        "bare-open-empty-id",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pi, _rx) = adapter(mode, dir.path());
+        std::fs::write(
+            dir.path().join("pm/pm.yaml"),
+            "pi:\n  models:\n    allow: [model-1]\n",
+        )
+        .unwrap();
+        let mut row = agent("dev-1", json!({"model": "model-1"}));
+        row.cwd = dir.path().to_string_lossy().into();
+        let opened = pi.open(&row);
+        let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+        let turn = pi.run_turn(&private, "unverified-open", &|_| {});
+        let journal =
+            std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+        pi.close();
+        assert!(
+            !journal.contains("prompt"),
+            "unverified open accepted prompt: {mode} {journal}"
+        );
+        assert!(opened.is_err());
+        assert!(turn.is_err());
+    }
+}
+
+#[test]
+fn verified_completion_provider_bare_id_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [model-1]\n",
+    )
+    .unwrap();
+    let mut row = agent("dev-1", json!({"model": "model-1"}));
+    row.cwd = dir.path().to_string_lossy().into();
+    let identity = pi.open(&row).unwrap();
+    assert_eq!(identity.model.as_deref(), Some("fake/model-1"));
+    assert!(pi
+        .run_turn("safe completion provider", "verified-bare", &|_| {})
+        .is_ok());
+    pi.close();
+}
+
+fn refused_cursor_effort_cannot_accept_prompt(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter(mode, dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [grok-4.7-high]\n",
+    )
+    .unwrap();
+    let mut row = agent(
+        "dev-1",
+        json!({"model": "grok-4.7-high", "effort": "high", "role": "operator"}),
+    );
+    row.cwd = dir.path().to_string_lossy().into();
+    let opened = pi.open(&row);
+    let private = format!("CAD603-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let turn = pi.run_turn(&private, "after-effort-error", &|_| {});
+    let journal = std::fs::read_to_string(dir.path().join("agents/pi-rpc-dev-1.jsonl")).unwrap();
+    pi.close();
+    assert!(opened.is_err());
+    assert!(
+        !journal.contains("prompt"),
+        "failed effort setup left prompt capability: {mode} {journal}"
+    );
+    assert!(turn.is_err());
+}
+
+#[test]
+fn cursor_effort_refusal_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-refusal");
+}
+
+#[test]
+fn cursor_effort_state_error_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-state-error");
+}
+
+#[test]
+fn cursor_effort_mismatch_closes_before_private_prompt() {
+    refused_cursor_effort_cannot_accept_prompt("cursor-effort-mismatch");
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.

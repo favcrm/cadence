@@ -1339,6 +1339,23 @@ pub struct PiAdapter {
     env: ProviderEnv,
 }
 
+/// Identity evidence must include an actual namespace and model id;
+/// a display name or a full requested id cannot replace that namespace.
+fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
+    let model = state.get("model")?;
+    let provider = model.get("provider")?.as_str()?;
+    let id = model.get("id")?.as_str()?;
+    if provider.is_empty()
+        || provider.contains('/')
+        || provider.chars().any(char::is_whitespace)
+        || id.trim().is_empty()
+        || id.trim() != id
+    {
+        return None;
+    }
+    Some((format!("{provider}/{id}"), id))
+}
+
 impl PiAdapter {
     pub fn new(hooks: AdapterHooks, log_path: &Path, env: &ProviderEnv) -> Self {
         let shared = Arc::new(Shared {
@@ -1522,28 +1539,40 @@ impl PiAdapter {
             "worker"
         };
         crate::pi_policy::require_allowed(pi_policy.as_ref(), role, &want)?;
-        let model = self.checked(
+        let model = match self.checked(
             "set_model",
             json!({"provider": provider, "modelId": model_id}),
-        )?;
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                // The provider may have changed state before failing.
+                self.close();
+                return Err(error);
+            }
+        };
         // The ack is a hint like `--model` — `get_state` is the proof;
         // a silent fallback fails the command (same rule as open).
-        let state = self.checked("get_state", json!({}))?;
-        let reported_id = state
-            .get("model")
-            .and_then(|m| m.get("id").or_else(|| m.get("name")))
-            .and_then(Value::as_str);
-        let reported_full = state
-            .get("model")
-            .and_then(|m| m.get("provider"))
-            .and_then(Value::as_str)
-            .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
-        if !(reported_full.as_deref() == Some(want.as_str()) || reported_id == Some(want.as_str()))
-        {
+        let state = match self.checked("get_state", json!({})) {
+            Ok(state) => state,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
+        let Some((resolved_model, _)) = resolved_pi_model(&state) else {
+            self.close();
+            return Err(Error::provider("pi did not report a nonempty provider and model id after set_model — transport closed (CAD-603)"));
+        };
+        if let Err(error) = crate::pi_policy::require_safe_transport(&resolved_model) {
+            self.close();
+            return Err(error);
+        }
+        if resolved_model != want {
+            self.close();
             return Err(Error::provider(format!(
                 "pi reports model {} but '{want}' was set — the provider \
                  silently fell back instead of honoring set_model (CAD-559)",
-                reported_full.as_deref().or(reported_id).unwrap_or("<none>")
+                resolved_model
             )));
         }
         Ok(json!({"was": before, "model": model, "requested": want}))
@@ -1975,102 +2004,110 @@ impl ProviderAdapter for PiAdapter {
         // a blocking extension_ui_request from its first line, and a
         // dispatch that found no transport would leave it unanswered.
         *self.shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
-        let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
-        *self.transport.write().unwrap() = transport;
-        // Effort: validate against the model's real levels, then verify
-        // what stuck — Pi answers success even on a silent fallback.
-        if let Some(effort) = params.get("effort").and_then(Value::as_str) {
-            let applied = self
-                .request("set_thinking_level", json!({"level": effort}))
-                .and_then(|r| {
-                    if r.get("success").and_then(Value::as_bool) == Some(true) {
-                        Ok(())
-                    } else {
-                        Err(self.command_error("set_thinking_level", &r))
-                    }
-                })
-                .and_then(|()| self.request("get_state", json!({})))
-                .map(|r| {
-                    r.pointer("/data/thinkingLevel")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-            match applied {
-                Ok(Some(level)) if level == effort => {}
-                Ok(got) => {
-                    return Err(Error::provider(format!(
-                        "pi refused effort '{effort}' (thinking level stayed at \
+        // Own the candidate before launch. Every initialization error,
+        // including launch/effort setup, must revoke its prompt capability.
+        // Keep all fallible post-launch work inside one cleanup boundary.
+        *self.transport.write().unwrap() = Arc::clone(&transport);
+        let initialized = (|| {
+            let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
+            // Effort: validate against the model's real levels, then verify
+            // what stuck — Pi answers success even on a silent fallback.
+            if let Some(effort) = params.get("effort").and_then(Value::as_str) {
+                let applied = self
+                    .request("set_thinking_level", json!({"level": effort}))
+                    .and_then(|r| {
+                        if r.get("success").and_then(Value::as_bool) == Some(true) {
+                            Ok(())
+                        } else {
+                            Err(self.command_error("set_thinking_level", &r))
+                        }
+                    })
+                    .and_then(|()| self.request("get_state", json!({})))
+                    .map(|r| {
+                        r.pointer("/data/thinkingLevel")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                match applied {
+                    Ok(Some(level)) if level == effort => {}
+                    Ok(got) => {
+                        return Err(Error::provider(format!(
+                            "pi refused effort '{effort}' (thinking level stayed at \
                          {}) — supported levels: {}",
-                        got.as_deref().unwrap_or("unknown"),
-                        registry::PI_EFFORTS.join(", ")
-                    )))
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        let state = self.request("get_state", json!({}))?;
-        if state.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(self.command_error("get_state", &state));
-        }
-        let data = state.get("data").cloned().unwrap_or(Value::Null);
-        let session_id = data
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let reported_id = data
-            .get("model")
-            .and_then(|m| m.get("id").or_else(|| m.get("name")))
-            .and_then(Value::as_str);
-        let reported_full = data
-            .get("model")
-            .and_then(|m| m.get("provider"))
-            .and_then(Value::as_str)
-            .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
-        // CAD-559: Pi answers get_state with whatever model it fell
-        // back to — `--model` is a hint, not a contract. Refuse the
-        // launch unless the running model is the allowlisted one.
-        let matches = reported_full.as_deref() == Some(want) || reported_id == Some(want);
-        if !matches {
-            let config_note = if master {
-                let config = pi_config_dir(&self.state_dir);
-                format!(
-                    "; Pi master reads PI_CODING_AGENT_DIR={} (models.json is {})",
-                    config.display(),
-                    if config.join("models.json").is_file() {
-                        "present"
-                    } else {
-                        "absent"
+                            got.as_deref().unwrap_or("unknown"),
+                            registry::PI_EFFORTS.join(", ")
+                        )))
                     }
-                )
-            } else {
-                String::new()
+                    Err(e) => return Err(e),
+                }
+            }
+            let state = self.request("get_state", json!({}))?;
+            if state.get("success").and_then(Value::as_bool) != Some(true) {
+                return Err(self.command_error("get_state", &state));
+            }
+            let data = state.get("data").cloned().unwrap_or(Value::Null);
+            let session_id = data
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
+                return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
             };
-            return Err(Error::provider(format!(
-                "pi reports model {} but '{want}' was requested — the \
+            // A bare worker id may resolve to Cursor. No conversation has
+            // crossed RPC yet: close before a turn can launch its argv child.
+            crate::pi_policy::require_safe_transport(&reported_full)?;
+            // CAD-559: Pi answers get_state with whatever model it fell
+            // back to — `--model` is a hint, not a contract. Refuse the
+            // launch unless the running model is the allowlisted one.
+            let matches = if want.contains('/') {
+                reported_full == want
+            } else {
+                reported_id == want
+            };
+            if !matches {
+                let config_note = if master {
+                    let config = pi_config_dir(&self.state_dir);
+                    format!(
+                        "; Pi master reads PI_CODING_AGENT_DIR={} (models.json is {})",
+                        config.display(),
+                        if config.join("models.json").is_file() {
+                            "present"
+                        } else {
+                            "absent"
+                        }
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(Error::provider(format!(
+                    "pi reports model {} but '{want}' was requested — the \
                  provider silently fell back instead of honoring \
                  --model (CAD-559){config_note}",
-                reported_full.as_deref().or(reported_id).unwrap_or("<none>")
-            )));
+                    reported_full
+                )));
+            }
+            let model = Some(reported_full);
+            let effort = data
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Ok(Identity {
+                thread_id: session_id.clone(),
+                session_id,
+                model,
+                effort,
+                pid,
+                endpoint: None,
+                generation: Some(generation),
+                attach: None,
+            })
+        })();
+        if initialized.is_err() {
+            self.close();
         }
-        let model = reported_full
-            .or_else(|| reported_id.map(str::to_string))
-            .or_else(|| agent.model.clone());
-        let effort = data
-            .get("thinkingLevel")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        Ok(Identity {
-            thread_id: session_id.clone(),
-            session_id,
-            model,
-            effort,
-            pid,
-            endpoint: None,
-            generation: Some(generation),
-            attach: None,
-        })
+        initialized
     }
 
     /// One durable message → one `prompt` command → `agent_settled`.
