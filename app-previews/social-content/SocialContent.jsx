@@ -2,13 +2,11 @@ import { useState } from "react";
 import { sdk } from "./store.mjs";
 import { fixtures } from "./fixtures.mjs";
 import { HugeiconsIcon } from "@hugeicons/react";
-import {
-  CubeIcon,
-  File01Icon,
-  Tick02Icon,
-  MailSend01Icon,
-  ContrastIcon,
-} from "@hugeicons/core-free-icons";
+import CubeIcon from "@hugeicons/core-free-icons/CubeIcon";
+import File01Icon from "@hugeicons/core-free-icons/File01Icon";
+import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
+import MailSend01Icon from "@hugeicons/core-free-icons/MailSend01Icon";
+import ContrastIcon from "@hugeicons/core-free-icons/ContrastIcon";
 function Glyph({ icon }) {
   return (
     <HugeiconsIcon

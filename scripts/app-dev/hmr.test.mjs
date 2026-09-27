@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 const repo = fileURLToPath(new URL("../../", import.meta.url));
@@ -10,13 +10,23 @@ test("real Vite preview updates CSS over HMR, blocks APIs/files, and omits inher
     dir = resolve(repo, "app-previews", name),
     url = "http://127.0.0.1:3198";
   await mkdir(dir);
+  for (const file of [
+    "SocialContent.jsx",
+    "store.mjs",
+    "fixtures.mjs",
+    "sdk.mjs",
+  ])
+    await writeFile(
+      resolve(dir, file),
+      await readFile(resolve(repo, "app-previews/social-content", file)),
+    );
   await writeFile(
     resolve(dir, "index.html"),
     '<script type="module" src="/main.js"></script>',
   );
   await writeFile(
     resolve(dir, "main.js"),
-    'import "./style.css"; console.log(import.meta.env);',
+    'import "./style.css"; import View from "./SocialContent.jsx"; console.log(import.meta.env, View);',
   );
   await writeFile(resolve(dir, "style.css"), "body{color:red}");
   const child = spawn(
@@ -52,9 +62,42 @@ test("real Vite preview updates CSS over HMR, blocks APIs/files, and omits inher
     assert.equal((await fetch(`${url}/api/meta`)).status, 403);
     assert.equal((await fetch(`${url}/__platform/session`)).status, 403);
     assert.equal((await fetch(`${url}/@fs${repo}/Cargo.toml`)).status, 403);
-    assert.equal((await fetch(`${url}/@fs${repo}/design/tokens.css`)).status, 200);
+    assert.equal(
+      (await fetch(`${url}/@fs${repo}/design/tokens.css`)).status,
+      200,
+    );
     assert.equal((await fetch(`${url}/@fs${repo}/design/kit.css`)).status, 200);
-    assert.equal((await fetch(`${url}/@fs${repo}/ui/src/styles.css`)).status, 403);
+    assert.equal(
+      (await fetch(`${url}/@fs${repo}/ui/src/styles.css`)).status,
+      403,
+    );
+    const viewResponse = await fetch(`${url}/SocialContent.jsx`);
+    assert.equal(viewResponse.status, 200);
+    const view = await viewResponse.text();
+    const iconPaths = [
+      ...new Set(
+        [
+          ...view.matchAll(
+            /from "([^"\n]*hugeicons[^"\n]*core[-_]free[-_]icons[^"\n]*)"/g,
+          ),
+        ].map((match) => match[1]),
+      ),
+    ];
+    assert.ok(iconPaths.length > 0, "actual component icon imports found");
+    let iconBytes = 0;
+    for (const path of iconPaths) {
+      const response = await fetch(new URL(path, url));
+      assert.equal(response.status, 200);
+      iconBytes += (await response.arrayBuffer()).byteLength;
+    }
+    assert.ok(
+      iconBytes < 64 * 1024,
+      `served core-icon modules must stay below64KiB, received ${iconBytes}`,
+    );
+    assert.ok(
+      !iconPaths.some((path) => /core-free-icons\.js(?:\?|$)/.test(path)),
+      "no full icon barrel served",
+    );
     const client = await (await fetch(`${url}/@vite/client`)).text();
     const token = client.match(/const wsToken = "([^"]+)"/)[1];
     socket = new WebSocket(`ws://127.0.0.1:3198/?token=${token}`, "vite-hmr");

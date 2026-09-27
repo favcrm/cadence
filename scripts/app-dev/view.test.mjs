@@ -31,18 +31,28 @@ test("actual React view mounts and local draft flow works without a backend", as
       },
     },
   ).outputText;
-  const icons = await import(
-    pathToFileURL(
-      tools
-        .resolve("@hugeicons/core-free-icons")
-        .replace("/dist/cjs/", "/dist/esm/"),
-    ).href
-  );
+  const icons = new Map();
+  for (const name of [
+    "CubeIcon",
+    "File01Icon",
+    "Tick02Icon",
+    "MailSend01Icon",
+    "ContrastIcon",
+  ]) {
+    const id = `@hugeicons/core-free-icons/${name}`;
+    icons.set(
+      id,
+      await import(
+        pathToFileURL(tools.resolve(id).replace("/dist/cjs/", "/dist/esm/"))
+          .href
+      ),
+    );
+  }
   const exports = {};
   new Function("require", "exports", code)(
     (id) =>
-      id === "@hugeicons/core-free-icons"
-        ? icons
+      icons.has(id)
+        ? icons.get(id)
         : id.startsWith(".")
           ? source(id)
           : tools(id),

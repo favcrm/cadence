@@ -65,6 +65,18 @@ const server = await vite.createServer({
       react: resolve(repo, "ui/node_modules/react"),
       "react-dom": resolve(repo, "ui/node_modules/react-dom"),
       "@fontsource": resolve(repo, "ui/node_modules/@fontsource"),
+      ...Object.fromEntries(
+        [
+          "CubeIcon",
+          "File01Icon",
+          "Tick02Icon",
+          "MailSend01Icon",
+          "ContrastIcon",
+        ].map((name) => {
+          const id = `@hugeicons/core-free-icons/${name}`;
+          return [id, require.resolve(id).replace("/dist/cjs/", "/dist/esm/")];
+        }),
+      ),
       "@hugeicons": resolve(repo, "ui/node_modules/@hugeicons"),
     },
   },
