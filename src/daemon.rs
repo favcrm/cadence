@@ -975,12 +975,7 @@ impl Shared {
     }
 
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
-        if self
-            .store
-            .running_messages(alias)
-            .map(|messages| messages.iter().any(|m| m.source == "app_run_dispatch"))
-            .unwrap_or(true)
-        {
+        if self.store.app_material_endpoint(alias).unwrap_or(true) {
             return;
         }
         // CAD-551: a permission denial is a refused step, not a failed
@@ -3964,6 +3959,24 @@ mod tests {
     fn cad631_retained_app_provider_events_do_not_publish_material() {
         let dir = tempfile::tempdir().unwrap();
         let shared = cad627_shared(dir.path());
+        shared.store.ensure_thread("w1").unwrap();
+        fn payload(marker: &str) -> Value {
+            json!({"item":{"type":"agentMessage","phase":"commentary","text":marker},"text":marker,"tool":"read","summary":marker,"tool_use_id":"test-tool","trigger":marker})
+        }
+        for method in [
+            "item/completed",
+            "cadence/assistant_text",
+            "cadence/tool_use",
+            "cadence/session_compacted",
+        ] {
+            shared.on_provider_event("w1", method, payload("control-event-sentinel"));
+        }
+        assert!(format!("{:?}", shared.store.events("w1", 0, 100).unwrap())
+            .contains("control-event-sentinel"));
+        assert!(
+            format!("{:?}", shared.store.thread_entries("w1", 0, 100).unwrap())
+                .contains("control-event-sentinel")
+        );
         let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
         conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('private-job','app-run','w1','done',1,1);
             INSERT INTO tasks(id,job_id,assignee,state,created,updated) VALUES('private-task','private-job','w1','done',1,1);
@@ -3971,10 +3984,11 @@ mod tests {
             INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('private-job','s1','private-task','{}','identity','succeeded');").unwrap();
         for method in [
             "item/completed",
+            "cadence/assistant_text",
             "cadence/tool_use",
             "cadence/session_compacted",
         ] {
-            shared.on_provider_event("w1", method, json!({"item":{"text":"private-event-sentinel"},"trigger":"private-event-sentinel"}));
+            shared.on_provider_event("w1", method, payload("private-event-sentinel"));
         }
         let events = shared.store.events("w1", 0, 100).unwrap();
         assert!(!format!("{events:?}").contains("private-event-sentinel"));

@@ -107,9 +107,16 @@ fn cad631_execution_approval_is_separate_and_create_is_idempotent() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
     assert!(s.app_run_dispatch(id, "sha256:bundle").is_err());
-    assert!(s.app_run_decide(id, Some("forged"), false).is_err());
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    assert!(s
+        .app_run_decide(id, Some("forged"), false, Some("sha256:bundle"))
+        .is_err());
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     assert!(s
         .messages_for_task(run["steps"][0]["task_id"].as_str().unwrap())
         .unwrap()
@@ -135,8 +142,13 @@ fn cad631_execution_approval_is_separate_and_create_is_idempotent() {
 fn cad631_revoke_after_enqueue_prevents_claim_and_material_completion() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let message = dispatched["steps"][0]["message_id"].as_str().unwrap();
     s.app_capability_decide("install-1", "sha256:bundle", false)
@@ -167,8 +179,13 @@ fn producer_result(run: &str, message: &Message) -> Value {
 fn cad631_authenticated_text_and_independent_digest_review_complete_without_project() {
     let (dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let writer = start_local_step(&s, &dispatched, 0, "writer");
     s.finish(&writer, "completed", &producer_result(id, &writer), None)
@@ -222,8 +239,13 @@ fn cad631_authenticated_text_and_independent_digest_review_complete_without_proj
 fn cad631_operator_reconcile_cannot_create_material() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let writer = start_local_step(&s, &dispatched, 0, "writer");
     s.conn()
@@ -254,8 +276,13 @@ fn cad631_operator_reconcile_cannot_create_material() {
 fn cad631_revoke_running_turn_refuses_material() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let writer = start_local_step(&s, &dispatched, 0, "writer");
     s.app_capability_decide("install-1", "sha256:bundle", false)
@@ -271,8 +298,13 @@ fn cad631_revoke_running_turn_refuses_material() {
 fn cad631_snapshot_identity_replacement_and_wrong_bundle_cannot_claim() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let message = dispatched["steps"][0]["message_id"].as_str().unwrap();
     assert!(s
@@ -294,8 +326,13 @@ fn cad631_snapshot_identity_replacement_and_wrong_bundle_cannot_claim() {
 fn cad631_concurrent_dispatch_mints_one_kickoff() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap().to_owned();
-    s.app_run_decide(&id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        &id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let s = std::sync::Arc::new(s);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let handles = (0..2)
@@ -394,8 +431,13 @@ fn cad631_v19_additive_migration_is_atomic_and_preserves_legacy_queue() {
 fn cad631_app_turn_and_forged_task_cannot_borrow_account_union_for_effects() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let _writer = start_local_step(&s, &dispatched, 0, "writer");
     assert!(s.app_effect_guard("writer", None).is_err());
@@ -408,8 +450,13 @@ fn cad631_app_turn_and_forged_task_cannot_borrow_account_union_for_effects() {
 fn cad631_authority_loss_invalidates_once_and_keeps_material_receipts() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     s.app_run_dispatch(id, "sha256:bundle").unwrap();
     s.app_run_invalidate(id).unwrap();
     s.app_run_invalidate(id).unwrap();
@@ -478,8 +525,13 @@ fn cad631_generic_job_reads_do_not_reveal_private_rendered_title() {
 fn cad631_public_app_message_projection_hides_provider_material() {
     let (_dir, s, run) = runtime_fixture();
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, run["snapshot_digest"].as_str(), false)
-        .unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
     let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
     let message = start_local_step(&s, &dispatched, 0, "writer");
     s.conn()
@@ -499,7 +551,7 @@ fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private()
     let (_dir, s, run) = runtime_fixture();
     assert!(s.app_material_endpoint("writer").unwrap());
     let id = run["id"].as_str().unwrap();
-    s.app_run_decide(id, None, true).unwrap();
+    s.app_run_decide(id, None, true, None).unwrap();
     assert!(
         s.app_material_endpoint("writer").unwrap(),
         "terminal state must not expose retained transcript"
@@ -524,4 +576,87 @@ fn cad631_pty_team_is_explicitly_unsupported_and_transcript_history_is_private()
             project_link: None,
         })
         .is_err());
+}
+
+#[test]
+fn cad631_v18_upgrade_commits_only_completed_migrations_before_v20_failure() {
+    let (dir, s) = store();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("DROP TABLE app_run_reviews; DROP TABLE app_run_artifacts; DROP TABLE app_run_steps; DROP TABLE app_runs; DROP TABLE app_install_capabilities; DROP TABLE app_grants; UPDATE schema_version SET version=18; CREATE TRIGGER fail_v20 BEFORE UPDATE ON schema_version WHEN NEW.version=20 BEGIN SELECT RAISE(ABORT, 'forced v20 migration failure'); END;").unwrap();
+    drop(conn);
+    assert!(Store::open_for_schema_tests(&db)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("forced v20 migration failure"));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        19
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='app_runs'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='app_grants'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute_batch("DROP TRIGGER fail_v20").unwrap();
+    drop(conn);
+    let repaired = Store::open_for_schema_tests(&db).unwrap();
+    assert!(repaired.app_run_list(None).unwrap()["runs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        repaired
+            .conn()
+            .query_row("SELECT version FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        20
+    );
+}
+
+#[test]
+fn cad631_execution_approval_requires_current_bundle_not_snapshot_self_attestation() {
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    assert!(s
+        .app_run_decide(
+            id,
+            run["snapshot_digest"].as_str(),
+            false,
+            Some("sha256:changed-bundle")
+        )
+        .is_err());
+    assert!(s
+        .app_run_decide(id, run["snapshot_digest"].as_str(), false, None)
+        .is_err());
+    assert_eq!(s.app_run_show(id).unwrap()["state"], "awaiting_approval");
+    assert_eq!(
+        s.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='app_run_execution_approved'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
 }

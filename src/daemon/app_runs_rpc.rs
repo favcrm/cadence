@@ -138,14 +138,18 @@ impl Shared {
             }
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
-                self.with_app_run_current(id, |_| {
-                    self.store
-                        .app_run_decide(id, Some(required_str(params, "digest")?), false)
+                self.with_app_run_current(id, |current_bundle| {
+                    self.store.app_run_decide(
+                        id,
+                        Some(required_str(params, "digest")?),
+                        false,
+                        Some(current_bundle),
+                    )
                 })
             }
             "app_run_cancel" => {
                 self.store
-                    .app_run_decide(required_str(params, "run_id")?, None, true)
+                    .app_run_decide(required_str(params, "run_id")?, None, true, None)
             }
             "app_run_dispatch" => self.dispatch_app_run(required_str(params, "run_id")?),
             "app_run_show" => self.store.app_run_show(required_str(params, "run_id")?),

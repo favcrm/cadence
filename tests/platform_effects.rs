@@ -1622,7 +1622,7 @@ fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
 
     // Persist only the ownership seam under test; no material success is
     // injected, and the disabled native lane cannot dispatch this fixture.
-    let conn = d.db();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('app-effect-job','app-run','app-writer','running',1,1);
         INSERT INTO tasks(id,job_id,state,created,updated) VALUES('app-effect-task','app-effect-job','draft',1,1);
         INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('app-effect-job','app-install',1,'digest','{}','digest','app-writer','effect-request','running',1,1);

@@ -485,10 +485,7 @@ impl Store {
                     "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 )?;
             }
-            tx.execute(
-                "UPDATE schema_version SET version=?1",
-                [crate::rollout::SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE schema_version SET version=?1", [15])?;
             tx.commit()?;
         }
         if version < 16 {
@@ -509,10 +506,7 @@ impl Store {
                     tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"))?;
                 }
             }
-            tx.execute(
-                "UPDATE schema_version SET version=?1",
-                [crate::rollout::SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE schema_version SET version=?1", [16])?;
             tx.commit()?;
         }
         if version < 17 {
@@ -523,10 +517,7 @@ impl Store {
             // half-applied v17 converges on reopen.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(platform::SCHEMA_V17)?;
-            tx.execute(
-                "UPDATE schema_version SET version=?1",
-                [crate::rollout::SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE schema_version SET version=?1", [17])?;
             tx.commit()?;
         }
         if version < 18 {
@@ -537,10 +528,7 @@ impl Store {
             // preview only — credentials never land here.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(effects::SCHEMA_V18)?;
-            tx.execute(
-                "UPDATE schema_version SET version=?1",
-                [crate::rollout::SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE schema_version SET version=?1", [18])?;
             tx.commit()?;
         }
         if version < 19 {
@@ -563,10 +551,7 @@ impl Store {
                     "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",
                 )?;
             }
-            tx.execute(
-                "UPDATE schema_version SET version=?1",
-                [crate::rollout::SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE schema_version SET version=?1", [19])?;
             tx.commit()?;
         }
         if version < 20 {

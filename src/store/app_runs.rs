@@ -363,7 +363,13 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(json!({"runs":ids.iter().map(|id|self.app_run_show(id)).collect::<Result<Vec<_>>>()?}))
     }
-    pub fn app_run_decide(&self, id: &str, digest: Option<&str>, cancel: bool) -> Result<Value> {
+    pub fn app_run_decide(
+        &self,
+        id: &str,
+        digest: Option<&str>,
+        cancel: bool,
+        current_bundle: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let run = Self::app_run_show_in(&tx, id)?;
@@ -389,7 +395,9 @@ impl Store {
             Self::app_current_in(
                 &tx,
                 &run,
-                run["snapshot"]["bundle_digest"].as_str().unwrap(),
+                current_bundle.ok_or_else(|| {
+                    Error::rejected("execution approval requires current installation proof")
+                })?,
             )?;
             tx.execute("UPDATE app_runs SET state='approved',approved_digest=snapshot_digest,updated=? WHERE id=?",params![now(),id])?;
         }
