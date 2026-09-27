@@ -36,6 +36,7 @@ struct Rec {
 }
 
 struct State {
+    requests: AtomicUsize,
     script: Script,
     records: HashMap<String, Rec>,
     /// New send rows. A repeat of an existing key does not increment.
@@ -87,6 +88,7 @@ fn start(script: Script) -> (Door, AgenticosAdapter) {
     drop(listener);
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).unwrap();
     let state = Arc::new(Mutex::new(State {
+        requests: AtomicUsize::new(0),
         script,
         records: HashMap::new(),
         writes: AtomicUsize::new(0),
@@ -125,6 +127,11 @@ fn start(script: Script) -> (Door, AgenticosAdapter) {
 }
 
 fn handle(mut req: tiny_http::Request, state: &Mutex<State>) {
+    state
+        .lock()
+        .unwrap()
+        .requests
+        .fetch_add(1, Ordering::SeqCst);
     let method = req.method().as_str().to_string();
     let path = req.url().to_string();
     let key_hdr = header(&req, "idempotency-key").map(str::to_string);
@@ -135,6 +142,14 @@ fn handle(mut req: tiny_http::Request, state: &Mutex<State>) {
     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
 
     if method == "GET" {
+        if path.starts_with("/v1/runtime/connectors/connections") {
+            respond(
+                req,
+                200,
+                json!({"ok":true,"data":{"connections":[],"cursor":null}}),
+            );
+            return;
+        }
         let key = path.rsplit('/').next().unwrap_or("");
         let guard = state.lock().unwrap();
         match guard.records.get(key) {
@@ -466,6 +481,10 @@ struct CallDaemon {
 impl CallDaemon {
     fn start(adapter: Arc<AgenticosAdapter>) -> Self {
         let dir = tempfile::TempDir::new().unwrap();
+        Self::start_on(dir, adapter)
+    }
+
+    fn start_on(dir: tempfile::TempDir, adapter: Arc<AgenticosAdapter>) -> Self {
         let state = dir.path().join("state");
         let pm = dir.path().join("pm");
         std::fs::create_dir_all(&state).unwrap();
@@ -505,6 +524,14 @@ impl CallDaemon {
             thread::sleep(Duration::from_millis(50));
         }
         d
+    }
+
+    fn restart(mut self, adapter: Arc<AgenticosAdapter>) -> Self {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.take().unwrap().join().unwrap();
+        let replacement = tempfile::TempDir::new().unwrap();
+        let dir = std::mem::replace(&mut self._dir, replacement);
+        Self::start_on(dir, adapter)
     }
 
     fn op(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
@@ -566,6 +593,16 @@ impl Lane {
     }
 
     fn rpc(&mut self, d: &CallDaemon, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        self.rpc_with_prefix(d, method, params, "")
+    }
+
+    fn rpc_with_prefix(
+        &mut self,
+        d: &CallDaemon,
+        method: &str,
+        params: Value,
+        prefix: &str,
+    ) -> cadence_agent::Result<Value> {
         let req = self.dir.path().join(format!("req-{}.json", self.seq));
         std::fs::write(
             &req,
@@ -576,7 +613,7 @@ impl Lane {
         self.seq += 1;
         writeln!(
             self.stdin,
-            "{{ python3 -c 'import socket,sys;\
+            "{{ {prefix}python3 -c 'import socket,sys;\
              s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
              s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
              print(s.makefile().readline())' {} {} ; }} 2>&1; rc=$?; echo; echo {tag}$rc",
@@ -670,4 +707,201 @@ fn two_platform_calls_share_one_agenticos_row() {
         "a repeat publish_post posted again instead of mirroring the row"
     );
     assert_eq!(state.writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn agenticos_rpc_denies_ungranted_scopes_and_forged_identity_without_traffic() {
+    let (door, adapter) = start(Script::Posted);
+    let d = CallDaemon::start(Arc::new(adapter));
+    let mut lane = Lane::spawn(&d, "aos-source-worker");
+    let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello")});
+    assert!(lane.rpc(&d, "platform_call", call.clone()).is_err());
+    d.op("platform_grant", json!({"agent":"aos-source-worker","platform":"agenticos","account":"hosted","scopes":["sources"]})).unwrap();
+    assert!(lane.rpc(&d, "platform_call", call.clone()).is_err());
+    let mut forged = call.clone();
+    forged["agent"] = json!("operator");
+    assert!(lane.rpc(&d, "platform_call", forged).is_err());
+    let mut foreign = call.clone();
+    foreign["account"] = json!("foreign-account");
+    assert!(lane.rpc(&d, "platform_call", foreign).is_err());
+    d.op("platform_grant", json!({"agent":"aos-source-worker","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+    let mut forged = call;
+    forged["input"]["effect"] = json!("read");
+    assert!(lane.rpc(&d, "platform_call", forged).is_err());
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        0
+    );
+    d.op("platform_grant", json!({"agent":"aos-source-worker","platform":"agenticos","account":"hosted","scopes":["sources"]})).unwrap();
+    let read =
+        json!({"platform":"agenticos","account":"hosted","tool":"connections_list","input":{}});
+    assert_eq!(
+        lane.rpc(&d, "platform_call", read.clone()).unwrap()["platform_result"]["connections"],
+        json!([])
+    );
+    d.op(
+        "platform_ungrant",
+        json!({"agent":"aos-source-worker","platform":"agenticos","account":"hosted"}),
+    )
+    .unwrap();
+    assert!(lane.rpc(&d, "platform_call", read).is_err());
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        1,
+        "revoked read still contacted upstream"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn agenticos_detached_enrolled_child_cannot_forge_operator_grant_authority() {
+    let (door, adapter) = start(Script::Posted);
+    let d = CallDaemon::start(Arc::new(adapter));
+    let mut lane = Lane::spawn(&d, "aos-detached-worker");
+    let err = lane.rpc_with_prefix(&d, "platform_grant", json!({"agent":"aos-detached-worker","platform":"agenticos","account":"hosted","scopes":["publish"],"by":"operator"}), "setsid ").unwrap_err();
+    assert!(
+        err.to_string().contains("operator") || err.to_string().contains("refused"),
+        "{err}"
+    );
+    assert!(lane.rpc_with_prefix(&d, "platform_call", json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello"),"agent":"operator"}), "setsid ").is_err());
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn concurrent_agenticos_rpc_calls_and_actual_daemon_restart_share_the_durable_row() {
+    let (door, adapter) = start(Script::Posted);
+    let mut d = CallDaemon::start(Arc::new(adapter));
+    let mut first = Lane::spawn(&d, "aos-concurrent-1");
+    let mut second = Lane::spawn(&d, "aos-concurrent-2");
+    for agent in ["aos-concurrent-1", "aos-concurrent-2"] {
+        d.op(
+            "platform_grant",
+            json!({"agent":agent,"platform":"agenticos","account":"hosted","scopes":["publish"]}),
+        )
+        .unwrap();
+    }
+    let call = json!({"platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello")});
+    let barrier = std::sync::Barrier::new(3);
+    thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            first.rpc(&d, "platform_call", call.clone()).unwrap()
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            second.rpc(&d, "platform_call", call.clone()).unwrap()
+        });
+        barrier.wait();
+        for result in [a.join().unwrap(), b.join().unwrap()] {
+            assert_eq!(result["platform_result"]["verified"], "unknown");
+            assert_eq!(
+                result["platform_result"]["platform_ref"],
+                derived_key("hello")
+            );
+        }
+    });
+    d = d.restart(Arc::new(AgenticosAdapter::new(&door.base).unwrap()));
+    let result = first.rpc(&d, "platform_call", call).unwrap();
+    assert_eq!(result["platform_result"]["verified"], "unknown");
+    assert_eq!(
+        result["platform_result"]["platform_ref"],
+        derived_key("hello")
+    );
+    assert_eq!(door.state.lock().unwrap().writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn agenticos_http_peer_has_no_tool_relay_even_with_forged_identity() {
+    let (door, adapter) = start(Script::Posted);
+    let d = CallDaemon::start(Arc::new(adapter));
+    let _agent = Lane::spawn(&d, "aos-http-agent");
+    let port = (3110..3200)
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .expect("private board test port");
+    let stop = Arc::new(AtomicBool::new(false));
+    let state = d.state.clone();
+    let pm = d._dir.path().join("pm");
+    let board_stop = Arc::clone(&stop);
+    let board = thread::spawn(move || {
+        cadence_agent::ui::serve(
+            &state,
+            &pm,
+            &cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(board_stop),
+                test_seam: cfg!(feature = "test-seam"),
+                ..Default::default()
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "private board did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    struct BoardCleanup {
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<cadence_agent::Result<()>>>,
+    }
+    impl Drop for BoardCleanup {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.thread.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = BoardCleanup {
+        stop,
+        thread: Some(board),
+    };
+    let http = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    for path in [
+        "/api/platform_call",
+        "/api/platform/call",
+        "/v1/runtime/connectors/publish",
+    ] {
+        let response = http.post(format!("http://127.0.0.1:{port}{path}")).header("origin",format!("http://127.0.0.1:{port}")).header("x-cadence-by","operator").send_json(json!({"agent":"operator","platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello")})).unwrap();
+        assert!(
+            matches!(response.status().as_u16(), 403 | 404),
+            "unexpected tool relay at {path}"
+        );
+    }
+    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &d.state, port);
+    for path in [
+        "/api/platform_call",
+        "/api/platform/call",
+        "/v1/runtime/connectors/publish",
+    ] {
+        let body = json!({"agent":"operator","platform":"agenticos","account":"hosted","tool":"publish_post","input":input("hello")}).to_string();
+        let (code, _, _) = op::raw(port, &session.request("POST", path, &body));
+        assert_eq!(
+            code, 404,
+            "signed-in peer found an unsupported relay at {path}"
+        );
+        let (code, _, _) = op::raw(
+            port,
+            &session.request_as(
+                "POST",
+                path,
+                &body,
+                &op::seam_headers(&d.state, "agent:aos-http-agent"),
+            ),
+        );
+        assert!(
+            matches!(code, 403 | 404),
+            "forged agent peer reached tool relay at {path}"
+        );
+    }
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        0
+    );
 }
