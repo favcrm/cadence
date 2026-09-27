@@ -4,6 +4,16 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 const CONFIG: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
 
 #[test]
+fn nonhosted_registration_never_loads_image_metadata() {
+    let mut opts = crate::daemon::ServeOptions::default();
+    crate::platform::agenticos::register_with_loader(
+        &mut opts, "http://localhost:3110", false,
+        || -> Result<Option<DeploymentMetadata>> { panic!("nonhosted composition must not inspect image metadata") },
+    ).unwrap();
+    assert_eq!(opts.platforms["agenticos"].reported_manifest_version(), None);
+}
+
+#[test]
 fn strict_metadata_binds_exact_origin_and_rejects_forged_shapes() {
     let metadata = DeploymentMetadata::parse(CONFIG.as_bytes()).unwrap();
     assert_eq!(
