@@ -342,7 +342,7 @@ export default function Board({
   // drop-target highlight so swimlanes light up one cell, not a column.
   const columns = (laneCards: IssueCard[], lane: string, quickAdd: boolean) => (
       <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
-      {COLS.filter(([key]) => key !== "done" || filters.showDone).map(([key, name, wip], ci) => {
+      {COLS.map(([key, name, wip], ci) => {
         const showAdd = quickAdd && !readOnly;
         const cards = laneCards
           .filter((t) => t.status === key)
