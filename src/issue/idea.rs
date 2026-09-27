@@ -604,6 +604,7 @@ fn create_children(
             None,
             &[],
             None,
+            None,
             "operator",
         )?;
         let id = created["id"]

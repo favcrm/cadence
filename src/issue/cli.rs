@@ -58,9 +58,17 @@ pub enum IssueAction {
         #[arg(long)]
         component: Option<String>,
         /// Mint this exact id — for seeds/imports; must match the
-        /// project prefix and not exist.
+        /// project prefix and not exist. The master may not set it.
         #[arg(long)]
         id: Option<String>,
+        /// Issue body. The Pi master writes this under its tmp dir
+        /// first, then passes the path — stdin (`-`) is refused.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Status to create in. Only `backlog` is accepted; omit it
+        /// for the same result. The master cannot create any other.
+        #[arg(long)]
+        status: Option<String>,
     },
     /// List issues — a compact table on a TTY, `--json` for agents.
     /// Value flags repeat and comma-join and match ANY of their values;
@@ -720,9 +728,37 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             owner,
             component,
             id,
+            file,
+            status,
         } => {
+            let caller_is_master = crate::master::caller_is_master();
+            write::master_issue_new_limits(
+                caller_is_master,
+                owner.as_deref(),
+                id.as_deref(),
+                status.as_deref(),
+            )?;
+            let body = match file {
+                Some(ref f) if f.as_os_str() == "-" => {
+                    return Err(Error::rejected(crate::master::NO_STDIN));
+                }
+                Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
+                    |e| {
+                        Error::rejected(format!(
+                            "issue new --file {}: {e} — write it with the write tool into master/tmp, then --file",
+                            f.display()
+                        ))
+                    },
+                )?),
+                None => None,
+            };
             let pm = open_pm()?;
             let cwd = std::env::current_dir()?;
+            let actor = if caller_is_master {
+                crate::master::ALIAS
+            } else {
+                ""
+            };
             let out = write::new_issue(
                 &pm,
                 &cwd,
@@ -735,7 +771,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 component.as_deref(),
                 tags,
                 id.as_deref(),
-                "",
+                body.as_deref(),
+                actor,
             )?;
             print_json(&out);
             Ok(0)
