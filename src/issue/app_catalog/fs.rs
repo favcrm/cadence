@@ -138,7 +138,7 @@ impl Root {
             .map_err(|_| Error::rejected("catalog files must be UTF-8"))
     }
 
-    pub(super) fn list(&self, path: &Path) -> Result<Vec<String>> {
+    pub(super) fn list(&self, path: &Path, budget: &mut usize) -> Result<Vec<String>> {
         struct Directory(*mut libc::DIR);
         impl Drop for Directory {
             fn drop(&mut self) {
@@ -176,6 +176,9 @@ impl Root {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| Error::rejected("catalog global inventory limit exceeded"))?;
             names.push(
                 std::str::from_utf8(bytes)
                     .map_err(|_| Error::rejected("catalog names must be UTF-8"))?

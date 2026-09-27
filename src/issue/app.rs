@@ -560,18 +560,22 @@ fn workflow_slots(text: &str) -> Result<Vec<String>> {
 /// What `validate` returns on success: the parsed manifest, the
 /// verified file texts (`rel-path → text`, sorted), the secret guard's
 /// warnings and the workflow checks' notes.
-struct Validated {
-    manifest: Manifest,
-    files: Vec<(String, String)>,
-    secret_warnings: Vec<crate::secret::Finding>,
-    notes: Vec<String>,
+pub(crate) struct Validated {
+    pub(crate) manifest: Manifest,
+    pub(crate) files: Vec<(String, String)>,
+    pub(crate) secret_warnings: Vec<crate::secret::Finding>,
+    pub(crate) notes: Vec<String>,
 }
 
 /// Read a bundle's files as UTF-8 text and validate them: the manifest
 /// parses, every workflow passes the CAD-487 `workflow check` (same
 /// `check_text`), every `uses:` names a declared slot, and the secret
 /// guard runs over each file — an install refuses on any error.
-fn validate(root: &Path, agents: &HashSet<String>, agent_sources: &[String]) -> Result<Validated> {
+pub(crate) fn validate(
+    root: &Path,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> Result<Validated> {
     let paths = bundle_files(root)?;
     let mut files = Vec::with_capacity(paths.len());
     let mut secret_warnings = Vec::new();
@@ -600,6 +604,35 @@ fn validate(root: &Path, agents: &HashSet<String>, agent_sources: &[String]) -> 
         }
         files.push((rel, text));
     }
+    validate_contents(files, secret_warnings, errors, agents, agent_sources)
+}
+
+/// Validate an immutable descriptor-read snapshot before workspace publication.
+pub(crate) fn validate_texts(
+    files: Vec<(String, String)>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> Result<Validated> {
+    if files.len() > MAX_FILES {
+        return Err(Error::rejected("app bundle exceeds its file limit"));
+    }
+    let mut warnings = Vec::new();
+    for (name, text) in &files {
+        if text.len() as u64 > MAX_FILE_BYTES {
+            return Err(Error::rejected("app bundle file exceeds its limit"));
+        }
+        warnings.extend(crate::secret::guard(&format!("app file {name}"), text)?);
+    }
+    validate_contents(files, warnings, Vec::new(), agents, agent_sources)
+}
+
+fn validate_contents(
+    files: Vec<(String, String)>,
+    secret_warnings: Vec<crate::secret::Finding>,
+    mut errors: Vec<String>,
+    agents: &HashSet<String>,
+    agent_sources: &[String],
+) -> Result<Validated> {
     let manifest = match files.iter().find(|(rel, _)| rel == MANIFEST) {
         Some((_, text)) => match parse_manifest(text) {
             Ok(manifest) => manifest,
@@ -1013,7 +1046,7 @@ fn clone_git(url: &str, into: &Path) -> Result<String> {
 /// git URL (a mistyped path fails the clone with a clear error). The
 /// returned TempDir, when `Some`, owns the clone — keep it alive until
 /// the copy has landed.
-fn resolve_source(source: &str) -> Result<(PathBuf, Source, Option<tempfile::TempDir>)> {
+pub(crate) fn resolve_source(source: &str) -> Result<(PathBuf, Source, Option<tempfile::TempDir>)> {
     let path = Path::new(source);
     if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(format!(

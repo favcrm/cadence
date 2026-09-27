@@ -90,6 +90,7 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// that matches no entry is [`RouteClass::OperatorOnly`]
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
+    route("POST", "/api/app-installations", RouteClass::OperatorOnly),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
     route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
     route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),

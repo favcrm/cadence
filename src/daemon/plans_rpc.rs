@@ -447,6 +447,42 @@ impl Shared {
         Ok(payload)
     }
 
+    /// CAD-667 interim catalog surfaces are operator-only, including reads.
+    pub(super) fn rpc_app_workspace(
+        &self,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("workspace app catalog", params, peer_pid)?;
+        let allowed: &[&str] = match method {
+            "app_workspace_install" => &["source"],
+            "app_workspace_show" | "app_workspace_recover" => &["install_id"],
+            _ => &[],
+        };
+        let object = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("catalog parameters must be an object"))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(Error::rejected("unknown workspace catalog parameter"));
+        }
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        use crate::issue::app_catalog::workspace;
+        match method {
+            "app_workspace_install" => {
+                workspace::install(&pm, &self.state_dir, required_str(params, "source")?)
+            }
+            "app_workspace_list" => workspace::list(&pm),
+            "app_workspace_show" => workspace::show(&pm, required_str(params, "install_id")?),
+            "app_workspace_migrate" => workspace::migrate(&pm),
+            "app_workspace_recover" => {
+                workspace::recover(&pm, &self.state_dir, required_str(params, "install_id")?)
+            }
+            _ => Err(Error::rejected("unknown catalog operation")),
+        }
+    }
+
     /// CAD-577 `app_set_team` — the operator records an app's default
     /// team: one agent alias per workflow input role. Operator only,
     /// connection-bound like `app approve`. The team lives with the
