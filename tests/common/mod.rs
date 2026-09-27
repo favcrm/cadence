@@ -5069,10 +5069,19 @@ impl LoopFixture {
     /// so once both reviewers are busy this frees `r1` — the state a
     /// finished turn would leave — before the report is filed.
     pub fn pass_on(&mut self, id: &str, sha: &str, pr: &str) {
+        self.pass_on_with_hint(id, sha, pr, false);
+    }
+
+    /// A fixture with a long router period explicitly routes the worker's
+    /// report before waiting for review, keeping retry scheduling controlled.
+    pub fn pass_on_with_hint(&mut self, id: &str, sha: &str, pr: &str, hint: bool) {
         if self.agent_state("r1") != "idle" && self.agent_state("r2") != "idle" {
             self.idle_agent("r1");
         }
         self.done_on(id, sha, pr);
+        if hint {
+            self.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+        }
         let rec = self.wait_of(id, "in review", |r| {
             r["state"] == "reviewing" && r["head"] == sha
         });

@@ -3065,7 +3065,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     };
 
     // Busy before a status read has no safe retry precondition.
-    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.pass_on_with_hint("D-2", &a, LOOP_PR, true);
     let d2_status = lf.f.front("D-2").status;
     let lock = lf.f.pm_dir.join(".write.lock");
     std::fs::write(&lock, "").unwrap();
@@ -3084,7 +3084,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     assert!(lf.done_commits("D-2").is_empty());
 
     // A failing commit hook.
-    lf.pass_on("D-3", &b, "https://github.com/acme/app/pull/8");
+    lf.pass_on_with_hint("D-3", &b, "https://github.com/acme/app/pull/8", true);
     let d3_status = lf.f.front("D-3").status;
     let hooks = String::from_utf8(git(&["rev-parse", "--git-path", "hooks"]).stdout).unwrap();
     let hooks = lf.f.pm_dir.join(hooks.trim());
@@ -3167,7 +3167,7 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     // hand: the retry never overwrites that. A commit-msg hook refuses
     // only the done write, so the operator's own write goes through.
     let c = "c".repeat(40);
-    lf.pass_on("D-4", &c, "https://github.com/acme/app/pull/9");
+    lf.pass_on_with_hint("D-4", &c, "https://github.com/acme/app/pull/9", true);
     let d4_status = lf.f.front("D-4").status;
     let msg_hook = hooks.join("commit-msg");
     std::fs::write(
@@ -3304,7 +3304,7 @@ fn delivery_known_failed_status_survives_transient_tracker_contention() {
         },
     );
     let head = "a".repeat(40);
-    lf.pass_on("D-2", &head, LOOP_PR);
+    lf.pass_on_with_hint("D-2", &head, LOOP_PR, true);
     let original = lf.f.front("D-2").status;
     let (hook, _) = refuse_done_commits(&lf);
     lf.set_gh(&head, "MERGED", true, false);
