@@ -263,18 +263,19 @@ fn cad630_detached_enrolled_child_cannot_migrate_with_a_forged_operator_field() 
         "format":"cadence-slots", "version":2,
         "enrollments":[{"root":{"pid":std::process::id(),"starttime":start,"uid":unsafe{libc::getuid()}}}]
     }).to_string()).unwrap();
-    let output = std::process::Command::new("setsid")
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "cad630_detached_probe", "--nocapture"])
-        .env("CAD630_CHILD_PM", &f.pm.dir)
-        .env("CAD630_CHILD_STATE", &f.state)
-        .env("CAD630_FORGED_ACTOR", "operator:forged")
-        .env_remove("CADENCE_ALIAS")
-        .env_remove(test_seam::AS_ENV)
-        .env_remove(test_seam::ARM_ENV)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+    let output = cadence_agent::reaper::output(
+        std::process::Command::new("setsid")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "cad630_detached_probe", "--nocapture"])
+            .env("CAD630_CHILD_PM", &f.pm.dir)
+            .env("CAD630_CHILD_STATE", &f.state)
+            .env("CAD630_FORGED_ACTOR", "operator:forged")
+            .env_remove("CADENCE_ALIAS")
+            .env_remove(test_seam::AS_ENV)
+            .env_remove(test_seam::ARM_ENV)
+            .stdin(std::process::Stdio::null()),
+    )
+    .unwrap();
     assert!(output.status.success(), "detached proof failed: {output:?}");
     assert_eq!(bytes(&record), before);
     assert!(!f.pm.dir.join(".apps").exists());
