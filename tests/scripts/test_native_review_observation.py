@@ -21,6 +21,7 @@ def _load_module():
 SHA = "a" * 40
 PR_URL = "https://github.com/favcrm/cadence/pull/42"
 PR43_URL = "https://github.com/favcrm/cadence/pull/43"
+PR1_URL = "https://github.com/favcrm/cadence/pull/1"
 EXPECTED_BATCH = {"requests": [{"issue": "CAD-680", "pr": PR_URL, "sha": SHA}]}
 
 
@@ -383,6 +384,155 @@ class ObserveTest(unittest.TestCase):
         self.assertFalse(self.observe(RecordingGitHub([snapshot()]),
                                       RecordingNative([export(review())]),
                                       monotonic=HeldClock([0, -1]))["matched"])
+
+
+class StrictEqualityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_module()
+
+    def observe(self, gh, native, scope_=None, config=None):
+        cfg = config if config is not None else self.mod.Config(
+            1372936414, "favcrm/cadence", "cadence", "main")
+        return self.mod.observe(scope_ if scope_ is not None else scope(),
+                                gh, native, cfg,
+                                wall_clock=lambda: 1000, monotonic=lambda: 0)
+
+    def test_loose_scalar_equality_traps_refuse(self):
+        # Numeric/string traps that Python == accepts must still refuse.
+        float_repo = dict(snapshot(), repository_id=1372936414.0)
+        cases = {
+            "remote_repository_id_float": (
+                RecordingGitHub([float_repo, float_repo]),
+                RecordingNative([export(review()), export(review())]),
+                scope(), None),
+            "native_number_float": (
+                RecordingGitHub([snapshot(), snapshot()]),
+                RecordingNative([export(review(number=42.0)),
+                                 export(review(number=42.0))]),
+                scope(), None),
+            "sha_trailing_newline": (
+                RecordingGitHub([snapshot(sha=SHA + "\n"),
+                                 snapshot(sha=SHA + "\n")]),
+                RecordingNative([export(review(sha=SHA + "\n")),
+                                 export(review(sha=SHA + "\n"))]),
+                scope(), None),
+            # bool == int must not satisfy equality either.
+            "remote_repository_id_bool": (
+                RecordingGitHub([dict(snapshot(), repository_id=True),
+                                 dict(snapshot(), repository_id=True)]),
+                RecordingNative([export(review()), export(review())]),
+                scope(), self.mod.Config(1, "favcrm/cadence", "cadence", "main")),
+            "native_number_bool": (
+                RecordingGitHub([snapshot(number=1, pr=PR1_URL),
+                                 snapshot(number=1, pr=PR1_URL)]),
+                RecordingNative([export(review(number=True, pr=PR1_URL)),
+                                 export(review(number=True, pr=PR1_URL))]),
+                scope(number=1), None),
+        }
+        for name, (gh, native, sc, cfg) in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(self.observe(gh, native, scope_=sc,
+                                              config=cfg)["matched"])
+
+    def test_caller_scope_borrowed_mutation_refuses(self):
+        # The adapter mutates the caller's scope dict and returns reviews
+        # for the mutated issue; the originally requested binding must
+        # not change and the observation must refuse.
+        caller_scope = scope()
+
+        class MutatingScopeNative:
+            def __init__(self):
+                self.calls = 0
+                self.batches = []
+
+            def export(self, batch):
+                self.calls += 1
+                self.batches.append(copy.deepcopy(batch))
+                caller_scope["issue"] = "CAD-2"
+                return copy.deepcopy(export(review(issue="CAD-2")))
+
+        gh = RecordingGitHub([snapshot(), snapshot()])
+        native = MutatingScopeNative()
+        result = self.observe(gh, native, scope_=caller_scope)
+        self.assertFalse(result["matched"])
+        self.assertGreaterEqual(native.calls, 1)
+        for batch in native.batches:
+            self.assertEqual(batch, EXPECTED_BATCH)
+
+    def test_export_copied_before_next_callback(self):
+        # A shared mutable export aliased across native returns: the
+        # monotonic clock callback right after the first native return
+        # mutates it, so the second native read observes "new".
+        # The first returned export must already have been copied, so
+        # the observation must refuse with the changed review.
+        shared = export(review(report="CAD-680/reports/old.md"))
+
+        class SharedNative:
+            def __init__(self):
+                self.calls = 0
+
+            def export(self, batch):
+                self.calls += 1
+                return shared
+
+        mono_calls = [0]
+
+        def mono():
+            mono_calls[0] += 1
+            if mono_calls[0] == 3:  # tick right after first native return
+                shared["reviews"][0]["report"] = "CAD-680/reports/new.md"
+            return 0
+
+        gh = RecordingGitHub([snapshot(), snapshot()])
+        native = SharedNative()
+        result = self.mod.observe(scope(), gh, native, self.mod.Config(
+            1372936414, "favcrm/cadence", "cadence", "main"),
+            wall_clock=lambda: 1000, monotonic=mono)
+        self.assertFalse(result["matched"])
+        self.assertEqual(native.calls, 2)
+
+    def test_wall_and_config_vectors(self):
+        mod = self.mod
+        cfg = mod.Config(1372936414, "favcrm/cadence", "cadence", "main")
+        for kwargs in ({"repository_id": 0}, {"repository_id": True},
+                       {"repository": "bad repo"}, {"project": ""},
+                       {"base_ref": " "}):
+            full = {"repository_id": 1372936414,
+                    "repository": "favcrm/cadence",
+                    "project": "cadence", "base_ref": "main"}
+            full.update(kwargs)
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    mod.Config(**full)
+        # Non-Config config refuses rather than raising.
+        self.assertFalse(mod.observe(scope(), RecordingGitHub([snapshot()]),
+                                     RecordingNative([export(review())]),
+                                     {"repository_id": 1372936414},
+                                     wall_clock=lambda: 1000,
+                                     monotonic=lambda: 0)["matched"])
+        # Backwards wall clock refuses.
+        self.assertFalse(mod.observe(
+            scope(), RecordingGitHub([snapshot(), snapshot()]),
+            RecordingNative([export(review()), export(review())]), cfg,
+            wall_clock=HeldClock([1000, 999]), monotonic=lambda: 0)["matched"])
+        # Final wall ages the first export past 30s: refuse.
+        self.assertFalse(mod.observe(
+            scope(), RecordingGitHub([snapshot(), snapshot()]),
+            RecordingNative([export(review()), export(review())]), cfg,
+            wall_clock=HeldClock([1000, 1000, 1031]),
+            monotonic=lambda: 0)["matched"])
+        # Advancing checked_at within an advancing wall stays matched;
+        # an old reviewed_at remains valid standing evidence.
+        rev = review(reviewed_at=1)
+        result = mod.observe(
+            scope(), RecordingGitHub([snapshot(), snapshot()]),
+            RecordingNative([export(rev, checked_at=1000),
+                             export(rev, checked_at=1001)]), cfg,
+            wall_clock=HeldClock([1000, 1001, 1001]),
+            monotonic=lambda: 0)
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["checked_at"], [1000, 1001])
 
 
 def json_like_native_export_scope():

@@ -75,3 +75,62 @@ are intentionally ineligible for export.
 
 GitHub documents [checks from a specific App](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 and the [merge-group check lifecycle](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
+
+## Observation-only binding check (CAD-680)
+
+`scripts/native-review-observation.py` is a small trusted-side module that
+observes whether a single exact native review still binds a requested
+pull request head. It is library-only — no CLI, no deployment, no daemon
+change. `observe(scope, github, native, config)` performs exactly four
+reads in fixed order (`github.snapshot()`, `native.export(batch)`, then
+both again) and returns a `cadence.review-observation/1` result with
+`observation_only: true`. It never writes a check, status or file, and
+never propagates adapter exception text.
+
+Trusted adapter shapes:
+
+- `github.snapshot()` must return the authoritative, COMPLETE open-PR
+  inventory for the pinned repository (all pages):
+  `{repository_id, repository, complete: true, pull_requests: [...]}`
+  where each entry is exactly `{number, pr, sha, base_ref, state}`.
+- `native.export({"requests": [{issue, pr, sha}]})` returns a
+  `cadence.review-evidence/1` export with `transport_only: true`,
+  `checked_at`, and exactly one fully bound review.
+
+Both adapters must bound their own calls; the module only checks clocks
+when a call returns and cannot preempt a blocked adapter. Fixed limits:
+`MAX_EXPORT_AGE_SECONDS = 30` for `checked_at` freshness against wall
+time (re-checked at final wall time for both exports) and
+`MAX_DURATION_SECONDS = 5` cumulative monotonic budget across the four
+reads. Injectable `wall_clock`/`monotonic` are for tests; backwards or
+nonfinite movement refuses.
+
+Standing review rule: an old `reviewed_at` remains valid evidence —
+freshness applies only to `checked_at`, not review age. Config pins
+`repository_id`, `repository`, `project`, `base_ref`; scopes other than
+`pull_request` (including every merge-group shape) refuse before any
+adapter call. The same head SHA on any other open PR is ambiguous and
+refuses.
+
+The output is an observation, **not** an attestation or authorization.
+Adapter identity and live provenance are not authenticated by this
+policy — a malicious trusted adapter can forge plausible values, so this
+cannot claim universal forgery detection. A residual non-atomic race
+remains between the last read and any later use; a publisher must
+treat the result as one input, never as a published check.
+
+Remaining dependencies to productionize this observation: a
+credential-free private native broker/transport between the daemon and
+the observing process. The native socket already rejects different UIDs
+and derives authority from the connecting operator process, but a
+credentialless broker running in the daemon's own UID needs an
+independently proven private-channel isolation mechanism from same-UID
+workers — same UID or `chmod 0600` alone is not isolation — while the
+App publishing credential must live under a separately protected service
+identity. Also required: real runtime export-RPC deployment via the
+rollout owner rather than test doubles; protected App credential custody
+plus verified event intake; review generation, revocation and the
+residual non-atomic race on the evidence path; and an authoritative,
+complete original-constituent head inventory before merge groups can be
+supported. None of this is implemented here, and none of it enables any
+GitHub required check on its own.
