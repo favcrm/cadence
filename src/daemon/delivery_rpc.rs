@@ -475,14 +475,15 @@ impl Shared {
                 }
             }
         };
+        let review_receipt = json!({
+            "issue": id, "verdict": verdict.as_str(), "sha": sha, "reviewer": who,
+            "report": report, "pr": rec.pr, "project": rec.project, "worker": rec.worker,
+        });
         let out = rec.to_json();
         delivery::save(&self.state_dir, &all)?;
         // CAD-449: the daemon's own statement of this verdict — what a
         // merge must match to mark the ticket done.
-        if let Err(e) = self.store.record_review_verdict(json!({
-            "issue": id, "verdict": verdict.as_str(), "sha": sha, "reviewer": who,
-            "report": report,
-        })) {
+        if let Err(e) = self.store.record_review_verdict(review_receipt) {
             tracing::warn!("verdict evidence for {id}: {e}");
         }
         let _ = issue::write::add_comment(

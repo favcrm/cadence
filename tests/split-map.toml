@@ -988,6 +988,7 @@ helpers = [
 
 [binaries.delivery]
 tests = [
+    "cad120_review_evidence_rejects_untrusted_stale_and_forged_requests",
     "delivery_list_cad437_filters",
     "master_end_to_end_chat_plan_approve_dispatch_report",
     "master_limits_are_enforced_by_the_daemon",

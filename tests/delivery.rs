@@ -108,6 +108,16 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
         before,
         "concurrent export changed delivery state"
     );
+    let request_file =
+        lf.f.file("review-evidence-request.json", &request.to_string());
+    let (ok, proof) = lf.operator(&[
+        "delivery",
+        "review-evidence",
+        "--request-file",
+        &request_file,
+    ]);
+    assert!(ok, "{proof}");
+    assert_eq!(proof["reviews"][0]["sha"], sha);
 
     // File-only forgery has no exact native verdict-stream receipt.
     let path = lf.f.d.state.join("delivery.json");
@@ -144,6 +154,36 @@ fn cad120_review_evidence_rejects_untrusted_stale_and_forged_requests() {
         Some(lf.gh_dir.join("gh")),
     );
     let body = request.to_string();
+    let poster = lf.f.file(
+        "evidence-post.py",
+        "import socket, sys\nport, req = int(sys.argv[1]), sys.argv[2]\n\
+         s = socket.create_connection(('127.0.0.1', port))\ns.sendall(req.encode())\n\
+         print(s.makefile().read())\n",
+    );
+    let http_request = cad328_post(
+        port,
+        "/api/delivery/D-2/review-evidence",
+        THREAD_GUARDS,
+        &body,
+    );
+    for who in [&mut lf.w1, &mut lf.r1] {
+        for prefix in [
+            vec!["python3"],
+            vec!["setsid", "python3"],
+            vec!["setsid", "env", "-i", "/usr/bin/python3"],
+        ] {
+            let port_string = port.to_string();
+            let mut args = prefix;
+            args.extend([poster.as_str(), port_string.as_str(), http_request.as_str()]);
+            let reply = who.exec(&args);
+            let output = reply["out"].as_str().unwrap_or_default();
+            assert!(
+                output.contains(" 403 ") || output.contains(" 404 "),
+                "{reply}"
+            );
+            assert!(!output.contains("cadence.review-evidence/1"), "{reply}");
+        }
+    }
     for guards in [
         THREAD_GUARDS.to_string(),
         op_guards(&sign_in(&lf.f.d.state, port)),
