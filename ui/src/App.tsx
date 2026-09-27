@@ -37,6 +37,7 @@ import { IconChevron } from "./ui/icons";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
+import { RESOURCE_NAMES } from "./lib/cache";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, resources } from "./lib/resources";
@@ -263,10 +264,22 @@ export default function App() {
 
   useEffect(refresh, [refresh]);
 
+  const reconcile = useCallback(() => {
+    // A GET begun before subscription can still be in flight. Invalidate
+    // before refresh so it schedules one trailing post-subscription read;
+    // refresh alone would merely join the potentially stale request.
+    for (const key of RESOURCE_NAMES) {
+      if (key === "overview" && !overviewWantedRef.current) resources.overview.markInvalid();
+      else cache.invalidate(key);
+    }
+    cache.invalidate("lane");
+    refresh();
+  }, [refresh]);
+
   const liveUpdates = useRef<LiveUpdates | null>(null);
   useEffect(() => {
     const updates = new LiveUpdates({
-      resync: refresh,
+      resync: reconcile,
       invalidate: (key) => {
         if (key === "overview" && !overviewWantedRef.current) {
           resources.overview.markInvalid();
@@ -276,7 +289,7 @@ export default function App() {
         if (event.type === "issue") {
           if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
               (data.op === "upsert" && (!data.issue || typeof data.issue !== "object"))) {
-            refresh(); return;
+            reconcile(); return;
           }
           if (resources.issues.get().data === null) {
             void resources.issues.invalidate();
@@ -284,7 +297,7 @@ export default function App() {
         } else if (event.type === "agent") {
           if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
               (data.op === "upsert" && (!data.agent || typeof data.agent !== "object"))) {
-            refresh(); return;
+            reconcile(); return;
           }
           if (resources.agents.get().data === null) {
             void resources.agents.invalidate();
@@ -292,7 +305,7 @@ export default function App() {
             agents: patchRows(value.agents, data.id as string, data.op, data.agent as Agent, (row) => row.alias),
           }));
         } else {
-          if (!data.by_issue || !data.daemon || !("totals" in data)) { refresh(); return; }
+          if (!data.by_issue || !data.daemon || !("totals" in data)) { reconcile(); return; }
           resources.agents.mutate((value) => ({ ...value,
             daemon: data.daemon as AgentsPayload["daemon"],
             totals: data.totals as AgentsPayload["totals"],
@@ -319,7 +332,7 @@ export default function App() {
       sub.close();
       if (liveUpdates.current === updates) liveUpdates.current = null;
     };
-  }, [refresh]);
+  }, [reconcile]);
 
   // The banner's only action — never automatic. The composer draft is
   // stashed first so one click costs no text (CAD-573).
