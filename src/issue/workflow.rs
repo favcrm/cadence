@@ -67,11 +67,19 @@ const WORKFLOW_ONLY_KEYS: &[&str] = &["inputs", "distinct", "label"];
 /// the approval-affecting fields later stages add (a `reviewer:` line
 /// is checked, and `tries:`/`uses:` gate the file, even though the v0
 /// plan parser leaves them in the issue body).
-const TICKET_META_KEYS: &[&str] = &["size", "agent", "depends_on", "reviewer", "tries", "uses"];
+const TICKET_META_KEYS: &[&str] = &[
+    "size",
+    "agent",
+    "depends_on",
+    "reviewer",
+    "tries",
+    "uses",
+    "action",
+];
 
 /// Metadata fields that must be static so `workflow check` can verify
 /// them — a placeholder here is refused.
-const STATIC_META_KEYS: &[&str] = &["size", "depends_on"];
+const STATIC_META_KEYS: &[&str] = &["size", "depends_on", "action"];
 
 /// One `inputs:` entry: what the proposer is asked, whether the run may
 /// leave it blank, the shape its value must match at render (CAD-571),

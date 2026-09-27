@@ -112,6 +112,11 @@ impl Store {
     ) -> Result<Option<i64>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        if let Some(message) = self.message_in(&tx, id)? {
+            if message.source == "app_run_dispatch" {
+                return Err(Error::rejected("app turns do not support manual Enter recovery; preserve uncertainty and create a newly approved run"));
+            }
+        }
         let prior: i64 = tx.query_row(
             "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
              AND json_extract(payload,'$.message')=?2",
@@ -364,6 +369,9 @@ impl Store {
                 "Unexpected provider completion status: {status}"
             )));
         }
+        // Capture the active endpoint proof before the terminal UPDATE.
+        // RPC explicit app reports additionally prove their native caller.
+        let app_proof = self.app_completion_proof(tx, message, result)?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
             params![status, result.to_string(), error, now(), message.id],
@@ -376,9 +384,15 @@ impl Store {
             tx,
             &message.alias,
             "turn_finished",
-            json!({"message": message.id, "result": result}),
+            if message.source == "app_run_dispatch" {
+                json!({"message":message.id,"app_owned":true,"result_digest":super::app_runs::material_digest(result)})
+            } else {
+                json!({"message": message.id, "result": result})
+            },
         )?;
-        self.thread_note_finished(tx, message, status, result, error)?;
+        if message.source != "app_run_dispatch" {
+            self.thread_note_finished(tx, message, status, result, error)?;
+        }
         // Preserve the uncertain provider outcome on the work axis.  The
         // compatibility `turn_finished` row above stays unscoped, while
         // this explicit unknown row is scoped only when the message carries
@@ -398,7 +412,7 @@ impl Store {
                         "turn_unknown",
                         json!({
                             "message": message.id,
-                            "reason": unknown_event_reason(error, result),
+                            "reason": if message.source == "app_run_dispatch" { "app turn outcome is uncertain; inspect authorized run surfaces".to_string() } else { unknown_event_reason(error, result) },
                             "owner": "operator",
                             "next_action": unknown_event_action(&message.id),
                         }),
@@ -425,7 +439,9 @@ impl Store {
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
-        if status == "completed" {
+        if !self.app_run_finished_in(tx, message, status, result, &app_proof)?
+            && status == "completed"
+        {
             self.task_on_completed(tx, message, result)?;
         }
         Ok(routed)
@@ -860,7 +876,14 @@ impl Store {
         // An operator reconcile to `completed` behaves like a normal
         // completion for the task — same SHA rules: an explicit `sha`
         // field on the result, else a `SHA:` line in the note, else NULL.
-        if status == "completed" {
+        if !self.app_run_finished_in(
+            &tx,
+            &message,
+            status,
+            &result,
+            &super::app_runs::AppCompletionProof::OperatorReconcile,
+        )? && status == "completed"
+        {
             self.task_on_completed(&tx, &message, &result)?;
         }
         // The fence lifts when the last unknown reconciles — attention

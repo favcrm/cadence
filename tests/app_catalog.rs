@@ -176,6 +176,8 @@ fn cad630_duplicate_install_ids_refuse_before_mutating_records() {
 #[test]
 fn cad630_missing_id_backfill_is_repeatable_and_never_matches_an_old_approval() {
     let f = Fixture::new();
+    let schema_before = cadence_agent::rollout::store_schema(&f.state).unwrap();
+    assert_eq!(schema_before, Some(cadence_agent::rollout::SCHEMA_VERSION));
     let path = f.install("client", "");
     let first =
         test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
@@ -202,7 +204,8 @@ fn cad630_missing_id_backfill_is_repeatable_and_never_matches_an_old_approval() 
     ));
     assert_eq!(
         cadence_agent::rollout::store_schema(&f.state).unwrap(),
-        Some(19)
+        schema_before,
+        "filesystem catalog migration changed the database schema"
     );
 }
 

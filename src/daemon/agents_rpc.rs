@@ -286,16 +286,24 @@ impl Shared {
     }
 
     /// Screen contents of a PTY endpoint for operator inspection.
-    pub(super) fn rpc_capture(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_capture(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if self.store.app_material_endpoint(&alias)? {
+            self.operator_connection("app endpoint transcript inspection", params, peer_pid)?;
+        }
+
         let text = self.adapter_for(&alias)?.capture()?;
         Ok(json!({"alias": alias, "capture": text}))
     }
 
     /// Screen probe for a PTY endpoint — the same reduction the
     /// verified auto-claim gate uses.
-    pub(super) fn rpc_probe(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_probe(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if self.store.app_material_endpoint(&alias)? {
+            self.operator_connection("app endpoint transcript inspection", params, peer_pid)?;
+        }
+
         let probe = self.adapter_for(&alias)?.probe()?;
         let mut out = probe.to_json();
         out["alias"] = json!(alias);

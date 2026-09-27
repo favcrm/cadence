@@ -940,6 +940,57 @@ fn agent_requests_scoped_to_owner_pm_and_operator() {
     assert_eq!(own["requests"], json!([]));
 }
 
+#[test]
+fn cad631_app_pending_requests_do_not_grant_material_to_routing_pm() {
+    let d = Daemon::start(HashMap::new());
+    let mut pm = Lane::spawn_as(&d, "routing-pm", None, "pm");
+    let mut worker = Lane::spawn_as(
+        &d,
+        "request-worker",
+        Some(r#"{"broker_approvals":true,"upstream":"routing-pm"}"#),
+        "worker",
+    );
+    const PRIVATE: &str = "cad631-private-pending-request";
+    worker.rpc(&d, "request_open", json!({"alias":"request-worker", "request":"private-request", "tool":"bash", "input_summary":PRIVATE})).unwrap();
+    let request = json!({"alias":"request-worker"});
+    assert!(
+        pm.rpc(&d, "agent_requests", request.clone())
+            .unwrap()
+            .to_string()
+            .contains(PRIVATE),
+        "legacy PM positive control did not expose the actual pending input"
+    );
+
+    // Persist the historical assignment seam only; the real pending
+    // request above remains intact across the authority change.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('request-app-job','app-run','routing-pm','completed',1,1);
+        INSERT INTO tasks(id,job_id,assignee,state,created,updated) VALUES('request-app-task','request-app-job','request-worker','completed',1,1);
+        INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('request-app-job','app-install',1,'digest','{}','digest','routing-pm','request-private','succeeded',1,1);
+        INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('request-app-job','s1','request-app-task','{}','identity','succeeded');").unwrap();
+    for result in [
+        pm.rpc(&d, "agent_requests", request.clone()),
+        worker.rpc(&d, "agent_requests", request.clone()),
+    ] {
+        let error = refused(result);
+        assert!(error.contains("operator"), "{error}");
+        assert!(!error.contains(PRIVATE));
+    }
+    // Replacing the PM process under the same routing alias creates no
+    // material authority, even though effective_pm still names it.
+    pm.child.kill().unwrap();
+    pm.child.wait().unwrap();
+    conn.execute("DELETE FROM agents WHERE alias='routing-pm'", [])
+        .unwrap();
+    let mut replacement = Lane::spawn_as(&d, "routing-pm", None, "pm");
+    assert!(refused(replacement.rpc(&d, "agent_requests", request.clone())).contains("operator"));
+    assert!(d
+        .op("agent_requests", request)
+        .unwrap()
+        .to_string()
+        .contains(PRIVATE));
+}
+
 /// An agent may retire its own waiting row; it may not retire a row in
 /// `reconcile` — that state is exactly the ambiguity only a human
 /// resolves (§5.4 step 8).
@@ -1596,4 +1647,75 @@ fn no_credential_in_any_row_event_or_message() {
     assert!(!dump.contains(TOKEN), "store leaked the credential");
     let effects = d.op("platform_effects", json!({})).unwrap();
     assert!(!effects.to_string().contains(TOKEN), "record leaked");
+}
+
+/// A valid account grant remains usable outside an app run, but cannot
+/// authorize that run's effects or a forged app task attribution.
+#[test]
+fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:read", "widgets:write"]);
+    let mut worker = Lane::spawn_as(&d, "app-writer", None, "worker");
+    grant(
+        &d,
+        "app-writer",
+        "fixture",
+        "acct-1",
+        &["widgets:read", "widgets:write"],
+    );
+    let request = json!({"platform":"fixture","account":"acct-1","tool":"widgets.list","input":{}});
+    assert!(
+        worker.rpc(&d, "platform_call", request.clone()).is_ok(),
+        "otherwise-valid native grant control failed"
+    );
+
+    // Persist only the ownership seam under test; no material success is
+    // injected, and the disabled native lane cannot dispatch this fixture.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('app-effect-job','app-run','app-writer','running',1,1);
+        INSERT INTO tasks(id,job_id,state,created,updated) VALUES('app-effect-task','app-effect-job','draft',1,1);
+        INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('app-effect-job','app-install',1,'digest','{}','digest','app-writer','effect-request','running',1,1);
+        INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('app-effect-job','s1','app-effect-task','{}','identity','pending');").unwrap();
+    let before = db_snapshot(&d);
+    let mut forged = request.clone();
+    forged["task"] = json!("app-effect-task");
+    let error = refused(worker.rpc(&d, "platform_call", forged));
+    assert!(
+        error.contains("account grants do not authorize app outward effects"),
+        "{error}"
+    );
+    assert_eq!(
+        db_snapshot(&d),
+        before,
+        "forged app attribution wrote durable state"
+    );
+
+    conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('older-generic-active','app-writer','generic prompt','send','running','generic-turn',0)", []).unwrap();
+    conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('app-effect-active','app-writer','private kickoff','app_run_dispatch','running','active-turn',1)", []).unwrap();
+    let before = db_snapshot(&d);
+    for tool in ["widgets.list", "widgets.preview"] {
+        let mut call = request.clone();
+        call["tool"] = json!(tool);
+        let error = refused(worker.rpc(&d, "platform_call", call));
+        assert!(
+            error.contains("account grants do not authorize app outward effects"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        db_snapshot(&d),
+        before,
+        "active local app turn wrote effect or draft state"
+    );
+    conn.execute(
+        "UPDATE messages SET state='completed' WHERE id='app-effect-active'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        worker.rpc(&d, "platform_call", request).is_ok(),
+        "unrelated generic grant was weakened"
+    );
 }

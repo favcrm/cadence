@@ -366,6 +366,7 @@ impl Shared {
     /// is retried only on the next monitor interval.
     pub(super) fn run_monitor_watch(self: &Arc<Self>) {
         while !self.closing.load(Ordering::SeqCst) {
+            self.advance_app_runs();
             let at = epoch_secs();
             if let Ok(monitors) = self.store.due_monitors(at) {
                 for monitor in monitors {

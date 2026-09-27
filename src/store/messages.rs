@@ -170,6 +170,15 @@ impl Message {
             "created": self.created, "started": self.started,
             "completed": self.completed,
         });
+        if self.source == "app_run_dispatch" {
+            j["body"] = json!("[app-owned material: use authorized run surfaces]");
+            j["result"] = Value::Null;
+            j["error"] = self
+                .error
+                .as_ref()
+                .map(|_| json!("app turn failed; inspect authorized run surfaces"))
+                .unwrap_or(Value::Null);
+        }
         // Derived and additive: present only on a delivered, unreported
         // pty turn, so every existing reader of `state` is unchanged.
         if self.awaiting_report() {
@@ -730,6 +739,9 @@ impl Store {
             None
         };
         if let Some(task) = task_id {
+            if source != "app_run_dispatch" {
+                Self::refuse_app_task(tx, task)?;
+            }
             self.task_in(tx, task)?;
         }
         if let Some(old) = self.message_in(tx, id)? {
@@ -784,7 +796,9 @@ impl Store {
             None,
             task_id,
         )?;
-        Self::thread_note_enqueued(tx, alias, sender, source, body, id, refs)?;
+        if source != "app_run_dispatch" {
+            Self::thread_note_enqueued(tx, alias, sender, source, body, id, refs)?;
+        }
         Ok((false, "queued".to_string()))
     }
 
@@ -989,6 +1003,13 @@ impl Store {
     /// `submitting`. The actor is the only caller; one actor per alias
     /// keeps turns serialized.
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
+        self.take_queued_app_proven(alias, None)
+    }
+    pub(crate) fn take_queued_app_proven(
+        &self,
+        alias: &str,
+        proof: Option<(&str, &str)>,
+    ) -> Result<Take> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
@@ -1036,6 +1057,15 @@ impl Store {
                 tx.commit()?;
                 return Ok(Take::Empty);
             };
+            if message.source == "app_run_dispatch" {
+                let (expected, bundle) = proof.ok_or_else(|| {
+                    Error::rejected("app claim requires fresh filesystem installation proof")
+                })?;
+                if expected != message.id {
+                    return Err(Error::rejected("app claim head changed"));
+                }
+                self.app_message_admit_in(&tx, &message, bundle)?;
+            }
             if message.is_routed() {
                 let expected =
                     self.queued_recipient_identity(&tx, alias, &message.id, &message.source)?;

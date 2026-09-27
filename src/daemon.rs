@@ -18,6 +18,7 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_runs_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -682,7 +683,7 @@ impl Shared {
                     text: "The provider compacted this session's context; the next turn \
                            carries a continuity pack.",
                     payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT,
-                                         "trigger": params.get("trigger")})),
+                                         "trigger": if self.store.app_material_endpoint(alias).unwrap_or(true) { None } else { params.get("trigger") }})),
                     message_id: None,
                 },
             ) {
@@ -776,7 +777,12 @@ impl Shared {
                     }
                 }
             }
-            let _ = self.store.event_public(alias, kind, params);
+            let visible = if self.store.app_material_endpoint(alias).unwrap_or(true) {
+                json!({"app_owned":true,"diagnostic":"provider lifecycle event; inspect authorized app surfaces"})
+            } else {
+                params
+            };
+            let _ = self.store.event_public(alias, kind, visible);
             self.wake();
             return;
         }
@@ -786,7 +792,7 @@ impl Shared {
             alias,
             "provider_event",
             json!({
-                "method": method, "data": params,
+                "method": method, "data": if self.store.app_material_endpoint(alias).unwrap_or(true) { json!({"app_owned":true}) } else { params.clone() },
             }),
         );
         if method == "serverRequest/resolved" {
@@ -970,6 +976,9 @@ impl Shared {
     }
 
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
+        if self.store.app_material_endpoint(alias).unwrap_or(true) {
+            return;
+        }
         // CAD-551: a permission denial is a refused step, not a failed
         // one — one `tool_result` entry per denied call, paired with its
         // `tool_use` by `tool_use_id`. The denial arrives on the result
@@ -1487,7 +1496,7 @@ impl Shared {
                     .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 continue;
             }
-            match self.store.take_queued(alias)? {
+            match self.take_app_aware(alias)? {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
                     if adapter.disconnected() {
@@ -1533,18 +1542,21 @@ impl Shared {
                     // notice — the stored body still faces the
                     // endpoint's own screen (a pty profile's
                     // literal-only checks) before it may deliver.
-                    let outcome = adapter.check_body(&message.body).and_then(|()| {
-                        adapter.run_turn(&prompt, &message.id, &move |turn| {
-                            // CAD-250: a nudge owns no turn — it never
-                            // becomes `running`, and its paste is not the
-                            // held turn's proof of life.
-                            if !nudge {
-                                let _ = shared.store.mark_running(&started_id, turn);
-                                watch.bump_activity();
-                            }
-                            shared.wake();
-                        })
-                    });
+                    let outcome = self
+                        .admit_app_submission(&message)
+                        .and_then(|()| adapter.check_body(&message.body))
+                        .and_then(|()| {
+                            adapter.run_turn(&prompt, &message.id, &move |turn| {
+                                // CAD-250: a nudge owns no turn — it never
+                                // becomes `running`, and its paste is not the
+                                // held turn's proof of life.
+                                if !nudge {
+                                    let _ = shared.store.mark_running(&started_id, turn);
+                                    watch.bump_activity();
+                                }
+                                shared.wake();
+                            })
+                        });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,
@@ -1620,14 +1632,16 @@ impl Shared {
                             let _ = self.store.event_public(
                                 alias,
                                 "paste_not_rendered",
-                                json!({"message": message.id,
+                                if message.source == "app_run_dispatch" {
+                                    json!({"message":message.id,"app_owned":true,"reason":"app paste not rendered","attempt":unrendered,"retry":retry})
+                                } else { json!({"message": message.id,
                                        "reason": reason,
                                        "attempt": unrendered,
                                        "retry": retry,
                                        "before": before_tail,
                                        "after": after_tail,
                                        "claim_probe": claim_probe,
-                                       "reprobe": reprobe}),
+                                       "reprobe": reprobe}) },
                             );
                             if retry {
                                 let retry_ticket = ctl.wake.ticket();
@@ -1821,8 +1835,24 @@ impl Shared {
             "stop_reason": result.stop_reason,
             "error": result.error,
         });
-        self.store
-            .finish(message, &status, &stored, result.error.as_deref())?;
+        if message.source == "app_run_dispatch" && status == "completed" {
+            let (run, _) = self
+                .store
+                .app_message_installation(&message.id)?
+                .ok_or_else(|| Error::rejected("app completion association is absent"))?;
+            let recorded = self.with_app_run_current(&run, |digest| {
+                self.store.app_message_admit(message, digest)?;
+                self.store
+                    .finish(message, &status, &stored, result.error.as_deref())
+            });
+            if recorded.is_err() {
+                // Preserve transport evidence without accepting stale material.
+                self.store.finish(message, "failed", &json!({"status":"failed","turn_id":stored["turn_id"],"reason":"app authority changed before material acceptance"}), Some("app authority changed before material acceptance"))?;
+            }
+        } else {
+            self.store
+                .finish(message, &status, &stored, result.error.as_deref())?;
+        }
         self.notify_routed_target(message, &stored);
         self.wake();
         Ok(())
@@ -2360,6 +2390,16 @@ impl Shared {
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                // A retained app endpoint can hold private run inputs in
+                // pending provider requests. Routing metadata grants no
+                // material access, including to the worker or its PM.
+                if self.store.app_material_endpoint(&alias)? {
+                    self.operator_connection_on_agent(
+                        "app pending request inspection",
+                        params,
+                        peer_pid,
+                    )?;
+                }
                 // CAD-506: a pending row carries the caller-declared
                 // input — it discloses to the operator, to the owning
                 // agent, and to the owner's PM (CAD-370's authorised
@@ -2410,15 +2450,15 @@ impl Shared {
             "request_wait" => self.rpc_request_wait(params, peer_pid),
             "request_close" => self.rpc_request_close(params, peer_pid),
             "agent_ready" => self.rpc_ready(params),
-            "agent_capture" => self.rpc_capture(params),
-            "agent_probe" => self.rpc_probe(params),
+            "agent_capture" => self.rpc_capture(params, peer_pid),
+            "agent_probe" => self.rpc_probe(params, peer_pid),
             "agent_answer" => self.rpc_answer(params, peer_pid),
             "agent_recover_submit" => self.rpc_recover_submit(params, peer_pid),
             "agent_set" => self.rpc_set(params, peer_pid),
             "agent_inbox" => self.rpc_inbox(params, peer_pid),
             "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
             "message_read" => self.rpc_message_read(params, peer_pid),
-            "message_report" => self.rpc_message_report(params),
+            "message_report" => self.rpc_message_report(params, peer_pid),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),
@@ -2606,6 +2646,15 @@ impl Shared {
                 "approvals": self.store.work_approvals()?,
             })),
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
+            "app_local_install_approve" => self.rpc_app_local(method, params, peer_pid),
+            "app_local_install_revoke" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_create" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_approve" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_cancel" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_dispatch" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_show" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_list" => self.rpc_app_local(method, params, peer_pid),
+            "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_show" => self.rpc_app_workspace(method, params, peer_pid),
@@ -3916,6 +3965,47 @@ mod tests {
             })
             .unwrap();
         shared
+    }
+
+    #[test]
+    fn cad631_retained_app_provider_events_do_not_publish_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        shared.store.ensure_thread("w1").unwrap();
+        fn payload(marker: &str) -> Value {
+            json!({"item":{"type":"agentMessage","phase":"commentary","text":marker},"text":marker,"tool":"read","summary":marker,"tool_use_id":"test-tool","trigger":marker})
+        }
+        for method in [
+            "item/completed",
+            "cadence/assistant_text",
+            "cadence/tool_use",
+            "cadence/session_compacted",
+        ] {
+            shared.on_provider_event("w1", method, payload("control-event-sentinel"));
+        }
+        assert!(format!("{:?}", shared.store.events("w1", 0, 100).unwrap())
+            .contains("control-event-sentinel"));
+        assert!(
+            format!("{:?}", shared.store.thread_entries("w1", 0, 100).unwrap())
+                .contains("control-event-sentinel")
+        );
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute_batch("INSERT INTO jobs(id,spec_path,pm_alias,state,created,updated) VALUES('private-job','app-run','w1','done',1,1);
+            INSERT INTO tasks(id,job_id,assignee,state,created,updated) VALUES('private-task','private-job','w1','done',1,1);
+            INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('private-job','private-install',1,'digest','{}','digest','w1','request','succeeded',1,1);
+            INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('private-job','s1','private-task','{}','identity','succeeded');").unwrap();
+        for method in [
+            "item/completed",
+            "cadence/assistant_text",
+            "cadence/tool_use",
+            "cadence/session_compacted",
+        ] {
+            shared.on_provider_event("w1", method, payload("private-event-sentinel"));
+        }
+        let events = shared.store.events("w1", 0, 100).unwrap();
+        assert!(!format!("{events:?}").contains("private-event-sentinel"));
+        let entries = shared.store.thread_entries("w1", 0, 100).unwrap();
+        assert!(!format!("{entries:?}").contains("private-event-sentinel"));
     }
 
     /// The one-second board poll needs running rows, not thousands of

@@ -243,6 +243,7 @@ impl Store {
         text: &str,
         ceiling: usize,
     ) -> Result<String> {
+        Self::refuse_app_task(&self.conn(), task_id)?;
         let task = self.task(task_id)?;
         if is_task_terminal(&task.state) || task.assignee.as_deref() != Some(recipient) {
             return Ok(text.to_string());
@@ -403,6 +404,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, pm_alias)?;
         if let Ok(existing) = self.job_in(&tx, id) {
+            Self::refuse_app_job(&tx, id)?;
             let same = existing.pm_alias == pm_alias
                 && existing.spec_path == spec_path
                 && existing.spec_sha256.as_deref() == Some(spec_sha256)
@@ -512,6 +514,7 @@ impl Store {
         identifier(id, "Task id")?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_job(&tx, job_id)?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
             return Err(Error::rejected(format!(
@@ -599,6 +602,7 @@ impl Store {
     ) -> Result<(Task, String, bool, bool)> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
         if job.state != "open" {
@@ -758,6 +762,7 @@ impl Store {
         let sha = check_commit_sha(sha)?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
         if task.state != "review" {
@@ -910,6 +915,7 @@ impl Store {
         }
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
         if task.state != "verified" {
@@ -952,6 +958,7 @@ impl Store {
     pub fn reopen_task(&self, task_id: &str, by: &str) -> Result<Task> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "blocked" | "verified" | "failed") {
             return Err(Error::rejected(format!(
@@ -981,6 +988,7 @@ impl Store {
     pub fn fail_task(&self, task_id: &str, reason: &str, by: &str) -> Result<Task> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
             return Err(Error::rejected(format!(
@@ -1011,6 +1019,7 @@ impl Store {
     pub fn cancel_task(&self, task_id: &str, by: &str) -> Result<Task> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
             return Err(Error::rejected(format!(
@@ -1052,6 +1061,7 @@ impl Store {
     pub fn cancel_job(&self, job_id: &str, by: &str) -> Result<Job> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_job(&tx, job_id)?;
         let job = self.job_in(&tx, job_id)?;
         if matches!(job.state.as_str(), "done" | "cancelled" | "failed") {
             return Err(Error::rejected(format!(
@@ -1090,6 +1100,7 @@ impl Store {
     pub fn close_job(&self, job_id: &str, by: &str) -> Result<Job> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_job(&tx, job_id)?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
             return Err(Error::rejected(format!(
@@ -1133,6 +1144,7 @@ impl Store {
         let sha = check_commit_sha(sha)?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if task.state != "review" {
             return Err(Error::rejected(format!(

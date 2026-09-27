@@ -330,6 +330,16 @@ impl Shared {
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
+        if message.source == "app_run_dispatch" {
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Operator => {}
+                _ => {
+                    return Err(Error::rejected(
+                        "app mail inspection requires operator proof",
+                    ))
+                }
+            }
+        }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
             if caller != message.alias {
                 return Err(Error::rejected(format!(
@@ -831,7 +841,11 @@ impl Shared {
     /// On an endpoint whose adapter turn result completes the message
     /// (managed), only `ack` is accepted: the turn result is the one
     /// writer of the outcome, so a reported `result` would race it.
-    pub(super) fn rpc_message_report(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_message_report(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
         let kind = required_str(params, "kind")?;
@@ -840,6 +854,14 @@ impl Shared {
             .store
             .message(id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
+        if message.source == "app_run_dispatch" {
+            let caller = self.agent_caller(peer_pid, "app material report")?;
+            if !matches!(caller, AgentCaller::Agent(ref alias) if alias == &message.alias) {
+                return Err(Error::rejected(
+                    "app result requires its assigned native worker, not token possession",
+                ));
+            }
+        }
         let agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token) {
             return Err(Error::rejected(
@@ -914,10 +936,23 @@ impl Shared {
                         "turn_id": token, "via": "pty_report",
                         "sha": sha,
                     });
-                    match self
-                        .store
-                        .finish_running(&message.id, "completed", &stored, None)?
-                    {
+                    let completion = if message.source == "app_run_dispatch" {
+                        let (run, _) = self
+                            .store
+                            .app_message_installation(&message.id)?
+                            .ok_or_else(|| {
+                                Error::rejected("app completion association is absent")
+                            })?;
+                        self.with_app_run_current(&run, |digest| {
+                            self.store.app_message_admit(&message, digest)?;
+                            self.store
+                                .finish_running(&message.id, "completed", &stored, None)
+                        })?
+                    } else {
+                        self.store
+                            .finish_running(&message.id, "completed", &stored, None)?
+                    };
+                    match completion {
                         Ok(finished) => {
                             self.notify_routed_target(&finished, &stored);
                             // The report frees the actor's one turn — wake

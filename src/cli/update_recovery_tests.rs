@@ -236,22 +236,28 @@ fn cad628_real_host_recreates_a_board_that_survived_the_failed_daemon() {
 fn cad628_real_host_reports_old_schema_refusal_without_restoring() {
     let fixture = OldCli::new();
     fixture.claim("operator:cad628");
+    let schema_before = cadence_agent::rollout::store_schema(&fixture.state).unwrap();
+    let current_schema = schema_before.unwrap();
+    assert_eq!(current_schema, cadence_agent::rollout::SCHEMA_VERSION);
+    let previous_schema = current_schema - 1;
     let backup = fixture.dir.path().join("backup.sqlite3");
     std::fs::write(&backup, "operator-owned pre-update backup").unwrap();
     std::fs::write(
         &fixture.binary,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/calls"
-echo 'refusing: store schema 19 is newer than supported schema 18' >&2
+echo 'refusing: store schema {current_schema} is newer than supported schema {previous_schema}' >&2
 exit 1
-"#,
+"#
+        ),
     )
     .unwrap();
     let result = test_seam::scoped(Asserted::Operator, || {
         fixture.host().restart(&fixture.binary)
     });
     assert!(
-        matches!(result, Ok(RestartOutcome::Unclean(ref complaint)) if complaint.contains("store schema 19")),
+        matches!(result, Ok(RestartOutcome::Unclean(ref complaint)) if complaint.contains(&format!("store schema {current_schema}")) && complaint.contains(&format!("supported schema {previous_schema}"))),
         "{result:?}"
     );
     assert_eq!(
@@ -260,7 +266,8 @@ exit 1
     );
     assert_eq!(
         cadence_agent::rollout::store_schema(&fixture.state).unwrap(),
-        Some(19)
+        schema_before,
+        "old binary refusal changed the current database schema"
     );
     assert_eq!(fixture.calls().lines().count(), 1);
     assert!(!fixture.calls().contains("restore"));

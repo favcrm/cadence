@@ -13,6 +13,11 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: CatalogAction,
     },
+    /// App-owned local runs with separate execution approval.
+    Run {
+        #[command(subcommand)]
+        action: RunAction,
+    },
     /// Run a fixture-only HMR preview from an explicitly trusted local
     /// Cadence source checkout. This executes that checkout's known
     /// development harness, not an installed app or its manifest.
@@ -153,6 +158,18 @@ pub(crate) enum AppAction {
 
 #[derive(Subcommand)]
 pub(crate) enum CatalogAction {
+    /// Approve the exact installed digest for supported local artifact steps.
+    Approve {
+        install_id: String,
+        #[arg(long)]
+        digest: String,
+    },
+    /// Revoke local capabilities without changing legacy project approvals.
+    Revoke {
+        install_id: String,
+        #[arg(long)]
+        digest: String,
+    },
     /// Explicitly resume or roll back a retained catalog migration journal.
     MigrationRecover {
         journal_id: String,
@@ -171,6 +188,131 @@ pub(crate) enum CatalogAction {
     Recover { install_id: String },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum RunAction {
+    /// Freeze a checked local workflow and explicit inputs; does not dispatch.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        workflow: String,
+        /// JSON object of string inputs, including declared worker roles.
+        #[arg(long)]
+        inputs: PathBuf,
+        /// Idempotency key; reuse with different inputs is refused.
+        #[arg(long)]
+        request_id: String,
+        /// Registered PM whose workers execute this run.
+        #[arg(long)]
+        owner_pm: String,
+        /// Optional discovery link; confers no authority.
+        #[arg(long)]
+        project_link: Option<String>,
+    },
+    /// Approve the exact frozen run snapshot; does not authorize outward release.
+    Approve {
+        run_id: String,
+        #[arg(long)]
+        digest: String,
+    },
+    /// Cancel a run and prevent further dispatch.
+    Cancel { run_id: String },
+    /// Dispatch eligible steps of an explicitly approved run.
+    Dispatch { run_id: String },
+    /// Inspect an exact app-owned run and its output receipts.
+    Show { run_id: String },
+    /// List app-owned runs, optionally for an exact installation.
+    Ls {
+        #[arg(long)]
+        install_id: Option<String>,
+    },
+    /// Read a bounded text artifact as the operator or its assigned dependent turn.
+    Artifact {
+        artifact_id: String,
+        /// Active dependent kickoff; requires its current turn token.
+        #[arg(long, requires = "token")]
+        message: Option<String>,
+        #[arg(long, requires = "message")]
+        token: Option<String>,
+    },
+}
+
+fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_INPUT_BYTES: usize = 32 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_run_inputs", format!("cannot open inputs: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_run_inputs", format!("cannot read inputs: {e}")))?;
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::invalid(
+            "app_run_inputs",
+            "inputs JSON exceeds 32KiB",
+        ));
+    }
+    let inputs: std::collections::BTreeMap<String, String> = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_run_inputs", "inputs must be a JSON object of strings"))?;
+    Ok(json!(inputs))
+}
+
+fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        RunAction::Create {
+            install_id,
+            workflow,
+            inputs,
+            request_id,
+            owner_pm,
+            project_link,
+        } => {
+            let mut params = json!({
+                "install_id": install_id,
+                "workflow": workflow,
+                "inputs": read_run_inputs(inputs)?,
+                "request_id": request_id,
+                "owner_pm": owner_pm,
+            });
+            if let Some(link) = project_link {
+                params["project_link"] = json!(link);
+            }
+            ("app_run_create", params)
+        }
+        RunAction::Approve { run_id, digest } => {
+            ("app_run_approve", json!({"run_id":run_id,"digest":digest}))
+        }
+        RunAction::Cancel { run_id } => ("app_run_cancel", json!({"run_id":run_id})),
+        RunAction::Dispatch { run_id } => ("app_run_dispatch", json!({"run_id":run_id})),
+        RunAction::Show { run_id } => ("app_run_show", json!({"run_id":run_id})),
+        RunAction::Ls { install_id } => {
+            let params = match install_id {
+                Some(id) => json!({"install_id":id}),
+                None => json!({}),
+            };
+            ("app_run_list", params)
+        }
+        RunAction::Artifact {
+            artifact_id,
+            message,
+            token,
+        } => {
+            let params = match (message, token) {
+                (None, None) => json!({"artifact_id":artifact_id}),
+                (Some(message), Some(token)) => {
+                    json!({"artifact_id":artifact_id,"message":message,"token":token})
+                }
+                _ => {
+                    return Err(Error::invalid(
+                        "app_run_artifact",
+                        "message and token must be supplied together",
+                    ));
+                }
+            };
+            ("app_run_artifact", params)
+        }
+    })
+}
+
 /// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
 /// the tracker directly — one commit each, `Actor:` recorded, all
 /// unapproving-by-construction (a tracker write can only change the
@@ -181,6 +323,14 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
     let result = match &action {
         AppAction::Catalog { action } => {
             let (method, params) = match action {
+                CatalogAction::Approve { install_id, digest } => (
+                    "app_local_install_approve",
+                    json!({"install_id":install_id,"digest":digest}),
+                ),
+                CatalogAction::Revoke { install_id, digest } => (
+                    "app_local_install_revoke",
+                    json!({"install_id":install_id,"digest":digest}),
+                ),
                 CatalogAction::Install { source } => {
                     let source = if source.contains("://") || source.starts_with("git@") {
                         source.clone()
@@ -208,6 +358,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     ("app_workspace_recover", json!({"install_id":install_id}))
                 }
             };
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Run { action } => {
+            let (method, params) = run_params(action)?;
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {
@@ -333,4 +487,43 @@ pub(super) fn run_dev(
     let status = cadence_agent::reaper::status(&mut command)
         .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_run_inputs_reject_non_string_maps_without_echoing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.json");
+        for text in [
+            r#"["private input"]"#,
+            r#"{"source":123}"#,
+            r#"{"source":{"private input":"value"}}"#,
+            "private input",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let error = read_run_inputs(&path).unwrap_err().to_string();
+            assert!(error.contains("JSON object of strings"));
+            assert!(!error.contains("private input"));
+        }
+        std::fs::write(&path, r#"{"source":"source text","writer":"op-writer"}"#).unwrap();
+        assert_eq!(
+            read_run_inputs(&path).unwrap(),
+            json!({"source":"source text","writer":"op-writer"})
+        );
+    }
+
+    #[test]
+    fn app_run_inputs_bound_utf8_bytes_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.json");
+        let text = json!({"source":"界".repeat(11_000)}).to_string();
+        std::fs::write(&path, text).unwrap();
+        assert!(read_run_inputs(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 32KiB"));
+    }
 }

@@ -263,6 +263,7 @@ impl Store {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         for task_id in &unique {
+            Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
             if job.repo.as_deref() != Some(project) {
@@ -367,6 +368,7 @@ impl Store {
     ) -> Result<Option<(Task, String, bool, bool)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "dispatched" | "running") {
             tx.commit()?;
@@ -413,6 +415,7 @@ impl Store {
     ) -> Result<(Task, String, bool, bool)> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        Self::refuse_app_task(&tx, task_id)?;
         let monitor = self.monitor_in(&tx, monitor_id)?;
         if monitor.state != "active" {
             return Err(Error::rejected(format!(
