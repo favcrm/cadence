@@ -100,6 +100,8 @@ export default function App() {
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
+  const fullHeight = screen === "home" || screen === "wiki" ||
+    (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
   const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search));
@@ -488,7 +490,7 @@ export default function App() {
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
-        screen === "home" ? "h-[100dvh] overflow-hidden" : "min-h-screen"
+        fullHeight ? "app-workspace h-[100dvh] grid-rows-[minmax(0,1fr)] overflow-hidden" : "min-h-screen"
       }`}
     >
       <Sidebar
@@ -502,12 +504,9 @@ export default function App() {
         signedIn={meta?.signed_in ?? null}
       />
 
-      {/* CAD-600: Home is a full-height panel. The shell above is
-          exactly the dynamic viewport (`100dvh`, overflow hidden) so
-          mobile browser chrome cannot make `100vh` scroll the page
-          while this column stays `100dvh`. Every other screen keeps
-          `min-h-screen` on that shell and the natural document flow. */}
-      <div className={`min-w-0 flex flex-col ${screen === "home" ? "h-[100dvh] min-h-0" : ""}`}>
+      {/* Workspaces fill the dynamic viewport; their panes own scrolling.
+          Other screens retain the natural document flow. */}
+      <div className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
         <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}

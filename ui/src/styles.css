@@ -1327,6 +1327,7 @@ button.refchip:hover {
 .agent-update-detail[open] summary { color: var(--color-accent); }
 
 /* Workspace navigation and utilities share the content's left edge. */
+.app-workspace > aside { height: 100%; min-height: 0; }
 .app-header { height: 3.25rem; flex-shrink: 0; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
@@ -1334,7 +1335,7 @@ button.refchip:hover {
 .header-breadcrumb a { color: var(--color-ink-400); }
 .header-breadcrumb a:hover { color: var(--color-ink-100); }
 .header-breadcrumb a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; border-radius: .15rem; }
-.section-nav { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem 1rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; }
+.section-nav { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: .25rem 1rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; }
 .section-nav-link { display: inline-flex; align-items: center; justify-content: center; min-height: 2.75rem; padding: .5rem .25rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); font-size: var(--text-secondary); white-space: nowrap; }
 .section-nav-link:hover { color: var(--color-ink-100); }
 .section-nav-link[aria-current="page"] { color: var(--color-accent); border-bottom-color: var(--color-accent); font-weight: 500; }

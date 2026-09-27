@@ -17,6 +17,7 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+const Wiki = (require("../src/features/wiki/Wiki") as typeof import("../src/features/wiki/Wiki")).default;
 const Context = (require("../src/features/projects/Context") as typeof import("../src/features/projects/Context")).default;
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
@@ -63,7 +64,16 @@ async function run() {
   assert(host.textContent?.includes("Notes for projects/cadence/README.md"), "raw daemon text renders as Markdown");
   assert(requests.every((url) => !url.endsWith("path=") && !url.includes("path=projects&")), "tree never requests global parents");
   assert(Array.from(host.querySelectorAll("a")).some((link) => link.textContent === "Edit" && link.href.includes("/context?") && link.href.includes("mode=edit")), "Edit stays in the Context tab");
-  assert(!host.querySelector("details")?.open, "repository references start collapsed");
+  assert(!host.querySelector("details")?.open && host.querySelector(".wk-pane details"), "repository references stay collapsed inside the reading pane");
+  assert(host.querySelectorAll(".wk-bar").length === 1 && host.querySelectorAll("h1").length === 1, "one toolbar and the document heading avoid duplicate page framing");
+  const files = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Project files");
+  assert(files?.getAttribute("aria-expanded") === "false", "shared explorer begins collapsed for mobile");
+  await React.act(() => files.click());
+  assert(files.getAttribute("aria-expanded") === "true", "files disclosure expands");
+  const selected = host.querySelector(".wk-tname[aria-current='page']");
+  assert(selected instanceof HTMLElement, "selected file is announced as current");
+  await React.act(() => selected.click());
+  assert(files.getAttribute("aria-expanded") === "false", "choosing a file closes the mobile explorer");
   stashDraft(sessionStorage, { path: pagePath, text: "Draft in this project", baseRev: "base-rev", at: 1 });
   await go("/projects/cadence/context?file=README.md&mode=edit");
   const source = host.querySelector("textarea");
@@ -118,6 +128,15 @@ async function run() {
   assert(writes[2]?.from === pagePath && writes[2]?.to === "projects/cadence/brief.md", "move sends the actual HTTP contract");
   conflict = true;
   try { await wiki.save(pagePath, "changed", "base"); throw new Error("conflict wrongly resolved"); } catch (error) { assert(error instanceof WikiError && error.status === 409, "successful conflict envelopes reject the save promise"); }
+  conflict = false;
+  await React.act(async () => {
+    view.render(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
+    await flush();
+  });
+  await React.act(flush);
+  assert(host.querySelectorAll(".wk-bar").length === 1 && host.querySelectorAll("h1").length === 1, "global Wiki uses the same single-toolbar reader");
+  assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent?.trim() === "Files"), "global Wiki uses the same collapsible explorer");
+  assert(Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Edit")?.disabled, "shared reader respects read-only access in Wiki");
   await React.act(() => view.unmount());
   console.log("project Wiki interaction checks passed");
 }

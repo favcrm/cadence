@@ -5,8 +5,7 @@ import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
 import type { WikiKind } from "./api";
 
-/** The wiki root's label — the tracker path the store lives in (CAD-580). */
-export const WIKI_ROOT_LABEL = "~/pm/wiki";
+export const WIKI_ROOT_LABEL = "Wiki";
 export const WikiScopeContext = createContext<WikiScope | undefined>(undefined);
 export const useWikiScope = () => useContext(WikiScopeContext);
 

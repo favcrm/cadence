@@ -34,20 +34,18 @@ export default function Context({
   const scope = useMemo(() => ({ root: projectWikiRoot(project), label: "Context" }), [project]);
   const route = contextRoute(project, href);
   const wikiHref = (next: Route) => next.screen === "wiki" ? contextHref(project, next, href) : navHref(next);
+  const references = (
+    <details className="context-references">
+      <summary className="text-secondary font-medium text-ink-400">Repository references</summary>
+      <p className="text-label text-ink-500 mt-2 mb-4">Reviewed repository documents. Changes follow the repository’s review process.</p>
+      <ProjectContext project={project} context={context} loading={contextLoading} error={contextError} onRetry={onRetryContext} />
+    </details>
+  );
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 w-full">
-      <div className="mb-5">
-        <h1 className="text-section font-semibold text-ink-100">Context</h1>
-        <p className="text-secondary text-ink-400 mt-1">Project brief, research, decisions, and shared knowledge.</p>
-      </div>
-      {project === "all" ? <div className="card project-card-padding text-secondary text-ink-400">Choose a project to open its context.</div> : route ? (
-        <Wiki key={project} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
-      ) : <div className="card project-card-padding" role="alert">This page is outside the project’s context. <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>Open project context</Link></div>}
-      {project !== "all" && <details className="context-references mt-5">
-        <summary className="text-secondary font-medium text-ink-300">Repository references</summary>
-        <p className="text-label text-ink-500 mt-2 mb-4">Reviewed documents from the project repository. Edit these through the repository’s review process.</p>
-        <ProjectContext project={project} context={context} loading={contextLoading} error={contextError} onRetry={onRetryContext} />
-      </details>}
+    <main className="context-workspace" aria-label={`${project} context`}>
+      {project === "all" ? <div className="p-5 text-secondary text-ink-400">Choose a project to open its context.</div> : route ? (
+        <Wiki key={project} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} paneFooter={route.mode === "browse" ? references : undefined} />
+      ) : <div className="p-5" role="alert">This page is outside the project’s context. <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>Open project context</Link></div>}
     </main>
   );
 }

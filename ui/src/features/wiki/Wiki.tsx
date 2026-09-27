@@ -1,11 +1,8 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
-import Md from "../../ui/Md";
-import { IconCaret } from "../../ui/icons";
 import {
   blobPage,
   wiki,
@@ -25,13 +22,14 @@ import {
   Crumbs,
   EmptyCard,
   Failure,
-  KindIcon,
   Loading,
   LockIcon,
   Note,
   WIKI_ROOT_LABEL,
   WikiScopeContext,
 } from "./shared";
+import FileExplorer from "./FileExplorer";
+import PagePane from "./PagePane";
 import EditorPane from "./EditorPane";
 import FolderPane from "./FolderPane";
 import UploadPane from "./UploadPane";
@@ -59,6 +57,7 @@ export interface WikiProps {
   actor: string;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   scope?: WikiScope;
+  paneFooter?: ReactNode;
 }
 
 type Open =
@@ -69,7 +68,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }: WikiProps) {
+export default function Wiki({ route, navHref, readOnly, actor, onToast, scope, paneFooter }: WikiProps) {
   const root = scope?.root ?? "";
   const current = route.path ?? root;
   const validPath = withinScope(current, root);
@@ -80,8 +79,6 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
   const [openError, setOpenError] = useState<{ status: number; message: string } | null>(null);
   const [tick, setTick] = useState(0);
   const [missingRoot, setMissingRoot] = useState(false);
-  const [showFiles, setShowFiles] = useState(false);
-  const filesId = useId();
   const chooseStartPage = useRef(Boolean(scope && current === root && route.mode === "browse"));
 
   useEffect(() => {
@@ -254,64 +251,19 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
 
   return (
     <WikiScopeContext value={scope}>
-    <div className={`wk-content${scope ? " wk-scoped" : ""}`}>
+    <div className="wk-content">
       <div className="wk-split">
-        <div className="wk-tree">
-          <div className="slabel wk-treeroot">{scope ? "Project files" : WIKI_ROOT_LABEL}</div>
-          {scope && <button type="button" className="wk-tree-toggle" aria-expanded={showFiles} aria-controls={filesId} onClick={() => setShowFiles((shown) => !shown)}>
-            <KindIcon kind="dir" /> Project files <IconCaret />
-          </button>}
-          <nav id={filesId} aria-label={scope ? "Project context files" : "Wiki files"} className={scope && !showFiles ? "wk-treefiles collapsed" : "wk-treefiles"}>
-          {rows.length === 0 && (
-            <div className="wk-treemeta">
-              {dirError[root] ? (
-                <span className="text-label text-ink-500">Files unavailable</span>
-              ) : (
-                <span className="kicker">{missingRoot || open?.kind === "dir" ? "No pages yet" : "Loading…"}</span>
-              )}
-            </div>
-          )}
-          {rows.map((row) => {
-            // The open path, or the folder holding the open file.
-            const on = row.path === current || (open?.kind === "file" && row.path === parentPath(current));
-            return (
-              <div
-                key={row.path}
-                className={`wk-trow${row.dir ? " dir" : ""}${row.expanded ? " open" : ""}${on ? " on" : ""}`}
-                style={{ paddingLeft: 8 + row.depth * 16 }}
-              >
-                {row.dir ? (
-                  <button
-                    type="button"
-                    className="wk-caret"
-                    aria-label={row.expanded ? `collapse ${row.name}` : `expand ${row.name}`}
-                    aria-expanded={row.expanded}
-                    onClick={() => toggle(row.path)}
-                  >
-                    <IconCaret />
-                  </button>
-                ) : (
-                  <span className="wk-caret-space" />
-                )}
-                <span className="wk-tkind">
-                  <KindIcon kind={row.kind} />
-                </span>
-                <Link className="wk-tname" href={hrefFor(row.path)}>
-                  {row.name}
-                  {row.dir ? "/" : ""}
-                </Link>
-                {row.own && <span className="kicker">you</span>}
-                {row.locked && <LockIcon />}
-                <span className="wk-tmeta num">
-                  {row.size != null ? fmtBytes(row.size) : row.childCount != null ? row.childCount : ""}
-                </span>
-              </div>
-            );
-          })}
-          </nav>
-        </div>
+        <FileExplorer
+          label={scope ? "Project files" : "Files"}
+          rows={rows}
+          current={current}
+          folder={open?.kind === "file" ? parentPath(current) : undefined}
+          emptyText={dirError[root] ? "Files unavailable" : missingRoot || open?.kind === "dir" ? "No pages yet" : "Loading…"}
+          hrefFor={hrefFor}
+          onToggle={toggle}
+        />
 
-        <div className="wk-pane">
+        <div className="wk-pane" data-mode={route.mode}>
           {route.mode === "search" ? (
             <SearchPane route={route} navHref={navHref} />
           ) : route.mode === "history" && route.path ? (
@@ -356,6 +308,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
               onFail={fail}
             />
           )}
+          {paneFooter}
         </div>
       </div>
     </div>
@@ -521,7 +474,6 @@ function BrowsePane({
         {readOnly && !locked && !missingRoot && <Note warn>Sign in with editing access to add or edit pages.</Note>}
         {newRow}
         {!missingRoot && <FolderPane
-          dir={path}
           entries={open.listing.entries ?? []}
           navHref={navHref}
           readOnly={writeBlocked}
@@ -534,66 +486,17 @@ function BrowsePane({
   }
 
   const page = open.page;
-  const name = baseName(page.path);
-  const blob = previewKind(name, page.mime);
-  const isPage = page.kind === "page";
+  if (page.kind === "page") return <PagePane page={page} navHref={navHref} readOnly={readOnly} />;
   return (
     <>
       <div className="wk-bar">
         <Crumbs path={page.path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
         <div className="wk-tools">
           <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
+          <a className="btn" href={wikiFileUrl(page.path)} download>Download</a>
         </div>
       </div>
-      {!isPage && (
-        <div className="wk-bar wk-bar-tight">
-          <div className="wk-tools wk-tools-left">
-            <Button href={navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null })}>Back</Button>
-          </div>
-          <div className="wk-tools">
-            <a className="btn" href={wikiFileUrl(page.path)} download>
-              Download
-            </a>
-          </div>
-        </div>
-      )}
-      {isPage ? (
-        <>
-          <div className="wk-pagehead">
-            {scope ? <h2>{name.replace(/\.md$/i, "")}</h2> : <h1>{name}</h1>}
-            <span className="wk-meta">
-              {page.edited_by ? (
-                <>
-                  last edited by <b>{page.edited_by}</b> ·{" "}
-                </>
-              ) : null}
-              {relTime(page.mtime)}
-              {!scope && page.rev ? (
-                <>
-                  {" "}
-                  · rev <span className="num">{page.rev}</span>
-                </>
-              ) : null}
-            </span>
-            <div className="wk-tools">
-              <Button href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>History</Button>
-              <Button
-                variant="primary"
-                disabled={readOnly}
-                title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
-                href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}
-              >
-                Edit
-              </Button>
-            </div>
-          </div>
-          <div className="md card pad wk-md issue-reader">
-            <Md text={page.text ?? ""} />
-          </div>
-        </>
-      ) : (
-        <BlobPane page={page} blob={blob} />
-      )}
+      <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} />
     </>
   );
 }

@@ -17,7 +17,6 @@ import { KindIcon, Loading, useWikiScope } from "./shared";
  */
 
 export default function FolderPane({
-  dir,
   entries,
   navHref,
   readOnly,
@@ -25,7 +24,6 @@ export default function FolderPane({
   onToast,
   onFail,
 }: {
-  dir: string;
   entries: WikiEntry[];
   navHref: (route: Route) => string;
   readOnly: boolean;
@@ -97,7 +95,7 @@ export default function FolderPane({
     return (
       <div className="wk-empty card">
         <IconFolder size={34} />
-        <div className="wk-etitle">{dir ? `${scope && dir === scope.root ? scope.label : dir}/ is empty` : `${"~/pm/wiki"} is empty`}</div>
+        <div className="wk-etitle">This folder is empty</div>
         <div className="wk-ebody">
           {readOnly ? "nothing here yet — and writes are disabled for this board." : "start with New page, or drop files to upload."}
         </div>

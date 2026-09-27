@@ -10,16 +10,19 @@
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
 .wk-split {
   display: grid;
   grid-template-columns: 236px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   flex: 1;
-  min-height: calc(100vh - 2.85rem);
+  min-height: 0;
 }
 
 .wk-tree {
+  min-height: 0;
   border-right: 1px solid var(--color-ink-700);
   background: var(--color-ink-875);
   padding: 14px 10px;
@@ -28,6 +31,7 @@
 
 .wk-pane {
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 20px 28px 40px;
 }
@@ -44,7 +48,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 30px;
+  min-height: 38px;
   padding: 0 8px;
   border-radius: 4px;
   color: var(--color-ink-300);
@@ -249,41 +253,12 @@
 
 /* -------------------------------------------------------- page + preview */
 
-.wk-pagehead {
+/* Context fills the space below the project tabs, using the Wiki split. */
+.context-workspace {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 14px;
-}
-
-.wk-pagehead h1,
-.wk-pagehead h2 {
-  font-size: var(--text-drawer);
-  font-weight: 600;
-  color: var(--color-ink-100);
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-/* Project Context shares the Wiki panes, with the project tabs above it. */
-.wk-scoped {
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  overflow: hidden;
-  background: var(--color-ink-850);
-}
-
-.wk-scoped .wk-split {
-  min-height: 480px;
-}
-
-.wk-scoped .wk-pane {
-  padding: 20px;
-}
-
-.wk-scoped .wk-trow {
-  min-height: 38px;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
 .wk-tree-toggle {
@@ -293,6 +268,35 @@
 .context-references > summary {
   cursor: pointer;
   padding: 10px 0;
+}
+
+.context-references {
+  margin-top: 28px;
+  border-top: 1px solid var(--color-ink-700);
+  padding-top: 8px;
+}
+
+.wk-tree,
+.wk-pane {
+  overscroll-behavior: contain;
+}
+
+.wk-pane[data-mode="edit"] {
+  display: flex;
+  flex-direction: column;
+}
+
+.wk-pane[data-mode="edit"] > * { flex-shrink: 0; }
+.wk-pane[data-mode="edit"] .wk-esplit {
+  flex: 1;
+  min-height: 240px;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.wk-pane[data-mode="edit"] .wk-esrc,
+.wk-pane[data-mode="edit"] .wk-eprev {
+  min-height: 0;
+  max-height: none;
 }
 
 .context-references > summary:focus-visible,
@@ -315,13 +319,9 @@
   font-weight: 500;
 }
 
-.wk-pagehead .wk-tools {
-  margin-left: auto;
-}
-
 .wk-md {
   max-width: 72ch;
-  padding: 20px;
+  padding: 0;
 }
 
 .wk-pstage {
@@ -997,12 +997,10 @@
 /* --------------------------------------------------------- small screens */
 
 @media (max-width: 1023px) {
-  .wk-scoped .wk-split { min-height: 0; }
-  .wk-scoped .wk-treeroot { display: none; }
-  .wk-scoped .wk-tree { max-height: none; padding: 8px; }
-  .wk-scoped .wk-treefiles { max-height: 240px; overflow-y: auto; }
-  .wk-scoped .wk-treefiles.collapsed { display: none; }
-  .wk-scoped .wk-pane { padding: 16px; }
+  .wk-treeroot { display: none; }
+  .wk-tree { max-height: none; padding: 8px; }
+  .wk-treefiles { max-height: 240px; overflow-y: auto; }
+  .wk-treefiles.collapsed { display: none; }
   .wk-tree-toggle {
     display: flex;
     align-items: center;
@@ -1019,13 +1017,13 @@
   .wk-tree-toggle[aria-expanded="true"] > svg:last-child { transform: rotate(90deg); }
   .wk-split {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
     min-height: 0;
   }
 
   .wk-tree {
     border-right: 0;
     border-bottom: 1px solid var(--color-ink-700);
-    max-height: 240px;
   }
 
   .wk-pane {
@@ -1044,5 +1042,11 @@
 
   .wk-hsplit {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wk-pane[data-mode="edit"] .wk-esplit {
+    flex: none;
+    grid-template-rows: auto minmax(180px, 1fr) minmax(180px, 1fr);
+    min-height: 420px;
   }
 }
