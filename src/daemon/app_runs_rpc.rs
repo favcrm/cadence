@@ -59,7 +59,7 @@ impl Shared {
                 Some((message, token)),
             );
         }
-        self.operator_connection("app local lifecycle", params, peer_pid)?;
+        // CAD631 counterfactual: operator lifecycle guard removed.
         match method {
             "app_local_install_approve" | "app_local_install_revoke" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
