@@ -548,3 +548,58 @@ fn cad688_store_rotation_cannot_replace_identity_or_reset_revision() {
         2
     );
 }
+
+#[test]
+fn cad688_duplicate_connection_id_cannot_replace_another_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("test.sqlite3")).unwrap();
+    reg(&store, "keeper", dir.path());
+    let record = CredentialRecord {
+        connection_id: "conn-existing".into(),
+        credential_revision: 1,
+        platform: "fixture".into(),
+        account: "original".into(),
+        scopes: vec!["widgets:read".into()],
+        fingerprint: "original-fingerprint".into(),
+        custody: "file".into(),
+        exchange: "token".into(),
+        enrolled_at: 1.0,
+        by: "operator".into(),
+    };
+    store.platform_enroll(&record, false, None).unwrap();
+    store
+        .platform_grant_add("keeper", "fixture", "original", &record.scopes, "operator")
+        .unwrap();
+    let grants = store.platform_grants(None).unwrap();
+    let events = store
+        .conn()
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let mut collision = record.clone();
+    collision.account = "replacement".into();
+    collision.fingerprint = "replacement-fingerprint".into();
+    assert!(
+        store.platform_enroll(&collision, false, None).is_err(),
+        "unique-ID collision replaced another account"
+    );
+    assert!(store
+        .platform_credential("fixture", "replacement")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .platform_credential("fixture", "original")
+            .unwrap()
+            .unwrap()
+            .to_json(),
+        record.to_json()
+    );
+    assert_eq!(store.platform_grants(None).unwrap(), grants);
+    assert_eq!(
+        store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        events
+    );
+}
