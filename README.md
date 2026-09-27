@@ -26,6 +26,10 @@ Tagged releases will ship `install.sh` with checksums and build-provenance
 attestation once the first `v*` tag is cut; until then there is nothing at
 `releases/latest`.
 
+See [native installation](docs/INSTALL-AGENT.md) for supported platforms,
+explicit pilot versions and provenance verification. The
+[release checklist](docs/RELEASING.md) records the first-publication gates.
+
 ## Quick start
 
 ```bash
@@ -89,7 +93,9 @@ docs/       working docs — the context-manifest set stays tracked
 - Keep provider permissions intact and source state outside the repository.
 - Review the exact worker revision before calling a task complete.
 
-The initial release targets Linux. Provider CLIs and their authentication remain
+The release pipeline packages Linux x86_64/ARM64 and Apple Silicon macOS.
+Packaging is separate from verified provider support on each platform.
+Provider CLIs and their authentication remain
 external dependencies; native terminal integration may require tmux.
 
 ## License

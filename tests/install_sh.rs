@@ -84,13 +84,14 @@ impl Fixture {
     /// `published` overrides the outer checksum; `bad_inner` corrupts the
     /// binary's own checksum inside the tarball.
     fn publish(&self, sha: &str, published: Option<&str>, bad_inner: bool) {
+        self.publish_version(sha, published, bad_inner, env!("CARGO_PKG_VERSION"));
+    }
+
+    fn publish_version(&self, sha: &str, published: Option<&str>, bad_inner: bool, version: &str) {
         let stage = self.path("stage");
         let _ = fs::remove_dir_all(&stage);
         fs::create_dir_all(&stage).unwrap();
-        let bin = format!(
-            "#!/bin/sh\necho \"cadence {}+{sha}\"\n",
-            env!("CARGO_PKG_VERSION")
-        );
+        let bin = format!("#!/bin/sh\necho \"cadence {version}+{sha}\"\n");
         fs::write(stage.join("cadence"), &bin).unwrap();
         fs::set_permissions(stage.join("cadence"), fs::Permissions::from_mode(0o755)).unwrap();
         let inner = if bad_inner {
@@ -259,6 +260,24 @@ fn a_binary_that_does_not_match_its_inner_checksum_is_refused() {
     assert!(text.contains("does not match its cadence.sha256"), "{text}");
     assert!(!fx.default_releases().join(tag()).exists());
     assert!(fs::symlink_metadata(fx.link()).is_err());
+}
+
+#[test]
+fn a_wrong_version_is_refused_before_installing_or_replacing_the_active_link() {
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.home().join(".local/bin")).unwrap();
+    let previous = fx.path("previous-cadence");
+    fs::write(&previous, b"previous binary").unwrap();
+    std::os::unix::fs::symlink(&previous, fx.link()).unwrap();
+    fx.publish_version(SHA, None, false, "9.9.9");
+    let text = fx.install_err(&["--version", &tag()]);
+    assert!(
+        text.contains("downloaded cadence --version reports"),
+        "{text}"
+    );
+    assert_eq!(fs::read_link(fx.link()).unwrap(), previous);
+    assert!(!fx.default_releases().join(tag()).exists());
+    assert_eq!(Fixture::entries(&fx.path("tmp")), Vec::<String>::new());
 }
 
 #[test]
