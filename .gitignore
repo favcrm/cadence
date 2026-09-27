@@ -32,3 +32,8 @@ docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md
 !docs/design/hosted-migration.md
 !docs/roles/risk-classes.md
+
+# Operator connection guide is a maintained public CLI contract.
+!docs/guides/
+docs/guides/*
+!docs/guides/connections.md

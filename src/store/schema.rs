@@ -560,6 +560,23 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=20", [])?;
             tx.commit()?;
         }
+        if version < 21 {
+            let tx = conn.unchecked_transaction()?;
+            let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
+            let columns = statement
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            if !columns.iter().any(|c| c == "connection_id") {
+                tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';")?;
+            }
+            if !columns.iter().any(|c| c == "credential_revision") {
+                tx.execute_batch("ALTER TABLE platform_credentials ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 1;")?;
+            }
+            tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
+            tx.execute("UPDATE schema_version SET version=21", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

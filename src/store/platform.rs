@@ -44,6 +44,8 @@ pub const APP_GRANTS_REVOKED_EVENT: &str = "app_grants_revoked";
 /// bytes live in (ADR 0006 §5.3).
 #[derive(Clone, Debug)]
 pub struct CredentialRecord {
+    pub connection_id: String,
+    pub credential_revision: u64,
     pub platform: String,
     pub account: String,
     pub scopes: Vec<String>,
@@ -63,6 +65,8 @@ impl CredentialRecord {
         json!({
             "platform": self.platform,
             "account": self.account,
+            "connection_id": self.connection_id,
+            "credential_revision": self.credential_revision,
             "scopes": self.scopes,
             "fingerprint": self.fingerprint,
             "custody": self.custody,
@@ -168,6 +172,8 @@ fn scopes_of(raw: &str) -> Vec<String> {
 fn credential_row(row: &rusqlite::Row) -> rusqlite::Result<CredentialRecord> {
     let scopes: String = row.get("scopes")?;
     Ok(CredentialRecord {
+        connection_id: row.get("connection_id")?,
+        credential_revision: row.get("credential_revision")?,
         platform: row.get("platform")?,
         account: row.get("account")?,
         scopes: scopes_of(&scopes),
@@ -531,14 +537,18 @@ impl Store {
     ) -> Result<()> {
         identifier(&record.platform, "Platform")?;
         identifier(&record.account, "Account")?;
+        identifier(&record.connection_id, "Connection id")?;
+        if record.credential_revision > i64::MAX as u64 {
+            return Err(Error::rejected("connection revision exceeds storage bound"));
+        }
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let existing: Option<String> = tx
+        let existing: Option<(String, String, u64)> = tx
             .query_row(
-                "SELECT fingerprint FROM platform_credentials \
+                "SELECT fingerprint,connection_id,credential_revision FROM platform_credentials \
                  WHERE platform=?1 AND account=?2",
                 params![record.platform, record.account],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         match (existing, rotated) {
@@ -558,7 +568,14 @@ impl Store {
                     record.platform, record.account
                 )))
             }
-            (Some(old), true) => {
+            (Some((old, id, revision)), true) => {
+                if record.connection_id != id
+                    || revision.checked_add(1) != Some(record.credential_revision)
+                {
+                    return Err(Error::rejected(
+                        "connection rotation receipt is stale or inconsistent",
+                    ));
+                }
                 Self::event(
                     &tx,
                     PLATFORM_STREAM,
@@ -568,12 +585,16 @@ impl Store {
                            "by": record.by}),
                 )?;
             }
-            (None, _) => {}
+            (None, _) => {
+                if record.credential_revision != 1 {
+                    return Err(Error::rejected("new connection revision must be one"));
+                }
+            }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO platform_credentials
-             (platform, account, scopes, fingerprint, custody, exchange, enrolled_at, by)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO platform_credentials
+             (platform, account, scopes, fingerprint, custody, exchange, enrolled_at, by, connection_id, credential_revision)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(platform,account) DO UPDATE SET scopes=excluded.scopes,fingerprint=excluded.fingerprint,custody=excluded.custody,exchange=excluded.exchange,enrolled_at=excluded.enrolled_at,by=excluded.by,connection_id=excluded.connection_id,credential_revision=excluded.credential_revision",
             params![
                 record.platform,
                 record.account,
@@ -583,6 +604,8 @@ impl Store {
                 record.exchange,
                 record.enrolled_at,
                 record.by,
+                record.connection_id,
+                record.credential_revision,
             ],
         )?;
         let mut payload = record.to_json();
@@ -1150,5 +1173,25 @@ impl Store {
         let changed = revoke_derived(&tx, app, by)?;
         tx.commit()?;
         Ok(changed)
+    }
+}
+
+impl Store {
+    pub fn connection_workspace_id(&self) -> Result<String> {
+        Ok(self.conn().query_row(
+            "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn connection_credential(&self, id: &str) -> Result<Option<CredentialRecord>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT * FROM platform_credentials WHERE connection_id=?",
+                [id],
+                credential_row,
+            )
+            .optional()?)
     }
 }

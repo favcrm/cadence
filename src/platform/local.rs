@@ -743,6 +743,40 @@ struct Attachment {
 }
 
 impl PlatformAdapter for LocalAdapter {
+    fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
+        use crate::platform::connections::{CapabilityDescriptor, ProviderDescriptor};
+        Some(ProviderDescriptor {
+            schema: 1,
+            provider: "local".into(),
+            revision: "cadence-local/1".into(),
+            enrollment_shapes: vec![],
+            builtin_accounts: vec!["local".into()],
+            capabilities: vec![
+                CapabilityDescriptor {
+                    id: "blog.publish".into(),
+                    version: 1,
+                    tools: vec!["publish".into()],
+                    scopes: vec!["publish".into()],
+                    effect: "send".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
+                },
+                CapabilityDescriptor {
+                    id: "social.post".into(),
+                    version: 1,
+                    tools: vec!["publish".into()],
+                    scopes: vec!["publish".into()],
+                    effect: "send".into(),
+                    semantics: crate::platform::connections::CapabilitySemantics::LocalMarkdownSink,
+                },
+            ],
+        })
+    }
+    fn connection_registration(&self) -> Option<String> {
+        Some(crate::platform::connections::registration_digest(&format!(
+            "cadence-local/1:{}",
+            self.outbox.display()
+        )))
+    }
     fn table(&self) -> &ToolTable {
         &self.table
     }

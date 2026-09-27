@@ -12,6 +12,7 @@ mod build_slot;
 mod claude;
 mod codex;
 mod confine;
+mod connection;
 mod cursor;
 mod daemon;
 mod delivery;
@@ -78,6 +79,7 @@ use cadence_agent::error::Error;
 use cadence_agent::error::Result;
 use clap::Parser;
 use clap::Subcommand;
+use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
 use idea::IdeaAction;
@@ -1053,6 +1055,11 @@ pub(crate) enum Commands {
     /// rotates; an agent reads its own grants. Credential bytes cross
     /// the control socket once, operator→daemon — nothing ever returns
     /// them.
+    /// Exact provider account management, without app or agent grants.
+    Connection {
+        #[command(subcommand)]
+        action: ConnectionAction,
+    },
     Platform {
         #[command(subcommand)]
         action: PlatformAction,
@@ -3722,6 +3729,7 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Thread { action } => thread::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Issue { action } => issue::run(state_dir, action),
+        Commands::Connection { action } => connection::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),
         Commands::Idea { action } => idea::run(&state_dir, action),
         Commands::Plan { action } => plan::run(state_dir, action),

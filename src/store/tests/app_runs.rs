@@ -629,7 +629,7 @@ fn cad631_v18_upgrade_commits_only_completed_migrations_before_v20_failure() {
             .query_row("SELECT version FROM schema_version", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        20
+        crate::rollout::SCHEMA_VERSION
     );
 }
 
