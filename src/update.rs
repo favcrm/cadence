@@ -741,13 +741,10 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
     src.check_auth()?;
     let run = src.latest_green_main()?.ok_or_else(|| {
         Error::rejected(format!(
-            "no successful `{}` push run on {} in {} — nothing to install; check \
-             `gh run list --workflow {} --branch {}`",
-            upgrade::WORKFLOW,
-            upgrade::MAIN,
+            "no approved production candidate in {} — stage a successful main CI artifact \
+             and approve the production job in `{}`",
             src.repo(),
-            upgrade::WORKFLOW,
-            upgrade::MAIN
+            upgrade::STAGING_WORKFLOW
         ))
     })?;
     let target = run.head_sha.clone();

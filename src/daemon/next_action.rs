@@ -1395,15 +1395,24 @@ mod tests {
         let esc = crate::master::escalations(&s.state_dir);
         assert_eq!(esc.len(), 1, "{esc:?}");
         assert!(esc.contains_key("TST-1/next-action"));
-        // The row is the operator's.
+        // The alert remains exactly once, as a secondary cause when a
+        // reviewed green merge gives the operator a concrete next step.
         let view = crate::overview::overview_cached(&s.state_dir, pm.path());
         let rows: Vec<_> = view["needs_me"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|r| r["kind"].as_str() == Some("next_action"))
+            .filter(|r| {
+                r["causes"]
+                    .as_array()
+                    .is_some_and(|causes| causes.iter().any(|c| c["cause"] == "next_action"))
+            })
             .collect();
         assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
+        assert_eq!(rows[0]["audience"], "operator");
+        assert_eq!(rows[0]["kind"], "merge_decision");
+        assert_eq!(rows[0]["merge"]["sha"], SHA1);
+        assert_eq!(rows[0]["merge"]["pr"], PR1);
         // Pass two: still one record, still one row.
         s.checkup_tick();
         assert_eq!(crate::master::escalations(&s.state_dir).len(), 1);

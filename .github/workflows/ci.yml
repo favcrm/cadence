@@ -8,7 +8,7 @@ on:
   merge_group:
     types: [checks_requested]
   push:
-    branches: [main, 'feat/**']
+    branches: [main]
     # CAD-311: a `v*` tag runs every gate on the tagged commit, then the
     # release-* jobs below publish it to GitHub Releases.
     tags: ['v*']
@@ -171,6 +171,8 @@ jobs:
         working-directory: ui
       - name: Test nextest cost reporting
         run: python3 tests/scripts/test_nextest_cost_report.py
+      - name: Test delivery candidate and mutation validation
+        run: python3 tests/scripts/test_delivery_candidate.py
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
