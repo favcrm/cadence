@@ -58,6 +58,13 @@ import type { Viewer } from "../projects/work";
 import "./apps.css";
 
 type Tab = "posts" | "settings" | "how";
+type AppDetailProps = {
+  project: string;
+  name: string;
+  viewer: Viewer;
+  onOpenIssue: (id: string) => void;
+  onHome: () => void;
+};
 
 /**
  * `/apps/<project>/<name>` (CAD-563 r2) — one installed app, built
@@ -68,19 +75,18 @@ type Tab = "posts" | "settings" | "how";
  * opens the New-run drawer from a workflow link. Section links keep the
  * selected view in the URL for refresh and browser navigation.
  */
-export default function AppDetail({
+export default function AppDetail(props: AppDetailProps) {
+  // Drafts, pending UI and the run drawer belong to one installation.
+  return <AppPage key={`${props.project}/${props.name}`} {...props} />;
+}
+
+function AppPage({
   project,
   name,
   viewer,
   onOpenIssue,
   onHome,
-}: {
-  project: string;
-  name: string;
-  viewer: Viewer;
-  onOpenIssue: (id: string) => void;
-  onHome: () => void;
-}) {
+}: AppDetailProps) {
   const key = `${project}/${name}`;
   const state = useQuery(resources.app(key));
   const app = state.data;
@@ -317,7 +323,9 @@ function PostsTab({
           <h2 className="text-cardtitle font-medium text-ink-100">No posts yet</h2>
           <p className="mt-1">{!ready
             ? "Complete setup in Settings before starting a post."
-            : viewer.readOnly || !viewer.operator
+            : viewer.readOnly && viewer.operator
+              ? "New posts cannot be started on this read-only board."
+            : !viewer.operator
               ? "Sign in as the operator to start a post."
               : "Start a post when you’re ready. You’ll review the plan before any work runs."}</p>
         </div>
@@ -496,11 +504,12 @@ function TeamEditor({
   const [adding, setAdding] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const canEdit = viewer.operator && !viewer.readOnly;
   const valueOf = (role: string) => draft[role] ?? saved[role] ?? lastRun[role] ?? "";
   const dirty = roles.some((r) => valueOf(r) !== (saved[r] ?? ""));
 
   const save = () => {
-    if (busy) return;
+    if (busy || !canEdit) return;
     setBusy(true);
     setNote(null);
     setFailed(false);
@@ -522,7 +531,7 @@ function TeamEditor({
   };
 
   const addWorker = (role: string) => {
-    if (adding) return;
+    if (adding || !canEdit) return;
     setAdding(role);
     setNote(null);
     setFailed(false);
@@ -543,7 +552,7 @@ function TeamEditor({
       <p className="text-label text-ink-400 mb-2">
         The default agents for new runs. Changing the team does not require app approval.
       </p>
-      {!viewer.operator && <p className="text-label text-ink-500 mb-3">Sign in as the operator to change the team.</p>}
+      {!canEdit && <p className="text-label text-ink-500 mb-3">{viewer.readOnly ? "The team is read-only on this board." : "Sign in as the operator to change the team."}</p>}
       <ul className="space-y-3">
         {roles.map((role) => {
           const spec = inputs.find((i) => i.name === role);
@@ -562,7 +571,7 @@ function TeamEditor({
                 className="field flex-1 min-w-0"
                 data-role={role}
                 aria-describedby={spec?.ask ? `team-${role}-hint` : undefined}
-                disabled={busy || adding !== null || !viewer.operator}
+                disabled={busy || adding !== null || !canEdit}
               >
                 <option value="">Choose an agent</option>
                 {candidates.map((a) => (
@@ -577,11 +586,11 @@ function TeamEditor({
               <Button
                 variant="ghost"
                 onClick={() => addWorker(role)}
-                disabled={busy || adding !== null || !viewer.operator}
+                disabled={busy || adding !== null || !canEdit}
                 className="shrink-0"
                 aria-label={`Add worker for ${appFieldLabel(role)}`}
                 title={
-                  !viewer.operator
+                  !canEdit
                     ? "Joining a worker is the operator's."
                     : "join a new Devin worker for this role"
                 }
@@ -602,8 +611,8 @@ function TeamEditor({
             variant="primary"
             onClick={save}
             loading={busy}
-            disabled={adding !== null || !dirty || !viewer.operator}
-            title={!viewer.operator ? "Saving the team is the operator's." : undefined}
+            disabled={adding !== null || !dirty || !canEdit}
+            title={!canEdit ? "Changing the team requires an editable operator session." : undefined}
           >
             {busy ? "Saving…" : "Save team"}
           </Button>

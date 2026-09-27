@@ -80,6 +80,11 @@ const app: import("../src/lib/types").AppDetail = {
     },
   ],
 };
+const campaignApp = {
+  ...app,
+  project: "campaign",
+  team: { writer: "w1", reviewer: "r1" },
+};
 const writes: { path: string; body: unknown }[] = [];
 let failSave = false;
 let failRefresh = false;
@@ -120,6 +125,7 @@ globalThis.fetch = async (input, init) => {
     return failRefresh
       ? json({ error: "Refresh unavailable" }, 503)
       : json(app);
+  if (url.pathname === "/api/apps/campaign/blog-post") return json(campaignApp);
   if (url.pathname === "/api/apps")
     return json({
       apps: [app, { ...app, project: "campaign" }].map((a) => ({
@@ -147,11 +153,14 @@ function button(text: string) {
   assert(found, `button ${text} exists`);
   return found;
 }
-async function render(viewer = { readOnly: false, operator: true }) {
+async function render(
+  viewer = { readOnly: false, operator: true },
+  project = "site",
+) {
   await React.act(() =>
     root.render(
       React.createElement(AppDetail, {
-        project: "site",
+        project,
         name: "blog-post",
         viewer,
         onOpenIssue: () => {},
@@ -262,6 +271,27 @@ async function main() {
     "failed save retains the draft for retry",
   );
   failSave = false;
+  await render({ readOnly: true, operator: true });
+  assert(
+    button("Save team").disabled &&
+      host.querySelector<HTMLSelectElement>("#team-reviewer")?.disabled,
+    "a read-only board disables team writes even for an operator",
+  );
+  await React.act(() => button("Save team").click());
+  await React.act(() => button("Add worker").click());
+  await flush();
+  assert(
+    [...writes].length === 2,
+    "read-only controls never send the retained draft",
+  );
+  await resources.app("campaign/blog-post").revalidate();
+  await React.act(() => navigate("/apps/campaign/blog-post?tab=settings"));
+  await render({ readOnly: false, operator: true }, "campaign");
+  assert(
+    host.querySelector<HTMLSelectElement>("#team-reviewer")?.value === "r1" &&
+      button("Save team").disabled,
+    "switching to a cached installation resets the previous team's unsaved draft",
+  );
   await React.act(() => navigate("/apps/site/blog-post"));
   app.approved = true;
   app.approval = "approved";
@@ -269,10 +299,18 @@ async function main() {
     await resources.app("site/blog-post").invalidate();
   });
   await flush();
+  await render();
   assert(
     !host.querySelector("[aria-label='setup required']") &&
       !button("New post").disabled,
     "ready app removes setup without changing its readiness rule",
+  );
+  await render({ readOnly: true, operator: true });
+  assert(
+    host.textContent?.includes(
+      "New posts cannot be started on this read-only board.",
+    ) && !host.textContent?.includes("Sign in as the operator"),
+    "already signed-in read-only operators get accurate board-access copy",
   );
   await render({ readOnly: true, operator: false });
   assert(
