@@ -369,22 +369,54 @@ fn cad631_completed_pi_artifact_http_is_json_and_native_peer_scoped() {
         None,
         lane.pid(),
     );
+    // The board has no capture/probe relay: never invent a file/session fallback.
+    // Public metadata/chat reads must use the daemon's redacted read surfaces.
+    let surfaces = vec![
+        (path.clone(), 403),
+        (format!("/api/agents/{WRITER}/capture"), 400),
+        (format!("/api/agents/{WRITER}/probe"), 400),
+        (format!("/api/agents/{WRITER}"), 200),
+        ("/api/agents".to_string(), 200),
+        (format!("/api/threads/{WRITER}?tail=1"), 200),
+    ];
+    for (surface, expected) in &surfaces[1..] {
+        let (status, body) = b.operator("GET", surface, "");
+        assert_eq!(
+            status, *expected,
+            "board transcript surface {surface}: {body}"
+        );
+        assert!(
+            !body.contains(DRAFT),
+            "board metadata exposed private app material: {surface}"
+        );
+    }
     let mut failures = Vec::new();
     for prefix in ["", "setsid "] {
-        let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
-        let wire = stolen.request_as("GET", &path, "", "");
-        assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
-        assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
-        assert!(wire.contains(&stolen.cookie));
-        assert!(wire.contains(&stolen.key));
-        let file = lane.dir.path().join(format!("artifact-{}.txt", lane.seq));
-        std::fs::write(&file, wire).unwrap();
-        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
-        assert_eq!(rc, 0);
-        let status = response.split_whitespace().nth(1).unwrap_or("missing");
-        eprintln!("completed native artifact prefix={prefix:?} status={status}");
-        if status != "403" {
-            failures.push(format!("{prefix:?}: {status}"));
+        for (surface, expected) in &surfaces {
+            let stolen =
+                common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+            let wire = stolen.request_as("GET", surface, "", "");
+            assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
+            assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
+            assert!(wire.contains(&stolen.cookie));
+            assert!(wire.contains(&stolen.key));
+            let file = lane.dir.path().join(format!("artifact-{}.txt", lane.seq));
+            std::fs::write(&file, wire).unwrap();
+            let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import json,socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.settimeout(10);s.sendall(open(sys.argv[2],\"rb\").read());print(json.dumps(s.makefile().read()))' {} {}", b.port, file.display()));
+            assert_eq!(rc, 0);
+            let response: String = serde_json::from_str(response.trim()).unwrap();
+            let status = response.split_whitespace().nth(1).unwrap_or("missing");
+            eprintln!("completed native HTTP prefix={prefix:?} path={surface} status={status}");
+            if status != expected.to_string() {
+                failures.push(format!(
+                    "{prefix:?} {surface}: {status}, expected {expected}"
+                ));
+            }
+            if response.contains(DRAFT) {
+                failures.push(format!(
+                    "{prefix:?} {surface}: disclosed private app material"
+                ));
+            }
         }
     }
     assert!(

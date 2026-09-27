@@ -242,8 +242,8 @@ fn cad631_operator_reconcile_cannot_create_material() {
     .unwrap();
     let after = s.app_run_show(id).unwrap();
     assert!(after["artifacts"].as_array().unwrap().is_empty());
-    assert_ne!(after["state"], "succeeded");
-    s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    assert_eq!(after["state"], "failed");
+    assert!(s.app_run_dispatch(id, "sha256:bundle").is_err());
     assert!(s
         .messages_for_task(after["steps"][1]["task_id"].as_str().unwrap())
         .unwrap()

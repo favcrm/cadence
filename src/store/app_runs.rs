@@ -376,6 +376,10 @@ impl Store {
                 "UPDATE app_runs SET state='cancelled',approved_digest=NULL,updated=? WHERE id=?",
                 params![now(), id],
             )?;
+            tx.execute(
+                "UPDATE jobs SET state='cancelled',updated=? WHERE id=?",
+                params![now(), id],
+            )?;
         } else {
             if state != "awaiting_approval" || digest != run["snapshot_digest"].as_str() {
                 return Err(Error::rejected(
@@ -651,7 +655,15 @@ impl Store {
         };
         let Some((run_id,step_id,spec,generation,state,message_id))=tx.query_row("SELECT run_id,step_id,spec,identity_digest,state,message_id FROM app_run_steps WHERE task_id=?",[task_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?))).optional()? else{return Ok(false)};
         if matches!(proof, AppCompletionProof::OperatorReconcile) {
-            return Ok(true);
+            return self
+                .app_step_failed_in(
+                    tx,
+                    &run_id,
+                    &step_id,
+                    task_id,
+                    "operator reconciliation preserves transport history, not material success",
+                )
+                .map(|_| true);
         }
         // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
