@@ -173,9 +173,21 @@ const steps = {
       await p2.goto(base);
       await expectText(
         p2.locator("body"),
-        "Sign in this tab with",
+        "This tab is not signed in",
         "a tab without the session key is told to sign in",
       );
+      await expectText(
+        p2.locator("body"),
+        "Run cadence ui login and open the new link in this tab.",
+        "the unsigned tab explains how to obtain its own session",
+      );
+      if (!(await p2.getByRole("button", { name: "Send", exact: true }).isDisabled())) {
+        throw new Error("an unsigned tab must disable Send");
+      }
+      const meta = await p2.evaluate(() => fetch("/api/meta").then((r) => r.json()));
+      if (meta?.signed_in !== false || meta?.tab_signed_out !== true) {
+        throw new Error(`the unsigned tab holds a session: ${JSON.stringify(meta)}`);
+      }
       const res = await p2.evaluate(async () => {
         const r = await fetch("/api/threads/master/messages", {
           method: "POST",
