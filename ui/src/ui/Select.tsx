@@ -253,7 +253,7 @@ export function Select({
               )}
             </ul>
           </div>,
-          document.body,
+          triggerRef.current?.closest("dialog") ?? document.body,
         )
       : null;
 

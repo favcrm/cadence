@@ -3,6 +3,7 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
+import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
@@ -87,6 +88,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   overview: "overview",
   projects: "projects",
   apps: "apps",
+  workspaceApp: "app",
   agents: "agents",
   wiki: "wiki",
   outbox: "outbox",
@@ -107,7 +109,7 @@ export default function App() {
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
-  const fullHeight = screen === "home" || screen === "wiki" ||
+  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
@@ -563,7 +565,7 @@ export default function App() {
       }`}
     >
       <Sidebar
-        screen={screen}
+        screen={screen === "workspaceApp" ? "apps" : screen}
         navHref={hrefFor}
         project={navProject}
         projectHref={projectHref}
@@ -630,9 +632,9 @@ export default function App() {
                   key={item.screen}
                   href={hrefFor(item.route)}
                   onClick={() => setMenuOpen(false)}
-                  aria-current={screen === item.screen ? "page" : undefined}
+                  aria-current={(screen === "workspaceApp" ? "apps" : screen) === item.screen ? "page" : undefined}
                   className={`h-9 inline-flex items-center justify-center rounded text-secondary ${
-                    screen === item.screen
+                    (screen === "workspaceApp" ? "apps" : screen) === item.screen
                       ? "bg-accent/15 text-accent font-medium"
                       : "bg-ink-800 text-ink-300"
                   }`}
@@ -870,6 +872,9 @@ export default function App() {
         )}
         {route.screen === "apps" && !route.project && (
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "workspaceApp" && (
+          <WorkspaceApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "apps" && route.project && route.name && (
           <AppDetail

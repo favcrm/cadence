@@ -43,6 +43,7 @@ export type Route =
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
+  | { screen: "workspaceApp"; installId: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
   | { screen: "outbox" }
@@ -180,6 +181,10 @@ export function matchRoute(pathname: string): Route {
       const name = b ? segment(b) : null;
       if (project && name) return { screen: "apps", project, name };
     }
+    if (head === "app-installations" && a && !b) {
+      const installId = segment(a);
+      if (installId && /^[A-Za-z0-9_-]{1,128}$/.test(installId)) return { screen: "workspaceApp", installId };
+    }
     if (head === "agents" && !b) {
       if (!a) return { screen: "agents", alias: null };
       const alias = segment(a);
@@ -203,6 +208,8 @@ export function matchRoute(pathname: string): Route {
 
 export function routePath(route: Route): string {
   switch (route.screen) {
+    case "workspaceApp":
+      return `/app-installations/${encodeURIComponent(route.installId)}`;
     case "home":
       return "/";
     case "projects": {
