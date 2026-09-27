@@ -20,7 +20,13 @@ live.opened();
 emit("hello", { entities: true });
 for (let i = 0; i < 60; i++) { now += 1_000; if (i % 15 === 0) emit("heartbeat", {}); equal(live.healthy(), true, "idle heartbeat suppresses full polling"); }
 equal(syncs, 1, "first open reconciles once; steady healthy idle needs no more resync");
-for (let i = 0; i < 20; i++) emit("issues", { resources: ["projects", "overview"] });
+for (let i = 0; i < 20; i++) {
+  emit("issues", { resources: [] });
+  emit("aggregates", { resources: [] });
+}
+flush();
+equal(invalidations, [], "unchanged title-only aggregate snapshots cause no projects or overview reads");
+for (let i = 0; i < 20; i++) emit("aggregates", { resources: ["projects", "overview"] });
 equal(invalidations, [], "burst waits for one batch");
 flush();
 equal(invalidations, ["projects", "overview"], "20 events cause two resource requests");

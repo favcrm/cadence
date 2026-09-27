@@ -499,6 +499,8 @@ struct Watch {
     cards: HashMap<String, u64>,
     plans: HashMap<String, u64>,
     rows: HashMap<String, u64>,
+    projects: Option<u64>,
+    overview: Option<u64>,
 }
 
 /// A heartbeat the stream loop drops: a failed send is how the watcher
@@ -549,9 +551,65 @@ pub(super) fn entity_frame(text: &str) -> String {
         data["resource"] = json!(kind);
         data["rev"] = json!(format!("{:016x}", value_fp(&data)));
     } else if let Some(resources) = data["resources"].as_array_mut() {
-        resources.retain(|r| !matches!(r.as_str(), Some("issues" | "agents" | "issue")));
+        resources.retain(|r| {
+            !matches!(r.as_str(), Some("issues" | "agents" | "issue"))
+                && !(kind == "issues" && matches!(r.as_str(), Some("projects" | "overview")))
+        });
     }
     format!("event: {kind}\ndata: {data}\n\n")
+}
+
+/// Compare rendered aggregates, not inferred issue fields. Ignore only
+/// display clocks; audience/rank/warnings and every title/body/count remain.
+fn aggregate_fp(value: &Value) -> u64 {
+    fn stable(value: &Value, now: Option<i64>) -> Value {
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "generated_at" | "age" | "age_secs"))
+                    .map(|(key, value)| {
+                        // Preserve changes to WHICH review is oldest. Only its
+                        // passage-of-time increment is a display clock.
+                        let value = if key == "oldest_review_age" {
+                            match (now, value.as_i64()) {
+                                (Some(now), Some(age)) => json!(now - age),
+                                _ => value.clone(),
+                            }
+                        } else {
+                            stable(value, now)
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            ),
+            Value::Array(values) => {
+                Value::Array(values.iter().map(|value| stable(value, now)).collect())
+            }
+            _ => value.clone(),
+        }
+    }
+    value_fp(&stable(value, value["generated_at"].as_i64()))
+}
+
+fn aggregate_frame(
+    old_projects: Option<u64>,
+    projects: Option<u64>,
+    old_overview: Option<u64>,
+    overview: Option<u64>,
+) -> Arc<str> {
+    let mut resources = Vec::new();
+    if projects != old_projects {
+        resources.push("projects");
+    }
+    // A hidden/unbuilt overview cannot prove sameness: mark it invalid
+    // conservatively. Hidden clients defer reads until they show it.
+    if overview.is_none() || overview != old_overview {
+        resources.push("overview");
+    }
+    // An empty list proves this tracker batch checked the aggregate
+    // outputs without requiring any client read (also a stream checkpoint).
+    frame("aggregates", &json!({"resources": resources}))
 }
 
 fn fps(map: &Entities) -> HashMap<String, u64> {
@@ -710,6 +768,10 @@ impl Model {
     /// otherwise built now — one build at a time, later readers take its
     /// result. A tracker-only change reuses a recent daemon pass.
     pub(super) fn overview(self: &Arc<Self>) -> Value {
+        self.overview_value(true)
+    }
+
+    fn overview_value(self: &Arc<Self>, mark_wanted: bool) -> Value {
         let Ok(pm) = Pm::at(&self.pm_dir) else {
             // No tracker to index — the plain build is all daemon.
             return overview::overview_board(&self.state_dir, &self.pm_dir);
@@ -717,7 +779,9 @@ impl Model {
         let (key, _) = self.tracker_views(&pm);
         {
             let mut st = lock(&self.overview);
-            st.wanted = Some(Instant::now());
+            if mark_wanted {
+                st.wanted = Some(Instant::now());
+            }
             if let Some((value, age)) = self.servable(&st, key) {
                 if age >= OVERVIEW_FRESH && !st.building {
                     st.building = true;
@@ -801,6 +865,17 @@ impl Model {
         }
     }
 
+    fn aggregate_fps(self: &Arc<Self>) -> (Option<u64>, Option<u64>) {
+        let projects = Pm::at(&self.pm_dir)
+            .ok()
+            .map(|pm| value_fp(&super::projects_payload(&pm)));
+        let wanted = lock(&self.overview)
+            .wanted
+            .is_some_and(|at| at.elapsed() < OVERVIEW_WANTED);
+        let overview = wanted.then(|| aggregate_fp(&self.overview_value(false)));
+        (projects, overview)
+    }
+
     // ---------- stream ----------
 
     /// Join the board's stream. The first subscriber starts the watcher
@@ -818,6 +893,7 @@ impl Model {
             let snap = Arc::new(fetch_daemon(&self.state_dir));
             self.keep_snap(snap.clone());
             let (cards, plans) = self.entities(&snap);
+            let (projects, overview) = self.aggregate_fps();
             let base = Watch {
                 tracker: dir_mtime(&self.pm_dir),
                 delivery: self.delivery_stamp(),
@@ -827,6 +903,8 @@ impl Model {
                 cards: fps(&cards),
                 plans: fps(&plans),
                 rows: fps(&agent_rows(&snap)),
+                projects,
+                overview,
             };
             let me = self.clone();
             std::thread::spawn(move || me.watch(base));
@@ -964,6 +1042,12 @@ impl Model {
             diff_frames("agent", &w.rows, &rows, frames);
             w.rows = fps(&rows);
         }
+        if issues || delivery {
+            let (projects, overview) = self.aggregate_fps();
+            frames.push(aggregate_frame(w.projects, projects, w.overview, overview));
+            w.projects = projects;
+            w.overview = overview;
+        }
         if jobs || agents || monitoring || delivery {
             // Before the frames go out: the refetch they trigger must not
             // be served anything read before this tick.
@@ -1018,6 +1102,8 @@ mod tests {
             cards: HashMap::new(),
             plans: HashMap::new(),
             rows: HashMap::new(),
+            projects: None,
+            overview: None,
         };
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1123,6 +1209,69 @@ mod tests {
         assert_ne!(
             value_fp(&stable_row(&one)),
             value_fp(&stable_row(&mailbox(0, None, None)))
+        );
+    }
+
+    #[test]
+    fn aggregate_changes_follow_visible_semantics_not_display_clocks() {
+        let projects = json!({"projects": [{"key": "cadence", "issues": 12}]});
+        let overview = json!({"generated_at": 10, "projects": [{"key": "cadence", "open_by_status": {"doing": 2}, "oldest_review_age": 10}],
+            "needs_me": [{"title": "proposed plan title", "age": 10, "audience": "operator", "summary": "needs decision"}],
+            "recent_updates": [{"title": "recent title", "since": 10}], "signed_in": true});
+        let mut ticking = overview.clone();
+        ticking["generated_at"] = json!(20);
+        ticking["projects"][0]["oldest_review_age"] = json!(20);
+        ticking["needs_me"][0]["age"] = json!(20);
+        assert_eq!(aggregate_fp(&overview), aggregate_fp(&ticking));
+        let project_fp = Some(value_fp(&projects));
+        let fp = Some(aggregate_fp(&overview));
+        assert_eq!(
+            aggregate_frame(project_fp, project_fp, fp, Some(aggregate_fp(&ticking))),
+            frame("aggregates", &json!({"resources": []})),
+            "duplicate aggregate snapshots do not cause collection reads"
+        );
+        for path in ["title", "audience", "summary"] {
+            let mut changed = overview.clone();
+            changed["needs_me"][0][path] = json!("changed");
+            assert_ne!(
+                aggregate_fp(&overview),
+                aggregate_fp(&changed),
+                "actionable {path} stays in fingerprint"
+            );
+        }
+        let mut oldest_changed = overview.clone();
+        oldest_changed["projects"][0]["oldest_review_age"] = json!(5);
+        assert_ne!(
+            aggregate_fp(&overview),
+            aggregate_fp(&oldest_changed),
+            "a different oldest review is not a mere display-clock tick"
+        );
+        let mut changed = overview.clone();
+        changed["recent_updates"][0]["title"] = json!("changed recent title");
+        assert_ne!(aggregate_fp(&overview), aggregate_fp(&changed));
+        changed = overview.clone();
+        changed["signed_in"] = json!(false);
+        assert_ne!(
+            aggregate_fp(&overview),
+            aggregate_fp(&changed),
+            "session data is retained"
+        );
+        changed = overview.clone();
+        changed["projects"][0]["open_by_status"]["doing"] = json!(3);
+        assert_eq!(
+            aggregate_frame(project_fp, project_fp, fp, Some(aggregate_fp(&changed))),
+            frame("aggregates", &json!({"resources": ["overview"]}))
+        );
+        let mut count = projects.clone();
+        count["projects"][0]["issues"] = json!(13);
+        assert_eq!(
+            aggregate_frame(project_fp, Some(value_fp(&count)), fp, fp),
+            frame("aggregates", &json!({"resources": ["projects"]}))
+        );
+        assert_eq!(
+            aggregate_frame(project_fp, project_fp, None, None),
+            frame("aggregates", &json!({"resources": ["overview"]})),
+            "hidden overview is conservatively marked invalid"
         );
     }
 

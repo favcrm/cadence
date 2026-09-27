@@ -561,13 +561,13 @@ fn board_reads_p95_under_budget_on_a_400_issue_tracker() {
 
 /// Collect a board stream's bytes in the background.
 fn stream_into(port: u16) -> std::sync::Arc<std::sync::Mutex<String>> {
+    stream_into_path(port, "/api/stream")
+}
+
+fn stream_into_path(port: u16, path: &str) -> std::sync::Arc<std::sync::Mutex<String>> {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(
-        s,
-        "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-    )
-    .unwrap();
+    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
     s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let out = buf.clone();
     thread::spawn(move || {
@@ -993,4 +993,75 @@ fn board_live_measurement_fixture() {
         thread::sleep(Duration::from_secs(3));
     }
     thread::sleep(Duration::from_secs(15));
+}
+
+#[test]
+fn title_only_tracker_changes_skip_aggregate_reads_but_status_and_count_changes_invalidate() {
+    let fx = fixture(12, 0);
+    let initial = get_json(fx.port, "/api/overview");
+    let initial_projects = get_json(fx.port, "/api/projects");
+    let stream = stream_into_path(fx.port, "/api/stream?entities=1");
+    wait_for("entity stream hello", 10, || {
+        stream.lock().unwrap().contains("\"entities\":true")
+    });
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &["issue", "set", "CAD-2", "title=ordinary title changed"],
+    );
+    assert!(ok, "{out}");
+    wait_for("title patch and checked aggregate checkpoint", 15, || {
+        frames(&stream, "issue")
+            .iter()
+            .any(|f| f["id"] == "CAD-2" && f["issue"]["title"] == "ordinary title changed")
+            && !frames(&stream, "aggregates").is_empty()
+    });
+    assert!(frames(&stream, "issues").iter().all(|f| !f["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r == "projects" || r == "overview")));
+    assert!(
+        frames(&stream, "aggregates")
+            .iter()
+            .all(|f| f["resources"] == json!([])),
+        "title-only edits do not change rendered aggregates: {:?}",
+        frames(&stream, "aggregates")
+    );
+    assert_eq!(initial_projects, get_json(fx.port, "/api/projects"));
+    assert_eq!(
+        initial["projects"][0]["open_by_status"],
+        get_json(fx.port, "/api/overview")["projects"][0]["open_by_status"]
+    );
+    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-2", "status=done"]);
+    assert!(ok, "{out}");
+    wait_for("status aggregate update", 15, || {
+        frames(&stream, "aggregates").iter().any(|f| {
+            f["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "overview")
+        })
+    });
+    assert_ne!(
+        initial["projects"][0]["open_by_status"],
+        get_json(fx.port, "/api/overview")["projects"][0]["open_by_status"]
+    );
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &["issue", "new", "new counted issue", "--project", "cadence"],
+    );
+    assert!(ok, "{out}");
+    wait_for("project count aggregate update", 15, || {
+        frames(&stream, "aggregates").iter().any(|f| {
+            f["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "projects")
+        })
+    });
+    assert_ne!(initial_projects, get_json(fx.port, "/api/projects"));
 }

@@ -2615,6 +2615,20 @@ fn value_fp(value: &Value) -> u64 {
     h.finish()
 }
 
+/// The exact collection representation, shared with SSE aggregate change
+/// detection so config/count changes invalidate and title-only edits do not.
+fn projects_payload(pm: &Pm) -> Value {
+    let projects = project::list(&pm.dir).unwrap_or_default();
+    let issues = board::load_all(&pm.dir, None).unwrap_or_default();
+    let payload: Vec<Value> = projects.iter().map(|p| json!({
+        "key": p.key, "prefix": p.prefix, "components": p.components,
+        "tags": p.tags, "default_owner": p.default_owner,
+        "repos": p.repos.iter().map(|r| json!({"path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
+        "issues": issues.iter().filter(|i| i.project == p.key).count(),
+    })).collect();
+    json!({"projects": payload})
+}
+
 /// The board resources one stream event invalidates, sent as the frame's
 /// data (`{"resources":[...]}`) so the client refetches only those. The
 /// event name stays the change source, which older clients key on.
@@ -2721,6 +2735,9 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
         match rx.recv_timeout(Duration::from_secs(15)) {
             Ok(f) if &*f == read_model::HEARTBEAT => {}
             Ok(f) => {
+                if !entities && f.starts_with("event: aggregates\n") {
+                    continue;
+                }
                 let optimized = entities.then(|| read_model::entity_frame(&f));
                 let bytes = optimized.as_deref().unwrap_or(&f);
                 if !frame(&mut w, bytes.as_bytes()) {
@@ -3058,23 +3075,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                let projects = project::list(&pm.dir).unwrap_or_default();
-                let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                let payload: Vec<Value> = projects
-                    .iter()
-                    .map(|p| {
-                        json!({
-                            "key": p.key, "prefix": p.prefix,
-                            "components": p.components,
-                            "tags": p.tags,
-                            "default_owner": p.default_owner,
-                            "repos": p.repos.iter().map(|r| json!({
-                                "path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
-                            "issues": issues.iter().filter(|i| i.project == p.key).count(),
-                        })
-                    })
-                    .collect();
-                send(request, json_response(json!({"projects": payload})));
+                send(request, json_response(projects_payload(&pm)));
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },

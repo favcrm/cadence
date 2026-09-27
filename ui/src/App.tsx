@@ -335,7 +335,7 @@ export default function App() {
     liveUpdates.current = updates;
     const sub = subscribeSse({
       url: "/api/stream?entities=1",
-      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan"],
+      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates"],
       onEvent: updates.event,
       onOpen: updates.opened,
       onError: updates.failed,
