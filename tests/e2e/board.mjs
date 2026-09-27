@@ -54,7 +54,8 @@ async function needRow(page, kind, issue) {
   // Decisions tab. Open that tab as the operator would.
   const panel = page.locator('section[aria-label="agent updates"]:visible');
   await panel.waitFor({ timeout: TIMEOUT });
-  const decisions = panel.getByRole("button", { name: /^Decisions\b/ });
+  const decisions = panel.getByRole("group", { name: "Team activity" })
+    .getByRole("button", { name: /^Decisions\b/ });
   if ((await decisions.getAttribute("aria-pressed")) !== "true") await decisions.click();
   // CAD-574 groups PR decisions behind an initially closed disclosure.
   // Follow the same interaction as an operator before locating its row.
