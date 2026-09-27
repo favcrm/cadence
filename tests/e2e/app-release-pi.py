@@ -68,7 +68,14 @@ def source_text(kickoff):
               if line.startswith("CONTEXT_SOURCE=")]
     if len(values) != 1:
         raise RuntimeError("exactly one actual source canary required")
-    return "Context draft: " + values[0]
+    source = values[0]
+    # Generate large artifacts through a real producer turn from short valid
+    # workflow inputs. Do not widen input bounds to reach the release preview.
+    if source == "REPEAT_UTF8_E_5000":
+        source = "é" * 5000
+    elif source == "REPEAT_ASCII_X_17408":
+        source = "x" * 17408
+    return "Context draft: " + source
 
 
 def kickoff_from_prompt(prompt):

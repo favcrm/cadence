@@ -90,7 +90,7 @@ fn cad692_actual_accepted_artifact_waits_then_releases_one_project_free_local_it
     );
     assert_eq!(h.items(), items, "repeated release duplicated Local write");
     let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
-    for table in ["platform_grants", "platform_account_defaults"] {
+    for table in ["platform_grants", "platform_defaults"] {
         let count: i64 = db
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
@@ -381,7 +381,13 @@ fn cad692_routing_owner_legacy_effect_paths_neither_expose_nor_release_app_child
         "fixture must exercise matching routing owner"
     );
     let mut owner = LaneShell::spawn(h.root.path());
-    plant_member_pane(&h.daemon, OWNER, "inbox", None, owner.pid());
+    // The routing PM already owns this real run. Attach its inert fixture
+    // row to our actual shell instead of registering a duplicate alias.
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE agents SET endpoint_kind='pty',pid=?,pid_start=?,enabled=0,generation='planted',session_id='planted' WHERE alias=? AND role='pm' AND provider='inbox'",
+        rusqlite::params![owner.pid() as i64,common::proc_start(owner.pid()),OWNER],
+    ).unwrap(),1);
     let attempts = [
         (
             "agent_respond",
@@ -867,9 +873,10 @@ fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
         first_item["provenance"]["artifact_id"],
         second_item["provenance"]["artifact_id"]
     );
+    assert!(first_item["provenance"]["authority_digest"].is_string());
+    assert!(second_item["provenance"]["authority_digest"].is_string());
     assert_ne!(
-        first_item["provenance"]["core_authority_digest"],
-        second_item["provenance"]["core_authority_digest"],
+        first_item["provenance"]["authority_digest"], second_item["provenance"]["authority_digest"],
         "same-body release borrowed previous effect authority"
     );
     assert_eq!(
@@ -885,7 +892,7 @@ fn cad692_same_accepted_artifact_two_effects_have_distinct_intact_receipts() {
 fn cad692_full_preview_bound_rejects_before_effect_write_without_truncating_artifact() {
     let h = Release::new();
     let bounded = "é".repeat(5000);
-    let c = h.context("Bounded", &bounded, "preview-positive");
+    let c = h.context("Bounded", "REPEAT_UTF8_E_5000", "preview-positive");
     h.bind(&c, "preview-positive-binding");
     let run = h.complete(&c, "preview-positive-run");
     let artifact = h.artifact(&run);
@@ -903,7 +910,7 @@ fn cad692_full_preview_bound_rejects_before_effect_write_without_truncating_arti
         format!("# Reviewed draft\n\nContext draft: {bounded}")
     );
     let huge = "x".repeat(17 * 1024);
-    let c = h.context("Too large", &huge, "preview-negative");
+    let c = h.context("Too large", "REPEAT_ASCII_X_17408", "preview-negative");
     h.bind(&c, "preview-negative-binding");
     let run = h.complete(&c, "preview-negative-run");
     let artifact = h.artifact(&run);
@@ -1380,11 +1387,7 @@ fn cad692_context_free_schema3_real_review_and_explicit_local_release() {
         format!("# Reviewed draft\n\nContext draft: {A}")
     );
     let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
-    for table in [
-        "app_contexts",
-        "platform_grants",
-        "platform_account_defaults",
-    ] {
+    for table in ["app_contexts", "platform_grants", "platform_defaults"] {
         let count: i64 = db
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
