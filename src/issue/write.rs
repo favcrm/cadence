@@ -368,6 +368,7 @@ pub fn project_add(
         default_owner: owner.map(str::to_string),
         build: None,
         memory: None,
+        intake: None,
     };
     let dir = pm.dir.join(key);
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {

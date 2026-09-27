@@ -142,8 +142,11 @@ pub(super) const SCHEMA_V17: &str = "CREATE TABLE IF NOT EXISTS platform_credent
         account TEXT NOT NULL,
         set_at REAL NOT NULL,
         by TEXT NOT NULL,
-        PRIMARY KEY(project, platform));
-     CREATE TABLE IF NOT EXISTS app_grants(
+        PRIMARY KEY(project, platform));";
+
+// Introduced after released v18: create it in v19, not in the historical
+// v17 migration which existing custody databases have already applied.
+pub(super) const SCHEMA_APP_GRANTS: &str = "CREATE TABLE IF NOT EXISTS app_grants(
         app TEXT NOT NULL,
         agent TEXT NOT NULL,
         platform TEXT NOT NULL,

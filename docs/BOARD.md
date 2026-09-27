@@ -90,6 +90,7 @@ fail-closed on both:
 ```yaml
 pi:
   providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
+  agentic_providers: []                   # additional model provider namespaces
   models:
     allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
     master_allow: ["openrouter/z-ai/glm-5.3-flash"]   # optional role list (CAD-575)
@@ -111,6 +112,24 @@ pi:
   applicable list) allows nothing — a pi registration, start, or
   relaunch refuses rather than fall back. `model_policy:
   provider_default` is refused outright for pi.
+- Agentic Pi providers execute their own tools rather than returning
+  completions to Pi's harness. The Cursor package registers `cursor`
+  and runs `agent --print --trust --workspace`; its tools bypass Pi's
+  `--tools` and the master's `pi-guard`. `cursor` is always classified
+  agentic. Declare other such **model provider namespaces** in
+  `agentic_providers`; these are not npm package pins. Agentic models
+  are refused for the Pi master at resolution, every open, `agent set`
+  and `/model`, even when included in `master_allow`. Master models
+  must use `provider/id`, so classification happens before launch.
+  Currently the master is the only role whose tool policy depends on
+  `pi-guard`. Pi workers may still use allowed agentic models; only
+  inherited OS confinement governs their child tools. The native
+  Cadence Cursor adapter is separate and unchanged. `pi-devin` streams
+  completions and leaves Pi executing the tools, so it remains compatible
+  with this gate (its credential/confinement limitations above still apply).
+  Pinned extensions still load in every role; declare any additional
+  tool-executing provider before allowing its models. Per-role package
+  loading is a separate hardening step.
 - `models.default.{master,worker}` fills a start that names no model.
   After launch the adapter asks `get_state` what model is actually
   running; a provider answering with a different one fails the open
@@ -1388,6 +1407,8 @@ payload at read time — nothing is stored; `cadence overview [--json]
 |---|---|---|---|---|
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
+| 20 | `idea_plan` — an idea in `review` tagged `plan-ready` (CAD-139). A `parked` or `idea-stale` review does not raise `review_no_pr` | operator | — | `cadence idea decide <id> approve` |
+| 20 | `idea_duplicate` — a backlog idea linked `duplicate_of` another open issue | operator | — | `cadence issue show <id>` |
 | 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
 | 30 | `fenced` — agent in `attention` | operator | — (only the operator may unfence or reconcile, CAD-374; the PM escalates) | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |
@@ -1398,6 +1419,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
 | 80 | `blocked_ready` — every `blocked_by` target is `done` | team | the issue owner | `cadence issue set <id> status=ready` |
 | 85 | `intake` — an untriaged `cadence report` | team | the issue owner | `cadence report show <id>` |
+| 86 | `intake_relay` — a report the intake consumer could not publish or hand to the PM (quota, stopped PM, retry, still queued) | team | the configured relay PM alias | `cadence intake status <project>` |
 | 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | team | none | `gh run view <run> --repo <slug>` |
 | 92 | `ci_unverified` — a default-branch SHA whose `ci.yml` push run was cancelled (or never ran) and no later SHA's own run has passed; clears once one does, while the SHA keeps its label | team | none | `gh run rerun <run> --repo <slug>` (cancelled), else `gh run list --repo <slug> --workflow ci.yml --branch <branch>` |
 | 95 | `inbox_stale` — a mailbox past its unread threshold with no recent read | team | the inbox owner (group root, else `operator`) | `cadence inbox <a>` |
@@ -1434,6 +1456,7 @@ minutes):
 
 | Kind | `since` |
 |---|---|
+| `intake_relay` | the relay receipt or comment action `updated_at` |
 | `review_no_pr`, `intake` | when the issue entered its effective status: a file status is the tracker's last commit changing the `status:` line (read from the tracker's line-time cache in its git dir, keyed by HEAD: an unmoved HEAD reads the file, a fast-forward walks only the new commits, any other move walks the whole history again — 3 s budget per build; past it, rows get no clock and one `degraded` note); a notes status is the deriving note's time; a rollup or job status has none |
 | `blocked_ready` | the newest of its blockers' status clocks (when the last one reached done) |
 | `fenced` | the earliest `completed` of the agent's `unknown` messages; a fence without one (a disconnect while idle, a restart mismatch) uses the row's `updated` — every write that enters `attention` stamps it, so it is a lower bound on time fenced |
@@ -1463,7 +1486,7 @@ The payload carries the classification as `main_ci[]`; a repo without a
 `ci.yml` workflow has no block.
 
 GitHub data (open PRs, default-branch CI runs) comes from `gh` behind a
-60-second cache in the state dir (`overview-gh.json`, keyed by the
+60-second default cache in the state dir (`overview-gh.json`, keyed by the
 slug set, written temp-then-rename); an outage serves the last good
 body as `github.state: "stale"` — or `"unavailable"` when there is no
 good body — and the screen still renders. Daemon-dependent rows
@@ -1471,6 +1494,32 @@ good body — and the screen still renders. Daemon-dependent rows
 down, reported as `daemon.reachable: false`. Reachability is the
 `health` RPC — a daemon that predates `daemon_info` stays reachable
 (its agent rows appear) while drift reports the build as unknown.
+
+The board/CLI process can set `CADENCE_OVERVIEW_GH_CACHE_SECS` to 60–3600
+seconds; unset, invalid or out-of-range values use 60. For example, 300
+allows five-minute display freshness and reduces periodic refresh frequency
+by 80% compared with 60, assuming continuous reads and successful fetches.
+This is a scheduling calculation, not a measured daemon CPU improvement.
+Set it on every board/CLI reader sharing that cache: a reader with a shorter
+interval can still refresh it sooner. Existing `as_of` timestamps and
+stale/unavailable states retain their meaning. Repository selection comes
+from the tracker's deduplicated GitHub project remotes.
+`cadence session` shares the cache but keeps its existing 60-second bound.
+
+Overview GitHub reads run in the board/CLI process and write this JSON
+cache, not the daemon's SQLite store. The board's delivery sync has its
+own 60-second default, page-view budget and failure backoff; this setting
+does not change it or the reviewed-head merge guards (CAD-446).
+
+Recurring `agent_list` board summaries fetch running message rows and count
+historical parked deliveries in SQL, rather than decoding completed bodies
+and results every tick. The parked count still examines historical results;
+it is not constant-time. Overview probes pass `active_only: true` to
+`agent_show`, keeping queued/submitting/running messages and unresolved
+unknowns for fence evidence. A normal `agent_show` keeps full current-agent
+history. Both variants retain turn-token redaction; reads do not unfence,
+resume or launch an agent. The `start: skipping fenced agent` log is a
+daemon-start observation, not a periodic scheduler action (CAD-627).
 
 **Deploy drift** — the daemon reports its `build_commit` via the
 `daemon_info` RPC (`build.rs` compiles `CADENCE_BUILD_COMMIT`/

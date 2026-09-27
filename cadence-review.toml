@@ -14,7 +14,7 @@
 # A test or tool that commits must pass `-c user.name=… -c user.email=…`
 # (see gate_env in src/review.rs).
 
-# Run once in the review checkout before gating. The clippy gate needs
+# Run once in the review checkout before gating. The UI clippy gate needs
 # the UI built (the `ui` cargo feature embeds ui/dist); node_modules is
 # linked from the main checkout so pnpm build reuses its store.
 prepare = [
@@ -25,11 +25,20 @@ prepare = [
 # Ordered gates — the first failure stops the sequence and its last 40
 # output lines land in the report. vite build strips TypeScript types
 # without checking them, so the UI type check is its own gate (CAD-264).
+# Lint default and test-seam separately, matching CI's supported shapes;
+# retain UI lint coverage after prepare builds the embedded assets.
+# The board selection preserves all twelve CAD-537 splits of tests/board.rs.
 gates = [
+    "python3 scripts/check-review-recipe",
+    "python3 scripts/test-review-recipe",
     "cargo fmt --all -- --check",
     "cd ui && node_modules/.bin/tsc --noEmit",
-    "cargo clippy --all-targets --all-features -- -D warnings",
-    "cargo test --lib --bins --test board",
+    "cd ui && pnpm test",
+    "cargo clippy --all-targets --locked -- -D warnings",
+    "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
+    "cargo clippy --all-targets --locked --features ui -- -D warnings",
+    "cargo test --locked --test test_seam -- --test-threads 2",
+    "cargo test --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in -- --test-threads 2",
 ]
 
 # The one full-suite run (about 12 minutes; skipped with --no-full).
@@ -39,7 +48,9 @@ gates = [
 # full_secs waiting for the slot, then up to full_secs for the run.
 # Since CAD-426 the former `integration` binary is split into per-area
 # tests/*.rs binaries, so the full suite is the --all-targets group.
-full_suite = "scripts/cadence-nextest --all-targets"
+# Like CI, runtime suites use test-seam; default-feature clippy also checks
+# the production code shape. E2E stays opt-in via its separate workflow.
+full_suite = "scripts/cadence-nextest --all-targets --features test-seam"
 
 # Diff paths that count as test files — `fn` items added under these
 # are the PR's new tests.
@@ -48,7 +59,7 @@ test_globs = ["tests/**"]
 # How one test runs alone — {test} = fn name, {file} = diff path,
 # {target} = file stem (cargo's --test <stem>). Substitutions arrive
 # single-quoted — do not quote them again here.
-test_command = "scripts/cadence-nextest --test {target} -- {test} --exact"
+test_command = "scripts/cadence-nextest --features test-seam --test {target} -- {test} --exact"
 
 # The "waits on daemon state" heuristic: a new test whose name or added
 # body contains any of these is stressed `--stress` times (default 5).

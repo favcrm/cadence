@@ -635,21 +635,35 @@ mod tests {
     }
 
     fn worker(s: &Arc<Shared>, alias: &str, endpoint_kind: &str) {
+        staff(s, alias, endpoint_kind, "worker", "idle", None, None);
+    }
+
+    /// Register one agent. `team_role` is the model-lookup key and must
+    /// not, by itself, make the agent a delivery reviewer.
+    fn staff(
+        s: &Arc<Shared>,
+        alias: &str,
+        endpoint_kind: &str,
+        role: &str,
+        state: &str,
+        params: Option<&str>,
+        team_role: Option<&str>,
+    ) {
         s.store
             .register_agent(&NewAgent {
                 alias,
                 provider: "fake",
                 endpoint_kind,
-                role: "worker",
+                role,
                 cwd: "/tmp",
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
-                team_role: None,
+                params,
+                team_role,
                 model_policy: None,
             })
             .unwrap();
-        s.store.set_agent_state(alias, "idle", None).unwrap();
+        s.store.set_agent_state(alias, state, None).unwrap();
     }
 
     /// A pty lane whose live watch proves it busy — the checkup must
@@ -940,7 +954,7 @@ mod tests {
     fn unstaffed_green_pr_routes_one_review_to_a_free_reviewer() {
         let (_d, s, calls) = shared();
         worker(&s, "w1", "fake");
-        worker(&s, "r1", "fake");
+        staff(&s, "r1", "fake", "reviewer", "idle", None, None);
         let pm = tempfile::TempDir::new().unwrap();
         pm_scaffold(pm.path());
         s.provider_env
@@ -973,11 +987,152 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
+    /// CAD-591: each agent that the old "any idle peer" rule would pick
+    /// sorts ahead of `rev`. The route lands on `rev` only when the
+    /// implementer, the busy reviewer, the foreign-PM reviewer, and a
+    /// `qa` team-role label are all refused.
+    #[test]
+    fn review_skips_implementers_busy_reviewers_and_foreign_pm_groups() {
+        let (_d, s, calls) = shared();
+        worker(&s, "w1", "fake");
+        staff(&s, "a-impl", "fake", "worker", "idle", None, None);
+        staff(&s, "b-busy", "fake", "reviewer", "busy", None, None);
+        staff(
+            &s,
+            "c-foreign",
+            "fake",
+            "reviewer",
+            "idle",
+            Some(r#"{"upstream":"other-pm"}"#),
+            None,
+        );
+        staff(&s, "d-team", "fake", "worker", "idle", None, Some("qa"));
+        staff(&s, "rev", "fake", "reviewer", "idle", None, None);
+        let pm = tempfile::TempDir::new().unwrap();
+        pm_scaffold(pm.path());
+        s.provider_env
+            .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+        issue(pm.path(), "TST-1", "review", "");
+        let name = done_report(
+            pm.path(),
+            "TST-1",
+            1_700_000_000,
+            "w1",
+            Some(SHA1),
+            Some(PR1),
+        );
+        record(&s, "TST-1", |r| {
+            r.state = State::Unstaffed;
+            r.head = Some(SHA1.to_string());
+            r.pr = Some(PR1.to_string());
+            r.handled = vec![name];
+        });
+
+        s.checkup_tick();
+        assert_eq!(outcomes(&s, "w1"), ["review"]);
+        assert_eq!(records(&s)["TST-1"].reviewer.as_deref(), Some("rev"));
+        for alias in ["a-impl", "b-busy", "c-foreign", "d-team", "w1"] {
+            assert!(
+                s.store.queued_head(alias).unwrap().is_none(),
+                "{alias} was handed the review"
+            );
+        }
+        assert!(s.store.queued_head("rev").unwrap().is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_implementers_leave_the_review_unstaffed_in_needs_you() {
+        let (_d, s, calls) = shared();
+        worker(&s, "w1", "fake");
+        staff(&s, "rev", "fake", "worker", "idle", None, None);
+        let pm = tempfile::TempDir::new().unwrap();
+        pm_scaffold(pm.path());
+        s.provider_env
+            .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+        issue(pm.path(), "TST-1", "review", "");
+        let name = done_report(
+            pm.path(),
+            "TST-1",
+            1_700_000_000,
+            "w1",
+            Some(SHA1),
+            Some(PR1),
+        );
+        record(&s, "TST-1", |r| {
+            r.state = State::Unstaffed;
+            r.head = Some(SHA1.to_string());
+            r.pr = Some(PR1.to_string());
+            r.handled = vec![name];
+        });
+
+        s.checkup_tick();
+        assert_eq!(outcomes(&s, "w1"), ["escalate"]);
+        assert_eq!(records(&s)["TST-1"].state, State::Unstaffed);
+        assert!(records(&s)["TST-1"].reviewer.is_none());
+        assert!(s.store.queued_head("rev").unwrap().is_none());
+        assert!(s.store.queued_head("w1").unwrap().is_none());
+        assert!(calls.lock().unwrap().is_empty());
+        let view = crate::overview::overview_cached(&s.state_dir, pm.path());
+        let rows: Vec<_> = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"].as_str() == Some("review_unstaffed"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
+    }
+
+    /// CAD-591: a designated reviewer who is busy is not a fresh
+    /// assignment. The kickoff is not queued, and Needs-you keeps the
+    /// unstaffed row.
+    #[test]
+    fn busy_reviewer_pool_leaves_the_review_unstaffed_in_needs_you() {
+        let (_d, s, calls) = shared();
+        worker(&s, "w1", "fake");
+        staff(&s, "rev", "fake", "reviewer", "busy", None, None);
+        let pm = tempfile::TempDir::new().unwrap();
+        pm_scaffold(pm.path());
+        s.provider_env
+            .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+        issue(pm.path(), "TST-1", "review", "");
+        let name = done_report(
+            pm.path(),
+            "TST-1",
+            1_700_000_000,
+            "w1",
+            Some(SHA1),
+            Some(PR1),
+        );
+        record(&s, "TST-1", |r| {
+            r.state = State::Unstaffed;
+            r.head = Some(SHA1.to_string());
+            r.pr = Some(PR1.to_string());
+            r.handled = vec![name];
+        });
+
+        s.checkup_tick();
+        assert_eq!(outcomes(&s, "w1"), ["escalate"]);
+        assert_eq!(records(&s)["TST-1"].state, State::Unstaffed);
+        assert!(records(&s)["TST-1"].reviewer.is_none());
+        assert!(s.store.queued_head("rev").unwrap().is_none());
+        assert!(s.store.queued_head("w1").unwrap().is_none());
+        assert!(calls.lock().unwrap().is_empty());
+        let view = crate::overview::overview_cached(&s.state_dir, pm.path());
+        let rows: Vec<_> = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"].as_str() == Some("review_unstaffed"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
+    }
+
     #[test]
     fn an_unrecorded_done_report_is_adopted_and_routed() {
         let (_d, s, calls) = shared();
         worker(&s, "w1", "fake");
-        worker(&s, "r1", "fake");
+        staff(&s, "r1", "fake", "reviewer", "idle", None, None);
         let pm = tempfile::TempDir::new().unwrap();
         pm_scaffold(pm.path());
         s.provider_env

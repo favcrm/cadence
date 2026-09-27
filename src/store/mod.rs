@@ -52,6 +52,8 @@ mod inbox;
 mod kickoff;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
+#[cfg(test)]
+pub(crate) use messages::take_decoded_messages;
 pub use messages::{
     report_timeout_secs, Message, Priority, Steer, DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES,
     NUDGE_SOURCE,

@@ -56,6 +56,11 @@ pub struct PiPolicy {
     /// `name@version` pins for the provider packages Pi may `-e`.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// Model provider namespaces whose extensions execute their own
+    /// tools instead of returning completions to Pi's guarded harness.
+    /// Cursor is always agentic, even when this list is empty.
+    #[serde(default)]
+    pub agentic_providers: Vec<String>,
     #[serde(default)]
     pub models: PiModels,
 }
@@ -159,6 +164,17 @@ impl PiPolicy {
     /// Every entry is checked at read time — a malformed id or pin is
     /// a config error the operator fixes once, not a per-launch miss.
     fn validate(&self) -> Result<()> {
+        for provider in &self.agentic_providers {
+            if provider.is_empty()
+                || !provider
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                return Err(Error::rejected(format!(
+                    "pm.yaml [pi].agentic_providers '{provider}': expected a provider namespace"
+                )));
+            }
+        }
         for model in self
             .models
             .allow
@@ -225,6 +241,27 @@ pub fn resolve_model(
 /// key so a rejected request names its fix; an absent `[pi]` (or an
 /// empty applicable list) allows nothing.
 pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Result<()> {
+    // Pi's tool allowlist and pi-guard only govern tools executed by
+    // Pi itself. The Cursor extension runs its own `agent --trust`
+    // child; an allowlisted model must never bypass a guarded role.
+    // Keep this in the shared gate: resolve, open, /model and agent set
+    // all use it, and callers derive the master role from its identity.
+    if role == "master" && !model.contains('/') {
+        return Err(Error::rejected(format!(
+            "pi master model '{model}' must name provider/id so its tool execution \
+             classification can be checked before launch (CAD-602)"
+        )));
+    }
+    let provider = model.split_once('/').map(|(p, _)| p).unwrap_or(model);
+    let agentic = provider == "cursor"
+        || policy.is_some_and(|p| p.agentic_providers.iter().any(|p| p == provider));
+    if role == "master" && agentic {
+        return Err(Error::rejected(format!(
+            "pi master model '{model}' uses an agentic provider whose own tools \
+             bypass Pi's tool allowlist and pi-guard — use a completion-only \
+             provider even when this model is on master_allow (CAD-602)"
+        )));
+    }
     let key = policy.map(|p| p.models.allow_key(role)).unwrap_or("allow");
     let allow: &[String] = policy.map(|p| p.models.allow_for(role)).unwrap_or(&[]);
     if allow.iter().any(|m| m == model) {
@@ -573,6 +610,44 @@ mod tests {
         assert!(read(&pm).unwrap().is_none());
         let (_d, pm) = pm_with("host:\n  agent_gc_older_than_secs: 60\n");
         assert!(read(&pm).unwrap().is_none());
+    }
+
+    #[test]
+    fn agentic_providers_cannot_be_allowlisted_for_guarded_master() {
+        let (_dir, pm) = pm_with(
+            "pi:\n  agentic_providers: [acme]\n  models:\n    allow: [cursor/model, acme/model, devin/model, openrouter/model]\n",
+        );
+        let policy = read(&pm).unwrap().unwrap();
+        for model in ["cursor/model", "acme/model"] {
+            assert!(resolve_model(Some(&policy), "master", Some(model))
+                .unwrap_err()
+                .to_string()
+                .contains("agentic"));
+            require_allowed(Some(&policy), "worker", model).unwrap();
+        }
+        for model in ["devin/model", "openrouter/model"] {
+            resolve_model(Some(&policy), "master", Some(model)).unwrap();
+        }
+        // Empty declarations do not opt out of the known Cursor classification.
+        let (_dir, pm) =
+            pm_with("pi:\n  agentic_providers: []\n  models:\n    master_allow: [cursor/model]\n");
+        let policy = read(&pm).unwrap().unwrap();
+        assert!(require_allowed(Some(&policy), "master", "cursor/model").is_err());
+        let (_dir, pm) = pm_with("pi:\n  models:\n    allow: [model]\n");
+        let policy = read(&pm).unwrap().unwrap();
+        assert!(require_allowed(Some(&policy), "master", "model").is_err());
+        require_allowed(Some(&policy), "worker", "model").unwrap();
+    }
+
+    #[test]
+    fn agentic_provider_names_are_exact_namespaces() {
+        for name in ["", " cursor", "cursor/model", "cursor*"] {
+            let (_dir, pm) = pm_with(&format!("pi:\n  agentic_providers: ['{name}']\n"));
+            assert!(read(&pm)
+                .unwrap_err()
+                .to_string()
+                .contains("agentic_providers"));
+        }
     }
 
     #[test]

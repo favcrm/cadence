@@ -207,6 +207,7 @@ helpers = [
     "MASTER_PLAN",
     "REFLECTION",
     "impl:start_routed",
+    "impl:start_idea_router",
     "FAKE_GH_PY",
     "LOOP_PR",
     "LoopFixture",
@@ -220,6 +221,9 @@ helpers = [
     "CAD378_AREAS",
     "impl:cad378_lane",
 ]
+
+[binaries.idea_pipeline]
+tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children"]
 
 [binaries.daemon]
 tests = [
@@ -305,11 +309,14 @@ tests = [
     "cad384_operator_attributed_sends_need_proof",
     "cad384_shutdown_needs_the_operator_or_a_granted_rollout_holder",
     "cad384_operator_daemon_stop_from_a_plain_shell",
+    "cad626_restart_recovers_an_unreachable_daemon",
+    "cad626_snapshot_transport_failure_does_not_shutdown_a_lock_holder",
     "cad384_no_sandbox_exemption_outside_a_sandbox",
     "cad384_agent_cannot_claim_the_lease_as_the_operator",
     "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",
     "cad561_update_is_refused_inside_a_pane",
     "cad561_update_refuses_a_dropped_alias_claiming_the_operator",
+    "cad628_detached_agent_cannot_request_rollback_with_a_forged_operator",
 ]
 helpers = [
     "wait_lines",
@@ -334,6 +341,9 @@ tests = [
     "cad565_message_read_refuses_forged_identity_fields",
     "cli_doctor_smoke",
     "mock_installers_run_concurrently_with_private_state",
+    "mock_config_guard_finds_nested_rust_sources",
+    "mock_config_guard_never_follows_source_symlinks",
+    "mock_config_guard_reports_discovery_and_source_read_errors",
     "mock_config_never_touches_process_env",
     "pty_send_pastes_literal_and_completes_via_report",
     "pty_claim_is_single_use_and_expires",
@@ -439,6 +449,8 @@ tests = [
     "agent_remove_force_notifies_reply_to",
 ]
 helpers = [
+    "source_guard",
+    "env_mutation_source",
     "claude_sessions",
     "forced_removals",
     "stopped_fake_agent",
@@ -681,6 +693,7 @@ tests = [
     "cad551_master_state_working_turn_and_stop",
     "cad551_master_command_gate_and_allowlist",
     "cad551_master_command_board_gate",
+    "cad602_agentic_model_rpc_and_http_refuse",
     "cad575_master_models_gate_and_contract",
     "cad575_master_models_before_start",
     "cad575_master_models_board_gate",
@@ -811,6 +824,7 @@ tests = [
     "remove_waits_for_an_approve_already_inside_the_lock",
     "app_remove_then_reinstall_requires_approval_again",
     "removed_app_sweep_withdraws_the_approval",
+    "sweep_waits_for_an_approve_already_inside_the_lock",
     "install_id_reinstall_after_empty_approval_is_unapproved",
     "install_id_hand_delete_sweep_withdraws_approval",
     "install_id_missing_on_approval_is_not_honoured",
@@ -987,6 +1001,7 @@ tests = [
     "master_without_landlock_starts_only_on_the_operators_opt_in",
     "master_dispatch_races_dispatch_a_ticket_once",
     "delivery_loop_review_revise_pass_merge_end_to_end",
+    "review_routing_refuses_agent_callers_implementers_and_foreign_groups",
     "delivery_loop_escalates_after_two_revise_rounds",
     "delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record",
     "cad446_board_syncs_delivery_without_a_terminal",

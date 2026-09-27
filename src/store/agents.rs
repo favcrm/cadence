@@ -255,8 +255,11 @@ impl Store {
         identifier(new.alias, "Agent alias")?;
         identifier(new.provider, "Provider")?;
         identifier(new.endpoint_kind, "Endpoint kind")?;
-        if !matches!(new.role, "pm" | "worker") {
-            return Err(Error::rejected("Role must be pm or worker"));
+        // `reviewer` designates who the delivery loop may route a review
+        // to (CAD-591). It is not a PM and it does not grant the memory
+        // author/finalize roles, which stay `pm` | `worker`.
+        if !matches!(new.role, "pm" | "worker" | "reviewer") {
+            return Err(Error::rejected("Role must be pm, worker, or reviewer"));
         }
         if !matches!(new.sandbox, "read-only" | "workspace-write") {
             return Err(Error::rejected(

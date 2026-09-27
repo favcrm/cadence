@@ -202,6 +202,10 @@ pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> R
         Duration::from_secs(2),
     )
     .ok();
+    // CAD-129: the test queue. Best-effort like the slot line — a
+    // daemon that does not serve it yet leaves the field null.
+    let tests =
+        client::rpc_timeout(state_dir, "test_queue", json!({}), Duration::from_secs(2)).ok();
     Ok(json!({
         "agents": rows,
         // CAD-576: which agents the rows (and the footer's counts)
@@ -213,6 +217,7 @@ pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> R
             "unread_inboxes": unread_inboxes,
             "stale_inboxes": stale_inboxes,
             "slots": slots,
+            "tests": tests,
             // CAD-383: every in-flight claim, listed agents or not — a
             // PM whose lanes run outside cadence shows up here.
             "claims": claims,
@@ -390,6 +395,18 @@ pub(super) fn print_status_table(view: &Value) {
             waiting,
             cadence_agent::slots::fmt_wait(longest)
         );
+    }
+    let tests = &view["footer"]["tests"];
+    if tests.is_object() {
+        let running = tests["running"].as_array().map_or(0, Vec::len);
+        let queued = tests["queued"].as_u64().unwrap_or(0);
+        if running > 0 || queued > 0 {
+            let holder = tests["holder"].as_str().unwrap_or("-");
+            println!(
+                "tests: {running}/{} running, {queued} queued, holder {holder}",
+                tests["capacity"].as_u64().unwrap_or(0)
+            );
+        }
     }
     // CAD-383: claims held by someone with no row here — a PM whose
     // lanes run outside cadence, or an agent outside the scope.

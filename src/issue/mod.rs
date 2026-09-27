@@ -6,6 +6,7 @@
 //! daemon socket.
 
 pub mod app;
+pub mod app_catalog;
 pub mod areas;
 pub mod board;
 pub mod claim;
@@ -16,6 +17,7 @@ pub mod doctor;
 pub mod finish;
 pub mod history;
 pub mod hooks;
+pub mod idea;
 pub mod line_times;
 pub mod lint;
 pub mod model;

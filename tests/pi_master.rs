@@ -575,6 +575,15 @@ fn master_env_is_allowlisted_not_inherited() {
         .unwrap();
     let names = recorded_env(state.path());
     for name in PLANTED_ENV {
+        if *name == "PI_CODING_AGENT_DIR" {
+            let private: bool = serde_json::from_str(
+                &std::fs::read_to_string(state.path().join("master/cwd/pi-private-config.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(private, "Pi inherited a foreign config directory");
+            continue;
+        }
         assert!(
             !names.iter().any(|n| n == name),
             "planted {name} reached the pi child: {names:?}"
@@ -589,6 +598,47 @@ fn master_env_is_allowlisted_not_inherited() {
     ] {
         assert!(names.iter().any(|n| n == name), "{name} missing: {names:?}");
     }
+    pi.close();
+}
+
+#[test]
+fn unconfined_master_error_names_the_private_config_it_read() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "no-credits",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    let error = pi
+        .run_turn("hi", "m1", &|_| {})
+        .err()
+        .expect("model cannot authenticate")
+        .to_string();
+    assert!(
+        error.contains(state.path().join("master/pi").to_str().unwrap()),
+        "{error}"
+    );
+    assert!(error.contains("models.json is absent"), "{error}");
+    assert!(
+        !error.contains("Pi has no usable credentials"),
+        "missing config must not be diagnosed as proven bad credentials: {error}"
+    );
+    std::fs::write(state.path().join("master/pi/models.json"), "{}").unwrap();
+    let configured_error = pi
+        .run_turn("hi", "m2", &|_| {})
+        .err()
+        .expect("catalog alone does not supply auth")
+        .to_string();
+    assert!(
+        configured_error.contains("models.json is present"),
+        "{configured_error}"
+    );
+    assert!(
+        !configured_error.contains("models.json is absent"),
+        "{configured_error}"
+    );
     pi.close();
 }
 
@@ -1322,6 +1372,88 @@ fn session_command_model_gates_per_role() {
         .unwrap();
     assert_eq!(out["model"]["id"], "model-1", "{out}");
     worker.close();
+}
+
+/// CAD-602: neither an allowed model nor forged row fields can move
+/// the guard-dependent master onto a provider executing its own tools.
+#[test]
+fn agentic_provider_master_open_and_concurrent_switch_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let pi = master_adapter(
+        "normal",
+        &state,
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    std::fs::write(
+        state.join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"cursor/grok-4.7-high\"]\n",
+    )
+    .unwrap();
+    let mut forged = master_agent(
+        &state,
+        json!({"model": "cursor/grok-4.7-high", "role": "worker", "unconfined": true}),
+    );
+    forged.role = "worker".into();
+    let err = pi
+        .open(&forged)
+        .err()
+        .expect("agentic open must refuse")
+        .to_string();
+    assert!(err.contains("agentic"), "{err}");
+    assert!(!state.join("master/cwd/pi-rpc.jsonl").exists());
+
+    pi.open(&master_agent(
+        &state,
+        json!({"model": "fake/model-1", "unconfined": true}),
+    ))
+    .unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let err = pi
+                    .session_command("model", Some("cursor/grok-4.7-high"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("agentic"), "{err}");
+            });
+        }
+    });
+    let journal = std::fs::read_to_string(state.join("master/cwd/pi-rpc.jsonl")).unwrap();
+    assert!(
+        !journal
+            .lines()
+            .any(|line| { serde_json::from_str::<Value>(line).unwrap()["rpc"] == "set_model" }),
+        "{journal}"
+    );
+    pi.close();
+}
+
+#[test]
+fn agentic_provider_master_detached_child_refuses() {
+    // Session detachment must not change the policy: adapter identity,
+    // not process ancestry or an agent-supplied role field, owns the gate.
+    if std::env::var_os("CADENCE_602_DETACHED_PROOF").is_some() {
+        agentic_provider_master_open_and_concurrent_switch_refuse();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agentic_provider_master_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_602_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "detached proof failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The `wrong-model` fake accepts `--model` then reports a different

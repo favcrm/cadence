@@ -44,6 +44,7 @@ mod home;
 mod lane;
 mod login;
 mod operator;
+mod platform_account;
 mod read_model;
 mod stages;
 mod threads;
@@ -2050,6 +2051,15 @@ fn write_route(
     // The operator's plan decision (CAD-328 → CAD-360 RPCs) and answer
     // to a question report (CAD-341) — guarded, operator-only, inside
     // `home`.
+    if let Some(id) = home::idea_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_idea(&mut request, state_dir, id);
+        send(request, resp);
+        return;
+    }
     if let Some((epic, verb)) = home::plan_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2859,17 +2869,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
                 .then(|| home::operator_viewer(&request, state_dir, opts));
             let session = operator::meta(&request, state_dir, opts);
+            // Display the same verified identity that attributes public
+            // board writes, never a name supplied by request fields.
+            let actor = serde_json::from_value::<crate::operator_auth::BoardUser>(
+                session["session"]["user"].clone(),
+            )
+            .map(|user| user.actor())
+            .unwrap_or(actor);
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
                     "signed_in": session["signed_in"],
+                    "hosted": session["hosted"],
                     "session": session["session"],
                     "login_hint": session["login_hint"],
                     "tab_signed_out": session["tab_signed_out"],
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
                     "operator": operator,
+                    "platform_account_configured": opts.public.as_ref().is_some_and(|board| board.issuer == "http://api.internal"),
                     "tailnet_url": opts
                         .tailnet
                         .as_ref()
@@ -2890,6 +2909,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/platform-account" => send(request, platform_account::get(opts)),
         // The serving binary's build id and nothing else — cheap, and
         // unauthenticated like `/api/health`, so a tab whose stream is
         // stuck reconnecting can compare it against its own bundle's.

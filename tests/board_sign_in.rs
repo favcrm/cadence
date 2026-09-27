@@ -239,6 +239,20 @@ fn platform_sign_in_opens_and_gates_a_named_session() {
     let token = cookie_token(&set);
     let cookie = format!("Cookie: __Host-aos-board-session={token}");
 
+    let (code, _, body) = http_write(port, "GET", "/api/meta", &host, &[&cookie], b"");
+    assert_eq!(code, 200, "{body}");
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["hosted"], true);
+    assert_eq!(meta["session"]["user"]["name"], "Fable Chen");
+    assert_eq!(meta["session"]["user"]["email"], "fable@example.com");
+    assert_eq!(meta["session"]["user"]["role"], "operator");
+    assert_eq!(meta["actor"], "Fable Chen <fable@example.com> (board)");
+    let (code, local) = http(port, "GET", "/api/meta", &loopback);
+    assert_eq!(code, 200, "{local}");
+    let local: Value = serde_json::from_str(&local).unwrap();
+    assert_eq!(local["hosted"], false);
+    assert_eq!(local["actor"], "operator (ui)");
+
     // The cookie alone is the credential: reads pass with it.
     let (code, _, body) = http_write(port, "GET", "/api/issues", &host, &[&cookie], b"");
     assert_eq!(code, 200, "{body}");
@@ -552,6 +566,19 @@ fn a_member_session_never_decides() {
 
     // Participate: an agent-allowed write succeeds and is attributed to
     // the member's handle, not `operator`.
+    let (code, _, body) = http_write(
+        port,
+        "GET",
+        "/api/meta?operator=1&role=operator&actor=forged",
+        &host,
+        &[&cookie, "Tailscale-User-Login: forged@example.com"],
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["session"]["user"]["role"], "member");
+    assert_eq!(meta["operator"], false);
+    assert_eq!(meta["actor"], "Fable Chen <fable@example.com> (board)");
     let (code, _, body) = http_write(
         port,
         "POST",
