@@ -211,6 +211,139 @@ fn cad743_upgrade_is_operator_only_race_checked_and_preserves_identity() {
 }
 
 #[test]
+fn cad743_upgrade_refuses_full_binding_history_before_journal_mutation() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let source_manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&source_manifest).unwrap();
+    std::fs::write(
+        &source_manifest,
+        original
+            .replace("version: 0.1.0", "version: 0.2.0")
+            .replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send",
+            ),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let old_config = json!({"schema":1,"install_id":id,"context":null,
+        "bundle_digest":installed["digest"]});
+    let old_receipt = cadence_agent::store::app_runs::material_digest(&json!({
+        "kind":"app-binding-v1","install_id":id,"context_id":null,
+        "slot":"publication","config":old_config,
+    }));
+    let tx = conn.transaction().unwrap();
+    for index in 0..1000 {
+        tx.execute(
+            "INSERT INTO app_bindings
+             (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+             VALUES(?1,?2,NULL,'installation','publication',1,'revoked',?3,?4,?5,1,1)",
+            rusqlite::params![
+                format!("old-binding-{index}"),
+                id,
+                old_config.to_string(),
+                old_receipt,
+                format!("old-request-{index}"),
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let head = w.head();
+    let refusal = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+            "expected_generation":installed["catalog_generation"],
+            "expected_new_digest":proposed["digest"],"request_id":"capacity-blocked"}),
+    );
+    assert!(
+        refusal
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("binding capacity")),
+        "upgrade must refuse specifically for exhausted binding capacity: {refusal:?}"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps/upgrade-pending.yaml").exists());
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+}
+
+#[test]
+fn cad743_upgrade_after_one_hundred_old_bindings_can_create_new_version_binding() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let source_manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&source_manifest).unwrap();
+    std::fs::write(
+        &source_manifest,
+        original
+            .replace("version: 0.1.0", "version: 0.2.0")
+            .replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send",
+            ),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let old_config = json!({"schema":1,"install_id":id,"context":null,
+        "bundle_digest":installed["digest"]});
+    let old_receipt = cadence_agent::store::app_runs::material_digest(&json!({
+        "kind":"app-binding-v1","install_id":id,"context_id":null,
+        "slot":"publication","config":old_config,
+    }));
+    let tx = conn.transaction().unwrap();
+    for index in 0..100 {
+        tx.execute(
+            "INSERT INTO app_bindings
+             (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+             VALUES(?1,?2,NULL,'installation','publication',1,'revoked',?3,?4,?5,1,1)",
+            rusqlite::params![
+                format!("old-binding-{index}"), id, old_config.to_string(),
+                old_receipt, format!("old-request-{index}"),
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+            "expected_generation":installed["catalog_generation"],
+            "expected_new_digest":proposed["digest"],"request_id":"capacity-available"}),
+        )
+        .unwrap();
+    assert_eq!(upgraded["digest"], proposed["digest"]);
+    let store = cadence_agent::store::Store::open(&w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let binding = store
+        .app_binding_create(
+            id,
+            None,
+            "publication",
+            &json!({"schema":1,"install_id":id,"context":null,"bundle_digest":proposed["digest"]}),
+            "new-version-binding",
+        )
+        .unwrap();
+    assert_eq!(
+        binding["binding"]["config"]["bundle_digest"],
+        proposed["digest"]
+    );
+    let listed = w
+        .daemon
+        .operator_rpc("app_binding_list", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(listed["bindings"][0]["id"], binding["binding"]["id"]);
+    assert_eq!(listed["truncated"], true);
+}
+
+#[test]
 fn cad743_upgrade_refuses_nonterminal_run_and_retains_terminal_history() {
     let w = Workspace::new();
     let installed = w.install().unwrap();

@@ -515,6 +515,11 @@ impl Shared {
                     },
                     |files, manifest| {
                         self.store.app_install_upgrade_ready(id)?;
+                        self.store.app_binding_upgrade_capacity(
+                            id,
+                            required_str(params, "expected_new_digest")?,
+                            &manifest.capabilities.keys().cloned().collect::<Vec<_>>(),
+                        )?;
                         let contexts = self.store.app_context_list(id)?;
                         let mut incompatible_contexts = Vec::new();
                         for context in contexts["contexts"].as_array().into_iter().flatten() {
