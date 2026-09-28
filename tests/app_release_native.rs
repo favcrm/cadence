@@ -919,7 +919,6 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
     use base64::Engine as _;
     use image::ImageEncoder as _;
     use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
 
