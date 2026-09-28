@@ -41,7 +41,9 @@ pub use commands::{
     cmd_issue_set_ready, cmd_issue_show, CMD_DELIVERY_SYNC, CMD_ISSUE_SYNC, CMD_RESTART_WHEN_IDLE,
     CMD_UPGRADE_LATEST_MAIN,
 };
-use github_cache::{cache_file, github, github_bounded, read_cache, write_cache, GhCache};
+#[cfg(test)]
+use github_cache::write_cache;
+use github_cache::{cache_file, github, github_bounded, read_cache};
 #[allow(unused_imports)] // Preserve the existing crate-visible type path.
 pub(crate) use main_ci::MainCiAlerts;
 pub(crate) use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
