@@ -13,6 +13,16 @@ use crate::platform::AppCapabilityAsset;
 use super::{IMAGE_TOOL, PLATFORM};
 
 const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+/// CAD-734: base64 image custody keeps the existing 1 MiB AgenticOS JSON
+/// response cap end to end. A 512 KiB decoded asset needs at most 699,052
+/// base64 characters, which plus a bounded envelope fits the unchanged
+/// 1 MiB Cadence JSON cap and the 2 MiB upstream Treg body cap. Larger
+/// assets stay on the URL-mode path; raising this bound requires a
+/// coordinated storage/replay and failure-cost proof, never a lone buffer.
+pub(crate) const BASE64_ASSET_LIMIT: usize = 512 * 1024;
+/// Ceiling for the single encoded field, checked before any decode work.
+/// 699,052 characters carry 512 KiB; the slack covers padding only.
+pub(crate) const BASE64_ENCODED_LIMIT: usize = 700_000;
 // The fixed image-01 operation asks for one square image. Keep decode work
 // independent of the compressed byte count: a tiny file can expand enormously.
 const IMAGE_SIDE_LIMIT: u32 = 2048;
@@ -236,6 +246,17 @@ pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a s
     {
         return Err("image provider did not attest one successful image".into());
     }
+    // A base64-mode payload must never be accepted as a URL-mode result;
+    // mode confusion would let one paid outcome satisfy the other run.
+    if let Some(entries) = result["data"].get("image_base64") {
+        let non_empty = entries
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(true);
+        if non_empty {
+            return Err("image URL result carries an unexpected base64 payload".into());
+        }
+    }
     let images = result["data"]["image_urls"]
         .as_array()
         .ok_or("image URL list is missing")?;
@@ -262,7 +283,64 @@ pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a s
     Ok(url)
 }
 
+/// CAD-734: accept exactly one successful `data.image_base64` value and
+/// return its custody-checked bytes plus sniffed media type. The encoded
+/// field is bounded before decoding, the decoded bytes are bounded to
+/// [`BASE64_ASSET_LIMIT`], and the bytes then pass the same full
+/// PNG/JPEG/WebP decode, square/dimension/pixel/allocation limits as
+/// CDN custody. The encoded string is never retained: callers keep only
+/// the decoded asset bytes behind an immutable run-scoped receipt.
+pub(super) fn image_base64_bytes(result: &Value) -> Result<(Vec<u8>, &'static str), String> {
+    if result["base_resp"]["status_code"] != 0
+        || !matches!(result["metadata"]["success_count"].as_str(), Some("1"))
+        || !matches!(result["metadata"]["failed_count"].as_str(), Some("0"))
+    {
+        return Err("image provider did not attest one successful image".into());
+    }
+    // URL-mode output must never satisfy a base64-mode run (and vice
+    // versa): a retry under the same idempotency key cannot change mode.
+    if let Some(urls) = result["data"].get("image_urls") {
+        let non_empty = urls
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(true);
+        if non_empty {
+            return Err("image base64 result carries an unexpected URL payload".into());
+        }
+    }
+    let entries = result["data"]["image_base64"]
+        .as_array()
+        .ok_or("image base64 list is missing")?;
+    if entries.len() != 1 {
+        return Err("image provider returned a different number of images".into());
+    }
+    let encoded = entries[0]
+        .as_str()
+        .ok_or("image base64 value is malformed")?;
+    if encoded.is_empty() || encoded.len() > BASE64_ENCODED_LIMIT {
+        return Err("image base64 value exceeds the supported bound".into());
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "image base64 value is malformed")?;
+    if bytes.is_empty() || bytes.len() > BASE64_ASSET_LIMIT {
+        return Err("image base64 payload exceeds the 512 KiB base64 asset bound".into());
+    }
+    let media_type = image_data_mime(&bytes)?;
+    Ok((bytes, media_type))
+}
 pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+    let sniffed = image_data_mime(bytes)?;
+    if header.trim().to_ascii_lowercase() != sniffed {
+        return Err("downloaded image MIME differs from its bytes".into());
+    }
+    Ok(sniffed)
+}
+
+/// Byte-sniffed custody decode shared by CDN and base64 paths: no header
+/// trust, full decode inside square/dimension/pixel/allocation limits.
+fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
     let png = bytes.len() >= 45
         && bytes.starts_with(&[
             0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
@@ -285,9 +363,6 @@ pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, Str
     } else {
         return Err("downloaded image has no supported image signature".into());
     };
-    if header.trim().to_ascii_lowercase() != sniffed {
-        return Err("downloaded image MIME differs from its bytes".into());
-    }
     let format = match sniffed {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -383,6 +458,100 @@ mod tests {
             .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn cad734_base64_custody_accepts_one_bounded_image_and_refuses_forgeries() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let png = encoded_png(1, 1);
+        let good = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}});
+        let (bytes, mime) = image_base64_bytes(&good).unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(mime, "image/png");
+        let jpeg = encoded_jpeg(1, 1);
+        let (bytes, mime) = image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&jpeg)]}}))
+            .unwrap();
+        assert_eq!(bytes, jpeg);
+        assert_eq!(mime, "image/jpeg");
+        for (name, result) in [
+            (
+                "missing field",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{}}),
+            ),
+            (
+                "empty list",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[]}}),
+            ),
+            (
+                "two images",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png), engine.encode(&png)]}}),
+            ),
+            (
+                "not a string",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[42]}}),
+            ),
+            (
+                "empty string",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[""]}}),
+            ),
+            (
+                "malformed base64",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":["!!!not-base64!!!"]}}),
+            ),
+            (
+                "non-standard alphabet rejected",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("-{}", engine.encode(&png))]}}),
+            ),
+            (
+                "data-url prefix rejected",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("data:image/png;base64,{}", engine.encode(&png))]}}),
+            ),
+            (
+                "failed attestation",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"1","success_count":"0"},"data":{"image_base64":[engine.encode(&png)]}}),
+            ),
+            (
+                "bad status",
+                serde_json::json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}}),
+            ),
+            (
+                "url payload in base64 result",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)],"image_urls":["https://images.example.test/a.png"]}}),
+            ),
+            (
+                "not an image",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(b"<svg>not an image</svg>")]}}),
+            ),
+            (
+                "non-square",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(encoded_png(2, 1))]}}),
+            ),
+        ] {
+            assert!(image_base64_bytes(&result).is_err(), "{name}");
+        }
+        // URL-mode results must refuse a smuggled base64 payload, and an
+        // oversized encoded field must fail before any decode work.
+        let smuggled = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a.png"],"image_base64":[engine.encode(&png)]}});
+        assert!(image_url(&smuggled, &["images.example.test".into()]).is_err());
+        let oversized = "A".repeat(BASE64_ENCODED_LIMIT + 1);
+        assert!(image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[oversized]}})).is_err());
+        // A 512 KiB asset fits; anything larger is refused even though the
+        // field bound would admit its encoding.
+        let big = vec![0u8; BASE64_ASSET_LIMIT + 1];
+        let big_result = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&big)]}});
+        assert!(image_base64_bytes(&big_result).is_err());
+        // Encoded-size proof: the largest supported asset plus a bounded
+        // envelope must fit the unchanged 1 MiB JSON response cap.
+        let max_encoded = BASE64_ASSET_LIMIT.div_ceil(3) * 4;
+        assert!(
+            max_encoded <= BASE64_ENCODED_LIMIT,
+            "encoded bound must admit 512 KiB"
+        );
+        assert!(
+            max_encoded + 2048 <= 1024 * 1024,
+            "base64 JSON must fit the 1 MiB cap"
+        );
     }
 
     #[test]

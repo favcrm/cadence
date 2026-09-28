@@ -16,8 +16,12 @@ use crate::platform::adapter::PlatformAdapter;
 use crate::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
-use crate::platform::{AppCapabilityOutput, AppCapabilityQuote};
-use image::{download_image, image_agent, image_prompt, image_url};
+use crate::platform::{AppCapabilityAsset, AppCapabilityOutput, AppCapabilityQuote};
+#[cfg(test)]
+use image::BASE64_ENCODED_LIMIT;
+use image::{
+    download_image, image_agent, image_base64_bytes, image_prompt, image_url, BASE64_ASSET_LIMIT,
+};
 #[cfg(test)]
 use image::{image_mime, public_ip};
 
@@ -288,6 +292,16 @@ impl AgenticosExternalAdapter {
         Ok(normalized)
     }
 
+    /// CAD-734: the adapter fixes `response_format` from trusted deployment
+    /// metadata, never worker input. An approved CDN host selects URL mode;
+    /// without one the adapter quotes base64 mode, whose revision carries a
+    /// `base64:` prefix so a URL-mode run can never silently execute as
+    /// base64 under the same idempotency key (mode changes need a fresh
+    /// quote and operator approval).
+    fn image_base64_quote(&self) -> bool {
+        self.deployment_pin.as_deref() == Some(MANIFEST_PIN) && self.image_hosts.is_empty()
+    }
+
     fn call_image(
         &self,
         credential: &[u8],
@@ -295,7 +309,18 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, String> {
-        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) || self.image_hosts.is_empty() {
+        let base64 = authority["quote"]["price_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("base64:"));
+        if base64 {
+            if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+                return Err(
+                    "base64 image generation has not been approved by this deployment".into(),
+                );
+            }
+        } else if self.deployment_pin.as_deref() != Some(MANIFEST_PIN)
+            || self.image_hosts.is_empty()
+        {
             return Err("image CDN host has not been approved by this deployment".into());
         }
         let prompt = image_prompt(authority, input)?;
@@ -313,12 +338,13 @@ impl AgenticosExternalAdapter {
         {
             return Err("provider idempotency key is invalid".into());
         }
+        let response_format = if base64 { "base64" } else { "url" };
         let mut response = self.http.post(format!("{}{CALL_PATH}", self.base))
             .header("authorization", &format!("Bearer {token}"))
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "slug": IMAGE_TOOL,
-                "body": {"model":"image-01","prompt":prompt,"aspect_ratio":"1:1","response_format":"url","n":1,"prompt_optimizer":false},
+                "body": {"model":"image-01","prompt":prompt,"aspect_ratio":"1:1","response_format":response_format,"n":1,"prompt_optimizer":false},
                 "max_charge_minor": ceiling,
             }))
             .map_err(|_| "AgenticOS image request could not reach the provider")?;
@@ -343,27 +369,38 @@ impl AgenticosExternalAdapter {
         if charged > ceiling {
             return Err("AgenticOS image charge exceeds the approved ceiling".into());
         }
-        let url = image_url(&data["result"], &self.image_hosts)?;
-        #[cfg(feature = "test-seam")]
-        let asset = if let Some(local) = &self.test_cdn_url {
-            let config = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(20)))
-                .http_status_as_error(false)
-                .max_redirects(0)
-                .proxy(None)
-                .build();
-            download_image(&ureq::Agent::new_with_config(config), local)?
+        let asset = if base64 {
+            // Custody-checked inline bytes: the encoded string is dropped
+            // here and never stored as the reviewed asset.
+            let (bytes, media_type) = image_base64_bytes(&data["result"])?;
+            AppCapabilityAsset {
+                media_type: media_type.into(),
+                bytes,
+            }
         } else {
-            download_image(&self.image_http, url)?
+            let url = image_url(&data["result"], &self.image_hosts)?;
+            #[cfg(feature = "test-seam")]
+            let asset = if let Some(local) = &self.test_cdn_url {
+                let config = ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(20)))
+                    .http_status_as_error(false)
+                    .max_redirects(0)
+                    .proxy(None)
+                    .build();
+                download_image(&ureq::Agent::new_with_config(config), local)?
+            } else {
+                download_image(&self.image_http, url)?
+            };
+            #[cfg(not(feature = "test-seam"))]
+            let asset = download_image(&self.image_http, url)?;
+            asset
         };
-        #[cfg(not(feature = "test-seam"))]
-        let asset = download_image(&self.image_http, url)?;
         let digest = format!("sha256:{:x}", Sha256::digest(&asset.bytes));
         let result = json!({
             "schema":1,"kind":"media.generated.image","provider":PLATFORM,
             "source_receipt_id":authority["source"]["receipt_id"],
             "source_post_id":authority["source"]["post"]["id"],
-            "model":"image-01","aspect_ratio":"1:1",
+            "model":"image-01","aspect_ratio":"1:1","n":1,"response_format":response_format,
             "charge":data["price"],"repeated":data["repeated"],
             "asset_sha256":digest,"asset_media_type":asset.media_type,
         });
@@ -576,15 +613,30 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
-        if binding["config"]["mapping"]["capability"] == "media.generate"
-            && (self.deployment_pin.as_deref() != Some(MANIFEST_PIN) || self.image_hosts.is_empty())
-        {
-            return Err("image CDN host has not been approved by this deployment".into());
+        if binding["config"]["mapping"]["capability"] == "media.generate" {
+            if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+                return Err("image generation has not been approved by this deployment".into());
+            }
+            if self.image_hosts.is_empty() && binding["config"]["mapping"]["tool"] != IMAGE_TOOL {
+                return Err("provider quote names an unreviewed action".into());
+            }
         }
         let (total, mut revision) = self.quote_fixed(credential, binding)?;
         if binding["config"]["mapping"]["capability"] == "media.generate" {
-            let frozen = json!({"provider_quote":revision,"approved_image_hosts":self.image_hosts});
-            revision = format!("sha256:{:x}", Sha256::digest(frozen.to_string().as_bytes()));
+            if self.image_base64_quote() {
+                let frozen = json!({"provider_quote":revision,"response_format":"base64","model":"image-01","aspect_ratio":"1:1","n":1,"base64_asset_limit_bytes":BASE64_ASSET_LIMIT});
+                revision = format!(
+                    "base64:sha256:{:x}",
+                    Sha256::digest(frozen.to_string().as_bytes())
+                );
+            } else {
+                if self.image_hosts.is_empty() {
+                    return Err("image CDN host has not been approved by this deployment".into());
+                }
+                let frozen =
+                    json!({"provider_quote":revision,"approved_image_hosts":self.image_hosts});
+                revision = format!("sha256:{:x}", Sha256::digest(frozen.to_string().as_bytes()));
+            }
         }
         Ok(AppCapabilityQuote {
             schema: 1,
@@ -1068,6 +1120,290 @@ mod tests {
         for _ in 0..3 {
             assert!(adapter
                 .execute_app_capability(b"test-token", &proof, &json!({}), "stable-image-request")
+                .is_err());
+        }
+        worker.join().unwrap();
+    }
+
+    fn cad734_test_png() -> Vec<u8> {
+        use ::image::ImageEncoder as _;
+        let mut bytes = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0], 1, 1, ::image::ExtendedColorType::L8)
+            .unwrap();
+        bytes
+    }
+
+    fn cad734_image_proof(quote: Value) -> Value {
+        let mut proof = authority();
+        proof["slot"] = json!("image");
+        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
+        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
+        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
+        proof["quote"] = quote;
+        proof
+    }
+
+    #[test]
+    fn cad734_base64_quote_pins_mode_without_a_cdn_host() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider quote");
+                assert_eq!(
+                    request.url(),
+                    "/v1/runtime/tools/minimax.image-gen.from_text"
+                );
+                request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                    "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
+                    "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
+                }}).to_string())).unwrap();
+            }
+        });
+        // No approved CDN host: the adapter fixes base64 mode from trusted
+        // deployment metadata, never from worker input.
+        let base64_adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        assert!(base64_adapter.image_hosts.is_empty());
+        let binding = cad734_image_proof(Value::Null)["binding"].clone();
+        let first = base64_adapter
+            .quote_app_capability(b"test-token", &binding)
+            .unwrap();
+        assert_eq!(first.total_price_micros, 31_500);
+        assert!(
+            first.price_revision.starts_with("base64:sha256:"),
+            "base64 runs carry a mode prefix URL runs never have"
+        );
+        let second = base64_adapter
+            .quote_app_capability(b"test-token", &binding)
+            .unwrap();
+        assert_eq!(first.price_revision, second.price_revision);
+        // An approved host selects URL mode with the legacy revision.
+        let mut url_adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        url_adapter.image_hosts = vec!["images.example.test".into()];
+        let url_quote = url_adapter
+            .quote_app_capability(b"test-token", &binding)
+            .unwrap();
+        assert!(!url_quote.price_revision.starts_with("base64:"));
+        assert_ne!(url_quote.price_revision, first.price_revision);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cad734_base64_call_uses_fixed_body_and_retains_bytes_not_text() {
+        use base64::Engine as _;
+        let png = cad734_test_png();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        assert!(encoded.len() < BASE64_ENCODED_LIMIT);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let fixture = encoded.clone();
+        let worker = std::thread::spawn(move || {
+            for index in 0..2 {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                if index == 0 {
+                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                        "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
+                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
+                    }}).to_string())).unwrap();
+                } else {
+                    assert_eq!(request.url(), CALL_PATH);
+                    assert_eq!(
+                        request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("idempotency-key"))
+                            .map(|header| header.value.as_str()),
+                        Some("app-call-image-base64")
+                    );
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    let body: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["slug"], IMAGE_TOOL);
+                    assert_eq!(body["max_charge_minor"], 31_500);
+                    assert_eq!(body["body"]["model"], "image-01");
+                    assert_eq!(body["body"]["aspect_ratio"], "1:1");
+                    assert_eq!(body["body"]["n"], 1);
+                    assert_eq!(body["body"]["response_format"], "base64");
+                    assert_eq!(body["body"]["prompt_optimizer"], false);
+                    assert!(body.get("company").is_none());
+                    assert!(body.get("query").is_none());
+                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                        "slug":IMAGE_TOOL,"repeated":false,
+                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},
+                        "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_base64":[fixture]}}
+                    }}).to_string())).unwrap();
+                }
+            }
+        });
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        let binding = cad734_image_proof(Value::Null)["binding"].clone();
+        let quote = adapter
+            .quote_app_capability(b"test-token", &binding)
+            .unwrap();
+        let proof = cad734_image_proof(serde_json::to_value(quote).unwrap());
+        let output = adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-base64")
+            .unwrap();
+        let asset = output.asset.expect("base64 run retains an asset");
+        assert_eq!(asset.bytes, png);
+        assert_eq!(asset.media_type, "image/png");
+        assert_eq!(output.result["response_format"], "base64");
+        assert_eq!(output.result["model"], "image-01");
+        assert_eq!(
+            output.result["asset_sha256"],
+            format!("sha256:{:x}", Sha256::digest(&png))
+        );
+        // The reviewed receipt carries digests only: no encoded image,
+        // temporary URL or worker assertion becomes the reviewed asset.
+        let serialized = output.result.to_string();
+        assert!(!serialized.contains(&encoded));
+        assert!(!serialized.contains("image_urls"));
+        assert!(!serialized.contains("image_base64"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cad734_mode_never_changes_under_a_stable_idempotency_key() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cad734_test_png());
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for (index, payload) in [
+                // Each authority receives the other mode's payload: neither
+                // retry may silently change mode under its stable key.
+                json!({"image_base64":[encoded]}),
+                json!({"image_urls":["https://images.example.test/a.png"]}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                assert_eq!(request.url(), CALL_PATH);
+                let key = if index == 0 {
+                    "stable-url-run"
+                } else {
+                    "stable-base64-run"
+                };
+                assert_eq!(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("idempotency-key"))
+                        .map(|header| header.value.as_str()),
+                    Some(key)
+                );
+                request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                    "slug":IMAGE_TOOL,"repeated":false,
+                    "price":{"currency":"USD","scale":6,"amount":"0.031500"},
+                    "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":payload}
+                }}).to_string())).unwrap();
+            }
+        });
+        let ceiling = json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500});
+        let mut url_adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        url_adapter.image_hosts = vec!["images.example.test".into()];
+        // A URL-mode authority that receives a base64 payload refuses: the
+        // retry cannot silently become a base64 run under the same key.
+        let mut url_quote = ceiling.clone();
+        url_quote["price_revision"] = json!("sha256:legacy-url-quote");
+        let url_proof = cad734_image_proof(url_quote);
+        assert!(url_adapter
+            .execute_app_capability(b"test-token", &url_proof, &json!({}), "stable-url-run")
+            .is_err());
+        // A base64-mode authority that receives a URL payload refuses too.
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        let mut base64_quote = ceiling.clone();
+        base64_quote["price_revision"] = json!("base64:sha256:test-quote");
+        let base64_proof = cad734_image_proof(base64_quote);
+        assert!(adapter
+            .execute_app_capability(
+                b"test-token",
+                &base64_proof,
+                &json!({}),
+                "stable-base64-run"
+            )
+            .is_err());
+        // A base64 authority on an unapproved deployment, and a URL
+        // authority after its host approval lapses, both fail closed.
+        let unpinned = AgenticosExternalAdapter::with_deployment_pin(&base, None).unwrap();
+        assert!(unpinned
+            .execute_app_capability(
+                b"test-token",
+                &base64_proof,
+                &json!({}),
+                "stable-base64-run"
+            )
+            .is_err());
+        let lapsed =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        assert!(lapsed
+            .execute_app_capability(b"test-token", &url_proof, &json!({}), "stable-url-run")
+            .is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cad734_base64_refuses_uncertain_outcomes_without_a_second_call() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for status in [429, 200] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                assert_eq!(request.url(), CALL_PATH);
+                assert_eq!(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("idempotency-key"))
+                        .map(|header| header.value.as_str()),
+                    Some("stable-base64-uncertain")
+                );
+                let body = if status == 200 {
+                    json!({"ok":true,"data":{"slug":IMAGE_TOOL,"repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"0","failed_count":"1"},"data":{"image_base64":[]}}}})
+                } else {
+                    json!({"ok":false,"error":{"code":"provider_unavailable"}})
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                    )
+                    .unwrap();
+            }
+        });
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        let proof = cad734_image_proof(
+            json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"base64:sha256:test-quote"}),
+        );
+        // Exactly one provider call per execute: failures stay visible and
+        // retry only with the same key, never as an automatic second call.
+        for _ in 0..2 {
+            assert!(adapter
+                .execute_app_capability(
+                    b"test-token",
+                    &proof,
+                    &json!({}),
+                    "stable-base64-uncertain"
+                )
                 .is_err());
         }
         worker.join().unwrap();
