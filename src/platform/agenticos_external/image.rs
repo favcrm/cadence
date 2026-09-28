@@ -426,6 +426,35 @@ pub(super) fn download_image(agent: &ureq::Agent, url: &str) -> Result<AppCapabi
     })
 }
 
+/// CAD-734 mapping onto the AOS-94 slice-1 device media-import shape
+/// (agenticos-stack/agenticos-v2#214, `devicePublishMediaImportSchema`):
+/// `{connectionId, digest, mime, sizeBytes}` where digest is bare 64-hex
+/// SHA-256 and mime is `image/jpeg`/`image/png` within 10 MiB.
+/// This is a mapping, not a parallel contract: the backend owns the schema,
+/// the media key (`dp1.<workspace>.<connection>.<digest32>`, backend-issued
+/// and opaque to Cadence) and read-back verification. Cadence maps its
+/// retained custody bytes here and refuses publish-bound use of anything
+/// outside the slice-1 shape: WebP stays valid for Local draft custody but
+/// is refused here until PM decides transcode-or-amend, and the run
+/// receipt's `sha256:` prefix is stripped, never sent. Slice-2 send
+/// authority (preflight/send HTTP, grant presentation) is open and untouched
+/// by this lane.
+#[cfg(test)]
+pub(crate) const DEVICE_PUBLISH_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+#[cfg(test)]
+pub(super) fn device_import_fields(media_type: &str, bytes: &[u8]) -> Result<Value, String> {
+    if !matches!(media_type, "image/jpeg" | "image/png") {
+        return Err("publish-bound media type is outside the device import shape".into());
+    }
+    if bytes.is_empty() || bytes.len() > DEVICE_PUBLISH_MAX_IMAGE_BYTES {
+        return Err("publish-bound media size is outside the device import shape".into());
+    }
+    use sha2::Digest as _;
+    let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+    Ok(serde_json::json!({"digest": digest, "mime": media_type, "sizeBytes": bytes.len()}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +581,44 @@ mod tests {
             max_encoded + 2048 <= 1024 * 1024,
             "base64 JSON must fit the 1 MiB cap"
         );
+    }
+
+    #[test]
+    fn cad734_device_import_maps_custody_bytes_onto_slice1_shape() {
+        // Slice-1 fixture vector: sha256("test") is the fixture digest.
+        let fixture_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let fields = device_import_fields("image/jpeg", b"test").unwrap();
+        assert_eq!(fields["digest"], fixture_digest);
+        assert_eq!(fields["mime"], "image/jpeg");
+        assert_eq!(fields["sizeBytes"], 4);
+        // Digest is bare 64-hex: the run receipt's `sha256:` prefix is
+        // stripped, never sent; size is the exact retained byte count.
+        let png = encoded_png(1, 1);
+        let fields = device_import_fields("image/png", &png).unwrap();
+        assert_eq!(fields["digest"].as_str().unwrap().len(), 64);
+        assert!(fields["digest"]
+            .as_str()
+            .unwrap()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!fields["digest"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(fields["sizeBytes"], png.len() as u64);
+        // Adversarial: publish-bound mapping refuses everything outside the
+        // slice-1 shape, even custody-valid bytes.
+        assert!(device_import_fields("image/webp", &encoded_webp(1, 1)).is_err());
+        assert!(device_import_fields("IMAGE/JPEG", b"test").is_err());
+        assert!(device_import_fields("application/octet-stream", b"test").is_err());
+        assert!(device_import_fields("", b"test").is_err());
+        assert!(device_import_fields("image/jpeg", b"").is_err());
+        assert!(
+            device_import_fields("image/png", &vec![0u8; DEVICE_PUBLISH_MAX_IMAGE_BYTES + 1])
+                .is_err()
+        );
+        // Slice-1 cap admits every Cadence custody bound by construction.
+        const {
+            assert!(BASE64_ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
+            assert!(ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
+        }
     }
 
     #[test]
