@@ -4,6 +4,7 @@ goal: "One independently reviewed zh-HK caption and one retained generated image
 label: New Instagram caption and image
 publication_slot: publication
 capability_slots: [image]
+required_asset_slot: image
 inputs:
   subject: { ask: "Short post subject", example: "Customer follow-up" }
   source: { ask: "Selected source facts, supplied by the server" }

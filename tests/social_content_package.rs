@@ -69,6 +69,7 @@ fn cad714_image_acquisition_requires_one_fixed_draft_slot() {
     ]);
     let parsed = LocalWorkflow::parse(IMAGE_INSTAGRAM, &values).unwrap();
     assert_eq!(parsed.capability_slots, ["image"]);
+    assert_eq!(parsed.required_asset_slot.as_deref(), Some("image"));
     assert_eq!(parsed.publication_slot.as_deref(), Some("publication"));
     assert_eq!(parsed.steps.len(), 2);
     assert_eq!(parsed.steps[0].kind, "produce_text");
