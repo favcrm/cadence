@@ -20,6 +20,7 @@ const VERSION: &str = "hosted-cadence-auth.v1";
 const MAX_RESPONSE: u64 = 64 * 1024;
 const MAX_SERVICE_TOKEN: usize = 128;
 const RECORD: &str = "enrollment.json";
+const TRUSTED_ISSUER: &str = "trusted-issuer";
 
 fn reject(message: &str) -> Error {
     Error::rejected(message)
@@ -201,6 +202,28 @@ fn private_dir(dir: &Path, create: bool) -> Result<()> {
     }
     Ok(())
 }
+/// The operator must establish this independent trust pin before a service
+/// credential is ever transmitted. Enrollment never creates it.
+fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
+    private_dir(dir, false)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(TRUSTED_ISSUER))
+        .map_err(|_| reject("Trusted issuer pin is missing"))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject("Trusted issuer pin must be a private owned file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(2049).read_to_end(&mut bytes)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| reject("Invalid trusted issuer pin"))?;
+    let pinned = text.strip_suffix('\n').unwrap_or(text);
+    if pinned.len() > 2048 || origin(pinned, cfg!(test))?.as_str() != issuer {
+        return Err(reject("Issuer differs from operator trust pin"));
+    }
+    Ok(())
+}
 fn lock(dir: &Path, exclusive: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -370,6 +393,7 @@ pub fn enroll(
     if !id(org) || !id(client_agent) || !token(service_token, "hcs_") {
         return Err(reject("Invalid hosted enrollment request"));
     }
+    require_trusted_issuer(dir, &issuer)?;
     let requested = ["bridge.enroll", "results.submit"];
     let exchange = post(
         &issuer,
@@ -453,6 +477,7 @@ pub fn enroll(
         return Err(reject("Issuer child did not match service grant"));
     }
     record.valid(at)?;
+    require_trusted_issuer(dir, &record.issuer)?;
     save(dir, &record)?;
     Ok(record.info())
 }
@@ -484,6 +509,12 @@ mod tests {
             child_token: CHILD.into(),
             service_token: SERVICE.into(),
         }
+    }
+    fn trust(dir: &Path, issuer: &str) {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join(TRUSTED_ISSUER), format!("{issuer}\n")).unwrap();
+        fs::set_permissions(dir.join(TRUSTED_ISSUER), fs::Permissions::from_mode(0o600)).unwrap();
     }
     fn pin(board: &str) -> DestinationPin {
         DestinationPin::new("ws_real", board, "hsp_subject", "hca_agent").unwrap()
@@ -643,21 +674,12 @@ mod tests {
             );
         });
         let root = tempfile::tempdir().unwrap();
-        let saved = enroll(
-            &issuer,
-            "ws_real",
-            audience,
-            "worker",
-            SERVICE,
-            &root.path().join("e"),
-        )
-        .unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        let saved = enroll(&issuer, "ws_real", audience, "worker", SERVICE, &dir).unwrap();
         server.join().unwrap();
         assert_eq!(saved.audience(), audience);
-        assert_eq!(
-            current(&root.path().join("e")).unwrap().subject_id(),
-            "hsp_subject"
-        );
+        assert_eq!(current(&dir).unwrap().subject_id(), "hsp_subject");
         assert!(!format!("{saved:?}").contains(CHILD));
     }
 
@@ -682,6 +704,7 @@ mod tests {
         });
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
+        trust(&dir, &issuer);
         assert!(enroll(
             &issuer,
             "ws_real",
@@ -692,6 +715,32 @@ mod tests {
         )
         .is_err());
         server.join().unwrap();
-        assert!(!dir.exists());
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn unpinned_or_foreign_issuer_fails_before_any_service_token_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        assert!(enroll(
+            "https://attacker.example.test",
+            "ws_real",
+            "https://real.board.example.test",
+            "worker",
+            SERVICE,
+            &dir
+        )
+        .is_err());
+        trust(&dir, "https://api.agenticos.example.test");
+        assert!(enroll(
+            "https://attacker.example.test",
+            "ws_real",
+            "https://real.board.example.test",
+            "worker",
+            SERVICE,
+            &dir
+        )
+        .is_err());
+        assert!(!dir.join(RECORD).exists());
     }
 }

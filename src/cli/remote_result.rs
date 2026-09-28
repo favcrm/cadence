@@ -25,7 +25,7 @@ pub(crate) enum RemoteAction {
 }
 #[derive(Subcommand)]
 pub(crate) enum EnrollmentAction {
-    /// Exchange a service credential from stdin and enroll one implementer.
+    /// Exchange a service credential from stdin. Requires a private trusted-issuer file.
     Bootstrap {
         #[arg(long)]
         issuer: String,
