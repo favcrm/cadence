@@ -238,11 +238,15 @@ def handle(conn):
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
         elif method == "mcpServerStatus/list":
-            send_json(conn, {"id": mid, "result": {"data": [{"name": "cadence",
-                "runtimeStatus": "connected", "tools": {
-                    name: {"name": name} for name in
-                    ("self", "wiki_search", "wiki_read", "issue_show")}}],
-                "nextCursor": None}})
+            if "serverName" in msg.get("params", {}):
+                send_json(conn, {"id": mid, "error": {"code": -32602,
+                    "message": "serverName is not supported"}})
+            else:
+                send_json(conn, {"id": mid, "result": {"data": [{"name": "cadence",
+                    "runtimeStatus": "connected", "tools": {
+                        name: {"name": name} for name in
+                        ("self", "wiki_search", "wiki_read", "issue_show")}}],
+                    "nextCursor": None}})
         elif method == "mcpServer/tool/call":
             send_json(conn, {"id": mid, "result": {"content": [{"type": "text",
                 "text": json.dumps({"alias": current_alias, "running": []})}]}})

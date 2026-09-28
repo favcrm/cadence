@@ -60,6 +60,15 @@ for line in sys.stdin:
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
     elif method == "mcpServerStatus/list":
+        params = msg.get("params", {})
+        if "serverName" in params:
+            emit({"id": mid, "error": {"code": -32602,
+                 "message": "serverName is not a supported inventory parameter"}})
+            continue
+        if mode == "mcp-page" and params.get("cursor") != "page-2":
+            emit({"id": mid, "result": {"data": [{"name": "other",
+                "runtimeStatus": "connected", "tools": {}}], "nextCursor": "page-2"}})
+            continue
         status = "failed" if mode == "mcp-fail" else "connected"
         tools = {} if mode == "mcp-fail" else {
             name: {"name": name} for name in ("self", "wiki_search", "wiki_read", "issue_show")}

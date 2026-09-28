@@ -13,7 +13,7 @@
 //! experimental by its vendor; the tested CLI version is negotiated at
 //! initialize, not assumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
@@ -58,26 +58,50 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
 /// Cadence work. Ask Codex for this thread's actual tool inventory before
 /// advertising the endpoint as ready.
 fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Result<()> {
-    let inventory = transport
-        .request_timeout(
-            "mcpServerStatus/list",
-            json!({"threadId": thread_id, "serverName":"cadence", "detail":"toolsAndAuthOnly"}),
-            Duration::from_secs(12),
-        )
-        .map_err(|error| Error::provider(format!("Codex Cadence MCP readiness failed: {error}")))?;
-    let server = inventory["data"]
-        .as_array()
-        .and_then(|servers| servers.iter().find(|server| server["name"] == "cadence"))
-        .ok_or_else(|| Error::provider("Codex Cadence MCP readiness failed: server absent"))?;
-    if server["runtimeStatus"] != "connected"
-        || !["self", "wiki_search", "wiki_read", "issue_show"]
-            .iter()
-            .all(|name| server["tools"].get(*name).is_some())
-    {
-        return Err(Error::provider(format!(
-            "Codex Cadence MCP readiness failed: status {}, tools {}",
-            server["runtimeStatus"], server["tools"]
-        )));
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    let mut found = false;
+    for _ in 0..32 {
+        let mut params = json!({"threadId": thread_id, "detail":"toolsAndAuthOnly", "limit":100});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let inventory = transport
+            .request_timeout("mcpServerStatus/list", params, Duration::from_secs(12))
+            .map_err(|error| {
+                Error::provider(format!("Codex Cadence MCP readiness failed: {error}"))
+            })?;
+        let servers = inventory["data"].as_array().ok_or_else(|| {
+            Error::provider("Codex Cadence MCP readiness failed: invalid server inventory")
+        })?;
+        if let Some(server) = servers.iter().find(|server| server["name"] == "cadence") {
+            if server["runtimeStatus"] != "connected"
+                || !["self", "wiki_search", "wiki_read", "issue_show"]
+                    .iter()
+                    .all(|name| server["tools"].get(*name).is_some())
+            {
+                return Err(Error::provider(format!(
+                    "Codex Cadence MCP readiness failed: status {}, tools {}",
+                    server["runtimeStatus"], server["tools"]
+                )));
+            }
+            found = true;
+            break;
+        }
+        let Some(next) = inventory["nextCursor"].as_str() else {
+            break;
+        };
+        if !seen.insert(next.to_string()) {
+            return Err(Error::provider(
+                "Codex Cadence MCP readiness failed: repeated inventory cursor",
+            ));
+        }
+        cursor = Some(next.to_string());
+    }
+    if !found {
+        return Err(Error::provider(
+            "Codex Cadence MCP readiness failed: server absent or inventory page limit reached",
+        ));
     }
     // Listing tools only proves that the MCP process started. Exercise the
     // daemon connection from that process before declaring this worker ready.

@@ -112,6 +112,15 @@ fn codex_mcp_unavailable_fences_before_dispatch() {
 }
 
 #[test]
+fn codex_mcp_inventory_finds_cadence_on_later_page() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("mcp-page");
+    d.register_codex("paged-tools");
+    d.wait_agent("paged-tools", "idle", 15);
+    assert!(mock.pidfile.exists());
+}
+
+#[test]
 fn codex_command_rpc_denial_still_opens_with_scoped_mcp() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
