@@ -112,7 +112,7 @@ fn codex_mcp_unavailable_fences_before_dispatch() {
 }
 
 #[test]
-fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
+fn codex_command_rpc_denial_still_opens_with_scoped_mcp() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
     sandbox_probe(&d, "deny_rpc");
@@ -123,15 +123,17 @@ fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
                "cwd":cwd, "sandbox":"workspace-write"}),
     )
     .unwrap();
-    let agent = d.wait_agent("rpc-blocked", "attention", 15);
-    let error = agent["error"].as_str().unwrap_or("");
-    assert!(error.contains("Cadence RPC socket"), "{agent}");
-    assert!(error.contains("Operation not permitted"), "{agent}");
-    assert!(!mock.pidfile.exists(), "provider started before RPC proof");
+    d.wait_agent("rpc-blocked", "idle", 15);
+    assert!(mock.pidfile.exists(), "MCP-capable provider did not start");
+    let reqs = mock_requests(&mock);
+    assert_eq!(
+        reqs[0]["params"]["config"]["mcp_servers"]["cadence"]["env"]["CADENCE_ALIAS"],
+        "rpc-blocked"
+    );
 }
 
 #[test]
-fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
+fn codex_mcp_resolves_relative_daemon_state_before_changing_cwd() {
     let daemon_cwd = std::env::current_dir().unwrap();
     let root = TempDir::new_in("/tmp").unwrap();
     let mut relative_state = PathBuf::new();
@@ -140,7 +142,7 @@ fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
     }
     relative_state.push(root.path().strip_prefix("/").unwrap());
     let d = TestDaemon::start_on(relative_state);
-    let _mock = d.mock_codex("ok");
+    let mock = d.mock_codex("ok");
     let agent_cwd = d.dir.path().to_str().unwrap();
     d.fixture_rpc(
         "agent_register",
@@ -149,6 +151,10 @@ fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
     )
     .unwrap();
     d.wait_agent("relative-state", "idle", 15);
+    let reqs = mock_requests(&mock);
+    let bridge = &reqs[0]["params"]["config"]["mcp_servers"]["cadence"];
+    let absolute_state = std::fs::canonicalize(&d.state).unwrap();
+    assert_eq!(bridge["args"][1], absolute_state.to_string_lossy().as_ref());
 }
 
 #[test]
