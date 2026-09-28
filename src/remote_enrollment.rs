@@ -31,6 +31,11 @@ enum EnrollmentSource {
     Service,
     Browser,
 }
+#[derive(Clone, Copy)]
+enum ChildSource<'a> {
+    Service(&'a str),
+    Browser,
+}
 fn is_service_source(source: &EnrollmentSource) -> bool {
     *source == EnrollmentSource::Service
 }
@@ -466,7 +471,7 @@ fn device_code(value: &Value) -> Result<(&str, &str, &str, u64)> {
             .authority()
             .is_none_or(|a| a.as_str().contains('@'))
         || verification_uri.host().is_none_or(str::is_empty)
-        || verification.contains(['\n', '\r', '#'])
+        || verification.contains(['\n', '\r', '#', '?'])
         || complete != format!("{verification}?code={user}")
         || timestamp(value, "expires_in")? == 0
         || timestamp(value, "expires_in")? > 600
@@ -478,7 +483,7 @@ fn device_code(value: &Value) -> Result<(&str, &str, &str, u64)> {
     Ok((device, user, complete, timestamp(value, "interval")?))
 }
 
-fn browser_grant(value: &Value, _org: &str, audience: &str) -> Result<()> {
+fn browser_grant(value: &Value, org: &str, audience: &str) -> Result<()> {
     let at = now()?;
     let principal = &value["principal"];
     let credential = &value["credential"];
@@ -486,6 +491,7 @@ fn browser_grant(value: &Value, _org: &str, audience: &str) -> Result<()> {
         .as_array()
         .ok_or_else(|| reject("Invalid hosted browser capabilities"))?;
     if field(value, "version")? != VERSION
+        || field(value, "organization_id")? != org
         || field(value, "audience")? != audience
         || field(principal, "kind")? != "user"
         || field(principal, "current_role")? != "owner"
@@ -556,6 +562,9 @@ pub fn enroll_browser(
             "/v1/hosted-cadence/device/token",
             json!({"device_code":device,"code_verifier":verifier}),
         )?;
+        if Instant::now() >= deadline {
+            return Err(reject("Hosted browser authorization expired; start again"));
+        }
         if status == 200 {
             break response;
         }
@@ -576,8 +585,7 @@ pub fn enroll_browser(
         client_agent,
         dir,
         &grant,
-        EnrollmentSource::Browser,
-        None,
+        ChildSource::Browser,
     )
 }
 
@@ -646,8 +654,7 @@ fn enroll_locked(
         client_agent,
         dir,
         &exchange,
-        EnrollmentSource::Service,
-        Some(service_token),
+        ChildSource::Service(service_token),
     )
 }
 
@@ -658,13 +665,12 @@ fn enroll_child_locked(
     client_agent: &str,
     dir: &Path,
     grant: &Value,
-    source: EnrollmentSource,
-    service_token: Option<&str>,
+    source: ChildSource<'_>,
 ) -> Result<EnrollmentInfo> {
     let bridge = &grant["credential"];
     let path = match source {
-        EnrollmentSource::Service => "/v1/hosted-cadence/service/enroll",
-        EnrollmentSource::Browser => "/v1/hosted-cadence/enroll",
+        ChildSource::Service(_) => "/v1/hosted-cadence/service/enroll",
+        ChildSource::Browser => "/v1/hosted-cadence/enroll",
     };
     let enrollment = post(
         issuer,
@@ -699,8 +705,14 @@ fn enroll_child_locked(
             .map_err(|_| reject("Invalid child capabilities"))?,
         expires_at: timestamp(child_credential, "expires_at")?,
         child_token: field(child_credential, "access_token")?.into(),
-        source,
-        service_token: service_token.map(str::to_owned),
+        source: match source {
+            ChildSource::Service(_) => EnrollmentSource::Service,
+            ChildSource::Browser => EnrollmentSource::Browser,
+        },
+        service_token: match source {
+            ChildSource::Service(credential) => Some(credential.to_owned()),
+            ChildSource::Browser => None,
+        },
     };
     if record.organization_id != org
         || record.audience != audience
@@ -866,6 +878,9 @@ mod tests {
         let original = record(u64::MAX);
         trust(&dir, &original.issuer);
         save(&dir, &original).unwrap();
+        assert!(!fs::read_to_string(dir.join(RECORD))
+            .unwrap()
+            .contains("\"source\""));
         assert_eq!(current(&dir).unwrap().agent_id(), original.agent_id);
         assert!(with_current(&dir, &pin(&original.audience), |token| Ok(token == CHILD)).unwrap());
         let file = dir.join(RECORD);
@@ -980,6 +995,14 @@ mod tests {
         socket.write_all(&bytes).unwrap();
     }
     fn request(listener: &TcpListener, path: &str, bearer: &str) -> std::net::TcpStream {
+        request_with_audience(listener, path, bearer, "http://127.0.0.1:1")
+    }
+    fn request_with_audience(
+        listener: &TcpListener,
+        path: &str,
+        bearer: &str,
+        expected_audience: &str,
+    ) -> std::net::TcpStream {
         let (socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1009,7 +1032,7 @@ mod tests {
         reader.read_exact(&mut body).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["organization_id"], "ws_real");
-        assert_eq!(body["audience"], "http://127.0.0.1:1");
+        assert_eq!(body["audience"], expected_audience);
         socket
     }
     fn public_request(listener: &TcpListener, path: &str) -> (std::net::TcpStream, Value) {
@@ -1031,6 +1054,7 @@ mod tests {
             let (key, value) = line.split_once(':').unwrap();
             assert!(!key.eq_ignore_ascii_case("authorization"));
             assert!(!key.eq_ignore_ascii_case("cookie"));
+            assert!(!key.eq_ignore_ascii_case("origin"));
             if key.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap();
             }
@@ -1090,10 +1114,54 @@ mod tests {
     }
 
     #[test]
+    fn browser_refuses_foreign_issuer_before_device_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, "https://trusted.agenticos.test");
+        assert!(enroll_browser(
+            &issuer,
+            "ws_real",
+            "http://127.0.0.1:1",
+            "worker",
+            &dir,
+            |_, _| panic!("foreign issuer returned a browser code"),
+        )
+        .is_err());
+        assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn hosted_public_token_request_refuses_redirect_without_forwarding_verifier() {
+        let issuer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker = TcpListener::bind("127.0.0.1:0").unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", issuer_listener.local_addr().unwrap());
+        let location = format!("http://{}/stolen", attacker.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, value) =
+                public_request(&issuer_listener, "/v1/hosted-cadence/device/token");
+            assert!(value["code_verifier"].is_string());
+            write!(socket, "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        assert!(post_public(
+            &issuer,
+            "/v1/hosted-cadence/device/token",
+            json!({"device_code":format!("hcd_{}", "A".repeat(43)),
+                "code_verifier":"V".repeat(43)}),
+        )
+        .is_err());
+        server.join().unwrap();
+        assert!(attacker.accept().is_err());
+    }
+
+    #[test]
     fn browser_fixture_binds_one_child_without_storing_bridge_or_verifier() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let audience = "http://127.0.0.1:1";
+        let audience = "https://real.board.example.test";
         let at = now().unwrap();
         let server = thread::spawn(move || {
             let (mut code_socket, code_request) =
@@ -1135,7 +1203,8 @@ mod tests {
                 "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
                     "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}}),
             );
-            let mut child = request(&listener, "/v1/hosted-cadence/enroll", BRIDGE);
+            let mut child =
+                request_with_audience(&listener, "/v1/hosted-cadence/enroll", BRIDGE, audience);
             respond(
                 &mut child,
                 &json!({"version":VERSION,"organization_id":"ws_real",
@@ -1291,7 +1360,7 @@ mod tests {
 
     #[test]
     fn issuer_refuses_wrong_agent_role_capability_or_expiry() {
-        for mutation in ["agent", "role", "scope", "expired"] {
+        for mutation in ["agent", "role", "scope", "expired", "over_parent"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let issuer = format!("http://{}", listener.local_addr().unwrap());
             let at = now().unwrap();
@@ -1323,6 +1392,9 @@ mod tests {
                     "role" => child["agents"][0]["role"] = json!("reviewer"),
                     "scope" => child["agents"][0]["capabilities"] = json!(["reviews.submit"]),
                     "expired" => child["agents"][0]["credential"]["expires_at"] = json!(at),
+                    "over_parent" => {
+                        child["agents"][0]["credential"]["expires_at"] = json!(at + 121)
+                    }
                     _ => unreachable!(),
                 }
                 respond(&mut second, &child);
