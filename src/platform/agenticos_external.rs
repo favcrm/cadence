@@ -47,6 +47,8 @@ pub struct AgenticosExternalAdapter {
     http: ureq::Agent,
     image_hosts: Vec<String>,
     image_http: ureq::Agent,
+    #[cfg(feature = "test-seam")]
+    test_cdn_url: Option<String>,
 }
 
 impl AgenticosExternalAdapter {
@@ -81,11 +83,40 @@ impl AgenticosExternalAdapter {
             http: ureq::Agent::new_with_config(config),
             image_hosts: image_hosts.to_vec(),
             image_http: image_agent(),
+            #[cfg(feature = "test-seam")]
+            test_cdn_url: None,
         };
         adapter
             .connection_descriptor()
             .expect("descriptor")
             .validate(&adapter.table)?;
+        Ok(adapter)
+    }
+
+    /// Local integration fixture: the provider still returns an exact approved
+    /// HTTPS host, while its CDN bytes come from a loopback-only fake transport.
+    /// Production registration never calls this constructor.
+    #[cfg(feature = "test-seam")]
+    pub fn with_test_cdn(
+        base: &str,
+        deployment_pin: Option<&str>,
+        image_hosts: &[String],
+        fake_cdn_url: &str,
+    ) -> Result<Self> {
+        let uri: ureq::http::Uri = fake_cdn_url
+            .parse()
+            .map_err(|_| Error::rejected("test CDN URL is malformed"))?;
+        if uri.scheme_str() != Some("http")
+            || uri.host() != Some("127.0.0.1")
+            || uri.port_u16().is_none()
+            || uri
+                .authority()
+                .is_none_or(|part| part.as_str().contains('@'))
+        {
+            return Err(Error::rejected("test CDN must be a loopback HTTP fixture"));
+        }
+        let mut adapter = Self::with_deployment(base, deployment_pin, image_hosts)?;
+        adapter.test_cdn_url = Some(fake_cdn_url.to_owned());
         Ok(adapter)
     }
 
@@ -305,6 +336,19 @@ impl AgenticosExternalAdapter {
             return Err("AgenticOS image charge exceeds the approved ceiling".into());
         }
         let url = image_url(&data["result"], &self.image_hosts)?;
+        #[cfg(feature = "test-seam")]
+        let asset = if let Some(local) = &self.test_cdn_url {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(20)))
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .proxy(None)
+                .build();
+            download_image(&ureq::Agent::new_with_config(config), local)?
+        } else {
+            download_image(&self.image_http, url)?
+        };
+        #[cfg(not(feature = "test-seam"))]
         let asset = download_image(&self.image_http, url)?;
         let digest = format!("sha256:{:x}", Sha256::digest(&asset.bytes));
         let result = json!({
@@ -808,7 +852,7 @@ mod tests {
 
     #[test]
     fn image_result_and_cdn_boundary_fail_closed() {
-        use base64::Engine as _;
+        use ::image::ImageEncoder as _;
         let good = json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/generated.png"]}});
         assert_eq!(
             image_url(&good, &["images.example.test".into()]).unwrap(),
@@ -840,7 +884,10 @@ mod tests {
         }
         assert!(public_ip("1.1.1.1".parse().unwrap()));
         assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
-        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+        let mut png = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0], 1, 1, ::image::ExtendedColorType::L8)
+            .unwrap();
         assert_eq!(image_mime(&png, "image/png").unwrap(), "image/png");
         assert!(image_mime(b"<svg/>", "image/png").is_err());
         assert!(image_mime(&png[..8], "image/png").is_err());
@@ -915,6 +962,54 @@ mod tests {
         assert!(adapter
             .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-test")
             .is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn image_call_refuses_rate_limit_and_uncertain_provider_outcomes_with_stable_key() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for status in [429, 502, 200] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                assert_eq!(request.url(), CALL_PATH);
+                assert_eq!(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("idempotency-key"))
+                        .map(|header| header.value.as_str()),
+                    Some("stable-image-request")
+                );
+                let body = if status == 200 {
+                    json!({"ok":true,"data":{"slug":IMAGE_TOOL,"repeated":true,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"0","failed_count":"1"},"data":{"image_urls":[]}}}})
+                } else {
+                    json!({"ok":false,"error":{"code":"provider_unavailable"}})
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        adapter.image_hosts = vec!["images.example.test".into()];
+        let mut proof = authority();
+        proof["slot"] = json!("image");
+        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
+        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
+        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
+        proof["quote"] = json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"fixed-test-quote"});
+        for _ in 0..3 {
+            assert!(adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "stable-image-request")
+                .is_err());
+        }
         worker.join().unwrap();
     }
 

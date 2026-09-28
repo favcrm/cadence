@@ -60,6 +60,7 @@ impl Release {
             },
             true,
             required_asset_slot,
+            false,
         );
         (h, observed, observed_price)
     }
@@ -85,12 +86,18 @@ impl Release {
     pub(crate) fn with_options(
         configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
     ) -> Self {
-        Self::with_options_and_bundle(configure, false, None)
+        Self::with_options_and_bundle(configure, false, None, false)
+    }
+    pub(crate) fn with_social_image(
+        configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
+    ) -> Self {
+        Self::with_options_and_bundle(configure, false, None, true)
     }
     fn with_options_and_bundle(
         configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
         source_capability: bool,
         required_asset_slot: Option<&str>,
+        social_image: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
@@ -131,51 +138,56 @@ impl Release {
             );
             daemon.wait_agent(alias, "idle", 20);
         }
-        let source = root.path().join("bundle");
-        std::fs::create_dir_all(source.join("workflows")).unwrap();
-        let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/local-content");
-        let manifest = std::fs::read_to_string(original.join("app.md")).unwrap();
-        let manifest = manifest.replace("  connections: []", "  connections: []\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send");
-        let manifest = if source_capability {
-            manifest.replace("  capabilities:", "  capabilities:\n    source:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
+        let source = if social_image {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/social-content")
         } else {
-            manifest
-        };
-        let manifest = if required_asset_slot == Some("image") {
-            manifest.replace("  capabilities:", "  capabilities:\n    image:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
-        } else {
-            manifest
-        };
-        std::fs::write(source.join("app.md"), manifest).unwrap();
-        let text = std::fs::read_to_string(original.join("workflows/draft.md")).unwrap();
-        let workflow = text
-            .replace("source: { ask:", "source: { context_default: true, ask:")
-            .replacen("---\n", "---\npublication_slot: publication\n", 1);
-        let workflow = if source_capability {
-            workflow.replacen(
-                "publication_slot: publication\n",
-                "publication_slot: publication\ncapability_slots: [source]\n",
-                1,
-            )
-        } else {
-            workflow
-        };
-        let workflow = if let Some(slot) = required_asset_slot {
-            let capability_slots = if slot == "image" {
-                "[source, image]"
+            let source = root.path().join("bundle");
+            std::fs::create_dir_all(source.join("workflows")).unwrap();
+            let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/local-content");
+            let manifest = std::fs::read_to_string(original.join("app.md")).unwrap();
+            let manifest = manifest.replace("  connections: []", "  connections: []\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send");
+            let manifest = if source_capability {
+                manifest.replace("  capabilities:", "  capabilities:\n    source:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
             } else {
-                "[source]"
+                manifest
             };
-            workflow.replacen(
-                "capability_slots: [source]\n",
-                &format!("capability_slots: {capability_slots}\nrequired_asset_slot: {slot}\n"),
-                1,
-            )
-        } else {
-            workflow
+            let manifest = if required_asset_slot == Some("image") {
+                manifest.replace("  capabilities:", "  capabilities:\n    image:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
+            } else {
+                manifest
+            };
+            std::fs::write(source.join("app.md"), manifest).unwrap();
+            let text = std::fs::read_to_string(original.join("workflows/draft.md")).unwrap();
+            let workflow = text
+                .replace("source: { ask:", "source: { context_default: true, ask:")
+                .replacen("---\n", "---\npublication_slot: publication\n", 1);
+            let workflow = if source_capability {
+                workflow.replacen(
+                    "publication_slot: publication\n",
+                    "publication_slot: publication\ncapability_slots: [source]\n",
+                    1,
+                )
+            } else {
+                workflow
+            };
+            let workflow = if let Some(slot) = required_asset_slot {
+                let capability_slots = if slot == "image" {
+                    "[source, image]"
+                } else {
+                    "[source]"
+                };
+                workflow.replacen(
+                    "capability_slots: [source]\n",
+                    &format!("capability_slots: {capability_slots}\nrequired_asset_slot: {slot}\n"),
+                    1,
+                )
+            } else {
+                workflow
+            };
+            assert_ne!(text, workflow);
+            std::fs::write(source.join("workflows/draft.md"), &workflow).unwrap();
+            source
         };
-        assert_ne!(text, workflow);
-        std::fs::write(source.join("workflows/draft.md"), &workflow).unwrap();
         let install = daemon
             .operator_rpc("app_workspace_install", json!({"source":source}))
             .unwrap();
