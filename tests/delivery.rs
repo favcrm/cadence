@@ -3245,33 +3245,22 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     let hooks = lf.f.pm_dir.join(hooks.trim());
     std::fs::create_dir_all(&hooks).unwrap();
     let hook = hooks.join("pre-commit");
-    // The hook counts its runs, so the test can wait for a retry.
-    let runs = lf.f.tmp.path().join("hook-runs");
-    std::fs::write(
-        &hook,
-        format!("#!/bin/sh\necho x >> {}\nexit 1\n", runs.display()),
-    )
-    .unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     lf.set_gh(&b, "MERGED", true, false);
     let row3 = lf.sync_of("D-3");
     assert_eq!(row3["ticket"]["outcome"], "pending", "{row3}");
-    // Past the done write and its comment (both refused by the hook),
-    // a router retry fails too — and no comment follows it to re-stage
-    // the index, so what the retry left staged is what it left.
+    // Retry while the hook still refuses the write. A hook-run count
+    // includes notice commits and cannot tell whether a done attempt
+    // completed; wait for the persisted second attempt instead.
     lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while std::fs::read_to_string(&runs)
-        .unwrap_or_default()
-        .lines()
-        .count()
-        < 3
-    {
-        assert!(Instant::now() < deadline, "no retry ran");
-        thread::sleep(Duration::from_millis(50));
-    }
-    // Hold the tracker lock while looking, so no retry is mid-write.
+    let pending = lf.wait_of("D-3", "second failed done attempt", |r| {
+        r["ticket_done"]["attempts"] == 2
+    });
+    assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
+    // Hold the tracker lock while checking that the failed retry left
+    // neither issue.md nor the index changed.
     let deadline = Instant::now() + Duration::from_secs(30);
     while std::fs::OpenOptions::new()
         .write(true)
@@ -3294,10 +3283,11 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
             .is_empty(),
         "a failed done write left issue.md changed"
     );
+    // Heal the hook before releasing the tracker to any router pass.
+    std::fs::remove_file(&hook).unwrap();
     std::fs::remove_file(&lock).unwrap();
     assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
     // The next writer after the hook is gone commits only its own file.
-    std::fs::remove_file(&hook).unwrap();
     let (ok, out) =
         lf.f.cli_as("w1", &["issue", "comment", "D-3", "-m", "progress"]);
     assert!(ok, "{out}");
