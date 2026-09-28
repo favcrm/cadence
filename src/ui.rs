@@ -87,6 +87,11 @@ pub struct UiFlags {
     /// Clear a persisted --read-only.
     #[arg(long, overrides_with = "read_only")]
     pub no_read_only: bool,
+    /// Hosted board: accept protected traffic only on the configured
+    /// AgenticOS public Host. `CADENCE_BOARD_PUBLIC_ONLY=1` also enables
+    /// this during `cadence setup`; the choice persists in ui.json.
+    #[arg(long)]
+    pub board_public_only: bool,
     /// Publish the board on the tailnet through `tailscale serve`
     /// (https port default: 9450). Ensures the serve mapping, adds the
     /// tailnet name to the Host and Origin allowlists, and attributes
@@ -310,6 +315,7 @@ pub struct UiOpts {
     pub allow_hosts: Vec<String>,
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub board_public_only: bool,
     pub tailscale: Option<TailscaleOpts>,
     /// The AgenticOS board-identity configuration (CAD-526).
     pub board: Option<PublicBoard>,
@@ -318,6 +324,9 @@ pub struct UiOpts {
 /// Everything the running server needs, resolved.
 #[derive(Clone, Default)]
 pub struct ServeOpts {
+    /// This board process's boot-pinned daemon agent UID. `serve` obtains
+    /// it once from the private daemon socket; tests can inject a pin.
+    pub agent_uid: Option<u32>,
     pub host: String,
     pub port: u16,
     pub dist: Option<PathBuf>,
@@ -326,6 +335,7 @@ pub struct ServeOpts {
     /// Operator `--allow-origin` plus the tailnet https origin.
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub board_public_only: bool,
     /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
     /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
     pub tailnet: Option<(String, u16)>,
@@ -446,6 +456,17 @@ fn is_loopback_host(host: &str) -> bool {
 /// and ensures the serve mapping; a persisted tailscale block is kept
 /// (the detached server never re-ensures — only operator verbs do).
 fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpts)> {
+    let env_public_only = match std::env::var("CADENCE_BOARD_PUBLIC_ONLY") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(_) => return Err(Error::rejected("CADENCE_BOARD_PUBLIC_ONLY must be 0 or 1")),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(_) => {
+            return Err(Error::rejected(
+                "CADENCE_BOARD_PUBLIC_ONLY is not valid UTF-8",
+            ))
+        }
+    };
     let mut eff = UiOpts {
         host: flags.host.clone().or_else(|| persisted.host.clone()),
         port: flags.port.or(persisted.port),
@@ -465,12 +486,20 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
         } else {
             flags.read_only || persisted.read_only
         },
+        board_public_only: flags.board_public_only
+            || persisted.board_public_only
+            || env_public_only,
         tailscale: persisted.tailscale.clone(),
         // CAD-526: each field resolves flag → env → persisted; the block
         // is all-or-nothing — any field present with another missing is
         // an operator error, never a partial trust root.
         board: resolve_board(flags, persisted)?,
     };
+    if eff.board_public_only && eff.board.is_none() {
+        return Err(Error::rejected(
+            "board public-only mode requires a public board identity",
+        ));
+    }
     if let Some(https_port) = flags.tailscale {
         crate::sandbox::refuse_global("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
@@ -621,12 +650,14 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         }
     }
     Ok(ServeOpts {
+        agent_uid: None,
         host,
         port,
         dist: eff.dist.clone(),
         allow_hosts,
         allow_origins,
         read_only: eff.read_only,
+        board_public_only: eff.board_public_only,
         tailnet,
         tailscaled_socket: None,
         tailnet_latch: Default::default(),
@@ -682,8 +713,9 @@ fn err_response(code: u16, message: &str) -> Response<std::io::Cursor<Vec<u8>>> 
 }
 
 /// Defence in depth on an unauthenticated loopback origin that renders
-/// agent-written Markdown.
-const CSP: &str = "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+/// agent-written Markdown. Social source previews use only these reviewed
+/// image CDNs; the client checks the same host families before rendering.
+const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
@@ -2200,6 +2232,18 @@ fn write_route(
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
         .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade_recovery = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade_check = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade/check"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
     let install_recovery = path
         .strip_prefix("/api/app-installations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -2207,6 +2251,9 @@ fn write_route(
     if path == "/api/app-installations/migrate"
         || catalog_recovery.is_some()
         || install_recovery.is_some()
+        || install_upgrade.is_some()
+        || install_upgrade_check.is_some()
+        || install_upgrade_recovery.is_some()
     {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2214,6 +2261,12 @@ fn write_route(
         }
         let (operation, id) = if let Some(id) = catalog_recovery {
             ("app_workspace_migration_recover", Some(id))
+        } else if let Some(id) = install_upgrade_recovery {
+            ("app_workspace_upgrade_recover", Some(id))
+        } else if let Some(id) = install_upgrade_check {
+            ("app_workspace_upgrade_check", Some(id))
+        } else if let Some(id) = install_upgrade {
+            ("app_workspace_upgrade", Some(id))
         } else if let Some(id) = install_recovery {
             ("app_workspace_recover", Some(id))
         } else {
@@ -2974,6 +3027,31 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         .public
         .as_ref()
         .is_some_and(|p| host.trim().eq_ignore_ascii_case(&p.host));
+    // CAD-747: a hosted agent shares this network namespace and can dial
+    // the board's loopback port (or the image's blind TCP relay) itself.
+    // Host is therefore a surface selector, never proof of the Worker.
+    // In hosted-only mode the public board session gate must cover every
+    // protected route, even when the caller chooses a local Host.
+    if opts.board_public_only && !public_host {
+        if matches!(method, Method::Get | Method::Head)
+            && raw_path == "/api/health"
+            && raw_query.is_empty()
+        {
+            send(
+                request,
+                json_response(json!({
+                    "ok": true,
+                    "build": crate::overview::BUILD_COMMIT,
+                })),
+            );
+        } else {
+            send(
+                request,
+                err_response(421, "hosted board requires its public Host"),
+            );
+        }
+        return;
+    }
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {
@@ -3807,7 +3885,48 @@ pub fn read_model_stats(state_dir: &Path, pm_dir: &Path) -> Value {
 /// since `/api/stream`, and issue file writes must not interleave.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn board_boot_agent_uid(state_dir: &Path, injected: Option<u32>) -> Result<Option<u32>> {
+    if injected.is_some() {
+        return Ok(injected);
+    }
+    let configured = crate::agent_uid::config::configured_uid(state_dir)?;
+    let historical = crate::agent_uid::config::mode_marker_uid(state_dir)?;
+    if configured.is_some() || historical.is_some() {
+        crate::agent_uid::config::require_private_state_dir(state_dir)?;
+    }
+    reconcile_board_agent_uid(
+        configured,
+        historical,
+        operator::active_agent_uid(state_dir),
+    )
+}
+
+fn reconcile_board_agent_uid(
+    configured: Option<u32>,
+    historical: Option<u32>,
+    health: std::result::Result<Option<u32>, String>,
+) -> Result<Option<u32>> {
+    match health {
+        Ok(uid) if configured.is_some() && uid != configured => Err(Error::rejected(
+            "Private daemon agent UID differs from configured UID",
+        )),
+        Ok(uid) if historical.is_some() && uid != historical => Err(Error::rejected(
+            "Private daemon agent UID differs from persistent mode marker",
+        )),
+        Ok(uid) => Ok(uid),
+        Err(error) if configured.is_some() || historical.is_some() => Err(Error::rejected(
+            format!("Agent UID mode has no private daemon boot pin: {error}"),
+        )),
+        Err(_) => Ok(None), // Standalone local board, with the split disabled.
+    }
+}
+
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    if opts.board_public_only && opts.public.is_none() {
+        return Err(Error::rejected(
+            "board public-only mode requires a public board identity",
+        ));
+    }
     // CAD-526: a publicly-named board hands the daemon its trust root —
     // `operator/board-identity.json`, under the same uid-private rules
     // as the operator secret — before the first request can mint a
@@ -3825,6 +3944,7 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();
+    opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
     } else {
@@ -4001,11 +4121,53 @@ pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Res
 
 fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> Result<i32> {
     std::fs::create_dir_all(state_dir)?;
-    if reset {
-        let _ = std::fs::remove_file(opts_file(state_dir));
-    }
-    let persisted = load_opts(state_dir);
+    // Resolve a reset against defaults without deleting ui.json first.
+    // A refused security-mode transition must leave the running board's
+    // saved options intact, including its public identity.
+    let recorded = load_opts(state_dir);
+    let persisted = if reset {
+        UiOpts::default()
+    } else {
+        recorded.clone()
+    };
     let (eff, so) = resolve_opts(flags, &persisted)?;
+    let running = read_pid(state_dir);
+    if running.is_some() {
+        if eff.board_public_only != recorded.board_public_only {
+            return Err(Error::rejected(
+                "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
+            ));
+        }
+        if eff.board_public_only {
+            if eff.board != recorded.board || eff.host != recorded.host || eff.port != recorded.port
+            {
+                return Err(Error::rejected(
+                    "running public-only board identity or bind cannot change — stop the UI, then start it with the new configuration",
+                ));
+            }
+            // A saved true flag is not proof the *running* process loaded
+            // it (an older build could have saved options before noticing
+            // an existing UI). The exact local query is 421 only under
+            // the active hosted gate; ordinary health answers 200.
+            let active = match http_get(
+                &so.host,
+                so.port,
+                "/api/health?public-only-probe=1",
+                &format!("{}:{}", so.host, so.port),
+                &[],
+            ) {
+                Ok((421, body)) => serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .is_some_and(|v| v["error"] == "hosted board requires its public Host"),
+                _ => false,
+            };
+            if !active {
+                return Err(Error::rejected(
+                    "running UI has not proved the board public-only gate — stop the UI and start it again",
+                ));
+            }
+        }
+    }
     // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
     // board shared — best effort when tailscaled itself is unreachable.
     if flags.tailscale.is_none() {
@@ -4021,7 +4183,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     }
     save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
-    if let Some(pid) = read_pid(state_dir) {
+    if let Some(pid) = running {
         let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             .unwrap_or((0, String::new()));
         if !quiet {
@@ -4576,7 +4738,120 @@ mod tests {
         proxied_actor, running_json, static_answer_for, static_file, StaticAnswer,
     };
     use serde_json::{json, Value};
-    use tiny_http::Response;
+    use tiny_http::{Header, Response};
+
+    #[test]
+    fn board_csp_allows_only_reviewed_social_preview_image_hosts() {
+        let mut response = Response::from_string("<html></html>");
+        response.add_header(Header::from_bytes("Content-Type", "text/html").unwrap());
+        assert!(super::add_security_headers(&mut response));
+        let policy = response
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Content-Security-Policy"))
+            .unwrap()
+            .value
+            .as_str();
+        let image_sources = policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("img-src "))
+            .unwrap();
+        assert_eq!(
+            image_sources.split_whitespace().collect::<Vec<_>>(),
+            [
+                "'self'",
+                "data:",
+                "https://cdninstagram.com",
+                "https://*.cdninstagram.com",
+                "https://fbcdn.net",
+                "https://*.fbcdn.net",
+            ]
+        );
+        assert!(policy.contains("default-src 'self'"));
+        assert!(policy.contains("base-uri 'none'"));
+        assert!(policy.contains("frame-ancestors 'none'"));
+        assert!(!policy
+            .split_whitespace()
+            .any(|source| source == "https:" || source == "*"));
+    }
+
+    #[test]
+    fn hosted_public_only_is_explicit_and_requires_public_identity() {
+        let mut flags = super::UiFlags::default();
+        let empty = super::UiOpts::default();
+        assert!(
+            !super::resolve_opts(&flags, &empty)
+                .unwrap()
+                .0
+                .board_public_only
+        );
+        flags.board_public_only = true;
+        assert!(super::resolve_opts(&flags, &empty).is_err());
+
+        let board = super::PublicBoard {
+            host: "acme.board.localhost:3111".to_string(),
+            issuer: "http://api.internal".to_string(),
+            company: "co_1".to_string(),
+            authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+        };
+        let persisted = super::UiOpts {
+            board: Some(board),
+            board_public_only: true,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_vec(&persisted).unwrap();
+        let restored: super::UiOpts = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            super::resolve_opts(&super::UiFlags::default(), &restored)
+                .unwrap()
+                .1
+                .board_public_only
+        );
+    }
+
+    #[test]
+    fn standalone_board_without_uid_record_does_not_need_daemon_health() {
+        let state = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), Some(2200)).unwrap(),
+            Some(2200)
+        );
+    }
+
+    #[test]
+    fn historical_uid_mode_cannot_start_standalone_after_record_loss() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = state.path().join(crate::agent_uid::config::MODE_MARKER);
+        std::fs::write(&marker, br#"{"uid":2200}"#).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = super::board_boot_agent_uid(state.path(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("no private daemon boot pin"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn first_uid_provisioning_requires_matching_private_daemon_boot() {
+        for health in [Ok(None), Ok(Some(3300))] {
+            assert!(
+                super::reconcile_board_agent_uid(Some(2200), None, health).is_err(),
+                "configured UID must match private daemon boot before board startup"
+            );
+        }
+        assert_eq!(
+            super::reconcile_board_agent_uid(Some(2200), None, Ok(Some(2200))).unwrap(),
+            Some(2200)
+        );
+    }
 
     #[test]
     fn agent_activity_uses_latest_valid_instant_across_timestamp_shapes() {

@@ -165,12 +165,22 @@ impl Store {
         install: &str,
         context: Option<&str>,
         binding: Option<&str>,
+        bundle_digest: Option<&str>,
     ) -> Result<()> {
-        let mut statement = conn.prepare("SELECT e.effect_id FROM platform_effects e JOIN app_effect_authorizations a ON a.effect_id=e.effect_id WHERE a.install_id=? AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR json_extract(a.authority,'$.binding.id')=?) AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')")?;
+        let mut statement = conn.prepare("SELECT e.effect_id FROM platform_effects e JOIN app_effect_authorizations a ON a.effect_id=e.effect_id WHERE a.install_id=? AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR json_extract(a.authority,'$.binding.id')=?) AND (? IS NULL OR json_extract(a.authority,'$.bundle_digest')=?) AND e.authorization_kind='app_artifact' AND e.state IN ('waiting','decided')")?;
         let ids = statement
-            .query_map(params![install, context, context, binding, binding], |r| {
-                r.get::<_, String>(0)
-            })?
+            .query_map(
+                params![
+                    install,
+                    context,
+                    context,
+                    binding,
+                    binding,
+                    bundle_digest,
+                    bundle_digest
+                ],
+                |r| r.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for id in ids {
@@ -205,7 +215,12 @@ impl Store {
         slot: &str,
     ) -> Result<Value> {
         let run = Self::app_run_show_in(conn, id)?;
-        Self::app_current_in(conn, &run, bundle)?;
+        if run["snapshot"]["bundle_digest"] != bundle {
+            return Err(Error::rejected(
+                "publication bundle differs from the frozen run",
+            ));
+        }
+        Self::app_completed_current_in(conn, &run)?;
         if run["state"] != "succeeded"
             || run["approved_digest"] != run["snapshot_digest"]
             || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]

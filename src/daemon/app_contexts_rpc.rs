@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 /// Each default must be explicitly content-safe everywhere it is declared.
 /// Different workflows can declare different content keys; a run uses only its
 /// selected workflow's defaults.
-fn validate_defaults(
+pub(super) fn validate_defaults(
     files: &BTreeMap<String, String>,
     defaults: &BTreeMap<String, String>,
 ) -> Result<()> {

@@ -40,6 +40,11 @@ const mixed = render("[x](JaVaScRiPt:alert(1))");
 equal(/javascript:/i.test(mixed), false, "case does not smuggle the scheme through");
 const img = render("![x](javascript:alert(1))");
 equal(/javascript:/i.test(img), false, "an image src cannot be a javascript: url");
+const cdnImage = render("![preview](https://scontent.fbcdn.net/track.jpg?marker=agent-text)");
+equal(/<img/i.test(cdnImage), false, "agent Markdown cannot auto-load a newly CSP-allowed CDN image");
+equal(cdnImage.includes("preview"), true, "blocked Markdown image keeps its alt text");
+const localImage = render("![local](/assets/local.png)");
+equal(localImage.includes('src="/assets/local.png"'), true, "same-origin Markdown images keep rendering");
 const data = render("[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)");
 equal(/data:text\/html/i.test(data), false, "a data:text/html link is stripped too");
 

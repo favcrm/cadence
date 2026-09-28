@@ -39,10 +39,10 @@ use crate::store::{self, Store};
 /// project-default tables (CAD-366); v18 adds the pending-effect and
 /// draft tables (CAD-506); v19 adds `app_grants.install_id`, the
 /// install an app-derived grant belongs to (CAD-577).
-/// CAD-753 keeps app record data in per-installation SQLite files,
-/// never in core tables — there is no v28 core migration.
+/// CAD-753 keeps app record data in per-installation SQLite files;
+/// this version tracks core tables only.
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -2759,7 +2759,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 27);
+        assert_eq!(SCHEMA_VERSION, 28);
     }
 
     struct MigrationHolder;

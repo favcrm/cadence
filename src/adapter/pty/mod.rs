@@ -64,6 +64,7 @@ pub use profile::{DraftView, TuiProfile};
 pub use stub::StubProfile;
 
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -74,6 +75,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::adapter::registry;
+use crate::agent_uid::View;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -155,6 +157,9 @@ pub struct PtyAdapter {
     cwd: String,
     /// Cadence state dir, exported into the pane for `cadence self`.
     state_dir: PathBuf,
+    /// Trusted daemon boot mode, never an agent param or pane env value.
+    agent_uid: Option<u32>,
+    agent_exec: PathBuf,
     /// The daemon's tracker and profile, exported into the pane
     /// ([`crate::adapter::DAEMON_CONTEXT_ENV`]).
     context_env: Vec<(String, String)>,
@@ -182,13 +187,100 @@ pub struct PtyAdapter {
 /// The pane's `-e` environment: the agent's alias and state dir for
 /// `cadence self`, then the daemon's tracker and profile — a sandbox
 /// worker's `cadence issue …` must stay in the sandbox (CAD-310).
-fn pane_env(alias: &str, state_dir: &Path, context: &[(String, String)]) -> Vec<String> {
-    let mut vars = vec![
-        format!("CADENCE_ALIAS={alias}"),
-        format!("CADENCE_STATE_DIR={}", state_dir.display()),
-    ];
+fn pane_env(
+    alias: &str,
+    state_dir: &Path,
+    context: &[(String, String)],
+    split: bool,
+) -> Vec<String> {
+    let mut vars = vec![format!("CADENCE_ALIAS={alias}")];
+    if split {
+        vars.push(format!(
+            "CADENCE_SOCKET={}",
+            crate::agent_uid::config::shared_socket_path().display()
+        ));
+    } else {
+        vars.push(format!("CADENCE_STATE_DIR={}", state_dir.display()));
+    }
     vars.extend(context.iter().map(|(k, v)| format!("{k}={v}")));
     vars
+}
+
+fn split_pane_command(helper: &Path, vars: &[String], command: &str) -> String {
+    let mut pieces = vec![
+        "exec".to_string(),
+        shlex_quote(&helper.to_string_lossy()),
+        "exec".into(),
+    ];
+    for var in vars {
+        pieces.push("--env".into());
+        pieces.push(shlex_quote(var));
+    }
+    pieces.extend([
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        shlex_quote(command),
+    ]);
+    pieces.join(" ")
+}
+
+/// Only a seam-armed test may replace the fixed installed helper.
+/// A process environment variable alone is never helper authority.
+pub(crate) fn agent_exec_path(state_dir: &Path, env: &ProviderEnv) -> PathBuf {
+    if crate::test_seam::armed(state_dir) {
+        env.own("CADENCE_AGENT_EXEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(crate::agent_uid::HELPER_DEST))
+    } else {
+        PathBuf::from(crate::agent_uid::HELPER_DEST)
+    }
+}
+
+/// The operator's source briefing is not evidence that the agent can
+/// read its lane copy. In split mode ask the fixed drop helper to test
+/// that copy as the agent UID; any refusal or missing file stays
+/// `briefing_missing` in `agent show`.
+pub(crate) fn briefing_available(source: &Path, exposed: &Path, helper: Option<&Path>) -> bool {
+    if !source.is_file() {
+        return false;
+    }
+    let Some(helper) = helper else {
+        return true;
+    };
+    crate::reaper::output(
+        Command::new(helper)
+            .args([
+                "exec",
+                "--",
+                "/bin/sh",
+                "-c",
+                "test -f \"$1\" && test -r \"$1\"",
+                "cadence-briefing",
+            ])
+            .arg(exposed),
+    )
+    .is_ok_and(|out| out.status.success())
+}
+
+fn pane_uids(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|line| line.starts_with("Uid:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
+fn owned_lane_dir(path: &Path, uid: u32) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid)
+}
+
+fn split_profile_ready(name: &str, seam: bool) -> bool {
+    // The real profiles still prove native ownership from the daemon
+    // UID's HOME (and Cursor also prepares a chat there). Launching
+    // their pane as the agent uid before those paths move would make
+    // ownership checks lie or touch operator credentials. Only the
+    // test seam's stub may exercise this infrastructure slice.
+    seam && name == "Stub"
 }
 
 fn short_hash(text: &str) -> String {
@@ -448,12 +540,30 @@ pub(crate) fn kill_server(state_dir: &Path, env: &ProviderEnv) -> usize {
 /// agent whose pane may have survived a fence (fences detach now).
 /// Best effort: only sessions we launched exist on this socket, and a
 /// missing session or server is already the goal state.
-pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv) {
+pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv, agent_uid: Option<u32>) {
     let tmux = env
         .var("CADENCE_TMUX_COMMAND")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
+    if let Some(uid) = agent_uid {
+        let pid = crate::reaper::output(Command::new(&tmux).arg("-L").arg(&socket).args([
+            "display-message",
+            "-p",
+            "-t",
+            alias,
+            "#{pane_pid}",
+        ]))
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| text.trim().parse::<u32>().ok());
+        if !pid.is_some_and(|pid| pane_uids(pid) == Some((uid, uid))) {
+            // Do not destroy an old operator-uid pane after a mode
+            // switch or a forged/stale tmux row. No same-uid fallback.
+            return;
+        }
+    }
     let _ = crate::reaper::output(Command::new(tmux).arg("-L").arg(&socket).args([
         "kill-session",
         "-t",
@@ -670,6 +780,7 @@ impl PtyAdapter {
         log_path: &Path,
         agent: &Agent,
         env: &ProviderEnv,
+        agent_uid: Option<u32>,
         profile: impl TuiProfile + 'static,
     ) -> Result<Self> {
         let state_dir = log_path
@@ -684,6 +795,52 @@ impl PtyAdapter {
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
             .or_else(|| agent.thread_id.clone());
+        let seam = crate::test_seam::armed(&state_dir);
+        if agent_uid.is_some() && !split_profile_ready(profile.name(), seam) {
+            return Err(Error::rejected(format!(
+                "agent UID pty launch for {} is pending agent-UID native session proof/preparation",
+                profile.name()
+            )));
+        }
+        let agent_exec = agent_exec_path(&state_dir, env);
+        if let Some(uid) = agent_uid {
+            if !seam {
+                crate::agent_uid::config::require_private_state_dir(&state_dir)?;
+                let named = crate::agent_uid::LiveHost::new()
+                    .user(crate::agent_uid::AGENT_USER)?
+                    .ok_or_else(|| Error::rejected("agent UID account is not provisioned"))?;
+                if named.uid != uid {
+                    return Err(Error::rejected(
+                        "configured agent UID does not match cadence-agent",
+                    ));
+                }
+                let meta = std::fs::symlink_metadata(&agent_exec).map_err(|e| {
+                    Error::rejected(format!("agent UID helper is unavailable: {e}"))
+                })?;
+                let launch_gid = crate::agent_uid::LiveHost::new()
+                    .group(crate::agent_uid::LAUNCH_GROUP)?
+                    .ok_or_else(|| Error::rejected("agent UID launch group is not provisioned"))?
+                    .gid;
+                if !meta.is_file()
+                    || meta.uid() != 0
+                    || meta.gid() != launch_gid
+                    || meta.mode() & 0o7777 != 0o4750
+                {
+                    return Err(Error::rejected(
+                        "agent UID helper is not root:cadence-launch setuid 4750",
+                    ));
+                }
+            } else if !agent_exec.is_file() {
+                return Err(Error::rejected("test agent UID helper is unavailable"));
+            }
+        }
+        let mut context_env = crate::adapter::daemon_context_env(env);
+        if let Some(lock) = env.var("CADENCE_SUITE_LOCK").filter(|v| !v.is_empty()) {
+            context_env.push(("CADENCE_SUITE_LOCK".into(), lock));
+        }
+        if agent_uid.is_some() {
+            context_env.push(("TERM".into(), "screen-256color".into()));
+        }
         Ok(Self {
             hooks,
             state: Mutex::new(PtyState {
@@ -705,7 +862,9 @@ impl PtyAdapter {
             desired_session,
             cwd: agent.cwd.clone(),
             state_dir,
-            context_env: crate::adapter::daemon_context_env(env),
+            agent_uid,
+            agent_exec,
+            context_env,
             auto_ready: AtomicBool::new(
                 agent
                     .params
@@ -772,8 +931,64 @@ impl PtyAdapter {
     /// resilience retry at their own decision point.
     fn verify_ownership(&self, session: &str, native: &str) -> Result<u32> {
         let pane_pid = self.pane_pid(session)?;
+        self.verify_agent_uid(pane_pid)?;
         self.profile.verify_ownership(native, pane_pid)?;
         Ok(pane_pid)
+    }
+
+    fn verify_agent_uid(&self, pane_pid: u32) -> Result<()> {
+        if let Some(uid) = self.agent_uid {
+            if pane_uids(pane_pid) != Some((uid, uid)) {
+                return Err(Error::provider(format!(
+                    "pane {pane_pid} is not running as the configured agent uid {uid}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_agent_uid(&self, pane_pid: u32) -> Result<()> {
+        if self.agent_uid.is_none() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.verify_agent_uid(pane_pid).is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return self.verify_agent_uid(pane_pid);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn preflight_split_launch(&self) -> Result<()> {
+        let Some(uid) = self.agent_uid else {
+            return Ok(());
+        };
+        if !owned_lane_dir(Path::new(&self.cwd), uid) {
+            return Err(Error::provider(format!(
+                "agent lane cwd {} must be a real directory owned by the configured agent uid",
+                self.cwd
+            )));
+        }
+        for flag in ["-r", "-x"] {
+            let out = crate::reaper::output(
+                Command::new(&self.agent_exec)
+                    .args(["exec", "--", "/usr/bin/test", flag])
+                    .arg(&self.cwd),
+            )?;
+            if !out.status.success() {
+                return Err(Error::provider(format!(
+                    "agent uid cannot access lane cwd {} ({}): {}",
+                    self.cwd,
+                    flag,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Poll the profile's ownership proof until the pane claims a
@@ -858,7 +1073,14 @@ impl PtyAdapter {
         // CAD-202: a pane whose cwd was deleted (its worktree removed
         // under it) runs work nowhere — refuse like any other gate, so
         // the message stays queued, before a claim is consumed.
-        if let Some(cwd) = lane::pane_cwd(pane_pid).filter(|c| c.deleted) {
+        let helper = self.agent_uid.map(|_| self.agent_exec.as_path());
+        let cwd = lane::pane_cwd_with(pane_pid, helper);
+        if helper.is_some() && cwd.is_none() {
+            return Err(Error::gate(
+                "pane cwd could not be verified through agent UID helper",
+            ));
+        }
+        if let Some(cwd) = cwd.filter(|c| c.deleted) {
             return Err(Error::gate(format!(
                 "cwd_deleted: the pane's working directory {} was deleted — \
                  re-home the lane (`cadence agent stop`, fix its cwd, resume) \
@@ -1063,6 +1285,7 @@ impl ProviderAdapter for PtyAdapter {
             // deadline the spawn path gets rather than fencing a live
             // pane on one observation.
             let pane_pid = self.pane_pid(&session)?;
+            self.wait_agent_uid(pane_pid)?;
             // The pane was already running — an exit mid-wait is a
             // crash, not proof the stored chat is gone. The spawn
             // arm re-runs the resume on the next open and reports
@@ -1097,6 +1320,7 @@ impl ProviderAdapter for PtyAdapter {
                     self.cwd
                 )));
             }
+            self.preflight_split_launch()?;
             // Mint once: a profile with a prepare step mints its native
             // session id *before* the pane exists, and the event folds
             // it into `params.session` — a respawn after a failed launch
@@ -1132,7 +1356,17 @@ impl ProviderAdapter for PtyAdapter {
             // Pane env identifies the agent to `cadence self` and carries
             // the daemon's tracker and profile; -e args are tmux options,
             // never shell-interpreted.
-            let pane_env = pane_env(&session, &self.state_dir, &self.context_env);
+            let pane_env = pane_env(
+                &session,
+                &self.state_dir,
+                &self.context_env,
+                self.agent_uid.is_some(),
+            );
+            let command = if self.agent_uid.is_some() {
+                split_pane_command(&self.agent_exec, &pane_env, &command)
+            } else {
+                command
+            };
             let mut args: Vec<&str> = vec![
                 "new-session",
                 "-d",
@@ -1145,12 +1379,15 @@ impl ProviderAdapter for PtyAdapter {
                 "-y",
                 "40",
             ];
-            for var in &pane_env {
-                args.extend(["-e", var.as_str()]);
+            if self.agent_uid.is_none() {
+                for var in &pane_env {
+                    args.extend(["-e", var.as_str()]);
+                }
             }
             args.push(&command);
             self.tmux_ok(&args)?;
             let pane_pid = self.pane_pid(&session)?;
+            self.wait_agent_uid(pane_pid)?;
             // Bound the wait for the TUI to acquire its native session.
             match self.wait_owned_session(&session, pane_pid) {
                 // The TUI exited on the chat it was told to resume —
@@ -1540,6 +1777,15 @@ impl ProviderAdapter for PtyAdapter {
 
     fn close(&self) {
         let session = self.session();
+        if let Some(uid) = self.agent_uid {
+            let proven = self
+                .pane_pid(&session)
+                .ok()
+                .is_some_and(|pid| pane_uids(pid) == Some((uid, uid)));
+            if !proven {
+                return;
+            }
+        }
         // Only ever kills a session on our own private socket — one we
         // launched. Foreign panes are never registered as killable.
         let _ = self.tmux(&["kill-session", "-t", &session]);
@@ -1851,7 +2097,10 @@ impl ProviderAdapter for PtyAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{match_draft, normalize_screen, pane_env, tail_chars, DraftMatch};
+    use super::{
+        agent_exec_path, briefing_available, kill_pane, match_draft, normalize_screen,
+        owned_lane_dir, pane_env, split_pane_command, split_profile_ready, tail_chars, DraftMatch,
+    };
 
     fn rows(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
@@ -2017,7 +2266,7 @@ mod tests {
             ("CADENCE_PROFILE".to_string(), "sandbox:x".to_string()),
         ];
         assert_eq!(
-            pane_env("w1", std::path::Path::new("/sbx/state"), &context),
+            pane_env("w1", std::path::Path::new("/sbx/state"), &context, false),
             [
                 "CADENCE_ALIAS=w1",
                 "CADENCE_STATE_DIR=/sbx/state",
@@ -2025,5 +2274,128 @@ mod tests {
                 "CADENCE_PROFILE=sandbox:x",
             ]
         );
+    }
+
+    #[test]
+    fn cad514_split_pane_env_does_not_expose_private_state() {
+        // This is deliberately red against the old pane env: an
+        // agent-uid process cannot traverse the operator's private
+        // state dir. In split mode its client must use the shared
+        // socket, and HOME/PATH come only from the drop helper.
+        let vars = pane_env("w1", std::path::Path::new("/operator/private"), &[], true);
+        assert!(vars
+            .iter()
+            .any(|v| v == "CADENCE_SOCKET=/var/lib/cadence/cadence.sock"));
+        assert!(!vars.iter().any(|v| v.starts_with("CADENCE_STATE_DIR=")));
+        assert!(!vars
+            .iter()
+            .any(|v| v.starts_with("HOME=") || v.starts_with("PATH=")));
+    }
+
+    #[test]
+    fn cad514_forged_pane_env_is_data_not_operator_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("fake helper");
+        let marker = dir.path().join("injected");
+        std::fs::write(&helper, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let forged = format!("worker'$(touch {})", marker.display());
+        let vars = pane_env(&forged, std::path::Path::new("/private/state"), &[], true);
+        let command = split_pane_command(&helper, &vars, "printf safe");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!marker.exists(), "forged alias escaped the launch command");
+        let args = String::from_utf8(out.stdout).unwrap();
+        assert!(args.contains(&format!("CADENCE_ALIAS={forged}")), "{args}");
+        assert!(!args.contains("/private/state"), "{args}");
+    }
+
+    #[test]
+    fn cad514_split_lane_requires_agent_owned_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(owned_lane_dir(dir.path(), uid));
+        assert!(!owned_lane_dir(dir.path(), uid.saturating_add(1)));
+        let link = dir.path().join("forged-lane-link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(!owned_lane_dir(&link, uid));
+    }
+
+    #[test]
+    fn cad514_real_pty_profiles_refuse_split_mode_until_native_proof_moves() {
+        for profile in ["Claude", "Devin", "Cursor"] {
+            assert!(!split_profile_ready(profile, true), "{profile}");
+            assert!(!split_profile_ready(profile, false), "{profile}");
+        }
+        assert!(!split_profile_ready("Stub", false));
+        assert!(split_profile_ready("Stub", true));
+    }
+
+    #[test]
+    fn cad514_forged_helper_path_is_ignored_without_test_seam() {
+        let state = tempfile::tempdir().unwrap();
+        let env = crate::adapter::ProviderEnv::default();
+        env.set("CADENCE_AGENT_EXEC", "/tmp/forged-helper");
+        assert_eq!(
+            agent_exec_path(state.path(), &env),
+            std::path::PathBuf::from(crate::agent_uid::HELPER_DEST)
+        );
+    }
+
+    #[test]
+    fn cad514_split_kill_pane_refuses_operator_uid_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tmux-double");
+        let marker = dir.path().join("killed");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *display-message*) echo {};;\n  *kill-session*) touch '{}' ;;\nesac\n",
+                std::process::id(), marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = crate::adapter::ProviderEnv::default();
+        env.set("CADENCE_TMUX_COMMAND", script.to_string_lossy());
+        let other_uid = unsafe { libc::geteuid() }.saturating_add(1);
+        kill_pane(dir.path(), "worker", &env, Some(other_uid));
+        assert!(!marker.exists(), "split mode killed an operator-uid pane");
+        kill_pane(dir.path(), "worker", &env, None);
+        assert!(marker.exists(), "legacy same-uid stop changed");
+    }
+
+    #[test]
+    fn cad514_agent_show_needs_readable_lane_copy_not_only_private_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("operator-source.md");
+        let exposed = dir.path().join("lane/BRIEFING-worker.md");
+        let helper = dir.path().join("fake-helper");
+        std::fs::write(&source, b"briefing").unwrap();
+        std::fs::write(
+            &helper,
+            b"#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -- ] || exit 2\nshift 2\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
+        assert!(briefing_available(&source, &source, None));
+        std::fs::create_dir(exposed.parent().unwrap()).unwrap();
+        std::fs::write(&exposed, b"briefing").unwrap();
+        assert!(briefing_available(&source, &exposed, Some(&helper)));
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
+        std::fs::write(&helper, b"#!/bin/sh\nexit 2\n").unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
     }
 }

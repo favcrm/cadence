@@ -2991,7 +2991,7 @@ mod tests {
         let mut worker = agent(json!({"repos": ["favcrm/cadence"]}));
         let log = std::env::temp_dir().join(format!("cad243-cloud-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
-        let built = build(&worker, hooks(&events, &requests), &log, &env).unwrap();
+        let built = build(&worker, hooks(&events, &requests), &log, &env, None).unwrap();
         let ident = built.open(&worker).unwrap();
         assert_eq!(ident.session_id, "devin-created");
         assert!(
@@ -3004,6 +3004,7 @@ mod tests {
             hooks(&events, &requests),
             Path::new("unused.log"),
             &env,
+            None,
         )
         .pipe_err()
         .to_string();

@@ -6,7 +6,9 @@ use cadence_agent::adapter::registry::{self, Reporting};
 use cadence_agent::client;
 use cadence_agent::error::{Error, Result};
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// What a launch writes for the agent's ambient briefing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,8 +53,9 @@ pub(crate) fn role_instructions(briefing: &str) -> Option<&str> {
 
 /// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
 /// state dir — `<state>/briefings/<root>/`, where `<root>` is the
-/// upstream PM's alias when wired, else the agent's own — never inside
-/// any repository the agent works in. When the agent's params opt in
+/// upstream PM's alias when wired, else the agent's own. Split-mode
+/// pty panes receive an agent-owned copy under their lane. When the
+/// agent's params opt in
 /// (`--agents-md`), the marker-delimited cadence block also lands in
 /// its cwd repo's AGENTS.md. With `enqueue` also sends the durable
 /// `bootstrap-<alias>` message (`source = "bootstrap"` — provenance
@@ -94,10 +97,20 @@ pub(crate) fn brief_agent(
             .and_then(|old| role_instructions(&old).map(str::to_string)),
     }
     .filter(|text| !text.trim().is_empty());
-    std::fs::write(
-        &file,
-        briefing_body(state_dir, &agent, root_alias, instructions.as_deref()),
-    )?;
+    let body = briefing_body(state_dir, &agent, root_alias, instructions.as_deref());
+    std::fs::write(&file, &body)?;
+    let exposed_file = if cadence_agent::agent_uid::config::configured_uid(state_dir)?.is_some()
+        && agent["endpoint_kind"].as_str() == Some("pty")
+    {
+        let cwd = agent["cwd"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("agent lane cwd is missing"))?;
+        let lane_file = client::lane_briefing_path(Path::new(cwd), &agent["params"], alias);
+        copy_briefing_as_agent(&lane_file, body.as_bytes())?;
+        lane_file
+    } else {
+        file.clone()
+    };
     // AGENTS.md is opt-in (`--agents-md` persists the param and resume
     // replays it). Only the agent's own cwd repo is ever touched, and
     // only when it sits inside a git repository.
@@ -137,7 +150,7 @@ pub(crate) fn brief_agent(
                  '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
                  `cadence self` for this message's id and turn_id, {report_line}. \
                  List peers with `cadence agent list`.",
-                file.display()
+                exposed_file.display()
             )
         };
         client::rpc(
@@ -148,7 +161,43 @@ pub(crate) fn brief_agent(
                    "source": "bootstrap"}),
         )?;
     }
-    Ok(file)
+    Ok(exposed_file)
+}
+
+fn copy_briefing_as_agent(path: &Path, body: &[u8]) -> Result<()> {
+    copy_briefing_with_helper(path, body, Path::new(cadence_agent::agent_uid::HELPER_DEST))
+}
+
+fn copy_briefing_with_helper(path: &Path, body: &[u8], helper: &Path) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::rejected("briefing destination has no directory"))?;
+    let mut command = Command::new(helper);
+    command
+        .args([
+            "exec", "--", "/bin/sh", "-c",
+            "umask 077; mkdir -p -- \"$1\" || exit; tmp=$(mktemp \"$1/.briefing.XXXXXX\") || exit; cat > \"$tmp\" || exit; mv -f -- \"$tmp\" \"$2\"",
+            "cadence-briefing",
+        ])
+        .arg(dir)
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cadence_agent::reaper::spawn(&mut command)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::internal("briefing helper stdin missing"))?
+        .write_all(body)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "agent UID briefing copy refused: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Prompt posted into a Devin cloud session. The briefing file is still
@@ -388,8 +437,7 @@ pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
          This repo may be worked on by cadence-managed agents. If\n\
          `CADENCE_ALIAS` is set in your environment: run `cadence self` for\n\
          your identity and running turn token, read your briefing at the\n\
-         path `cadence agent show` prints (it lives under the daemon's\n\
-         state dir, not in this repo), report with\n\
+         path `cadence agent show` prints, report with\n\
          `cadence message result <msg-id> --token <turn_id> --text ...`,\n\
          and discover peers with `cadence agent list`.\n\
          {AGENTS_END}\n"
@@ -404,4 +452,28 @@ pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
     }
     write!(file, "{block}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cad514_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn briefing_copy_uses_agent_helper_and_preserves_previous_file_on_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("fake-helper");
+        std::fs::write(
+            &helper,
+            b"#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -- ] || exit 2\nshift 2\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.path().join("odd ' $(false)").join("BRIEFING-worker.md");
+        copy_briefing_with_helper(&file, b"first\n", &helper).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"first\n");
+        std::fs::write(&helper, b"#!/bin/sh\nexit 2\n").unwrap();
+        assert!(copy_briefing_with_helper(&file, b"second\n", &helper).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"first\n");
+    }
 }

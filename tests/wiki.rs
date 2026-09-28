@@ -387,6 +387,110 @@ fn agent_cannot_read_index_health_or_force_a_refresh() {
 }
 
 #[test]
+fn managed_agent_and_detached_child_cannot_operate_wiki_index() {
+    let fx = fx();
+    let d = &fx.d;
+    d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    let before = index_status(d);
+    let mut first = ManagedWorker::start(d, "index-guard-a");
+    let mut second = ManagedWorker::start(d, "index-guard-b");
+    for method in ["wiki_index_status", "wiki_index_refresh"] {
+        for how in ["self", "detached"] {
+            let reply = first.rpc(how, method, json!({}));
+            assert_eq!(reply["ok"], false, "{how} {method}: {reply}");
+        }
+        let forged = first.rpc("self", method, json!({"operator": true}));
+        assert_eq!(forged["ok"], false, "forged {method}: {forged}");
+    }
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.rpc("self", "wiki_index_refresh", json!({})));
+        let b = scope.spawn(|| second.rpc("self", "wiki_index_refresh", json!({})));
+        assert_eq!(a.join().unwrap()["ok"], false);
+        assert_eq!(b.join().unwrap()["ok"], false);
+    });
+    let after = index_status(d);
+    assert_eq!(after["indexed_tree"], before["indexed_tree"]);
+    assert_eq!(after["last_refresh"], before["last_refresh"]);
+}
+
+#[test]
+fn agent_identity_is_bound_to_the_enrolled_peer_not_request_fields() {
+    let fx = fx();
+    let d = &fx.d;
+    let mut first = ManagedWorker::start(d, "identity-a");
+    let mut second = ManagedWorker::start(d, "identity-b");
+    let own = first.rpc("self", "agent_identity", json!({}));
+    assert_eq!(own["ok"], true, "{own}");
+    assert_eq!(own["result"]["alias"], "identity-a");
+    let detached = first.rpc("detached", "agent_identity", json!({}));
+    assert_eq!(detached["ok"], false, "{detached}");
+    let forged = first.rpc("self", "agent_identity", json!({"alias":"operator"}));
+    assert_eq!(forged["ok"], false, "{forged}");
+    assert!(d.operator_rpc("agent_identity", json!({})).is_err());
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.rpc("self", "agent_identity", json!({})));
+        let b = scope.spawn(|| second.rpc("self", "agent_identity", json!({})));
+        assert_eq!(a.join().unwrap()["result"]["alias"], "identity-a");
+        assert_eq!(b.join().unwrap()["result"]["alias"], "identity-b");
+    });
+}
+
+#[test]
+fn managed_mcp_server_reads_scoped_wiki_through_enrolled_peer() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/mcp-answer.md", "nimbus bridge answer\n");
+    write_op(d, "users/alice/private.md", "private nimbus note\n");
+    let mut worker = ManagedWorker::start(d, "mcp-reader");
+    let script = r#"
+import json, subprocess, sys
+binary, state = sys.argv[1:]
+calls = [
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}},
+  {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"self","arguments":{}}},
+  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wiki_search","arguments":{"q":"nimbus"}}},
+  {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"wiki_read","arguments":{"path":"global/mcp-answer.md"}}},
+  {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wiki_read","arguments":{"path":"users/alice/private.md"}}},
+  {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"wiki_index_refresh","arguments":{}}},
+]
+result = subprocess.run([binary, "--state-dir", state, "mcp-agent"],
+  input="\n".join(json.dumps(call) for call in calls) + "\n",
+  text=True, capture_output=True, timeout=15)
+print(json.dumps({"rc":result.returncode,"responses": [json.loads(line) for line in result.stdout.splitlines()],"err":result.stderr}))
+"#;
+    let result = worker.exec(&[
+        "python3",
+        "-c",
+        script,
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.to_str().unwrap(),
+    ]);
+    assert_eq!(result["rc"], 0, "{result}");
+    let out: Value = serde_json::from_str(result["out"].as_str().unwrap()).unwrap();
+    assert_eq!(out["rc"], 0, "{out}");
+    let responses = out["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 6, "{out}");
+    let identity: Value = serde_json::from_str(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(identity["alias"], "mcp-reader");
+    let search = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(search.contains("global/mcp-answer.md"), "{search}");
+    assert!(!search.contains("users/alice/private.md"), "{search}");
+    assert!(responses[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("nimbus bridge answer"));
+    assert_eq!(responses[4]["result"]["isError"], true, "{out}");
+    assert_eq!(responses[5]["result"]["isError"], true, "{out}");
+}
+
+#[test]
 fn index_refresh_rebuilds_even_when_current() {
     let fx = fx();
     let d = &fx.d;

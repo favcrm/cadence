@@ -255,7 +255,7 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                 if *bind_continuity {
                     let bound = remote_enrollment::bind_browser(enrollment_dir).map_err(|error| {
                         Error::rejected(format!(
-                            "Browser child enrollment was saved, but continuity bind is pending or uncertain: {error}. Retry the same saved child and key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`"
+                            "Browser child enrollment was saved, but continuity did not complete: {error}"
                         ))
                     })?;
                     if bound.organization_id() != enrolled.organization_id()

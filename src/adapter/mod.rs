@@ -273,6 +273,12 @@ pub struct AdapterHooks {
 pub trait ProviderAdapter: Send + Sync {
     /// Open or resume the provider session for `agent`.
     fn open(&self, agent: &Agent) -> Result<Identity>;
+    /// Verify a managed provider after its process is enrolled in the
+    /// daemon's caller registry, before the actor can dispatch any work.
+    /// Most providers need no post-enrollment check.
+    fn post_enrollment_ready(&self, _agent: &Agent) -> Result<()> {
+        Ok(())
+    }
     /// Re-open after a provably clean daemon restart to adopt the
     /// recorded in-flight turn (CAD-89): the endpoint must still be
     /// the one the shutdown recorded — same pane pid, same native
@@ -513,6 +519,7 @@ pub fn build(
     hooks: AdapterHooks,
     log_path: &std::path::Path,
     env: &ProviderEnv,
+    agent_uid: Option<u32>,
 ) -> Result<Box<dyn ProviderAdapter>> {
     // The registry is consulted for pair validation only — its
     // rejections carry the same per-kind text the match arms below
@@ -546,6 +553,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 // The stored permission mode rides the profile so the
                 // same argv is replayed on every open — fresh launch
                 // and `-r` resume alike.
@@ -562,6 +570,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::ClaudeProfile::new(agent, env)?,
             )?)),
             "cursor" => Ok(Box::new(pty::PtyAdapter::new(
@@ -569,6 +578,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::CursorProfile::new(agent, env)?,
             )?)),
             // Harness double: proves the adapter is profile-driven.
@@ -577,6 +587,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::StubProfile::new(env)?,
             )?)),
             other => Err(crate::error::Error::rejected(format!(

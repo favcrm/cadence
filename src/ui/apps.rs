@@ -570,7 +570,49 @@ pub(super) fn workspace(
     method: &str,
     id: Option<&str>,
 ) -> HttpResp {
-    let params = if method == "app_workspace_migration_recover" {
+    let params = if matches!(
+        method,
+        "app_workspace_upgrade" | "app_workspace_upgrade_check" | "app_workspace_upgrade_recover"
+    ) {
+        let bytes = match read_body(request, BODY_CAP) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return err_response(400, "upgrade body must be a JSON object"),
+        };
+        let Some(fields) = value.as_object() else {
+            return err_response(400, "upgrade body must be a JSON object");
+        };
+        let expected: &[&str] = if method == "app_workspace_upgrade" {
+            &[
+                "source",
+                "expected_digest",
+                "expected_generation",
+                "expected_new_digest",
+                "request_id",
+            ]
+        } else if method == "app_workspace_upgrade_check" {
+            &["source", "expected_digest", "expected_generation"]
+        } else {
+            &["request_id"]
+        };
+        if fields.len() != expected.len()
+            || fields.keys().any(|key| !expected.contains(&key.as_str()))
+            || expected.iter().any(|key| {
+                fields
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            })
+        {
+            return err_response(400, "upgrade body has missing or unsupported fields");
+        }
+        let mut params = value;
+        params["install_id"] = json!(id);
+        params
+    } else if method == "app_workspace_migration_recover" {
         let bytes = match read_body(request, BODY_CAP) {
             Ok(bytes) => bytes,
             Err(response) => return response,

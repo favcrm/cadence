@@ -50,6 +50,18 @@ impl Workspace {
         self.daemon
             .operator_rpc("app_workspace_install", json!({"source": self.source()}))
     }
+    fn upgrade_check(&self, installed: &Value) -> Value {
+        self.daemon
+            .operator_rpc(
+                "app_workspace_upgrade_check",
+                json!({
+                    "install_id":installed["install_id"], "source":self.source(),
+                    "expected_digest":installed["digest"],
+                    "expected_generation":installed["catalog_generation"]
+                }),
+            )
+            .unwrap()
+    }
     fn head(&self) -> String {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -59,6 +71,927 @@ impl Workspace {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap()
+    }
+}
+
+#[test]
+fn cad743_upgrade_is_operator_only_race_checked_and_preserves_identity() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let old_digest = installed["digest"].as_str().unwrap();
+    let generation = installed["catalog_generation"].as_str().unwrap();
+    let old_bundle =
+        w.pm.dir
+            .join(".apps/installations")
+            .join(id)
+            .join("bundle/app.md");
+    let old_text = std::fs::read_to_string(&old_bundle).unwrap();
+    let source = w.source();
+    let source_manifest = source.join("app.md");
+    std::fs::write(
+        &source_manifest,
+        old_text.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let head_before_check = w.head();
+    let proposed = w.upgrade_check(&installed);
+    assert_eq!(proposed["committed"], false);
+    assert_eq!(proposed["version"], "0.2.0");
+    assert!(proposed["structural_diff"]["changed"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("app.md")));
+    assert_eq!(w.head(), head_before_check);
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+    let params = json!({"install_id":id,"source":source,"expected_digest":old_digest,
+        "expected_generation":generation,"expected_new_digest":proposed["digest"],
+        "request_id":"upgrade-once"});
+    std::fs::write(
+        &source_manifest,
+        old_text.replace("version: 0.1.0", "version: 0.3.0"),
+    )
+    .unwrap();
+    let changed = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params.clone())
+        .unwrap_err();
+    assert!(changed
+        .to_string()
+        .contains("proposed workspace bundle digest changed"));
+    assert_eq!(w.head(), head_before_check);
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+    std::fs::write(
+        &source_manifest,
+        old_text.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "upgrade-worker", "claude", None, lane.pid());
+    for attack in [
+        params.clone(),
+        json!({"install_id":id,"source":source,
+        "expected_digest":old_digest,"expected_generation":generation,
+        "expected_new_digest":proposed["digest"],"request_id":"upgrade-once",
+        "actor":"operator","approved":true}),
+    ] {
+        let frame = lane.rpc(&w.daemon.state, "app_workspace_upgrade", attack);
+        assert_eq!(
+            frame["ok"], false,
+            "agent upgraded the installation: {frame}"
+        );
+        assert!(
+            frame.to_string().contains("operator") || frame.to_string().contains("authority"),
+            "agent denial missed the operator gate: {frame}"
+        );
+    }
+    let detached_request = lane.dir.path().join("upgrade-detached.json");
+    std::fs::write(
+        &detached_request,
+        cadence_agent::proto::request("app_workspace_upgrade", params.clone()).to_string(),
+    )
+    .unwrap();
+    let (rc, output) = lane.run(&format!("setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}", cadence_agent::client::socket_path(&w.daemon.state).display(), detached_request.display()));
+    assert_eq!(rc, 0);
+    let frame: Value = serde_json::from_str(output.trim()).unwrap();
+    assert_eq!(frame["ok"], false);
+    assert!(
+        frame.to_string().contains("operator"),
+        "detached child denial missed the operator gate: {frame}"
+    );
+    let forged = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,
+        "source":source,"expected_digest":old_digest,"expected_generation":generation,
+        "expected_new_digest":proposed["digest"],"request_id":"upgrade-once","approved":true}),
+    );
+    assert!(forged.is_err(), "forged approval field was accepted");
+    let results = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            w.daemon
+                .operator_rpc("app_workspace_upgrade", params.clone())
+        });
+        let b = scope.spawn(|| {
+            w.daemon
+                .operator_rpc("app_workspace_upgrade", params.clone())
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let first = results.0.unwrap();
+    let second = results.1.unwrap();
+    assert_eq!(
+        first["digest"], second["digest"],
+        "repeat request was not idempotent"
+    );
+    assert_ne!(first["digest"], old_digest);
+    assert_eq!(first["install_id"], id);
+    assert_eq!(first["approved"], false);
+    assert_eq!(std::fs::read_to_string(&old_bundle).unwrap(), old_text);
+    let stale = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,
+        "source":source,"expected_digest":old_digest,"expected_generation":generation,
+        "expected_new_digest":proposed["digest"],"request_id":"conflicting-upgrade"}),
+    );
+    assert!(stale.is_err(), "stale expected digest updated again");
+    std::fs::write(&source_manifest, "the source is no longer a valid bundle").unwrap();
+    let replay = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params.clone())
+        .unwrap();
+    assert_eq!(
+        replay["idempotent"], true,
+        "committed replay fetched the mutable source"
+    );
+    let second_source = w._root.path().join("second-source");
+    for name in [
+        "app.md",
+        "workflows/blog-post.md",
+        "rubrics/blog.md",
+        "templates/brief.md",
+        "templates/post.md",
+    ] {
+        let destination = second_source.join(name);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/blog-post")
+                .join(name),
+            destination,
+        )
+        .unwrap();
+    }
+    let second_manifest = second_source.join("app.md");
+    let second_text = std::fs::read_to_string(&second_manifest).unwrap();
+    std::fs::write(
+        &second_manifest,
+        second_text.replace("app: blog-post", "app: second-post"),
+    )
+    .unwrap();
+    let second = w
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":second_source}))
+        .unwrap();
+    assert_ne!(second["catalog_generation"], replay["catalog_generation"]);
+    let replay_after_unrelated_install = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params)
+        .unwrap();
+    assert_eq!(replay_after_unrelated_install["idempotent"], true);
+    assert_eq!(replay_after_unrelated_install["digest"], proposed["digest"]);
+    let shown = w
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(shown["version"], "0.2.0");
+}
+
+#[test]
+fn cad743_upgrade_refuses_full_binding_history_before_journal_mutation() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let source_manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&source_manifest).unwrap();
+    std::fs::write(
+        &source_manifest,
+        original
+            .replace("version: 0.1.0", "version: 0.2.0")
+            .replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send",
+            ),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let old_config = json!({"schema":1,"install_id":id,"context":null,
+        "bundle_digest":installed["digest"]});
+    let old_receipt = cadence_agent::store::app_runs::material_digest(&json!({
+        "kind":"app-binding-v1","install_id":id,"context_id":null,
+        "slot":"publication","config":old_config,
+    }));
+    let tx = conn.transaction().unwrap();
+    for index in 0..1000 {
+        tx.execute(
+            "INSERT INTO app_bindings
+             (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+             VALUES(?1,?2,NULL,'installation','publication',1,'revoked',?3,?4,?5,1,1)",
+            rusqlite::params![
+                format!("old-binding-{index}"),
+                id,
+                old_config.to_string(),
+                old_receipt,
+                format!("old-request-{index}"),
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let head = w.head();
+    let refusal = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+            "expected_generation":installed["catalog_generation"],
+            "expected_new_digest":proposed["digest"],"request_id":"capacity-blocked"}),
+    );
+    assert!(
+        refusal
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("binding capacity")),
+        "upgrade must refuse specifically for exhausted binding capacity: {refusal:?}"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps/upgrade-pending.yaml").exists());
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+}
+
+#[test]
+fn cad743_upgrade_after_one_hundred_old_bindings_can_create_new_version_binding() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let source_manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&source_manifest).unwrap();
+    std::fs::write(
+        &source_manifest,
+        original
+            .replace("version: 0.1.0", "version: 0.2.0")
+            .replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send",
+            ),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let old_config = json!({"schema":1,"install_id":id,"context":null,
+        "bundle_digest":installed["digest"]});
+    let old_receipt = cadence_agent::store::app_runs::material_digest(&json!({
+        "kind":"app-binding-v1","install_id":id,"context_id":null,
+        "slot":"publication","config":old_config,
+    }));
+    let tx = conn.transaction().unwrap();
+    for index in 0..100 {
+        tx.execute(
+            "INSERT INTO app_bindings
+             (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+             VALUES(?1,?2,NULL,'installation','publication',1,'revoked',?3,?4,?5,1,1)",
+            rusqlite::params![
+                format!("old-binding-{index}"), id, old_config.to_string(),
+                old_receipt, format!("old-request-{index}"),
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+            "expected_generation":installed["catalog_generation"],
+            "expected_new_digest":proposed["digest"],"request_id":"capacity-available"}),
+        )
+        .unwrap();
+    assert_eq!(upgraded["digest"], proposed["digest"]);
+    let store = cadence_agent::store::Store::open(&w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let binding = store
+        .app_binding_create(
+            id,
+            None,
+            "publication",
+            &json!({"schema":1,"install_id":id,"context":null,"bundle_digest":proposed["digest"]}),
+            "new-version-binding",
+        )
+        .unwrap();
+    assert_eq!(
+        binding["binding"]["config"]["bundle_digest"],
+        proposed["digest"]
+    );
+    let listed = w
+        .daemon
+        .operator_rpc("app_binding_list", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(listed["bindings"][0]["id"], binding["binding"]["id"]);
+    assert_eq!(listed["truncated"], true);
+}
+
+#[test]
+fn cad743_upgrade_compatibility_inspects_configured_bindings_beyond_inventory_limit() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, original
+        .replace("version: 0.1.0", "version: 0.2.0")
+        .replace("  connections: [publish]", "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send"))
+        .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let tx = conn.transaction().unwrap();
+    for index in 0..101 {
+        let digest = if index == 100 {
+            &proposed["digest"]
+        } else {
+            &installed["digest"]
+        };
+        let config = json!({"schema":1,"install_id":id,"context":null,
+            "bundle_digest":digest,"declaration":null});
+        let receipt = cadence_agent::store::app_runs::material_digest(&json!({
+            "kind":"app-binding-v1","install_id":id,"context_id":null,
+            "slot":"publication","config":config,
+        }));
+        tx.execute("INSERT INTO app_bindings
+            (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+            VALUES(?1,?2,NULL,?3,'publication',1,'configured',?4,?5,?6,?7,?7)",
+            rusqlite::params![format!("binding-{index:03}"),id,format!("context:fake-{index:03}"),
+                config.to_string(),receipt,format!("request-{index:03}"),index as f64],
+        ).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let listed = w
+        .daemon
+        .operator_rpc("app_binding_list", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(listed["bindings"].as_array().unwrap().len(), 100);
+    assert_eq!(listed["truncated"], true);
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({
+                "install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+                "expected_generation":installed["catalog_generation"],
+                "expected_new_digest":proposed["digest"],"request_id":"complete-binding-preflight"
+            }),
+        )
+        .unwrap();
+    let required = upgraded["compatibility"]["rebind_required"]
+        .as_array()
+        .unwrap();
+    assert_eq!(required.len(), 101);
+    assert!(required.contains(&json!("binding-000")));
+    assert_eq!(
+        upgraded["compatibility"]["incompatible_bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        101
+    );
+}
+
+#[test]
+fn cad743_upgrade_refuses_nonterminal_run_and_retains_terminal_history() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let old_digest = installed["digest"].as_str().unwrap();
+    let generation = installed["catalog_generation"].as_str().unwrap();
+    let context = w.daemon.operator_rpc("app_context_create",
+        json!({"install_id":id,"label":"Fav Limited","input_defaults":{},"request_id":"fav-limited"})).unwrap();
+    let context_id = context["context"]["id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    for (run, state) in [
+        ("kept-run", "succeeded"),
+        ("pending-run", "awaiting_approval"),
+    ] {
+        db.execute("INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES(?,?,1,?,'{}','snapshot','owner',?,?,1,1)",
+            rusqlite::params![run,id,old_digest,run,state]).unwrap();
+    }
+    let source = w.source();
+    let manifest = source.join("app.md");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        original.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let params = json!({"install_id":id,"source":source,"expected_digest":old_digest,
+        "expected_generation":generation,"expected_new_digest":proposed["digest"],
+        "request_id":"after-pending"});
+    let head = w.head();
+    let blocked = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params.clone())
+        .unwrap_err();
+    assert!(
+        blocked.to_string().contains("nonterminal run"),
+        "wrong gate: {blocked}"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps/upgrade-pending.yaml").exists());
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+    db.execute(
+        "UPDATE app_runs SET state='cancelled' WHERE id='pending-run'",
+        [],
+    )
+    .unwrap();
+    let upgraded = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params)
+        .unwrap();
+    assert_eq!(upgraded["approved"], false);
+    assert_eq!(upgraded["install_id"], id);
+    assert_eq!(
+        upgraded["compatibility"]["incompatible_contexts"],
+        json!([])
+    );
+    let kept_context = w
+        .daemon
+        .operator_rpc(
+            "app_context_show",
+            json!({"install_id":id,"context_id":context_id}),
+        )
+        .unwrap();
+    assert_eq!(kept_context["context"]["config"]["label"], "Fav Limited");
+    let historical = w
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":"kept-run"}))
+        .unwrap();
+    assert_eq!(historical["state"], "succeeded");
+    assert_eq!(historical["snapshot"], json!({}));
+    let cancelled = w
+        .daemon
+        .operator_rpc("app_run_show", json!({"run_id":"pending-run"}))
+        .unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(
+        std::fs::read_to_string(
+            w.pm.dir
+                .join(".apps/installations")
+                .join(id)
+                .join("bundle/app.md")
+        )
+        .unwrap(),
+        original
+    );
+}
+
+#[test]
+fn cad743_invalid_new_bundle_never_stages_or_revokes_old_approval() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let old_digest = installed["digest"].as_str().unwrap();
+    let generation = installed["catalog_generation"].as_str().unwrap();
+    let source = w.source();
+    std::fs::write(source.join("app.md"), "not a valid app manifest").unwrap();
+    let head = w.head();
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,
+        "source":source,"expected_digest":old_digest,"expected_generation":generation,
+        "expected_new_digest":"sha256:unavailable","request_id":"invalid-bundle"})
+        )
+        .is_err());
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps/upgrade-pending.yaml").exists());
+    assert!(!w.pm.dir.join(".apps/upgrade-journals").exists());
+    assert_eq!(
+        w.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id":id}))
+            .unwrap()["digest"],
+        old_digest
+    );
+}
+
+#[test]
+fn cad743_interrupted_upgrade_requires_explicit_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let old_digest = installed["digest"].as_str().unwrap();
+    let generation = installed["catalog_generation"].as_str().unwrap();
+    let old_bundle =
+        w.pm.dir
+            .join(".apps/installations")
+            .join(id)
+            .join("bundle/app.md");
+    let old_text = std::fs::read_to_string(&old_bundle).unwrap();
+    let source = w.source();
+    std::fs::write(
+        source.join("app.md"),
+        old_text.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let hook = w.pm.dir.join(".git/hooks/pre-commit");
+    let original_hook = std::fs::read(&hook).ok();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let head = w.head();
+    let failure = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,
+        "source":source,"expected_digest":old_digest,"expected_generation":generation,
+        "expected_new_digest":proposed["digest"],"request_id":"recover-once"}),
+        )
+        .unwrap_err();
+    assert!(failure.to_string().contains("upgrade-recover"));
+    assert_eq!(w.head(), head);
+    assert!(w.pm.dir.join(".apps/upgrade-pending.yaml").is_file());
+    assert_eq!(std::fs::read_to_string(&old_bundle).unwrap(), old_text);
+    assert!(w
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":id}))
+        .is_err());
+    match original_hook {
+        Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
+        None => std::fs::remove_file(&hook).unwrap(),
+    }
+    let journal_path =
+        w.pm.dir
+            .join(".apps/upgrade-journals")
+            .join(id)
+            .join("recover-once.yaml");
+    let journal_bytes = std::fs::read(&journal_path).unwrap();
+    let mut forged: serde_yaml::Value = serde_yaml::from_slice(&journal_bytes).unwrap();
+    forged["files"].as_mapping_mut().unwrap().insert(
+        serde_yaml::Value::String("../escape.md".into()),
+        serde_yaml::Value::String("forged".into()),
+    );
+    std::fs::write(&journal_path, serde_yaml::to_string(&forged).unwrap()).unwrap();
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_workspace_upgrade_recover",
+                json!({"install_id":id,"request_id":"recover-once"})
+            )
+            .is_err(),
+        "forged upgrade journal escaped the confined bundle"
+    );
+    assert_eq!(w.head(), head);
+    std::fs::write(&journal_path, journal_bytes).unwrap();
+    std::fs::remove_file(w.pm.dir.join(".apps/upgrade-pending.yaml")).unwrap();
+    // Reconstruct the instant after the durable journal write but before the
+    // pending marker write. Recovery must work even when nothing was applied.
+    let staged: serde_yaml::Value =
+        serde_yaml::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    std::fs::write(
+        w.pm.dir.join(".apps/catalog.yaml"),
+        staged["before_catalog"].as_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        w.pm.dir
+            .join(".apps/installations")
+            .join(id)
+            .join("record.yaml"),
+        staged["before_record"].as_str().unwrap(),
+    )
+    .unwrap();
+    let staged_replay = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,"source":source,"expected_digest":old_digest,
+        "expected_generation":generation,"expected_new_digest":proposed["digest"],
+        "request_id":"recover-once"}),
+    );
+    assert!(
+        staged_replay
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("upgrade-recover")),
+        "uncommitted journal was mistaken for a committed replay: {staged_replay:?}"
+    );
+    let recovered = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade_recover",
+            json!({"install_id":id,"request_id":"recover-once"}),
+        )
+        .unwrap();
+    assert_eq!(recovered["version"], "0.2.0");
+    assert_eq!(recovered["install_id"], id);
+    assert!(!w.pm.dir.join(".apps/upgrade-pending.yaml").exists());
+    assert_eq!(std::fs::read_to_string(&old_bundle).unwrap(), old_text);
+}
+
+#[test]
+fn cad743_http_upgrade_has_same_operator_and_field_gate() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let original = std::fs::read_to_string(w.source().join("app.md")).unwrap();
+    std::fs::write(
+        w.source().join("app.md"),
+        original.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "upgrade-http-agent", "claude", None, lane.pid());
+    let port = (3110..3200)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let path = format!("/api/app-installations/{id}/upgrade");
+    let check_path = format!("/api/app-installations/{id}/upgrade/check");
+    let check_body = json!({"source":w.source(),"expected_digest":installed["digest"],
+        "expected_generation":installed["catalog_generation"]})
+    .to_string();
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let (code, _, response) =
+        common::op::raw(port, &session.request("POST", &check_path, &check_body));
+    assert_eq!(code, 200, "operator HTTP upgrade check: {response}");
+    let proposed: Value = serde_json::from_str(&response).unwrap();
+    let body = json!({"source":w.source(),"expected_digest":installed["digest"],
+        "expected_generation":installed["catalog_generation"],
+        "expected_new_digest":proposed["digest"],"request_id":"http-upgrade"})
+    .to_string();
+    let head = w.head();
+    for prefix in ["", "setsid "] {
+        for (path, body) in [(&check_path, &check_body), (&path, &body)] {
+            let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+            let request = lane.dir.path().join(format!(
+                "upgrade-http-stolen-{}-{}.txt",
+                prefix.len(),
+                path.len()
+            ));
+            std::fs::write(&request, session.request_as("POST", path, body, "")).unwrap();
+            let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}", request.display()));
+            assert_eq!(rc, 0);
+            assert_eq!(
+                response.split_whitespace().nth(1),
+                Some("403"),
+                "agent HTTP peer accessed {path}: {response}"
+            );
+        }
+    }
+    assert_eq!(w.head(), head);
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let forged = json!({"source":w.source(),"expected_digest":installed["digest"],
+        "expected_generation":installed["catalog_generation"],
+        "expected_new_digest":proposed["digest"],"request_id":"http-upgrade",
+        "approved":true})
+    .to_string();
+    let (code, _, _) = common::op::raw(port, &session.request("POST", &path, &forged));
+    assert_eq!(code, 400);
+    assert_eq!(w.head(), head);
+    let (code, _, response) = common::op::raw(port, &session.request("POST", &path, &body));
+    assert_eq!(code, 200, "operator HTTP upgrade: {response}");
+    let row: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(row["version"], "0.2.0");
+    assert_eq!(row["approved"], false);
+}
+
+#[test]
+fn cad743_cli_upgrade_uses_expected_digest_and_generation() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let original = std::fs::read_to_string(w.source().join("app.md")).unwrap();
+    std::fs::write(
+        w.source().join("app.md"),
+        original.replace("version: 0.1.0", "version: 0.2.0"),
+    )
+    .unwrap();
+    let check = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &[
+            "app",
+            "catalog",
+            "upgrade-check",
+            id,
+            w.source().to_str().unwrap(),
+            "--expected-digest",
+            installed["digest"].as_str().unwrap(),
+            "--expected-generation",
+            installed["catalog_generation"].as_str().unwrap(),
+        ],
+    );
+    assert!(
+        check.status.success(),
+        "CLI upgrade check: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let proposed: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(proposed["committed"], false);
+    let command = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &[
+            "app",
+            "catalog",
+            "upgrade",
+            id,
+            w.source().to_str().unwrap(),
+            "--expected-digest",
+            installed["digest"].as_str().unwrap(),
+            "--expected-generation",
+            installed["catalog_generation"].as_str().unwrap(),
+            "--expected-new-digest",
+            proposed["digest"].as_str().unwrap(),
+            "--request-id",
+            "cli-upgrade",
+        ],
+    );
+    assert!(
+        command.status.success(),
+        "CLI upgrade: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let row: Value = serde_json::from_slice(&command.stdout).unwrap();
+    assert_eq!(row["install_id"], id);
+    assert_eq!(row["version"], "0.2.0");
+    assert_eq!(row["approved"], false);
+    std::fs::remove_dir_all(w.source()).unwrap();
+    let repeated = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &[
+            "app",
+            "catalog",
+            "upgrade",
+            id,
+            w.source().to_str().unwrap(),
+            "--expected-digest",
+            installed["digest"].as_str().unwrap(),
+            "--expected-generation",
+            installed["catalog_generation"].as_str().unwrap(),
+            "--expected-new-digest",
+            proposed["digest"].as_str().unwrap(),
+            "--request-id",
+            "cli-upgrade",
+        ],
+    );
+    assert!(
+        repeated.status.success(),
+        "CLI replay after source removal: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated_row: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_row["idempotent"], true);
+}
+
+/// Operator-run evidence against a private *copy*. Never point these variables at live state.
+#[test]
+#[ignore = "requires an isolated pilot PM/SQLite copy and a proposed Social Content source"]
+fn cad743_isolated_social_content_pilot_upgrade() {
+    let pm_dir = PathBuf::from(std::env::var("CAD743_COPY_PM").unwrap());
+    let state = PathBuf::from(std::env::var("CAD743_COPY_STATE").unwrap());
+    let source = PathBuf::from(std::env::var("CAD743_PROPOSED_SOURCE").unwrap());
+    let id = std::env::var("CAD743_COPY_INSTALL_ID").unwrap();
+    assert!(pm_dir.starts_with("/tmp/cad743-pilot-proof/"));
+    assert!(state.starts_with("/tmp/cad743-pilot-proof/"));
+    assert!(source.is_dir());
+    let old_bundle = pm_dir
+        .join(".apps/installations")
+        .join(&id)
+        .join("bundle/app.md");
+    let old_bytes = std::fs::read(&old_bundle).unwrap();
+    let before = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        before
+            .query_row("SELECT version FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        27
+    );
+    let old_approval: (i64, String, String) = before
+        .query_row(
+            "SELECT epoch,digest,state FROM app_install_capabilities WHERE install_id=?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    drop(before);
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let daemon = TestDaemon::start_on_opts(state.clone(), opts);
+    let installed = daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(installed["version"], "0.4.0");
+    let contexts_before = daemon
+        .operator_rpc("app_context_list", json!({"install_id":id}))
+        .unwrap();
+    let bindings_before = daemon
+        .operator_rpc("app_binding_list", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(contexts_before["contexts"].as_array().unwrap().len(), 1);
+    assert_eq!(bindings_before["bindings"].as_array().unwrap().len(), 3);
+    let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        28
+    );
+    let retained_approval: (i64, String, String) = db
+        .query_row(
+            "SELECT epoch,digest,state FROM app_capability_epochs WHERE install_id=?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retained_approval, old_approval);
+    let runs: Vec<String> = db
+        .prepare("SELECT id FROM app_runs WHERE install_id=? ORDER BY id")
+        .unwrap()
+        .query_map([&id], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(runs.len() >= 2);
+    let old_runs: Vec<Value> = runs
+        .iter()
+        .map(|run| {
+            daemon
+                .operator_rpc("app_run_show", json!({"run_id":run}))
+                .unwrap()
+        })
+        .collect();
+    assert!(old_runs.iter().all(|run| run["state"] == "failed"));
+    let check = daemon
+        .operator_rpc(
+            "app_workspace_upgrade_check",
+            json!({
+        "install_id":id,"source":source,"expected_digest":installed["digest"],
+        "expected_generation":installed["catalog_generation"]}),
+        )
+        .unwrap();
+    assert_eq!(check["version"], "0.5.0");
+    let apply = json!({"install_id":id,"source":source,"expected_digest":installed["digest"],
+        "expected_generation":installed["catalog_generation"],
+        "expected_new_digest":check["digest"],"request_id":"isolated-social-content-v05"});
+    db.execute(
+        "UPDATE app_runs SET state='awaiting_approval' WHERE id=?",
+        [&runs[0]],
+    )
+    .unwrap();
+    let blocked = daemon
+        .operator_rpc("app_workspace_upgrade", apply.clone())
+        .unwrap_err();
+    assert!(blocked.to_string().contains("nonterminal run"), "{blocked}");
+    assert!(!pm_dir.join(".apps/upgrade-pending.yaml").exists());
+    db.execute("UPDATE app_runs SET state='failed' WHERE id=?", [&runs[0]])
+        .unwrap();
+    let upgraded = daemon.operator_rpc("app_workspace_upgrade", apply).unwrap();
+    assert_eq!(upgraded["install_id"], id);
+    assert_eq!(upgraded["version"], "0.5.0");
+    assert_eq!(upgraded["approved"], false);
+    assert_eq!(std::fs::read(&old_bundle).unwrap(), old_bytes);
+    assert_eq!(
+        daemon
+            .operator_rpc("app_context_list", json!({"install_id":id}))
+            .unwrap(),
+        contexts_before
+    );
+    assert_eq!(
+        daemon
+            .operator_rpc("app_binding_list", json!({"install_id":id}))
+            .unwrap(),
+        bindings_before
+    );
+    for (run, old) in runs.iter().zip(old_runs.iter()) {
+        assert_eq!(
+            &daemon
+                .operator_rpc("app_run_show", json!({"run_id":run}))
+                .unwrap(),
+            old
+        );
     }
 }
 

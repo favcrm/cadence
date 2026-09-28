@@ -13,7 +13,7 @@
 //! experimental by its vendor; the tested CLI version is negotiated at
 //! initialize, not assumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,6 +32,124 @@ use super::{
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
+/// Codex's command sandbox cannot open the daemon's Unix socket on this
+/// Linux host. A thread-scoped local MCP server runs beside the provider,
+/// retaining its enrolled process ancestry for Cadence caller checks.
+fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
+    let state_dir = log_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::provider("Codex MCP cannot derive daemon state directory"))?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
+        Error::provider(format!(
+            "Codex MCP cannot resolve daemon state directory: {error}"
+        ))
+    })?;
+    let binary = std::env::current_exe()?;
+    Ok(json!({
+        "command": binary,
+        "args": ["--state-dir", state_dir, "mcp-agent"],
+        "env": {"CADENCE_ALIAS": agent.alias, "CADENCE_STATE_DIR": state_dir},
+        "startup_timeout_sec": 10,
+        // Managed Codex runs with approvalPolicy=never. Without these
+        // per-tool approvals, it lists the MCP tools but rejects every
+        // model-initiated call before the daemon can apply its own scope.
+        // Keep future tools undiscoverable and subject to a prompt, which
+        // the unattended worker cannot grant.
+        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show"],
+        "default_tools_approval_mode": "prompt",
+        "tools": {
+            "self": {"approval_mode": "approve"},
+            "wiki_search": {"approval_mode": "approve"},
+            "wiki_read": {"approval_mode": "approve"},
+            "issue_show": {"approval_mode": "approve"},
+        },
+    }))
+}
+
+/// A configured but unavailable MCP server leaves the agent unable to do
+/// Cadence work. Ask Codex for this thread's actual tool inventory before
+/// advertising the endpoint as ready.
+fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Result<()> {
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    let mut found = false;
+    for _ in 0..32 {
+        let mut params = json!({"threadId": thread_id, "detail":"toolsAndAuthOnly", "limit":100});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let inventory = transport
+            .request_timeout("mcpServerStatus/list", params, Duration::from_secs(12))
+            .map_err(|error| {
+                Error::provider(format!("Codex Cadence MCP readiness failed: {error}"))
+            })?;
+        let servers = inventory["data"].as_array().ok_or_else(|| {
+            Error::provider("Codex Cadence MCP readiness failed: invalid server inventory")
+        })?;
+        if let Some(server) = servers.iter().find(|server| server["name"] == "cadence") {
+            if server["runtimeStatus"] != "connected"
+                || !["self", "wiki_search", "wiki_read", "issue_show"]
+                    .iter()
+                    .all(|name| server["tools"].get(*name).is_some())
+            {
+                return Err(Error::provider(format!(
+                    "Codex Cadence MCP readiness failed: status {}, tools {}",
+                    server["runtimeStatus"], server["tools"]
+                )));
+            }
+            found = true;
+            break;
+        }
+        let Some(next) = inventory["nextCursor"].as_str() else {
+            break;
+        };
+        if !seen.insert(next.to_string()) {
+            return Err(Error::provider(
+                "Codex Cadence MCP readiness failed: repeated inventory cursor",
+            ));
+        }
+        cursor = Some(next.to_string());
+    }
+    if !found {
+        return Err(Error::provider(
+            "Codex Cadence MCP readiness failed: server absent or inventory page limit reached",
+        ));
+    }
+    // Listing tools only proves that the MCP process started. Exercise the
+    // daemon connection from that process before declaring this worker ready.
+    let proof = transport
+        .request_timeout(
+            "mcpServer/tool/call",
+            json!({"threadId":thread_id, "server":"cadence", "tool":"self", "arguments":{}}),
+            Duration::from_secs(12),
+        )
+        .map_err(|error| {
+            Error::provider(format!("Codex Cadence MCP identity proof failed: {error}"))
+        })?;
+    let identity = proof["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|item| item["type"] == "text"))
+        .and_then(|item| item["text"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    if proof["isError"] == true
+        || identity
+            .as_ref()
+            .and_then(|identity| identity["alias"].as_str())
+            != Some(alias)
+    {
+        return Err(Error::provider(format!(
+            "Codex Cadence MCP identity proof failed for {alias}: {}",
+            if proof["isError"] == true {
+                proof["content"].to_string()
+            } else {
+                "missing or mismatched Cadence identity".to_string()
+            }
+        )));
+    }
+    Ok(())
+}
+
 /// Silence bound before a turn is `unknown` (`params.turn_idle_secs`) —
 /// the same activity-based liveness as managed claude: a turn that keeps
 /// streaming is alive however long it runs. `params.turn_max_secs` adds
@@ -43,7 +161,6 @@ const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
 const SANDBOX_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 const SANDBOX_PROBE_OUTPUT_LIMIT: usize = 2048;
-const RPC_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
 const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
@@ -315,7 +432,7 @@ fn codex_sandbox_command(env: &ProviderEnv) -> Vec<String> {
     vec!["codex".to_string()]
 }
 
-fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str, log_path: &Path) -> Result<()> {
+fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str) -> Result<()> {
     // Validation also happens before the app-server thread request. A corrupt
     // row must not turn into a broader `codex sandbox` default here.
     registry::codex_sandbox(sandbox)?;
@@ -367,58 +484,6 @@ fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str, log_path: &Path) 
             "Codex sandbox readiness failed ({sandbox}, exit {}): {detail}. \
              Check the host's confined sandbox prerequisites before assigning \
              this worker (Ubuntu 24.04: bwrap AppArmor user namespace profile).",
-            output.status
-        )));
-    }
-    // This same sandbox must run the Cadence CLI during a worker turn.
-    // Workspace I/O alone does not prove its Unix-socket RPC is reachable.
-    let state_dir = log_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| Error::provider("Codex readiness cannot locate daemon state directory"))?;
-    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
-        Error::provider(format!(
-            "Codex readiness cannot resolve daemon state directory: {error}"
-        ))
-    })?;
-    let cadence = std::env::current_exe().map_err(|error| {
-        Error::provider(format!(
-            "Codex readiness cannot locate Cadence binary: {error}"
-        ))
-    })?;
-    let mut rpc_probe = Command::new(&command[0]);
-    rpc_probe.current_dir(cwd).args(&command[1..]);
-    rpc_probe.args([
-        "sandbox",
-        "-c",
-        &format!("sandbox_mode=\"{sandbox}\""),
-        "--",
-    ]);
-    rpc_probe.arg(cadence).arg("--state-dir").arg(state_dir);
-    rpc_probe.args(["daemon", "status"]);
-    let (output, bounds) = crate::proc::run_bounded_limited(
-        &mut rpc_probe,
-        SANDBOX_PROBE_DEADLINE,
-        RPC_PROBE_OUTPUT_LIMIT,
-    )
-    .map_err(|error| {
-        Error::provider(format!(
-            "Codex sandbox Cadence RPC readiness failed ({sandbox}): {error}. \
-             Check access to this daemon's Unix socket before assigning the worker."
-        ))
-    })?;
-    if !output.status.success() || bounds.stdout_exceeded || bounds.stderr_exceeded {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let parsed = serde_json::from_slice::<Value>(&output.stderr).ok();
-        let detail = parsed
-            .as_ref()
-            .and_then(|value| value.get("error"))
-            .and_then(Value::as_str)
-            .or_else(|| stderr.trim().lines().next())
-            .unwrap_or("no error detail");
-        return Err(Error::provider(format!(
-            "Codex sandbox Cadence RPC readiness failed ({sandbox}, exit {}): {detail}. \
-             The worker's command sandbox cannot reach this daemon's Unix socket.",
             output.status
         )));
     }
@@ -853,6 +918,17 @@ impl Shared {
 }
 
 impl ProviderAdapter for CodexAdapter {
+    fn post_enrollment_ready(&self, agent: &Agent) -> Result<()> {
+        let thread_id = self
+            .shared
+            .thread_id
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::provider("Codex Cadence MCP identity proof has no thread"))?;
+        check_agent_mcp(&self.transport, &thread_id, &agent.alias)
+    }
+
     /// The raw transport clock — `Shared::dispatch` stamps every
     /// incoming message, so the daemon's stall watch reads true
     /// provider traffic, not only the curated event stream.
@@ -880,12 +956,7 @@ impl ProviderAdapter for CodexAdapter {
         // keeps a hand-edited store from reaching `thread/start`, and
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
-        sandbox_probe(
-            &self.sandbox_command,
-            &agent.cwd,
-            &agent.sandbox,
-            &self.log_path,
-        )?;
+        sandbox_probe(&self.sandbox_command, &agent.cwd, &agent.sandbox)?;
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
@@ -930,15 +1001,25 @@ impl ProviderAdapter for CodexAdapter {
             if let Some(model) = configured_model.as_deref() {
                 params["model"] = json!(model);
             }
+            // Give only this managed thread the Cadence tool bridge. Never
+            // mutate the operator's global Codex configuration or grant
+            // command execution general network access.
+            params["config"] = json!({"mcp_servers": {
+                "cadence": agent_mcp_config(agent, &self.log_path)?
+            }});
             if let Some(effort) = configured_effort.as_deref() {
-                // Scope the reasoning setting to this managed thread. This
-                // uses the app-server config field without touching the
-                // operator's global ~/.codex configuration.
-                params["config"] = json!({"model_reasoning_effort": effort});
+                params["config"]["model_reasoning_effort"] = json!(effort);
             }
-            if let Some(instructions) = &agent.instructions {
-                params["developerInstructions"] = json!(instructions);
+            let mut instructions = agent.instructions.clone().unwrap_or_default();
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
             }
+            instructions.push_str(
+                "Use the cadence MCP tools for Cadence identity, wiki search/read, and issue reads. \
+                 The command sandbox cannot reach Cadence's RPC socket. Your final answer is the \
+                 managed turn result; do not call cadence message result from a shell.",
+            );
+            params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {
                 params["threadId"] = json!(thread);
             }

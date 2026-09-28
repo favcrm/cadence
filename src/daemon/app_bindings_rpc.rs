@@ -47,7 +47,16 @@ impl Shared {
             "app_binding_show" => self
                 .store
                 .app_binding_show(install, required_str(params, "binding_id")?),
-            "app_binding_list" => self.store.app_binding_list(install, context),
+            "app_binding_list" => {
+                let pm = self.pm_at(&self.pm_dir()?)?;
+                workspace::with_runtime_snapshot(&pm, install, |bundle, _| {
+                    self.store.app_binding_list_preferred(
+                        install,
+                        context,
+                        Some(required_str(bundle, "digest")?),
+                    )
+                })
+            }
             "app_binding_revoke" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, install, |_, _| {
@@ -235,7 +244,7 @@ impl Shared {
     ) -> Result<()> {
         let current = self
             .store
-            .app_binding_for_slot(install, context, slot)?
+            .app_binding_for_slot(install, context, slot, required_str(bundle, "digest")?)?
             .ok_or_else(|| Error::rejected("publication binding is absent or revoked"))?;
         if current.id != proof.id
             || current.revision != proof.revision

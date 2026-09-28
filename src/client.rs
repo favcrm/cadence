@@ -29,14 +29,40 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("cadence.sock")
 }
 
+fn rpc_socket_path(state_dir: &Path) -> Result<PathBuf> {
+    // ADR 0007 T3: an agent-uid pane gets only the shared socket path,
+    // never the operator's private state-dir path. Unset preserves the
+    // original behavior for every operator CLI and existing fixture.
+    match std::env::var_os("CADENCE_SOCKET") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(Error::rejected("CADENCE_SOCKET must be an absolute path"));
+            }
+            Ok(path)
+        }
+        None => Ok(socket_path(state_dir)),
+    }
+}
+
 /// The briefing file an actor agent reads —
-/// `<state>/briefings/<root>/BRIEFING-<alias>.md` — never inside the
-/// agent's cwd repository. The `<root>` segment is the upstream PM's
+/// `<state>/briefings/<root>/BRIEFING-<alias>.md` — the operator-owned
+/// source copy. Split-mode pty panes get a separate lane copy. The
+/// `<root>` segment is the upstream PM's
 /// alias when `params` wires one, else the agent's own alias.
 pub fn briefing_path(state_dir: &Path, params: &Value, alias: &str) -> PathBuf {
     let root = params["upstream"].as_str().unwrap_or(alias);
     state_dir
         .join("briefings")
+        .join(root)
+        .join(format!("BRIEFING-{alias}.md"))
+}
+
+/// Agent-UID panes cannot traverse the operator's private state dir.
+/// Their briefing copy lives under the lane, using the same root name.
+pub fn lane_briefing_path(cwd: &Path, params: &Value, alias: &str) -> PathBuf {
+    let root = params["upstream"].as_str().unwrap_or(alias);
+    cwd.join(".cadence")
         .join(root)
         .join(format!("BRIEFING-{alias}.md"))
 }
@@ -326,6 +352,24 @@ pub fn rpc_timeout(
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
 }
 
+/// Query the daemon bound to this private state directory, ignoring
+/// `CADENCE_SOCKET`. The board uses this for boot-pinned UID authority;
+/// an inherited agent socket override must never choose that source.
+pub fn rpc_private_timeout(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    proto::unwrap(rpc_frame_on(
+        state_dir,
+        &socket_path(state_dir),
+        method,
+        params,
+        timeout,
+    )?)
+}
+
 /// `rpc` that tells the two failures apart: the outer `Err` is the
 /// transport — no daemon at the socket, an I/O error, a malformed
 /// frame — and the inner result is the daemon's own answer, a refusal
@@ -342,8 +386,18 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
 
 /// One request/response frame over the daemon socket.
 fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-    let socket = socket_path(state_dir);
-    let mut stream = UnixStream::connect(&socket).map_err(|_| {
+    let socket = rpc_socket_path(state_dir)?;
+    rpc_frame_on(state_dir, &socket, method, params, timeout)
+}
+
+fn rpc_frame_on(
+    state_dir: &Path,
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut stream = UnixStream::connect(socket).map_err(|_| {
         Error::internal(format!(
             "Daemon is not reachable at {} — start it with `cadence daemon start`",
             socket.display()

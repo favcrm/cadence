@@ -15,12 +15,62 @@ use cadence_agent::store::Store;
 use cadence_agent::store::Take;
 use serde_json::json;
 use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use tempfile::TempDir;
+
+#[test]
+fn configured_agent_uid_binds_two_sockets_without_changing_private_clients() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let edge = root.path().join("edge");
+    std::fs::create_dir_all(&edge).unwrap();
+    std::fs::set_permissions(&edge, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let shared = edge.join("cadence.sock");
+    let mut opts = daemon_opts();
+    opts.agent_uid = Some(2000);
+    opts.shared_socket = Some((shared.clone(), unsafe { libc::getegid() }));
+    let d = TestDaemon::start_on_opts(state.clone(), opts);
+    for path in [state.join("cadence.sock"), shared.clone()] {
+        let mut stream = UnixStream::connect(&path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"method":"health", "params":{"peer_uid":2000}})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert!(response["error"].is_null(), "{path:?}: {response}");
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(root.path().join("unused-state"))
+        .arg("status")
+        .env("CADENCE_SOCKET", &shared)
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(d);
+    assert!(
+        !shared.exists(),
+        "shared socket must be removed on clean stop"
+    );
+}
 
 #[test]
 fn fifo_queue_and_idempotent_send() {
@@ -4531,9 +4581,14 @@ fn instructions_file_with_no_bootstrap_refused_except_codex() {
     d.wait_agent("r-codex", "idle", 20);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs[0]["method"], "thread/start", "{reqs:?}");
-    assert_eq!(
-        reqs[0]["params"]["developerInstructions"],
-        "Role: reviewer."
+    let instructions = reqs[0]["params"]["developerInstructions"].as_str().unwrap();
+    assert!(
+        instructions.starts_with("Role: reviewer.\n\n"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Use the cadence MCP tools"),
+        "{instructions}"
     );
 }
 

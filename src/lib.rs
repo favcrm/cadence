@@ -33,6 +33,7 @@ pub mod lease;
 pub mod master;
 pub mod master_perm;
 pub mod mcp;
+pub mod mcp_agent;
 pub mod memory;
 pub mod model_defaults;
 pub mod needs_dismiss;

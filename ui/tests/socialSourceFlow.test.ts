@@ -20,7 +20,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.3.0", digest: "bundle-v3", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md", "workflows/source-instagram.md"] };
-const binding = (slot: string, connectionId: string, provider: string) => ({ id: `binding-${slot}`, install_id: "install-a", context_id: null, slot, revision: 1, state: "configured", digest: `digest-${slot}`, config: { connection_id: connectionId, provider, account: "company-a" } });
+const binding = (slot: string, connectionId: string, provider: string) => ({ id: `binding-${slot}`, install_id: "install-a", context_id: null, slot, revision: 1, state: "configured", digest: `digest-${slot}`, config: { bundle_digest: "bundle-v3", connection_id: connectionId, provider, account: "company-a" } });
 const sourceSnapshot = { owner_pm: "pm-a", inputs: { profile_handle: "juicysuite_crm", writer: "writer-a" }, workflow: { title: "Read public Instagram posts: juicysuite_crm", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Read bound source" }] }, capabilities: { source: { id: "binding-source", revision: 1, digest: "digest-source" } }, quotes: { source: { schema: 1, currency: "USD", unit_price_micros: 2000, units: 1, total_price_micros: 2000, price_revision: "sha256:quote" } }, assignments: {} };
 const sourceRun = (state = "awaiting_approval") => ({ id: "source-run", install_id: "install-a", context_id: null, state, snapshot_digest: "source-digest", approved_digest: state === "awaiting_approval" ? null : "source-digest", snapshot: sourceSnapshot, steps: [{ step_id: "1", task_id: "task-a", state: state === "succeeded" ? "succeeded" : "pending", message_id: state === "succeeded" ? "message-a" : null }], artifacts: [], reviews: [] });
 const receipt = { id: "receipt-a", run_id: "source-run", slot: "source", digest: "receipt-digest", binding_digest: "digest-source", result: { schema: 1, kind: "social.source.posts", provider: "agenticos_external", source_tool: "scrapecreators.instagram.user.posts", handle: "juicysuite_crm", profile_verified: true, empty_reason: null, more_available: false, posts: [{ id: "post-a", caption: "Original line one\nOriginal line two", permalink: "https://www.instagram.com/p/AbCd123/", published_at: "2026-09-27T00:00:00Z", published_at_unix: 1790467200, media_kind: "image", preview_url: null }] } };
@@ -127,6 +127,26 @@ async function main() {
   await click(button("Board")); await click(button("Sources"));
   assert(!host.querySelector(".wa-source-image"), "A tampered receipt cannot load an arbitrary browser image URL");
   assert(!!host.querySelector(".wa-source-image-fallback") && host.textContent?.includes("View original post"), "Unavailable previews retain a clear path to inspect the original");
+  for (const previewUrl of [
+    "https://cdninstagram.com.attacker.example/track",
+    "https://fbcdn.net.attacker.example/track",
+    "http://scontent.cdninstagram.com/post.jpg",
+    "https://user:password@scontent.cdninstagram.com/post.jpg",
+    "https://scontent.cdninstagram.com:444/post.jpg",
+  ]) {
+    receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: previewUrl }] } }];
+    await click(button("Board")); await click(button("Sources"));
+    assert(!host.querySelector(".wa-source-image"), `Untrusted preview URL must stay blocked: ${previewUrl}`);
+  }
+  for (const previewUrl of [
+    "https://scontent.cdninstagram.com/post.jpg",
+    "https://scontent.fbcdn.net/post.jpg",
+  ]) {
+    receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: previewUrl }] } }];
+    await click(button("Board")); await click(button("Sources"));
+    assert((host.querySelector(".wa-source-image") as HTMLImageElement | null)?.src === previewUrl,
+      `Reviewed CDN preview should be rendered: ${previewUrl}`);
+  }
   receiptRows = [receipt]; await click(button("Board")); await click(button("Sources"));
   await click(button("Use as source"));
   const sourceField = host.querySelector("#wa-post-source") as HTMLTextAreaElement;

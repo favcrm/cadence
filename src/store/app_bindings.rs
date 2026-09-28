@@ -18,6 +18,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS app_binding_live_slot
 ";
 const CONFIG_BYTES: usize = 16 * 1024;
 const LIST_MAX: i64 = 100;
+const ACTIVE_BUNDLE_MAX: i64 = 100;
+const LIFETIME_MAX: i64 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,20 +143,99 @@ impl Store {
         Ok(json!({"binding":binding_in(&self.conn(), install, id)?}))
     }
 
-    /// An omitted filter lists both installation and context bindings.
+    /// An omitted context filter lists both installation and context bindings.
+    /// The current catalog digest is prioritized so retained old versions do
+    /// not hide a newly configured binding inside the bounded response.
     pub fn app_binding_list(&self, install: &str, context: Option<&str>) -> Result<Value> {
+        self.app_binding_list_preferred(install, context, None)
+    }
+    pub fn app_binding_list_preferred(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        preferred_digest: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id FROM app_bindings WHERE install_id=? AND (? IS NULL OR context_id=?) ORDER BY created,id LIMIT 100")?;
-        let ids = stmt
-            .query_map(params![install, context, context], |r| {
-                r.get::<_, String>(0)
-            })?
+        let mut stmt = conn.prepare("SELECT id FROM app_bindings WHERE install_id=? AND (? IS NULL OR context_id=?)
+            ORDER BY CASE WHEN ? IS NOT NULL AND json_extract(config,'$.bundle_digest')=? THEN 0 ELSE 1 END,
+                     CASE WHEN state='configured' THEN 0 ELSE 1 END, created DESC,id DESC LIMIT 101")?;
+        let mut ids = stmt
+            .query_map(
+                params![
+                    install,
+                    context,
+                    context,
+                    preferred_digest,
+                    preferred_digest
+                ],
+                |r| r.get::<_, String>(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let truncated = ids.len() > LIST_MAX as usize;
+        ids.truncate(LIST_MAX as usize);
         let bindings = ids
             .iter()
             .map(|id| binding_in(&conn, install, id))
             .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"bindings":bindings}))
+        Ok(json!({"bindings":bindings,"truncated":truncated}))
+    }
+
+    /// Upgrade compatibility must inspect every configured binding, including
+    /// rows intentionally hidden by the bounded operator inventory.
+    pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+        )?;
+        let ids = stmt
+            .query_map([install], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| binding_in(&conn, install, id))
+            .collect()
+    }
+
+    /// Called under the PM upgrade lock before any journal write. Every
+    /// declared slot must be usable in at least one scope after the upgrade.
+    pub fn app_binding_upgrade_capacity(
+        &self,
+        install: &str,
+        bundle_digest: &str,
+        slots: &[String],
+    ) -> Result<()> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        let total: i64 = conn.query_row(
+            "SELECT count(*) FROM app_bindings WHERE install_id=?",
+            [install],
+            |r| r.get(0),
+        )?;
+        let active: i64 = conn.query_row(
+            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+             AND json_extract(config,'$.bundle_digest')=?",
+            params![install, bundle_digest],
+            |r| r.get(0),
+        )?;
+        let mut missing = 0;
+        for slot in slots {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND state='configured'
+                 AND json_extract(config,'$.bundle_digest')=? AND slot=?)",
+                params![install, bundle_digest, slot],
+                |r| r.get(0),
+            )?;
+            if !present {
+                missing += 1;
+            }
+        }
+        if total + missing > LIFETIME_MAX || active + missing > ACTIVE_BUNDLE_MAX {
+            return Err(Error::rejected(
+                "binding capacity cannot reserve the new package's declared slots; retain evidence or choose another installation",
+            ));
+        }
+        Ok(())
     }
 
     pub fn app_binding_create(
@@ -190,17 +271,28 @@ impl Store {
             tx.commit()?;
             return Ok(json!({"binding":row}));
         }
-        let count: i64 = tx.query_row(
+        let total: i64 = tx.query_row(
             "SELECT count(*) FROM app_bindings WHERE install_id=?",
             [install],
             |r| r.get(0),
         )?;
-        if count >= LIST_MAX {
+        if total >= LIFETIME_MAX {
             return Err(Error::rejected(
-                "installation has reached its binding limit",
+                "installation has reached its lifetime binding capacity",
             ));
         }
-        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND state='configured')",params![install,scope_key(context),slot],|r| r.get(0))?;
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM app_bindings WHERE install_id=? AND state='configured'
+             AND json_extract(config,'$.bundle_digest')=?",
+            params![install, config["bundle_digest"].as_str()],
+            |r| r.get(0),
+        )?;
+        if active >= ACTIVE_BUNDLE_MAX {
+            return Err(Error::rejected(
+                "this package version has reached its configured binding capacity",
+            ));
+        }
+        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
         if occupied {
             return Err(Error::rejected(
                 "this scope already has a configured binding for this slot",
@@ -255,6 +347,11 @@ impl Store {
         }
         let context = row["context_id"].as_str();
         validate_config(install, context, config)?;
+        if row["config"]["bundle_digest"] != config["bundle_digest"] {
+            return Err(Error::rejected(
+                "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
+            ));
+        }
         let slot = row["slot"]
             .as_str()
             .ok_or_else(|| Error::internal("invalid binding slot"))?;
@@ -263,7 +360,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding update lost its revision claim"));
         }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
         Self::event(
             &tx,
             "app_bindings",
@@ -292,7 +389,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding revoke lost its revision claim"));
         }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
         Self::event(
             &tx,
             "app_bindings",
@@ -309,9 +406,10 @@ impl Store {
         install: &str,
         context: Option<&str>,
         slot: &str,
+        bundle_digest: &str,
     ) -> Result<Option<BindingProof>> {
         let conn = self.conn();
-        let id = conn.query_row("SELECT id FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND state='configured'",params![install,scope_key(context),slot],|r| r.get::<_,String>(0)).optional()?;
+        let id = conn.query_row("SELECT id FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND json_extract(config,'$.bundle_digest')=? AND state='configured'",params![install,scope_key(context),slot,bundle_digest],|r| r.get::<_,String>(0)).optional()?;
         id.map(|id| {
             let row = binding_in(&conn, install, &id)?;
             Ok(BindingProof {

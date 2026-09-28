@@ -106,6 +106,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("agent_list", Rule::Read),
     ("agent_show", Rule::Read),
     (
+        "agent_identity",
+        Rule::Handler("caller_identity (verified agent endpoint only, CAD-744)"),
+    ),
+    (
         "agent_send",
         Rule::Handler(
             "thread_sender: the operator's thread write needs proof (CAD-384); \
@@ -404,6 +408,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_show", Rule::Handler("operator_connection (CAD-753)")),
     ("app_record_update", Rule::Handler("operator_connection (CAD-753)")),
     ("app_workspace_install", Rule::Handler("operator_connection (CAD-667)")),
+    ("app_workspace_upgrade", Rule::Handler("operator_connection (CAD-743)")),
+    ("app_workspace_upgrade_check", Rule::Handler("operator_connection (CAD-743)")),
+    ("app_workspace_upgrade_recover", Rule::Handler("operator_connection (CAD-743)")),
     ("app_workspace_list", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_show", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_migrate", Rule::Handler("operator_connection (CAD-667)")),

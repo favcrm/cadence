@@ -828,7 +828,7 @@ impl Shared {
         // `agent stop` is the explicit kill. For a live agent the
         // actor's own close() already ran, so this is a no-op for it.
         if agent.endpoint_kind == "pty" {
-            adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
+            adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env, self.agent_uid);
         }
         match pane_tree {
             Some(Ok(Some(root))) => {
@@ -962,12 +962,12 @@ impl Shared {
                        "drain_secs": opts.drain.as_secs_f64()}),
             );
         };
-        let report = lane::reap_session(root, &opts, &still_ours, &on_intent);
-        let kind = if report.refused.is_some() {
-            "pane_tree_reap_refused"
-        } else {
-            "pane_tree_reaped"
-        };
+        let helper = self
+            .agent_uid
+            .map(|_| adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env));
+        let report =
+            lane::reap_session_with(root, &opts, &still_ours, &on_intent, helper.as_deref());
+        let kind = report.event_kind();
         let mut payload = report.to_json();
         payload["root"] = root.to_json();
         let _ = self.store.event_public(alias, kind, payload);
@@ -1005,7 +1005,12 @@ impl Shared {
                 // the live pane the actor verified — read-only use.
                 _ => true,
             };
-            proven.then(|| lane::pane_cwd(pid)).flatten()
+            let helper = self
+                .agent_uid
+                .map(|_| adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env));
+            proven
+                .then(|| lane::pane_cwd_with(pid, helper.as_deref()))
+                .flatten()
         });
         j["cwd_deleted"] = json!(cwd.as_ref().is_some_and(|c| c.deleted));
         j["pane_cwd"] = cwd.map(|c| c.to_json()).unwrap_or(Value::Null);

@@ -542,6 +542,35 @@ pub(crate) enum CatalogAction {
     },
     /// Install a validated bundle without creating a project or grants.
     Install { source: String },
+    /// Replace one exact workspace bundle while keeping its installation ID.
+    /// The current digest and catalog generation must match the inspected row.
+    UpgradeCheck {
+        install_id: String,
+        source: String,
+        #[arg(long)]
+        expected_digest: String,
+        #[arg(long)]
+        expected_generation: String,
+    },
+    /// Apply an inspected upgrade, pinned to both old and proposed bytes.
+    Upgrade {
+        install_id: String,
+        source: String,
+        #[arg(long)]
+        expected_digest: String,
+        #[arg(long)]
+        expected_generation: String,
+        #[arg(long)]
+        expected_new_digest: String,
+        #[arg(long)]
+        request_id: String,
+    },
+    /// Resume a retained workspace upgrade after interrupted Git delivery.
+    UpgradeRecover {
+        install_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
     /// List catalogued installations. Never migrates on read.
     Ls,
     /// Inspect an exact stable installation ID.
@@ -865,6 +894,70 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     };
                     ("app_workspace_install", json!({"source":source}))
                 }
+                CatalogAction::Upgrade {
+                    install_id,
+                    source,
+                    expected_digest,
+                    expected_generation,
+                    expected_new_digest,
+                    request_id,
+                } => {
+                    let source = if source.contains("://") || source.starts_with("git@") {
+                        source.clone()
+                    } else {
+                        // A committed request is replayable after its local
+                        // checkout is removed. The daemon verifies the exact
+                        // stored source and digest before returning that row.
+                        match std::fs::canonicalize(source) {
+                            Ok(path) => path,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                std::path::absolute(source).map_err(|e| {
+                                    Error::rejected(format!("workspace app source: {e}"))
+                                })?
+                            }
+                            Err(error) => {
+                                return Err(Error::rejected(format!(
+                                    "workspace app source: {error}"
+                                )))
+                            }
+                        }
+                        .to_string_lossy()
+                        .into_owned()
+                    };
+                    (
+                        "app_workspace_upgrade",
+                        json!({"install_id":install_id,"source":source,
+                        "expected_digest":expected_digest,"expected_generation":expected_generation,
+                        "expected_new_digest":expected_new_digest,"request_id":request_id}),
+                    )
+                }
+                CatalogAction::UpgradeCheck {
+                    install_id,
+                    source,
+                    expected_digest,
+                    expected_generation,
+                } => {
+                    let source = if source.contains("://") || source.starts_with("git@") {
+                        source.clone()
+                    } else {
+                        std::fs::canonicalize(source)
+                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    (
+                        "app_workspace_upgrade_check",
+                        json!({"install_id":install_id,"source":source,
+                        "expected_digest":expected_digest,"expected_generation":expected_generation}),
+                    )
+                }
+                CatalogAction::UpgradeRecover {
+                    install_id,
+                    request_id,
+                } => (
+                    "app_workspace_upgrade_recover",
+                    json!({"install_id":install_id,"request_id":request_id}),
+                ),
                 CatalogAction::MigrationRecover {
                     journal_id,
                     rollback,

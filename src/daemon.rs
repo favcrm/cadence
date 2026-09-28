@@ -324,6 +324,9 @@ pub struct Shared {
     shutdown_facts: Mutex<Option<ShutdownFacts>>,
     provider_log_dir: PathBuf,
     state_dir: PathBuf,
+    /// Captured at boot from the private per-state record. Absent means
+    /// the original same-UID socket and caller rule, unchanged.
+    agent_uid: Option<u32>,
     /// How each agent's endpoint last came up (`"adopted"` /
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
@@ -548,6 +551,7 @@ impl Shared {
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
+            agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
@@ -1293,7 +1297,7 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        let adapter = adapter::build(&agent, hooks, &log_path, &self.provider_env)?;
+        let adapter = adapter::build(&agent, hooks, &log_path, &self.provider_env, self.agent_uid)?;
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
@@ -1378,6 +1382,10 @@ impl Shared {
         // slots from the pid just recorded — the daemon's own record,
         // never a caller's claim.
         self.enroll_endpoint(alias);
+        // A provider's own local tools can only authenticate after this
+        // enrollment is visible to the daemon's peer-ancestry verifier.
+        // Keep dispatch gated until that proof succeeds.
+        adapter.post_enrollment_ready(&agent)?;
         self.wake();
         let retry_base = self.pty_retry_base();
         let mut gate_notice: Option<String> = None;
@@ -2154,6 +2162,9 @@ impl Shared {
                 json!({
                 "state": "ready",
                 "pid": std::process::id(),
+                // The board compares this boot-pinned UID to the private
+                // record before attributing any session-bearing peer.
+                "agent_uid": self.agent_uid,
                 "sandbox": crate::sandbox::profile(),
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
@@ -2331,6 +2342,17 @@ impl Shared {
                 }
                 Ok(json!({"agents": agents}))
             }
+            "agent_identity" => {
+                if !params.as_object().is_some_and(|fields| fields.is_empty()) {
+                    return Err(Error::rejected("agent identity accepts no fields"));
+                }
+                match self.caller_identity(peer_pid)? {
+                    Caller::Agent(verified) => Ok(json!({"alias": verified.agent.alias})),
+                    Caller::NoAgentIdentity => Err(Error::rejected(
+                        "agent identity requires a verified agent endpoint",
+                    )),
+                }
+            }
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
@@ -2356,21 +2378,33 @@ impl Shared {
                 if agent.endpoint_kind == "pty" {
                     self.pty_lane_facts(&agent, &mut agent_json);
                 }
-                // The briefing lives under the state dir — actors read
-                // it there, never inside their cwd repository. The path
-                // is advertised only while the file exists; a missing
-                // one is named as missing, never as a live path.
+                // In split mode the operator copy remains private in
+                // state; the agent receives a separate copy inside its
+                // lane, written by the drop helper after briefing.
                 if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
                     let file = client::briefing_path(
                         &self.state_dir,
                         agent.params.as_ref().unwrap_or(&Value::Null),
                         &agent.alias,
                     );
-                    if file.is_file() {
-                        agent_json["briefing"] = json!(file);
+                    let exposed = if self.agent_uid.is_some() && agent.endpoint_kind == "pty" {
+                        client::lane_briefing_path(
+                            std::path::Path::new(&agent.cwd),
+                            agent.params.as_ref().unwrap_or(&Value::Null),
+                            &agent.alias,
+                        )
+                    } else {
+                        file.clone()
+                    };
+                    let helper =
+                        (self.agent_uid.is_some() && agent.endpoint_kind == "pty").then(|| {
+                            adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env)
+                        });
+                    if adapter::pty::briefing_available(&file, &exposed, helper.as_deref()) {
+                        agent_json["briefing"] = json!(exposed);
                     } else {
                         agent_json["briefing"] = Value::Null;
-                        agent_json["briefing_missing"] = json!(file);
+                        agent_json["briefing_missing"] = json!(exposed);
                     }
                 }
                 // CAD-556: the emitted Landlock policy for a confined
@@ -2570,7 +2604,12 @@ impl Shared {
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
                     if agent.endpoint_kind == "pty" {
-                        adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
+                        adapter::pty::kill_pane(
+                            &self.state_dir,
+                            &alias,
+                            &self.provider_env,
+                            self.agent_uid,
+                        );
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
                     notify
@@ -2611,6 +2650,7 @@ impl Shared {
                                     &self.state_dir,
                                     &agent.alias,
                                     &self.provider_env,
+                                    self.agent_uid,
                                 );
                             }
                             self.open_attach.lock().unwrap().remove(&agent.alias);
@@ -2711,6 +2751,9 @@ impl Shared {
             "app_record_show" => self.rpc_app_record(method, params, peer_pid),
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
+            "app_workspace_upgrade_recover" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_list" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_show" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_migrate" => self.rpc_app_workspace(method, params, peer_pid),
@@ -3570,6 +3613,12 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
+    /// In-process fixture override; `serve()` leaves this unset and
+    /// resolves the private state record. Never sourced from an RPC.
+    pub agent_uid: Option<u32>,
+    /// In-process fixture path/gid for the second socket. Production
+    /// uses `/var/lib/cadence/cadence.sock` and the fixed cadence group.
+    pub shared_socket: Option<(PathBuf, u32)>,
     /// Provider launch overrides (`CADENCE_CLAUDE_COMMAND`, …) for this
     /// daemon only; unset names fall back to the environment.
     pub provider_env: ProviderEnv,
@@ -3693,6 +3742,15 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
+    if opts.agent_uid.is_none() {
+        opts.agent_uid = crate::agent_uid::config::configured_uid(state_dir)?;
+    }
+    let euid = unsafe { libc::geteuid() };
+    if opts.agent_uid.is_some_and(|uid| uid == 0 || uid == euid) {
+        return Err(Error::rejected(
+            "configured agent UID is root or the daemon UID",
+        ));
+    }
     // Before the marker is consumed and before recover() writes. A
     // direct `daemon run` of a different build by a non-holder must
     // leave shutdown.json and the database byte-identical. `daemon
@@ -3704,6 +3762,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // files may be the only copy of the previous store. Every start path
     // — `daemon start`, `run`, `restart` — comes through here.
     crate::backup::refuse_interrupted_restore(state_dir)?;
+    // Once split UID mode was admitted, losing its record must not
+    // restart this state dir as a legacy same-UID daemon. Persist the
+    // pin before a shared socket can accept any agent frame.
+    crate::agent_uid::config::ensure_mode_marker(state_dir, opts.agent_uid)?;
     // CAD-482: the seam confines a fixture before the lease or the
     // store writes anything — a refused arm leaves only the singleton
     // lock behind. A state dir still carrying a minted token re-arms:
@@ -3731,6 +3793,24 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
         eprintln!("warning: operator secret unavailable, board logins refused: {e}");
     }
+    let shared_socket = if opts.agent_uid.is_some() {
+        let (path, gid, fixture) = match &opts.shared_socket {
+            Some((path, gid)) => (path.clone(), *gid, true),
+            None => (
+                crate::agent_uid::config::shared_socket_path().to_path_buf(),
+                crate::agent_uid::config::shared_gid()?,
+                false,
+            ),
+        };
+        Some(serve::bind_shared_socket(&path, gid, fixture)?)
+    } else {
+        if opts.shared_socket.is_some() {
+            return Err(Error::rejected(
+                "shared socket needs a configured agent UID",
+            ));
+        }
+        None
+    };
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.
@@ -3833,24 +3913,28 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             shared.begin_closing();
             continue;
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let shared = Arc::clone(&shared);
-                thread::spawn(move || handle_conn(shared, stream));
+        let listeners: Vec<&UnixListener> = std::iter::once(&listener)
+            .chain(shared_socket.as_ref().map(|socket| &socket.listener))
+            .collect();
+        let mut accepted = false;
+        for listener in &listeners {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = true;
+                    let shared = Arc::clone(&shared);
+                    thread::spawn(move || handle_conn(shared, stream));
+                }
+                // Both idle and an aborted queued connection are normal.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(e) => return Err(e.into()),
             }
-            // WouldBlock is the idle nonblocking accept; ConnectionAborted
-            // is the listener race — a queued connection reset before
-            // accept (a client exiting mid-handshake) must not kill the
-            // daemon.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
-                serve::accept_wait::wait_for_connection(&listener)?;
-            }
-            Err(e) => return Err(e.into()),
+        }
+        if !accepted {
+            serve::accept_wait::wait_for_connections(&listeners)?;
         }
     }
     // Former facts snapshot lived in `shutdown`. A test holds this
@@ -3886,6 +3970,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(&socket_path);
+    drop(shared_socket);
     Ok(())
 }
 

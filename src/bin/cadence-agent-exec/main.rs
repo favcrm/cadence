@@ -3,7 +3,9 @@
 //! `/opt/cadence/libexec/cadence-agent-exec`; three verbs only:
 //!
 //!   exec [--env K=V]… -- <argv…>   spawn as the agent uid
-//!   kill <pid> <signal>            signal an agent-uid pid
+//!   kill <pid> <signal> [<starttime> <sid>]
+//!                                  signal an agent-uid pid; reaper form
+//!                                  pins and checks the process identity
 //!   inspect <pid>                  print an agent-uid pid's /proc facts
 //!
 //! This file is the privileged syscall layer — every boundary decision
@@ -112,7 +114,11 @@ fn run() -> i32 {
     }
     match request {
         policy::Request::Exec { env, argv } => exec(&agent, &env, &argv),
-        policy::Request::Kill { pid, signal } => kill_verb(pid, signal, agent.uid),
+        policy::Request::Kill {
+            pid,
+            signal,
+            expected,
+        } => kill_verb(pid, signal, expected, agent.uid),
         policy::Request::Inspect { pid } => inspect_verb(pid, agent.uid),
     }
 }
@@ -312,12 +318,52 @@ fn exec(agent: &Account, env: &[(OsString, OsString)], argv: &[OsString]) -> ! {
     exit(CANNOT_EXEC);
 }
 
-/// `kill <pid> <sig>`: the pid is verified agent-owned via
+/// `kill <pid> <sig> [<starttime> <sid>]`: the pid is verified agent-owned via
 /// `/proc/<pid>/status` for a clean refusal; the kernel's EPERM on the
 /// `kill(2)` itself is the actual boundary (the check is advisory — a
 /// pid can die and be reused between the two calls).
 #[cfg(target_os = "linux")]
-fn kill_verb(pid: i32, signal: i32, agent_uid: u32) -> i32 {
+fn kill_verb(pid: i32, signal: i32, expected: Option<(u64, u32)>, agent_uid: u32) -> i32 {
+    // The reaper's verified form pins the pid before reading /proc and
+    // sends through that same pidfd. A pid reused between an ordinary
+    // /proc check and kill(2) could otherwise hit another agent lane.
+    if let Some((starttime, sid)) = expected {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            return fail(&format!(
+                "pidfd_open {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let verified = proc_owner(pid)
+            .is_some_and(|(real, effective)| policy::target_is_agent(real, effective, agent_uid))
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| policy::proc_stat_ids(&stat))
+                .is_some_and(|(_, actual_sid, actual_start)| {
+                    actual_sid == u64::from(sid) && actual_start == starttime
+                });
+        if !verified {
+            unsafe { libc::close(fd as i32) };
+            return refuse(&format!("pid {pid} identity changed before signal"));
+        }
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd as i32,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(fd as i32) };
+        return if sent == 0 {
+            0
+        } else {
+            fail(&format!("pidfd_send_signal {pid}: {error}"))
+        };
+    }
     if let Some((real, effective)) = proc_owner(pid) {
         if !policy::target_is_agent(real, effective, agent_uid) {
             return refuse(&format!("pid {pid} is not owned by the agent uid"));
@@ -372,9 +418,64 @@ fn proc_owner(pid: i32) -> Option<(u32, u32)> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::disallowed_methods)] // tests do not run the daemon subreaper
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn cad514_detached_verified_kill_refuses_forgery_and_concurrent_peer() {
+        // Direct syscall-layer proof, without installing setuid: the
+        // detached child and a concurrent peer have the current test
+        // uid standing in for the agent uid. The helper's live host
+        // test remains a separate provision-time acceptance step.
+        let mut child = std::process::Command::new("setsid")
+            .args(["sleep", "30"])
+            .spawn()
+            .unwrap();
+        let mut peer = std::process::Command::new("setsid")
+            .args(["sleep", "30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (sid, start) = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let (_, sid, start) = policy::proc_stat_ids(&stat).unwrap();
+            if sid == pid as u64 {
+                break (sid as u32, start);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "setsid child did not detach"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            kill_verb(pid, libc::SIGTERM, Some((start + 1, sid)), uid),
+            REFUSED
+        );
+        assert_eq!(
+            kill_verb(pid, libc::SIGTERM, Some((start, sid + 1)), uid),
+            REFUSED
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let _ = kill_verb(pid, libc::SIGTERM, Some((start, sid)), uid);
+                });
+            }
+        });
+        let _ = child.wait();
+        assert!(
+            peer.try_wait().unwrap().is_none(),
+            "peer child was signalled"
+        );
+        let _ = peer.kill();
+        let _ = peer.wait();
+    }
 
     /// Run `body` in a forked child and return its exit code, so the
     /// one-way process mutations under test (`close_fds`, the prctl)
