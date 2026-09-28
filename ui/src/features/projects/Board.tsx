@@ -1,5 +1,5 @@
 import { useWriteBlock } from "../auth/WriteGate";
-import { useState } from "react";
+import { useId, useRef, useState, type FormEvent } from "react";
 import { api, type WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
 import { epicProgress, matches, type BoardFilters } from "../../lib/filters";
@@ -82,16 +82,17 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
         {rows.map((issue) => (
           <div key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850">
             <div className="flex items-center gap-2">
-              <Link href={issuePath(issue.project, issue.id)} className="lnk num text-label">{issue.id}</Link>
+              <span className="num text-label text-ink-400">{issue.id}</span>
               <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
               <span className="num text-micro text-ink-500 ml-auto">{issue.priority}</span>
             </div>
-            <button type="button" className="block text-left text-ink-200 mt-1.5 leading-[1.4]" onClick={() => onOpen(issue.id)}>{issue.title}</button>
+            <Link href={issuePath(issue.project, issue.id)} className="block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
               <span>{issue.owner ?? "unassigned"}</span>
               <span>{issue.component ?? "no component"}</span>
               <span>{issue.checks.done}/{issue.checks.total} checks</span>
               {project === "all" && <span>{issue.project}</span>}
+              <button type="button" className="board-preview-link ml-auto" aria-label={`Preview ${issue.id}`} onClick={() => onOpen(issue.id)}>Preview</button>
             </div>
           </div>
         ))}
@@ -115,8 +116,9 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
               <tr key={issue.id} className="hover:bg-ink-850 transition-colors">
                 <td className="px-4 py-3 min-w-0 max-w-[28rem]">
                   <div className="min-w-0">
-                    <Link href={issuePath(issue.project, issue.id)} className="lnk num">{issue.id}</Link>
-                    <button className="block text-left text-ink-200 truncate mt-0.5 max-w-full" title={issue.title} onClick={() => onOpen(issue.id)}>{issue.title}</button>
+                    <span className="num text-ink-500">{issue.id}</span>
+                    <Link href={issuePath(issue.project, issue.id)} className="block text-left text-ink-200 hover:text-accent truncate mt-0.5 max-w-full" title={issue.title}>{issue.title}</Link>
+                    <button type="button" className="board-preview-link mt-1" aria-label={`Preview ${issue.id}`} onClick={() => onOpen(issue.id)}>Preview</button>
                   </div>
                 </td>
                 {project === "all" && <td className="px-3 py-3 align-top num text-ink-400">{issue.project}</td>}
@@ -169,94 +171,85 @@ interface Props {
   onAgents: () => void;
 }
 
-/// Quick-add at the top of Backlog: title + project + priority, Enter
-/// creates, Escape cancels.
-function QuickAdd({
+/** One create form for both list and board views. The draft survives a failed write. */
+function NewIssueForm({
   projects,
   project,
   onCreated,
   onError,
+  onCancel,
 }: {
   projects: Project[];
   project: string;
   onCreated: (resp: WriteResp, verb: string) => void;
   onError: (e: unknown, verb: string) => void;
+  onCancel: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState("P2");
   const [selProject, setSelProject] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pending = useRef(false);
+  const fieldId = useId();
+  const projectId = useId();
+  const priorityId = useId();
   const projectKey =
     project === "all" ? selProject || (projects[0]?.key ?? "") : project;
-
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="w-full rounded border border-dashed border-ink-600 px-3 py-2 text-left text-label text-ink-500 hover:border-accent/60 hover:text-accent transition-colors"
-      >
-        + new issue
-      </button>
-    );
-  }
-  const submit = () => {
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     const t = title.trim();
-    if (!t || !projectKey || busy) return;
+    if (!t || !projectKey || pending.current) return;
+    pending.current = true;
+    setError(null);
     setBusy(true);
     api
       .create({ project: projectKey, title: t, priority })
       .then((resp) => {
         onCreated(resp, `${resp.card.id} created`);
-        setTitle("");
-        setOpen(false);
+        onCancel();
       })
-      .catch((e) => onError(e, "create"))
-      .finally(() => setBusy(false));
+      .catch((e) => {
+        setError(e instanceof Error ? e.message : String(e));
+        onError(e, "create");
+      })
+      .finally(() => {
+        pending.current = false;
+        setBusy(false);
+      });
   };
   return (
-    <div className="card p-2.5 space-y-2 border-accent/40">
-      <input
-        autoFocus
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") submit();
-          if (e.key === "Escape") {
-            setTitle("");
-            setOpen(false);
-          }
-        }}
-        className="field w-full"
-        placeholder={`title — creates in ${projectKey}`}
-      />
-      <div className="flex gap-1.5">
-        {project === "all" ? (
-          <Select
-            size="sm"
-            className="min-w-0 flex-1"
-            value={projectKey}
-            onChange={setSelProject}
-            aria-label="project"
-            options={projects.map((p) => ({ value: p.key, label: p.key }))}
-          />
-        ) : (
-          <span className="chip bg-ink-800 text-ink-400 self-center">
-            {projectKey}
-          </span>
-        )}
-        <Select
-          size="sm"
-          value={priority}
-          onChange={setPriority}
-          aria-label="priority"
-          options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))}
-        />
-        <Button variant="primary" size="sm" onClick={submit} disabled={!title.trim() || busy}>
-          add
-        </Button>
+    <form className="card board-new-issue mb-4 p-4 border-accent/40 reveal" onSubmit={submit} onKeyDown={(event) => {
+      if (event.key === "Escape" && !busy) onCancel();
+    }}>
+      <div className="flex items-start gap-3 mb-3">
+        <div className="min-w-0">
+          <h2 className="text-cardtitle font-semibold text-ink-100">New issue</h2>
+          <p className="text-label text-ink-500 mt-0.5">Start work in {projectKey || "a project"}.</p>
+        </div>
+        <Button className="ml-auto" variant="ghost" size="sm" onClick={onCancel} disabled={busy}>Cancel</Button>
       </div>
-    </div>
+      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,14rem)_7rem] items-end">
+        <div className="min-w-0">
+          <label className="slabel block mb-1" htmlFor={fieldId}>Title</label>
+          <input id={fieldId} name="title" autoFocus required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} disabled={busy} className="field w-full" placeholder="What needs to happen?" />
+        </div>
+        {project === "all" ? (
+          <div className="min-w-0">
+            <label className="slabel block mb-1" htmlFor={projectId}>Project</label>
+            <Select id={projectId} full value={projectKey} onChange={setSelProject} disabled={busy || projects.length === 0} options={projects.map((p) => ({ value: p.key, label: p.key }))} />
+          </div>
+        ) : <div className="min-w-0"><span className="slabel block mb-1">Project</span><span className="block text-label text-ink-300 py-2">{projectKey}</span></div>}
+        <div className="min-w-0">
+          <label className="slabel block mb-1" htmlFor={priorityId}>Priority</label>
+          <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
+        </div>
+      </div>
+      {error && <p className="text-label text-fail mt-3" role="alert">Could not create issue: {error}</p>}
+      <div className="flex justify-end mt-3">
+        <Button variant="primary" type="submit" loading={busy} disabled={!title.trim() || !projectKey}>Create issue</Button>
+      </div>
+    </form>
   );
 }
 
@@ -283,6 +276,7 @@ export default function Board({
 }: Props) {
   const block = useWriteBlock(readOnly);
   const [over, setOver] = useState<string | null>(null);
+  const [newOpen, setNewOpen] = useState(false);
   const issues = issuesState.data ?? [];
   const loaded = issuesState.data !== null;
   // `scope` is what the project and the search box leave; the filter
@@ -342,10 +336,9 @@ export default function Board({
 
   // The five status columns over one set of cards. `lane` keys the
   // drop-target highlight so swimlanes light up one cell, not a column.
-  const columns = (laneCards: IssueCard[], lane: string, quickAdd: boolean) => (
-      <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
+  const columns = (laneCards: IssueCard[], lane: string) => (
+    <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
       {COLS.map(([key, name, wip], ci) => {
-        const showAdd = quickAdd && !readOnly;
         const cards = laneCards
           .filter((t) => t.status === key)
           .sort(byPriority);
@@ -412,18 +405,10 @@ export default function Board({
               <span className="kicker num">
                 {doneHidden > 0 ? doneHidden : cards.length}
                 {/* The WIP limit is board-wide — a lane shows its count only. */}
-                  {wip && lane === "" ? ` · limit ${wip}` : ""}
+                {wip && lane === "" ? ` · limit ${wip}` : ""}
               </span>
             </header>
             <div className="p-2.5 space-y-2.5 flex-1">
-              {key === "backlog" && showAdd && (
-                <QuickAdd
-                  projects={projects}
-                  project={project}
-                  onCreated={onCreated}
-                  onError={onError}
-                />
-              )}
               {doneHidden > 0 ? (
                 <button
                   onClick={() => onFilters({ ...filters, showDone: true })}
@@ -431,7 +416,7 @@ export default function Board({
                 >
                   {doneHidden} done hidden — show
                 </button>
-              ) : cards.length === 0 && !(key === "backlog" && showAdd) ? (
+              ) : cards.length === 0 ? (
                 <p className="kicker px-1 py-2">empty</p>
               ) : (
                 cards.map((t) => (
@@ -462,7 +447,7 @@ export default function Board({
   const loose = visible.filter((t) => !t.parent);
 
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 w-full">
+    <main className="issues-board px-4 lg:px-8 pt-6 pb-9 w-full">
       {health && !health.pm_present && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
           <span className="chip bg-warn/10 text-warn">no pm dir</span>
@@ -505,17 +490,20 @@ export default function Board({
             : "…"}
         </span>
         <StaleChip state={issuesState} />
-        <div className="ml-auto flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
-          {(["kanban", "list"] as const).map((mode) => (
-            <button
-              key={mode}
-              aria-pressed={view === mode}
-              onClick={() => onView(mode)}
-              className={`chip !py-[.25rem] capitalize ${view === mode ? "bg-accent/10 text-accent" : "text-ink-500 hover:text-ink-200"}`}
-            >
-              {mode === "kanban" ? "board" : "list"}
-            </button>
-          ))}
+        <div className="ml-auto flex items-center gap-2">
+          {!readOnly && !newOpen && <Button variant="primary" onClick={() => setNewOpen(true)}>New issue</Button>}
+          <div className="flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
+            {(["kanban", "list"] as const).map((mode) => (
+              <button
+                key={mode}
+                aria-pressed={view === mode}
+                onClick={() => onView(mode)}
+                className={`chip !py-[.25rem] capitalize ${view === mode ? "bg-accent/10 text-accent" : "text-ink-500 hover:text-ink-200"}`}
+              >
+                {mode === "kanban" ? "board" : "list"}
+              </button>
+            ))}
+          </div>
         </div>
         <input
           value={query}
@@ -525,6 +513,10 @@ export default function Board({
           placeholder="Search issues, owners or tags"
         />
       </div>
+
+      {newOpen && !readOnly && (
+        <NewIssueForm projects={projects} project={project} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
+      )}
 
       <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section
         className="card mb-4 px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 reveal"
@@ -659,7 +651,7 @@ export default function Board({
       />
       {issuesState.status === "empty" && (
         <p className="kicker mb-4" role="status">
-          the tracker has no issues yet{readOnly ? "" : " — + new issue in Backlog creates one"}
+          the tracker has no issues yet{readOnly ? "" : " — use New issue to create one"}
         </p>
       )}
 
@@ -669,13 +661,14 @@ export default function Board({
           issues={issues}
           filters={filters}
           onChange={onFilters}
+          view={view}
         />
       )}
 
       {!loaded ? null : view === "list" ? (
         <IssueList issues={visible} project={project} onOpen={onOpen} />
       ) : !filters.groupByEpic ? (
-        columns(visible, "", true)
+        columns(visible, "")
       ) : (
         <div className="space-y-5">
           {epicIds.map((epic) => {
@@ -717,7 +710,6 @@ export default function Board({
                 {columns(
                   visible.filter((t) => t.parent === epic),
                   epic,
-                  false,
                 )}
               </section>
             );
@@ -729,7 +721,7 @@ export default function Board({
               </h2>
               <span className="kicker num">{loose.length}</span>
             </header>
-            {columns(loose, "none", true)}
+            {columns(loose, "none")}
           </section>
         </div>
       )}

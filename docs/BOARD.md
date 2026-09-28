@@ -1605,8 +1605,12 @@ pnpm build       # → ui/dist (committed; --features ui embeds it)
 
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
-hover), the drawer edits fields/body/links/refs, comments and attaches
-artifacts, and backlog has quick-add. In I3 the board is live: the SPA
+hover), the issue page edits fields/body/links/refs, comments and attaches
+artifacts. The Issues workspace opens in list view; each title in the list
+or board links to the full issue, while an explicit Preview action opens a
+modal summary with load/error/retry feedback. Writable users can create an
+issue from either view using the same form, which preserves its draft on a
+failed request; read-only users see no creation action. In I3 the board is live: the SPA
 opens an `EventSource` on `/api/stream` and each frame refetches only the
 resources its data names (`ui/src/lib/cache.ts`: one store per resource,
 requests coalesced, a failed refresh keeps the last good payload as
@@ -1763,11 +1767,12 @@ A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),
 the other three widen within themselves (any of them). The selection
 lives in the URL (`/projects/cadence?tag=ui,api&epic=CAD-38&owner=ann&
-component=adapter&group=epic`), so a filtered view is a link. "group by
-epic" renders one swimlane per epic with its progress bar (done ÷
+component=adapter&group=epic`), so a filtered view is a link. In board view,
+"group by epic" renders one swimlane per epic with its progress bar (done ÷
 children, dropped excluded — over all children, not only the visible
-ones) and a last lane for issues with no epic. Cards show their tags;
-the drawer edits them through the same PATCH, `if_rev` included, with
+ones) and a last lane for issues with no epic. The grouping control is hidden
+in list view, where it has no visual effect. Cards show their tags;
+the full issue page edits them through the same PATCH, `if_rev` included, with
 the project's declared tags as toggle chips.
 
 ## Seeding

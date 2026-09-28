@@ -962,6 +962,8 @@ export default function App() {
           key={openId}
           id={openId}
           detail={detailState?.data?.id === openId ? detailState.data : null}
+          readState={detailState}
+          onRetry={() => void resources.issue(openId).refresh()}
           href={(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
             const fromCard = issues.find((i) => i.id === openId)?.project ?? null;
