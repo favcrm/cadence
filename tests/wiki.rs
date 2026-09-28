@@ -483,7 +483,7 @@ fn failed_refresh_stays_idle_and_search_refuses_stale_hits() {
 /// already had, or the new one — never a torn mix, and never stale hits
 /// the store knows are wrong.
 #[test]
-fn search_during_concurrent_writes_never_serves_a_torn_index() {
+fn searches_while_background_refresh_catches_up() {
     let fx = fx();
     let d = &fx.d;
     write_op(d, "global/base.md", "# Base\nsteady term\n");

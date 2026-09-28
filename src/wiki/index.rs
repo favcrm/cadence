@@ -576,6 +576,7 @@ struct Run {
 /// The shared scheduler state a mutation signals and the refresh
 /// worker drains — plus the last run's record, which the health
 /// surface reads.
+#[derive(Default)]
 struct RefreshState {
     /// A mutation is committed and waiting for the worker.
     needed: bool,
@@ -585,17 +586,6 @@ struct RefreshState {
     running: bool,
     /// The most recent finished (or failed) refresh.
     last: Option<Run>,
-}
-
-impl Default for RefreshState {
-    fn default() -> Self {
-        Self {
-            needed: false,
-            closing: false,
-            running: false,
-            last: None,
-        }
-    }
 }
 
 /// The post-commit eager refresh: one coalesced rebuild per burst of
