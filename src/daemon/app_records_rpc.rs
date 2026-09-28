@@ -60,22 +60,20 @@ impl Shared {
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        // Writes re-check the context's live proof inside the
-        // installation snapshot first, the way run creation re-checks
-        // its context receipt — a context archived after the caller
+        // Writes re-check the context's live proof inside the same
+        // installation snapshot, the way run creation re-checks its
+        // context receipt — a context archived after the caller
         // listed it refuses the write. The store re-checks liveness
         // again in its own write transaction.
-        if matches!(method, "app_record_create" | "app_record_update") {
-            workspace::with_runtime_snapshot(&pm, install, |_, _| {
-                self.store.app_context_proof(install, context)?;
-                Ok(())
-            })?;
-        }
+        let write = matches!(method, "app_record_create" | "app_record_update");
         let result = workspace::with_runtime_snapshot(&pm, install, |_, _| {
             let _release = self
                 .app_release_lock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if write {
+                self.store.app_context_proof(install, context)?;
+            }
             match method {
                 "app_record_list" => self.store.app_record_list(install, context),
                 "app_record_show" => {
@@ -98,7 +96,7 @@ impl Shared {
                 _ => Err(Error::rejected("unknown app record method")),
             }
         })?;
-        if matches!(method, "app_record_create" | "app_record_update") {
+        if write {
             self.wake();
         }
         Ok(result)
