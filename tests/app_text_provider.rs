@@ -199,3 +199,27 @@ fn local_readback_pins_exact_effect_directory_and_authority() {
         Verified::False
     );
 }
+
+#[test]
+fn app_outbox_scan_hides_uncommitted_temporary_binary_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = dir.path().join("outbox");
+    let temporary = outbox.join("app-items/.tmp-uncommitted");
+    std::fs::create_dir_all(&temporary).unwrap();
+    std::fs::write(temporary.join("post.md"), "# Draft\n\nbody").unwrap();
+    std::fs::write(
+        temporary.join("index.json"),
+        json!({"effect_id":"effect-fake",
+        "title":"Draft","attachments":[{"name":"asset.bin","sha256":"forged"}],
+        "result":{"board_url":"http://localhost/outbox?item=effect-fake"}})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        cadence_agent::platform::local::list_items(&outbox, None).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "unfinished temp item became a visible draft"
+    );
+}

@@ -1243,6 +1243,12 @@ pub fn list_items(outbox: &Path, effect_id: Option<&str>) -> crate::error::Resul
                 continue;
             };
             for item in entries.flatten() {
+                // The app sink writes a complete index in a private temporary
+                // directory before its atomic rename. A crash must not make
+                // that uncommitted directory visible as a published draft.
+                if item.file_name().to_string_lossy().starts_with(".tmp-") {
+                    continue;
+                }
                 let Some(index) = fs::read_to_string(item.path().join("index.json"))
                     .ok()
                     .and_then(|t| serde_json::from_str::<Value>(&t).ok())
