@@ -15,12 +15,19 @@ acceptance-tested capability, not a promise of universal session attachment.
 
 ## Install
 
-Build from source — a recent stable Rust toolchain via
-[rustup](https://rustup.rs) is all you need:
+To build from source with the board used in the quick start, install a recent
+stable Rust toolchain via [rustup](https://rustup.rs), Node 22 and the pnpm
+version declared in `ui/package.json`. Build the UI before installing Cadence:
 
 ```bash
-cargo install --path . --locked
+pnpm -C ui install --frozen-lockfile
+pnpm -C ui build
+cargo install --path . --locked --features ui
 ```
+
+For a CLI-only source build, `cargo install --path . --locked` needs just Rust.
+That binary does not embed the board; serving it also requires a built UI and
+`cadence ui start --dist /path/to/ui/dist`.
 
 [Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
 is available as an explicit-tag local CLI pilot for Linux x86_64/ARM64 and Apple
