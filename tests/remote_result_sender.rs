@@ -69,6 +69,11 @@ fn matching_caller_claims_cannot_open_an_untrusted_board_connection() {
         .stderr(Stdio::piped());
     let output = cadence_agent::reaper::output(&mut cmd).unwrap();
     assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("unexpected argument") && error.contains("--org"),
+        "legacy caller-supplied destination flags were accepted: {error}"
+    );
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         match listener.accept() {
