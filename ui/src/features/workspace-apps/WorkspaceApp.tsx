@@ -762,7 +762,7 @@ export default function WorkspaceApp({
                           source, expected_digest: receipt.expected_digest,
                           expected_generation: receipt.expected_generation,
                           expected_new_digest: receipt.digest,
-                          request_id: retainedRequest(`${installId}.upgrade.${receipt.digest}`),
+                          request_id: retainedRequest(JSON.stringify([installId, "upgrade", receipt.expected_digest, receipt.expected_generation, receipt.digest])),
                         });
                         setUpgradeProposal(null);
                         setUpgradeSource("");
@@ -831,9 +831,7 @@ export default function WorkspaceApp({
                             await workspaceApps.createBinding(installId, {
                               slot: "publication",
                               connection_id: selected,
-                              request_id: retainedRequest(
-                                `${installId}.${contextId}.binding.${selected}`,
-                              ),
+                              request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "publication", selected])),
                               ...(contextId ? { context_id: contextId } : {}),
                             });
                         })
@@ -873,7 +871,7 @@ export default function WorkspaceApp({
                       onClick={() => void mutate(async () => {
                         const selected = sourceConnectionId || sourceBinding?.config.connection_id || "";
                         if (sourceBinding) await workspaceApps.updateBinding(installId, sourceBinding.id, { expected_revision: sourceBinding.revision, connection_id: selected });
-                        else await workspaceApps.createBinding(installId, { slot: "source", connection_id: selected, request_id: retainedRequest(`${installId}.${contextId}.source-binding.${selected}`), ...(contextId ? { context_id: contextId } : {}) });
+                        else await workspaceApps.createBinding(installId, { slot: "source", connection_id: selected, request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "source", selected])), ...(contextId ? { context_id: contextId } : {}) });
                       })}
                     >Save source connection</Button>
                   </div>
@@ -901,7 +899,7 @@ export default function WorkspaceApp({
                       onClick={() => void mutate(async () => {
                         const selected = imageConnectionId || imageBinding?.config.connection_id || "";
                         if (imageBinding) await workspaceApps.updateBinding(installId, imageBinding.id, { expected_revision: imageBinding.revision, connection_id: selected });
-                        else await workspaceApps.createBinding(installId, { slot: "image", connection_id: selected, request_id: retainedRequest(`${installId}.${contextId}.image-binding.${selected}`), ...(contextId ? { context_id: contextId } : {}) });
+                        else await workspaceApps.createBinding(installId, { slot: "image", connection_id: selected, request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "image", selected])), ...(contextId ? { context_id: contextId } : {}) });
                       })}
                     >Save image connection</Button>
                   </div>

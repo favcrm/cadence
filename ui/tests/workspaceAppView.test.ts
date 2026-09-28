@@ -20,6 +20,8 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"] };
+let simulatedInstallation: typeof installation | null = null;
+let simulatedUpgradeNumber = 0;
 const snapshot = { owner_pm: "pm-a", inputs: { subject: "Synthetic caption", source: "Synthetic source facts", writer: "writer-a", reviewer: "reviewer-a" }, workflow: { title: "Instagram caption: Synthetic caption", publication_slot: "publication", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Write" }, { id: "2", kind: "review_text", assignee: "reviewer-a", dependencies: ["1"], instruction: "Review" }] }, publication: { slot: "publication", binding: { id: "binding-a", revision: 1, digest: "binding-digest" } }, assignments: {} };
 let rows: any[] = [];
 let effects: any[] = [];
@@ -38,7 +40,7 @@ let pendingWrite: (() => void) | null = null;
 let loseCreateReply = false;
 function read(path: string): Response {
   if (denyReads) return json({ error: "Operator session expired" }, 403);
-  if (path === "/api/app-installations/install-a") return json(installation);
+  if (path === "/api/app-installations/install-a") return json(simulatedInstallation ?? installation);
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [{ id: "context-b", install_id: "install-a", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } }] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { bundle_digest: "bundle-digest", connection_id: "local-id", account: "default" } }] });
   if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "default" }] });
@@ -55,13 +57,24 @@ globalThis.fetch = async (input, init) => {
     const body = JSON.parse(String(init.body)); writes.push({ path, body });
     const respond = () => {
       if (path === "/api/app-installations/install-a/upgrade/check") {
+        if (simulatedInstallation) {
+          const target = body.source === "/tmp/social-v04" ? "bundle-digest" : "new-bundle-digest";
+          assert(body.expected_digest === simulatedInstallation.digest && body.expected_generation === simulatedInstallation.catalog_generation && target !== simulatedInstallation.digest, "Repeat upgrade check pins the active version and generation");
+          return json({ install_id: "install-a", name: "social-content", version: body.source === "/tmp/social-v04" ? "0.4.0" : "0.5.0", digest: target, expected_digest: body.expected_digest, expected_generation: body.expected_generation, structural_diff: { added: [], changed: ["app.md"], removed: [] }, secret_warnings: [] });
+        }
         assert(body.source === "/tmp/social-v05" && body.expected_digest === "bundle-digest" && body.expected_generation === "catalog-generation", "Upgrade check pins current catalog and bundle");
         return json({ install_id: "install-a", name: "social-content", version: "0.5.0", digest: "new-bundle-digest", expected_digest: "bundle-digest", expected_generation: "catalog-generation", structural_diff: { added: ["workflows/image-manual.md"], changed: ["app.md"], removed: [] }, secret_warnings: [] });
       }
       if (path === "/api/app-installations/install-a/upgrade") {
+        if (simulatedInstallation) {
+          assert(body.expected_digest === simulatedInstallation.digest && body.expected_generation === simulatedInstallation.catalog_generation && body.expected_new_digest !== simulatedInstallation.digest, "Repeat upgrade apply matches its reviewed current version");
+          simulatedInstallation = { ...simulatedInstallation, digest: body.expected_new_digest, catalog_generation: `later-generation-${++simulatedUpgradeNumber}`, approved: false };
+          return json(simulatedInstallation);
+        }
         assert(body.source === "/tmp/social-v05" && body.expected_digest === "bundle-digest" && body.expected_generation === "catalog-generation" && body.expected_new_digest === "new-bundle-digest" && body.request_id, "Upgrade apply sends only the reviewed old/new material and a stable request");
         return json({ ...installation, digest: "new-bundle-digest", approved: false });
       }
+      if (path === "/api/app-installations/install-a/bindings") return json({ binding: { id: `binding-${writes.length}`, install_id: "install-a", context_id: body.context_id ?? null, slot: body.slot, revision: 1, state: "configured", digest: `binding-digest-${writes.length}`, config: { bundle_digest: (simulatedInstallation ?? installation).digest, connection_id: body.connection_id, account: "default" } } });
       if (path === "/api/app-runs") {
         assert(body.inputs.source === "Synthetic source facts" && !Object.hasOwn(body.inputs, "source_text"), "Create uses exact supported package input source");
         assert(!Object.hasOwn(body, "context_id") && !Object.hasOwn(body, "project_link"), "No brand and no project require no synthetic ownership fields");
@@ -130,6 +143,10 @@ async function choose(id: string, label: string) {
   const option = Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes(label));
   assert(option?.closest("dialog") === host.querySelector("dialog"), "Modal combobox options stay inside the active dialog instead of inert page body");
   await click(option);
+}
+async function choosePage(label: string, optionLabel: string) {
+  await click(host.querySelector(`button[aria-label="${label}"]`));
+  await click(Array.from(document.querySelectorAll(`[role="listbox"][aria-label="${label}"] [role="option"]`)).find(value => value.textContent?.includes(optionLabel)));
 }
 async function main() {
   holdReads = true; await render();
@@ -223,6 +240,7 @@ async function main() {
   assert(Number(writes.length) === 1 && text().includes("new-bundle-digest") && text().includes("workflows/image-manual.md"), "Board shows exact proposed digest and changed files before apply");
   await click(button("Apply checked update"));
   assert(Number(writes.length) === 2 && writes[1].path.endsWith("/upgrade"), "Only an explicit second action applies the checked upgrade");
+  const firstUpgradeId = writes[1].body.request_id;
   await fresh(false, false);
   assert(reads.length === 0, "Unproven viewer must not request operator-only app, connection, artifact or effect receipts");
   await fresh(); await click(button("Library")); await click(host.querySelector(".wa-post-card"));
@@ -243,6 +261,27 @@ async function main() {
   denyStage = denyReads = false;
   await React.act(async () => { stale.forEach(value => value.resolve(read(value.path))); }); await flush();
   assert(!button("New post") && !text().includes("Reviewed text"), "A late successful pre-refusal poll cannot restore revoked private data");
+  simulatedInstallation = { ...installation };
+  await fresh();
+  await click(host.querySelector('button[aria-label="Optional brand context"]'));
+  await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("Brand B")));
+  await click(button("Settings"));
+  await choosePage("Local destination", "local-id");
+  await click(button("Save destination"));
+  const oldBindingId = writes.at(-1)?.body.request_id;
+  assert(oldBindingId && writes.at(-1)?.body.slot === "publication", "Old package can bind a brand Local destination");
+  simulatedInstallation = { ...installation, digest: "new-bundle-digest", catalog_generation: "generation-b" };
+  await fresh(); await click(button("Settings"));
+  await choosePage("Local destination", "local-id");
+  await click(button("Save destination"));
+  assert(writes.at(-1)?.body.request_id && writes.at(-1)?.body.request_id !== oldBindingId, "Same connection in a new bundle needs a new binding request identity");
+  await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v04");
+  await click(button("Check update")); await click(button("Apply checked update"));
+  assert(simulatedInstallation.digest === "bundle-digest", "Return to the earlier bundle applies as a distinct upgrade");
+  await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v05");
+  await click(button("Check update")); await click(button("Apply checked update"));
+  assert(String(simulatedInstallation.digest) === "new-bundle-digest" && writes.at(-1)?.body.request_id !== firstUpgradeId, "A later A-to-B upgrade must not reuse an earlier A-to-B request after catalog generation advances");
+  simulatedInstallation = null;
   installation.name = "another-app"; await fresh();
   assert(text().includes("no supported board workspace") && !button("New post") && !button("Approve app"), "Unrelated workspace apps get a truthful guide without Social Content actions");
   installation.name = "social-content";
