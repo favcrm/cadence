@@ -810,6 +810,30 @@ pub(crate) fn client_socket(
     Ok(None)
 }
 
+/// Security-sensitive variant: require the client's remote endpoint to
+/// equal the board's concrete bound IP and port, not merely its port.
+/// A wildcard bind has no single destination and must be refused by
+/// the caller before invoking this lookup.
+pub(crate) fn client_socket_exact(
+    server: SocketAddr,
+    peer: SocketAddr,
+) -> Result<Option<(u64, u32)>, String> {
+    let mut read_any = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        read_any = true;
+        if let Some(found) = find_client_socket_exact(&text, server, peer) {
+            return Ok(Some(found));
+        }
+    }
+    if !read_any {
+        return Err("/proc/net/tcp and /proc/net/tcp6 are unreadable".to_string());
+    }
+    Ok(None)
+}
+
 /// Scan one `/proc/net/tcp{,6}` table: `sl local rem st … uid timeout
 /// inode`. Inode 0 (a TIME_WAIT remnant) is owned by nobody — skipped.
 fn find_client_socket(table: &str, server_port: u16, peer: SocketAddr) -> Option<(u64, u32)> {
@@ -820,6 +844,25 @@ fn find_client_socket(table: &str, server_port: u16, peer: SocketAddr) -> Option
         let uid: u32 = cols.get(7)?.parse().ok()?;
         let inode: u64 = cols.get(9)?.parse().ok()?;
         (local == peer && remote.port() == server_port && inode != 0).then_some((inode, uid))
+    })
+}
+
+/// Security-sensitive board UID lookup; the destination address must be
+/// the actual concrete address the board bound, never an HTTP Host value.
+fn find_client_socket_exact(
+    table: &str,
+    server: SocketAddr,
+    peer: SocketAddr,
+) -> Option<(u64, u32)> {
+    let server = canonical(server);
+    let peer = canonical(peer);
+    table.lines().skip(1).find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let local = canonical(parse_addr(cols.get(1)?)?);
+        let remote = canonical(parse_addr(cols.get(2)?)?);
+        let uid: u32 = cols.get(7)?.parse().ok()?;
+        let inode: u64 = cols.get(9)?.parse().ok()?;
+        (local == peer && remote == server && inode != 0).then_some((inode, uid))
     })
 }
 
@@ -1119,6 +1162,47 @@ mod tests {
         let (_, own) = proc_uids(std::process::id()).unwrap();
         let (_, uid) = client_socket(port, peer).unwrap().unwrap();
         assert_eq!(uid, own);
+    }
+
+    #[test]
+    fn exact_board_socket_lookup_rejects_same_port_at_another_destination() {
+        let peer: SocketAddr = "127.0.0.1:40961".parse().unwrap();
+        let board: SocketAddr = "127.0.0.1:3115".parse().unwrap();
+        let table = "sl local rem st tx tr retr uid timeout inode\n\
+            0: 0100007F:A001 0200007F:0C2B 01 0 0 0 2000 0 111\n\
+            1: 0100007F:A001 0100007F:0C2B 01 0 0 0 1000 0 222\n";
+        assert_eq!(
+            find_client_socket(table, board.port(), peer),
+            Some((111, 2000))
+        );
+        assert_eq!(
+            find_client_socket_exact(table, board, peer),
+            Some((222, 1000))
+        );
+        let mapped_board: SocketAddr = "[::ffff:127.0.0.1]:3115".parse().unwrap();
+        let mapped_peer: SocketAddr = "[::ffff:127.0.0.1]:40961".parse().unwrap();
+        assert_eq!(
+            find_client_socket_exact(table, mapped_board, mapped_peer),
+            Some((222, 1000))
+        );
+    }
+
+    #[test]
+    fn exact_board_socket_lookup_tracks_real_loopback_v4_and_v6() {
+        let (_, own_uid) = proc_uids(std::process::id()).unwrap();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(listener) = TcpListener::bind(bind) else {
+                // IPv6 can be disabled on a test host.
+                continue;
+            };
+            let server = listener.local_addr().unwrap();
+            let _client = TcpStream::connect(server).unwrap();
+            let (accepted, peer) = listener.accept().unwrap();
+            let exact = client_socket_exact(accepted.local_addr().unwrap(), peer)
+                .unwrap()
+                .expect("live client socket must match exact board endpoint");
+            assert_eq!(exact.1, own_uid, "{bind}");
+        }
     }
 
     /// CAD-149: the policy per caller kind and mutation class.

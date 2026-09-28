@@ -22,6 +22,7 @@
 //! a test.
 
 pub mod audit;
+pub mod config;
 #[doc(hidden)]
 pub mod fixture;
 pub mod provision;

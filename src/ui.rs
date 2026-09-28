@@ -324,6 +324,9 @@ pub struct UiOpts {
 /// Everything the running server needs, resolved.
 #[derive(Clone, Default)]
 pub struct ServeOpts {
+    /// This board process's boot-pinned daemon agent UID. `serve` obtains
+    /// it once from the private daemon socket; tests can inject a pin.
+    pub agent_uid: Option<u32>,
     pub host: String,
     pub port: u16,
     pub dist: Option<PathBuf>,
@@ -647,6 +650,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         }
     }
     Ok(ServeOpts {
+        agent_uid: None,
         host,
         port,
         dist: eff.dist.clone(),
@@ -3859,6 +3863,42 @@ pub fn read_model_stats(state_dir: &Path, pm_dir: &Path) -> Value {
 /// since `/api/stream`, and issue file writes must not interleave.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn board_boot_agent_uid(state_dir: &Path, injected: Option<u32>) -> Result<Option<u32>> {
+    if injected.is_some() {
+        return Ok(injected);
+    }
+    let configured = crate::agent_uid::config::configured_uid(state_dir)?;
+    let historical = crate::agent_uid::config::mode_marker_uid(state_dir)?;
+    if configured.is_some() || historical.is_some() {
+        crate::agent_uid::config::require_private_state_dir(state_dir)?;
+    }
+    reconcile_board_agent_uid(
+        configured,
+        historical,
+        operator::active_agent_uid(state_dir),
+    )
+}
+
+fn reconcile_board_agent_uid(
+    configured: Option<u32>,
+    historical: Option<u32>,
+    health: std::result::Result<Option<u32>, String>,
+) -> Result<Option<u32>> {
+    match health {
+        Ok(uid) if configured.is_some() && uid != configured => Err(Error::rejected(
+            "Private daemon agent UID differs from configured UID",
+        )),
+        Ok(uid) if historical.is_some() && uid != historical => Err(Error::rejected(
+            "Private daemon agent UID differs from persistent mode marker",
+        )),
+        Ok(uid) => Ok(uid),
+        Err(error) if configured.is_some() || historical.is_some() => Err(Error::rejected(
+            format!("Agent UID mode has no private daemon boot pin: {error}"),
+        )),
+        Err(_) => Ok(None), // Standalone local board, with the split disabled.
+    }
+}
+
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
@@ -3882,6 +3922,7 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();
+    opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
     } else {
@@ -4708,6 +4749,49 @@ mod tests {
                 .unwrap()
                 .1
                 .board_public_only
+        );
+    }
+
+    #[test]
+    fn standalone_board_without_uid_record_does_not_need_daemon_health() {
+        let state = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), Some(2200)).unwrap(),
+            Some(2200)
+        );
+    }
+
+    #[test]
+    fn historical_uid_mode_cannot_start_standalone_after_record_loss() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = state.path().join(crate::agent_uid::config::MODE_MARKER);
+        std::fs::write(&marker, br#"{"uid":2200}"#).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = super::board_boot_agent_uid(state.path(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("no private daemon boot pin"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn first_uid_provisioning_requires_matching_private_daemon_boot() {
+        for health in [Ok(None), Ok(Some(3300))] {
+            assert!(
+                super::reconcile_board_agent_uid(Some(2200), None, health).is_err(),
+                "configured UID must match private daemon boot before board startup"
+            );
+        }
+        assert_eq!(
+            super::reconcile_board_agent_uid(Some(2200), None, Ok(Some(2200))).unwrap(),
+            Some(2200)
         );
     }
 

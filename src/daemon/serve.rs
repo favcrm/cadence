@@ -4,10 +4,16 @@ pub(super) mod accept_wait;
 
 use super::*;
 
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
 use std::io::BufReader;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 
 impl Shared {
     /// CAD-538: the hosted-lease heartbeat — renew every `renew_every`
@@ -51,10 +57,57 @@ impl Shared {
     }
 }
 
-/// Reject peers that are not the same Unix user; return the peer PID
-/// used to derive slot and approval-answer caller identity.
+// This entire RPC dispatch tree is synchronous: one OS thread per
+// accepted connection, no async task migration. The scope is set for
+// each frame and restored on drop. In configured UID mode, a missing
+// scope refuses; a future async refactor must explicitly carry this
+// credential instead of falling back to ambient operator identity.
+thread_local! {
+    static FRAME_PEER_UID: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+pub(super) struct PeerUidScope(Option<u32>);
+
+impl PeerUidScope {
+    fn enter(uid: u32) -> Self {
+        FRAME_PEER_UID.with(|slot| Self(slot.replace(Some(uid))))
+    }
+}
+
+impl Drop for PeerUidScope {
+    fn drop(&mut self) {
+        FRAME_PEER_UID.with(|slot| slot.set(self.0));
+    }
+}
+
+pub(super) fn frame_peer_uid(configured: Option<u32>) -> Result<u32> {
+    if configured.is_none() {
+        return Ok(unsafe { libc::geteuid() });
+    }
+    FRAME_PEER_UID.with(|slot| {
+        slot.get()
+            .ok_or_else(|| Error::rejected("socket peer UID context missing"))
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PeerCred {
+    pid: u32,
+    uid: u32,
+}
+
+/// Reject peers outside the exact kernel-credential UID admit set;
+/// the pid still derives slot and approval-answer caller identity.
+#[cfg(any(target_os = "linux", test))]
+fn admit_peer_uid(peer_uid: u32, daemon_uid: u32, agent_uid: Option<u32>) -> bool {
+    if agent_uid.is_some_and(|uid| daemon_uid == 0 || uid == 0 || uid == daemon_uid) {
+        return false;
+    }
+    peer_uid == daemon_uid || agent_uid == Some(peer_uid)
+}
+
 #[cfg(target_os = "linux")]
-fn check_peer(stream: &UnixStream) -> Result<u32> {
+fn check_peer(stream: &UnixStream, agent_uid: Option<u32>) -> Result<PeerCred> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -73,17 +126,23 @@ fn check_peer(stream: &UnixStream) -> Result<u32> {
     if rc != 0 {
         return Err(Error::internal("Cannot determine socket peer credentials"));
     }
-    if cred.uid != unsafe { libc::geteuid() } {
-        return Err(Error::rejected("Socket peer is not the same user"));
+    if len as usize != std::mem::size_of::<libc::ucred>()
+        || cred.pid <= 0
+        || !admit_peer_uid(cred.uid, unsafe { libc::geteuid() }, agent_uid)
+    {
+        return Err(Error::rejected("Socket peer UID or PID is not admitted"));
     }
-    Ok(cred.pid as u32)
+    Ok(PeerCred {
+        pid: cred.pid as u32,
+        uid: cred.uid,
+    })
 }
 
 /// Off Linux there is no `SO_PEERCRED`: refuse every peer (fail closed)
 /// until the macOS port (CAD-315) brings a verified equivalent. The
 /// daemon does not start there anyway — see `reaper::enable`.
 #[cfg(not(target_os = "linux"))]
-fn check_peer(_stream: &UnixStream) -> Result<u32> {
+fn check_peer(_stream: &UnixStream, _agent_uid: Option<u32>) -> Result<PeerCred> {
     Err(Error::rejected(
         "socket peer credentials are only checked on Linux; the daemon is Linux-only \
          until the macOS port (CAD-315)",
@@ -102,7 +161,7 @@ pub(super) fn process_start_identity(pid: u32) -> Result<u64> {
 }
 
 pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
-    let Ok(peer_pid) = check_peer(&stream) else {
+    let Ok(peer) = check_peer(&stream, shared.agent_uid) else {
         return;
     };
     let mut writer = match stream.try_clone() {
@@ -112,6 +171,7 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
+        let _peer_scope = PeerUidScope::enter(peer.uid);
         let response = serde_json::from_str::<Value>(&line)
             .map_err(|_| Error::rejected("Request must be one JSON object per line"))
             .and_then(|frame| {
@@ -125,7 +185,7 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                 // caller for this one dispatch. The field is refused
                 // everywhere else.
                 let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
-                shared.dispatch(method, &params, peer_pid)
+                shared.dispatch(method, &params, peer.pid)
             });
         let frame = match response {
             Ok(result) => proto::ok(result),
@@ -135,6 +195,88 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
             break;
         }
     }
+}
+
+/// The second socket lives outside the private state directory, so
+/// different state-dir daemons need one global lifetime lock. A stale
+/// socket is removed only while this lock is held and only after its
+/// owner/mode/type and refused connection prove it is inert.
+pub(super) struct SharedSocket {
+    pub listener: UnixListener,
+    path: PathBuf,
+    _lock: File,
+}
+
+impl Drop for SharedSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub(super) fn bind_shared_socket(path: &Path, gid: u32, fixture: bool) -> Result<SharedSocket> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::rejected("shared socket path has no parent"))?;
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    let euid = unsafe { libc::geteuid() };
+    if !parent_meta.is_dir()
+        || parent_meta.uid() != euid
+        || parent_meta.mode() & 0o022 != 0
+        || (!fixture && (parent_meta.gid() != gid || parent_meta.mode() & 0o050 != 0o050))
+    {
+        return Err(Error::rejected(
+            "shared socket parent owner, group or mode refused",
+        ));
+    }
+    let lock_path = parent.join("cadence-socket.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)?;
+    let meta = lock.metadata()?;
+    if !meta.is_file() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return Err(Error::rejected("shared socket lock owner or mode refused"));
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(Error::rejected("another daemon owns the shared socket"));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket()
+                || meta.uid() != euid
+                || meta.gid() != gid
+                || meta.mode() & 0o777 != 0o660
+                || UnixStream::connect(path)
+                    .err()
+                    .is_none_or(|error| error.kind() != std::io::ErrorKind::ConnectionRefused)
+            {
+                return Err(Error::rejected(
+                    "shared socket is active or its provenance is refused",
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = UnixListener::bind(path)?;
+    let socket = SharedSocket {
+        listener,
+        path: path.to_path_buf(),
+        _lock: lock,
+    };
+    // The protected parent and held lock make this path stable until
+    // the bind is fully prepared; the agent group cannot rename it.
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::rejected("shared socket path contains NUL"))?;
+    if unsafe { libc::chown(cpath.as_ptr(), euid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    socket.listener.set_nonblocking(true)?;
+    Ok(socket)
 }
 
 /// Exclusive lifetime ownership of the state directory. The lock file is
@@ -474,4 +616,94 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
         shared.launch_actor(&agent.alias)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod agent_uid_tests {
+    use super::{admit_peer_uid, bind_shared_socket, frame_peer_uid, PeerUidScope};
+    use crate::daemon::{ServeOptions, Shared};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn configured_agent_uid_is_admitted_but_foreign_and_root_are_refused() {
+        assert!(admit_peer_uid(1000, 1000, Some(2000)));
+        assert!(admit_peer_uid(2000, 1000, Some(2000)));
+        assert!(!admit_peer_uid(2000, 1000, None));
+        assert!(!admit_peer_uid(0, 1000, Some(2000)));
+        assert!(!admit_peer_uid(3000, 1000, Some(2000)));
+        assert!(!admit_peer_uid(1000, 1000, Some(1000)));
+        assert!(admit_peer_uid(0, 0, None));
+        assert!(!admit_peer_uid(0, 0, Some(2000)));
+    }
+
+    #[test]
+    fn held_agent_frame_cannot_bleed_into_concurrent_operator_frame() {
+        assert!(frame_peer_uid(Some(2000)).is_err());
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [1000u32, 2000u32]
+            .into_iter()
+            .map(|uid| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let _held = PeerUidScope::enter(uid);
+                    barrier.wait();
+                    assert_eq!(frame_peer_uid(Some(2000)).unwrap(), uid);
+                    let _nested = PeerUidScope::enter(uid + 10);
+                    assert_eq!(frame_peer_uid(Some(2000)).unwrap(), uid + 10);
+                    drop(_nested);
+                    assert_eq!(frame_peer_uid(Some(2000)).unwrap(), uid);
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(frame_peer_uid(Some(2000)).is_err());
+    }
+
+    #[test]
+    fn forged_operator_assertion_cannot_upgrade_agent_uid_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let opts = ServeOptions {
+            agent_uid: Some(2000),
+            ..ServeOptions::default()
+        };
+        let shared = Shared::new(root.path(), &opts).unwrap();
+        crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+            assert!(shared.operator_evidence(std::process::id()).is_err());
+            let _agent_frame = PeerUidScope::enter(2000);
+            assert!(shared.operator_evidence(std::process::id()).is_err());
+            assert!(!matches!(
+                shared.connection_caller(std::process::id()).unwrap(),
+                crate::daemon::caller_rule::Who::Operator
+            ));
+        });
+    }
+
+    #[test]
+    fn shared_socket_is_group_only_and_stale_or_active_paths_are_fenced() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cadence.sock");
+        let gid = unsafe { libc::getegid() };
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = bind_shared_socket(&path, gid, true).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o660);
+        assert_eq!(meta.gid(), gid);
+        assert!(UnixStream::connect(&path).is_ok());
+        assert!(bind_shared_socket(&path, gid, true).is_err());
+        drop(socket);
+        assert!(!path.exists());
+
+        let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        drop(stale);
+        let replacement = bind_shared_socket(&path, gid, true).unwrap();
+        drop(replacement);
+        assert!(!path.exists());
+    }
 }

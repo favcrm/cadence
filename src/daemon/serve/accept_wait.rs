@@ -10,6 +10,36 @@ pub(in crate::daemon) fn wait_for_connection(listener: &UnixListener) -> io::Res
     wait_for(listener, 50)
 }
 
+/// The shared agent socket is optional; poll both descriptors with
+/// one bounded wait so traffic on either wakes the accept loop.
+pub(in crate::daemon) fn wait_for_connections(listeners: &[&UnixListener]) -> io::Result<bool> {
+    if let [listener] = listeners {
+        return wait_for_connection(listener);
+    }
+    let mut descriptors: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|listener| libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 50) };
+    if result < 0 {
+        return poll_outcome(Err(io::Error::last_os_error()), 0);
+    }
+    if result == 0 {
+        return Ok(false);
+    }
+    let mut ready = false;
+    for descriptor in descriptors {
+        if descriptor.revents != 0 {
+            ready |= poll_outcome(Ok(1), descriptor.revents)?;
+        }
+    }
+    Ok(ready)
+}
+
 fn wait_for(listener: &UnixListener, timeout_ms: i32) -> io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd: listener.as_raw_fd(),
@@ -99,6 +129,22 @@ mod tests {
     #[test]
     fn arriving_connection_wakes_the_idle_listener() {
         assert_wakes(true);
+    }
+
+    #[test]
+    fn second_listener_wakes_the_same_accept_loop() {
+        let (a_root, a) = listener();
+        let (b_root, b) = listener();
+        let path = b_root.path().join("accept.sock");
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            UnixStream::connect(path).unwrap()
+        });
+        assert!(wait_for_connections(&[&a, &b]).unwrap());
+        let _client = sender.join().unwrap();
+        assert!(b.accept().is_ok());
+        assert_eq!(a.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        drop(a_root);
     }
 
     #[test]
