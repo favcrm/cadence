@@ -2055,6 +2055,115 @@ fn session_host_report_flag_labels_errors_and_env_is_dead() {
     );
 }
 
+#[test]
+fn session_verbs_reject_malformed_host_report_before_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let pm = tmp.path().join("pm");
+    let repo = tmp.path().join("repo");
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    let sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    let bad = tmp.path().join("empty-object.json");
+    std::fs::write(&bad, "{}").unwrap();
+
+    for args in [&["session", "start", "--fix"][..], &["session", "end"][..]] {
+        let out = run_session_host(&state, &pm, &repo, args, &bad, &[]);
+        let msg = session_text(&out);
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted malformed report: {msg}"
+        );
+        assert!(msg.contains("not a doctor --host report"), "{msg}");
+        assert!(!state.join("ui.pid").exists(), "{args:?} started a board");
+        assert!(!state.join("sessions").exists(), "{args:?} wrote a handoff");
+        assert!(stub_calls(&sd)
+            .iter()
+            .all(|(m, _)| !matches!(m.as_str(), "agent_stop" | "agent_gc" | "agent_send")));
+    }
+
+    let good = clean_host(tmp.path());
+    for args in [
+        &["session", "start"][..],
+        &["session", "end", "--dry-run"][..],
+    ] {
+        let out = run_session_host(&state, &pm, &repo, args, &good, &[]);
+        assert!(
+            session_text(&out).contains("real host not scanned"),
+            "valid shorthand rejected: {}",
+            session_text(&out)
+        );
+    }
+}
+
+#[test]
+fn session_start_shows_tailscale_fix_failure_in_text_and_json() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    let pm = tmp.path().join("pm");
+    let repo = tmp.path().join("repo");
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    let host = clean_host(tmp.path());
+    // A live pidfile makes the session inspect the persisted sharing
+    // mapping without starting or stopping a board. The pid check only
+    // probes liveness; the fake CLI fails before any board restart.
+    std::fs::write(state.join("ui.pid"), std::process::id().to_string()).unwrap();
+    std::fs::write(state.join("ui.json"), r#"{"port":3199,"tailscale":{"dns_name":"fake.ts.net","https_port":9450,"target":"http://127.0.0.1:3199"}}"#).unwrap();
+    let fake = tmp.path().join("fake-bin");
+    std::fs::create_dir(&fake).unwrap();
+    std::fs::write(fake.join("tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls.log\"\necho 'synthetic serve refusal' >&2\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        fake.join("tailscale"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let env = [("PATH", Path::new(&path))];
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix"],
+        &host,
+        &env,
+    );
+    let text = session_text(&out);
+    assert!(text.contains("synthetic serve refusal"), "{text}");
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix", "--json"],
+        &host,
+        &env,
+    );
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let board = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "board")
+        .unwrap();
+    assert!(
+        board.to_string().contains("synthetic serve refusal"),
+        "{board}"
+    );
+    let calls = std::fs::read_to_string(fake.join("calls.log")).unwrap();
+    assert!(
+        calls.contains("serve status --json") && calls.contains("status --json"),
+        "{calls}"
+    );
+}
+
 /// CAD-146: piping output into a reader that closes early
 /// (`cadence … | head -12`) must exit 0 quietly. Rust ignores
 /// SIGPIPE, so the closed read end turns the next stdout write into
