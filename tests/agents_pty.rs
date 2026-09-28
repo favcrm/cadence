@@ -5628,7 +5628,10 @@ fn pty_unreported_turn_holds_queue_and_bounds_to_unknown() {
     assert!(row["title"].as_str().unwrap().contains("4 queued"), "{row}");
 
     // A result report releases exactly the next turn.
-    d.report("acc1", &token1, "result", "done").unwrap();
+    // An earlier result may mention acc2 in its own text. That is not
+    // evidence that acc2 produced a result.
+    d.report("acc1", &token1, "result", "acc2 is still queued")
+        .unwrap();
     d.wait_message("w1", "acc1", &["completed"], 10);
     pty_token(&d, "w1", "acc2");
     assert_eq!(running_ids(&d), ["acc2"]);
@@ -5653,7 +5656,14 @@ fn pty_unreported_turn_holds_queue_and_bounds_to_unknown() {
             .unwrap()
             .iter()
             .filter(|m| {
-                m["source"] == source && m["body"].as_str().unwrap_or_default().contains("acc2")
+                if m["source"] != source {
+                    return false;
+                }
+                let body = m["body"].as_str().expect("routed PM message body");
+                let json_start = body.find('{').expect("routed PM JSON payload");
+                let payload: Value =
+                    serde_json::from_str(&body[json_start..]).expect("valid routed PM JSON");
+                payload["message"].as_str().expect("routed PM message id") == "acc2"
             })
             .count()
     };
