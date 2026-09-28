@@ -792,7 +792,7 @@ impl Store {
             };
             Self::app_context_proof_current_in(conn, run["install_id"].as_str().unwrap(), &proof)?;
         } else if !((run["snapshot"]["schema"] == 1 && run["snapshot"].get("context").is_none())
-            || (run["snapshot"]["schema"] == 3
+            || (matches!(run["snapshot"]["schema"].as_u64(), Some(3 | 4))
                 && run["snapshot"].get("context").is_some_and(Value::is_null)))
         {
             return Err(Error::rejected(

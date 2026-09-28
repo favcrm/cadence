@@ -92,8 +92,10 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
         {run.state === "succeeded" && !list && !errors[run.id] && <p className="wa-muted" role="status">Loading retained source receipts…</p>}
         {list?.map(receipt => <div key={receipt.id} className="wa-stack">
           <p className="wa-kicker">Receipt {receipt.id} · @{receipt.result.handle} · {receipt.result.more_available ? "more posts available at provider" : "page complete"}</p>
-          {!receipt.result.profile_verified && <p className="wa-alert">No public posts were returned. The profile identity cannot be verified from an empty page.</p>}
-          <div className="wa-source-grid">
+          {receipt.result.posts.length === 0 && <p className="wa-alert" role="status">{receipt.result.profile_verified
+            ? "No public posts were returned for this verified profile. Try another public profile or add source facts manually."
+            : "No public posts were returned. The profile identity cannot be verified from an empty page. Try another public profile or add source facts manually."}</p>}
+          {receipt.result.posts.length > 0 && <div className="wa-source-grid">
             {receipt.result.posts.map(post => <article key={post.id} className="wa-post-card">
               <SourcePostPreview post={post} />
               <div className="wa-card-meta"><span className="wa-kicker">{post.media_kind}</span><time dateTime={post.published_at ?? undefined}>{post.published_at ? new Date(post.published_at).toLocaleDateString() : post.published_at_unix ? new Date(post.published_at_unix * 1000).toLocaleDateString() : "Time unavailable"}</time></div>
@@ -103,7 +105,7 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
                 <Button size="sm" disabled={!canCreate || !post.caption} onClick={() => onPick({ receiptId: receipt.id, postId: post.id, handle: receipt.result.handle, caption: post.caption, permalink: post.permalink })}>Use as source</Button>
               </div>
             </article>)}
-          </div>
+          </div>}
         </div>)}
         {list?.length === 0 && <p className="wa-muted">No usable source receipt was stored for this run.</p>}
       </section>;

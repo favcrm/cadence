@@ -260,6 +260,67 @@ fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
 }
 
 #[test]
+fn cad709_context_free_capability_run_approves_only_its_frozen_snapshot() {
+    let (h, _calls, _price) = Release::with_capability();
+    for (slot, request_id) in [
+        ("publication", "context-free-capability-publication"),
+        ("source", "context-free-capability-source"),
+    ] {
+        let binding = h
+            .daemon
+            .operator_rpc(
+                "app_binding_create",
+                json!({"install_id":h.install["install_id"],"slot":slot,
+                    "connection_id":h.connection,"request_id":request_id}),
+            )
+            .unwrap()["binding"]
+            .clone();
+        assert!(binding["context_id"].is_null());
+    }
+    let created = h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({"install_id":h.install["install_id"],"workflow":"draft",
+                "inputs":{"subject":"No brand context","source":format!("CONTEXT_SOURCE={A}"),
+                    "writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"context-free-capability-run","owner_pm":OWNER}),
+        )
+        .unwrap();
+    assert_eq!(created["snapshot"]["schema"], 4);
+    assert!(created["context_id"].is_null());
+    assert_eq!(created["snapshot"].get("context"), Some(&Value::Null));
+    assert!(created["snapshot"]["capabilities"]["source"].is_object());
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({"run_id":created["id"],"digest":created["snapshot_digest"],
+                "context_id":"forged-context"}),
+            )
+            .is_err(),
+        "caller cannot supply a context to a context-free approval"
+    );
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({"run_id":created["id"],"digest":"forged-snapshot-digest"}),
+            )
+            .is_err(),
+        "caller cannot approve a different snapshot"
+    );
+    let approved = h
+        .daemon
+        .operator_rpc(
+            "app_run_approve",
+            json!({"run_id":created["id"],"digest":created["snapshot_digest"]}),
+        )
+        .unwrap();
+    assert_eq!(approved["state"], "approved");
+}
+
+#[test]
 fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
     let (h, calls, _) = Release::with_capability();
     let context = h.context("Client A", A, "asset-context-a");
