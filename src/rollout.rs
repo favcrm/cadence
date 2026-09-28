@@ -40,7 +40,7 @@ use crate::store::{self, Store};
 /// draft tables (CAD-506); v19 adds `app_grants.install_id`, the
 /// install an app-derived grant belongs to (CAD-577).
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -2757,7 +2757,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 24);
+        assert_eq!(SCHEMA_VERSION, 25);
     }
 
     struct MigrationHolder;

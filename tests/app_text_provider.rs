@@ -143,6 +143,7 @@ fn local_sink_receipt_distinguishes_actual_non_utf8_destination_bytes() {
 fn local_readback_pins_exact_effect_directory_and_authority() {
     use cadence_agent::contract_fixture::Verified;
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
     let (dir, adapter) = adapter();
     let provenance = json!({"effect_id":"effect-a","authorization_kind":"app_artifact","authority_digest":"sha256:authority-a","artifact_id":"artifact-a","artifact_digest":format!("sha256:{:x}",Sha256::digest(b"same reviewed artifact")),"sink_registration":adapter.connection_registration().unwrap()});
     let input = adapter
@@ -152,7 +153,10 @@ fn local_readback_pins_exact_effect_directory_and_authority() {
     let bucket = dir.path().join("outbox/app-items");
     let wrong = bucket.join("effect-other");
     std::fs::create_dir_all(&wrong).unwrap();
-    let index = json!({"effect_id":"effect-a","scope":{"kind":"app_artifact"},"input_digest":digest,"authority_digest":"sha256:authority-a","provenance":provenance});
+    for directory in [bucket.parent().unwrap(), bucket.as_path()] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let index = json!({"effect_id":"effect-a","scope":{"kind":"app_artifact"},"input_digest":digest,"authority_digest":"sha256:authority-a","provenance":provenance,"attachments":[]});
     std::fs::write(wrong.join("index.json"), index.to_string()).unwrap();
     std::fs::write(wrong.join("post.md"), "# Draft\n\nsame reviewed artifact").unwrap();
     assert_eq!(
@@ -193,5 +197,29 @@ fn local_readback_pins_exact_effect_directory_and_authority() {
     assert_eq!(
         adapter.read_back("publish_app_text", &input),
         Verified::False
+    );
+}
+
+#[test]
+fn app_outbox_scan_hides_uncommitted_temporary_binary_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = dir.path().join("outbox");
+    let temporary = outbox.join("app-items/.tmp-uncommitted");
+    std::fs::create_dir_all(&temporary).unwrap();
+    std::fs::write(temporary.join("post.md"), "# Draft\n\nbody").unwrap();
+    std::fs::write(
+        temporary.join("index.json"),
+        json!({"effect_id":"effect-fake",
+        "title":"Draft","attachments":[{"name":"asset.bin","sha256":"forged"}],
+        "result":{"board_url":"http://localhost/outbox?item=effect-fake"}})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        cadence_agent::platform::local::list_items(&outbox, None).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "unfinished temp item became a visible draft"
     );
 }

@@ -619,6 +619,35 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=24", [])?;
             tx.commit()?;
         }
+        if version < 25 {
+            // A review can additionally pin one immutable, run-scoped binary
+            // capability receipt. Both columns and the version advance commit
+            // together; existing text-only reviews retain NULL asset fields.
+            let tx = conn.unchecked_transaction()?;
+            for (table, column, definition) in [
+                (
+                    "app_run_reviews",
+                    "asset_receipt_id",
+                    "asset_receipt_id TEXT",
+                ),
+                ("app_run_reviews", "asset_digest", "asset_digest TEXT"),
+                (
+                    "app_capability_results",
+                    "receipt_schema",
+                    "receipt_schema INTEGER NOT NULL DEFAULT 1",
+                ),
+            ] {
+                let columns = tx
+                    .prepare(&format!("PRAGMA table_info({table})"))?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if !columns.iter().any(|name| name == column) {
+                    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+                }
+            }
+            tx.execute("UPDATE schema_version SET version=25", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

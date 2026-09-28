@@ -64,6 +64,8 @@ fn validate_child(row: &EffectRow, authority: &Value) -> Result<()> {
         || row.task.is_some()
         || row.input.get("project").is_some()
         || row.input.get("attachments").is_some()
+        || row.input.get("asset") != authority.get("asset")
+        || authority["provenance"].get("asset") != authority.get("asset")
     {
         return Err(Error::rejected(
             "app effect child does not match its server-owned input",
@@ -207,7 +209,7 @@ impl Store {
         if run["state"] != "succeeded"
             || run["approved_digest"] != run["snapshot_digest"]
             || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]
-            || run["snapshot"]["schema"] != 3
+            || !matches!(run["snapshot"]["schema"].as_u64(), Some(3 | 4))
             || run["snapshot"]["publication"]["slot"] != slot
         {
             return Err(Error::rejected(
@@ -254,9 +256,9 @@ impl Store {
                 "artifact differs from its actual completed producer receipt",
             ));
         }
-        let review: (String,String,String,String) = conn.query_row(
-            "SELECT step_id,reviewer,message_id,rationale FROM app_run_reviews WHERE run_id=? AND artifact_id=? AND artifact_digest=? AND decision='approve' ORDER BY step_id LIMIT 1",
-            params![id,artifact,digest],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
+        let review: (String,String,String,String,Option<String>,Option<String>) = conn.query_row(
+            "SELECT step_id,reviewer,message_id,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=? AND artifact_id=? AND artifact_digest=? AND decision='approve' ORDER BY step_id LIMIT 1",
+            params![id,artifact,digest],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?
             .ok_or_else(||Error::rejected("artifact has no accepted independent review"))?;
         if review.1 == producer {
             return Err(Error::rejected("artifact review is not independent"));
@@ -268,11 +270,38 @@ impl Store {
         )?;
         let reviewed =
             historical_step_receipt(conn, &run, &review.0, &review.2, &review.1, &review_turn)?;
+        let asset = match (&review.4, &review.5) {
+            (None, None) => None,
+            (Some(receipt_id), Some(asset_digest)) => {
+                let (receipt, _) = super::app_capabilities::asset_material_in(conn, receipt_id)?;
+                if receipt["receipt_schema"] != 2
+                    || receipt["run_id"] != id
+                    || receipt["step_id"] != step
+                    || receipt["asset"]["digest"] != *asset_digest
+                    || run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
+                        ["digest"]
+                        != receipt["binding_digest"]
+                {
+                    return Err(Error::rejected(
+                        "reviewed binary asset no longer matches its run receipt",
+                    ));
+                }
+                Some(
+                    json!({"receipt_id":receipt_id,"receipt_digest":receipt["digest"],
+                    "binding_digest":receipt["binding_digest"],
+                    "digest":receipt["asset"]["digest"],"media_type":receipt["asset"]["media_type"],
+                    "size":receipt["asset"]["size"]}),
+                )
+            }
+            _ => return Err(Error::rejected("reviewed binary asset pin is incomplete")),
+        };
         if reviewed["material"]["kind"] != "review_text"
             || reviewed["material"]["decision"] != "approve"
             || reviewed["material"]["producer_step_id"] != step
             || reviewed["material"]["artifact_sha256"] != digest
             || reviewed["material"]["rationale"] != review.3
+            || reviewed["material"]["asset_receipt_id"] != json!(review.4)
+            || reviewed["material"]["asset_sha256"] != json!(review.5)
         {
             return Err(Error::rejected(
                 "stored review differs from its actual accepted turn",
@@ -280,10 +309,12 @@ impl Store {
         }
         let text = String::from_utf8(body)
             .map_err(|_| Error::rejected("accepted artifact is not UTF-8 text"))?;
-        Ok(
-            json!({"run":run,"binding":proof,"artifact":{"id":artifact,"digest":digest,"media_type":media,"text":text},
-            "producer_receipt":producer_receipt,"review_receipt":reviewed}),
-        )
+        let mut material = json!({"run":run,"binding":proof,"artifact":{"id":artifact,"digest":digest,"media_type":media,"text":text},
+            "producer_receipt":producer_receipt,"review_receipt":reviewed});
+        if let Some(asset) = asset {
+            material["asset"] = asset;
+        }
+        Ok(material)
     }
 
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {

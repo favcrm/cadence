@@ -162,8 +162,11 @@ impl Shared {
                 "slot":slot,"binding":proof,"material_digest":app_runs::material_digest(&material),
                 "producer_receipt_digest":app_runs::material_digest(&material["producer_receipt"]),
                 "review_receipt_digest":app_runs::material_digest(&material["review_receipt"])});
+            if let Some(asset) = material.get("asset") {
+                authority["asset"] = asset.clone();
+            }
             let core_digest = app_effects::authority_digest(&authority);
-            let provenance = json!({"schema":1,"authorization_kind":"app_artifact","effect_id":effect_id,"authority_digest":core_digest,
+            let mut provenance = json!({"schema":1,"authorization_kind":"app_artifact","effect_id":effect_id,"authority_digest":core_digest,
                 "install_id":install,"context_id":run["context_id"],"context_revision":run["snapshot"]["context"]["revision"],
                 "context_digest":run["snapshot"]["context"]["digest"],"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                 "artifact_id":artifact["id"],"artifact_digest":artifact["digest"],"binding_id":proof.id,
@@ -172,7 +175,10 @@ impl Shared {
                 "connection_revision":proof.config["connection_revision"],"registration_digest":proof.config["registration_digest"],
                 "sink_registration":proof.config["sink_registration"],"mapping":proof.config["mapping"],
                 "review_receipt_digest":authority["review_receipt_digest"]});
-            authority["provenance"] = provenance.clone();
+            if let Some(asset) = material.get("asset") {
+                provenance["asset"] = asset.clone();
+            }
+            authority["provenance"] = provenance;
             let provider = required_str(&proof.config, "provider")?;
             let account = required_str(&proof.config, "account")?;
             let tool = required_str(&proof.config["mapping"], "tool")?;
@@ -181,10 +187,11 @@ impl Shared {
                 .get(provider)
                 .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
             let input = adapter
-                .prepare_app_text(
+                .prepare_app_artifact(
                     required_str(params, "title")?,
                     required_str(artifact, "text")?,
-                    &provenance,
+                    &authority["provenance"],
+                    material.get("asset"),
                 )
                 .map_err(Error::rejected)?;
             let preview = adapter.preview(account, tool, &input);
