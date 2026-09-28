@@ -708,7 +708,7 @@ impl Store {
                 )?;
             }
             let invalid: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible != 0",
+                "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible IS NOT 0",
                 [],
                 |row| row.get(0),
             )?;
@@ -718,10 +718,16 @@ impl Store {
                 ));
             }
             tx.execute_batch(
-                "CREATE TRIGGER IF NOT EXISTS cloud_dispatch_eligibility_immutable
+                "DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_immutable;
+                 DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_insert_guard;
+                 CREATE TRIGGER cloud_dispatch_eligibility_immutable
                  BEFORE UPDATE ON cloud_dispatch_outbox
                  WHEN NEW.cloud_eligible IS NOT OLD.cloud_eligible
                  BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is immutable'); END;
+                 CREATE TRIGGER cloud_dispatch_eligibility_insert_guard
+                 BEFORE INSERT ON cloud_dispatch_outbox
+                 WHEN NEW.cloud_eligible IS NOT 0
+                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is unverified'); END;
                  UPDATE schema_version SET version=27;",
             )?;
             tx.commit()?;
