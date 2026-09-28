@@ -50,9 +50,9 @@ cadence setup                  # idempotent first run: state dir, tracker,
 cadence daemon start           # detached controller
 cadence skill install          # ship the `cadence` skill to your agent CLIs
 
-cadence claude                 # managed headless Claude — or devin / codex / cursor
-cadence join <pm> devin        # spawn a worker wired to a group PM
-cadence dispatch CAD-1 --to w1 # one-step issue hand-off
+cadence claude --alias pm --role pm       # named headless PM
+cadence join pm devin --alias w1 --detach # named worker; keep this shell free
+cadence dispatch CAD-1 --to w1           # replace CAD-1 with an existing issue
 
 cadence status                 # one-screen fleet overview
 cadence ui status              # check the board started by setup
