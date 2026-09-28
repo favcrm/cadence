@@ -55,8 +55,11 @@ cadence join <pm> devin        # spawn a worker wired to a group PM
 cadence dispatch CAD-1 --to w1 # one-step issue hand-off
 
 cadence status                 # one-screen fleet overview
-cadence ui run                 # the board: 127.0.0.1:3010
+cadence ui status              # check the board started by setup
 ```
+
+Open the board URL printed by `cadence setup`. Use `cadence ui run` only when
+deliberately serving a board in the foreground without one already running.
 
 `cadence --help` is the installed CLI reference. Start with
 [project context](docs/START-HERE.md) for contracts and source ownership, or the
