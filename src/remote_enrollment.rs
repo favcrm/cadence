@@ -305,7 +305,9 @@ impl ContinuityRecord {
                     self.lineage_id.is_some() || self.key_id.is_some() || self.generation.is_some()
                 }
                 ContinuityState::Bound => {
-                    self.lineage_id.as_deref().is_none_or(|value| !id(value))
+                    self.lineage_id
+                        .as_deref()
+                        .is_none_or(|value| !continuity_lineage_id(value))
                         || self
                             .key_id
                             .as_deref()
@@ -353,6 +355,24 @@ fn continuity_b64(value: &str) -> bool {
 }
 fn continuity_minted(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(continuity_b64)
+}
+fn continuity_lineage_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("hcl_") else {
+        return false;
+    };
+    let bytes = suffix.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes[14] == b'4'
+        && b"89ab".contains(&bytes[19])
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(byte)
+        })
 }
 fn continuity_checksum(record: &ContinuityRecord) -> Result<String> {
     let bytes =
@@ -500,16 +520,19 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     );
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(key.sign(proof.as_bytes()).as_ref());
-    let reply: ContinuityBindReply = serde_json::from_value(post(
-        &enrollment.issuer,
-        "/v1/hosted-cadence/continuity/bind",
-        &enrollment.child_token,
-        json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
+    let reply: ContinuityBindReply = serde_json::from_value(
+        post(
+            &enrollment.issuer,
+            "/v1/hosted-cadence/continuity/bind",
+            &enrollment.child_token,
+            json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
             "publicKey":public,"signature":signature}),
-    )?)
+        )
+        .map_err(|_| reject("Hosted continuity bind uncertain; retry with the same pending key"))?,
+    )
     .map_err(|_| reject("Invalid hosted continuity bind response"))?;
     if reply.version != CONTINUITY_VERSION
-        || !id(&reply.lineage_id)
+        || !continuity_lineage_id(&reply.lineage_id)
         || !continuity_minted(&reply.key_id, "key_")
         || reply.generation != 1
         || (reply.delivery != "bound" && reply.delivery != "metadata")
@@ -528,7 +551,9 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     continuity.lineage_id = Some(reply.lineage_id);
     continuity.key_id = Some(reply.key_id);
     continuity.generation = Some(reply.generation);
-    save_continuity_locked(dir, &continuity)?;
+    save_continuity_locked(dir, &continuity).map_err(|_| {
+        reject("Hosted continuity bind may be committed remotely; local save uncertain")
+    })?;
     continuity.info()
 }
 
@@ -1100,6 +1125,7 @@ mod tests {
     const SERVICE: &str = "hcs_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const BRIDGE: &str = "hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
     const CHILD: &str = "hct_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    const LINEAGE: &str = "hcl_00000000-0000-4000-8000-000000000001";
     fn record(expires: u64) -> Enrollment {
         Enrollment {
             version: VERSION.into(),
@@ -1505,7 +1531,7 @@ mod tests {
                 &mut bind,
                 &json!({
                     "version":"hosted-cadence-continuity.v1", "delivery":"bound",
-                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
                     "generation":1, "organizationId":"ws_real",
                     "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
                     "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
@@ -1522,10 +1548,10 @@ mod tests {
         save(&dir, &child).unwrap();
         let bound = bind_browser(&dir).unwrap();
         server.join().unwrap();
-        assert_eq!(bound.lineage_id(), "lineage_agent");
+        assert_eq!(bound.lineage_id(), LINEAGE);
         assert_eq!(bound.agent_id(), child.agent_id);
         assert_eq!(bound.generation(), 1);
-        assert_eq!(bound_browser(&dir).unwrap().lineage_id(), "lineage_agent");
+        assert_eq!(bound_browser(&dir).unwrap().lineage_id(), LINEAGE);
         let file = dir.join("continuity.json");
         assert_eq!(
             fs::metadata(&file).unwrap().permissions().mode() & 0o777,
@@ -1565,6 +1591,14 @@ mod tests {
             ("credentialKind", json!("parent")),
             ("generation", json!(2)),
             ("keyId", json!("key_invalid")),
+            (
+                "lineageId",
+                json!("hca_00000000-0000-4000-8000-000000000001"),
+            ),
+            (
+                "lineageId",
+                json!("hcl_00000000-0000-1000-8000-000000000001"),
+            ),
             ("sessionId", json!("private_session")),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1587,7 +1621,7 @@ mod tests {
                     continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
                 let mut reply = json!({
                     "version":"hosted-cadence-continuity.v1", "delivery":"bound",
-                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
                     "generation":1, "organizationId":"ws_real",
                     "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
                     "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
@@ -1645,7 +1679,8 @@ mod tests {
         child.source = EnrollmentSource::Browser;
         child.service_token = None;
         save(&dir, &child).unwrap();
-        assert!(bind_browser(&dir).is_err());
+        let error = bind_browser(&dir).unwrap_err();
+        assert!(format!("{error}").contains("expired"));
         server.join().unwrap();
         assert!(bound_browser(&dir).is_err());
     }
@@ -1684,16 +1719,102 @@ mod tests {
                 &mut bind,
                 &json!({
                     "version":"hosted-cadence-continuity.v1", "delivery":"bound",
-                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
                     "generation":1, "organizationId":"ws_real",
                     "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
                     "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
                 }),
             );
         });
-        assert!(bind_browser(&dir).is_err());
+        let error = bind_browser(&dir).unwrap_err();
+        assert!(format!("{error}").contains("uncertain"), "{error}");
         server.join().unwrap();
         assert!(bound_browser(&dir).is_err());
+    }
+
+    #[test]
+    fn browser_continuity_bind_metadata_recovers_only_the_same_pending_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let at = now().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first_challenge, _) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+            respond(
+                &mut first_challenge,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1",
+                    "challengeId":format!("ch_{}", "A".repeat(43)),
+                    "operationId":format!("op_{}", "B".repeat(43)),
+                    "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                    "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                }),
+            );
+            let (mut first_bind, first_body) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+            let first_public = first_body["publicKey"].as_str().unwrap().to_owned();
+            write!(first_bind, "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            let (mut second_challenge, _) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+            respond(
+                &mut second_challenge,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1",
+                    "challengeId":format!("ch_{}", "F".repeat(43)),
+                    "operationId":format!("op_{}", "G".repeat(43)),
+                    "nonce":"H".repeat(43), "registryEpoch":"I".repeat(43),
+                    "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                }),
+            );
+            let (mut second_bind, second_body) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+            assert_eq!(second_body["publicKey"], first_public);
+            assert_ne!(second_body["signature"], first_body["signature"]);
+            let proof = format!(
+                "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
+                "F".repeat(43), "H".repeat(43), "I".repeat(43), first_public
+            );
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ED25519,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&first_public)
+                    .unwrap(),
+            )
+            .verify(
+                proof.as_bytes(),
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(second_body["signature"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            respond(
+                &mut second_bind,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1", "delivery":"metadata",
+                    "lineageId":LINEAGE, "keyId":format!("key_{}", "E".repeat(43)),
+                    "generation":1, "organizationId":"ws_real",
+                    "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                    "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
+                }),
+            );
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        trust(&dir, &issuer);
+        let mut child = record(at + 120);
+        child.issuer = issuer;
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        save(&dir, &child).unwrap();
+        let error = bind_browser(&dir).unwrap_err();
+        assert!(format!("{error}").contains("uncertain"), "{error}");
+        assert!(
+            bound_browser(&dir).is_err(),
+            "pending key claimed a lineage"
+        );
+        assert_eq!(bind_browser(&dir).unwrap().lineage_id(), LINEAGE);
+        server.join().unwrap();
+        assert_eq!(bound_browser(&dir).unwrap().generation(), 1);
     }
 
     #[test]
