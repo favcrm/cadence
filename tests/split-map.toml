@@ -586,6 +586,7 @@ helpers = [
 
 [binaries.managed_claude_codex]
 tests = [
+    "codex_mcp_read_tools_can_run_without_global_approval",
     "codex_mcp_resolves_relative_daemon_state_before_changing_cwd",
     "codex_command_rpc_denial_still_opens_with_scoped_mcp",
     "codex_sandbox_failure_fences_before_app_server_dispatch",
