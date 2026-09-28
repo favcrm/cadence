@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, claim, doctor, finish, history, hooks, lint, model, project, reconcile, retro, start,
-    sync, work, write, Pm,
+    blocked, board, claim, doctor, finish, history, hooks, lint, model, project, reconcile, retro,
+    start, sync, work, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -130,6 +130,10 @@ pub enum IssueAction {
         /// Only computed-ready leaves.
         #[arg(long)]
         ready: bool,
+        /// Only issues with at least one open `blocked_by` target
+        /// (CAD-757) — blocked work in active states is one query away.
+        #[arg(long)]
+        blocked: bool,
         /// Board state at a git revision — exports the tree at `<rev>`
         /// and lists it read-only; cards report `status_source: file`.
         #[arg(long)]
@@ -479,6 +483,21 @@ pub enum IssueAction {
         #[arg(long, value_parser = ["ours", "theirs"])]
         resolve: Option<String>,
     },
+    /// Blocked-work hygiene (CAD-757): park `doing`/`review` leaves
+    /// whose blockers are still open and whose claim is older than
+    /// `--grace` — tagged `blocked-park`, comment-bearing commit,
+    /// reversible — and for a tagged item whose blockers all closed,
+    /// notify its last claimer and drop the tag. The daemon checkup
+    /// runs the same sweep; this verb is the manual and dry-run path.
+    Sweep {
+        /// Report what would change — nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds a blocked active item may hold an unchanged claim
+        /// before it parks [default: 86400].
+        #[arg(long, value_name = "SECS")]
+        grace: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -821,6 +840,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             until,
             open,
             ready,
+            blocked,
             at,
             sort,
             limit,
@@ -938,6 +958,9 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             if *ready {
                 views.retain(|v| v.ready);
+            }
+            if *blocked {
+                views.retain(|v| v.blocked);
             }
             // Stage/health filters run on the work block — one ctx.
             let by_id: std::collections::HashMap<String, &board::View> =
@@ -1647,6 +1670,18 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     Err(e) => eprintln!("reconcile: {e}"),
                 }
             }
+            Ok(0)
+        }
+        IssueAction::Sweep { dry_run, grace } => {
+            let pm = open_pm()?;
+            let out = blocked::sweep(
+                &pm,
+                grace.unwrap_or(blocked::PARK_GRACE_SECS),
+                *dry_run,
+                Some(state_dir),
+                "",
+            )?;
+            print_json(&out);
             Ok(0)
         }
     }

@@ -395,6 +395,20 @@ impl Shared {
             .unwrap_or(master_rpc::QUESTION_GRACE_SECS) as i64;
         let escalated = master::escalations(&self.state_dir);
         let now = crate::issue::time::now_epoch();
+        // CAD-757: park stale blocked work and wake parked lanes whose
+        // blockers closed — best-effort, a sweep failure must not
+        // starve the report scan that feeds the idle-lane map.
+        if let Ok(pm) = issue::Pm::at(pm_dir) {
+            if let Err(e) = issue::blocked::sweep(
+                &pm,
+                issue::blocked::PARK_GRACE_SECS,
+                false,
+                Some(&self.state_dir),
+                "daemon",
+            ) {
+                tracing::warn!(event = "blocked_sweep_failed", error = e.to_string());
+            }
+        }
         for project in issue::project::list(pm_dir)? {
             let Ok(entries) = std::fs::read_dir(pm_dir.join(&project.key)) else {
                 continue;

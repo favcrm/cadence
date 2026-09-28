@@ -345,7 +345,7 @@ pub fn claim(
         None => text,
     };
     let comment = write::commit_front_with_comment(
-        pm, &dir, &front, &next, &body, &by, &text, &subject, actor,
+        pm, &dir, &front, &next, &body, &by, "claim", &text, &subject, actor,
     )?;
     let now = time::now_epoch();
     Ok(json!({
@@ -412,6 +412,7 @@ pub fn release(
         &next,
         &body,
         &by,
+        "claim",
         &format!("Released by {by}{suffix}"),
         &format!("release by {by}"),
         actor,
