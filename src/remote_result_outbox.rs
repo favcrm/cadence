@@ -561,22 +561,54 @@ fn validate_journal_path(dir: &Path) -> Result<()> {
             Ok(_) => return Err(corrupt()),
         }
     }
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join("results.sqlite3-journal"))
-    {
-        Ok(file) => {
-            let metadata = file.metadata()?;
-            private_metadata(&metadata, false)?;
-            if metadata.len() > MAX_RECOVERY_FILE_BYTES {
-                return Err(corrupt());
-            }
+    validate_journal_file(&dir.join("results.sqlite3-journal"))
+}
+fn validate_journal_file(path: &Path) -> Result<()> {
+    // A concurrent SQLite DELETE-mode commit can unlink the journal after
+    // open() and before fstat(). Recheck that one disappearing path; keep the
+    // ordinary private-file rule for every still-linked journal.
+    for _ in 0..3 {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if journal_needs_recheck(path, &file)? {
+            continue;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e.into()),
+        return Ok(());
     }
-    Ok(())
+    Err(Error::rejected(
+        "Offline outbox journal changed during inspection; custody was retained",
+    ))
+}
+fn journal_needs_recheck(path: &Path, file: &File) -> Result<bool> {
+    let metadata = file.metadata()?;
+    if metadata.nlink() == 0 {
+        if metadata.uid() != unsafe { libc::geteuid() } || !private_file_fields(&metadata) {
+            return Err(unsafe_private_path());
+        }
+        if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+            return Err(corrupt());
+        }
+        // The opened inode is no longer reachable through this name. Do not
+        // reject a completed SQLite transaction; inspect any replacement on
+        // the next iteration, including symlinks and hardlinks.
+        return match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(_) => Ok(true),
+            Err(e) => Err(e.into()),
+        };
+    }
+    private_metadata(&metadata, false)?;
+    if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+        return Err(corrupt());
+    }
+    Ok(false)
 }
 fn recovery_preflight(dir: &Path, original: &Path, expected_version: u32) -> Result<()> {
     let scratch = tempfile::Builder::new()
@@ -856,15 +888,19 @@ fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
         && if directory {
             meta.is_dir() && meta.mode() & 0o777 == 0o700
         } else {
-            meta.is_file() && meta.mode() & 0o777 == 0o600 && meta.nlink() == 1
+            private_file_fields(meta) && meta.nlink() == 1
         };
     if safe {
         Ok(())
     } else {
-        Err(Error::rejected(
-            "Offline outbox paths must be private, owned and not symlinks",
-        ))
+        Err(unsafe_private_path())
     }
+}
+fn private_file_fields(meta: &fs::Metadata) -> bool {
+    meta.is_file() && meta.mode() & 0o777 == 0o600
+}
+fn unsafe_private_path() -> Error {
+    Error::rejected("Offline outbox paths must be private, owned and not symlinks")
 }
 fn verify_header(file: &mut File) -> Result<u32> {
     let mut header = [0u8; 100];
@@ -882,4 +918,72 @@ fn verify_header(file: &mut File) -> Result<u32> {
         return Err(corrupt());
     }
     Ok(version)
+}
+
+#[cfg(test)]
+mod journal_race_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_sqlite_journal_descriptor_is_rechecked_without_accepting_replacements() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let database = root.path().join(DB_NAME);
+        let journal = root.path().join("results.sqlite3-journal");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE values_test (value INTEGER);")
+            .unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO values_test VALUES (1);")
+            .unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&journal)
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().nlink(), 1);
+        conn.execute_batch("COMMIT;").unwrap();
+        let unlinked = file.metadata().unwrap();
+        assert_eq!(unlinked.nlink(), 0);
+        assert!(!journal.exists());
+        // The former blanket file rule rejected this ordinary SQLite commit.
+        assert!(private_metadata(&unlinked, false).is_err());
+        assert!(!journal_needs_recheck(&journal, &file).unwrap());
+        validate_journal_file(&journal).unwrap();
+
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &journal).unwrap();
+        assert!(journal_needs_recheck(&journal, &file).unwrap());
+        assert!(validate_journal_file(&journal).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        fs::remove_file(&journal).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO values_test VALUES (2);")
+            .unwrap();
+        let hardlink = root.path().join("hardlink");
+        fs::hard_link(&journal, &hardlink).unwrap();
+        assert!(validate_journal_file(&journal).is_err());
+        fs::remove_file(&hardlink).unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let non_private = root.path().join("non-private-journal");
+        fs::write(&non_private, b"not private").unwrap();
+        fs::set_permissions(&non_private, fs::Permissions::from_mode(0o644)).unwrap();
+        let non_private_file = File::open(&non_private).unwrap();
+        fs::remove_file(&non_private).unwrap();
+        assert!(journal_needs_recheck(&non_private, &non_private_file).is_err());
+
+        let fifo = root.path().join("fifo-journal");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let fifo_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&fifo)
+            .unwrap();
+        fs::remove_file(&fifo).unwrap();
+        assert!(journal_needs_recheck(&fifo, &fifo_file).is_err());
+    }
 }
