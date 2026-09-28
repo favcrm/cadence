@@ -246,6 +246,8 @@ export default function WorkspaceApp({
     data?.contexts.filter((value) => value.state === "active") ?? [];
   const selectedContext = contexts.find(value => value.id === contextId);
   const workflowInputs = Object.fromEntries((data?.installation.workflows ?? []).map(value => [value.name, value.inputs]));
+  const supportsContentPrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "content_prompt"));
+  const supportsImagePrompt = Object.values(workflowInputs).some(inputs => inputs.some(input => input.name === "image_prompt"));
   const agents = data?.agents ?? [];
   const workers = agents.filter(
     (agent) =>
@@ -859,7 +861,7 @@ export default function WorkspaceApp({
                 <section className="wa-panel wa-stack">
                   <h2>Brand contexts</h2>
                   <p className="wa-muted">
-                    A brand is optional app context. Save its content and image prompts here; each new post can override them without changing these defaults. A project isn’t required.
+                    A brand is optional app context. {supportsContentPrompt ? "Save prompt defaults here; each new post can override them without changing these settings. " : "This installed bundle needs an upgrade before prompt defaults are available. "}A project isn’t required.
                   </p>
                   {selectedContext && <div className="wa-row">
                     <p className="wa-kicker">Selected: {selectedContext.config.label} · revision {selectedContext.revision}</p>
@@ -931,22 +933,22 @@ export default function WorkspaceApp({
                         disabled={!canWrite || busy}
                       />
                     </div>
-                    <div className="wa-fields">
-                      <div className="wa-field">
+                    {(supportsContentPrompt || supportsImagePrompt) && <div className="wa-fields">
+                      {supportsContentPrompt && <div className="wa-field">
                         <label htmlFor="wa-default-content-prompt">Content prompt default</label>
                         <textarea id="wa-default-content-prompt" name="content_prompt" className="wa-input wa-prompt-input"
                           value={contentPrompt} onChange={event => setContentPrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
                         <p className="wa-kicker">Guides caption wording. One line, up to 512 characters.</p>
-                      </div>
-                      <div className="wa-field">
+                      </div>}
+                      {supportsImagePrompt && <div className="wa-field">
                         <label htmlFor="wa-default-image-prompt">Image prompt default</label>
                         <textarea id="wa-default-image-prompt" name="image_prompt" className="wa-input wa-prompt-input"
                           value={imagePrompt} onChange={event => setImagePrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
                         <p className="wa-kicker">Guides the one generated draft image; provider and safety constraints stay fixed.</p>
-                      </div>
-                    </div>
+                      </div>}
+                    </div>}
                     <div className="wa-fields">
                       <div className="wa-field">
                         <label htmlFor="wa-brand-voice">
@@ -1085,7 +1087,7 @@ export default function WorkspaceApp({
             </div>
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
-              ? <p className="wa-alert">Frozen one-image charge: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong>. This covers one `image-01` square draft from the selected post. Binding {run.snapshot.capabilities?.image?.digest}. A changed price or binding stops dispatch.</p>
+              ? <p className="wa-alert">Frozen one-image charge: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong>. This covers one `image-01` square draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed price or binding stops dispatch.</p>
               : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
             <section className="wa-stack">
               <h3>Frozen plan</h3>

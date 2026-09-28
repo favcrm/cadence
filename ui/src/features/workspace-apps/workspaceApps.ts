@@ -50,7 +50,7 @@ export interface WorkspaceRun {
 export interface ImageReceipt {
   id: string; run_id: string; slot: string; digest: string; binding_digest: string;
   asset: { media_type: string; digest: string; size: number } | null;
-  result: { schema: number; kind: string; provider: string; model: string; aspect_ratio: string; asset_sha256: string; asset_media_type: string; source_receipt_id: string; source_post_id: string };
+  result: { schema: number; kind: string; provider: string; model: string; aspect_ratio: string; asset_sha256: string; asset_media_type: string; source_receipt_id: string | null; source_post_id: string | null };
 }
 export interface ImageAsset {
   receipt_id: string; media_type: string; digest: string; size: number; base64: string;

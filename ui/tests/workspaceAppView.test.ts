@@ -204,6 +204,7 @@ async function main() {
   await fresh(true, true);
   assert(button("New post")?.disabled, "Read-only operator cannot create posts");
   await click(button("Settings"));
+  assert(!host.querySelector("#wa-default-content-prompt") && !host.querySelector("#wa-default-image-prompt") && text().includes("needs an upgrade"), "Older installed bundles do not offer prompt defaults their workflow cannot save");
   assert(button("Save destination")?.disabled && button("Add brand")?.disabled, "Read-only settings have no enabled mutation controls");
   await click(button("Save destination")); await click(button("Add brand"));
   assert(writes.length === 0, "Read-only attempted actions cause zero POSTs");

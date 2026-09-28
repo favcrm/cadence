@@ -5,14 +5,14 @@ import { workspaceApps, type ImageReceipt, type WorkspaceRun } from "./workspace
 const imageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const assetLimit = 2 * 1024 * 1024;
 
-async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, signal: AbortSignal) {
+export async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, signal: AbortSignal) {
   const meta = receipt.asset;
   if (receipt.run_id !== run.id || receipt.slot !== "image"
     || receipt.binding_digest !== run.snapshot.capabilities?.image?.digest
     || receipt.result?.schema !== 1 || receipt.result.kind !== "media.generated.image"
     || receipt.result.model !== "image-01" || receipt.result.aspect_ratio !== "1:1"
-    || receipt.result.source_receipt_id !== run.snapshot.source?.receipt_id
-    || receipt.result.source_post_id !== run.snapshot.source?.post.id
+    || receipt.result.source_receipt_id !== (run.snapshot.source?.receipt_id ?? null)
+    || receipt.result.source_post_id !== (run.snapshot.source?.post.id ?? null)
     || !meta || !imageTypes.has(meta.media_type) || meta.media_type !== receipt.result.asset_media_type
     || meta.digest !== receipt.result.asset_sha256 || !/^sha256:[a-f0-9]{64}$/.test(meta.digest)
     || !Number.isSafeInteger(meta.size) || meta.size < 1 || meta.size > assetLimit) {
@@ -86,7 +86,7 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
     {error && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
     {!loading && !visibleReceipt && !error && <p className="wa-muted">No image asset has been retained yet. A provider URL or worker description cannot stand in for one.</p>}
     {visibleImage && visibleReceipt?.asset && <figure className="wa-retained-image">
-      <img src={visibleImage} alt="Generated draft awaiting review against the selected source" width="512" height="512" />
+      <img src={visibleImage} alt={run.snapshot.source ? "Generated draft awaiting review against the selected source" : "Generated draft awaiting review against the pasted facts"} width="512" height="512" />
       <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
     </figure>}
     {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}

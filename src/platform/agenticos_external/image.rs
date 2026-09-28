@@ -124,7 +124,7 @@ fn compose_image_prompt(
     if title.is_empty() || title.chars().count() > 120 {
         return Err("image subject or frozen brand context is invalid".into());
     }
-    if !crate::issue::workflow::visible_source_facts(frozen_source) {
+    if !legacy && !crate::issue::workflow::visible_source_facts(frozen_source) {
         return Err("image run source facts are invalid".into());
     }
     if !guidance.is_empty() && !crate::issue::workflow::bounded_content(guidance) {
@@ -187,8 +187,12 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     let frozen_source = authority["inputs"]["source"]
         .as_str()
         .ok_or("image run lacks frozen source facts")?;
+    let legacy = authority["inputs"].get("image_prompt").is_none();
     let source = &authority["source"];
     if source.is_null() {
+        if legacy {
+            return Err("image run lacks a frozen selected public source post".into());
+        }
         // An operator-pasted, frozen one-line source needs no provider
         // receipt. A URL alone is not factual material for an image.
         if manual_source_starts_with_url(frozen_source) {
@@ -217,13 +221,12 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     let title = authority["inputs"]["subject"].as_str().unwrap_or("");
     let voice = authority["inputs"]["brand_voice"].as_str().unwrap_or("");
     let guidance = authority["inputs"]["image_prompt"].as_str().unwrap_or("");
-    compose_image_prompt(
-        title,
-        frozen_source,
-        voice,
-        guidance,
-        authority["inputs"].get("image_prompt").is_none(),
-    )
+    let prompt_source = if legacy {
+        source["post"]["caption"].as_str().unwrap_or_default()
+    } else {
+        frozen_source
+    };
+    compose_image_prompt(title, prompt_source, voice, guidance, legacy)
 }
 
 pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a str, String> {
