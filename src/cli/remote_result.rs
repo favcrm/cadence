@@ -1,18 +1,19 @@
-//! Explicit offline custody. No daemon, credential resolver or remote sender.
+//! Explicit local result custody and one pinned hosted sender. No daemon or credential resolver.
 use cadence_agent::error::{Error, Result};
 use cadence_agent::remote_enrollment;
 use cadence_agent::remote_result_outbox::{
-    DestinationPin, LocalReceipt, ResultCommand, ResultOutbox, MAX_COMMAND_BYTES,
+    deliver_with, DestinationPin, LocalReceipt, ResultCommand, ResultOutbox, MAX_COMMAND_BYTES,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Subcommand)]
 pub(crate) enum RemoteAction {
-    /// Retain or inspect offline result custody; no hosted transport.
+    /// Retain, inspect or explicitly send local result custody.
     Result {
         #[command(subcommand)]
         action: ResultAction,
@@ -66,6 +67,23 @@ pub(crate) enum ResultAction {
         #[command(flatten)]
         destination: DestinationArgs,
     },
+    /// POST a retained command using its issuer-bound child enrollment.
+    Send {
+        #[arg(long)]
+        outbox_dir: PathBuf,
+        #[arg(long)]
+        command_id: String,
+        /// Private enrollment directory whose issuer binding must match custody.
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+    },
+    /// Inspect one command's local or queued custody; never contacts the server.
+    Status {
+        #[arg(long)]
+        outbox_dir: PathBuf,
+        #[arg(long)]
+        command_id: String,
+    },
 }
 #[derive(Args)]
 pub(crate) struct DestinationArgs {
@@ -75,7 +93,7 @@ pub(crate) struct DestinationArgs {
     /// Original organization ID (structural metadata, not membership proof).
     #[arg(long)]
     org: String,
-    /// Exact canonical HTTPS gateway origin; no request is sent.
+    /// Exact canonical HTTPS board origin, pinned before a later send.
     #[arg(long)]
     audience: String,
     #[arg(long)]
@@ -96,6 +114,40 @@ fn metadata(receipt: &LocalReceipt) -> Value {
     json!({"state":receipt.state(),"commandId":receipt.command_id(),"digest":receipt.digest(),
         "storedAt":receipt.stored_at_ms(),"destination":{"org":pin.organization_id(),
         "audience":pin.audience(),"subject":pin.subject_id(),"agent":pin.agent_id()}})
+}
+fn existing_outbox(dir: &PathBuf) -> Result<ResultOutbox> {
+    if !dir.is_absolute()
+        || !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        || !fs::symlink_metadata(dir.join("results.sqlite3")).is_ok_and(|m| m.is_file())
+    {
+        return Err(Error::rejected("Existing offline custody is required"));
+    }
+    ResultOutbox::open(dir)
+}
+fn post_queued(url: &str, bearer: &str, body: &str) -> Result<(u16, Vec<u8>)> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(12)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        // Ambient proxy settings cannot retarget a bearer bound to the pin.
+        .proxy(None)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent
+        .post(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+        .map_err(|_| Error::rejected("Hosted result send uncertain; local custody retained"))?;
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::rejected("Hosted result response uncertain; local custody retained"))?;
+    Ok((status, bytes))
 }
 pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
     if let RemoteAction::Enrollment { action } = action {
@@ -178,25 +230,226 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
             let pin = destination.pin()?;
             // The library can initialize new custody; inspection must not do so.
             // Hostile same-UID path replacement races remain outside its boundary.
-            let existing = fs::symlink_metadata(&destination.outbox_dir).is_ok_and(|m| m.is_dir());
-            let database = fs::symlink_metadata(destination.outbox_dir.join("results.sqlite3"))
-                .is_ok_and(|m| m.is_file());
-            if !existing || !database {
-                return Err(Error::rejected(
-                    "Pending inspection requires existing offline custody",
-                ));
-            }
             // Protected open can create an init lock or recover a valid journal;
             // this is metadata-only output, not a universally read-only open.
-            let outbox = ResultOutbox::open(&destination.outbox_dir)?;
+            let outbox = existing_outbox(&destination.outbox_dir)?;
             let receipts: Vec<_> = outbox
                 .pending_for(&pin)?
                 .iter()
-                .map(|row| metadata(row.receipt()))
+                .map(|row| {
+                    let mut value = metadata(row.receipt());
+                    value["state"] = json!(row.state());
+                    value
+                })
                 .collect();
-            json!({"state":"local_pending","receipts":receipts})
+            json!({"receipts":receipts})
+        }
+        ResultAction::Send {
+            outbox_dir,
+            command_id,
+            enrollment_dir,
+        } => {
+            let outbox = existing_outbox(outbox_dir)?;
+            let row = outbox.get(command_id)?;
+            let pin = row.receipt().destination();
+            let receipt = remote_enrollment::with_current(enrollment_dir, pin, |bearer| {
+                deliver_with(
+                    &outbox,
+                    command_id,
+                    pin.organization_id(),
+                    pin.audience(),
+                    bearer,
+                    post_queued,
+                )
+            })?;
+            json!({"state":"remote_queued","application":"applied_unknown", "receipt":{
+                "commandId":receipt.command_id(),"digest":receipt.digest(),
+                "acceptedAt":receipt.accepted_at(),"expiresAt":receipt.expires_at()}})
+        }
+        ResultAction::Status {
+            outbox_dir,
+            command_id,
+        } => {
+            let row = existing_outbox(outbox_dir)?.get(command_id)?;
+            let mut value = metadata(row.receipt());
+            value["state"] = json!(row.state());
+            value["application"] = json!("applied_unknown");
+            if let Some(queued) = row.queued_receipt() {
+                value["receipt"] = json!({"commandId":queued.command_id(), "digest":queued.digest(),
+                    "acceptedAt":queued.accepted_at(),"expiresAt":queued.expires_at()});
+            }
+            value
         }
     };
     println!("{output}");
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    const CHILD: &str = "hct_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+    const AUDIENCE: &str = "https://board.example.invalid";
+    const ROUTE: &str = "/__platform/hosted-cadence/org-1/results";
+
+    fn command() -> ResultCommand {
+        ResultCommand::parse_json(&json!({
+            "version":"hosted-cadence-result.v1", "commandId":"command-1", "kind":"agent_result",
+            "assignmentId":"assignment-1", "taskId":"task-1", "taskRevision":1,
+            "turnId":"turn-1", "reportedHeadSha":"a".repeat(40), "text":"private result"
+        }).to_string()).unwrap()
+    }
+
+    fn serve_once(
+        status: &str,
+        response: Vec<u8>,
+        expected_body: String,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}{}", listener.local_addr().unwrap(), ROUTE);
+        let status = status.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim_end(), format!("POST {ROUTE} HTTP/1.1"));
+            let mut authorization = None;
+            let mut content_type = None;
+            let mut content_length = None;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                let value = value.trim();
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => authorization = Some(value.to_owned()),
+                    "content-type" => content_type = Some(value.to_owned()),
+                    "content-length" => content_length = Some(value.parse::<usize>().unwrap()),
+                    _ => (),
+                }
+            }
+            assert_eq!(authorization, Some(format!("Bearer {CHILD}")));
+            assert_eq!(content_type.as_deref(), Some("application/json"));
+            let mut body = vec![0; content_length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(body, expected_body.as_bytes());
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:9/trap\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&response).unwrap();
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn real_http_transport_carries_only_pinned_command_and_accepts_strict_queued_202() {
+        let root = tempfile::tempdir().unwrap();
+        let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
+        let cmd = command();
+        let pin = DestinationPin::new("org-1", AUDIENCE, "subject-1", "agent-1").unwrap();
+        outbox.enqueue(&pin, &cmd).unwrap();
+        let response = json!({"ok":true,"receipt":{"commandId":"command-1","state":"queued",
+            "acceptedAt":100,"expiresAt":200,"digest":cmd.digest()}})
+        .to_string()
+        .into_bytes();
+        let (endpoint, server) = serve_once("202 Accepted", response, cmd.canonical_json().into());
+        let queued = deliver_with(
+            &outbox,
+            "command-1",
+            "org-1",
+            AUDIENCE,
+            CHILD,
+            |url, bearer, body| {
+                assert_eq!(url, format!("{AUDIENCE}{ROUTE}"));
+                post_queued(&endpoint, bearer, body)
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(queued.state(), "remote_queued");
+        assert_eq!(
+            outbox.get("command-1").unwrap().queued_receipt(),
+            Some(&queued)
+        );
+    }
+
+    #[test]
+    fn real_http_transport_preserves_pending_on_redirect_and_oversized_202() {
+        let root = tempfile::tempdir().unwrap();
+        let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
+        let cmd = command();
+        let pin = DestinationPin::new("org-1", AUDIENCE, "subject-1", "agent-1").unwrap();
+        outbox.enqueue(&pin, &cmd).unwrap();
+        let (redirect, redirect_server) =
+            serve_once("302 Found", b"moved".to_vec(), cmd.canonical_json().into());
+        let (status, _) = post_queued(&redirect, CHILD, cmd.canonical_json()).unwrap();
+        redirect_server.join().unwrap();
+        assert_eq!(status, 302);
+        let (endpoint, server) = serve_once(
+            "202 Accepted",
+            vec![b'x'; 4097],
+            cmd.canonical_json().into(),
+        );
+        assert!(deliver_with(
+            &outbox,
+            "command-1",
+            "org-1",
+            AUDIENCE,
+            CHILD,
+            |_, bearer, body| { post_queued(&endpoint, bearer, body) }
+        )
+        .is_err());
+        server.join().unwrap();
+        assert_eq!(outbox.get("command-1").unwrap().state(), "local_pending");
+    }
+
+    #[test]
+    fn proxy_env_cannot_retarget_hosted_send() {
+        if std::env::var_os("CADENCE_PROXY_PROOF_CHILD").is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("proxy_env_cannot_retarget_hosted_send")
+                .env("CADENCE_PROXY_PROOF_CHILD", "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("http_proxy", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("all_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+            let output = cadence_agent::reaper::output(&mut child).unwrap();
+            assert!(
+                output.status.success(),
+                "proxy isolation proof failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let cmd = command();
+        let (endpoint, server) = serve_once(
+            "202 Accepted",
+            json!({"ok":true,"receipt":{"commandId":"command-1","state":"queued",
+                "acceptedAt":100,"expiresAt":200,"digest":cmd.digest()}})
+            .to_string()
+            .into_bytes(),
+            cmd.canonical_json().into(),
+        );
+        let (status, _) = post_queued(&endpoint, CHILD, cmd.canonical_json()).unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 202);
+    }
 }
