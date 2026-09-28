@@ -1377,6 +1377,10 @@ impl Shared {
         // slots from the pid just recorded — the daemon's own record,
         // never a caller's claim.
         self.enroll_endpoint(alias);
+        // A provider's own local tools can only authenticate after this
+        // enrollment is visible to the daemon's peer-ancestry verifier.
+        // Keep dispatch gated until that proof succeeds.
+        adapter.post_enrollment_ready(&agent)?;
         self.wake();
         let retry_base = self.pty_retry_base();
         let mut gate_notice: Option<String> = None;

@@ -929,6 +929,17 @@ impl Shared {
 }
 
 impl ProviderAdapter for CodexAdapter {
+    fn post_enrollment_ready(&self, agent: &Agent) -> Result<()> {
+        let thread_id = self
+            .shared
+            .thread_id
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::provider("Codex Cadence MCP identity proof has no thread"))?;
+        check_agent_mcp(&self.transport, &thread_id, &agent.alias)
+    }
+
     /// The raw transport clock — `Shared::dispatch` stamps every
     /// incoming message, so the daemon's stall watch reads true
     /// provider traffic, not only the curated event stream.
@@ -1040,7 +1051,6 @@ impl ProviderAdapter for CodexAdapter {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
                 .to_string();
-            check_agent_mcp(&self.transport, &thread_id, &agent.alias)?;
             *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
             let effective_model = result
                 .get("model")
