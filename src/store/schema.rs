@@ -649,9 +649,9 @@ impl Store {
             tx.commit()?;
         }
         if version < 26 {
-            // CAD-720: committed dispatch facts are inert until a separate,
-            // durable remote turn claim. No migration backfills old
-            // messages: their cloud audience and restore epoch are unknown.
+            // CAD-720: historical v26 source rows are inert. No migration
+            // backfills older messages: their cloud enrollment and restore
+            // generation are unknown. v27 fences every v26 row as local.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS cloud_dispatch_outbox(
@@ -688,6 +688,23 @@ impl Store {
                       OR NEW.claimed IS NOT OLD.claimed))
                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch source or claim is immutable'); END;
                 UPDATE schema_version SET version=26;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 27 {
+            // Every v26 row was created by a local dispatch without issuer
+            // enrollment. Preserve it for audit, but make it permanently
+            // ineligible for a future cloud turn claim. No current insert
+            // path is permitted to create an eligible row either.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
+                    cloud_eligible INTEGER NOT NULL DEFAULT 0 CHECK(cloud_eligible=0);
+                 CREATE TRIGGER cloud_dispatch_eligibility_immutable
+                 BEFORE UPDATE ON cloud_dispatch_outbox
+                 WHEN NEW.cloud_eligible IS NOT OLD.cloud_eligible
+                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is immutable'); END;
+                 UPDATE schema_version SET version=27;",
             )?;
             tx.commit()?;
         }

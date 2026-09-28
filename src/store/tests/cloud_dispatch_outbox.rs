@@ -10,144 +10,33 @@ fn draft_task() -> (TempDir, Store) {
     (dir, s)
 }
 
+fn count(s: &Store) -> i64 {
+    s.conn()
+        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
 #[test]
 fn ordinary_local_dispatch_never_creates_a_cloud_claim_candidate() {
     let (_dir, s) = draft_task();
     let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
     assert!(!duplicate);
-    let count: i64 = s
-        .conn()
-        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 0, "local work must not accumulate cloud candidates");
-    assert!(s.claim_cloud_dispatch_turn(&mid, "later-org", "w1").is_err());
+    assert_eq!(
+        count(&s),
+        0,
+        "local work must not accumulate cloud candidates"
+    );
+    assert!(s.claim_cloud_dispatch_turn(&mid).is_err());
+    let (_, same, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    assert!(duplicate);
+    assert_eq!(same, mid);
     assert_eq!(s.task("t1").unwrap().state, "dispatched");
 }
 
 #[test]
-fn restored_v26_local_row_is_permanently_ineligible_even_with_later_org() {
-    let (dir, s) = draft_task();
-    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
-    drop(s);
-    let db = dir.path().join("t.sqlite3");
-    let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "DROP TRIGGER cloud_dispatch_source_immutable;
-         DROP TABLE cloud_dispatch_outbox;
-         CREATE TABLE cloud_dispatch_outbox(
-           cursor INTEGER PRIMARY KEY AUTOINCREMENT,
-           message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
-           source TEXT NOT NULL,
-           task_id TEXT,
-           task_revision INTEGER,
-           audience_agent TEXT NOT NULL,
-           expected_head TEXT,
-           payload_digest TEXT NOT NULL,
-           organization_id TEXT,
-           remote_turn_id TEXT UNIQUE,
-           created REAL NOT NULL,
-           claimed REAL
-         );
-         UPDATE schema_version SET version=26;",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cloud_dispatch_outbox(message_id,source,task_id,task_revision,
-         audience_agent,payload_digest,created) VALUES (?1,'job_dispatch','t1',1,'w1','sha256:legacy',1)",
-        [&mid],
-    )
-    .unwrap();
-    drop(conn);
-    let restored = Store::open_for_schema_tests(&db).unwrap();
-    let eligible: i64 = restored
-        .conn()
-        .query_row(
-            "SELECT cloud_eligible FROM cloud_dispatch_outbox WHERE message_id=?1",
-            [&mid],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(eligible, 0);
-    assert!(restored
-        .claim_cloud_dispatch_turn(&mid, "later-org", "w1")
-        .is_err());
-    let unchanged: (Option<String>, Option<String>) = restored
-        .conn()
-        .query_row(
-            "SELECT organization_id,remote_turn_id FROM cloud_dispatch_outbox WHERE message_id=?1",
-            [&mid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(unchanged, (None, None));
-}
-
-#[test]
-fn cloud_dispatch_outbox_is_committed_with_job_kickoff_and_retry_is_same_fact() {
-    let (_dir, s) = draft_task();
-    let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
-    assert!(!duplicate);
-    let row: (String, String, i64, Option<String>) = s
-        .conn()
-        .query_row(
-            "SELECT message_id, audience_agent, task_revision, remote_turn_id \
-             FROM cloud_dispatch_outbox WHERE message_id=?1",
-            [&mid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(row, (mid.clone(), "w1".into(), 1, None));
-    let (_, again, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
-    assert!(duplicate);
-    assert_eq!(again, mid);
-    let count: i64 = s
-        .conn()
-        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 1);
-    s.enqueue_steered(
-        "w1",
-        "forged dispatch source without a lane",
-        None,
-        "forged-source",
-        "dispatch",
-        None,
-        None,
-        None,
-        &Sender::Unattributed,
-        &Steer::NONE,
-        None,
-    )
-    .unwrap();
-    let count: i64 = s
-        .conn()
-        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 1, "source alone cannot mint an outbox fact");
-    assert!(s
-        .conn()
-        .execute(
-            "UPDATE cloud_dispatch_outbox SET audience_agent='forged-agent' WHERE message_id=?1",
-            [&mid],
-        )
-        .is_err());
-    let actionable: i64 = s
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE remote_turn_id IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(actionable, 0, "dispatch alone cannot create remote work");
-}
-
-#[test]
-fn cloud_dispatch_outbox_insert_failure_rolls_back_entire_dispatch() {
+fn a_cloud_outbox_insert_failure_does_not_rollback_local_dispatch() {
     let (_dir, s) = draft_task();
     s.conn()
         .execute_batch(
@@ -155,64 +44,14 @@ fn cloud_dispatch_outbox_insert_failure_rolls_back_entire_dispatch() {
              BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;",
         )
         .unwrap();
-    assert!(s.dispatch_task("t1", None, None, "operator").is_err());
-    let task = s.task("t1").unwrap();
-    assert_eq!(task.state, "draft");
-    assert_eq!(task.revision, 0);
-    assert!(task.dispatch_message.is_none());
-    let count: i64 = s
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE task_id='t1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 0);
+    let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    assert!(!duplicate);
+    assert_eq!(count(&s), 0);
+    assert!(s.claim_cloud_dispatch_turn(&mid).is_err());
 }
 
 #[test]
-fn cloud_turn_claim_is_exact_idempotent_and_refuses_forged_or_stale_targets() {
-    let (_dir, s) = draft_task();
-    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
-    assert!(s.claim_cloud_dispatch_turn(&mid, "", "w1").is_err());
-    assert!(s
-        .claim_cloud_dispatch_turn(&mid, "org-1", "forged-agent")
-        .is_err());
-    let turn = s.claim_cloud_dispatch_turn(&mid, "org-1", "w1").unwrap();
-    assert!(turn.starts_with("remote-"));
-    assert_ne!(turn, mid);
-    assert_eq!(
-        s.claim_cloud_dispatch_turn(&mid, "org-1", "w1").unwrap(),
-        turn
-    );
-    assert!(s.claim_cloud_dispatch_turn(&mid, "org-2", "w1").is_err());
-    s.cancel_task("t1", "operator").unwrap();
-    assert!(s.claim_cloud_dispatch_turn(&mid, "org-1", "w1").is_err());
-}
-
-#[test]
-fn concurrent_cloud_claims_return_one_durable_turn() {
-    let (_dir, s) = draft_task();
-    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
-    let s = std::sync::Arc::new(s);
-    let mut threads = Vec::new();
-    for _ in 0..8 {
-        let s = s.clone();
-        let mid = mid.clone();
-        threads.push(std::thread::spawn(move || {
-            s.claim_cloud_dispatch_turn(&mid, "org-1", "w1").unwrap()
-        }));
-    }
-    let turns: std::collections::HashSet<String> = threads
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
-        .collect();
-    assert_eq!(turns.len(), 1);
-}
-
-#[test]
-fn cloud_plain_dispatch_has_no_task_revision_and_claims_once() {
+fn ordinary_local_plain_dispatch_never_creates_cloud_candidate() {
     let (dir, s) = store();
     let cwd = dir.path().join("w");
     reg(&s, "w1", &cwd);
@@ -232,15 +71,8 @@ fn cloud_plain_dispatch_has_no_task_revision_and_claims_once() {
         )
         .unwrap();
     assert!(!duplicate);
-    let row: (Option<String>, Option<i64>) = s
-        .conn()
-        .query_row(
-            "SELECT task_id,task_revision FROM cloud_dispatch_outbox WHERE message_id='plain-1'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(row, (None, None));
+    assert_eq!(count(&s), 0);
+    assert!(s.claim_cloud_dispatch_turn("plain-1").is_err());
     let (duplicate, _) = s
         .enqueue_steered(
             "w1",
@@ -257,21 +89,105 @@ fn cloud_plain_dispatch_has_no_task_revision_and_claims_once() {
         )
         .unwrap();
     assert!(duplicate);
-    let count: i64 = s
+    assert_eq!(count(&s), 0);
+}
+
+/// Rebuild the exact pre-fix v26 columns around a committed local dispatch.
+/// This models a disk snapshot restored after the fix has been installed.
+fn restored_v26_local_row(claimed: bool) -> (TempDir, Store, String) {
+    let (dir, s) = draft_task();
+    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER cloud_dispatch_source_immutable;
+         DROP TRIGGER cloud_dispatch_eligibility_immutable;
+         DROP TABLE cloud_dispatch_outbox;
+         CREATE TABLE cloud_dispatch_outbox(
+           cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+           message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+           source TEXT NOT NULL CHECK(source IN ('dispatch','job_dispatch')),
+           task_id TEXT,
+           task_revision INTEGER,
+           audience_agent TEXT NOT NULL,
+           expected_head TEXT,
+           payload_digest TEXT NOT NULL,
+           organization_id TEXT,
+           remote_turn_id TEXT UNIQUE,
+           created REAL NOT NULL,
+           claimed REAL
+         );
+         UPDATE schema_version SET version=26;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO cloud_dispatch_outbox(message_id,source,task_id,task_revision,
+         audience_agent,payload_digest,created) VALUES (?1,'job_dispatch','t1',1,'w1','sha256:legacy',1)",
+        [&mid],
+    )
+    .unwrap();
+    if claimed {
+        conn.execute(
+            "UPDATE cloud_dispatch_outbox SET organization_id='old-org',
+             remote_turn_id='remote-old',claimed=1 WHERE message_id=?1",
+            [&mid],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let restored = Store::open_for_schema_tests(&db).unwrap();
+    (dir, restored, mid)
+}
+
+#[test]
+fn restored_v26_local_rows_remain_ineligible_with_later_org_or_old_claim() {
+    for claimed in [false, true] {
+        let (_dir, s, mid) = restored_v26_local_row(claimed);
+        let eligible: i64 = s
+            .conn()
+            .query_row(
+                "SELECT cloud_eligible FROM cloud_dispatch_outbox WHERE message_id=?1",
+                [&mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(eligible, 0);
+        assert!(s.claim_cloud_dispatch_turn(&mid).is_err());
+        assert!(s
+            .conn()
+            .execute(
+                "UPDATE cloud_dispatch_outbox SET cloud_eligible=1,
+                 organization_id='later-org' WHERE message_id=?1",
+                [&mid],
+            )
+            .is_err());
+        assert_eq!(s.task("t1").unwrap().state, "dispatched");
+    }
+}
+
+#[test]
+fn concurrent_claims_cannot_turn_legacy_local_work_into_cloud_work() {
+    let (_dir, s, mid) = restored_v26_local_row(false);
+    let s = std::sync::Arc::new(s);
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        let mid = mid.clone();
+        threads.push(std::thread::spawn(move || {
+            s.claim_cloud_dispatch_turn(&mid).is_err()
+        }));
+    }
+    assert!(threads.into_iter().all(|thread| thread.join().unwrap()));
+    let turn: Option<String> = s
         .conn()
-        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT remote_turn_id FROM cloud_dispatch_outbox WHERE message_id=?1",
+            [&mid],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(count, 1);
-    let first = s
-        .claim_cloud_dispatch_turn("plain-1", "org-1", "w1")
-        .unwrap();
-    assert_eq!(
-        s.claim_cloud_dispatch_turn("plain-1", "org-1", "w1")
-            .unwrap(),
-        first
-    );
+    assert!(turn.is_none());
 }
 
 #[test]
@@ -280,8 +196,13 @@ fn cloud_outbox_v26_migration_is_atomic() {
     let db = dir.path().join("t.sqlite3");
     Store::open(&db).unwrap();
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("DROP TABLE cloud_dispatch_outbox; UPDATE schema_version SET version=25;")
-        .unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER cloud_dispatch_source_immutable;
+         DROP TRIGGER cloud_dispatch_eligibility_immutable;
+         DROP TABLE cloud_dispatch_outbox;
+         UPDATE schema_version SET version=25;",
+    )
+    .unwrap();
     conn.execute_batch(
         "CREATE TRIGGER fail_cloud_schema BEFORE UPDATE ON schema_version \
          WHEN NEW.version=26 BEGIN SELECT RAISE(ABORT,'migration denied'); END;",
@@ -303,5 +224,5 @@ fn cloud_outbox_v26_migration_is_atomic() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
 }

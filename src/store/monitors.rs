@@ -602,7 +602,6 @@ impl Store {
             Some(task_id),
         )?;
         self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, at, by)?;
-        Self::record_cloud_dispatch_tx(&tx, &kickoff, Some((task_id, revision)))?;
         let dispatched = self.task_in(&tx, task_id)?;
         tx.commit()?;
         let behind_dead = worker.endpoint.is_none()
