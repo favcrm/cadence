@@ -275,6 +275,7 @@ pub fn with_current<T>(
     private_dir(dir, false)?;
     let _guard = lock(dir, false)?;
     let record = read_locked(dir)?;
+    require_trusted_issuer(dir, &record.issuer)?;
     record.valid(now()?)?;
     record.with_pin(pin, send)?
 }
@@ -282,6 +283,7 @@ pub fn current(dir: &Path) -> Result<EnrollmentInfo> {
     private_dir(dir, false)?;
     let _guard = lock(dir, false)?;
     let record = read_locked(dir)?;
+    require_trusted_issuer(dir, &record.issuer)?;
     record.valid(now()?)?;
     Ok(record.info())
 }
@@ -289,11 +291,9 @@ pub fn current(dir: &Path) -> Result<EnrollmentInfo> {
 /// re-verifies its current owner, organization, audience, scope and revocation.
 pub fn renew(dir: &Path) -> Result<EnrollmentInfo> {
     private_dir(dir, false)?;
-    let prior = {
-        let _guard = lock(dir, false)?;
-        read_locked(dir)?
-    };
-    enroll(
+    let _guard = lock(dir, true)?;
+    let prior = read_locked(dir)?;
+    enroll_locked(
         &prior.issuer,
         &prior.organization_id,
         &prior.audience,
@@ -310,9 +310,7 @@ pub fn remove(dir: &Path) -> Result<()> {
     fs::remove_file(path)?;
     Ok(())
 }
-fn save(dir: &Path, record: &Enrollment) -> Result<()> {
-    private_dir(dir, true)?;
-    let _guard = lock(dir, true)?;
+fn save_locked(dir: &Path, record: &Enrollment) -> Result<()> {
     if dir.join(RECORD).exists() {
         let prior = read_locked(dir)?;
         if prior.issuer != record.issuer
@@ -338,6 +336,12 @@ fn save(dir: &Path, record: &Enrollment) -> Result<()> {
         .map_err(|_| reject("Unable to save enrollment"))?;
     File::open(dir)?.sync_all()?;
     Ok(())
+}
+#[cfg(test)]
+fn save(dir: &Path, record: &Enrollment) -> Result<()> {
+    private_dir(dir, true)?;
+    let _guard = lock(dir, true)?;
+    save_locked(dir, record)
 }
 
 fn post(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
@@ -393,10 +397,23 @@ pub fn enroll(
     if !id(org) || !id(client_agent) || !token(service_token, "hcs_") {
         return Err(reject("Invalid hosted enrollment request"));
     }
-    require_trusted_issuer(dir, &issuer)?;
+    private_dir(dir, false)?;
+    let _guard = lock(dir, true)?;
+    enroll_locked(&issuer, org, &audience, client_agent, service_token, dir)
+}
+
+fn enroll_locked(
+    issuer: &str,
+    org: &str,
+    audience: &str,
+    client_agent: &str,
+    service_token: &str,
+    dir: &Path,
+) -> Result<EnrollmentInfo> {
+    require_trusted_issuer(dir, issuer)?;
     let requested = ["bridge.enroll", "results.submit"];
     let exchange = post(
-        &issuer,
+        issuer,
         "/v1/hosted-cadence/service/exchange",
         service_token,
         json!({"version":VERSION,"organization_id":org,"audience":audience,
@@ -424,7 +441,7 @@ pub fn enroll(
         return Err(reject("Issuer grant did not match service credential"));
     }
     let enrollment = post(
-        &issuer,
+        issuer,
         "/v1/hosted-cadence/service/enroll",
         field(bridge, "access_token")?,
         json!({"version":VERSION,"organization_id":org,"audience":audience,
@@ -478,7 +495,7 @@ pub fn enroll(
     }
     record.valid(now()?)?;
     require_trusted_issuer(dir, &record.issuer)?;
-    save(dir, &record)?;
+    save_locked(dir, &record)?;
     Ok(record.info())
 }
 
@@ -554,6 +571,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("enroll");
         let original = record(u64::MAX);
+        trust(&dir, &original.issuer);
         save(&dir, &original).unwrap();
         assert_eq!(current(&dir).unwrap().agent_id(), original.agent_id);
         assert!(with_current(&dir, &pin(&original.audience), |token| Ok(token == CHILD)).unwrap());
@@ -562,8 +580,24 @@ mod tests {
         value["record"]["audience"] = json!("https://attacker.board.example.test");
         fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(current(&dir).is_err());
-        save(&root.path().join("fresh"), &original).unwrap();
+        let mut forged = original.clone();
+        forged.issuer = "https://attacker.example.test".into();
+        let sealed = Sealed {
+            checksum: checksum(&forged).unwrap(),
+            record: forged,
+        };
+        fs::write(&file, serde_json::to_vec(&sealed).unwrap()).unwrap();
+        let mut calls = 0;
+        assert!(current(&dir).is_err());
+        assert!(with_current(&dir, &pin(&original.audience), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
         let fresh = root.path().join("fresh");
+        trust(&fresh, &original.issuer);
+        save(&fresh, &original).unwrap();
         fs::set_permissions(fresh.join(RECORD), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(current(&fresh).is_err());
         let link = root.path().join("link");
@@ -576,6 +610,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("enroll");
         let original = record(u64::MAX);
+        trust(&dir, &original.issuer);
         save(&dir, &original).unwrap();
         let expected = pin(&original.audience);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -716,6 +751,159 @@ mod tests {
         .is_err());
         server.join().unwrap();
         assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn issuer_refuses_wrong_org_role_scope_and_expired_service_grant() {
+        for mutation in ["org", "role", "scope", "expired"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let at = now().unwrap();
+            let server = thread::spawn(move || {
+                let mut first = request(&listener, "/v1/hosted-cadence/service/exchange", SERVICE);
+                let mut grant = json!({"version":VERSION,"organization_id":"ws_real",
+                    "audience":"http://127.0.0.1:1",
+                    "principal":{"kind":"service","subject_id":"hsp_subject",
+                        "current_role":"member","provisioned_by":"owner_1"},
+                    "capabilities":["bridge.enroll","results.submit"],
+                    "credential":{"credential_id":"hcb_credential","access_token":BRIDGE,
+                        "token_type":"Bearer","issued_at":at,"expires_at":at+120,
+                        "renewal":"reexchange"}});
+                match mutation {
+                    "org" => grant["organization_id"] = json!("ws_other"),
+                    "role" => grant["principal"]["current_role"] = json!("owner"),
+                    "scope" => grant["capabilities"] = json!(["assignments.read"]),
+                    "expired" => grant["credential"]["expires_at"] = json!(at),
+                    _ => unreachable!(),
+                }
+                respond(&mut first, &grant);
+            });
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("e");
+            trust(&dir, &issuer);
+            assert!(enroll(
+                &issuer,
+                "ws_real",
+                "http://127.0.0.1:1",
+                "worker",
+                SERVICE,
+                &dir
+            )
+            .is_err());
+            server.join().unwrap();
+            assert!(!dir.join(RECORD).exists(), "saved invalid {mutation} grant");
+        }
+    }
+
+    #[test]
+    fn issuer_refuses_wrong_agent_role_capability_or_expiry() {
+        for mutation in ["agent", "role", "scope", "expired"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let at = now().unwrap();
+            let server = thread::spawn(move || {
+                let mut first = request(&listener, "/v1/hosted-cadence/service/exchange", SERVICE);
+                respond(
+                    &mut first,
+                    &json!({"version":VERSION,"organization_id":"ws_real",
+                    "audience":"http://127.0.0.1:1",
+                    "principal":{"kind":"service","subject_id":"hsp_subject",
+                        "current_role":"member","provisioned_by":"owner_1"},
+                    "capabilities":["bridge.enroll","results.submit"],
+                    "credential":{"credential_id":"hcb_credential","access_token":BRIDGE,
+                        "token_type":"Bearer","issued_at":at,"expires_at":at+120,
+                        "renewal":"reexchange"}}),
+                );
+                let mut second = request(&listener, "/v1/hosted-cadence/service/enroll", BRIDGE);
+                let mut child = json!({"version":VERSION,"organization_id":"ws_real",
+                    "audience":"http://127.0.0.1:1","bridge_id":"hcb_bridge","agents":[{
+                    "agent_id":"hca_agent","bridge_id":"hcb_bridge","client_agent_id":"worker",
+                    "principal_subject_id":"hsp_subject","organization_id":"ws_real",
+                    "audience":"http://127.0.0.1:1","role":"implementer",
+                    "capabilities":["results.submit"],
+                    "credential":{"credential_id":"hcc_credential","access_token":CHILD,
+                        "token_type":"Bearer","issued_at":at,"expires_at":at+120,
+                        "renewal":"reexchange"}}]});
+                match mutation {
+                    "agent" => child["agents"][0]["client_agent_id"] = json!("other"),
+                    "role" => child["agents"][0]["role"] = json!("reviewer"),
+                    "scope" => child["agents"][0]["capabilities"] = json!(["reviews.submit"]),
+                    "expired" => child["agents"][0]["credential"]["expires_at"] = json!(at),
+                    _ => unreachable!(),
+                }
+                respond(&mut second, &child);
+            });
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("e");
+            trust(&dir, &issuer);
+            assert!(enroll(
+                &issuer,
+                "ws_real",
+                "http://127.0.0.1:1",
+                "worker",
+                SERVICE,
+                &dir
+            )
+            .is_err());
+            server.join().unwrap();
+            assert!(!dir.join(RECORD).exists(), "saved invalid {mutation} child");
+        }
+    }
+
+    #[test]
+    fn issuer_redirect_never_forwards_service_bearer_to_another_origin() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        let trap_url = format!("http://{}", trap.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut first = request(&listener, "/v1/hosted-cadence/service/exchange", SERVICE);
+            write!(first, "HTTP/1.1 302 Found\r\nlocation: {trap_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        assert!(enroll(
+            &issuer,
+            "ws_real",
+            "http://127.0.0.1:1",
+            "worker",
+            SERVICE,
+            &dir
+        )
+        .is_err());
+        server.join().unwrap();
+        trap.set_nonblocking(true).unwrap();
+        assert!(
+            trap.accept().is_err(),
+            "issuer redirect forwarded the service bearer"
+        );
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn revoked_service_exchange_does_not_extend_existing_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut first = request(&listener, "/v1/hosted-cadence/service/exchange", SERVICE);
+            write!(
+                first,
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        let mut old = record(now().unwrap() + 60);
+        old.issuer = issuer;
+        old.audience = "http://127.0.0.1:1".into();
+        save(&dir, &old).unwrap();
+        let bytes = fs::read(dir.join(RECORD)).unwrap();
+        assert!(renew(&dir).is_err());
+        server.join().unwrap();
+        assert_eq!(fs::read(dir.join(RECORD)).unwrap(), bytes);
     }
 
     #[test]

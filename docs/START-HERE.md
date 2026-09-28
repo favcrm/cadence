@@ -23,6 +23,7 @@ verified delivery with routine coordination handled by the system.
 | How is identity and role policy enforced? | [Caller rules](../src/daemon/caller_rule.rs), [daemon identity](../src/daemon/identity.rs), [HTTP admission](../src/ui.rs), [audit](AUDIT.md) and [risk rules](roles/risk-classes.md). Source policy is not proof of a live deployment. |
 | How do agents act on external platforms? | [Platform contract schemas](../contracts/), [effect handlers](../src/daemon/effect_rpc.rs) and [platform implementation](../src/platform/). Inspect the relevant adapter and its tests before claiming a supported effect. |
 | How do reports reach the team? | [Report intake](../src/issue/report.rs) and [relay implementation](../src/issue/relay.rs). Configuration and an active consumer are separate from enqueue success. |
+| How does local hosted enrollment establish a result destination? | [AgenticOS issuer and enrollment contract](REMOTE-AUTH.md), [offline result custody](REMOTE-RESULT-OUTBOX.md) and [enrollment implementation](../src/remote_enrollment.rs). CAD-717 prepares a bound child credential; CAD-716 must still connect its sender before transport is supported. |
 
 ## First task checklist
 
