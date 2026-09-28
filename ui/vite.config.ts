@@ -33,19 +33,30 @@ function uiBuild(): string {
   return `${version}+${sha || "unknown"}`;
 }
 
-// Dev proxies the API to `cadence ui run` on its default loopback port.
+// Dev proxies only to the explicitly selected sandbox board.
+function devBoardPort(): number {
+  const raw = process.env.CADENCE_DEV_BOARD_PORT;
+  if (!raw || !/^\d+$/.test(raw)) {
+    throw new Error("CADENCE_DEV_BOARD_PORT must be an integer from 3110 to 3199");
+  }
+  const port = Number(raw);
+  if (port < 3110 || port > 3199) {
+    throw new Error("CADENCE_DEV_BOARD_PORT must be an integer from 3110 to 3199");
+  }
+  return port;
+}
+
 // Build emits fixed asset names — index.js/index.css plus the latin
 // woff2 files — so the Rust binary can embed them behind `--features ui`.
-export default defineConfig({
+export default defineConfig(({ command, isPreview }) => ({
   plugins: [react(), tailwindcss()],
   define: {
     __CADENCE_BUILD__: JSON.stringify(uiBuild()),
   },
-  server: {
-    proxy: {
-      "/api": "http://127.0.0.1:3010",
-    },
-  },
+  server:
+    command === "serve" && !isPreview
+      ? { proxy: { "/api": `http://127.0.0.1:${devBoardPort()}` } }
+      : undefined,
   build: {
     assetsInlineLimit: 0,
     rollupOptions: {
@@ -59,4 +70,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

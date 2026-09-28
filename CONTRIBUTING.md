@@ -94,6 +94,43 @@ invocations require it; the runner acquires the lock and prevents nested locking
 by test children. Do not invent a per-lane lock to bypass host serialization.
 Use ports 3110–3199 for boards you start and preserve production services.
 
+## Isolated board development
+
+Use a source-built sandbox for local work after the hosted coordinator becomes
+authoritative. The sandbox creates its own tracker, daemon state and board; it
+refuses the production state and port. Pick a free port in 3110–3199 and a
+short temp root (Unix socket paths have a length limit):
+
+```bash
+export CADENCE_SANDBOX_ROOT="$(mktemp -d /tmp/cadence-dev.XXXXXX)"
+export CADENCE_DEV_BOARD_PORT=3117
+pnpm -C ui install --frozen-lockfile
+pnpm -C ui build
+# On a shared host, obtain the documented build-slot admission first.
+CARGO_BUILD_JOBS=4 cargo build --locked --features ui
+./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
+pnpm -C ui dev --host 127.0.0.1
+```
+
+Open the Vite URL printed by the final command. UI edits reload there without a
+Rust build or cloud deployment; `/api` proxies only to the selected sandbox
+board. `pnpm -C ui dev` refuses a missing or out-of-range
+`CADENCE_DEV_BOARD_PORT`, including the production port 3010. For Rust edits,
+leave Vite running, then rebuild and restart the sandbox:
+
+```bash
+CARGO_BUILD_JOBS=4 cargo build --locked --features ui
+./target/debug/cadence sandbox down dev
+./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
+```
+
+Repeat that backend cycle after each Rust edit; Vite reconnects when the board
+returns. For CLI experiments in another terminal, use
+`./target/debug/cadence sandbox env dev` and export its printed values there
+before issuing commands. Keep cloud tokens out of the sandbox shell. At the
+end, run `./target/debug/cadence sandbox down dev`; the temp root remains
+available for inspection and can be removed later by its owner.
+
 Choose tests by the changed contract:
 
 - Pure state/decision tests give quick feedback without process startup or waits.
