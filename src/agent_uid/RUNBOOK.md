@@ -146,16 +146,18 @@ The Stage A provisioning is inert only **before** any state directory has
 entered agent-UID mode. Once `agent-uid.json` has been configured and the
 daemon has written `agent-uid-mode.json`, removing the record, marker, host
 account or directories is **not** a rollback. The daemon and board refuse a
-missing or changed UID on restart. Keep both private files and the original
-UID in place, stop new agent launches, and retain a recoverable copy of the
-state until the operator-only deprovision procedure in CAD-762 has been
-reviewed and rehearsed. Do not delete `/var/lib/cadence` or its repository
-store as part of an agent-UID rollback.
+missing or changed UID on restart **while the marker survives**. If both the
+record and marker disappear, current code cannot distinguish that loss from
+a never-activated installation and may start in legacy mode. Keep both
+private files and the original UID in place, stop new agent launches, and
+retain a recoverable copy of the state until the operator-only deprovision
+procedure in CAD-762 has been reviewed and rehearsed. Do not delete
+`/var/lib/cadence` or its repository store as part of an agent-UID rollback.
 
 A restore must retain the exact UID record and mode marker. A snapshot taken
 before the first split-mode boot may lack the marker, so its local files alone
 cannot prove that a previous split-mode installation existed. Do not start
-the restored daemon or board from that snapshot until an independent
-out-of-state UID pin has been checked or an explicit operator reconciliation
-has completed. CAD-762 tracks that restore proof and the deprovision sequence;
-this runbook does not authorize a live downgrade.
+the restored daemon or board from that snapshot. An independent out-of-state
+UID pin and explicit operator reconciliation are **not implemented or
+rehearsed yet**; CAD-762 must supply and review them before such a restore
+can boot. This runbook does not authorize a live downgrade.
