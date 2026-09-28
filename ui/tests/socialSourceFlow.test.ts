@@ -19,8 +19,13 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
-const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.3.0", digest: "bundle-v3", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md", "workflows/source-instagram.md"] };
-const binding = (slot: string, connectionId: string, provider: string) => ({ id: `binding-${slot}`, install_id: "install-a", context_id: null, slot, revision: 1, state: "configured", digest: `digest-${slot}`, config: { bundle_digest: "bundle-v3", connection_id: connectionId, provider, account: "company-a" } });
+const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.5.0", digest: "bundle-v5", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md", "workflows/source-instagram.md", "workflows/image-instagram.md", "workflows/image-manual.md"], workflows: [
+  { name: "instagram", inputs: [{ name: "content_prompt", default: "App content prompt" }] },
+  { name: "facebook", inputs: [{ name: "content_prompt", default: "App content prompt" }] },
+  { name: "image-instagram", inputs: [{ name: "content_prompt", default: "App content prompt" }, { name: "image_prompt", default: "App image prompt" }] },
+  { name: "image-manual", inputs: [{ name: "content_prompt", default: "App content prompt" }, { name: "image_prompt", default: "App image prompt" }] },
+] };
+const binding = (slot: string, connectionId: string, provider: string) => ({ id: `binding-${slot}`, install_id: "install-a", context_id: null, slot, revision: 1, state: "configured", digest: `digest-${slot}`, config: { bundle_digest: "bundle-v5", connection_id: connectionId, provider, account: "company-a" } });
 const sourceSnapshot = { owner_pm: "pm-a", inputs: { profile_handle: "juicysuite_crm", writer: "writer-a" }, workflow: { title: "Read public Instagram posts: juicysuite_crm", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Read bound source" }] }, capabilities: { source: { id: "binding-source", revision: 1, digest: "digest-source" } }, quotes: { source: { schema: 1, currency: "USD", unit_price_micros: 2000, units: 1, total_price_micros: 2000, price_revision: "sha256:quote" } }, assignments: {} };
 const sourceRun = (state = "awaiting_approval") => ({ id: "source-run", install_id: "install-a", context_id: null, state, snapshot_digest: "source-digest", approved_digest: state === "awaiting_approval" ? null : "source-digest", snapshot: sourceSnapshot, steps: [{ step_id: "1", task_id: "task-a", state: state === "succeeded" ? "succeeded" : "pending", message_id: state === "succeeded" ? "message-a" : null }], artifacts: [], reviews: [] });
 const receipt = { id: "receipt-a", run_id: "source-run", slot: "source", digest: "receipt-digest", binding_digest: "digest-source", result: { schema: 1, kind: "social.source.posts", provider: "agenticos_external", source_tool: "scrapecreators.instagram.user.posts", handle: "juicysuite_crm", profile_verified: true, empty_reason: null, more_available: false, posts: [{ id: "post-a", caption: "Original line one\nOriginal line two", permalink: "https://www.instagram.com/p/AbCd123/", published_at: "2026-09-27T00:00:00Z", published_at_unix: 1790467200, media_kind: "image", preview_url: null }] } };
@@ -85,6 +90,14 @@ async function choose(id: string, label: string) {
 }
 async function main() {
   await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  assert(!host.textContent?.includes("no supported board workspace") && button("New post") && button("Sources"), "Installed v0.5 opens the board with post and source actions");
+  await click(button("New post"));
+  assert(host.querySelector("#wa-content-prompt") && host.querySelector("#wa-image-prompt"), "New post exposes both Cadence-owned per-post prompts");
+  await click(host.querySelector("#wa-workflow"));
+  assert(Array.from(document.querySelectorAll('[role="option"]')).some(value => value.textContent?.includes("Caption and image from pasted facts")), "v0.5 offers the manual-facts image workflow");
+  await click(host.querySelector('button[aria-label="Close New post"]'));
+  await click(button("Settings"));
+  assert(host.querySelector("#wa-default-content-prompt") && host.querySelector("#wa-default-image-prompt"), "Settings exposes both saved prompt defaults for v0.5");
   await click(button("Sources"));
   assert(host.textContent?.includes("No source reads yet"), "No source card is invented before a provider receipt");
   await click(button("Find public posts"));
@@ -159,6 +172,11 @@ async function main() {
   await React.act(async () => root.unmount()); root = createRoot(host); reads.length = 0;
   await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: false, readOnly: false } }))); await flush();
   assert(reads.length === 0, "Unproven viewer never requests private provider receipts");
+  await React.act(async () => root.unmount());
+  installation.files = installation.files.filter(path => path !== "workflows/image-manual.md");
+  root = createRoot(host);
+  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  assert(host.textContent?.includes("no supported board workspace") && !button("New post"), "Incomplete v0.5 workflows cannot be mistaken for a supported board contract");
   await React.act(async () => root.unmount());
   console.log("social source mounted flow passed");
 }

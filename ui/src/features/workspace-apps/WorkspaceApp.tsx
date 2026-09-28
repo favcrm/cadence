@@ -53,6 +53,20 @@ type Snapshot = {
   runs: WorkspaceRun[];
   effects: AppEffect[];
 };
+const socialContentWorkflows: Record<string, readonly string[]> = {
+  "0.2.0": ["instagram", "facebook"],
+  "0.3.0": ["instagram", "facebook", "source-instagram"],
+  "0.4.0": ["instagram", "facebook", "source-instagram", "image-instagram"],
+  "0.5.0": ["instagram", "facebook", "source-instagram", "image-instagram", "image-manual"],
+};
+function supportsSocialContentWorkspace(installation: Installation): boolean {
+  const expected = socialContentWorkflows[installation.version];
+  if (installation.name !== "social-content" || !expected) return false;
+  const installed = installation.files
+    .filter(path => path.startsWith("workflows/") && path.endsWith(".md"))
+    .map(path => path.slice("workflows/".length, -".md".length));
+  return installed.length === expected.length && expected.every(name => installed.includes(name));
+}
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -491,7 +505,7 @@ export default function WorkspaceApp({
     },
   ];
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
-  if (data && (data.installation.name !== "social-content" || !["0.2.0", "0.3.0", "0.4.0"].includes(data.installation.version) || workflowOptions.length !== 2)) {
+  if (data && !supportsSocialContentWorkspace(data.installation)) {
     return <main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
