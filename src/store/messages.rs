@@ -452,6 +452,12 @@ impl Store {
             self.supersede_in(&tx, old, id, steer)?;
         }
         self.notify_superseded(&tx, &superseded, id, steer)?;
+        // Only the lane-bound daemon dispatch path carries both tags.
+        // A caller-supplied `source=dispatch` without a proven lane
+        // cannot mint a cloud source fact.
+        if !retry && source == "dispatch" && issue.is_some() && worktree.is_some() {
+            Self::record_cloud_dispatch_tx(&tx, id, None)?;
+        }
         if !retry && steer.is_steering() {
             Self::event_scoped(
                 &tx,

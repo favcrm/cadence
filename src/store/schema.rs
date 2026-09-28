@@ -648,6 +648,49 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=25", [])?;
             tx.commit()?;
         }
+        if version < 26 {
+            // CAD-720: committed dispatch facts are inert until a separate,
+            // durable remote turn claim. No migration backfills old
+            // messages: their cloud audience and restore epoch are unknown.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cloud_dispatch_outbox(
+                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+                    source TEXT NOT NULL CHECK(source IN ('dispatch','job_dispatch')),
+                    task_id TEXT,
+                    task_revision INTEGER,
+                    audience_agent TEXT NOT NULL,
+                    expected_head TEXT,
+                    payload_digest TEXT NOT NULL,
+                    organization_id TEXT,
+                    remote_turn_id TEXT UNIQUE,
+                    created REAL NOT NULL,
+                    claimed REAL,
+                    CHECK ((task_id IS NULL AND task_revision IS NULL)
+                        OR (task_id IS NOT NULL AND task_revision IS NOT NULL)),
+                    CHECK ((organization_id IS NULL AND remote_turn_id IS NULL AND claimed IS NULL)
+                        OR (organization_id IS NOT NULL AND remote_turn_id IS NOT NULL AND claimed IS NOT NULL))
+                );
+                CREATE TRIGGER IF NOT EXISTS cloud_dispatch_source_immutable
+                BEFORE UPDATE ON cloud_dispatch_outbox
+                WHEN NEW.message_id IS NOT OLD.message_id
+                  OR NEW.source IS NOT OLD.source
+                  OR NEW.task_id IS NOT OLD.task_id
+                  OR NEW.task_revision IS NOT OLD.task_revision
+                  OR NEW.audience_agent IS NOT OLD.audience_agent
+                  OR NEW.expected_head IS NOT OLD.expected_head
+                  OR NEW.payload_digest IS NOT OLD.payload_digest
+                  OR NEW.created IS NOT OLD.created
+                  OR (OLD.remote_turn_id IS NOT NULL AND (
+                      NEW.organization_id IS NOT OLD.organization_id
+                      OR NEW.remote_turn_id IS NOT OLD.remote_turn_id
+                      OR NEW.claimed IS NOT OLD.claimed))
+                BEGIN SELECT RAISE(ABORT, 'cloud dispatch source or claim is immutable'); END;
+                UPDATE schema_version SET version=26;",
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

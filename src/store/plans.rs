@@ -721,6 +721,7 @@ impl Store {
             Some(&job.id),
             Some(task_id),
         )?;
+        Self::record_cloud_dispatch_tx(&tx, &kickoff, Some((task_id, revision)))?;
         tx.commit()?;
         let behind_dead = worker.endpoint.is_none()
             && registry::has_actor(&worker.provider, &worker.endpoint_kind);
