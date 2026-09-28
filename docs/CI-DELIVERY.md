@@ -82,11 +82,13 @@ CI must still prove the original implementation passes the test.
 ## PR test selection and review coverage
 
 The required `test` job reads its selection policy from the PR base.
-A missing base policy or any uncertainty runs the full suite. Ordinary
-documentation edits omit Rust execution in this job; fmt, clippy, build
-and UI remain required. Documentation used as test data (including
-AGENTS.md and docs/AUDIT.md), deleted files and referenced files use the
-full fallback. This is a test-job saving, not removal of every Rust build.
+A missing base policy or any uncertainty runs the full suite. Documentation
+edits, even alongside isolated test edits, also run the full Rust scope:
+Rust can read Markdown contents through a directory walk or constructed
+path without a literal filename reference. Benchmark run 36298074797
+measured 9 seconds for docs-selected versus 797 seconds for docs-full in
+this test job; this change gives up that fast path, not a measured whole-PR
+wall-clock saving. Fmt, clippy, build and UI remain required.
 
 An isolated top-level integration test edit runs its Cargo target plus
 all lib/bin tests and the split-map inventory contract. A reference from
