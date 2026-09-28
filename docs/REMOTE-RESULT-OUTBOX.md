@@ -76,14 +76,20 @@ source. For example, with a mode-0600 file outside shell history:
 
 ```sh
 cadence remote result send --outbox-dir /absolute/private/results \
-  --command-id command-1 < /absolute/private/child-bearer.txt
+  --command-id command-1 --org org-1 \
+  --audience https://board.example.invalid \
+  < /absolute/private/child-bearer.txt
 cadence remote result status --outbox-dir /absolute/private/results \
   --command-id command-1
 ```
 
 Stdin is the **only** credential source. A final LF or CRLF is allowed. There
 is no argv, `CADENCE_TOKEN`, `agc_`, config, environment, selected-org or browser
-fallback; missing or invalid input leaves `local_pending` unchanged. Keep the
+fallback; missing or invalid input leaves `local_pending` unchanged. `--org`
+and `--audience` are required independent confirmations from the trusted
+enrollment context. Both must exactly match the retained pin before network
+I/O. They cannot retarget the send; copying them from the outbox alone does not
+authenticate the endpoint. Keep the
 bearer out of shell arguments and result JSON. The sender does not print the
 bearer, command text, HTTP error body or response URL.
 

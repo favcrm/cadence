@@ -796,6 +796,8 @@ fn validate_queued(receipt: &QueuedReceipt, local: &LocalReceipt) -> Result<()> 
 pub fn deliver_with<F>(
     outbox: &ResultOutbox,
     command_id: &str,
+    expected_organization_id: &str,
+    expected_audience: &str,
     child_bearer: &str,
     post: F,
 ) -> Result<QueuedReceipt>
@@ -815,6 +817,11 @@ where
     }
     let pending = outbox.get(command_id)?;
     let pin = pending.receipt().destination();
+    if pin.organization_id() != expected_organization_id || pin.audience() != expected_audience {
+        return Err(Error::rejected(
+            "Hosted result destination differs from explicit enrollment confirmation",
+        ));
+    }
     DestinationPin::new(
         pin.organization_id(),
         pin.audience(),
