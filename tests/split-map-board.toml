@@ -353,6 +353,10 @@ tests = [
     "platform_session_fails_closed_when_jwks_is_unreachable",
     "board_session_open_refuses_an_agent_before_consuming_jti",
     "a_member_session_never_decides",
+    "hosted_public_only_refuses_local_host_before_board_reads",
+    "hosted_public_only_detached_child_probe",
+    "hosted_public_only_cannot_be_persisted_over_a_running_open_board",
+    "hosted_public_only_cannot_change_live_public_identity_without_restart",
 ]
 helpers = [
     "jwks_stub",
