@@ -917,12 +917,16 @@ fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
 #[test]
 fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
     use base64::Engine as _;
+    use image::ImageEncoder as _;
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
 
-    let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&[0], 1, 1, image::ExtendedColorType::L8)
+        .unwrap();
     let cdn = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let cdn_url = format!("http://{}/image.png", cdn.server_addr().to_ip().unwrap());
     let mut corrupt = png.clone();

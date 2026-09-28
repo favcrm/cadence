@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn image_result_and_cdn_boundary_fail_closed() {
-        use base64::Engine as _;
+        use ::image::ImageEncoder as _;
         let good = json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/generated.png"]}});
         assert_eq!(
             image_url(&good, &["images.example.test".into()]).unwrap(),
@@ -884,7 +884,10 @@ mod tests {
         }
         assert!(public_ip("1.1.1.1".parse().unwrap()));
         assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
-        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+        let mut png = Vec::new();
+        ::image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0], 1, 1, ::image::ExtendedColorType::L8)
+            .unwrap();
         assert_eq!(image_mime(&png, "image/png").unwrap(), "image/png");
         assert!(image_mime(b"<svg/>", "image/png").is_err());
         assert!(image_mime(&png[..8], "image/png").is_err());

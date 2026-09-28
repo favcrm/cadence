@@ -397,8 +397,8 @@ mod tests {
 
     #[test]
     fn custody_rejects_redirect_corrupt_mime_and_oversize_before_receipt() {
-        use base64::Engine as _;
-        let tiny_png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+        let tiny_png = encoded_png(1, 1);
+        let expected = tiny_png.clone();
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr().to_ip().unwrap());
         let worker = std::thread::spawn(move || {
@@ -439,7 +439,7 @@ mod tests {
         }
         let retained = download_image(&agent, &format!("{base}/3")).unwrap();
         assert_eq!(retained.media_type, "image/png");
-        assert_eq!(retained.bytes.len(), 68);
+        assert_eq!(retained.bytes, expected);
         worker.join().unwrap();
     }
 }
