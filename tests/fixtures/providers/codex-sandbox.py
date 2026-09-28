@@ -2,6 +2,7 @@
 """Exercise the Codex sandbox preflight without a model or host namespaces."""
 
 import os
+import socket
 import subprocess
 import sys
 
@@ -21,5 +22,12 @@ if mode == "fail":
 if mode == "hang":
     subprocess.run(["sleep", "30"], check=True)
     sys.exit(0)
-assert mode == "ok", mode
+if mode in ("ok", "deny_rpc") and len(command) >= 5 and command[1] == "--state-dir" and command[3:] == ["daemon", "status"]:
+    if mode == "deny_rpc":
+        print("Cadence RPC socket connect: Operation not permitted", file=sys.stderr)
+        sys.exit(1)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(os.path.join(command[2], "cadence.sock"))
+    sys.exit(0)
+assert mode in ("ok", "deny_rpc"), mode
 sys.exit(subprocess.run(command, cwd=cwd).returncode)

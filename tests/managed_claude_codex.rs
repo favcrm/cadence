@@ -77,6 +77,46 @@ fn codex_sandbox_success_preserves_workspace_write_on_app_server() {
 }
 
 #[test]
+fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    sandbox_probe(&d, "deny_rpc");
+    let cwd = d.dir.path().to_str().unwrap();
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias":"rpc-blocked", "provider":"codex", "endpoint_kind":"managed",
+               "cwd":cwd, "sandbox":"workspace-write"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("rpc-blocked", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or("");
+    assert!(error.contains("Cadence RPC socket"), "{agent}");
+    assert!(error.contains("Operation not permitted"), "{agent}");
+    assert!(!mock.pidfile.exists(), "provider started before RPC proof");
+}
+
+#[test]
+fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
+    let daemon_cwd = std::env::current_dir().unwrap();
+    let root = TempDir::new_in("/tmp").unwrap();
+    let mut relative_state = PathBuf::new();
+    for _ in daemon_cwd.components().skip(1) {
+        relative_state.push("..");
+    }
+    relative_state.push(root.path().strip_prefix("/").unwrap());
+    let d = TestDaemon::start_on(relative_state);
+    let _mock = d.mock_codex("ok");
+    let agent_cwd = d.dir.path().to_str().unwrap();
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias":"relative-state", "provider":"codex", "endpoint_kind":"managed",
+               "cwd":agent_cwd, "sandbox":"workspace-write"}),
+    )
+    .unwrap();
+    d.wait_agent("relative-state", "idle", 15);
+}
+
+#[test]
 fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");

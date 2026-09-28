@@ -43,6 +43,7 @@ const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
 const SANDBOX_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 const SANDBOX_PROBE_OUTPUT_LIMIT: usize = 2048;
+const RPC_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
 const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
@@ -314,7 +315,7 @@ fn codex_sandbox_command(env: &ProviderEnv) -> Vec<String> {
     vec!["codex".to_string()]
 }
 
-fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str) -> Result<()> {
+fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str, log_path: &Path) -> Result<()> {
     // Validation also happens before the app-server thread request. A corrupt
     // row must not turn into a broader `codex sandbox` default here.
     registry::codex_sandbox(sandbox)?;
@@ -366,6 +367,58 @@ fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str) -> Result<()> {
             "Codex sandbox readiness failed ({sandbox}, exit {}): {detail}. \
              Check the host's confined sandbox prerequisites before assigning \
              this worker (Ubuntu 24.04: bwrap AppArmor user namespace profile).",
+            output.status
+        )));
+    }
+    // This same sandbox must run the Cadence CLI during a worker turn.
+    // Workspace I/O alone does not prove its Unix-socket RPC is reachable.
+    let state_dir = log_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::provider("Codex readiness cannot locate daemon state directory"))?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
+        Error::provider(format!(
+            "Codex readiness cannot resolve daemon state directory: {error}"
+        ))
+    })?;
+    let cadence = std::env::current_exe().map_err(|error| {
+        Error::provider(format!(
+            "Codex readiness cannot locate Cadence binary: {error}"
+        ))
+    })?;
+    let mut rpc_probe = Command::new(&command[0]);
+    rpc_probe.current_dir(cwd).args(&command[1..]);
+    rpc_probe.args([
+        "sandbox",
+        "-c",
+        &format!("sandbox_mode=\"{sandbox}\""),
+        "--",
+    ]);
+    rpc_probe.arg(cadence).arg("--state-dir").arg(state_dir);
+    rpc_probe.args(["daemon", "status"]);
+    let (output, bounds) = crate::proc::run_bounded_limited(
+        &mut rpc_probe,
+        SANDBOX_PROBE_DEADLINE,
+        RPC_PROBE_OUTPUT_LIMIT,
+    )
+    .map_err(|error| {
+        Error::provider(format!(
+            "Codex sandbox Cadence RPC readiness failed ({sandbox}): {error}. \
+             Check access to this daemon's Unix socket before assigning the worker."
+        ))
+    })?;
+    if !output.status.success() || bounds.stdout_exceeded || bounds.stderr_exceeded {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let parsed = serde_json::from_slice::<Value>(&output.stderr).ok();
+        let detail = parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .or_else(|| stderr.trim().lines().next())
+            .unwrap_or("no error detail");
+        return Err(Error::provider(format!(
+            "Codex sandbox Cadence RPC readiness failed ({sandbox}, exit {}): {detail}. \
+             The worker's command sandbox cannot reach this daemon's Unix socket.",
             output.status
         )));
     }
@@ -827,7 +880,12 @@ impl ProviderAdapter for CodexAdapter {
         // keeps a hand-edited store from reaching `thread/start`, and
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
-        sandbox_probe(&self.sandbox_command, &agent.cwd, &agent.sandbox)?;
+        sandbox_probe(
+            &self.sandbox_command,
+            &agent.cwd,
+            &agent.sandbox,
+            &self.log_path,
+        )?;
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
