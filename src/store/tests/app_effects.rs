@@ -324,7 +324,7 @@ fn cad692_actual_v22_migration_is_atomic_and_preserves_context_and_legacy_receip
             .query_row("SELECT version FROM schema_version", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        23
+        crate::rollout::SCHEMA_VERSION
     );
     assert_eq!(reopened.connection_workspace_id().unwrap(), workspace);
     assert_eq!(

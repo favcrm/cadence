@@ -2666,11 +2666,11 @@ impl Shared {
             "app_run_show" => self.rpc_app_local(method, params, peer_pid),
             "app_run_list" => self.rpc_app_local(method, params, peer_pid),
             "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
-            "app_binding_quote"
-            | "app_run_capability_call"
-            | "app_run_capability_results"
-            | "app_run_capability_result"
-            | "app_run_capability_asset" => self.rpc_app_capability(method, params, peer_pid),
+            "app_binding_quote" => self.rpc_app_capability(method, params, peer_pid),
+            "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),
+            "app_run_capability_results" => self.rpc_app_capability(method, params, peer_pid),
+            "app_run_capability_result" => self.rpc_app_capability(method, params, peer_pid),
+            "app_run_capability_asset" => self.rpc_app_capability(method, params, peer_pid),
             "app_binding_create" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_update" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_revoke" => self.rpc_app_binding(method, params, peer_pid),

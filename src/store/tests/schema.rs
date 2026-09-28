@@ -584,7 +584,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            23,
+            24,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -727,5 +727,47 @@
                     "".into()
                 )
             );
+        }
+    }
+
+    /// The app call reservation and result tables land together with the v24
+    /// checkpoint. A failed checkpoint must leave neither table behind.
+    #[test]
+    fn cad632_migration_v23_to_v24_is_atomic_and_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE app_capability_claims;
+             DROP TABLE app_capability_results;
+             UPDATE schema_version SET version=23;
+             CREATE TRIGGER fail_v24 BEFORE UPDATE ON schema_version
+             BEGIN SELECT RAISE(ABORT,'forced v24 checkpoint failure'); END;",
+        ).unwrap();
+        drop(conn);
+        assert!(Store::open_for_schema_tests(&db).is_err());
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 23);
+        let tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('app_capability_claims','app_capability_results')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(tables, 0, "failed migration left partial capability tables");
+        conn.execute_batch("DROP TRIGGER fail_v24").unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            Store::open_for_schema_tests(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+            let tables: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'
+                 AND name IN ('app_capability_claims','app_capability_results')",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(tables, 2);
         }
     }

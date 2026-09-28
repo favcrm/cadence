@@ -116,7 +116,8 @@ impl CapabilityNeed {
             && self.version == 1
             && self.action == "publish"
             && self.effect == "send";
-        let bounded_read_or_draft = matches!(self.effect.as_str(), "read" | "draft")
+        let bounded_read_or_draft = self.capability != "text.publish"
+            && matches!(self.effect.as_str(), "read" | "draft")
             && self.version == 1
             && self.capability.len() <= 64
             && self.capability.split('.').count() == 2
