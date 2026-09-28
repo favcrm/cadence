@@ -237,5 +237,10 @@ foreign/symlink database/journal unchanged bytes, and concurrent process retry.
 `tests/remote_result_sender.rs` checks the exact pinned body/URL, strict 202
 receipt, altered command and pin conflict, wrong credentials/statuses, receipt
 reopen, v1 migration, concurrent duplicate send and actual CLI stdin/status
-behavior. Its injected transport does not prove live HTTPS issuer/enrollment or
-production gateway activation; those remain CAD-675 end-to-end gates.
+behavior. `src/cli/remote_result.rs` also drives the production HTTP helper
+through a loopback server to inspect its actual Authorization header, content
+type and canonical bytes, matching 202 receipt, redirect handling and response
+bound. This local transport fixture uses HTTP because CI has no publicly trusted
+local TLS name; the production pin validator requires HTTPS and the transport
+disables ambient proxies. Live HTTPS issuer/enrollment and gateway activation
+remain CAD-675 end-to-end gates.

@@ -292,3 +292,135 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
     println!("{output}");
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    const CHILD: &str = "hct_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+    const AUDIENCE: &str = "https://board.example.invalid";
+    const ROUTE: &str = "/__platform/hosted-cadence/org-1/results";
+
+    fn command() -> ResultCommand {
+        ResultCommand::parse_json(&json!({
+            "version":"hosted-cadence-result.v1", "commandId":"command-1", "kind":"agent_result",
+            "assignmentId":"assignment-1", "taskId":"task-1", "taskRevision":1,
+            "turnId":"turn-1", "reportedHeadSha":"a".repeat(40), "text":"private result"
+        }).to_string()).unwrap()
+    }
+
+    fn serve_once(
+        status: &str,
+        response: Vec<u8>,
+        expected_body: String,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}{}", listener.local_addr().unwrap(), ROUTE);
+        let status = status.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim_end(), format!("POST {ROUTE} HTTP/1.1"));
+            let mut authorization = None;
+            let mut content_type = None;
+            let mut content_length = None;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                let value = value.trim();
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => authorization = Some(value.to_owned()),
+                    "content-type" => content_type = Some(value.to_owned()),
+                    "content-length" => content_length = Some(value.parse::<usize>().unwrap()),
+                    _ => (),
+                }
+            }
+            assert_eq!(authorization, Some(format!("Bearer {CHILD}")));
+            assert_eq!(content_type.as_deref(), Some("application/json"));
+            let mut body = vec![0; content_length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(body, expected_body.as_bytes());
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:9/trap\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&response).unwrap();
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn real_http_transport_carries_only_pinned_command_and_accepts_strict_queued_202() {
+        let root = tempfile::tempdir().unwrap();
+        let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
+        let cmd = command();
+        let pin = DestinationPin::new("org-1", AUDIENCE, "subject-1", "agent-1").unwrap();
+        outbox.enqueue(&pin, &cmd).unwrap();
+        let response = json!({"ok":true,"receipt":{"commandId":"command-1","state":"queued",
+            "acceptedAt":100,"expiresAt":200,"digest":cmd.digest()}})
+        .to_string()
+        .into_bytes();
+        let (endpoint, server) = serve_once("202 Accepted", response, cmd.canonical_json().into());
+        let queued = deliver_with(
+            &outbox,
+            "command-1",
+            "org-1",
+            AUDIENCE,
+            CHILD,
+            |url, bearer, body| {
+                assert_eq!(url, format!("{AUDIENCE}{ROUTE}"));
+                post_queued(&endpoint, bearer, body)
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(queued.state(), "remote_queued");
+        assert_eq!(
+            outbox.get("command-1").unwrap().queued_receipt(),
+            Some(&queued)
+        );
+    }
+
+    #[test]
+    fn real_http_transport_preserves_pending_on_redirect_and_oversized_202() {
+        let root = tempfile::tempdir().unwrap();
+        let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
+        let cmd = command();
+        let pin = DestinationPin::new("org-1", AUDIENCE, "subject-1", "agent-1").unwrap();
+        outbox.enqueue(&pin, &cmd).unwrap();
+        let (redirect, redirect_server) =
+            serve_once("302 Found", b"moved".to_vec(), cmd.canonical_json().into());
+        let (status, _) = post_queued(&redirect, CHILD, cmd.canonical_json()).unwrap();
+        redirect_server.join().unwrap();
+        assert_eq!(status, 302);
+        let (endpoint, server) = serve_once(
+            "202 Accepted",
+            vec![b'x'; 4097],
+            cmd.canonical_json().into(),
+        );
+        assert!(deliver_with(
+            &outbox,
+            "command-1",
+            "org-1",
+            AUDIENCE,
+            CHILD,
+            |_, bearer, body| { post_queued(&endpoint, bearer, body) }
+        )
+        .is_err());
+        server.join().unwrap();
+        assert_eq!(outbox.get("command-1").unwrap().state(), "local_pending");
+    }
+}
