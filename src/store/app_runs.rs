@@ -221,13 +221,41 @@ impl Store {
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        let previous: Option<(String, String)> = tx
+            .query_row(
+                "SELECT digest,state FROM app_install_capabilities WHERE install_id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         tx.execute("INSERT INTO app_install_capabilities VALUES(?,1,?,?,?) ON CONFLICT(install_id) DO UPDATE SET epoch=epoch+1,digest=excluded.digest,state=excluded.state,created=excluded.created",params![id,digest,if approve{"approved"}else{"revoked"},now()])?;
         let epoch: i64 = tx.query_row(
             "SELECT epoch FROM app_install_capabilities WHERE install_id=?",
             [id],
             |r| r.get(0),
         )?;
-        Self::app_effect_invalidate_in(&tx, id, None, None)?;
+        if approve {
+            // Reapproving the same bundle supersedes its older epochs. A new
+            // bundle leaves completed old-version work authorized by its
+            // exact historical epoch and retained bundle bytes.
+            tx.execute(
+                "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=? AND digest=?",
+                params![id, digest],
+            )?;
+            if previous.as_ref().is_some_and(|(old, _)| old == digest) {
+                Self::app_effect_invalidate_in(&tx, id, None, None)?;
+            }
+        } else {
+            // An explicit installation revoke removes authority from every
+            // version, including completed historical work.
+            tx.execute(
+                "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=?",
+                [id],
+            )?;
+            Self::app_effect_invalidate_in(&tx, id, None, None)?;
+        }
+        tx.execute("INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
+            params![id,epoch,digest,if approve{"approved"}else{"revoked"},now()])?;
         Self::event(
             &tx,
             Self::DAEMON_STREAM,
@@ -380,7 +408,7 @@ impl Store {
                 ));
             }
             let source_run = Self::app_run_show_in(&tx, &row.0)?;
-            Self::app_current_in(&tx, &source_run, bundle_digest)?;
+            Self::app_completed_current_in(&tx, &source_run)?;
             super::app_capabilities::source_receipt_recoverable_in(
                 &tx,
                 &source_run,
@@ -674,6 +702,29 @@ impl Store {
         self.app_run_show(id)
     }
     pub(super) fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
+        Self::app_authority_in(conn, run, bundle, false)
+    }
+    /// Completed material retains its original approval epoch across package
+    /// upgrades. It is never used for a new/active run or worker dispatch.
+    pub(super) fn app_completed_current_in(conn: &Connection, run: &Value) -> Result<()> {
+        if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
+            || run["approved_digest"] != run["snapshot_digest"]
+        {
+            return Err(Error::rejected(
+                "historical run is not completed and approved",
+            ));
+        }
+        let bundle = run["snapshot"]["bundle_digest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("historical bundle digest is missing"))?;
+        Self::app_authority_in(conn, run, bundle, true)
+    }
+    fn app_authority_in(
+        conn: &Connection,
+        run: &Value,
+        bundle: &str,
+        historical: bool,
+    ) -> Result<()> {
         Self::app_context_current_in(conn, run)?;
         if material_digest(&run["snapshot"]) != run["snapshot_digest"] {
             return Err(Error::rejected(
@@ -805,7 +856,12 @@ impl Store {
                 "legacy snapshot cannot carry capability authority",
             ));
         }
-        let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
+        let table = if historical {
+            "app_capability_epochs"
+        } else {
+            "app_install_capabilities"
+        };
+        let found=conn.query_row(&format!("SELECT 1 FROM {table} WHERE install_id=? AND epoch=? AND digest=? AND state='approved'"),params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
         if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
             return Err(Error::rejected(
                 "app capability epoch or bundle digest is stale",
@@ -1637,6 +1693,16 @@ impl Store {
     /// creation. Terminal history stays in SQLite; no active turn is retired.
     pub fn app_install_upgrade_ready(&self, install: &str) -> Result<()> {
         let conn = self.conn();
+        let unresolved_effects: i64 = conn.query_row(
+            "SELECT count(*) FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.install_id=? AND e.state IN ('waiting','decided','executing')",
+            [install],
+            |row| row.get(0),
+        )?;
+        if unresolved_effects != 0 {
+            return Err(Error::rejected(
+                "installation has an unresolved app effect; decide or reconcile it before upgrade",
+            ));
+        }
         let active: i64 = conn.query_row(
             "SELECT count(*) FROM app_runs WHERE install_id=? AND state IN ('awaiting_approval','approved','running')",
             [install],

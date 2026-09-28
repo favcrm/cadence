@@ -235,7 +235,7 @@ impl Shared {
     ) -> Result<()> {
         let current = self
             .store
-            .app_binding_for_slot(install, context, slot)?
+            .app_binding_for_slot(install, context, slot, required_str(bundle, "digest")?)?
             .ok_or_else(|| Error::rejected("publication binding is absent or revoked"))?;
         if current.id != proof.id
             || current.revision != proof.revision

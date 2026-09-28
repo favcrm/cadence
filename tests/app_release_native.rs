@@ -9,6 +9,164 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+#[test]
+fn cad743_old_reviewed_draft_releases_after_upgrade_and_new_binding() {
+    let h = Release::new();
+    let context = h.context("Client A", A, "cad743-context");
+    let old_binding = h.bind(&context, "cad743-old-publication");
+    let run = h.complete(&context, "cad743-reviewed-run");
+    let proposed_source = h.root.path().join("bundle");
+    let manifest = proposed_source.join("app.md");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        original.replace("version: '0.1.0'", "version: '0.2.0'"),
+    )
+    .unwrap();
+    let check = h
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade_check",
+            json!({
+                "install_id":h.install["install_id"],"source":proposed_source,
+                "expected_digest":h.install["digest"],
+                "expected_generation":h.install["catalog_generation"]
+            }),
+        )
+        .unwrap();
+    let pending = h.stage(&run, "cad743-pending-release");
+    let params = json!({"install_id":h.install["install_id"],"source":proposed_source,
+        "expected_digest":h.install["digest"],"expected_generation":h.install["catalog_generation"],
+        "expected_new_digest":check["digest"],"request_id":"cad743-upgrade"});
+    let refused = h
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params.clone())
+        .unwrap_err();
+    assert!(refused.to_string().contains("effect"), "{refused}");
+    assert!(!h.root.path().join("pm/.apps/upgrade-pending.yaml").exists());
+    h.daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id":pending["effect_id"],
+        "digest":pending["digest"],"decision":"decline"}),
+        )
+        .unwrap();
+    let upgraded = h
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params)
+        .unwrap();
+    assert_eq!(upgraded["approved"], false);
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":h.install["install_id"],"digest":upgraded["digest"]}),
+        )
+        .unwrap();
+    let new_binding = h.daemon.operator_rpc("app_binding_create", json!({
+        "install_id":h.install["install_id"],"context_id":context["id"],
+        "slot":"publication","connection_id":h.connection,"request_id":"cad743-new-publication"
+    })).unwrap()["binding"].clone();
+    assert_ne!(old_binding["id"], new_binding["id"]);
+    let effect = h.stage(&run, "cad743-old-release");
+    let done = h.decide(&effect);
+    assert_eq!(done["state"], "done");
+    assert_eq!(h.items().as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn cad743_old_source_receipt_selects_into_new_bundle_without_another_read() {
+    let (h, calls, _) = Release::with_capability();
+    let context = h.context("Client A", A, "cad743-source-context");
+    let old = h
+        .daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":h.connection,"request_id":"cad743-old-source"
+            }),
+        )
+        .unwrap()["binding"]
+        .clone();
+    let run = h.create(&context, "cad743-source-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let finished = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    let receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(receipt["binding_digest"], old["digest"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let source = h.root.path().join("bundle");
+    let manifest = source.join("app.md");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        original.replace("version: '0.1.0'", "version: '0.2.0'"),
+    )
+    .unwrap();
+    let check = h.daemon.operator_rpc("app_workspace_upgrade_check", json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],"expected_generation":h.install["catalog_generation"]
+    })).unwrap();
+    let upgraded = h.daemon.operator_rpc("app_workspace_upgrade", json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],"expected_generation":h.install["catalog_generation"],
+        "expected_new_digest":check["digest"],"request_id":"cad743-source-upgrade"
+    })).unwrap();
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":h.install["install_id"],
+        "digest":upgraded["digest"]}),
+        )
+        .unwrap();
+    let new_binding = h
+        .daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":h.connection,"request_id":"cad743-new-source"
+            }),
+        )
+        .unwrap()["binding"]
+        .clone();
+    assert_ne!(old["id"], new_binding["id"]);
+    let selected = h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                "inputs":{"subject":"Recovered source","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"cad743-new-caption","owner_pm":OWNER,
+                "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+            }),
+        )
+        .unwrap();
+    assert_eq!(selected["snapshot"]["bundle_digest"], upgraded["digest"]);
+    assert_eq!(
+        selected["snapshot"]["source"]["source_run_id"],
+        finished["id"]
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "retained source was fetched twice"
+    );
+}
 fn native(
     lane: &mut LaneShell,
     state: &Path,

@@ -983,3 +983,64 @@ pub(crate) fn with_runtime_snapshot<T>(
     }
     callback(&description, &files)
 }
+
+/// Read an immutable installed revision for completed work. The current
+/// catalog still proves the installation identity; only exact retained bundle
+/// bytes may supply the old app contract. Active runs always use the current
+/// runtime snapshot above.
+pub(crate) fn with_completed_bundle_snapshot<T>(
+    pm: &Pm,
+    id: &str,
+    digest: &str,
+    callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
+) -> Result<T> {
+    let id = InstallationId::parse(id)?;
+    let revision = digest
+        .strip_prefix("sha256:")
+        .filter(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .ok_or_else(|| Error::rejected("historical bundle digest is invalid"))?;
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    no_pending(&root)?;
+    let current = describe(&root, &catalog, &id)?;
+    let entry = &catalog.installations[&id];
+    if entry.storage != Storage::Workspace {
+        return Err(Error::rejected(
+            "historical bundle needs a workspace installation",
+        ));
+    }
+    let bundle = if current["digest"] == digest {
+        entry.paths(&id).0
+    } else {
+        let base = Path::new(".apps/installations").join(&*id);
+        let original = base.join("bundle");
+        let old_files = snapshot(&root, &original, false)?;
+        if bundle_digest(&old_files) == digest {
+            original
+        } else {
+            base.join("revisions").join(revision).join("bundle")
+        }
+    };
+    let files = snapshot(&root, &bundle, false)?;
+    if bundle_digest(&files) != digest {
+        return Err(Error::rejected(
+            "retained historical bundle differs from its frozen digest",
+        ));
+    }
+    let manifest = app::parse_manifest(
+        files
+            .get("app.md")
+            .ok_or_else(|| Error::rejected("historical bundle manifest is missing"))?,
+    )?;
+    if manifest.app != entry.app {
+        return Err(Error::rejected(
+            "historical bundle changes installation identity",
+        ));
+    }
+    callback(&json!({"digest":digest}), &files)
+}

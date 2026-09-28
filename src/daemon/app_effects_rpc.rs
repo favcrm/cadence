@@ -74,9 +74,10 @@ impl Shared {
                 }
                 let authority = &frozen["effect"]["authority"];
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                let decided = workspace::with_runtime_snapshot(
+                let decided = workspace::with_completed_bundle_snapshot(
                     &pm,
                     required_str(authority, "install_id")?,
+                    required_str(authority, "bundle_digest")?,
                     |bundle, files| {
                         let _custody = self
                             .platform_custody_lock
@@ -125,48 +126,52 @@ impl Shared {
             .simple()
         );
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let slot = required_str(params, "slot")?;
-            let material = self.store.app_publication_material(
-                run_id,
-                required_str(params, "artifact_id")?,
-                required_str(bundle, "digest")?,
-                slot,
-            )?;
-            let proof: BindingProof = serde_json::from_value(material["binding"].clone())
-                .map_err(|_| Error::rejected("frozen publication binding is invalid"))?;
-            self.app_binding_receipt_current(
-                install,
-                run["context_id"].as_str(),
-                slot,
-                &proof,
-                bundle,
-                files,
-            )?;
-            let effect_id = match self.store.effect_by_request(&request)? {
-                Some(row) => row.effect_id,
-                None => format!("effect-{}", uuid::Uuid::new_v4().simple()),
-            };
-            let artifact = &material["artifact"];
-            let mut authority = json!({"schema":1,"install_id":install,"context":run["snapshot"]["context"],
+        workspace::with_completed_bundle_snapshot(
+            &pm,
+            install,
+            required_str(&run["snapshot"], "bundle_digest")?,
+            |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let slot = required_str(params, "slot")?;
+                let material = self.store.app_publication_material(
+                    run_id,
+                    required_str(params, "artifact_id")?,
+                    required_str(bundle, "digest")?,
+                    slot,
+                )?;
+                let proof: BindingProof = serde_json::from_value(material["binding"].clone())
+                    .map_err(|_| Error::rejected("frozen publication binding is invalid"))?;
+                self.app_binding_receipt_current(
+                    install,
+                    run["context_id"].as_str(),
+                    slot,
+                    &proof,
+                    bundle,
+                    files,
+                )?;
+                let effect_id = match self.store.effect_by_request(&request)? {
+                    Some(row) => row.effect_id,
+                    None => format!("effect-{}", uuid::Uuid::new_v4().simple()),
+                };
+                let artifact = &material["artifact"];
+                let mut authority = json!({"schema":1,"install_id":install,"context":run["snapshot"]["context"],
                 "run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],"epoch":run["epoch"],
                 "bundle_digest":bundle["digest"],"artifact_id":artifact["id"],"artifact_digest":artifact["digest"],
                 "slot":slot,"binding":proof,"material_digest":app_runs::material_digest(&material),
                 "producer_receipt_digest":app_runs::material_digest(&material["producer_receipt"]),
                 "review_receipt_digest":app_runs::material_digest(&material["review_receipt"])});
-            if let Some(asset) = material.get("asset") {
-                authority["asset"] = asset.clone();
-            }
-            let core_digest = app_effects::authority_digest(&authority);
-            let mut provenance = json!({"schema":1,"authorization_kind":"app_artifact","effect_id":effect_id,"authority_digest":core_digest,
+                if let Some(asset) = material.get("asset") {
+                    authority["asset"] = asset.clone();
+                }
+                let core_digest = app_effects::authority_digest(&authority);
+                let mut provenance = json!({"schema":1,"authorization_kind":"app_artifact","effect_id":effect_id,"authority_digest":core_digest,
                 "install_id":install,"context_id":run["context_id"],"context_revision":run["snapshot"]["context"]["revision"],
                 "context_digest":run["snapshot"]["context"]["digest"],"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                 "artifact_id":artifact["id"],"artifact_digest":artifact["digest"],"binding_id":proof.id,
@@ -175,64 +180,65 @@ impl Shared {
                 "connection_revision":proof.config["connection_revision"],"registration_digest":proof.config["registration_digest"],
                 "sink_registration":proof.config["sink_registration"],"mapping":proof.config["mapping"],
                 "review_receipt_digest":authority["review_receipt_digest"]});
-            if let Some(asset) = material.get("asset") {
-                provenance["asset"] = asset.clone();
-            }
-            authority["provenance"] = provenance;
-            let provider = required_str(&proof.config, "provider")?;
-            let account = required_str(&proof.config, "account")?;
-            let tool = required_str(&proof.config["mapping"], "tool")?;
-            let adapter = self
-                .platforms
-                .get(provider)
-                .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
-            let input = adapter
-                .prepare_app_artifact(
-                    required_str(params, "title")?,
-                    required_str(artifact, "text")?,
-                    &authority["provenance"],
-                    material.get("asset"),
-                )
-                .map_err(Error::rejected)?;
-            let preview = adapter.preview(account, tool, &input);
-            if serde_json::to_vec(&input)?.len() > 64 * 1024 || preview.len() > 16 * 1024 {
-                return Err(Error::rejected(
-                    "publication input or complete preview exceeds its byte bound",
-                ));
-            }
-            let bytes = crate::platform::load_credential(
-                &self.store,
-                &self.platform_custody,
-                provider,
-                account,
-            )?;
-            crate::platform::refuse_leak("app release input", &input.to_string(), &bytes)?;
-            crate::platform::refuse_leak("app release preview", &preview, &bytes)?;
-            let row = EffectRow {
-                effect_id,
-                request,
-                agent: required_str(&run["snapshot"], "owner_pm")?.into(),
-                platform: provider.into(),
-                account: account.into(),
-                tool: tool.into(),
-                label: None,
-                input,
-                input_summary: required_str(params, "title")?.into(),
-                preview,
-                source_name: None,
-                source_hash: Some(required_str(artifact, "digest")?.into()),
-                scopes: serde_json::from_value(proof.config["mapping"]["scopes"].clone())?,
-                task: None,
-                state: "waiting".into(),
-                close_reason: None,
-                decision: None,
-                outcome: None,
-                needs_you: false,
-                staged_at: 0.0,
-                updated_at: 0.0,
-            };
-            self.store.app_effect_stage(&row, &authority)
-        })
+                if let Some(asset) = material.get("asset") {
+                    provenance["asset"] = asset.clone();
+                }
+                authority["provenance"] = provenance;
+                let provider = required_str(&proof.config, "provider")?;
+                let account = required_str(&proof.config, "account")?;
+                let tool = required_str(&proof.config["mapping"], "tool")?;
+                let adapter = self
+                    .platforms
+                    .get(provider)
+                    .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
+                let input = adapter
+                    .prepare_app_artifact(
+                        required_str(params, "title")?,
+                        required_str(artifact, "text")?,
+                        &authority["provenance"],
+                        material.get("asset"),
+                    )
+                    .map_err(Error::rejected)?;
+                let preview = adapter.preview(account, tool, &input);
+                if serde_json::to_vec(&input)?.len() > 64 * 1024 || preview.len() > 16 * 1024 {
+                    return Err(Error::rejected(
+                        "publication input or complete preview exceeds its byte bound",
+                    ));
+                }
+                let bytes = crate::platform::load_credential(
+                    &self.store,
+                    &self.platform_custody,
+                    provider,
+                    account,
+                )?;
+                crate::platform::refuse_leak("app release input", &input.to_string(), &bytes)?;
+                crate::platform::refuse_leak("app release preview", &preview, &bytes)?;
+                let row = EffectRow {
+                    effect_id,
+                    request,
+                    agent: required_str(&run["snapshot"], "owner_pm")?.into(),
+                    platform: provider.into(),
+                    account: account.into(),
+                    tool: tool.into(),
+                    label: None,
+                    input,
+                    input_summary: required_str(params, "title")?.into(),
+                    preview,
+                    source_name: None,
+                    source_hash: Some(required_str(artifact, "digest")?.into()),
+                    scopes: serde_json::from_value(proof.config["mapping"]["scopes"].clone())?,
+                    task: None,
+                    state: "waiting".into(),
+                    close_reason: None,
+                    decision: None,
+                    outcome: None,
+                    needs_you: false,
+                    staged_at: 0.0,
+                    updated_at: 0.0,
+                };
+                self.store.app_effect_stage(&row, &authority)
+            },
+        )
     }
 
     fn app_release_current(
@@ -271,9 +277,10 @@ impl Shared {
         let frozen = self.store.app_effect_show(id)?;
         let authority = &frozen["effect"]["authority"];
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(
+        workspace::with_completed_bundle_snapshot(
             &pm,
             required_str(authority, "install_id")?,
+            required_str(authority, "bundle_digest")?,
             |bundle, files| {
                 let _custody = self
                     .platform_custody_lock

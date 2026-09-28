@@ -200,7 +200,7 @@ impl Store {
                 "installation has reached its binding limit",
             ));
         }
-        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND state='configured')",params![install,scope_key(context),slot],|r| r.get(0))?;
+        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND coalesce(json_extract(config,'$.bundle_digest'),'')=coalesce(?,'') AND state='configured')",params![install,scope_key(context),slot,config["bundle_digest"].as_str()],|r| r.get(0))?;
         if occupied {
             return Err(Error::rejected(
                 "this scope already has a configured binding for this slot",
@@ -255,6 +255,11 @@ impl Store {
         }
         let context = row["context_id"].as_str();
         validate_config(install, context, config)?;
+        if row["config"]["bundle_digest"] != config["bundle_digest"] {
+            return Err(Error::rejected(
+                "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
+            ));
+        }
         let slot = row["slot"]
             .as_str()
             .ok_or_else(|| Error::internal("invalid binding slot"))?;
@@ -309,9 +314,10 @@ impl Store {
         install: &str,
         context: Option<&str>,
         slot: &str,
+        bundle_digest: &str,
     ) -> Result<Option<BindingProof>> {
         let conn = self.conn();
-        let id = conn.query_row("SELECT id FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND state='configured'",params![install,scope_key(context),slot],|r| r.get::<_,String>(0)).optional()?;
+        let id = conn.query_row("SELECT id FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=? AND json_extract(config,'$.bundle_digest')=? AND state='configured'",params![install,scope_key(context),slot,bundle_digest],|r| r.get::<_,String>(0)).optional()?;
         id.map(|id| {
             let row = binding_in(&conn, install, &id)?;
             Ok(BindingProof {

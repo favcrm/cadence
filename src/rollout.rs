@@ -40,7 +40,7 @@ use crate::store::{self, Store};
 /// draft tables (CAD-506); v19 adds `app_grants.install_id`, the
 /// install an app-derived grant belongs to (CAD-577).
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

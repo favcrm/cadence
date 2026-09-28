@@ -309,6 +309,7 @@ impl Shared {
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
+                                required_str(row, "digest")?,
                             )?;
                             if let Some(proof) = &binding {
                                 self.app_binding_receipt_current(
@@ -345,6 +346,7 @@ impl Shared {
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
+                                required_str(row, "digest")?,
                             )?
                             .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
                         self.app_binding_receipt_current(

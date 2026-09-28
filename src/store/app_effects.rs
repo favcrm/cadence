@@ -205,7 +205,12 @@ impl Store {
         slot: &str,
     ) -> Result<Value> {
         let run = Self::app_run_show_in(conn, id)?;
-        Self::app_current_in(conn, &run, bundle)?;
+        if run["snapshot"]["bundle_digest"] != bundle {
+            return Err(Error::rejected(
+                "publication bundle differs from the frozen run",
+            ));
+        }
+        Self::app_completed_current_in(conn, &run)?;
         if run["state"] != "succeeded"
             || run["approved_digest"] != run["snapshot_digest"]
             || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]
