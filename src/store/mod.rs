@@ -65,6 +65,7 @@ pub mod app_bindings;
 pub mod app_capabilities;
 pub mod app_contexts;
 pub mod app_effects;
+pub mod app_records;
 pub mod app_runs;
 mod plans;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};

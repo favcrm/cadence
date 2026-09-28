@@ -23,6 +23,11 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// Host-managed per-installation customer records with scoped revisions.
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -212,6 +217,48 @@ pub(crate) enum ContextAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum RecordAction {
+    /// Create a customer record in an exact installation context.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        record_id: String,
+        /// JSON file holding the customer profile object.
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// List customer records in an exact installation context.
+    Ls {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+    },
+    /// Inspect one exact customer record.
+    Show {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        record_id: String,
+    },
+    /// Replace the profile at the exact observed revision.
+    Set {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        record_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        /// JSON file holding the customer profile object.
+        #[arg(long)]
+        profile: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum BindingAction {
     /// Bind one declared capability slot to an exact connection ID.
     Create {
@@ -311,6 +358,71 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
+fn read_record_profile(path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_PROFILE_BYTES: usize = 16 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_record_profile", format!("cannot open profile: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_record_profile", format!("cannot read profile: {e}")))?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return Err(Error::invalid(
+            "app_record_profile",
+            "profile JSON exceeds 16KiB",
+        ));
+    }
+    let profile: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_record_profile", "profile must be a JSON object"))?;
+    if !profile.is_object() {
+        return Err(Error::invalid(
+            "app_record_profile",
+            "profile must be a JSON object",
+        ));
+    }
+    Ok(profile)
+}
+
+fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        RecordAction::Create {
+            install_id,
+            context_id,
+            record_id,
+            profile,
+        } => (
+            "app_record_create",
+            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "profile": read_record_profile(profile)?}),
+        ),
+        RecordAction::Ls {
+            install_id,
+            context_id,
+        } => (
+            "app_record_list",
+            json!({"install_id": install_id, "context_id": context_id}),
+        ),
+        RecordAction::Show {
+            install_id,
+            context_id,
+            record_id,
+        } => (
+            "app_record_show",
+            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id}),
+        ),
+        RecordAction::Set {
+            install_id,
+            context_id,
+            record_id,
+            expected_revision,
+            profile,
+        } => (
+            "app_record_update",
+            json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?}),
+        ),
+    })
+}
+
 fn release_scope(install: Option<&str>, context: Option<&str>) -> serde_json::Value {
     let mut params = json!({});
     if let Some(id) = install {
@@ -773,6 +885,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Run { action } => {
             let (method, params) = run_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Record { action } => {
+            let (method, params) = record_params(action)?;
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {

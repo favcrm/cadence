@@ -732,6 +732,18 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 28 {
+            // v28: host-managed per-installation app records (CAD-753) —
+            // context-scoped rows with CAS revisions and attributed
+            // history. Additive tables only, `IF NOT EXISTS`, one
+            // transaction: a half-applied v28 converges on reopen, and
+            // every pre-existing installation, context, run and grant
+            // row is untouched.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::app_records::SCHEMA)?;
+            tx.execute("UPDATE schema_version SET version=28", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,
