@@ -1076,6 +1076,113 @@ mod tests {
         (socket, serde_json::from_slice(&body).unwrap())
     }
 
+    fn continuity_request(listener: &TcpListener, path: &str) -> (std::net::TcpStream, Value) {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), format!("POST {path} HTTP/1.1"));
+        let mut length = 0;
+        let mut bearer = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let (key, value) = line.split_once(':').unwrap();
+            if key.eq_ignore_ascii_case("authorization") {
+                bearer = value.trim().into();
+            }
+            assert!(!key.eq_ignore_ascii_case("cookie"));
+            if key.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        assert_eq!(bearer, format!("Bearer {CHILD}"));
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        (socket, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[test]
+    fn browser_continuity_bind_proves_key_and_retains_exact_private_lineage() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let at = now().unwrap();
+        let server = thread::spawn(move || {
+            let (mut challenge, request) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+            assert_eq!(request, json!({"version":"hosted-cadence-continuity.v1"}));
+            respond(
+                &mut challenge,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1",
+                    "challengeId":format!("ch_{}", "A".repeat(43)),
+                    "operationId":format!("op_{}", "B".repeat(43)),
+                    "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                    "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                }),
+            );
+            let (mut bind, request) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+            assert_eq!(request["version"], "hosted-cadence-continuity.v1");
+            assert_eq!(request["challengeId"], format!("ch_{}", "A".repeat(43)));
+            let public = request["publicKey"].as_str().unwrap();
+            let signature = request["signature"].as_str().unwrap();
+            let proof = format!(
+                "{{\"version\":\"hosted-cadence-continuity.v1\",\"action\":\"bind_key\",\"challengeId\":\"ch_{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{}\"}}",
+                "A".repeat(43), "C".repeat(43), "D".repeat(43), public
+            );
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ED25519,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(public)
+                    .unwrap(),
+            )
+            .verify(
+                proof.as_bytes(),
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(signature)
+                    .unwrap(),
+            )
+            .unwrap();
+            respond(
+                &mut bind,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1", "delivery":"bound",
+                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "generation":1, "organizationId":"ws_real",
+                    "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                    "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
+                }),
+            );
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        trust(&dir, &issuer);
+        let mut child = record(at + 120);
+        child.issuer = issuer;
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        save(&dir, &child).unwrap();
+        let bound = bind_browser(&dir).unwrap();
+        server.join().unwrap();
+        assert_eq!(bound.lineage_id(), "lineage_agent");
+        assert_eq!(bound.agent_id(), child.agent_id);
+        assert_eq!(bound.generation(), 1);
+        assert_eq!(bound_browser(&dir).unwrap().lineage_id(), "lineage_agent");
+        let file = dir.join("continuity.json");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!fs::read_to_string(file).unwrap().contains(CHILD));
+    }
+
     #[test]
     fn browser_device_grant_rejects_forged_binding_and_scopes() {
         let at = now().unwrap();
