@@ -4058,11 +4058,53 @@ pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Res
 
 fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> Result<i32> {
     std::fs::create_dir_all(state_dir)?;
-    if reset {
-        let _ = std::fs::remove_file(opts_file(state_dir));
-    }
-    let persisted = load_opts(state_dir);
+    // Resolve a reset against defaults without deleting ui.json first.
+    // A refused security-mode transition must leave the running board's
+    // saved options intact, including its public identity.
+    let recorded = load_opts(state_dir);
+    let persisted = if reset {
+        UiOpts::default()
+    } else {
+        recorded.clone()
+    };
     let (eff, so) = resolve_opts(flags, &persisted)?;
+    let running = read_pid(state_dir);
+    if running.is_some() {
+        if eff.board_public_only != recorded.board_public_only {
+            return Err(Error::rejected(
+                "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
+            ));
+        }
+        if eff.board_public_only {
+            if eff.board != recorded.board || eff.host != recorded.host || eff.port != recorded.port
+            {
+                return Err(Error::rejected(
+                    "running public-only board identity or bind cannot change — stop the UI, then start it with the new configuration",
+                ));
+            }
+            // A saved true flag is not proof the *running* process loaded
+            // it (an older build could have saved options before noticing
+            // an existing UI). The exact local query is 421 only under
+            // the active hosted gate; ordinary health answers 200.
+            let active = match http_get(
+                &so.host,
+                so.port,
+                "/api/health?public-only-probe=1",
+                &format!("{}:{}", so.host, so.port),
+                &[],
+            ) {
+                Ok((421, body)) => serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .is_some_and(|v| v["error"] == "hosted board requires its public Host"),
+                _ => false,
+            };
+            if !active {
+                return Err(Error::rejected(
+                    "running UI has not proved the board public-only gate — stop the UI and start it again",
+                ));
+            }
+        }
+    }
     // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
     // board shared — best effort when tailscaled itself is unreachable.
     if flags.tailscale.is_none() {
@@ -4078,7 +4120,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     }
     save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
-    if let Some(pid) = read_pid(state_dir) {
+    if let Some(pid) = running {
         let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             .unwrap_or((0, String::new()));
         if !quiet {

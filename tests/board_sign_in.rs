@@ -250,6 +250,152 @@ fn hosted_public_only_detached_child_probe() {
     assert_eq!(status, 421, "detached agent read: {body}");
 }
 
+#[test]
+fn hosted_public_only_cannot_be_persisted_over_a_running_open_board() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, host, _board) =
+        start_public_board(pm.path(), state.path(), "http://api.internal".to_string());
+    let local = format!("127.0.0.1:{port}");
+    assert_eq!(http(port, "GET", "/api/issues", &local).0, 200);
+
+    let saved = ui::UiOpts {
+        port: Some(port),
+        board: Some(ui::PublicBoard {
+            host: host.clone(),
+            issuer: "http://api.internal".to_string(),
+            company: "co_1".to_string(),
+            authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+        }),
+        ..Default::default()
+    };
+    let opts_path = state.path().join("ui.json");
+    let before = serde_json::to_vec_pretty(&saved).unwrap();
+    std::fs::write(&opts_path, &before).unwrap();
+    // `read_pid` sees a live process, while the in-process board above
+    // supplies the real open HTTP peer. Never call `ui stop` on this fake
+    // pidfile: that would signal the test runner itself.
+    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+    let flags = ui::UiFlags {
+        board_public_only: true,
+        ..Default::default()
+    };
+    let result = ui::run_cli(
+        state.path(),
+        &ui::UiAction::Start {
+            flags,
+            reset: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "running board falsely reported public-only activation"
+    );
+    assert_eq!(std::fs::read(&opts_path).unwrap(), before);
+    assert_eq!(http(port, "GET", "/api/issues", &local).0, 200);
+
+    let reset_flags = ui::UiFlags {
+        board_public_only: true,
+        board_host: Some(host),
+        board_issuer: Some("http://api.internal".to_string()),
+        board_company: Some("co_1".to_string()),
+        ..Default::default()
+    };
+    let result = ui::run_cli(
+        state.path(),
+        &ui::UiAction::Start {
+            flags: reset_flags,
+            reset: true,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "--reset falsely reported public-only activation"
+    );
+    assert_eq!(std::fs::read(&opts_path).unwrap(), before);
+
+    // A prior buggy start could have written `true` while the old process
+    // remained open. Persisted state alone may never certify that process.
+    let stale = ui::UiOpts {
+        board_public_only: true,
+        ..saved
+    };
+    let stale_bytes = serde_json::to_vec_pretty(&stale).unwrap();
+    std::fs::write(&opts_path, &stale_bytes).unwrap();
+    let result = ui::run_cli(
+        state.path(),
+        &ui::UiAction::Start {
+            flags: ui::UiFlags::default(),
+            reset: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "stale true flag falsely certified an open board"
+    );
+    assert_eq!(std::fs::read(&opts_path).unwrap(), stale_bytes);
+    assert_eq!(http(port, "GET", "/api/issues", &local).0, 200);
+}
+
+#[test]
+fn hosted_public_only_cannot_change_live_public_identity_without_restart() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        |opts| {
+            let host = format!("acme.board.localhost:{}", opts.port);
+            opts.allow_hosts.push(host.clone());
+            opts.public = Some(ui::PublicBoard {
+                host,
+                issuer: "http://api.internal".to_string(),
+                company: "co_1".to_string(),
+                authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+            });
+            opts.board_public_only = true;
+        },
+    );
+    let saved = ui::UiOpts {
+        port: Some(port),
+        board_public_only: true,
+        board: Some(ui::PublicBoard {
+            host: format!("acme.board.localhost:{port}"),
+            issuer: "http://api.internal".to_string(),
+            company: "co_1".to_string(),
+            authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+        }),
+        ..Default::default()
+    };
+    let opts_path = state.path().join("ui.json");
+    let before = serde_json::to_vec_pretty(&saved).unwrap();
+    std::fs::write(&opts_path, &before).unwrap();
+    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+    let result = ui::run_cli(
+        state.path(),
+        &ui::UiAction::Start {
+            flags: ui::UiFlags {
+                board_host: Some(format!("other.board.localhost:{port}")),
+                ..Default::default()
+            },
+            reset: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "running board falsely claimed a new public identity"
+    );
+    assert_eq!(std::fs::read(&opts_path).unwrap(), before);
+    assert_eq!(
+        http(port, "GET", "/api/issues", &format!("127.0.0.1:{port}")).0,
+        421
+    );
+}
+
 /// The real headers a contract exchange carries (the worker's callback
 /// page fetches same-origin; a form post cannot set Content-Type: json).
 fn session_post(port: u16, host: &str, body: &[u8]) -> (u16, String, String) {
