@@ -1,17 +1,9 @@
-use super::super::app_contexts::ContextConfig;
-use super::super::app_records::CustomerProfile;
+use super::super::app_records::{record_db_path, CustomerProfile, RecordStore};
 use super::*;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-fn record_store() -> (TempDir, Store) {
-    let dir = TempDir::new().unwrap();
-    let store = Store::open(&dir.path().join("t.sqlite3")).unwrap();
-    (dir, store)
-}
-
-fn seeded_context(store: &Store, install: &str, request: &str) -> String {
-    let config = ContextConfig::new("Client", std::collections::BTreeMap::new()).unwrap();
-    let row = store.app_context_create(install, &config, request).unwrap();
-    row["context"]["id"].as_str().unwrap().to_string()
+fn record_file(dir: &TempDir, install: &str) -> RecordStore {
+    RecordStore::open(dir.path(), install).unwrap()
 }
 
 fn customer(name: &str, email: &str) -> CustomerProfile {
@@ -19,96 +11,95 @@ fn customer(name: &str, email: &str) -> CustomerProfile {
 }
 
 #[test]
-fn cad753_record_cas_digest_and_history_at_store_level() {
-    let (_dir, store) = record_store();
-    let context = seeded_context(&store, "install-1", "ctx-1");
-    let created = store
-        .app_record_create(
-            "install-1",
-            &context,
-            "customer-1",
-            &customer("Amina", "amina@example.com"),
-        )
-        .unwrap();
-    assert_eq!(created["record"]["revision"], 1);
-    let digest = created["record"]["digest"].as_str().unwrap().to_string();
-    assert!(digest.starts_with("sha256:"));
-    assert_eq!(created["record"]["history"].as_array().unwrap().len(), 1);
+fn cad753_record_files_are_physical_per_installation() {
+    let dir = TempDir::new().unwrap();
+    let a = record_file(&dir, "install-a");
+    let b = record_file(&dir, "install-b");
+    let path_a = record_db_path(dir.path(), "install-a").unwrap();
+    let path_b = record_db_path(dir.path(), "install-b").unwrap();
+    assert_ne!(path_a, path_b);
+    assert!(path_a.is_file() && path_b.is_file());
+    // Two installations are two inodes, not two views of one file.
+    assert_ne!(
+        std::fs::metadata(&path_a).unwrap().ino(),
+        std::fs::metadata(&path_b).unwrap().ino()
+    );
 
-    // The same record ID under another installation or context is a
-    // different row, not a collision.
-    let other_context = seeded_context(&store, "install-2", "ctx-2");
-    store
-        .app_record_create(
-            "install-2",
-            &other_context,
-            "customer-1",
-            &customer("Boris", "boris@example.com"),
-        )
-        .unwrap();
+    a.app_record_create(
+        "ctx-1",
+        "customer-1",
+        &customer("Amina", "amina@example.com"),
+    )
+    .unwrap();
+    b.app_record_create(
+        "ctx-1",
+        "customer-1",
+        &customer("Boris", "boris@example.com"),
+    )
+    .unwrap();
     assert_eq!(
-        store
-            .app_record_show("install-2", &other_context, "customer-1")
-            .unwrap()["record"]["profile"]["display_name"],
+        a.app_record_show("ctx-1", "customer-1").unwrap()["record"]["profile"]["display_name"],
+        "Amina"
+    );
+    assert_eq!(
+        b.app_record_show("ctx-1", "customer-1").unwrap()["record"]["profile"]["display_name"],
         "Boris"
     );
+    // Context scoping lives inside each file: the same record ID in
+    // another context of the same file is absent.
     assert!(
-        store
-            .app_record_show("install-2", &other_context, "customer-9")
-            .is_err()
-            && store
-                .app_record_show("install-1", &other_context, "customer-1")
-                .is_err()
-            && store
-                .app_record_show("install-2", &context, "customer-1")
-                .is_err(),
-        "cross-install or cross-context read reached a record"
+        a.app_record_show("ctx-2", "customer-1").is_err()
+            && a.app_record_list("ctx-2").unwrap()["records"]
+                .as_array()
+                .unwrap()
+                .is_empty()
     );
 
-    // Stale CAS refuses and leaves revision, digest and history alone.
-    assert!(store
+    // CAS, digest and attributed history, as before.
+    let created = a.app_record_show("ctx-1", "customer-1").unwrap();
+    assert!(a
         .app_record_update(
-            "install-1",
-            &context,
+            "ctx-1",
             "customer-1",
             9,
             &customer("Stale", "stale@example.com")
         )
         .is_err());
-    let kept = store
-        .app_record_show("install-1", &context, "customer-1")
-        .unwrap();
-    assert_eq!(kept["record"], created["record"]);
-
-    let updated = store
+    assert_eq!(
+        a.app_record_show("ctx-1", "customer-1").unwrap()["record"],
+        created["record"]
+    );
+    let updated = a
         .app_record_update(
-            "install-1",
-            &context,
+            "ctx-1",
             "customer-1",
             1,
             &customer("Amina B", "amina@example.com"),
         )
         .unwrap();
     assert_eq!(updated["record"]["revision"], 2);
-    assert_ne!(updated["record"]["digest"].as_str().unwrap(), digest);
+    assert_ne!(updated["record"]["digest"], created["record"]["digest"]);
     assert_eq!(updated["record"]["history"].as_array().unwrap().len(), 2);
     assert_eq!(updated["record"]["history"][1]["actor"], "operator");
-
+    // The sibling file is untouched by the CAS above.
+    assert_eq!(
+        b.app_record_show("ctx-1", "customer-1").unwrap()["record"]["revision"],
+        1
+    );
     // Duplicate create with the same body is idempotent; a different
     // body under the same ID is refused, never merged.
-    let repeat = store
-        .app_record_create(
-            "install-1",
-            &context,
+    assert_eq!(
+        a.app_record_create(
+            "ctx-1",
             "customer-1",
-            &customer("Amina B", "amina@example.com"),
+            &customer("Amina B", "amina@example.com")
         )
-        .unwrap();
-    assert_eq!(repeat["record"]["revision"], 2);
-    assert!(store
+        .unwrap()["record"]["revision"],
+        2
+    );
+    assert!(a
         .app_record_create(
-            "install-1",
-            &context,
+            "ctx-1",
             "customer-1",
             &customer("Other", "other@example.com")
         )
@@ -116,9 +107,136 @@ fn cad753_record_cas_digest_and_history_at_store_level() {
 }
 
 #[test]
+fn cad753_record_file_reopens_with_its_contents() {
+    let dir = TempDir::new().unwrap();
+    let created = record_file(&dir, "install-a")
+        .app_record_create(
+            "ctx-1",
+            "customer-1",
+            &customer("Amina", "amina@example.com"),
+        )
+        .unwrap();
+    drop(created);
+    // No daemon handle is held between these opens: persistence is the
+    // file itself.
+    let reopened = RecordStore::open(dir.path(), "install-a").unwrap();
+    assert_eq!(
+        reopened.app_record_show("ctx-1", "customer-1").unwrap()["record"]["revision"],
+        1
+    );
+    reopened
+        .app_record_update(
+            "ctx-1",
+            "customer-1",
+            1,
+            &customer("Amina B", "amina@example.com"),
+        )
+        .unwrap();
+    drop(reopened);
+    assert_eq!(
+        RecordStore::open(dir.path(), "install-a")
+            .unwrap()
+            .app_record_show("ctx-1", "customer-1")
+            .unwrap()["record"]["revision"],
+        2
+    );
+}
+
+#[test]
+fn cad753_record_file_identity_and_corruption_refuse_without_deletion() {
+    let dir = TempDir::new().unwrap();
+    record_file(&dir, "install-a")
+        .app_record_create(
+            "ctx-1",
+            "customer-1",
+            &customer("Amina", "amina@example.com"),
+        )
+        .unwrap();
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    // A file planted at another installation's path — the same bytes
+    // claimed by another name — is refused by its identity row, and
+    // the planted bytes are preserved.
+    let planted = record_db_path(dir.path(), "install-b").unwrap();
+    std::fs::copy(&path, &planted).unwrap();
+    let Err(error) = RecordStore::open(dir.path(), "install-b") else {
+        panic!("planted identity accepted");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("identity"),
+        "identity mismatch unclear: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&planted).unwrap(),
+        std::fs::read(&path).unwrap()
+    );
+    // Corrupt bytes refuse and are preserved, never healed in place.
+    let victim = record_db_path(dir.path(), "install-victim").unwrap();
+    RecordStore::open(dir.path(), "install-victim").unwrap();
+    std::fs::write(&victim, b"not a database at all").unwrap();
+    let Err(error) = RecordStore::open(dir.path(), "install-victim") else {
+        panic!("corrupt file accepted");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("corrupt") || error.contains("backup"),
+        "corruption refusal unclear: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"not a database at all",
+        "corrupt file was modified"
+    );
+    // The intact installation still opens with its contents.
+    assert_eq!(
+        RecordStore::open(dir.path(), "install-a")
+            .unwrap()
+            .app_record_show("ctx-1", "customer-1")
+            .unwrap()["record"]["profile"]["display_name"],
+        "Amina"
+    );
+}
+
+#[test]
+fn cad753_record_paths_are_safe_and_private() {
+    let dir = TempDir::new().unwrap();
+    for bad in [
+        "",
+        "../escape",
+        "/absolute",
+        "has space",
+        "UPPER",
+        "ctx/x",
+        "..",
+        ".",
+    ] {
+        assert!(
+            record_db_path(dir.path(), bad).is_err(),
+            "unsafe installation ID accepted: {bad}"
+        );
+    }
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    assert_eq!(
+        path,
+        dir.path().join("app-records").join("install-a.sqlite3")
+    );
+    RecordStore::open(dir.path(), "install-a").unwrap();
+    assert_eq!(
+        std::fs::metadata(dir.path().join("app-records"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn cad753_record_profile_validation_never_echoes_content() {
-    let (_dir, store) = record_store();
-    let context = seeded_context(&store, "install-1", "ctx-1");
     let marker = "cad753-store-private-marker";
     for body in [
         json!({"schema": 1, "display_name": "", "consent": {"email": "granted"}}),
@@ -136,97 +254,4 @@ fn cad753_record_profile_validation_never_echoes_content() {
             "profile content leaked in refusal"
         );
     }
-    // Records require a live context in the same installation.
-    assert!(store
-        .app_record_create(
-            "install-1",
-            "ctx-no-such",
-            "customer-1",
-            &customer("A", "a@example.com")
-        )
-        .is_err());
-    assert!(store
-        .app_record_create(
-            "install-9",
-            &context,
-            "customer-1",
-            &customer("A", "a@example.com")
-        )
-        .is_err());
-}
-
-#[test]
-fn cad753_record_migration_is_atomic_and_preserves_existing_state() {
-    let (dir, store) = record_store();
-    let context = seeded_context(&store, "install-1", "ctx-1");
-    let created = store
-        .app_record_create(
-            "install-1",
-            &context,
-            "customer-1",
-            &customer("Amina", "amina@example.com"),
-        )
-        .unwrap();
-    let before_contexts = store.app_context_list("install-1").unwrap();
-    let db = dir.path().join("t.sqlite3");
-    drop(store);
-    let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
-        "DROP TABLE app_record_revisions; DROP TABLE app_records;
-         UPDATE schema_version SET version=27;
-         CREATE TRIGGER reject_record_schema BEFORE UPDATE ON schema_version WHEN NEW.version=28 BEGIN SELECT RAISE(ABORT,'migration denied'); END;",
-    )
-    .unwrap();
-    assert!(Store::open_for_schema_tests(&db).is_err());
-    assert_eq!(
-        conn.query_row("SELECT version FROM schema_version", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        27
-    );
-    assert_eq!(
-        conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name IN ('app_records','app_record_revisions')",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-    conn.execute_batch("DROP TRIGGER reject_record_schema;")
-        .unwrap();
-    drop(conn);
-    let migrated = Store::open_for_schema_tests(&db).unwrap();
-    assert_eq!(
-        migrated.app_context_list("install-1").unwrap(),
-        before_contexts
-    );
-    // Fresh tables accept new records; the pre-migration rows were
-    // installation data under the old schema contract and are not
-    // resurrected as different rows.
-    let fresh = seeded_context(&migrated, "install-9", "ctx-9");
-    let recreated = migrated
-        .app_record_create(
-            "install-9",
-            &fresh,
-            "customer-1",
-            &customer("Amina", "amina@example.com"),
-        )
-        .unwrap();
-    assert_eq!(recreated["record"]["revision"], 1);
-    assert_eq!(
-        migrated
-            .app_record_show("install-9", &fresh, "customer-1")
-            .unwrap()["record"],
-        recreated["record"]
-    );
-    drop(migrated);
-    let reopened = Store::open(&db).unwrap();
-    assert_eq!(
-        reopened
-            .app_record_show("install-9", &fresh, "customer-1")
-            .unwrap()["record"],
-        recreated["record"]
-    );
-    drop(created);
 }

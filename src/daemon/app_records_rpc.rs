@@ -1,17 +1,22 @@
-//! Strict operator management of host-managed installation records.
+//! Strict operator management of per-installation record files.
 //!
 //! Every method first proves the operator connection, then resolves
 //! the installation through the workspace catalog snapshot — an
-//! unknown or diverted installation ID never reaches the store — and
-//! only then runs the typed store action. The payload grammar is
-//! exact: identity-shaped (`by`, `actor`), discovery-link
-//! (`project`, `project_link`) and routing (`workspace`) fields are
-//! unsupported and refused. There is no HTTP peer in this slice; no
-//! HTTP route exposes these methods (the board peer is follow-up
-//! CAD-753-F1).
+//! unknown or diverted installation ID never reaches a file — and
+//! only then opens `<state_dir>/app-records/<install_id>.sqlite3`.
+//! Writes additionally prove the live context on core first; the
+//! record write then commits entirely inside the installation file,
+//! with no cross-file transaction. The payload grammar is exact:
+//! identity-shaped (`by`, `actor`), discovery-link (`project`,
+//! `project_link`) and routing (`workspace`) fields are unsupported
+//! and refused. File paths and SQL never leave this handler: callers
+//! name installations, contexts and records only. There is no HTTP
+//! peer in this slice; no HTTP route exposes these methods (the
+//! board peer is follow-up CAD-753-F1; backup/export coverage is
+//! follow-up CAD-753-F2).
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_records::CustomerProfile;
+use crate::store::app_records::{CustomerProfile, RecordStore};
 
 fn record_profile(params: &Value) -> Result<CustomerProfile> {
     let body = params
@@ -60,13 +65,11 @@ impl Shared {
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        // Writes re-check the context's live proof inside the same
-        // installation snapshot, the way run creation re-checks its
-        // context receipt — a context archived after the caller
-        // listed it refuses the write. The store re-checks liveness
-        // again in its own write transaction.
         let write = matches!(method, "app_record_create" | "app_record_update");
-        let result = workspace::with_runtime_snapshot(&pm, install, |_, _| {
+        // The installation snapshot and (for writes) the live context
+        // proof come from core; the record file opens after, in
+        // sequence — never one transaction across both stores.
+        workspace::with_runtime_snapshot(&pm, install, |_, _| {
             let _release = self
                 .app_release_lock
                 .lock()
@@ -74,29 +77,38 @@ impl Shared {
             if write {
                 self.store.app_context_proof(install, context)?;
             }
-            match method {
-                "app_record_list" => self.store.app_record_list(install, context),
-                "app_record_show" => {
-                    self.store
-                        .app_record_show(install, context, required_str(params, "record_id")?)
-                }
-                "app_record_create" => self.store.app_record_create(
-                    install,
-                    context,
-                    required_str(params, "record_id")?,
-                    &record_profile(params)?,
-                ),
-                "app_record_update" => self.store.app_record_update(
-                    install,
-                    context,
-                    required_str(params, "record_id")?,
-                    record_revision(params)?,
-                    &record_profile(params)?,
-                ),
-                _ => Err(Error::rejected("unknown app record method")),
-            }
+            Ok(())
         })?;
+        let records = RecordStore::open(&self.state_dir, install)?;
+        let result = match method {
+            "app_record_list" => records.app_record_list(context),
+            "app_record_show" => {
+                records.app_record_show(context, required_str(params, "record_id")?)
+            }
+            "app_record_create" => records.app_record_create(
+                context,
+                required_str(params, "record_id")?,
+                &record_profile(params)?,
+            ),
+            "app_record_update" => records.app_record_update(
+                context,
+                required_str(params, "record_id")?,
+                record_revision(params)?,
+                &record_profile(params)?,
+            ),
+            _ => Err(Error::rejected("unknown app record method")),
+        }?;
         if write {
+            // Best-effort audit on core; the file commit above stands
+            // either way.
+            self.store.note_app_record(
+                install,
+                context,
+                required_str(params, "record_id").unwrap_or(""),
+                result["record"]["revision"].as_i64().unwrap_or(0),
+                result["record"]["digest"].as_str().unwrap_or(""),
+                method == "app_record_create",
+            );
             self.wake();
         }
         Ok(result)

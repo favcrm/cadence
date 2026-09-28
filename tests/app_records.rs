@@ -486,6 +486,38 @@ fn cad753_records_stay_out_of_git_and_have_no_http_route() {
     let profile = json!({"schema": 1, "display_name": "cad753-record-git-marker Quill", "email": "quill@example.com", "tags": [], "consent": {"email": "granted"}});
     w.create(install, context_id, "customer-1", profile);
 
+    // The body lives in the installation's own SQLite file under the
+    // daemon state dir — one physical file per installation.
+    let file = w
+        .daemon
+        .state
+        .join("app-records")
+        .join(format!("{install}.sqlite3"));
+    assert!(file.is_file(), "installation record file missing");
+    let db =
+        rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let body: String = db
+        .query_row("SELECT body FROM app_records", [], |r| r.get(0))
+        .unwrap();
+    assert!(body.contains("cad753-record-git-marker"));
+    // ... and core SQLite holds no record tables at all.
+    let core = rusqlite::Connection::open_with_flags(
+        w.daemon.state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        core.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE 'app_record%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "record tables leaked into core SQLite"
+    );
+
     let output = std::process::Command::new("grep")
         .args(["-r", "cad753-record-git-marker", "--exclude-dir=.git", "."])
         .current_dir(&w.pm.dir)
@@ -556,6 +588,61 @@ fn cad753_records_stay_out_of_git_and_have_no_http_route() {
     ] {
         let (code, _, _) = common::op::raw(port, &session.request(method, &path, &body));
         assert_eq!(code, 404, "HTTP surface exposed records at {method} {path}");
+    }
+}
+
+#[test]
+fn cad753_two_installations_use_two_physical_files() {
+    use std::os::unix::fs::MetadataExt;
+    let w = Records::new();
+    let first = w.install();
+    let second = w.install_second();
+    let a = first["install_id"].as_str().unwrap();
+    let b = second["install_id"].as_str().unwrap();
+    let ctx_a = w.context(a, "Client", "ctx-a")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ctx_b = w.context(b, "Client", "ctx-b")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    w.create(a, &ctx_a, "customer-1", Records::profile(PROFILE_A));
+    w.create(b, &ctx_b, "customer-1", Records::profile(PROFILE_B));
+
+    // Two installations of the same package are two distinct SQLite
+    // files — different paths, different inodes — each holding only
+    // its own rows.
+    let dir = w.daemon.state.join("app-records");
+    let file_a = dir.join(format!("{a}.sqlite3"));
+    let file_b = dir.join(format!("{b}.sqlite3"));
+    assert_ne!(file_a, file_b);
+    assert!(file_a.is_file() && file_b.is_file());
+    assert_ne!(
+        std::fs::metadata(&file_a).unwrap().ino(),
+        std::fs::metadata(&file_b).unwrap().ino()
+    );
+    for (file, name) in [(&file_a, "Amina Diallo"), (&file_b, "Boris Feld")] {
+        let db =
+            rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let rows: Vec<String> = db
+            .prepare("SELECT body FROM app_records")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains(name), "sibling data leaked across files");
+        let identity: String = db
+            .query_row("SELECT install_id FROM record_identity", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            identity,
+            file.file_stem().unwrap().to_str().unwrap(),
+            "file identity differs from its installation"
+        );
     }
 }
 
