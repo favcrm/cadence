@@ -47,6 +47,8 @@ pub struct AgenticosExternalAdapter {
     http: ureq::Agent,
     image_hosts: Vec<String>,
     image_http: ureq::Agent,
+    #[cfg(feature = "test-seam")]
+    test_cdn_url: Option<String>,
 }
 
 impl AgenticosExternalAdapter {
@@ -81,11 +83,40 @@ impl AgenticosExternalAdapter {
             http: ureq::Agent::new_with_config(config),
             image_hosts: image_hosts.to_vec(),
             image_http: image_agent(),
+            #[cfg(feature = "test-seam")]
+            test_cdn_url: None,
         };
         adapter
             .connection_descriptor()
             .expect("descriptor")
             .validate(&adapter.table)?;
+        Ok(adapter)
+    }
+
+    /// Local integration fixture: the provider still returns an exact approved
+    /// HTTPS host, while its CDN bytes come from a loopback-only fake transport.
+    /// Production registration never calls this constructor.
+    #[cfg(feature = "test-seam")]
+    pub fn with_test_cdn(
+        base: &str,
+        deployment_pin: Option<&str>,
+        image_hosts: &[String],
+        fake_cdn_url: &str,
+    ) -> Result<Self> {
+        let uri: ureq::http::Uri = fake_cdn_url
+            .parse()
+            .map_err(|_| Error::rejected("test CDN URL is malformed"))?;
+        if uri.scheme_str() != Some("http")
+            || uri.host() != Some("127.0.0.1")
+            || uri.port_u16().is_none()
+            || uri
+                .authority()
+                .is_none_or(|part| part.as_str().contains('@'))
+        {
+            return Err(Error::rejected("test CDN must be a loopback HTTP fixture"));
+        }
+        let mut adapter = Self::with_deployment(base, deployment_pin, image_hosts)?;
+        adapter.test_cdn_url = Some(fake_cdn_url.to_owned());
         Ok(adapter)
     }
 
@@ -305,6 +336,19 @@ impl AgenticosExternalAdapter {
             return Err("AgenticOS image charge exceeds the approved ceiling".into());
         }
         let url = image_url(&data["result"], &self.image_hosts)?;
+        #[cfg(feature = "test-seam")]
+        let asset = if let Some(local) = &self.test_cdn_url {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(20)))
+                .http_status_as_error(false)
+                .max_redirects(0)
+                .proxy(None)
+                .build();
+            download_image(&ureq::Agent::new_with_config(config), local)?
+        } else {
+            download_image(&self.image_http, url)?
+        };
+        #[cfg(not(feature = "test-seam"))]
         let asset = download_image(&self.image_http, url)?;
         let digest = format!("sha256:{:x}", Sha256::digest(&asset.bytes));
         let result = json!({

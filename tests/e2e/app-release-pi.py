@@ -133,6 +133,8 @@ def run_prompt(prompt):
     pi.emit({"type": "message_start", "message": {"role": "assistant"}})
     kickoff = kickoff_from_prompt(prompt)
     turn = active_turn(kickoff)
+    social_probe_path = STATE / ("social-image-probe-" + kickoff["run_id"] + ".json")
+    social_probe = json.loads(social_probe_path.read_text()) if social_probe_path.exists() else None
     common = {
         "schema": 1,
         "kind": kickoff["kind"],
@@ -148,7 +150,27 @@ def run_prompt(prompt):
         "native_turn_observed": True,
     }
     if kickoff["kind"] == "produce_text":
-        draft = source_text(kickoff)
+        capability_refused = False
+        if social_probe is None:
+            draft = source_text(kickoff)
+        else:
+            slot = social_probe["slot"]
+            request = {"message": turn["id"], "token": turn["turn_id"],
+                       "slot": slot, "request_id": "social-" + slot + "-once", "input": {}}
+            first = frame("app_run_capability_call", request)
+            if first.get("ok") is not True:
+                capability_refused = True
+                receipt["capability_refused"] = True
+                draft = ""
+            else:
+                replay = frame("app_run_capability_call", request)
+                if replay != first:
+                    raise RuntimeError("social capability stable-key replay changed receipt")
+                receipt = first["result"]
+                (STATE / ("app-capability-result-" + kickoff["run_id"] + ".json")).write_text(
+                    json.dumps(receipt))
+                draft = ("我哋幫你跟進客戶，清晰記錄每一步。 #客戶關係" if slot == "image"
+                         else "Source receipt " + receipt["id"])
         cap_probe = STATE / ("app-capability-probe-" + kickoff["run_id"] + ".json")
         if cap_probe.exists():
             from concurrent.futures import ThreadPoolExecutor
@@ -202,12 +224,15 @@ def run_prompt(prompt):
                 json.dumps(receipt))
         if (STATE / ("context-hold-writer-" + kickoff["run_id"])).exists():
             hold(kickoff, "writer")
-        result = dict(
-            common,
-            outcome="succeeded",
-            artifacts=[{"media_type": "text/markdown", "text": draft}],
-        )
-        receipt["artifact_sha256"] = "sha256:" + hashlib.sha256(draft.encode()).hexdigest()
+        if capability_refused:
+            result = dict(common, outcome="failed", artifacts=[])
+        else:
+            result = dict(
+                common,
+                outcome="succeeded",
+                artifacts=[{"media_type": "text/markdown", "text": draft}],
+            )
+            receipt["artifact_sha256"] = "sha256:" + hashlib.sha256(draft.encode()).hexdigest()
     else:
         dependencies = kickoff["dependencies"]
         if len(dependencies) != 1:
@@ -247,6 +272,12 @@ def run_prompt(prompt):
             decoded = base64.b64decode(asset["result"]["base64"], validate=True)
             if ("sha256:" + hashlib.sha256(decoded).hexdigest()) != asset["result"]["digest"]:
                 raise RuntimeError("reviewer asset bytes differ from durable digest")
+            if social_probe and social_probe["slot"] == "image":
+                import struct
+                if (asset["result"]["media_type"] != "image/png"
+                        or not decoded.startswith(b"\x89PNG\r\n\x1a\n")
+                        or struct.unpack(">II", decoded[16:24]) != (1, 1)):
+                    raise RuntimeError("reviewer image fixture is not the retained square PNG")
             if frame("app_run_capability_asset", {
                 "receipt_id":cap_receipt["id"], "message":turn["id"],
                 "token":turn["turn_id"]}, True).get("ok") is not False:
@@ -283,7 +314,8 @@ def run_prompt(prompt):
             producer_revision=dependency["revision"],
             artifact_sha256=actual_digest,
             decision="approve",
-            rationale="The fetched context draft retains its exact source canary.",
+            rationale=("The fetched caption and retained square PNG match the selected source and both digests."
+                       if social_probe else "The fetched context draft retains its exact source canary."),
         )
         if cap_result_path.exists():
             result["asset_receipt_id"] = cap_receipt["id"]

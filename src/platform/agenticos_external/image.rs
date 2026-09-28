@@ -333,8 +333,13 @@ mod tests {
             image_mime(&encoded_png(2, 1), "image/png").is_err(),
             "non-square output must refuse"
         );
+        let bomb = encoded_png(2049, 2049);
         assert!(
-            image_mime(&encoded_png(2049, 2049), "image/png").is_err(),
+            bomb.len() < ASSET_LIMIT,
+            "the adversary must fit the CDN byte cap"
+        );
+        assert!(
+            image_mime(&bomb, "image/png").is_err(),
             "oversized encoded square must refuse"
         );
         assert_eq!(

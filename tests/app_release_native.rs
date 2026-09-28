@@ -1,6 +1,8 @@
 //! CAD692 reviewed Local release through actual native provider turns.
 #![allow(clippy::disallowed_methods)]
 mod common;
+#[cfg(feature = "test-seam")]
+use cadence_agent::platform::agenticos_external::{AgenticosExternalAdapter, MANIFEST_PIN};
 use common::app_release::{Release, A, B, OWNER, REVIEWER, WRITER};
 use common::{plant_member_pane, LaneShell};
 use serde_json::{json, Value};
@@ -909,6 +911,273 @@ fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
         "oversized asset retained old review"
     );
     assert_eq!(h.items().as_array().unwrap().len(), 1);
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+    let cdn = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let cdn_url = format!("http://{}/image.png", cdn.server_addr().to_ip().unwrap());
+    let mut corrupt = png.clone();
+    let payload = corrupt
+        .windows(4)
+        .position(|window| window == b"IDAT")
+        .unwrap()
+        + 4;
+    corrupt[payload] ^= 0x40;
+    let cdn_png = png.clone();
+    let cdn_worker = std::thread::spawn(move || {
+        for bytes in [corrupt, cdn_png] {
+            let request = cdn
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .expect("fixture CDN GET");
+            assert_eq!(request.url(), "/image.png");
+            request
+                .respond(tiny_http::Response::from_data(bytes).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
+                ))
+                .unwrap();
+        }
+    });
+    let provider = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let provider_url = format!("http://{}", provider.server_addr().to_ip().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let image_calls = Arc::new(AtomicUsize::new(0));
+    let stop_worker = stop.clone();
+    let image_calls_worker = image_calls.clone();
+    let provider_worker = std::thread::spawn(move || {
+        while !stop_worker.load(Ordering::SeqCst) {
+            let Some(mut request) = provider.recv_timeout(Duration::from_millis(100)).unwrap()
+            else {
+                continue;
+            };
+            let reply = if request.url() != "/v1/runtime/tools/call"
+                && request.url().starts_with("/v1/runtime/tools/")
+            {
+                let image = request.url().ends_with("minimax.image-gen.from_text");
+                if !image {
+                    assert_eq!(
+                        request.url(),
+                        "/v1/runtime/tools/scrapecreators.instagram.user.posts"
+                    );
+                }
+                let slug = if image {
+                    "minimax.image-gen.from_text"
+                } else {
+                    "scrapecreators.instagram.user.posts"
+                };
+                json!({"ok":true,"data":{"slug":slug,"effect":if image {"draft"} else {"read"},"chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":if image {"0.031500"} else {"0.002000"}},"unitPrice":null}})
+            } else {
+                assert_eq!(request.url(), "/v1/runtime/tools/call");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert!(request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("idempotency-key"))
+                    .is_some_and(|header| header.value.as_str().starts_with("app-call-")));
+                match body["slug"].as_str().unwrap() {
+                    "scrapecreators.instagram.user.posts" => {
+                        assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
+                        json!({"ok":true,"data":{"slug":"scrapecreators.instagram.user.posts","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.002000"},"result":{"success":true,"status":"ok","user":{"username":"juicysuite_crm","is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","user":{"username":"juicysuite_crm","is_private":false},"caption":{"text":"JuicySuite CRM helps teams track customers"},"media_type":1}]}}})
+                    }
+                    "minimax.image-gen.from_text" => {
+                        image_calls_worker.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(body["max_charge_minor"], 31_500);
+                        assert_eq!(body["body"]["model"], "image-01");
+                        assert_eq!(body["body"]["aspect_ratio"], "1:1");
+                        assert_eq!(body["body"]["n"], 1);
+                        assert_eq!(body["body"]["response_format"], "url");
+                        assert!(body["body"]["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("JuicySuite CRM"));
+                        json!({"ok":true,"data":{"slug":"minimax.image-gen.from_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_urls":["https://images.example.test/generated.png"]}}}})
+                    }
+                    other => panic!("unexpected fixture tool: {other}"),
+                }
+            };
+            request
+                .respond(tiny_http::Response::from_string(reply.to_string()))
+                .unwrap();
+        }
+    });
+    let h = Release::with_social_image(move |opts, _| {
+        let adapter = AgenticosExternalAdapter::with_test_cdn(
+            &provider_url,
+            Some(MANIFEST_PIN),
+            &["images.example.test".into()],
+            &cdn_url,
+        )
+        .unwrap();
+        opts.platforms
+            .insert("agenticos_external".into(), Arc::new(adapter));
+    });
+    let external = h.daemon.operator_rpc("connection_create", json!({"provider":"agenticos_external","account":"ws_11111111-1111-4111-8111-111111111111","shape":"token","token":"AAAAAAAAAAAAAAAAAAAA","scopes":["provider.read","provider.draft"],"accept_same_uid_risk":true})).unwrap()["connection"]["id"].as_str().unwrap().to_string();
+    for slot in ["source", "image"] {
+        h.daemon.operator_rpc("app_binding_create", json!({"install_id":h.install["install_id"],"slot":slot,"connection_id":external.as_str(),"request_id":format!("bind-{slot}")})).unwrap();
+    }
+    h.daemon.operator_rpc("app_binding_create", json!({"install_id":h.install["install_id"],"slot":"publication","connection_id":h.connection,"request_id":"bind-publication"})).unwrap();
+    let source = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"source-instagram","inputs":{"profile_handle":"juicysuite_crm","writer":WRITER},"request_id":"source-run","owner_pm":OWNER})).unwrap();
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "social-image-probe-{}.json",
+            source["id"].as_str().unwrap()
+        )),
+        json!({"slot":"source"}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&source);
+    let source = h.wait_state(source["id"].as_str().unwrap(), "succeeded");
+    let source_receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":source["id"]}))
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(source_receipt["result"]["posts"][0]["id"], "post-1");
+    let quoted = h
+        .daemon
+        .operator_rpc(
+            "app_binding_quote",
+            json!({"install_id":h.install["install_id"],"slot":"image"}),
+        )
+        .unwrap();
+    assert_eq!(quoted["quote"]["total_price_micros"], 31_500);
+    let refused = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":{"subject":"Customer follow-up","brand_voice":"Warm and clear","writer":WRITER,"reviewer":REVIEWER},"source_receipt_id":source_receipt["id"],"selected_post_id":"post-1","request_id":"corrupt-image-run","owner_pm":OWNER})).unwrap();
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "social-image-probe-{}.json",
+            refused["id"].as_str().unwrap()
+        )),
+        json!({"slot":"image"}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&refused);
+    let refused = h.wait_state(refused["id"].as_str().unwrap(), "failed");
+    assert!(refused["artifacts"].as_array().unwrap().is_empty());
+    assert!(refused["reviews"].as_array().unwrap().is_empty());
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_run_capability_results",
+            json!({"run_id":refused["id"]})
+        )
+        .unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(h.daemon.operator_rpc("app_effect_stage", json!({"run_id":refused["id"],"artifact_id":"forged","slot":"publication","request_id":"corrupt-release","title":"Never released"})).is_err());
+    assert!(h.items().as_array().unwrap().is_empty());
+    let run = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":{"subject":"Customer follow-up","brand_voice":"Warm and clear","writer":WRITER,"reviewer":REVIEWER},"source_receipt_id":source_receipt["id"],"selected_post_id":"post-1","request_id":"image-run","owner_pm":OWNER})).unwrap();
+    assert_eq!(run["snapshot"]["quotes"]["image"], quoted["quote"]);
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "social-image-probe-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"slot":"image"}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let completed = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    let receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(receipt["result"]["kind"], "media.generated.image");
+    assert_eq!(receipt["result"]["model"], "image-01");
+    assert_eq!(receipt["result"]["aspect_ratio"], "1:1");
+    assert_eq!(receipt["asset"]["media_type"], "image/png");
+    assert_eq!(receipt["asset"]["size"], png.len());
+    assert_eq!(
+        receipt["asset"]["digest"],
+        format!("sha256:{:x}", Sha256::digest(&png))
+    );
+    let retained = h
+        .daemon
+        .operator_rpc(
+            "app_run_capability_asset",
+            json!({"receipt_id":receipt["id"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(retained["base64"].as_str().unwrap())
+            .unwrap(),
+        png
+    );
+    assert_eq!(completed["reviews"][0]["asset_receipt_id"], receipt["id"]);
+    assert_eq!(
+        completed["reviews"][0]["asset_digest"],
+        receipt["asset"]["digest"]
+    );
+    assert!(!receipt.to_string().contains("images.example.test"));
+    assert_eq!(
+        image_calls.load(Ordering::SeqCst),
+        2,
+        "each of two runs should make one provider call despite stable-key retry"
+    );
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE app_capability_results SET asset=NULL WHERE id=?",
+        [receipt["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    assert!(h.daemon.operator_rpc("app_effect_stage", json!({"run_id":run["id"],"artifact_id":completed["artifacts"][0]["id"],"slot":"publication","request_id":"missing-asset","title":"Reviewed draft"})).is_err());
+    db.execute(
+        "UPDATE app_capability_results SET asset=? WHERE id=?",
+        rusqlite::params![&png, receipt["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    let staged = h.stage(&completed, "image-release");
+    db.execute(
+        "UPDATE app_capability_results SET asset=x'00' WHERE id=?",
+        [receipt["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_effect_decide",
+            json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"decision":"accept"})
+        )
+        .is_err());
+    db.execute(
+        "UPDATE app_capability_results SET asset=? WHERE id=?",
+        rusqlite::params![&png, receipt["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    let done = h.decide(&staged);
+    assert_eq!(done["state"], "done");
+    let items = h.items();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(
+        items[0]["attachments"][0]["sha256"],
+        receipt["asset"]["digest"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("sha256:")
+    );
+    let path = h
+        .root
+        .path()
+        .join("outbox/app-items")
+        .join(staged["effect_id"].as_str().unwrap())
+        .join("attachments/asset.bin");
+    assert_eq!(std::fs::read(path).unwrap(), png);
+    stop.store(true, Ordering::SeqCst);
+    provider_worker.join().unwrap();
+    cdn_worker.join().unwrap();
 }
 
 #[test]
