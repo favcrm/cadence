@@ -396,6 +396,7 @@ include!("queue.rs");
 include!("schema.rs");
 
 mod app_runs;
+mod cloud_dispatch_outbox;
 
 mod app_contexts;
 
