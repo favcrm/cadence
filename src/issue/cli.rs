@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, claim, doctor, finish, history, hooks, lint, model, project, retro, start, sync, work,
-    write, Pm,
+    board, claim, doctor, finish, history, hooks, lint, model, project, reconcile, retro, start,
+    sync, work, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -433,6 +433,29 @@ pub enum IssueAction {
     Lint {
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Reconcile tracker status with merge reality (CAD-754): classify
+    /// every `doing`/`review` leaf issue against its recorded branch,
+    /// worktree and `pr:` refs, and mark `done` the ones whose work
+    /// provably merged — one commit per issue naming the evidence.
+    /// `held`/`stalled` rows are reported, never moved: an open PR or
+    /// a claim newer than the merge blocks the flip. Merged worktree
+    /// refs are swept with the same guard `finish --merged` uses.
+    /// `issue sync` runs this sweep after a successful push.
+    Reconcile {
+        /// Limit the sweep to one project (all projects when omitted).
+        #[arg(long)]
+        project: Option<String>,
+        /// Print the classification without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Classify at most this many issues (0 = no limit — the daemon
+        /// tick uses a bound so the rest drain over later ticks).
+        #[arg(long, default_value = "0")]
+        limit: usize,
+        /// Emit the sweep rows as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Bring the tracker level with `origin`: fetch, rebase the local
     /// commits on top, lint the result, push. A conflict or lint
@@ -1554,6 +1577,40 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 Ok(1)
             }
         }
+        IssueAction::Reconcile {
+            project,
+            dry_run,
+            limit,
+            json,
+        } => {
+            let pm = open_pm()?;
+            let out = reconcile::run(&pm, project.as_deref(), *dry_run, "", state_dir, *limit)?;
+            if *json {
+                print_json(&out);
+            } else {
+                for row in out["rows"].as_array().into_iter().flatten() {
+                    let mut line = format!(
+                        "{}: {}",
+                        row["issue"].as_str().unwrap_or("?"),
+                        row["outcome"].as_str().unwrap_or("?")
+                    );
+                    if let Some(r) = row["reason"].as_str() {
+                        line.push_str(&format!("({})", r.lines().next().unwrap_or(r)));
+                    }
+                    if let Some(e) = row["evidence"].as_str() {
+                        line.push_str(&format!(" — {e}"));
+                    }
+                    println!("{line}");
+                }
+            }
+            // A reconcile whose own writes failed still answers — the
+            // row says why. `errors` counts unwritable closes.
+            Ok(if out["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+                1
+            } else {
+                0
+            })
+        }
         IssueAction::Sync {
             no_push,
             dry_run,
@@ -1565,16 +1622,28 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 _ => sync::Resolve::Theirs,
             });
             let report = sync::run(&pm, !no_push, *dry_run, side)?;
-            if report["ok"].as_bool() == Some(true) {
-                print_json(&report);
-                Ok(0)
-            } else {
+            if report["ok"].as_bool() != Some(true) {
                 eprintln!(
                     "{}",
                     serde_json::to_string_pretty(&report).unwrap_or_default()
                 );
-                Ok(1)
+                return Ok(1);
             }
+            print_json(&report);
+            // CAD-754: a fresh upstream is the right time to sweep —
+            // status catches up with merges the push just published.
+            // Failure never fails the sync that succeeded.
+            if !*dry_run {
+                match reconcile::run(&pm, None, false, "", state_dir, 0) {
+                    Ok(rec) => {
+                        let done = rec["done"].as_array().map(|d| d.len()).unwrap_or(0);
+                        let held = rec["held"].as_array().map(|h| h.len()).unwrap_or(0);
+                        eprintln!("reconcile: {done} closed, {held} held");
+                    }
+                    Err(e) => eprintln!("reconcile: {e}"),
+                }
+            }
+            Ok(0)
         }
     }
 }

@@ -308,6 +308,7 @@ impl Shared {
         let mut nudges_swept: Option<Instant> = None;
         let mut checkup_at: Option<Instant> = None;
         let mut events_rolled: Option<Instant> = None;
+        let mut reconcile_at: Option<Instant> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             // CAD-250 N3: a nudge still queued past its TTL is stale
@@ -353,6 +354,13 @@ impl Shared {
                     self.checkup_tick();
                     checkup_at = Some(Instant::now());
                 }
+            }
+            // CAD-754: tracker reconcile — close doing/review issues
+            // whose recorded work merged, hourly, a bounded batch per
+            // tick so a backlog drains over hours not one stall-watch.
+            if reconcile_at.is_none_or(|at| at.elapsed() >= RECONCILE_EVERY) {
+                self.reconcile_tick();
+                reconcile_at = Some(Instant::now());
             }
             std::thread::sleep(STALL_TICK);
         }
@@ -1243,6 +1251,10 @@ const DAEMON_EVENTS_KEEP: i64 = 200;
 
 /// How often the stall watch folds week-old delivery events (CAD-316).
 const EVENT_ROLLUP_EVERY: Duration = Duration::from_secs(3600);
+
+/// CAD-754: how often the tracker reconcile sweep runs — hourly, a
+/// bounded batch per tick so a stale backlog drains over hours.
+const RECONCILE_EVERY: Duration = Duration::from_secs(3600);
 
 /// Cross-tick watch state: `pending` dedupes dry-run events (one per
 /// db per crossing, cleared when it drops under the limit), and
