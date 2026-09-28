@@ -462,6 +462,11 @@ pub(crate) enum RunAction {
         /// Exact optional brand context; omission means a context-free run.
         #[arg(long)]
         context_id: Option<String>,
+        /// Exact previously fetched provider result, if this run uses a source post.
+        #[arg(long, requires = "selected_post_id")]
+        source_receipt_id: Option<String>,
+        #[arg(long, requires = "source_receipt_id")]
+        selected_post_id: Option<String>,
     },
     /// Approve the exact frozen run snapshot; does not authorize outward release.
     Approve {
@@ -486,6 +491,37 @@ pub(crate) enum RunAction {
     Artifact {
         artifact_id: String,
         /// Active dependent kickoff; requires its current turn token.
+        #[arg(long, requires = "token")]
+        message: Option<String>,
+        #[arg(long, requires = "message")]
+        token: Option<String>,
+    },
+    /// Invoke one frozen read/draft capability during the assigned app turn.
+    CapabilityCall {
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        slot: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        input_json: String,
+    },
+    /// Operator view of durable capability receipts for one run.
+    CapabilityResults { run_id: String },
+    /// Operator or assigned turn view of one exact receipt.
+    CapabilityResult {
+        receipt_id: String,
+        #[arg(long, requires = "token")]
+        message: Option<String>,
+        #[arg(long, requires = "message")]
+        token: Option<String>,
+    },
+    /// Operator or assigned turn download of one exact bounded asset.
+    CapabilityAsset {
+        receipt_id: String,
         #[arg(long, requires = "token")]
         message: Option<String>,
         #[arg(long, requires = "message")]
@@ -523,6 +559,8 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
             owner_pm,
             project_link,
             context_id,
+            source_receipt_id,
+            selected_post_id,
         } => {
             let mut params = json!({
                 "install_id": install_id,
@@ -536,6 +574,10 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
             }
             if let Some(context) = context_id {
                 params["context_id"] = json!(context);
+            }
+            if let (Some(receipt), Some(post)) = (source_receipt_id, selected_post_id) {
+                params["source_receipt_id"] = json!(receipt);
+                params["selected_post_id"] = json!(post);
             }
             ("app_run_create", params)
         }
@@ -576,6 +618,58 @@ fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
                 }
             };
             ("app_run_artifact", params)
+        }
+        RunAction::CapabilityCall {
+            message,
+            token,
+            slot,
+            request_id,
+            input_json,
+        } => {
+            let input: Value = serde_json::from_str(input_json).map_err(|_| {
+                Error::invalid(
+                    "app_run_capability_call",
+                    "input-json must be a JSON object",
+                )
+            })?;
+            if !input.is_object() || serde_json::to_vec(&input)?.len() > 64 * 1024 {
+                return Err(Error::invalid(
+                    "app_run_capability_call",
+                    "input-json must be an object within 64 KiB",
+                ));
+            }
+            (
+                "app_run_capability_call",
+                json!({"message":message,"token":token,"slot":slot,
+                "request_id":request_id,"input":input}),
+            )
+        }
+        RunAction::CapabilityResults { run_id } => {
+            ("app_run_capability_results", json!({"run_id":run_id}))
+        }
+        RunAction::CapabilityResult {
+            receipt_id,
+            message,
+            token,
+        }
+        | RunAction::CapabilityAsset {
+            receipt_id,
+            message,
+            token,
+        } => {
+            let mut params = json!({"receipt_id":receipt_id});
+            if let (Some(message), Some(token)) = (message, token) {
+                params["message"] = json!(message);
+                params["token"] = json!(token);
+            }
+            (
+                if matches!(action, RunAction::CapabilityResult { .. }) {
+                    "app_run_capability_result"
+                } else {
+                    "app_run_capability_asset"
+                },
+                params,
+            )
         }
     })
 }

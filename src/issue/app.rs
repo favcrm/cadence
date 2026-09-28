@@ -112,14 +112,26 @@ pub struct CapabilityNeed {
 }
 impl CapabilityNeed {
     pub fn validate(&self) -> Result<()> {
+        let publication = self.capability == "text.publish"
+            && self.version == 1
+            && self.action == "publish"
+            && self.effect == "send";
+        let bounded_read_or_draft = matches!(self.effect.as_str(), "read" | "draft")
+            && self.version == 1
+            && self.capability.len() <= 64
+            && self.capability.split('.').count() == 2
+            && self.capability.split('.').all(model::valid_tag)
+            && !self.action.is_empty()
+            && self.action.len() <= 32
+            && self
+                .action
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         if self.schema != 1
-            || self.capability != "text.publish"
-            || self.version != 1
-            || self.action != "publish"
             || self.resource_kind != "connection_account"
-            || self.effect != "send"
+            || !(publication || bounded_read_or_draft)
         {
-            return Err(Error::rejected("unsupported app capability contract: text.publish@1 / publish / connection_account / send is required"));
+            return Err(Error::rejected("unsupported app capability contract"));
         }
         Ok(())
     }
@@ -372,7 +384,17 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             capabilities =
                 serde_yaml::from_value::<BTreeMap<String, CapabilityNeed>>(value.clone())
                     .map_err(|e| Error::rejected(format!("app.md needs.capabilities: {e}")))?;
-            if capabilities.len() > 1 {
+            if capabilities.len() > 8 {
+                return Err(Error::rejected(
+                    "an app supports at most eight capability slots",
+                ));
+            }
+            if capabilities
+                .values()
+                .filter(|need| need.effect == "send")
+                .count()
+                > 1
+            {
                 return Err(Error::rejected(
                     "an app supports at most one publication capability slot",
                 ));
@@ -2835,6 +2857,24 @@ mod tests {
                 "connections: [publication]\n  capabilities:",
             ),
             good.replace("effect: send", "effect: draft"),
+        ] {
+            assert!(parse_manifest(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cad632_read_and_draft_declarations_are_provider_neutral() {
+        let app = "---\napp: studio\ntitle: Studio\nversion: '1'\nneeds:\n  capabilities:\n    source: {schema: 1, capability: social.read, version: 1, action: posts, resource_kind: connection_account, effect: read}\n    image: {schema: 1, capability: media.generate, version: 1, action: image, resource_kind: connection_account, effect: draft}\n---\nGuide\n";
+        let parsed = parse_manifest(app).unwrap();
+        assert_eq!(parsed.capabilities["source"].effect, "read");
+        assert_eq!(parsed.capabilities["image"].effect, "draft");
+        for bad in [
+            app.replace("effect: read", "effect: send"),
+            app.replace("social.read", "social.read;platform_call"),
+            app.replace(
+                "resource_kind: connection_account",
+                "resource_kind: workspace",
+            ),
         ] {
             assert!(parse_manifest(&bad).is_err(), "{bad}");
         }

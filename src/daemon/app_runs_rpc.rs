@@ -21,6 +21,8 @@ impl Shared {
                 "owner_pm",
                 "project_link",
                 "context_id",
+                "source_receipt_id",
+                "selected_post_id",
             ],
             "app_run_approve" => &["run_id", "digest"],
             "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
@@ -36,7 +38,13 @@ impl Shared {
                 "app lifecycle payload has unsupported fields",
             ));
         }
-        for field in ["project_link", "install_id", "context_id"] {
+        for field in [
+            "project_link",
+            "install_id",
+            "context_id",
+            "source_receipt_id",
+            "selected_post_id",
+        ] {
             if fields.get(field).is_some_and(|value| !value.is_string()) {
                 return Err(Error::rejected(
                     "optional app references must be strings when present",
@@ -109,6 +117,13 @@ impl Shared {
                 )
             }
             "app_run_create" => {
+                if params.get("source_receipt_id").is_some()
+                    != params.get("selected_post_id").is_some()
+                {
+                    return Err(Error::rejected(
+                        "source receipt and selected post must be supplied together",
+                    ));
+                }
                 let id = required_str(params, "install_id")?;
                 let name = required_str(params, "workflow")?;
                 if !crate::issue::model::valid_tag(name) {
@@ -117,6 +132,7 @@ impl Shared {
                 let mut inputs: BTreeMap<String, String> =
                     serde_json::from_value(params.get("inputs").cloned().unwrap_or(json!({})))
                         .map_err(|_| Error::rejected("inputs must be a string map"))?;
+                let supplied_source = inputs.get("source").cloned();
                 if serde_json::to_vec(&inputs)
                     .map_err(|e| Error::internal(e.to_string()))?
                     .len()
@@ -165,6 +181,23 @@ impl Shared {
                             ));
                         }
                     }
+                    if let (Some(receipt), Some(post)) = (
+                        optional_str(params, "source_receipt_id"),
+                        optional_str(params, "selected_post_id"),
+                    ) {
+                        let line = self.store.app_selected_source_input(
+                            id,
+                            context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                            receipt,
+                            post,
+                        )?;
+                        if supplied_source.as_ref().is_some_and(|value| value != &line) {
+                            return Err(Error::rejected(
+                                "supplied source differs from selected provider post",
+                            ));
+                        }
+                        inputs.insert("source".into(), line);
+                    }
                     let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
                         if context.is_some() {
                             Error::rejected("contextual workflow inputs refused")
@@ -205,7 +238,44 @@ impl Shared {
                         })
                         .transpose()?
                         .flatten();
-                    self.store.app_run_create_with_publication(
+                    let mut capabilities = BTreeMap::new();
+                    let mut quotes = BTreeMap::new();
+                    for slot in &workflow.capability_slots {
+                        let manifest =
+                            crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(
+                                || Error::rejected("installation manifest unavailable"),
+                            )?)?;
+                        let declared = manifest.capabilities.get(slot).ok_or_else(|| {
+                            Error::rejected("run capability slot is not declared by installation")
+                        })?;
+                        if !matches!(declared.effect.as_str(), "read" | "draft") {
+                            return Err(Error::rejected(
+                                "run capability slot must be read or draft",
+                            ));
+                        }
+                        let proof = self
+                            .store
+                            .app_binding_for_slot(
+                                id,
+                                context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                                slot,
+                            )?
+                            .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                        self.app_binding_receipt_current(
+                            id,
+                            context.as_ref().map(|(_, proof)| proof.id.as_str()),
+                            slot,
+                            &proof,
+                            row,
+                            files,
+                        )?;
+                        capabilities.insert(slot.clone(), proof);
+                        quotes.insert(
+                            slot.clone(),
+                            self.app_capability_quote(capabilities.get(slot).unwrap())?,
+                        );
+                    }
+                    self.store.app_run_create_with_capabilities(
                         LocalRunRequest {
                             install_id: id,
                             bundle_digest: row["digest"].as_str().unwrap(),
@@ -217,6 +287,10 @@ impl Shared {
                         },
                         context.as_ref().map(|(_, proof)| proof),
                         binding.as_ref(),
+                        &capabilities,
+                        &quotes,
+                        optional_str(params, "source_receipt_id")
+                            .zip(optional_str(params, "selected_post_id")),
                     )
                 })
             }
@@ -232,6 +306,10 @@ impl Shared {
                 })
             }
             "app_run_cancel" => {
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 self.store
                     .app_run_decide(required_str(params, "run_id")?, None, true, None)
             }
@@ -271,7 +349,7 @@ impl Shared {
             callback(row["digest"].as_str().unwrap())
         })
     }
-    fn app_run_binding_current(
+    pub(super) fn app_run_binding_current(
         &self,
         run: &Value,
         bundle: &Value,
@@ -292,6 +370,28 @@ impl Shared {
                 bundle,
                 files,
             )?;
+        }
+        if let Some(capabilities) = run["snapshot"]["capabilities"].as_object() {
+            for (slot, value) in capabilities {
+                let proof: crate::store::app_bindings::BindingProof =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        Error::rejected("run capability binding receipt is invalid")
+                    })?;
+                self.app_binding_receipt_current(
+                    required_str(run, "install_id")?,
+                    run["context_id"].as_str(),
+                    slot,
+                    &proof,
+                    bundle,
+                    files,
+                )?;
+                let quote = self.app_capability_quote(&proof)?;
+                if run["snapshot"]["quotes"][slot] != json!(quote) {
+                    return Err(Error::rejected(
+                        "capability price changed since run creation",
+                    ));
+                }
+            }
         }
         Ok(())
     }

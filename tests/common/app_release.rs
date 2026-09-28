@@ -1,5 +1,6 @@
 //! CAD692 reviewed local release proofs through real native provider turns.
 #![allow(clippy::disallowed_methods)]
+pub(crate) mod capability;
 pub(crate) mod fault;
 use super::{daemon_opts, pi_policy_pm, TestDaemon};
 use cadence_agent::issue::Pm;
@@ -21,6 +22,23 @@ pub(crate) struct Release {
     pub(crate) connection: String,
 }
 impl Release {
+    pub(crate) fn with_capability() -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let price = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1880));
+        let observed_price = price.clone();
+        let h = Self::with_options_and_bundle(
+            move |opts, _| {
+                capability::wrap(opts, calls, price);
+            },
+            true,
+        );
+        (h, observed, observed_price)
+    }
     pub(crate) fn with_app_fault(fault: AppFault) -> Self {
         Self::with_options(move |opts, _| {
             fault::wrap(
@@ -42,6 +60,12 @@ impl Release {
     }
     pub(crate) fn with_options(
         configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
+    ) -> Self {
+        Self::with_options_and_bundle(configure, false)
+    }
+    fn with_options_and_bundle(
+        configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
+        source_capability: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
@@ -87,11 +111,25 @@ impl Release {
         let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/local-content");
         let manifest = std::fs::read_to_string(original.join("app.md")).unwrap();
         let manifest = manifest.replace("  connections: []", "  connections: []\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send");
+        let manifest = if source_capability {
+            manifest.replace("  capabilities:", "  capabilities:\n    source:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
+        } else {
+            manifest
+        };
         std::fs::write(source.join("app.md"), manifest).unwrap();
         let text = std::fs::read_to_string(original.join("workflows/draft.md")).unwrap();
         let workflow = text
             .replace("source: { ask:", "source: { context_default: true, ask:")
             .replacen("---\n", "---\npublication_slot: publication\n", 1);
+        let workflow = if source_capability {
+            workflow.replacen(
+                "publication_slot: publication\n",
+                "publication_slot: publication\ncapability_slots: [source]\n",
+                1,
+            )
+        } else {
+            workflow
+        };
         assert_ne!(text, workflow);
         std::fs::write(source.join("workflows/draft.md"), &workflow).unwrap();
         let install = daemon

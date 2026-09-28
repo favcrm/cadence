@@ -5,6 +5,7 @@ use common::app_release::{Release, A, B, OWNER, REVIEWER, WRITER};
 use common::{plant_member_pane, LaneShell};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 fn native(
     lane: &mut LaneShell,
@@ -28,6 +29,212 @@ fn native(
     let (rc,text)=lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(10);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}",state.join("cadence.sock").display(),request.display()));
     assert_eq!(rc, 0, "native process failed: {text}");
     serde_json::from_str(text.trim()).unwrap()
+}
+
+#[test]
+fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
+    let (h, calls, price) = Release::with_capability();
+    let a = h.context("Client A", A, "source-context-a");
+    let source_a = h
+        .daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":a["id"],"slot":"source",
+                "connection_id":h.connection,"request_id":"source-binding-a"
+            }),
+        )
+        .unwrap()["binding"]
+        .clone();
+    let quoted = h
+        .daemon
+        .operator_rpc(
+            "app_binding_quote",
+            json!({
+                "install_id":h.install["install_id"],"context_id":a["id"],"slot":"source"
+            }),
+        )
+        .unwrap();
+    assert_eq!(quoted["binding_digest"], source_a["digest"]);
+    assert_eq!(quoted["quote"]["total_price_micros"], 1880);
+    let run_a = h.create(&a, "source-run-a");
+    assert_eq!(run_a["snapshot"]["quotes"]["source"], quoted["quote"]);
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run_a["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":a["id"],"install_id":h.install["install_id"]}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run_a);
+    let finished_a = h.wait_state(run_a["id"].as_str().unwrap(), "succeeded");
+    let result_a = h
+        .daemon
+        .operator_rpc(
+            "app_run_capability_results",
+            json!({"run_id":finished_a["id"]}),
+        )
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(result_a["slot"], "source");
+    assert_eq!(
+        result_a["result"]["posts"][0]["caption"],
+        format!("CONTEXT_SOURCE={A}\nSecond line")
+    );
+    let asset = h
+        .daemon
+        .operator_rpc(
+            "app_run_capability_asset",
+            json!({"receipt_id":result_a["id"]}),
+        )
+        .unwrap();
+    assert_eq!(asset["digest"], result_a["asset"]["digest"]);
+    assert_eq!(asset["media_type"], "application/octet-stream");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "concurrent replay reached provider twice"
+    );
+    assert!(result_a.get("turn_id").is_none());
+    let probes: Value = serde_json::from_str(
+        &std::fs::read_to_string(h.daemon.state.join(format!(
+            "app-capability-result-{}.json",
+            run_a["id"].as_str().unwrap()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(probes["id"], result_a["id"]);
+    assert_eq!(probes["probes"].as_array().unwrap().len(), 8);
+
+    let selected = h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":a["id"],"workflow":"draft",
+                "inputs":{"subject":"Selected post","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"source-selected-a","owner_pm":OWNER,
+                "source_receipt_id":result_a["id"],"selected_post_id":"post-1"
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        selected["snapshot"]["source"]["post"]["caption"],
+        result_a["result"]["posts"][0]["caption"]
+    );
+    assert_eq!(
+        selected["snapshot"]["inputs"]["source"],
+        format!("CONTEXT_SOURCE={A} Second line")
+    );
+    assert_eq!(
+        selected["snapshot"]["source"]["binding_digest"],
+        source_a["digest"]
+    );
+    price.store(2000, Ordering::SeqCst);
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({
+                    "run_id":selected["id"],"digest":selected["snapshot_digest"]
+                })
+            )
+            .is_err(),
+        "live price change must refuse frozen run approval"
+    );
+    price.store(1880, Ordering::SeqCst);
+    for changed in [
+        json!({"install_id":h.install["install_id"],"context_id":a["id"],"workflow":"draft",
+            "inputs":{"subject":"Changed","writer":WRITER,"reviewer":REVIEWER,"source":"forged"},
+            "request_id":"source-forged-input","owner_pm":OWNER,
+            "source_receipt_id":result_a["id"],"selected_post_id":"post-1"}),
+        json!({"install_id":h.install["install_id"],"context_id":a["id"],"workflow":"draft",
+            "inputs":{"subject":"Missing","writer":WRITER,"reviewer":REVIEWER},
+            "request_id":"source-forged-post","owner_pm":OWNER,
+            "source_receipt_id":result_a["id"],"selected_post_id":"not-present"}),
+    ] {
+        assert!(h.daemon.operator_rpc("app_run_create", changed).is_err());
+    }
+    let b = h.context("Client B", B, "source-context-b");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":b["id"],"slot":"source",
+                "connection_id":h.connection,"request_id":"source-binding-b"
+            }),
+        )
+        .unwrap();
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":b["id"],"workflow":"draft",
+                "inputs":{"subject":"Cross","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"source-cross-context","owner_pm":OWNER,
+                "source_receipt_id":result_a["id"],"selected_post_id":"post-1"
+            })
+        )
+        .is_err());
+    let run_b = h.create(&b, "source-run-b");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run_b["id"].as_str().unwrap()
+        )),
+        json!({"source":B,"context_id":b["id"],"install_id":h.install["install_id"],"other_receipt_id":result_a["id"]}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run_b);
+    h.wait_state(run_b["id"].as_str().unwrap(), "succeeded");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({
+                "install_id":h.install["install_id"],"binding_id":source_a["id"],
+                "expected_revision":source_a["revision"]
+            }),
+        )
+        .unwrap();
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({
+                    "run_id":selected["id"],"digest":selected["snapshot_digest"]
+                })
+            )
+            .is_err(),
+        "revocation released an old run capability"
+    );
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_create",
+                json!({
+                    "install_id":h.install["install_id"],"context_id":a["id"],"workflow":"draft",
+                    "inputs":{"subject":"After revoke","writer":WRITER,"reviewer":REVIEWER},
+                    "request_id":"source-after-revoke","owner_pm":OWNER,
+                    "source_receipt_id":result_a["id"],"selected_post_id":"post-1"
+                })
+            )
+            .is_err(),
+        "revoked source binding was reused by a new run"
+    );
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_run_capability_result",
+                json!({"receipt_id":result_a["id"]})
+            )
+            .unwrap()["id"],
+        result_a["id"],
+        "operator lost historical audit receipt"
+    );
 }
 
 #[test]

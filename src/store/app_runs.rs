@@ -49,10 +49,14 @@ pub struct LocalWorkflow {
     pub steps: Vec<LocalStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_slots: Vec<String>,
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
-        let publication_slot = workflow::parse_template(text)?.publication_slot;
+        let template = workflow::parse_template(text)?;
+        let publication_slot = template.publication_slot;
+        let capability_slots = template.capability_slots;
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -146,6 +150,7 @@ impl LocalWorkflow {
             title: parsed.title,
             steps,
             publication_slot,
+            capability_slots,
         })
     }
 }
@@ -248,6 +253,24 @@ impl Store {
         context: Option<&super::app_contexts::ContextProof>,
         binding: Option<&super::app_bindings::BindingProof>,
     ) -> Result<Value> {
+        self.app_run_create_with_capabilities(
+            request,
+            context,
+            binding,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+    }
+    pub fn app_run_create_with_capabilities(
+        &self,
+        request: LocalRunRequest<'_>,
+        context: Option<&super::app_contexts::ContextProof>,
+        binding: Option<&super::app_bindings::BindingProof>,
+        capabilities: &BTreeMap<String, super::app_bindings::BindingProof>,
+        quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
+        selected_source: Option<(&str, &str)>,
+    ) -> Result<Value> {
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -258,6 +281,9 @@ impl Store {
             project_link,
         } = request;
         crate::proto::identifier(request_id, "app run request ID")?;
+        let verified_source = selected_source
+            .map(|(receipt, _)| self.app_capability_result(receipt))
+            .transpose()?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         if let Some(proof) = context {
@@ -282,6 +308,111 @@ impl Store {
                 ));
             }
         }
+        if capabilities.len() != workflow.capability_slots.len()
+            || quotes.len() != workflow.capability_slots.len()
+        {
+            return Err(Error::rejected(
+                "every declared run capability needs an exact binding",
+            ));
+        }
+        for slot in &workflow.capability_slots {
+            if !quotes
+                .get(slot)
+                .is_some_and(crate::platform::AppCapabilityQuote::valid)
+            {
+                return Err(Error::rejected(
+                    "run capability needs a valid frozen price quote",
+                ));
+            }
+            let proof = capabilities
+                .get(slot)
+                .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+            if proof.config["bundle_digest"] != bundle_digest
+                || !super::app_bindings::binding_current_in(
+                    &tx,
+                    install_id,
+                    context.map(|c| c.id.as_str()),
+                    slot,
+                    proof,
+                )?
+                || !matches!(
+                    proof.config["mapping"]["effect"].as_str(),
+                    Some("read" | "draft")
+                )
+            {
+                return Err(Error::rejected(
+                    "run capability binding is stale or belongs to a different scope",
+                ));
+            }
+        }
+        let source = if let Some((receipt_id, post_id)) = selected_source {
+            let row = tx.query_row(
+                "SELECT r.run_id,r.slot,r.binding_digest,r.result,r.result_digest,a.install_id,a.context_id,a.state
+                 FROM app_capability_results r JOIN app_runs a ON a.id=r.run_id WHERE r.id=?",
+                [receipt_id], |r| Ok((
+                    r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+                    r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
+                    r.get::<_,Option<String>>(6)?,r.get::<_,String>(7)?
+                )),
+            ).optional()?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
+            if row.5 != install_id
+                || row.6.as_deref() != context.map(|c| c.id.as_str())
+                || row.7 != "succeeded"
+            {
+                return Err(Error::rejected(
+                    "source receipt is outside this installation/context or incomplete",
+                ));
+            }
+            let source_run = Self::app_run_show_in(&tx, &row.0)?;
+            Self::app_current_in(&tx, &source_run, bundle_digest)?;
+            let source_binding = &source_run["snapshot"]["capabilities"][&row.1];
+            if source_binding["digest"] != row.2
+                || source_binding["config"]["mapping"]["effect"] != "read"
+            {
+                return Err(Error::rejected(
+                    "source receipt lacks a current read binding",
+                ));
+            }
+            let result: Value = serde_json::from_str(&row.3)?;
+            if verified_source.as_ref().is_none_or(|receipt| {
+                receipt["digest"] != row.4
+                    || receipt["result"] != result
+                    || receipt["run_id"] != row.0
+                    || receipt["slot"] != row.1
+                    || receipt["binding_digest"] != row.2
+            }) {
+                return Err(Error::rejected("selected source receipt has changed"));
+            }
+            let posts = result["posts"]
+                .as_array()
+                .ok_or_else(|| Error::rejected("source receipt has no normalized posts"))?;
+            let mut matches = posts
+                .iter()
+                .filter(|post| post["id"].as_str() == Some(post_id));
+            let selected = matches
+                .next()
+                .ok_or_else(|| Error::rejected("selected post is absent from source receipt"))?;
+            if matches.next().is_some() {
+                return Err(Error::rejected(
+                    "selected post id is ambiguous in source receipt",
+                ));
+            }
+            let caption = selected["caption"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("selected post has no normalized caption"))?;
+            let display = workflow::source_input_line(caption)?;
+            if inputs.get("source").map(String::as_str) != Some(display.as_str()) {
+                return Err(Error::rejected(
+                    "run source input differs from the selected provider post",
+                ));
+            }
+            Some(json!({"receipt_id":receipt_id,"receipt_digest":row.4,
+                "source_run_id":row.0,"binding_digest":row.2,
+                "post_id":post_id,"post":selected,
+                "post_digest":material_digest(selected)}))
+        } else {
+            None
+        };
         let epoch:i64=tx.query_row("SELECT epoch FROM app_install_capabilities WHERE install_id=? AND digest=? AND state='approved'",params![install_id,bundle_digest],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("installation capability approval is absent or stale"))?;
         let owner = self.agent_in(&tx, owner_pm)?;
         if owner.role != "pm" {
@@ -332,6 +463,24 @@ impl Store {
                 snapshot["context"] = Value::Null;
             }
             snapshot["publication"] = json!({"slot":slot,"binding":binding});
+        }
+        if !workflow.capability_slots.is_empty() {
+            snapshot["schema"] = json!(4);
+            if context.is_none() {
+                snapshot["context"] = Value::Null;
+            }
+            snapshot["capabilities"] = json!(capabilities);
+            snapshot["quotes"] = json!(quotes);
+        }
+        if let Some(source) = source {
+            snapshot["schema"] = json!(4);
+            if context.is_none() {
+                snapshot["context"] = Value::Null;
+            }
+            snapshot["capabilities"] = json!(capabilities);
+            snapshot["quotes"] = json!(quotes);
+            snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
+            snapshot["source"] = source;
         }
         let digest = material_digest(&snapshot);
         if let Some((id, existing)) = tx
@@ -496,7 +645,9 @@ impl Store {
                 "immutable app run snapshot receipt is corrupt",
             ));
         }
-        if run["snapshot"]["schema"] == 3 {
+        if run["snapshot"]["schema"] == 3
+            || (run["snapshot"]["schema"] == 4 && run["snapshot"]["publication"].is_object())
+        {
             let slot = run["snapshot"]["publication"]["slot"]
                 .as_str()
                 .ok_or_else(|| Error::rejected("publication snapshot slot is missing"))?;
@@ -535,6 +686,73 @@ impl Store {
                 "legacy snapshot cannot carry publication authority",
             ));
         }
+        if run["snapshot"]["schema"] == 4 {
+            let declared = run["snapshot"]["workflow"]["capability_slots"]
+                .as_array()
+                .ok_or_else(|| {
+                    Error::rejected("capability slots are missing from frozen workflow")
+                })?;
+            let frozen = run["snapshot"]["capabilities"]
+                .as_object()
+                .ok_or_else(|| Error::rejected("capability binding map is missing"))?;
+            let quotes = run["snapshot"]["quotes"]
+                .as_object()
+                .ok_or_else(|| Error::rejected("capability price quote map is missing"))?;
+            if (declared.is_empty() && run["snapshot"]["source"].is_null())
+                || declared.len() != frozen.len()
+                || declared.len() != quotes.len()
+                || declared.len() > 8
+            {
+                return Err(Error::rejected(
+                    "frozen capability slot set differs from workflow",
+                ));
+            }
+            for name in declared {
+                let slot = name
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("frozen capability slot is invalid"))?;
+                let quote: crate::platform::AppCapabilityQuote = serde_json::from_value(
+                    quotes
+                        .get(slot)
+                        .ok_or_else(|| Error::rejected("frozen capability quote is missing"))?
+                        .clone(),
+                )
+                .map_err(|_| Error::rejected("frozen capability quote is invalid"))?;
+                if !quote.valid() {
+                    return Err(Error::rejected("frozen capability quote is invalid"));
+                }
+                let proof: super::app_bindings::BindingProof = serde_json::from_value(
+                    frozen
+                        .get(slot)
+                        .ok_or_else(|| Error::rejected("frozen capability binding is missing"))?
+                        .clone(),
+                )
+                .map_err(|_| Error::rejected("frozen capability binding is invalid"))?;
+                if proof.config["bundle_digest"] != bundle
+                    || !matches!(
+                        proof.config["mapping"]["effect"].as_str(),
+                        Some("read" | "draft")
+                    )
+                    || !super::app_bindings::binding_current_in(
+                        conn,
+                        run["install_id"].as_str().unwrap(),
+                        run["context_id"].as_str(),
+                        slot,
+                        &proof,
+                    )?
+                {
+                    return Err(Error::rejected("frozen capability binding is stale"));
+                }
+            }
+        } else if run["snapshot"].get("capabilities").is_some()
+            || run["snapshot"]["workflow"]
+                .get("capability_slots")
+                .is_some_and(|v| !v.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err(Error::rejected(
+                "legacy snapshot cannot carry capability authority",
+            ));
+        }
         let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
         if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
             return Err(Error::rejected(
@@ -547,7 +765,7 @@ impl Store {
         let context = run["context_id"].as_str();
         if let Some(id) = context {
             let snapshot = &run["snapshot"];
-            if !matches!(snapshot["schema"].as_u64(), Some(2 | 3))
+            if !matches!(snapshot["schema"].as_u64(), Some(2..=4))
                 || snapshot["context"]["id"].as_str() != Some(id)
             {
                 return Err(Error::rejected("context snapshot association is invalid"));
@@ -635,7 +853,10 @@ impl Store {
                 ));
             }
             let message = format!("app-{id}-{step_id}-r1");
-            let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,"result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+            let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
+                "source":run["snapshot"]["source"],
+                "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
+                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
             let body = envelope.to_string();
             if body.len() > super::ENQUEUE_BYTES {
                 return Err(Error::rejected(
@@ -1174,6 +1395,70 @@ pub struct LocalRunRequest<'a> {
 }
 
 impl Store {
+    /// The socket caller and live turn select the run; a request cannot name
+    /// another run, installation, context, account, or provider.
+    pub(crate) fn app_capability_turn(
+        &self,
+        alias: &str,
+        message: &str,
+        token: &str,
+        slot: &str,
+        bundle: &str,
+    ) -> Result<(Value, String, super::app_bindings::BindingProof)> {
+        let conn = self.conn();
+        let msg = self
+            .message_in(&conn, message)?
+            .filter(|m| {
+                m.alias == alias
+                    && m.source == "app_run_dispatch"
+                    && m.state == "running"
+                    && m.turn_id.as_deref() == Some(token)
+            })
+            .ok_or_else(|| Error::rejected("capability needs the active assigned app turn"))?;
+        self.app_message_admit_in(&conn, &msg, bundle)?;
+        let (run_id, step_id, spec): (String, String, String) = conn.query_row(
+            "SELECT run_id,step_id,spec FROM app_run_steps WHERE message_id=? AND state='dispatched'",
+            [message], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        )?;
+        let step: LocalStep = serde_json::from_str(&spec)?;
+        let run = Self::app_run_show_in(&conn, &run_id)?;
+        let assigned = &run["snapshot"]["assignments"][&step_id];
+        let generation = self.agent_in(&conn, alias)?.generation;
+        if step.assignee != alias
+            || !local_token_current(
+                assigned["provider"].as_str().unwrap_or_default(),
+                assigned["endpoint_kind"].as_str().unwrap_or_default(),
+                generation.as_deref(),
+                token,
+            )
+        {
+            return Err(Error::rejected(
+                "capability turn endpoint is no longer current",
+            ));
+        }
+        if run["snapshot"]["schema"] != 4
+            || !run["snapshot"]["workflow"]["capability_slots"]
+                .as_array()
+                .is_some_and(|slots| slots.iter().any(|value| value == slot))
+        {
+            return Err(Error::rejected(
+                "slot is not in the frozen run capability set",
+            ));
+        }
+        let proof: super::app_bindings::BindingProof =
+            serde_json::from_value(run["snapshot"]["capabilities"][slot].clone())
+                .map_err(|_| Error::rejected("frozen capability binding is absent"))?;
+        if !matches!(
+            proof.config["mapping"]["effect"].as_str(),
+            Some("read" | "draft")
+        ) {
+            return Err(Error::rejected(
+                "app capability effects are read or draft only",
+            ));
+        }
+        Ok((run, step_id, proof))
+    }
+
     pub fn app_message_installation(&self, message: &str) -> Result<Option<(String, String)>> {
         Ok(self.conn().query_row("SELECT r.id,r.install_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.message_id=?",[message],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
     }
