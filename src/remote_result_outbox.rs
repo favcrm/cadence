@@ -589,6 +589,12 @@ fn validate_journal_file(path: &Path) -> Result<()> {
 fn journal_needs_recheck(path: &Path, file: &File) -> Result<bool> {
     let metadata = file.metadata()?;
     if metadata.nlink() == 0 {
+        if metadata.uid() != unsafe { libc::geteuid() } || !private_file_fields(&metadata) {
+            return Err(unsafe_private_path());
+        }
+        if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+            return Err(corrupt());
+        }
         // The opened inode is no longer reachable through this name. Do not
         // reject a completed SQLite transaction; inspect any replacement on
         // the next iteration, including symlinks and hardlinks.
@@ -882,15 +888,19 @@ fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
         && if directory {
             meta.is_dir() && meta.mode() & 0o777 == 0o700
         } else {
-            meta.is_file() && meta.mode() & 0o777 == 0o600 && meta.nlink() == 1
+            private_file_fields(meta) && meta.nlink() == 1
         };
     if safe {
         Ok(())
     } else {
-        Err(Error::rejected(
-            "Offline outbox paths must be private, owned and not symlinks",
-        ))
+        Err(unsafe_private_path())
     }
+}
+fn private_file_fields(meta: &fs::Metadata) -> bool {
+    meta.is_file() && meta.mode() & 0o777 == 0o600
+}
+fn unsafe_private_path() -> Error {
+    Error::rejected("Offline outbox paths must be private, owned and not symlinks")
 }
 fn verify_header(file: &mut File) -> Result<u32> {
     let mut header = [0u8; 100];
@@ -957,5 +967,23 @@ mod journal_race_tests {
         assert!(validate_journal_file(&journal).is_err());
         fs::remove_file(&hardlink).unwrap();
         conn.execute_batch("COMMIT;").unwrap();
+
+        let non_private = root.path().join("non-private-journal");
+        fs::write(&non_private, b"not private").unwrap();
+        fs::set_permissions(&non_private, fs::Permissions::from_mode(0o644)).unwrap();
+        let non_private_file = File::open(&non_private).unwrap();
+        fs::remove_file(&non_private).unwrap();
+        assert!(journal_needs_recheck(&non_private, &non_private_file).is_err());
+
+        let fifo = root.path().join("fifo-journal");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let fifo_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&fifo)
+            .unwrap();
+        fs::remove_file(&fifo).unwrap();
+        assert!(journal_needs_recheck(&fifo, &fifo_file).is_err());
     }
 }
