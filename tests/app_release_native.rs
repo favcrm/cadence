@@ -162,6 +162,43 @@ fn cad714_required_asset_refuses_caption_only_review_and_native_release() {
 }
 
 #[test]
+fn cad714_required_asset_allows_unpinned_revise_with_reviewer_rationale() {
+    let (h, _, _) = Release::with_required_asset();
+    let context = h.context("Client A", A, "required-revise-context");
+    h.bind(&context, "required-revise-publication");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"], "context_id":context["id"],
+                "slot":"source", "connection_id":h.connection,
+                "request_id":"required-revise-source"
+            }),
+        )
+        .unwrap();
+    let run = h.create(&context, "required-revise-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-review-asset-override-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"decision":"revise","rationale":"The caption needs a factual correction."})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let failed = h.wait_state(run["id"].as_str().unwrap(), "failed");
+    assert_eq!(failed["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(failed["reviews"][0]["decision"], "revise");
+    assert_eq!(
+        failed["reviews"][0]["rationale"],
+        "The caption needs a factual correction."
+    );
+    assert!(failed["reviews"][0]["asset_receipt_id"].is_null());
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
 fn cad714_required_asset_refuses_receipt_from_another_declared_slot() {
     let (h, _, _) = Release::with_mismatched_required_asset();
     let context = h.context("Client A", A, "required-slot-context");

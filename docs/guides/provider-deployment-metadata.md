@@ -5,13 +5,30 @@ The hosted image composition may bake `/etc/cadence/provider-deployments.json`:
 ```json
 {
   "schema": 1,
-  "providers": [{
-    "provider": "agenticos",
-    "origin": "http://api.internal",
-    "manifest_pin": "agenticos-manifest@1/publish_post@2"
-  }]
+  "providers": [
+    {
+      "provider": "agenticos",
+      "origin": "http://api.internal",
+      "manifest_pin": "agenticos-manifest@1/publish_post@2"
+    },
+    {
+      "provider": "agenticos_external",
+      "origin": "https://api-v2.agenticos.hk",
+      "manifest_pin": "agenticos-external-provider-tools@1",
+      "image_hosts": ["cdn.example.invalid"]
+    }
+  ]
 }
 ```
+
+The external entry is illustrative. Replace `cdn.example.invalid` only with
+the exact lowercase public DNS hostname independently verified for the image
+provider's returned URLs; it is not a live CDN assertion. Source reads may
+omit `image_hosts`. An absent or nonmatching image host keeps image acquisition
+closed, even when the manifest pin matches. At most four distinct hosts are
+allowed; each is a hostname, not a URL, wildcard or IP address. The image
+fetch refuses redirects and proxies, resolves once, and rejects private or
+non-public addresses before retaining bounded bytes.
 
 This is an image-owned assertion about an independently reviewed deployed
 contract. It is not remote discovery, an account binding, consent, a credential,
@@ -34,6 +51,12 @@ AgenticOS pin classifies `publish_post` as a draft approval handoff; AgenticOS
 still owns approval. The existing runtime door sends the exact content hash and
 durable idempotency key to `/v1/runtime/connectors/publish`. No app-effect guard,
 grant, or outward release approval is bypassed.
+
+The separate `agenticos_external` pin identifies the exact deployed external
+provider-tools contract for priced Social Content reads and drafts. The app
+cannot supply or change its origin, manifest pin or image host allowlist.
+An exact pin is necessary but does not grant a device credential, approve a
+quote, or authorize a paid call.
 
 Embedding code may supply typed `ServeOptions::provider_deployments` instead of
 the fixed file. This is a programmatic trusted-composition seam, never serialized

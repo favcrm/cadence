@@ -5,9 +5,10 @@ optional discovery metadata; it does not select a team, grant permission
 or create a project. Legacy project plans keep their existing commands
 and history.
 
-The first executor supports text production and independent text review.
-The installable example is `apps/local-content`, with workflow `draft`.
-It needs no external connection or AgenticOS provider. A configured,
+The executor supports text production and independent text review. A reviewed
+capability call may also retain one run-scoped binary asset for the reviewer.
+The installable text-only example is `apps/local-content`, with workflow
+`draft`; it needs no external connection or AgenticOS provider. A configured,
 registered worker still supplies the actual model execution.
 Use a managed Pi, Claude or Codex worker for this increment. Terminal
 workers are unsupported: their notice delivery requires a separate
@@ -49,11 +50,17 @@ registered workers in the explicitly selected owner group. It does not
 enroll workers or infer a team from the selected project.
 
 `uses` continues to name declared connection slots. It does not name an
-execution action. The local executor refuses connection use, unsupported
-actions, retry/reviewer metadata it cannot execute, and workflows requiring
-external sends, repository files, images or binary artifacts. The existing
-Social Content package requires those further capabilities; its presence
-in the catalog does not make that workflow runnable here.
+execution action. The local executor refuses unsupported actions, arbitrary
+repository files and external sends. A workflow may declare bounded
+`capability_slots`; each call uses a frozen binding, quote and run approval,
+not a worker-selected provider tool. An image workflow declares
+`required_asset_slot: image` in frontmatter, naming a declared capability
+slot. That requirement is part of the approval digest and frozen snapshot:
+the independent reviewer must pin the exact retained asset to approve, and
+Local staging checks it again. A `revise` verdict can carry its rationale
+without approving an asset. Text-only workflows need no asset pin. Installing
+Social Content alone does not create a connection, consent, quote approval or
+release authority.
 
 ## Operator flow
 
@@ -164,10 +171,11 @@ old results into new execution authority.
 
 ## Approval and recovery boundaries
 
-Installation capability approval, run execution approval and outward
-release are separate. This executor produces local run-owned artifacts;
-it creates no publish effect or outbox item. Those outputs do not imply
-Instagram/Facebook publishing, image generation or deck export.
+Installation capability approval, run execution approval, any priced provider
+call, and outward release are separate. This executor produces run-owned text
+artifacts and may retain a bounded binary capability asset; it creates no
+publish effect or outbox item by itself. Retained material does not imply
+Instagram/Facebook publishing or a Local release.
 
 Every dispatch checks the current installation, approval revision, frozen
 team and dependencies. Cancellation, revocation or material package change
@@ -188,9 +196,10 @@ An audit read grants no execution authority. Local
 artifact capabilities govern the broker; they do not claim shell or tool
 confinement for a worker's unrelated work.
 
-Catalog storage remains filesystem schema1. Persisted local runs add
-SQLite schema20 through an additive migration from schema19. Source merge
-and production rollout are separate operations managed by the rollout owner.
+Catalog storage remains filesystem schema1. Persisted local runs began in
+SQLite schema20; later additive migrations through schema25 store the
+capability asset receipt and optional reviewer pin. Source merge and
+production rollout are separate operations managed by the rollout owner.
 
 `owner_pm` is registered group and routing metadata, not material-read or
 execution authority. Reusing that alias does not grant app lifecycle decisions

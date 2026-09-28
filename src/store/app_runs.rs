@@ -1307,7 +1307,7 @@ impl Store {
                     if let Some((id,digest,producer))=tx.query_row("SELECT id,digest,producer FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![run_id,producer_step_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
                         let required_asset_slot = run["snapshot"]["workflow"]["required_asset_slot"].as_str();
                         let asset_valid = match (&asset_receipt_id,&asset_sha256) {
-                            (None,None) => required_asset_slot.is_none(),
+                            (None,None) => decision=="revise" || required_asset_slot.is_none(),
                             (Some(receipt_id),Some(asset_digest)) if decision=="approve" => {
                                 super::app_capabilities::asset_material_in(tx,receipt_id)
                                     .is_ok_and(|(receipt,_)| receipt["receipt_schema"]==2
