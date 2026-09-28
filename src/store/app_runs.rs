@@ -1633,6 +1633,33 @@ impl LocalWorkflow {
     }
 }
 impl Store {
+    /// Called while holding the PM lock: admission cannot race another run
+    /// creation. Terminal history stays in SQLite; no active turn is retired.
+    pub fn app_install_upgrade_ready(&self, install: &str) -> Result<()> {
+        let conn = self.conn();
+        let active: i64 = conn.query_row(
+            "SELECT count(*) FROM app_runs WHERE install_id=? AND state IN ('awaiting_approval','approved','running')",
+            [install],
+            |row| row.get(0),
+        )?;
+        if active != 0 {
+            return Err(Error::rejected(
+                "installation has a nonterminal run; finish or explicitly cancel it before upgrade",
+            ));
+        }
+        let grants: i64 = conn.query_row(
+            "SELECT count(*) FROM app_grants WHERE install_id=?",
+            [install],
+            |row| row.get(0),
+        )?;
+        if grants != 0 {
+            return Err(Error::rejected(
+                "installation has derived grants; revoke them before upgrade",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn app_capability_status(&self, id: &str, digest: &str) -> Result<Value> {
         Ok(self
             .conn()

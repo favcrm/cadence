@@ -234,6 +234,7 @@ impl Shared {
                         .map(|context| self.store.app_context_proof(id, context))
                         .transpose()?;
                     if let Some((config, _)) = &context {
+                        super::app_contexts_rpc::validate_defaults(files, &config.input_defaults)?;
                         let defaults: BTreeMap<_, _> = config
                             .input_defaults
                             .iter()
