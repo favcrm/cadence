@@ -43,6 +43,23 @@ fn preview_url(value: &str) -> Option<&str> {
     }
 }
 
+fn verified_profile(user: &Value, handle: &str) -> Result<(), String> {
+    let user = user
+        .as_object()
+        .ok_or("source profile identity is malformed")?;
+    if user.get("is_private") != Some(&Value::Bool(false)) {
+        return Err("source profile is private or privacy is unknown".into());
+    }
+    if !user
+        .get("username")
+        .and_then(Value::as_str)
+        .is_some_and(|found| found.eq_ignore_ascii_case(handle))
+    {
+        return Err("source post profile identity changed".into());
+    }
+    Ok(())
+}
+
 pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, String> {
     if !valid_handle(handle) {
         return Err("source handle is invalid".into());
@@ -62,25 +79,20 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
         .get("items")
         .and_then(Value::as_array)
         .ok_or("source post list is missing")?;
+    // The published full response includes a top-level user and each post's
+    // user. The catalog example truncates posts, so validate every identity
+    // supplied and require at least one attested account for each post.
+    let top_user = body.get("user");
+    if let Some(user) = top_user {
+        verified_profile(user, handle)?;
+    }
     let mut posts = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for row in items.iter().take(MAX_POSTS) {
-        // The reviewed Scrape Creators response embeds the posting account
-        // in every item; it does not promise a top-level user. An empty page
-        // therefore cannot attest the profile's identity or privacy.
-        let user = row
-            .get("user")
-            .and_then(Value::as_object)
-            .ok_or("source post profile is missing")?;
-        if user.get("is_private") == Some(&Value::Bool(true)) {
-            return Err("source profile is private".into());
-        }
-        if !user
-            .get("username")
-            .and_then(Value::as_str)
-            .is_some_and(|found| found.eq_ignore_ascii_case(handle))
-        {
-            return Err("source post profile identity changed".into());
+        if let Some(user) = row.get("user") {
+            verified_profile(user, handle)?;
+        } else if top_user.is_none() {
+            return Err("source post profile is missing".into());
         }
         let id = row
             .get("id")
@@ -129,7 +141,12 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
         let image_url = row
             .pointer("/image_versions2/candidates/0/url")
             .and_then(Value::as_str)
-            .and_then(preview_url);
+            .and_then(preview_url)
+            .or_else(|| {
+                row.get("display_uri")
+                    .and_then(Value::as_str)
+                    .and_then(preview_url)
+            });
         let kind = match row.get("media_type").and_then(Value::as_u64) {
             Some(1) => "image",
             Some(2) => "video",
@@ -146,7 +163,7 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
             "preview_url": image_url,
         }));
     }
-    let profile_verified = !posts.is_empty();
+    let profile_verified = top_user.is_some() || !posts.is_empty();
     Ok(json!({
         "schema": 1,
         "kind": "social.source.posts",
@@ -154,7 +171,7 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
         "source_tool": "scrapecreators.instagram.user.posts",
         "handle": handle,
         "profile_verified": profile_verified,
-        "empty_reason": if profile_verified { None } else { Some("no_public_posts_or_unavailable") },
+        "empty_reason": if posts.is_empty() { Some("no_public_posts_or_unavailable") } else { None },
         "posts": posts,
         "more_available": body.get("more_available").and_then(Value::as_bool).unwrap_or(false) || items.len() > MAX_POSTS,
     }))
@@ -165,7 +182,7 @@ mod tests {
     use super::*;
 
     fn reply() -> Value {
-        json!({"success":true,"status":"ok","items":[
+        json!({"success":true,"status":"ok","user":{"username":"juicysuite_crm","is_private":false},"items":[
             {"id":"123","code":"D7_aB-2","user":{"username":"juicysuite_crm","is_private":false},"caption":{"text":"Original facts"},"created_at":"2026-09-27T01:00:00Z","media_type":1,"image_versions2":{"candidates":[{"url":"https://scontent.cdninstagram.com/image.jpg"}]}},
             {"id":"456","code":"D7CD","user":{"username":"juicysuite_crm","is_private":false},"caption":null,"taken_at":1790470800,"media_type":8,"image_versions2":{"candidates":[{"url":"http://127.0.0.1/private"}]}}
         ]})
@@ -187,6 +204,31 @@ mod tests {
         assert_eq!(page["posts"][1]["media_kind"], "carousel");
         assert_eq!(page["handle"], "juicysuite_crm");
         assert_eq!(page["profile_verified"], true);
+    }
+
+    #[test]
+    fn top_level_profile_attests_posts_when_catalog_omits_nested_user() {
+        let mut page = reply();
+        page["items"][0].as_object_mut().unwrap().remove("user");
+        page["items"][0]["image_versions2"]["candidates"][0]["url"] =
+            json!("http://127.0.0.1/private");
+        page["items"][0]["display_uri"] = json!("https://instagram.fbcdn.net/display.jpg");
+        let normalized = normalize_posts("juicysuite_crm", &page).unwrap();
+        assert_eq!(normalized["profile_verified"], true);
+        assert_eq!(
+            normalized["posts"][0]["preview_url"],
+            "https://instagram.fbcdn.net/display.jpg"
+        );
+        page["user"]["username"] = json!("other_brand");
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        page["user"]["username"] = json!("juicysuite_crm");
+        page["user"]["is_private"] = json!(true);
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        page["user"].as_object_mut().unwrap().remove("is_private");
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        page["user"]["is_private"] = json!(false);
+        page.as_object_mut().unwrap().remove("user");
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
     }
 
     #[test]
@@ -217,7 +259,13 @@ mod tests {
         page["items"] = json!([]);
         let empty = normalize_posts("juicysuite_crm", &page).unwrap();
         assert!(empty["posts"].as_array().unwrap().is_empty());
-        assert_eq!(empty["profile_verified"], false);
+        assert_eq!(empty["profile_verified"], true);
+        assert_eq!(empty["empty_reason"], "no_public_posts_or_unavailable");
+        page.as_object_mut().unwrap().remove("user");
+        assert_eq!(
+            normalize_posts("juicysuite_crm", &page).unwrap()["profile_verified"],
+            false
+        );
         page["status"] = json!("rate_limited");
         assert!(normalize_posts("juicysuite_crm", &page).is_err());
         page["status"] = json!("ok");
