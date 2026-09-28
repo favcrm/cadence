@@ -1037,6 +1037,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         release_shutdown_snapshot: None,
         #[cfg(feature = "test-seam")]
         after_done_write_failure: None,
+        #[cfg(feature = "test-seam")]
+        after_done_retry_saved: None,
         // CAD-199: the agent-gc timer stays off unless a test pins it.
         agent_gc: Some(daemon::AgentGcSetting::default()),
         // CAD-96: idle auto-stop is ON by default in production; test

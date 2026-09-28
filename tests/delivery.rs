@@ -3189,13 +3189,35 @@ fn delivery_agent_cannot_mark_ticket_done() {
 /// the tracker takes writes again, and the row goes.
 #[test]
 fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
-    let mut lf = LoopFixture::dispatched_plan_with(
-        LOOP_PLAN,
+    #[cfg(feature = "test-seam")]
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[cfg(feature = "test-seam")]
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    #[cfg(feature = "test-seam")]
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let options = daemon::ServeOptions {
+        report_router: Some(3600),
+        ..daemon_opts()
+    };
+    #[cfg(feature = "test-seam")]
+    let options = {
+        let release_rx = Mutex::new(release_rx);
         daemon::ServeOptions {
-            report_router: Some(3600),
-            ..daemon_opts()
-        },
-    );
+            after_done_retry_saved: Some(Arc::new(move |id| {
+                if id == "D-3" {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap();
+                }
+            })),
+            ..options
+        }
+    };
+    let mut lf = LoopFixture::dispatched_plan_with(LOOP_PLAN, options);
     for id in ["D-3", "D-4"] {
         let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
         assert!(ok, "{id}: {sent}");
@@ -3241,36 +3263,38 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     // A failing commit hook.
     lf.pass_on_with_hint("D-3", &b, "https://github.com/acme/app/pull/8", true);
     let d3_status = lf.f.front("D-3").status;
-    let hooks = String::from_utf8(git(&["rev-parse", "--git-path", "hooks"]).stdout).unwrap();
-    let hooks = lf.f.pm_dir.join(hooks.trim());
-    std::fs::create_dir_all(&hooks).unwrap();
-    let hook = hooks.join("pre-commit");
-    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let (hook, done_runs) = refuse_done_commits(&lf);
+    let hooks = hook.parent().unwrap().to_path_buf();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     lf.set_gh(&b, "MERGED", true, false);
     let row3 = lf.sync_of("D-3");
     assert_eq!(row3["ticket"]["outcome"], "pending", "{row3}");
-    // Retry while the hook still refuses the write. A hook-run count
-    // includes notice commits and cannot tell whether a done attempt
-    // completed; wait for the persisted second attempt instead.
-    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
-    let pending = lf.wait_of("D-3", "second failed done attempt", |r| {
-        r["ticket_done"]["attempts"] == 2
-    });
-    assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
-    // Hold the tracker lock while checking that the failed retry left
-    // neither issue.md nor the index changed.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_err()
+    // Under CI's test-seam feature, stop the router after the second
+    // failed done write is saved as pending. It holds delivery_lock,
+    // not the tracker lock: inspection and the independent writer cannot
+    // consume the third attempt or carry staged done status.
+    #[cfg(feature = "test-seam")]
     {
-        assert!(Instant::now() < deadline, "the tracker lock never freed");
-        thread::sleep(Duration::from_millis(20));
+        lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let pending = lf.rec_of("D-3");
+        assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
+        assert_eq!(pending["ticket_done"]["attempts"], 2, "{pending}");
+        assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
+        assert_eq!(
+            std::fs::read_to_string(&done_runs).unwrap().lines().count(),
+            2,
+            "the hook counts only done writes"
+        );
     }
+    // Without the seam, the first completed failure still proves the
+    // rollback and recovery contract; the separate bounded-retry test
+    // proves three permanent failures under both feature shapes.
+    #[cfg(not(feature = "test-seam"))]
+    assert_eq!(
+        std::fs::read_to_string(&done_runs).unwrap().lines().count(),
+        1
+    );
     assert_eq!(lf.f.front("D-3").status, d3_status);
     assert!(
         git(&["diff", "--cached", "--quiet"]).status.success(),
@@ -3283,10 +3307,8 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
             .is_empty(),
         "a failed done write left issue.md changed"
     );
-    // Heal the hook before releasing the tracker to any router pass.
+    // Heal the hook while the seam prevents another delivery pass.
     std::fs::remove_file(&hook).unwrap();
-    std::fs::remove_file(&lock).unwrap();
-    assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
     // The next writer after the hook is gone commits only its own file.
     let (ok, out) =
         lf.f.cli_as("w1", &["issue", "comment", "D-3", "-m", "progress"]);
@@ -3301,6 +3323,8 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         "w1's comment committed D-3's status: {comment}"
     );
     lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    #[cfg(feature = "test-seam")]
+    release_tx.send(()).unwrap();
     lf.wait_of("D-3", "marked by a retry", |r| {
         r["ticket_done"]["outcome"] == "marked"
     });

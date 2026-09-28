@@ -446,6 +446,8 @@ pub struct Shared {
     wiki_index: Arc<crate::wiki::index::IndexRefresh>,
     #[cfg(feature = "test-seam")]
     after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "test-seam")]
+    after_done_retry_saved: Option<DoneRetrySavedHook>,
 }
 
 impl Shared {
@@ -593,6 +595,8 @@ impl Shared {
             seam,
             #[cfg(feature = "test-seam")]
             after_done_write_failure: opts.after_done_write_failure.clone(),
+            #[cfg(feature = "test-seam")]
+            after_done_retry_saved: opts.after_done_retry_saved.clone(),
             devin_catalog: crate::devin_catalog::CatalogCache::default(),
             wiki_index: crate::wiki::index::IndexRefresh::new(
                 state_dir.to_path_buf(),
@@ -3554,6 +3558,10 @@ fn group_root_reason(agent: &Agent, roots: &HashSet<String>) -> Option<&'static 
     }
 }
 
+/// Test-only callback for a persisted second failed done write.
+#[cfg(feature = "test-seam")]
+pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
@@ -3581,6 +3589,10 @@ pub struct ServeOptions {
     /// transaction releases its tracker lock. Never present in release.
     #[cfg(feature = "test-seam")]
     pub after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test-only pause after a failed retry is saved as pending, while
+    /// delivery_lock still excludes the next router pass.
+    #[cfg(feature = "test-seam")]
+    pub after_done_retry_saved: Option<DoneRetrySavedHook>,
     /// CAD-199 agent-gc timer: `Some` is verbatim (tests keep daemons
     /// hermetic this way); `None` reads `[host]
     /// agent_gc_older_than_secs` from pm.yaml each check — unset is off.
