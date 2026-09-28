@@ -1,8 +1,8 @@
 ---
 app: social-content
 title: Social Content
-version: '0.4.0'
-summary: Choose a retained public Instagram source, review a zh-HK caption, and optionally retain one generated image before Local release.
+version: '0.5.0'
+summary: Draft a reviewed zh-HK caption and optional image from retained Instagram or pasted facts with per-post content and image guidance before Local release.
 needs:
   connections: []
   capabilities:
@@ -54,11 +54,16 @@ a writer and a reviewer. Supply their aliases and the owner PM on every
 run; brand settings never select workers or grant provider authority.
 
 For repeated work with a client, optionally create an app context with
-`brand_voice` and `protected_terms` string defaults. Both are explicitly
-eligible content defaults in both caption workflows. The source is always a
-new run input. A context is optional; omitting it creates a context-free run.
-Brand guidance and protected terms are quoted content, never commands
-that can override factual fidelity, the rubric or the result contract.
+`brand_voice`, `protected_terms`, `content_prompt` and `image_prompt` string
+defaults. The two prompts also have app defaults. An empty per-post prompt
+field resolves to the saved context value, then the app default. A nonempty
+field overrides only that post. The effective values and their origin are
+frozen in its run snapshot before approval; later context edits cannot
+rewrite that run. Prompt guidance is bounded to one visible line, 512
+characters and 2,048 UTF-8 bytes. The source is always a new run input or
+a selected receipt, never a context default. A context is optional.
+All guidance is quoted content below factual fidelity, formatting, image
+safety, the rubric and the result contract.
 
 To allow a later Local release, list connections and create a
 `publication` binding before creating the run. Use the exact returned
@@ -103,7 +108,7 @@ single-line `source` input for the text workflow. A later rebind, revoke
 or different context cannot authorize an old receipt. A preview image URL
 is a display hint, not a retained image asset.
 
-## Generate one image from a retained post
+## Generate one image from a retained post or pasted facts
 
 An operator may bind the `image` capability to a company-scoped AgenticOS
 device connection with `provider.draft` scope. This binding requires an
@@ -114,11 +119,14 @@ after a separately approved capped probe confirms the real provider
 response. The provider's temporary URL is never the reviewed image.
 
 Create an `image-instagram` run using a selected source receipt and post in
-the same installation/context, a short subject, a writer and an independent
-reviewer. The run freezes the selected caption, brand voice and current one-image charge.
+the same installation/context. For operator-pasted facts, create an
+`image-manual` run with `inputs.source` and no receipt. Both require a short
+subject, writer and independent reviewer. A URL alone is not source facts.
+The run freezes source facts, effective content and image prompts, brand
+voice and the current one-image charge.
 The operator approves that exact run and cost before dispatch. The worker
 calls the `image` capability with an empty object; it cannot choose the
-provider, model, image count, prompt, aspect ratio or destination. The
+provider, model, image count, image guidance, aspect ratio or destination. The
 broker retains only a PNG, JPEG or WebP of at most 2 MiB that fully decodes
 to a nonzero square no wider than 2048 pixels (at most 4,194,304 pixels),
 within a 64 MiB decoder allocation budget. Corrupt, non-square, oversized
@@ -136,8 +144,9 @@ in the workflow; there is no comma-separated destination input. For both
 channels, create a separate run so each caption has its own review and
 release receipt.
 
-Supply `subject`, `source`, `writer` and `reviewer`. `brand_voice` and
-`protected_terms` are optional. Inputs currently require a single line:
+Supply `subject`, `source`, `writer` and `reviewer`. `brand_voice`,
+`protected_terms`, `content_prompt` and `image_prompt` are optional.
+The image prompt applies only to image-enabled workflows. Inputs require a single line:
 paste source facts as plain text with spaces between original lines,
 retaining exact names, prices, URLs, claims and disclaimer wording. A
 URL alone is not source material; paste the actual facts. Newlines and

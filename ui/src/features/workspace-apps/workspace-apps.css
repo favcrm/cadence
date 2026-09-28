@@ -322,6 +322,9 @@ textarea.wa-input {
   resize: vertical;
   min-height: 10rem;
 }
+textarea.wa-prompt-input {
+  min-height: 5rem;
+}
 .wa-input:disabled {
   opacity: 0.6;
 }

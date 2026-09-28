@@ -81,7 +81,7 @@ export function SourcesPanel({ runs, canWrite, canCreate, imageSupported, onImpo
       </div>
       <Button onClick={onImport} disabled={!canWrite}>Find public posts</Button>
     </div>
-    {!runs.length && <p className="wa-panel wa-empty">No source reads yet. Bind an AgenticOS provider connection in Settings, then find a public profile.</p>}
+    {!runs.length && <p className="wa-panel wa-empty">No source reads yet. Choose an Instagram source in Cadence Settings, then find a public profile.</p>}
     {runs.map(run => {
       const list = receipts[run.id];
       return <section key={run.id} className="wa-panel wa-stack">

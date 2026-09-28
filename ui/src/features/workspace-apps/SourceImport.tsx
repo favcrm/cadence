@@ -61,7 +61,7 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
   };
   return <WorkspaceDialog title="Find Instagram source" onClose={onClose}>
     <form className="wa-stack" onSubmit={submit}>
-      <p className="wa-muted">Read recent public posts through this installation’s bound AgenticOS connection. The provider’s current charge appears below. You’ll approve the exact frozen price and plan before a worker starts it.</p>
+      <p className="wa-muted">Read recent public posts through this app’s Instagram source connection. Cadence shows the current provider charge below; you approve the exact frozen price and plan before a worker starts.</p>
       {quote ? <p className="wa-alert">Current provider charge for one read: <strong>USD {(quote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong>. The plan will freeze this price; a change before execution stops the call.</p> : !quoteError && <p className="wa-muted" role="status">Checking provider price…</p>}
       {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError}</p>}
       {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || validation}</p>}

@@ -190,6 +190,11 @@ CREATE TABLE IF NOT EXISTS app_run_reviews(
  PRIMARY KEY(run_id,step_id), FOREIGN KEY(run_id,step_id) REFERENCES app_run_steps(run_id,step_id));
 ";
 
+pub struct LocalRunProvenance<'a> {
+    pub selected_source: Option<(&'a str, &'a str)>,
+    pub input_origins: &'a BTreeMap<String, String>,
+}
+
 impl Store {
     pub(super) fn refuse_app_task(conn: &Connection, task_id: &str) -> Result<()> {
         if conn
@@ -263,7 +268,10 @@ impl Store {
             binding,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            None,
+            LocalRunProvenance {
+                selected_source: None,
+                input_origins: &BTreeMap::new(),
+            },
         )
     }
     pub fn app_run_create_with_capabilities(
@@ -273,8 +281,12 @@ impl Store {
         binding: Option<&super::app_bindings::BindingProof>,
         capabilities: &BTreeMap<String, super::app_bindings::BindingProof>,
         quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
-        selected_source: Option<(&str, &str)>,
+        provenance: LocalRunProvenance<'_>,
     ) -> Result<Value> {
+        let LocalRunProvenance {
+            selected_source,
+            input_origins,
+        } = provenance;
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -463,6 +475,9 @@ impl Store {
             assignments.insert(step.id.clone(),json!({"alias":agent.alias,"identity_digest":generation,"identity":Self::agent_identity(&agent),"role":agent.role,"provider":agent.provider,"endpoint_kind":agent.endpoint_kind}));
         }
         let mut snapshot = json!({"schema":1,"install_id":install_id,"bundle_digest":bundle_digest,"epoch":epoch,"workflow":workflow,"inputs":inputs,"assignments":assignments,"owner_pm":owner_pm,"project_link":project_link,"artifact_policy":{"types":["text/plain","text/markdown"],"max_bytes":ARTIFACT_BYTES,"aggregate_bytes":RUN_ARTIFACT_BYTES}});
+        if !input_origins.is_empty() {
+            snapshot["input_origins"] = json!(input_origins);
+        }
         if let Some(proof) = context {
             snapshot["schema"] = json!(2);
             snapshot["context"] =
