@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type ImageReceipt, type WorkspaceRun } from "./workspaceApps";
 
@@ -33,47 +33,62 @@ async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, signal: A
   return `data:${meta.media_type};base64,${asset.base64}`;
 }
 
-export type VerifiedImage = { runId: string; receiptId: string; digest: string };
+export function imageSubject(run: WorkspaceRun) {
+  return JSON.stringify([run.id, run.snapshot.capabilities?.image?.digest, run.snapshot.source?.receipt_id, run.snapshot.source?.post.id]);
+}
+
+export type VerifiedImage = { runId: string; receiptId: string; digest: string; subject: string };
 
 export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: WorkspaceRun; onDenied: () => void; onVerified: (image: VerifiedImage | null) => void }) {
   const [receipt, setReceipt] = useState<ImageReceipt | null>(null);
   const [image, setImage] = useState<string | null>(null);
+  const [verifiedSubject, setVerifiedSubject] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const subject = imageSubject(run);
+  const priorSubject = useRef<string | null>(null);
   useEffect(() => {
-    setReceipt(null); setImage(null); setError(null);
+    // A status-only update must not hide bytes already verified for this run
+    // while the repeated read is pending. A different receipt subject cannot
+    // inherit those bytes, and every new read revokes release until it verifies.
+    if (priorSubject.current !== subject) { setReceipt(null); setImage(null); setVerifiedSubject(null); }
+    priorSubject.current = subject;
+    setError(null);
     onVerified(null);
     const controller = new AbortController();
     setLoading(true);
     void workspaceApps.imageResults(run.id, controller.signal).then(async results => {
       if (controller.signal.aborted) return;
       const matches = results.filter(value => value.slot === "image");
-      if (matches.length === 0) return;
+      if (matches.length === 0) { setReceipt(null); setImage(null); return; }
       if (matches.length !== 1) throw new Error("This run has ambiguous image receipts.");
       const source = await retainedImage(matches[0], run, controller.signal);
       if (!controller.signal.aborted) {
-        setReceipt(matches[0]); setImage(source);
-        onVerified({ runId: run.id, receiptId: matches[0].id, digest: matches[0].asset!.digest });
+        setReceipt(matches[0]); setImage(source); setVerifiedSubject(subject);
+        onVerified({ runId: run.id, receiptId: matches[0].id, digest: matches[0].asset!.digest, subject });
       }
     }).catch(reason => {
       if (controller.signal.aborted) return;
+      setReceipt(null); setImage(null); setVerifiedSubject(null);
       if (reason instanceof ApiError && [401, 403].includes(reason.status)) { onDenied(); return; }
       setError(reason instanceof Error ? reason.message : "Could not inspect retained image bytes.");
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [run.id, run.state, run.snapshot.capabilities?.image?.digest, onDenied, onVerified]);
-  const approved = receipt && run.reviews.some(review => review.decision === "approve"
-    && review.asset_receipt_id === receipt.id && review.asset_digest === receipt.asset?.digest);
+  }, [subject, run.state, onDenied, onVerified]);
+  const visibleReceipt = verifiedSubject === subject ? receipt : null;
+  const visibleImage = verifiedSubject === subject ? image : null;
+  const approved = visibleReceipt && run.reviews.some(review => review.decision === "approve"
+    && review.asset_receipt_id === visibleReceipt.id && review.asset_digest === visibleReceipt.asset?.digest);
   return <section className="wa-stack" aria-label="Retained generated image">
     <h3>Generated image</h3>
     {run.state === "failed" && <p className="wa-alert" data-tone="fail" role="status">This run did not complete. Any retained image remains available for inspection, but Local release is blocked.</p>}
     {loading && <p className="wa-muted" role="status">Checking retained image bytes…</p>}
     {error && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
-    {!loading && !receipt && !error && <p className="wa-muted">No image asset has been retained yet. A provider URL or worker description cannot stand in for one.</p>}
-    {image && receipt?.asset && <figure className="wa-retained-image">
-      <img src={image} alt="Generated draft awaiting review against the selected source" width="512" height="512" />
-      <figcaption>{receipt.asset.media_type} · {receipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
+    {!loading && !visibleReceipt && !error && <p className="wa-muted">No image asset has been retained yet. A provider URL or worker description cannot stand in for one.</p>}
+    {visibleImage && visibleReceipt?.asset && <figure className="wa-retained-image">
+      <img src={visibleImage} alt="Generated draft awaiting review against the selected source" width="512" height="512" />
+      <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
     </figure>}
-    {receipt?.asset && <p className="wa-digest">Receipt {receipt.id}<br />{receipt.asset.digest}</p>}
+    {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}
   </section>;
 }

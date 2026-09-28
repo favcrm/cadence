@@ -17,7 +17,7 @@ import { WorkspaceDialog } from "./WorkspaceDialog";
 import { NewPost, type NewPostValues, type SelectedSource } from "./NewPost";
 import { SourceImport, type SourceImportValues } from "./SourceImport";
 import { SourcesPanel } from "./SourcesPanel";
-import { ImageReceiptPanel, type VerifiedImage } from "./ImageReceiptPanel";
+import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import {
   workspaceApps,
@@ -1141,6 +1141,7 @@ export default function WorkspaceApp({
                       review.artifact_digest === artifact.digest &&
                       review.decision === "approve" &&
                       (!isImageRun(run) || (verifiedImage?.runId === run.id
+                        && verifiedImage.subject === imageSubject(run)
                         && review.asset_receipt_id === verifiedImage.receiptId
                         && review.asset_digest === verifiedImage.digest)),
                   ) && (
