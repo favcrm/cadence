@@ -113,6 +113,58 @@ fn trailer_share(pm_dir: &Path) -> Value {
     json!({"window": checked, "with_trailers": with_actor})
 }
 
+/// Dirty worktree paths no tracker write owns — a file dropped
+/// out-of-band and never committed sits foreign under every later
+/// write's eye, warning each time (CAD-759). Each is named with its
+/// mtime age; `.write.lock` and `.index/` are the tracker's own
+/// scratch. `ok` only when the tree is clean of them.
+fn foreign_dirty(pm_dir: &Path) -> Value {
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(pm_dir).args([
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+    ]));
+    let Ok(out) = out else {
+        return json!({"ok": false, "error": "git status failed"});
+    };
+    if !out.status.success() {
+        return json!({"ok": false, "error": "git status failed"});
+    }
+    let now = crate::issue::time::now_epoch();
+    let mut paths: Vec<Value> = Vec::new();
+    let mut note = |p: &str| {
+        if p == ".write.lock" || p.starts_with(".index/") {
+            return;
+        }
+        let age_secs = std::fs::metadata(pm_dir.join(p))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (now - d.as_secs() as i64).max(0));
+        paths.push(json!({"path": p, "age_secs": age_secs}));
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split('\0');
+    while let Some(rec) = fields.next() {
+        if rec.len() < 4 || rec.as_bytes()[2] != b' ' {
+            continue;
+        }
+        let (xy, path) = rec.split_at(2);
+        note(&path[1..]);
+        // `-z` rename/copy entries carry the source path in a second
+        // field with no status prefix of its own.
+        if xy.contains('R') || xy.contains('C') {
+            if let Some(orig) = fields.next() {
+                note(orig);
+            }
+        }
+    }
+    paths.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let ok = paths.is_empty();
+    json!({"ok": ok, "paths": paths})
+}
+
 pub fn run(pm: &Pm) -> Result<Value> {
     let git_dir = hooks::git_dir(&pm.dir);
     let hooks_report = hooks::report(&pm.dir);
@@ -129,7 +181,9 @@ pub fn run(pm: &Pm) -> Result<Value> {
         .as_ref()
         .map(|p| p["up_to_date"] == true)
         .unwrap_or(true);
-    let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok;
+    let foreign = foreign_dirty(&pm.dir);
+    let foreign_ok = foreign["ok"] == true;
+    let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok;
     Ok(json!({
         "ok": ok,
         "pm_dir": pm.dir,
@@ -144,5 +198,41 @@ pub fn run(pm: &Pm) -> Result<Value> {
         "push": push,
         "push_failures": git_dir.as_deref().map(push_failures).unwrap_or(Value::Null),
         "trailers": trailer_share(&pm.dir),
+        "foreign": foreign,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-759: a clean tree reports `foreign.ok`; one out-of-band
+    /// drop names itself and its age and flips the check — and the
+    /// tracker's own `.index/` scratch never counts as foreign.
+    #[test]
+    fn foreign_check_names_stray_files_with_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        std::fs::create_dir_all(pm.dir.join(".index")).unwrap();
+        std::fs::write(pm.dir.join(".index/foreign-seen"), "x\t1\n").unwrap();
+        let f = foreign_dirty(&pm.dir);
+        assert_eq!(f["ok"], true, "{f}");
+        assert_eq!(f["paths"].as_array().unwrap().len(), 0, "{f}");
+
+        std::fs::create_dir_all(pm.dir.join("cadence/CAD-584/artifacts")).unwrap();
+        std::fs::write(
+            pm.dir.join("cadence/CAD-584/artifacts/review-r1-x.md"),
+            "stray\n",
+        )
+        .unwrap();
+        let f = foreign_dirty(&pm.dir);
+        assert_eq!(f["ok"], false, "{f}");
+        let paths = f["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 1, "{f}");
+        assert_eq!(
+            paths[0]["path"].as_str().unwrap(),
+            "cadence/CAD-584/artifacts/review-r1-x.md"
+        );
+        assert!(paths[0]["age_secs"].as_i64().unwrap() < 60, "{f}");
+    }
 }

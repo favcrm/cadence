@@ -2484,4 +2484,30 @@ mod tests {
         let (front, _) = load_front(&dir).unwrap();
         assert_eq!(front.status, "backlog", "evidenced sibling rolled back");
     }
+
+    /// CAD-759: attach and comment each commit their new file in the
+    /// same commit that names it — neither leaves the tree dirty, and
+    /// a refused attach removes the dropped file like a refused
+    /// comment does.
+    #[test]
+    fn writes_commit_their_files_and_leave_a_clean_tree() {
+        let (dir, pm) = tracker();
+        let src = dir.path().join("note.txt");
+        std::fs::write(&src, "artifact bytes\n").unwrap();
+        super::attach(&pm, "CAD-1", &src).unwrap();
+        assert!(clean(&pm), "a committed attach left the tree dirty");
+        assert!(pm.dir.join("cadence/CAD-1/artifacts/note.txt").is_file());
+        add_comment(&pm, "CAD-1", "body", Some("w1"), None, None, "w1").unwrap();
+        assert!(clean(&pm), "a committed comment left the tree dirty");
+
+        // The refused half: the artifact is dropped, the commit is
+        // refused, and the file comes back out with the staging.
+        let hook = failing_hook(&pm);
+        std::fs::write(&src, "artifact bytes 2\n").unwrap();
+        let e = super::attach(&pm, "CAD-1", &src).unwrap_err();
+        assert!(e.to_string().contains("commit"), "{e}");
+        assert!(clean(&pm), "a refused attach left something behind");
+        assert!(!pm.dir.join("cadence/CAD-1/artifacts/note-1.txt").exists());
+        std::fs::remove_file(hook).unwrap();
+    }
 }
