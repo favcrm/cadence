@@ -1,6 +1,6 @@
-# AgenticOS issuer sign-in (CAD-539, first increment)
+# AgenticOS issuer sign-in and hosted enrollment (CAD-539, CAD-717)
 
-This increment authenticates a named principal with an AgenticOS issuer. It does
+CAD-539 authenticates a named principal with an AgenticOS issuer. It does
 **not** connect issue, message or team commands to hosted Cadence. Those commands
 still use the local daemon. Successful authentication reports
 `hosted_cadence: not_configured`; do not treat it as remote connectivity.
@@ -68,11 +68,66 @@ token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
 
+## Issuer-bound service enrollment (CAD-717)
+
+The separate `cadence remote enrollment` commands prepare a local implementer
+for the AOS-75 hosted result gateway. They do not route ordinary Cadence
+commands to the cloud. AOS-75 is default-off on AgenticOS staging; an enabled,
+deployed issuer and its owner-issued `hcs_` service credential are prerequisites.
+The device `agc_` credential above cannot substitute for `hcs_`.
+
+The operator first establishes an independent trust pin. In a private 0700
+directory, place the exact HTTPS API origin in a 0600 `trusted-issuer` file,
+with at most one final newline. This file must exist before bootstrap; the CLI
+never creates or changes it. For example:
+
+```sh
+install -d -m 700 /absolute/private/hosted-worker
+install -m 600 /dev/null /absolute/private/hosted-worker/trusted-issuer
+printf '%s\n' 'https://your-agenticos-api.example' > /absolute/private/hosted-worker/trusted-issuer
+secret-manager-read | cadence remote enrollment bootstrap \
+  --issuer https://your-agenticos-api.example --org ws_company \
+  --audience https://company.board.example --client-agent worker \
+  --enrollment-dir /absolute/private/hosted-worker
+```
+
+Bootstrap refuses a different issuer before sending the service token. It
+exchanges `hcs_` for an at-most-five-minute bridge token and enrolls one
+implementer with `results.submit`. AgenticOS validates the service credential's
+current owner, organization, board audience, scope, expiry and revocation. The
+client checks the returned service principal, exact organization and audience,
+bridge grant, server-assigned subject/bridge/agent IDs, role, capability and
+expiry. It stores the child and service credentials in a separate private 0600
+record; CLI output and Debug display only IDs and expiry.
+
+`cadence remote enrollment status --enrollment-dir ...` shows the binding.
+`renew` explicitly re-exchanges the stored service token; an expired or revoked
+service token fails. `remove` deletes only the local record. To change issuer,
+organization, board or client agent, remove the old record and bootstrap a new
+directory. Enrollment/renewal and removal are serialized, so a completed remove
+cannot be undone by an earlier in-flight renewal. A send holds a shared lock
+while checking and using the child token; renewal/removal wait for it.
+
+The local record has owner/mode checks, no-follow reads, atomic replacement and
+a checksum against accidental corruption. The checksum is not a MAC: a hostile
+process running as the same Unix user can read the tokens and recalculate it.
+Use a separate OS account or stronger credential store if that adversary is in
+scope. Every status/send rechecks the independent issuer pin. AOS-75 has no
+child-token revocation introspection endpoint, so local preflight can detect
+expiry and mismatch, but revocation after enrollment is rejected by the server
+at result receipt. This is not a claim of local pre-network revocation proof.
+
+CAD-716 must consume this binding before it may send: load the immutable
+outbox destination, use `remote_enrollment::with_current` to compare its org,
+board origin, subject and agent, and invoke the pinned HTTP sender only inside
+that callback. `--org` and `--audience` on the send command are caller assertions
+and cannot authorize bearer transmission. The sender PR remains draft until it
+uses this gate and passes independent review.
+
 ## Remaining cloud contract
 
-Board-host audience binding, board bearer exchange, service token administration,
-short-lived access with refresh, per-agent enrollment/roles, active-channel
-revocation, durable sleep-safe delivery, and actual hosted Cadence command
+Browser-based hosted consent, assignment delivery, active-channel revocation,
+durable sleep-safe application witness, and actual hosted Cadence command
 transport remain dependencies. Current device `read/draft/send` scopes belong
 to the issuer contract; they do not grant Cadence operator privileges. No board
 cookie authentication or assertion guard is weakened by this increment.

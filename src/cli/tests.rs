@@ -2,6 +2,43 @@
 use super::*;
 
 #[test]
+fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
+    let args = [
+        "cadence",
+        "remote",
+        "enrollment",
+        "bootstrap",
+        "--issuer",
+        "https://api.example.test",
+        "--org",
+        "ws_real",
+        "--audience",
+        "https://real.board.example.test",
+        "--client-agent",
+        "worker",
+        "--enrollment-dir",
+        "/tmp/cad717-enroll",
+    ];
+    assert!(Cli::try_parse_from(args).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "remote",
+        "enrollment",
+        "bootstrap",
+        "--org",
+        "ws_real",
+        "--audience",
+        "https://real.board.example.test",
+        "--client-agent",
+        "worker",
+        "--enrollment-dir",
+        "/tmp/cad717-enroll"
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from(args.into_iter().chain(["--token", "hcs_secret"])).is_err());
+}
+
+#[test]
 fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
     assert!(Cli::try_parse_from([
         "cadence",
