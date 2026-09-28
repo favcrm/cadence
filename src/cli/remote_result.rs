@@ -1,5 +1,6 @@
 //! Explicit offline custody. No daemon, credential resolver or remote sender.
 use cadence_agent::error::{Error, Result};
+use cadence_agent::remote_enrollment;
 use cadence_agent::remote_result_outbox::{
     DestinationPin, LocalReceipt, ResultCommand, ResultOutbox, MAX_COMMAND_BYTES,
 };
@@ -15,6 +16,42 @@ pub(crate) enum RemoteAction {
     Result {
         #[command(subcommand)]
         action: ResultAction,
+    },
+    /// Establish or inspect an issuer-bound hosted child credential.
+    Enrollment {
+        #[command(subcommand)]
+        action: EnrollmentAction,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum EnrollmentAction {
+    /// Exchange a service credential from stdin and enroll one implementer.
+    Bootstrap {
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        client_agent: String,
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+    },
+    /// Re-enroll after expiry using the private stored service credential.
+    Renew {
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+    },
+    /// Inspect bound IDs and expiry without printing either secret.
+    Status {
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+    },
+    /// Remove the local credential record; server revocation is separate.
+    Remove {
+        #[arg(long)]
+        enrollment_dir: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -61,7 +98,63 @@ fn metadata(receipt: &LocalReceipt) -> Value {
         "audience":pin.audience(),"subject":pin.subject_id(),"agent":pin.agent_id()}})
 }
 pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
-    let RemoteAction::Result { action } = action;
+    if let RemoteAction::Enrollment { action } = action {
+        let record = match action {
+            EnrollmentAction::Bootstrap {
+                issuer,
+                org,
+                audience,
+                client_agent,
+                enrollment_dir,
+            } => {
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .take(129)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| Error::rejected("Unable to read service credential from stdin"))?;
+                if bytes.len() > 128 {
+                    return Err(Error::rejected("Invalid service credential"));
+                }
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| Error::rejected("Invalid service credential"))?;
+                let token = text
+                    .strip_suffix("\r\n")
+                    .or_else(|| text.strip_suffix('\n'))
+                    .unwrap_or(text);
+                Some(remote_enrollment::enroll(
+                    issuer,
+                    org,
+                    audience,
+                    client_agent,
+                    token,
+                    enrollment_dir,
+                )?)
+            }
+            EnrollmentAction::Renew { enrollment_dir } => {
+                Some(remote_enrollment::renew(enrollment_dir)?)
+            }
+            EnrollmentAction::Status { enrollment_dir } => {
+                Some(remote_enrollment::current(enrollment_dir)?)
+            }
+            EnrollmentAction::Remove { enrollment_dir } => {
+                remote_enrollment::remove(enrollment_dir)?;
+                None
+            }
+        };
+        let output = if let Some(record) = record {
+            json!({"org":record.organization_id(),"audience":record.audience(),
+                "subject":record.subject_id(),"agent":record.agent_id(),
+                "expiresAt":record.expires_at()})
+        } else {
+            json!({"removed":true})
+        };
+        println!("{output}");
+        return Ok(0);
+    }
+    let RemoteAction::Result { action } = action else {
+        unreachable!()
+    };
     let output = match action {
         ResultAction::Retain { destination } => {
             let pin = destination.pin()?;
