@@ -172,10 +172,22 @@ pi:
   never the agent's private config dir, so a confined master cannot
   pick its own extensions. The installed `package.json` `version` must
   equal the pin and its `pi.extensions` files must exist; they become
-  the only `-e` argv entries (`--no-extensions` stays on), and the
+  operator-pinned `-e` argv entries (`--no-extensions` stays on), and the
   package dir joins the confined master's read set, read-only. A
   missing package, a drifted version or an entry escaping the package
   dir refuses the launch.
+- A hosted AgenticOS image may set
+  `CADENCE_PI_AGENTICOS_READ_EXTENSION=/opt/executor/cadence-read.mjs`.
+  This is an operator environment opt-in for the **master only**, separate
+  from company `pm.yaml`: the path must be an existing absolute regular
+  file with no symlink components. Cadence adds that file as an explicit
+  `-e` after its master guard, admits only `workspace_get` and
+  `account_get` to Pi's `--tools` list, and permits exactly those two
+  names through the guard. The image-owned extension must enforce the
+  reviewed v1 GET routes; Cadence does not enable the rest of the
+  AgenticOS manifest, including drafts and sends. Without the variable,
+  the existing master and worker toolsets are unchanged. A file in the
+  image alone does not activate this path.
 - A pin may carry a **content digest** — `name@version#sha256-<64
   lowercase hex>` (CAD-572). Every launch then hashes the installed
   package's own files and refuses on any mismatch, so a hand-edited

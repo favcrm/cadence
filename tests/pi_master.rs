@@ -419,6 +419,112 @@ fn master_launch_has_exact_lockdown_argv_and_a_real_guard() {
     pi.close();
 }
 
+#[test]
+fn hosted_agenticos_read_extension_is_an_explicit_master_only_allowlist() {
+    let state = tempfile::tempdir().unwrap();
+    let extension = state.path().join("agenticos-read.mjs");
+    std::fs::write(&extension, "// synthetic operator-owned read extension").unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[
+            (cadence_agent::master::TEST_NO_LANDLOCK, "1".into()),
+            (
+                "CADENCE_PI_AGENTICOS_READ_EXTENSION",
+                extension.to_string_lossy().into(),
+            ),
+        ],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+
+    let argv = recorded_argv(state.path());
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--extension", extension.to_str().unwrap()]));
+    assert!(argv.iter().any(|a| a == "--no-extensions"));
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--tools", "bash,read,write,workspace_get,account_get"]));
+    assert!(!argv
+        .iter()
+        .any(|a| a == "files_list" || a == "publish_post"));
+
+    let guard = state.path().join("master/pi-guard.js");
+    let mjs = state.path().join("guard.mjs");
+    std::fs::copy(&guard, &mjs).unwrap();
+    let harness = format!(
+        r#"import guard from "file://{}";
+let handler;
+guard({{ on: (name, cb) => {{ if (name === "tool_call") handler = cb; }} }});
+const names = ["workspace_get", "account_get", "files_list", "publish_post", "workspace_get;", "bash"];
+const out = [];
+for (const name of names) {{
+  const input = name === "bash" ? {{command:"cadence status"}} : {{}};
+  const r = await handler({{toolName:name,input}});
+  out.push(r === undefined ? null : String(r.reason ?? ""));
+}}
+process.stdout.write(JSON.stringify(out));"#,
+        mjs.display()
+    );
+    let script = state.path().join("harness.mjs");
+    std::fs::write(&script, harness).unwrap();
+    let out = cadence_agent::reaper::output(std::process::Command::new("node").arg(&script))
+        .expect("node is required for the pi toolchain");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reasons: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reasons.len(), 6);
+    assert_eq!(reasons[0], None);
+    assert_eq!(reasons[1], None);
+    assert!(reasons[2].is_some());
+    assert!(reasons[3].is_some());
+    assert!(reasons[4].is_some());
+    assert_eq!(reasons[5], None);
+}
+
+#[test]
+fn hosted_agenticos_read_extension_refuses_untrusted_paths() {
+    for kind in ["relative", "missing", "directory", "symlink"] {
+        let state = tempfile::tempdir().unwrap();
+        let valid = state.path().join("read.mjs");
+        std::fs::write(&valid, "// synthetic").unwrap();
+        let bad = match kind {
+            "relative" => "read.mjs".to_string(),
+            "missing" => state.path().join("missing.mjs").to_string_lossy().into(),
+            "directory" => state.path().to_string_lossy().into(),
+            "symlink" => {
+                let link = state.path().join("link.mjs");
+                std::os::unix::fs::symlink(&valid, &link).unwrap();
+                link.to_string_lossy().into()
+            }
+            _ => unreachable!(),
+        };
+        let pi = master_adapter(
+            "normal",
+            state.path(),
+            &[
+                (cadence_agent::master::TEST_NO_LANDLOCK, "1".into()),
+                ("CADENCE_PI_AGENTICOS_READ_EXTENSION", bad),
+            ],
+        );
+        let err = match pi.open(&master_agent(state.path(), json!({"unconfined": true}))) {
+            Ok(_) => panic!("{kind}: untrusted extension path must refuse before spawn"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("CADENCE_PI_AGENTICOS_READ_EXTENSION"),
+            "{kind}: {err}"
+        );
+        assert!(!state.path().join("master/cwd/pi-argv.json").exists());
+    }
+}
+
 /// CAD-322 round 2 (I1, confined leg): on a Landlock host the master's
 /// provider really is exec'd through `cadence confine` — fake-pi runs
 /// under the policy, writes its record into the policy's writable cwd,
