@@ -1050,6 +1050,22 @@ mod tests {
                         .contains("Use a calm editorial palette"));
                     assert!(body.get("company").is_none());
                     assert!(body.get("query").is_none());
+                    // The pilot credential never silently gains send authority:
+                    // no grant, media key, scope or approval-identity field
+                    // travels on a provider read/draft call (`publish.send`
+                    // is a separate runtime-audience credential in slice-1).
+                    for field in [
+                        "grant",
+                        "grantId",
+                        "mediaKey",
+                        "scope",
+                        "cadenceApprovalId",
+                        "cadenceRunId",
+                        "cadenceEffectId",
+                    ] {
+                        assert!(body.get(field).is_none(), "{field}");
+                        assert!(body["body"].get(field).is_none(), "{field}");
+                    }
                     request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
                         "slug":IMAGE_TOOL,"repeated":false,
                         "price":{"currency":"USD","scale":6,"amount":"0.031500"},
@@ -1236,6 +1252,22 @@ mod tests {
                     assert_eq!(body["body"]["prompt_optimizer"], false);
                     assert!(body.get("company").is_none());
                     assert!(body.get("query").is_none());
+                    // The pilot credential never silently gains send authority:
+                    // no grant, media key, scope or approval-identity field
+                    // travels on a provider read/draft call (`publish.send`
+                    // is a separate runtime-audience credential in slice-1).
+                    for field in [
+                        "grant",
+                        "grantId",
+                        "mediaKey",
+                        "scope",
+                        "cadenceApprovalId",
+                        "cadenceRunId",
+                        "cadenceEffectId",
+                    ] {
+                        assert!(body.get(field).is_none(), "{field}");
+                        assert!(body["body"].get(field).is_none(), "{field}");
+                    }
                     request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
                         "slug":IMAGE_TOOL,"repeated":false,
                         "price":{"currency":"USD","scale":6,"amount":"0.031500"},

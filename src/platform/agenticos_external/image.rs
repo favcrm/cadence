@@ -455,6 +455,31 @@ pub(super) fn device_import_fields(media_type: &str, bytes: &[u8]) -> Result<Val
     Ok(serde_json::json!({"digest": digest, "mime": media_type, "sizeBytes": bytes.len()}))
 }
 
+/// CAD-734 binding digests for the slice-1 grant/presentation gate
+/// (`grantSendStatus` in agenticos-stack/agenticos-v2#214): the presented
+/// claim Cadence will one day bind to a server-issued grant — exact caption
+/// digest plus exact image digest, computed over the approved caption bytes
+/// and the retained custody bytes. Caption follows the preflight request
+/// bound (1..=8000 chars); the image half reuses [`device_import_fields`]
+/// so only slice-1-shaped bytes can bind. Test-only until slice-2 wires
+/// the send: this lane creates no grant, presents none, and the pilot
+/// credential never carries `publish.send` (see the fixed-body tests).
+#[cfg(test)]
+pub(super) fn publish_binding_digests(
+    caption: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> Result<Value, String> {
+    let chars = caption.chars().count();
+    if !(1..=8000).contains(&chars) {
+        return Err("publish-bound caption is outside the device preflight shape".into());
+    }
+    let import = device_import_fields(media_type, bytes)?;
+    use sha2::Digest as _;
+    let caption_digest = format!("{:x}", sha2::Sha256::digest(caption.as_bytes()));
+    Ok(serde_json::json!({"captionDigest": caption_digest, "imageDigest": import["digest"]}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +606,38 @@ mod tests {
             max_encoded + 2048 <= 1024 * 1024,
             "base64 JSON must fit the 1 MiB cap"
         );
+    }
+
+    #[test]
+    fn cad734_publish_binding_digests_match_grant_gate_shapes() {
+        // Slice-1 fixture digest is sha256("test"): the caption half must
+        // reproduce the gate's exact content binding.
+        let fixture_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let png = encoded_png(1, 1);
+        let binding = publish_binding_digests("test", "image/png", &png).unwrap();
+        assert_eq!(binding["captionDigest"], fixture_digest);
+        assert_eq!(
+            binding["imageDigest"],
+            device_import_fields("image/png", &png).unwrap()["digest"]
+        );
+        // Boundary: 8000 chars bind, 8001 do not; empty never binds.
+        assert!(publish_binding_digests(&"x".repeat(8000), "image/png", &png).is_ok());
+        for bad in ["", &"x".repeat(8001)] {
+            assert!(publish_binding_digests(bad, "image/png", &png).is_err());
+        }
+        // The image half reuses the import gate: webp and empty bytes fail.
+        assert!(publish_binding_digests("test", "image/webp", &encoded_webp(1, 1)).is_err());
+        assert!(publish_binding_digests("test", "image/png", b"").is_err());
+        // Changed content binds a different digest: the gate's
+        // content_mismatch verdict is computable from custody outputs.
+        let altered_caption = publish_binding_digests("test!", "image/png", &png).unwrap();
+        assert_ne!(altered_caption["captionDigest"], binding["captionDigest"]);
+        assert_eq!(altered_caption["imageDigest"], binding["imageDigest"]);
+        let mut altered_bytes = png.clone();
+        altered_bytes.extend([0]);
+        let altered_image = publish_binding_digests("test", "image/png", &altered_bytes).unwrap();
+        assert_ne!(altered_image["imageDigest"], binding["imageDigest"]);
+        assert_eq!(altered_image["captionDigest"], binding["captionDigest"]);
     }
 
     #[test]
