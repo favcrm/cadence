@@ -208,6 +208,64 @@ fn v27_migration_converges_when_version_was_rolled_back_after_column_commit() {
 }
 
 #[test]
+fn v27_replay_replaces_permissive_column_and_fake_eligibility_trigger() {
+    let (dir, s) = draft_task();
+    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER cloud_dispatch_source_immutable;
+         DROP TRIGGER cloud_dispatch_eligibility_immutable;
+         DROP TABLE cloud_dispatch_outbox;
+         CREATE TABLE cloud_dispatch_outbox(
+           cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+           message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+           source TEXT NOT NULL,
+           task_id TEXT,
+           task_revision INTEGER,
+           audience_agent TEXT NOT NULL,
+           expected_head TEXT,
+           payload_digest TEXT NOT NULL,
+           organization_id TEXT,
+           remote_turn_id TEXT UNIQUE,
+           created REAL NOT NULL,
+           claimed REAL,
+           cloud_eligible INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TRIGGER cloud_dispatch_eligibility_immutable
+         BEFORE UPDATE ON cloud_dispatch_outbox
+         WHEN 0 BEGIN SELECT RAISE(ABORT, 'never runs'); END;
+         UPDATE schema_version SET version=26;",
+    )
+    .unwrap();
+    drop(conn);
+    Store::open_for_schema_tests(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO cloud_dispatch_outbox(message_id,source,audience_agent,
+             payload_digest,created,cloud_eligible)
+             VALUES (?1,'dispatch','w1','sha256:legacy',1,1)",
+            [&mid],
+        )
+        .is_err());
+    conn.execute(
+        "INSERT INTO cloud_dispatch_outbox(message_id,source,audience_agent,
+         payload_digest,created,cloud_eligible)
+         VALUES (?1,'dispatch','w1','sha256:legacy',1,0)",
+        [&mid],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "UPDATE cloud_dispatch_outbox SET cloud_eligible=1 WHERE message_id=?1",
+            [&mid],
+        )
+        .is_err());
+}
+
+#[test]
 fn cloud_outbox_v26_migration_is_atomic() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("t.sqlite3");
