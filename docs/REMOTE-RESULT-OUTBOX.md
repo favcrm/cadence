@@ -90,7 +90,8 @@ bearer, command text, HTTP error body or response URL.
 The sender loads the original canonical JSON and exact organization/HTTPS board
 origin from protected local custody by command ID. It validates the stored pin
 before network I/O, posts to
-`/__platform/hosted-cadence/<organizationId>/results`, disables redirects,
+`/__platform/hosted-cadence/<organizationId>/results`, disables redirects and
+ambient proxies,
 bounds the entire exchange to 12 seconds and the response body to 4 KiB. Only
 HTTP 202 with `{ "ok": true, "receipt": ... }`, no extra fields, state `queued`,
 the original command ID and SHA-256 digest, and safe increasing receipt times

@@ -126,6 +126,8 @@ fn post_queued(url: &str, bearer: &str, body: &str) -> Result<(u16, Vec<u8>)> {
         .timeout_global(Some(Duration::from_secs(12)))
         .http_status_as_error(false)
         .max_redirects(0)
+        // Ambient proxy settings cannot retarget a bearer bound to the pin.
+        .proxy(None)
         .build();
     let agent = ureq::Agent::new_with_config(config);
     let mut response = agent
