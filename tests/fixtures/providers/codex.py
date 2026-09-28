@@ -2,6 +2,7 @@
 import json, os, sys, threading, time
 pidfile, mode = sys.argv[1], sys.argv[2]
 turn_count = 0
+current_alias = os.environ.get("CADENCE_ALIAS", "")
 # interrupt-text / interrupt-tool (CAD-323): the turn in flight, waiting
 # for `turn/interrupt` — every interrupt lands in <pidfile>.interrupts.
 # hold: turn t-<n> completes once <pidfile>.release-t-<n> exists.
@@ -45,6 +46,9 @@ for line in sys.stdin:
         with open(pidfile + ".requests", "a") as rf:
             rf.write(json.dumps({"method": method,
                                  "params": msg.get("params", {})}) + "\n")
+        current_alias = msg.get("params", {}).get("config", {}).get(
+            "mcp_servers", {}).get("cadence", {}).get("env", {}).get(
+                "CADENCE_ALIAS", current_alias)
         if mode == "bad-thread":
             emit({"id": mid, "result": {"thread": {}}})
         else:
@@ -61,6 +65,13 @@ for line in sys.stdin:
             name: {"name": name} for name in ("self", "wiki_search", "wiki_read", "issue_show")}
         emit({"id": mid, "result": {"data": [{"name": "cadence",
             "runtimeStatus": status, "tools": tools}], "nextCursor": None}})
+    elif method == "mcpServer/tool/call":
+        if mode == "mcp-identity-fail":
+            emit({"id": mid, "result": {"content": [{"type": "text",
+                "text": "Cadence RPC refused"}], "isError": True}})
+        else:
+            emit({"id": mid, "result": {"content": [{"type": "text",
+                "text": json.dumps({"alias": current_alias, "running": []})}]}})
     elif method == "account/rateLimits/read":
         if mode in ("no-quota", "quota-recover"):
             emit({"id": mid, "error": {"code": -32601,

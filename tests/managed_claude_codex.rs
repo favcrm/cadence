@@ -152,6 +152,30 @@ fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
 }
 
 #[test]
+fn codex_mcp_identity_failure_fences_before_dispatch() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("mcp-identity-fail");
+    d.register_codex("unreachable-rpc");
+    let agent = d.wait_agent("unreachable-rpc", "attention", 15);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Cadence MCP identity proof failed"),
+        "{agent}"
+    );
+    d.send(
+        "unreachable-rpc",
+        json!({"text":"do work", "message":"mcp-rpc-unreachable-task"}),
+    )
+    .unwrap();
+    let show = d
+        .rpc("agent_show", json!({"alias":"unreachable-rpc"}))
+        .unwrap();
+    assert_eq!(show["messages"][0]["state"], "queued");
+}
+
+#[test]
 fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");

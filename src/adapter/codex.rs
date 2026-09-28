@@ -52,7 +52,7 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
 /// A configured but unavailable MCP server leaves the agent unable to do
 /// Cadence work. Ask Codex for this thread's actual tool inventory before
 /// advertising the endpoint as ready.
-fn check_agent_mcp(transport: &Transport, thread_id: &str) -> Result<()> {
+fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Result<()> {
     let inventory = transport
         .request_timeout(
             "mcpServerStatus/list",
@@ -72,6 +72,37 @@ fn check_agent_mcp(transport: &Transport, thread_id: &str) -> Result<()> {
         return Err(Error::provider(format!(
             "Codex Cadence MCP readiness failed: status {}, tools {}",
             server["runtimeStatus"], server["tools"]
+        )));
+    }
+    // Listing tools only proves that the MCP process started. Exercise the
+    // daemon connection from that process before declaring this worker ready.
+    let proof = transport
+        .request_timeout(
+            "mcpServer/tool/call",
+            json!({"threadId":thread_id, "server":"cadence", "tool":"self", "arguments":{}}),
+            Duration::from_secs(12),
+        )
+        .map_err(|error| {
+            Error::provider(format!("Codex Cadence MCP identity proof failed: {error}"))
+        })?;
+    let identity = proof["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|item| item["type"] == "text"))
+        .and_then(|item| item["text"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    if proof["isError"] == true
+        || identity
+            .as_ref()
+            .and_then(|identity| identity["alias"].as_str())
+            != Some(alias)
+    {
+        return Err(Error::provider(format!(
+            "Codex Cadence MCP identity proof failed for {alias}: {}",
+            if proof["isError"] == true {
+                proof["content"].to_string()
+            } else {
+                "missing or mismatched Cadence identity".to_string()
+            }
         )));
     }
     Ok(())
@@ -1009,7 +1040,7 @@ impl ProviderAdapter for CodexAdapter {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
                 .to_string();
-            check_agent_mcp(&self.transport, &thread_id)?;
+            check_agent_mcp(&self.transport, &thread_id, &agent.alias)?;
             *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
             let effective_model = result
                 .get("model")
