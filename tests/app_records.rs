@@ -647,6 +647,171 @@ fn cad753_two_installations_use_two_physical_files() {
 }
 
 #[test]
+fn cad753_operator_forged_fields_refuse_with_valid_control() {
+    let w = Records::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1");
+    let context_id = context["id"].as_str().unwrap();
+
+    // Valid control: the exact same shapes without forged fields work.
+    let created = w.create(
+        install,
+        context_id,
+        "customer-1",
+        Records::profile(PROFILE_A),
+    );
+    assert_eq!(created["record"]["revision"], 1);
+
+    // Forged identity fields are refused by the connection-bound
+    // operator gate — for the operator caller as well as agents.
+    for (method, params) in [
+        (
+            "app_record_show",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "by": "operator"}),
+        ),
+        (
+            "app_record_show",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "actor": "operator"}),
+        ),
+        (
+            "app_record_create",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-2", "profile": Records::profile(PROFILE_A), "by": "operator"}),
+        ),
+        (
+            "app_record_update",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "expected_revision": 1, "profile": Records::profile(PROFILE_B), "actor": "operator"}),
+        ),
+    ] {
+        assert!(
+            w.daemon.operator_rpc(method, params).is_err(),
+            "operator forged identity field accepted by {method}"
+        );
+    }
+    // Discovery-link fields are refused only by the exact payload
+    // allowlist — the operator gate does not know them.
+    for (method, params) in [
+        (
+            "app_record_show",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "project": "client"}),
+        ),
+        (
+            "app_record_show",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "project_link": "client"}),
+        ),
+        (
+            "app_record_list",
+            json!({"install_id": install, "context_id": context_id, "project_link": "client"}),
+        ),
+        (
+            "app_record_create",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-2", "profile": Records::profile(PROFILE_A), "project": "client"}),
+        ),
+        (
+            "app_record_update",
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-1", "expected_revision": 1, "profile": Records::profile(PROFILE_B), "workspace": "default"}),
+        ),
+    ] {
+        assert!(
+            w.daemon.operator_rpc(method, params).is_err(),
+            "operator forged link field accepted by {method}"
+        );
+    }
+    // Nothing above mutated the file: same revision, same digest,
+    // same history, no smuggled row.
+    assert_eq!(
+        w.show(install, context_id, "customer-1")["record"],
+        created["record"]
+    );
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_record_show",
+                json!({"install_id": install, "context_id": context_id, "record_id": "customer-2"}),
+            )
+            .is_err(),
+        "forged create smuggled a row"
+    );
+}
+
+#[test]
+fn cad753_cross_install_create_refuses_without_file_mutation() {
+    let w = Records::new();
+    let first = w.install();
+    let second = w.install_second();
+    let a = first["install_id"].as_str().unwrap();
+    let b = second["install_id"].as_str().unwrap();
+    let ctx_a = w.context(a, "Client A", "ctx-a")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ctx_b = w.context(b, "Client B", "ctx-b")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Valid controls: each installation creates in its own context.
+    w.create(a, &ctx_a, "customer-1", Records::profile(PROFILE_A));
+    w.create(b, &ctx_b, "customer-9", Records::profile(PROFILE_B));
+
+    // A live context of installation B is not a live context of A:
+    // create with install A plus B's context is refused by the
+    // context proof, not by a missing row.
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_record_create",
+                json!({"install_id": a, "context_id": ctx_b, "record_id": "customer-x", "profile": Records::profile(PROFILE_A)}),
+            )
+            .is_err(),
+        "cross-install create reached a file"
+    );
+    // An unknown context is refused the same way.
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_record_create",
+                json!({"install_id": a, "context_id": "ctx-no-such-context", "record_id": "customer-x", "profile": Records::profile(PROFILE_A)}),
+            )
+            .is_err(),
+        "unknown-context create reached a file"
+    );
+    // A forged installation never resolves to a file.
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_record_create",
+                json!({"install_id": "no-such-install", "context_id": ctx_a, "record_id": "customer-x", "profile": Records::profile(PROFILE_A)}),
+            )
+            .is_err(),
+        "forged-install create reached a file"
+    );
+    // Neither file gained a row: exact row sets asserted directly.
+    let rows = |install: &str| -> Vec<(String, String)> {
+        let file = w
+            .daemon
+            .state
+            .join("app-records")
+            .join(format!("{install}.sqlite3"));
+        let db = rusqlite::Connection::open_with_flags(
+            &file,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = db
+            .prepare("SELECT context_id, id FROM app_records ORDER BY context_id, id")
+            .unwrap();
+        let found = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        found.map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(rows(a), vec![(ctx_a.clone(), "customer-1".to_string())]);
+    assert_eq!(rows(b), vec![(ctx_b.clone(), "customer-9".to_string())]);
+    assert_eq!(w.show(a, &ctx_a, "customer-1")["record"]["revision"], 1);
+}
+
+#[test]
 fn cad753_cli_record_namespace_roundtrip() {
     let w = Records::new();
     let installed = w.install();
