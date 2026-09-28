@@ -244,6 +244,27 @@ pub(super) fn download_image(agent: &ureq::Agent, url: &str) -> Result<AppCapabi
 mod tests {
     use super::*;
 
+    fn encoded_png(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = vec![0u8; (width * height) as usize];
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&pixels, width, height, image::ExtendedColorType::L8)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn custody_decodes_and_bounds_supported_images() {
+        let mut corrupt = encoded_png(1, 1);
+        let payload = corrupt.windows(4).position(|window| window == b"IDAT").unwrap() + 4;
+        corrupt[payload] ^= 0x40;
+        assert!(image_mime(&corrupt, "image/png").is_err(), "plausible PNG with damaged payload must refuse");
+        assert!(image_mime(&encoded_png(2, 1), "image/png").is_err(), "non-square output must refuse");
+        assert!(image_mime(&encoded_png(2049, 2049), "image/png").is_err(), "oversized encoded square must refuse");
+        assert_eq!(image_mime(&encoded_png(1, 1), "image/png").unwrap(), "image/png");
+    }
+
     #[test]
     fn resolver_rejects_private_target_even_with_an_approved_name() {
         assert!(image_agent()
