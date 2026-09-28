@@ -584,7 +584,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            27,
+            28,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
