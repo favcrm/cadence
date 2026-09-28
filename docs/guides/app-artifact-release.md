@@ -2,7 +2,13 @@
 
 A workspace app can produce and review content without a project. A context stores the input defaults for one client or brand. A binding selects the exact connection for a declared app capability. Run approval permits the app's writer and independent reviewer to work; a separate effect approval permits one accepted artifact to leave the app.
 
-The initial release capability is text only. This path does not fetch social content, generate images, publish to Instagram or Facebook, or install the AgenticOS runtime metadata. It delivers a reviewed text item to the registered Local outbox. The Social Content preview remains a fixture until its controls use these APIs.
+The Local release capability delivers an independently reviewed text artifact
+and, when the reviewer pinned one, a retained binary asset in the same outbox
+item. Fetching public social content and generating an image are separate
+priced run capabilities; Local release does not publish to Instagram or
+Facebook or install AgenticOS runtime metadata. The Social Content board uses
+these APIs but still needs a scoped connection and exact cost approval for
+each live provider call.
 
 ## App declaration
 
@@ -21,7 +27,7 @@ needs:
       effect: send
 ```
 
-The selected workflow declares `publication_slot: publication` in its frontmatter. This declaration selects the slot for the eventual reviewed artifact; it is not a worker tool call. A context default applies only to an input explicitly marked `context_default: true`.
+The selected workflow declares `publication_slot: publication` in its frontmatter. This declaration selects the slot for the eventual reviewed artifact; it is not a worker tool call. An image workflow also declares `required_asset_slot: image` for a declared capability slot. That frozen, approval-affecting requirement makes a caption-only approval or Local stage invalid, including through the HTTP route. A context default applies only to an input explicitly marked `context_default: true`.
 
 An adapter's reviewed action mapping resolves the capability to its provider tool, required scopes, effect classification and input/output contracts. An unsupported mapping refuses the binding. The app declaration cannot select a provider tool or change the mapping's effect. The new Local `publish_app_text` tool is reserved for the reviewed app-artifact broker; legacy `platform_call` cannot invoke it even with a publish grant.
 
@@ -41,7 +47,7 @@ cadence app effect show EFFECT_ID
 cadence app effect accept EFFECT_ID --digest EXACT_EFFECT_DIGEST
 ```
 
-Omit `--context-id` when configuring a context-free installation. Bindings must exist when the run freezes its publication intent. An unbound draft cannot inherit a binding added later. Review the complete effect receipt before accepting its digest. Staging reads the stored accepted artifact and its real independent reviewer evidence; it accepts no caller-supplied body, path, provider, grant or verdict.
+Omit `--context-id` when configuring a context-free installation. Bindings must exist when the run freezes its publication intent. An unbound draft cannot inherit a binding added later. Review the complete effect receipt before accepting its digest. Staging reads the stored accepted artifact and its real independent reviewer evidence, including the exact asset receipt, digest and bytes when present; it accepts no caller-supplied body, asset path, provider, grant or verdict.
 
 An operator can decline a staged effect with `cadence app effect decline EFFECT_ID --digest EXACT_EFFECT_DIGEST`. Binding changes use `cadence app binding set INSTALL_ID BINDING_ID --expected-revision REVISION --connection-id CONNECTION_ID`; revocation uses `cadence app binding revoke INSTALL_ID BINDING_ID --expected-revision REVISION`. Revisions prevent a stale editor from overwriting a concurrent change.
 
@@ -71,7 +77,7 @@ The input body is bounded to 48 KiB and successful receipts to 4 MiB. The backen
 
 The effect's app-artifact authority records the exact installation, optional context, binding, connection, reviewed provider mapping, immutable run snapshot, accepted artifact bytes and reviewer provenance. Current authority is checked at staging, decision and final execution claim. Each eligible `decided` effect has one checked transition to `executing`; losing that claim makes no adapter call.
 
-The broker serializes authority mutation with the bounded Local commit and releases its SQL connection before the adapter reads its executing permit. The outbox stores an `app_artifact` item with provenance under `app-items/EFFECT_ID`. It does not invent a project, inherit a worker directory or publish attachments. The original project publication tool retains its existing behavior.
+The broker serializes authority mutation with the bounded Local commit and releases its SQL connection before the adapter reads its executing permit. The outbox stores an `app_artifact` item with provenance under `app-items/EFFECT_ID`. A binary review also writes the verified bytes as `attachments/asset.bin` in that same confined item; stage and execution recheck the run, producer, binding, media type, size and digest. It does not invent a project, inherit a worker directory or publish externally. The original project publication tool retains its existing behavior.
 
 Adapters report app-artifact execution errors as a known refusal or an uncertain outcome. An error after the Local item lands remains `reconcile`, including when exact readback finds the item. A process interrupted in `executing` also becomes a reconciliation item after restart. Neither case automatically sends again.
 

@@ -27,6 +27,29 @@ impl Release {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        Self::with_capability_required(None)
+    }
+    pub(crate) fn with_required_asset() -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        Self::with_capability_required(Some("source"))
+    }
+    pub(crate) fn with_mismatched_required_asset() -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        Self::with_capability_required(Some("image"))
+    }
+    fn with_capability_required(
+        required_asset_slot: Option<&'static str>,
+    ) -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let price = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1880));
@@ -36,6 +59,7 @@ impl Release {
                 capability::wrap(opts, calls, price);
             },
             true,
+            required_asset_slot,
         );
         (h, observed, observed_price)
     }
@@ -61,11 +85,12 @@ impl Release {
     pub(crate) fn with_options(
         configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
     ) -> Self {
-        Self::with_options_and_bundle(configure, false)
+        Self::with_options_and_bundle(configure, false, None)
     }
     fn with_options_and_bundle(
         configure: impl FnOnce(&mut cadence_agent::daemon::ServeOptions, &Path),
         source_capability: bool,
+        required_asset_slot: Option<&str>,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
@@ -116,6 +141,11 @@ impl Release {
         } else {
             manifest
         };
+        let manifest = if required_asset_slot == Some("image") {
+            manifest.replace("  capabilities:", "  capabilities:\n    image:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read")
+        } else {
+            manifest
+        };
         std::fs::write(source.join("app.md"), manifest).unwrap();
         let text = std::fs::read_to_string(original.join("workflows/draft.md")).unwrap();
         let workflow = text
@@ -125,6 +155,20 @@ impl Release {
             workflow.replacen(
                 "publication_slot: publication\n",
                 "publication_slot: publication\ncapability_slots: [source]\n",
+                1,
+            )
+        } else {
+            workflow
+        };
+        let workflow = if let Some(slot) = required_asset_slot {
+            let capability_slots = if slot == "image" {
+                "[source, image]"
+            } else {
+                "[source]"
+            };
+            workflow.replacen(
+                "capability_slots: [source]\n",
+                &format!("capability_slots: {capability_slots}\nrequired_asset_slot: {slot}\n"),
                 1,
             )
         } else {

@@ -53,6 +53,26 @@
   font-size: var(--text-secondary);
   line-height: 1.6;
 }
+.wa-retained-image {
+  margin: 0;
+  display: grid;
+  gap: 0.5rem;
+  width: min(100%, 24rem);
+}
+.wa-retained-image img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: contain;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-875);
+}
+.wa-retained-image figcaption {
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+}
 .wa-kicker {
   color: var(--color-ink-500);
   font-size: var(--text-micro);

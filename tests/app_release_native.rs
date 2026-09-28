@@ -54,6 +54,201 @@ fn rewrite_asset_receipt_as_v1(db: &rusqlite::Connection, receipt: &Value, media
 }
 
 #[test]
+fn cad714_required_asset_refuses_caption_only_review_and_native_release() {
+    let (h, _, _) = Release::with_required_asset();
+    let context = h.context("Client A", A, "required-context");
+    h.bind(&context, "required-publication");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"], "context_id":context["id"],
+                "slot":"source", "connection_id":h.connection, "request_id":"required-source"
+            }),
+        )
+        .unwrap();
+    let run = h.create(&context, "required-run");
+    assert_eq!(run["snapshot"]["workflow"]["required_asset_slot"], "source");
+    h.dispatch(&run);
+    let failed = h.wait_state(run["id"].as_str().unwrap(), "failed");
+    assert!(failed["reviews"].as_array().unwrap().is_empty());
+    let params = json!({"run_id":run["id"],"artifact_id":failed["artifacts"][0]["id"],
+        "slot":"publication","request_id":"required-release","title":"No image"});
+    assert!(h
+        .daemon
+        .operator_rpc("app_effect_stage", params.clone())
+        .is_err());
+    let mut forged = params.clone();
+    forged["asset_receipt_id"] = json!("caller-forged");
+    assert!(h.daemon.operator_rpc("app_effect_stage", forged).is_err());
+    let pair = std::thread::scope(|scope| {
+        let first = params.clone();
+        let second = params.clone();
+        let a = scope.spawn(|| h.daemon.operator_rpc("app_effect_stage", first));
+        let b = scope.spawn(|| h.daemon.operator_rpc("app_effect_stage", second));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(
+        pair.0.is_err() && pair.1.is_err(),
+        "concurrent calls staged a caption-only draft"
+    );
+    let mut lane = LaneShell::spawn(h.root.path());
+    plant_member_pane(&h.daemon, "asset-native-worker", "claude", None, lane.pid());
+    for detached in [false, true] {
+        assert_eq!(
+            native(
+                &mut lane,
+                &h.daemon.state,
+                detached,
+                "app_effect_stage",
+                params.clone()
+            )["ok"],
+            false
+        );
+    }
+    assert!(h.items().as_array().unwrap().is_empty());
+
+    // Model a caption-only approval recorded by an older daemon. The release
+    // boundary must enforce the frozen requirement independently of review.
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    let review_message = failed["steps"][1]["message_id"].as_str().unwrap();
+    let result: String = db
+        .query_row(
+            "SELECT result FROM messages WHERE id=?",
+            [review_message],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    let material: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+    let digest = cadence_agent::store::app_runs::material_digest(&json!({
+        "material":material,"producer":REVIEWER,"message":review_message
+    }));
+    db.execute("UPDATE app_run_steps SET state='succeeded',result_digest=? WHERE run_id=? AND step_id='s2'",
+        rusqlite::params![digest,run["id"].as_str().unwrap()]).unwrap();
+    db.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,'approve',?,NULL,NULL)",
+        rusqlite::params![run["id"].as_str().unwrap(),"s2",failed["artifacts"][0]["id"].as_str().unwrap(),
+        failed["artifacts"][0]["digest"].as_str().unwrap(),REVIEWER,review_message,
+        material["rationale"].as_str().unwrap()]).unwrap();
+    db.execute(
+        "UPDATE app_runs SET state='succeeded' WHERE id=?",
+        [run["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    assert!(
+        h.daemon.operator_rpc("app_effect_stage", params).is_err(),
+        "release accepted a historical caption-only review for an asset-required workflow"
+    );
+    assert!(h.items().as_array().unwrap().is_empty());
+
+    let good = h.create(&context, "required-good-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            good["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&good);
+    let completed = h.wait_state(good["id"].as_str().unwrap(), "succeeded");
+    assert!(completed["reviews"][0]["asset_receipt_id"].is_string());
+    let staged = h.stage(&completed, "required-good-release");
+    assert_eq!(
+        staged["authority"]["asset"]["receipt_id"],
+        completed["reviews"][0]["asset_receipt_id"]
+    );
+}
+
+#[test]
+fn cad714_required_asset_allows_unpinned_revise_with_reviewer_rationale() {
+    let (h, _, _) = Release::with_required_asset();
+    let context = h.context("Client A", A, "required-revise-context");
+    h.bind(&context, "required-revise-publication");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"], "context_id":context["id"],
+                "slot":"source", "connection_id":h.connection,
+                "request_id":"required-revise-source"
+            }),
+        )
+        .unwrap();
+    let run = h.create(&context, "required-revise-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-review-asset-override-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"decision":"revise","rationale":"The caption needs a factual correction."})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let failed = h.wait_state(run["id"].as_str().unwrap(), "failed");
+    assert_eq!(failed["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(failed["reviews"][0]["decision"], "revise");
+    assert_eq!(
+        failed["reviews"][0]["rationale"],
+        "The caption needs a factual correction."
+    );
+    assert!(failed["reviews"][0]["asset_receipt_id"].is_null());
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cad714_required_asset_refuses_receipt_from_another_declared_slot() {
+    let (h, _, _) = Release::with_mismatched_required_asset();
+    let context = h.context("Client A", A, "required-slot-context");
+    h.bind(&context, "required-slot-publication");
+    for slot in ["source", "image"] {
+        h.daemon
+            .operator_rpc(
+                "app_binding_create",
+                json!({
+                    "install_id":h.install["install_id"], "context_id":context["id"],
+                    "slot":slot, "connection_id":h.connection,
+                    "request_id":format!("required-slot-{slot}")
+                }),
+            )
+            .unwrap();
+    }
+    let run = h.create(&context, "required-slot-run");
+    assert_eq!(run["snapshot"]["workflow"]["required_asset_slot"], "image");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let failed = h.wait_state(run["id"].as_str().unwrap(), "failed");
+    let source_receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(source_receipt["slot"], "source");
+    assert!(failed["reviews"].as_array().unwrap().is_empty());
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_effect_stage",
+            json!({
+                "run_id":run["id"],"artifact_id":failed["artifacts"][0]["id"],
+                "slot":"publication","request_id":"required-slot-release","title":"Wrong asset"
+            })
+        )
+        .is_err());
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
 fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
     let (h, calls, price) = Release::with_capability();
     let a = h.context("Client A", A, "source-context-a");

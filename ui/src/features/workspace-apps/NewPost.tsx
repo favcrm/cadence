@@ -1,7 +1,9 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import Button from "../../ui/Button";
 import Select, { type SelectOption } from "../../ui/Select";
 import { WorkspaceDialog } from "./WorkspaceDialog";
+import { ApiError } from "../../lib/api";
+import { workspaceApps, type CapabilityQuote } from "./workspaceApps";
 
 export interface NewPostValues {
   title: string;
@@ -31,6 +33,11 @@ export function NewPost({
   onClose,
   onCreate,
   selectedSource,
+  installId,
+  contextId,
+  imageSupported,
+  imageBindingDigest,
+  onDenied,
 }: {
   workflows: SelectOption[];
   workers: SelectOption[];
@@ -40,6 +47,11 @@ export function NewPost({
   onClose: () => void;
   onCreate: (values: NewPostValues) => void;
   selectedSource?: SelectedSource | null;
+  installId: string;
+  contextId?: string;
+  imageSupported: boolean;
+  imageBindingDigest?: string;
+  onDenied: () => void;
 }) {
   const [title, setTitle] = useState("");
   const [source, setSource] = useState(selectedSource?.caption ?? "");
@@ -51,6 +63,32 @@ export function NewPost({
     workflows.length === 1 ? workflows[0].value : "",
   );
   const [validation, setValidation] = useState<string | null>(null);
+  const [imageQuote, setImageQuote] = useState<CapabilityQuote | null>(null);
+  const [imageQuoteError, setImageQuoteError] = useState<string | null>(null);
+  useEffect(() => {
+    setImageQuote(null); setImageQuoteError(null);
+    if (!sourceChoice || !imageBindingDigest) return;
+    const controller = new AbortController();
+    void workspaceApps.bindingQuote(installId, "image", contextId, controller.signal).then(value => {
+      if (controller.signal.aborted) return;
+      if (value.slot !== "image" || value.binding_digest !== imageBindingDigest
+        || value.quote.schema !== 1 || value.quote.currency !== "USD"
+        || value.quote.units !== 1 || !Number.isSafeInteger(value.quote.unit_price_micros)
+        || value.quote.unit_price_micros <= 0
+        || value.quote.total_price_micros !== value.quote.unit_price_micros
+        || typeof value.quote.price_revision !== "string" || !value.quote.price_revision) {
+        setImageQuoteError("The image connection or current provider price changed. Refresh Settings before planning an image.");
+        return;
+      }
+      setImageQuote(value);
+    }).catch(reason => {
+      if (controller.signal.aborted) return;
+      if (reason instanceof ApiError && [401, 403].includes(reason.status)) { onDenied(); return; }
+      setImageQuoteError(reason instanceof Error ? reason.message : "Could not obtain the image provider’s price.");
+    });
+    return () => controller.abort();
+  }, [installId, contextId, imageBindingDigest, sourceChoice?.receiptId, onDenied]);
+  const availableWorkflows = workflows.filter(option => option.value !== "image-instagram" || !!imageQuote);
   const ownerGroup = managers.some((manager) => manager.value === ownerPm)
     ? ownerPm
     : "";
@@ -62,6 +100,8 @@ export function NewPost({
     const invalid =
       !title.trim() || !source.trim()
         ? "Enter a post title and source facts."
+        : workflow === "image-instagram" && (!sourceChoice || !imageQuote)
+          ? "Choose a retained Instagram source and wait for its current image price."
         : /[\r\n\t]/.test(title) || (!sourceChoice && /[\r\n\t]/.test(source))
           ? "Title and source facts must be one paragraph without line breaks or tabs for this workflow."
           : !workflow
@@ -96,7 +136,7 @@ export function NewPost({
     <WorkspaceDialog title="New post" onClose={onClose}>
       <form className="wa-stack" onSubmit={submit}>
         <p className="wa-muted">
-          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. The exact source receipt and post are frozen into the plan." : "Paste the facts your team should use. You’ll review the frozen plan"}
+          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound; its exact charge will be frozen in the plan." : "Paste the facts your team should use. You’ll review the frozen plan"}
           {!sourceChoice && " before the writer starts. Releasing the accepted text is a separate decision."}
         </p>
         {(error || validation) && (
@@ -104,6 +144,13 @@ export function NewPost({
             {error || validation}
           </p>
         )}
+        {sourceChoice && imageSupported && (!imageBindingDigest
+          ? <p className="wa-alert">To add an image, bind an AgenticOS provider.draft connection in Settings.</p>
+          : imageQuote
+            ? <p className="wa-alert">Current charge for one generated image: <strong>USD {(imageQuote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong>. The frozen plan requires a separate cost approval before dispatch.</p>
+            : imageQuoteError
+              ? <p className="wa-alert" data-tone="fail" role="alert">{imageQuoteError}</p>
+              : <p className="wa-muted" role="status">Checking one-image provider price…</p>)}
         <div className="wa-field">
           <label htmlFor="wa-post-title">Post title</label>
           <input
@@ -132,9 +179,9 @@ export function NewPost({
             aria-describedby="wa-source-help"
           />
           <p id="wa-source-help" className="wa-kicker">
-            {sourceChoice ? <>From @{sourceChoice.handle} · <a href={sourceChoice.permalink} target="_blank" rel="noopener noreferrer">View original post</a> · receipt {sourceChoice.receiptId}. The selected text cannot be edited while linked to this receipt.</> : "Paste one paragraph without line breaks. Image generation isn’t available yet."}
+            {sourceChoice ? <>From @{sourceChoice.handle} · <a href={sourceChoice.permalink} target="_blank" rel="noopener noreferrer">View original post</a> · receipt {sourceChoice.receiptId}. The selected text cannot be edited while linked to this receipt.</> : "Paste one paragraph without line breaks. Select a retained Instagram post to make an image."}
           </p>
-          {sourceChoice && <Button onClick={() => { setSourceChoice(null); setSource(""); }}>Use pasted facts instead</Button>}
+          {sourceChoice && <Button onClick={() => { setSourceChoice(null); setSource(""); if (workflow === "image-instagram") setWorkflow(""); }}>Use pasted facts instead</Button>}
         </div>
         <div className="wa-fields">
           <div className="wa-field">
@@ -143,7 +190,7 @@ export function NewPost({
               id="wa-workflow"
               value={workflow}
               onChange={setWorkflow}
-              options={workflows}
+              options={availableWorkflows}
               placeholder="Choose workflow"
               disabled={busy}
               full

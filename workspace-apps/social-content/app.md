@@ -1,8 +1,8 @@
 ---
 app: social-content
 title: Social Content
-version: '0.3.0'
-summary: Choose a retained public Instagram source or paste facts, review a zh-HK caption, then explicitly release to Local.
+version: '0.4.0'
+summary: Choose a retained public Instagram source, review a zh-HK caption, and optionally retain one generated image before Local release.
 needs:
   connections: []
   capabilities:
@@ -13,6 +13,13 @@ needs:
       action: list_posts
       resource_kind: connection_account
       effect: read
+    image:
+      schema: 1
+      capability: media.generate
+      version: 1
+      action: generate_image
+      resource_kind: connection_account
+      effect: draft
     publication:
       schema: 1
       capability: text.publish
@@ -28,8 +35,9 @@ Choose Instagram or Facebook and make one caption per run from source
 facts. You can paste the facts or choose one retained public Instagram
 post through the `source-instagram` acquisition workflow. This workspace
 bundle needs no project. The channel is a writing brief; releasing a
-caption delivers it to Local, not that social network. Image generation,
-scheduling and external posting remain unavailable in this version.
+caption delivers it to Local, not that social network. An image-enabled
+caption run can retain one generated asset from a selected source.
+Scheduling and external posting remain unavailable in this version.
 
 ## Set up once
 
@@ -94,6 +102,28 @@ byte-exact selected caption and receipt digest, then inserts a derived
 single-line `source` input for the text workflow. A later rebind, revoke
 or different context cannot authorize an old receipt. A preview image URL
 is a display hint, not a retained image asset.
+
+## Generate one image from a retained post
+
+An operator may bind the `image` capability to a company-scoped AgenticOS
+device connection with `provider.draft` scope. This binding requires an
+exact image CDN host allowlist in root-owned provider deployment metadata;
+without that list and a matching manifest pin, image price discovery stays
+closed. The host is established only
+after a separately approved capped probe confirms the real provider
+response. The provider's temporary URL is never the reviewed image.
+
+Create an `image-instagram` run using a selected source receipt and post in
+the same installation/context, a short subject, a writer and an independent
+reviewer. The run freezes the selected caption, brand voice and current one-image charge.
+The operator approves that exact run and cost before dispatch. The worker
+calls the `image` capability with an empty object; it cannot choose the
+provider, model, image count, prompt, aspect ratio or destination. The
+broker stores the verified bytes as a run-scoped image receipt or records
+a refusal. The reviewer checks the caption and the exact retained bytes
+in this same run, pinning both digests. A later Local draft may cite only
+that reviewer-pinned asset through the separate CAD-713 release gate. Do not release from a
+temporary provider URL or from an unreviewed worker description.
 
 ## New post
 

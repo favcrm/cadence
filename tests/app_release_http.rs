@@ -276,6 +276,36 @@ fn cad709_http_recovers_paid_source_receipt_after_later_run_failure() {
 }
 
 #[test]
+fn cad714_http_cannot_release_caption_when_workflow_requires_asset() {
+    let (release, _, _) = Release::with_required_asset();
+    let b = Board::from_release(release);
+    let context = b.release.context("HTTP Client", A, "required-http-context");
+    b.value(
+        "POST",
+        &b.bindings(),
+        json!({"context_id":context["id"],"slot":"publication",
+        "connection_id":b.release.connection,"request_id":"required-http-publication"}),
+    );
+    b.value(
+        "POST",
+        &b.bindings(),
+        json!({"context_id":context["id"],"slot":"source",
+        "connection_id":b.release.connection,"request_id":"required-http-source"}),
+    );
+    let run = b.release.create(&context, "required-http-run");
+    b.release.dispatch(&run);
+    let failed = b.release.wait_state(run["id"].as_str().unwrap(), "failed");
+    let path = format!("/api/app-runs/{}/effects", run["id"].as_str().unwrap());
+    let body = json!({"artifact_id":failed["artifacts"][0]["id"],"slot":"publication",
+        "request_id":"required-http-stage","title":"Caption only"});
+    assert_eq!(b.operator("POST", &path, &body.to_string()).0, 409);
+    let mut forged = body;
+    forged["asset_receipt_id"] = json!("caller-forged");
+    assert_eq!(b.operator("POST", &path, &forged.to_string()).0, 400);
+    assert!(b.release.items().as_array().unwrap().is_empty());
+}
+
+#[test]
 fn cad692_http_release_is_populated_strict_and_requires_exact_digest() {
     let b = Board::new();
     let (binding, run, effect) = b.populate();

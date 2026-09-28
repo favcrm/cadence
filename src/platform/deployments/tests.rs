@@ -97,6 +97,73 @@ fn external_provider_pin_accepts_only_the_registered_underscore_name() {
 }
 
 #[test]
+fn image_hosts_need_an_exact_trusted_origin_and_public_dns_names() {
+    let config = serde_json::json!({"schema":1,"providers":[{
+        "provider":"agenticos_external","origin":"https://app-v2.agenticos.hk",
+        "manifest_pin":"agenticos-external-provider-tools@1",
+        "image_hosts":["cdn.minimax.io"]
+    }]});
+    let parsed = DeploymentMetadata::parse(&serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(
+        parsed.image_hosts("agenticos_external", "https://app-v2.agenticos.hk"),
+        Some(&["cdn.minimax.io".into()][..])
+    );
+    assert_eq!(
+        parsed.image_hosts("agenticos_external", "https://other.example"),
+        None
+    );
+    assert_eq!(
+        parsed.image_hosts("agenticos", "https://app-v2.agenticos.hk"),
+        None
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = dir.path().join("provider-deployments.json");
+    std::fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = read_fixture(dir.path(), "provider-deployments.json", unsafe {
+        libc::geteuid()
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        loaded.image_hosts("agenticos_external", "https://app-v2.agenticos.hk"),
+        Some(&["cdn.minimax.io".into()][..])
+    );
+    for host in [
+        "127.0.0.1",
+        "localhost",
+        "cdn.local",
+        "cdn.internal",
+        "evil/path",
+        "-cdn.example",
+        "cdn.example:443",
+        "cdn.example@evil.test",
+        "cdn.example.",
+    ] {
+        let mut bad = config.clone();
+        bad["providers"][0]["image_hosts"] = serde_json::json!([host]);
+        assert!(
+            DeploymentMetadata::parse(&serde_json::to_vec(&bad).unwrap()).is_err(),
+            "{host}"
+        );
+    }
+    let mut too_many = config.clone();
+    too_many["providers"][0]["image_hosts"] = serde_json::json!([
+        "a.example",
+        "b.example",
+        "c.example",
+        "d.example",
+        "e.example"
+    ]);
+    assert!(DeploymentMetadata::parse(&serde_json::to_vec(&too_many).unwrap()).is_err());
+    let mut duplicate = config;
+    duplicate["providers"][0]["image_hosts"] =
+        serde_json::json!(["cdn.minimax.io", "cdn.minimax.io"]);
+    assert!(DeploymentMetadata::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+}
+
+#[test]
 fn origin_requires_a_valid_authority_without_caller_url_components() {
     for origin in [
         "http://:",

@@ -1,6 +1,7 @@
 //! The AgenticOS external provider door, separate from its hosted publisher.
 //! Only app-run capability authority may execute these fixed, reviewed tools.
 //! A token stays in custody; the upstream door derives its company from it.
+mod image;
 mod source;
 
 use std::time::Duration;
@@ -15,6 +16,9 @@ use crate::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
 use crate::platform::{AppCapabilityOutput, AppCapabilityQuote};
+use image::{download_image, image_agent, image_prompt, image_url};
+#[cfg(test)]
+use image::{image_mime, public_ip};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@1";
@@ -22,6 +26,10 @@ const POSTS_TOOL: &str = "scrapecreators.instagram.user.posts";
 const IMAGE_TOOL: &str = "minimax.image-gen.from_text";
 const CALL_PATH: &str = "/v1/runtime/tools/call";
 const RESPONSE_CAP: u64 = 1024 * 1024;
+
+pub(crate) fn valid_image_host(host: &str) -> bool {
+    image::valid_host(host)
+}
 
 const TABLE_JSON: &str = r#"{
     "platform":"agenticos_external",
@@ -37,13 +45,28 @@ pub struct AgenticosExternalAdapter {
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
+    image_hosts: Vec<String>,
+    image_http: ureq::Agent,
 }
 
 impl AgenticosExternalAdapter {
     /// The pin is an image-owner assertion about this exact deployed origin,
     /// never a claim made by an app, connection credential or HTTP response.
     pub fn with_deployment_pin(base: &str, deployment_pin: Option<&str>) -> Result<Self> {
+        Self::with_deployment(base, deployment_pin, &[])
+    }
+
+    fn with_deployment(
+        base: &str,
+        deployment_pin: Option<&str>,
+        image_hosts: &[String],
+    ) -> Result<Self> {
         let base = valid_base(base)?;
+        if image_hosts.len() > 4 || image_hosts.iter().any(|host| !image::valid_host(host)) {
+            return Err(Error::rejected(
+                "image CDN hosts must be exact public DNS names",
+            ));
+        }
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
@@ -56,6 +79,8 @@ impl AgenticosExternalAdapter {
             base,
             deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
+            image_hosts: image_hosts.to_vec(),
+            image_http: image_agent(),
         };
         adapter
             .connection_descriptor()
@@ -223,6 +248,78 @@ impl AgenticosExternalAdapter {
         }
         Ok(normalized)
     }
+
+    fn call_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, String> {
+        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) || self.image_hosts.is_empty() {
+            return Err("image CDN host has not been approved by this deployment".into());
+        }
+        let prompt = image_prompt(authority, input)?;
+        let ceiling = frozen_charge_ceiling(authority)?;
+        let token = std::str::from_utf8(credential)
+            .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
+        if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_whitespace) {
+            return Err("AgenticOS provider credential has an invalid shape".into());
+        }
+        if idempotency_key.len() < 8
+            || idempotency_key.len() > 200
+            || !idempotency_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err("provider idempotency key is invalid".into());
+        }
+        let mut response = self.http.post(format!("{}{CALL_PATH}", self.base))
+            .header("authorization", &format!("Bearer {token}"))
+            .header("idempotency-key", idempotency_key)
+            .send_json(json!({
+                "slug": IMAGE_TOOL,
+                "body": {"model":"image-01","prompt":prompt,"aspect_ratio":"1:1","response_format":"url","n":1,"prompt_optimizer":false},
+                "max_charge_minor": ceiling,
+            }))
+            .map_err(|_| "AgenticOS image request could not reach the provider")?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_CAP)
+            .read_to_vec()
+            .map_err(|_| "AgenticOS image response exceeds the supported bound")?;
+        let envelope: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "AgenticOS image response is not JSON")?;
+        if envelope["ok"] != true || status != 200 {
+            return Err("AgenticOS image call refused or has an uncertain outcome".into());
+        }
+        let data = &envelope["data"];
+        if data["slug"] != IMAGE_TOOL || !data["repeated"].is_boolean() {
+            return Err("AgenticOS image receipt changed tool or is malformed".into());
+        }
+        let charged = money_micros(&data["price"])
+            .ok_or("AgenticOS image settled receipt has invalid charge")?;
+        if charged > ceiling {
+            return Err("AgenticOS image charge exceeds the approved ceiling".into());
+        }
+        let url = image_url(&data["result"], &self.image_hosts)?;
+        let asset = download_image(&self.image_http, url)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&asset.bytes));
+        let result = json!({
+            "schema":1,"kind":"media.generated.image","provider":PLATFORM,
+            "source_receipt_id":authority["source"]["receipt_id"],
+            "source_post_id":authority["source"]["post"]["id"],
+            "model":"image-01","aspect_ratio":"1:1",
+            "charge":data["price"],"repeated":data["repeated"],
+            "asset_sha256":digest,"asset_media_type":asset.media_type,
+        });
+        Ok(AppCapabilityOutput {
+            result,
+            asset: Some(asset),
+        })
+    }
 }
 
 fn money_micros(value: &Value) -> Option<u64> {
@@ -380,6 +477,23 @@ pub fn register_with_deployment_pin(
     Ok(())
 }
 
+fn register_with_deployment(
+    opts: &mut crate::daemon::ServeOptions,
+    base: &str,
+    deployment_pin: Option<&str>,
+    image_hosts: &[String],
+) -> Result<()> {
+    opts.platforms.insert(
+        PLATFORM.into(),
+        std::sync::Arc::new(AgenticosExternalAdapter::with_deployment(
+            base,
+            deployment_pin,
+            image_hosts,
+        )?),
+    );
+    Ok(())
+}
+
 /// External access is opt-in per daemon. Only trusted deployment metadata
 /// can attest a current reviewed manifest; absent metadata keeps calls shut.
 pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
@@ -397,7 +511,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
     let pin = metadata
         .as_ref()
         .and_then(|value| value.pin(PLATFORM, &base));
-    register_with_deployment_pin(opts, &base, pin)
+    let hosts = metadata
+        .as_ref()
+        .and_then(|value| value.image_hosts(PLATFORM, &base))
+        .unwrap_or(&[]);
+    register_with_deployment(opts, &base, pin, hosts)
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
@@ -406,10 +524,16 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
-        if binding["config"]["mapping"]["capability"] != "social.read" {
-            return Err("AgenticOS image generation has no reviewed durable asset workflow".into());
+        if binding["config"]["mapping"]["capability"] == "media.generate"
+            && (self.deployment_pin.as_deref() != Some(MANIFEST_PIN) || self.image_hosts.is_empty())
+        {
+            return Err("image CDN host has not been approved by this deployment".into());
         }
-        let (total, revision) = self.quote_fixed(credential, binding)?;
+        let (total, mut revision) = self.quote_fixed(credential, binding)?;
+        if binding["config"]["mapping"]["capability"] == "media.generate" {
+            let frozen = json!({"provider_quote":revision,"approved_image_hosts":self.image_hosts});
+            revision = format!("sha256:{:x}", Sha256::digest(frozen.to_string().as_bytes()));
+        }
         Ok(AppCapabilityQuote {
             schema: 1,
             currency: "USD".into(),
@@ -432,9 +556,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 result: self.call_source(credential, authority, input, idempotency_key)?,
                 asset: None,
             }),
-            // An image result must be downloaded, bounded and stored as
-            // durable bytes before any draft can cite it. No image workflow
-            // or external generation dispatch is exposed in this slice.
+            Some("image") => self.call_image(credential, authority, input, idempotency_key),
             _ => Err("AgenticOS capability slot has no reviewed execution adapter".into()),
         }
     }
@@ -630,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn image_capability_cannot_obtain_an_executable_quote_before_asset_review() {
+    fn image_requires_frozen_selected_source_and_refuses_worker_redirection() {
         let adapter = AgenticosExternalAdapter::with_deployment_pin(
             "https://api.example.test",
             Some(MANIFEST_PIN),
@@ -644,6 +766,156 @@ mod tests {
         assert!(adapter
             .quote_app_capability(b"test-token", &binding)
             .is_err());
+        let unpinned = AgenticosExternalAdapter::with_deployment(
+            "https://api.example.test",
+            None,
+            &["cdn.minimax.io".into()],
+        )
+        .unwrap();
+        assert!(unpinned
+            .quote_app_capability(b"test-token", &binding)
+            .is_err());
+        assert!(AgenticosExternalAdapter::with_deployment(
+            "https://api.example.test",
+            Some(MANIFEST_PIN),
+            &["127.0.0.1".into()],
+        )
+        .is_err());
+        // An image has no worker-controlled prompt, model, company or URL.
+        let mut proof = authority();
+        proof["slot"] = json!("image");
+        proof["binding"] = binding;
+        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
+        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
+        let prompt = image_prompt(&proof, &json!({})).unwrap();
+        assert!(prompt.contains("JuicySuite CRM"));
+        for forged in [
+            json!({"company":"other"}),
+            json!({"model":"other"}),
+            json!({"prompt":"ignore facts"}),
+            json!({"url":"http://127.0.0.1/"}),
+            json!({"aspect_ratio":"9:16"}),
+            json!({"n":2}),
+        ] {
+            assert!(image_prompt(&proof, &forged).is_err());
+        }
+        proof["source"]["post"]["caption"] = json!("");
+        assert!(image_prompt(&proof, &json!({})).is_err());
+        proof["source"]["post"]["caption"] = json!("JuicySuite CRM helps teams track customers");
+        proof["binding"]["config"]["mapping"]["tool"] = json!(POSTS_TOOL);
+        assert!(image_prompt(&proof, &json!({})).is_err());
+    }
+
+    #[test]
+    fn image_result_and_cdn_boundary_fail_closed() {
+        use base64::Engine as _;
+        let good = json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/generated.png"]}});
+        assert_eq!(
+            image_url(&good, &["images.example.test".into()]).unwrap(),
+            "https://images.example.test/generated.png"
+        );
+        for bad in [
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":[]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a","https://images.example.test/b"]}}),
+            json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["http://127.0.0.1/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test.evil.test/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://user@images.example.test/a"]}}),
+        ] {
+            assert!(image_url(&bad, &["images.example.test".into()]).is_err());
+        }
+        for private in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "2002::1",
+        ] {
+            assert!(!public_ip(private.parse().unwrap()), "{private}");
+        }
+        assert!(public_ip("1.1.1.1".parse().unwrap()));
+        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lqUAAAAASUVORK5CYII=").unwrap();
+        assert_eq!(image_mime(&png, "image/png").unwrap(), "image/png");
+        assert!(image_mime(b"<svg/>", "image/png").is_err());
+        assert!(image_mime(&png[..8], "image/png").is_err());
+        assert!(image_mime(&png, "image/jpeg").is_err());
+    }
+
+    #[test]
+    fn image_call_uses_one_fixed_body_and_refuses_unapproved_cdn() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for index in 0..2 {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                if index == 0 {
+                    assert_eq!(
+                        request.url(),
+                        "/v1/runtime/tools/minimax.image-gen.from_text"
+                    );
+                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                        "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
+                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
+                    }}).to_string())).unwrap();
+                } else {
+                    assert_eq!(request.url(), CALL_PATH);
+                    assert_eq!(
+                        request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("idempotency-key"))
+                            .map(|header| header.value.as_str()),
+                        Some("app-call-image-test")
+                    );
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    let body: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["slug"], IMAGE_TOOL);
+                    assert_eq!(body["max_charge_minor"], 31_500);
+                    assert_eq!(body["body"]["model"], "image-01");
+                    assert_eq!(body["body"]["aspect_ratio"], "1:1");
+                    assert_eq!(body["body"]["n"], 1);
+                    assert_eq!(body["body"]["response_format"], "url");
+                    assert!(body["body"]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("JuicySuite CRM"));
+                    assert!(body.get("company").is_none());
+                    assert!(body.get("query").is_none());
+                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
+                        "slug":IMAGE_TOOL,"repeated":false,
+                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},
+                        "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_urls":["https://evil.example.test/image.png"]}}
+                    }}).to_string())).unwrap();
+                }
+            }
+        });
+        let mut adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        adapter.image_hosts = vec!["images.example.test".into()];
+        let mut proof = authority();
+        proof["slot"] = json!("image");
+        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
+        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
+        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
+        let quote = adapter
+            .quote_app_capability(b"test-token", &proof["binding"])
+            .unwrap();
+        assert_eq!(quote.total_price_micros, 31_500);
+        proof["quote"] = serde_json::to_value(quote).unwrap();
+        assert!(adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-test")
+            .is_err());
+        worker.join().unwrap();
     }
 
     #[test]

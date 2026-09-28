@@ -17,6 +17,7 @@ import { WorkspaceDialog } from "./WorkspaceDialog";
 import { NewPost, type NewPostValues, type SelectedSource } from "./NewPost";
 import { SourceImport, type SourceImportValues } from "./SourceImport";
 import { SourcesPanel } from "./SourcesPanel";
+import { ImageReceiptPanel, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import {
   workspaceApps,
@@ -70,6 +71,7 @@ export default function WorkspaceApp({
   const [section, setSection] = useState<Section>("Board");
   const [contextId, setContextId] = useState("");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  const [verifiedImage, setVerifiedImage] = useState<VerifiedImage | null>(null);
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [selectedSource, setSelectedSource] = useState<SelectedSource | null>(null);
@@ -87,6 +89,7 @@ export default function WorkspaceApp({
   const [protectedTerms, setProtectedTerms] = useState("");
   const [connectionId, setConnectionId] = useState("");
   const [sourceConnectionId, setSourceConnectionId] = useState("");
+  const [imageConnectionId, setImageConnectionId] = useState("");
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
@@ -97,8 +100,9 @@ export default function WorkspaceApp({
     setLoading(false);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContextId(""); setConnectionId("");
-    setSourceConnectionId(""); setImporting(false); setSelectedSource(null);
+    setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
+    setVerifiedImage(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
   }, []);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
@@ -156,9 +160,10 @@ export default function WorkspaceApp({
   useEffect(() => {
     setData(null);
     setBrandName(""); setBrandVoice(""); setProtectedTerms(""); setConnectionId("");
-    setSourceConnectionId(""); setImporting(false); setSelectedSource(null);
+    setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
     setContextId("");
     setSelectedRun(null);
+    setVerifiedImage(null);
     setSelectedEffectId("");
     setArtifact(null);
     setOutbox(null);
@@ -203,6 +208,13 @@ export default function WorkspaceApp({
       (effect) => (effect.authority.context?.id ?? "") === contextId,
     ) ?? [];
   const run = data?.runs.find((value) => value.id === selectedRun) ?? null;
+  const imageQuote = run?.snapshot.quotes?.image;
+  const imagePlanPriced = !!(run?.snapshot.source?.receipt_id && run.snapshot.source.post.id
+    && run.snapshot.capabilities?.image?.digest && imageQuote?.schema === 1
+    && imageQuote.currency === "USD" && imageQuote.units === 1
+    && Number.isSafeInteger(imageQuote.unit_price_micros) && imageQuote.unit_price_micros > 0
+    && imageQuote.total_price_micros === imageQuote.unit_price_micros
+    && typeof imageQuote.price_revision === "string" && imageQuote.price_revision.length > 0);
   const runEffects =
     data?.effects.filter((effect) => effect.authority.run_id === run?.id) ?? [];
   const selectedEffect =
@@ -216,6 +228,7 @@ export default function WorkspaceApp({
       value.state === "configured",
   );
   const sourceBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "source" && value.state === "configured");
+  const imageBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "image" && value.state === "configured");
   const contexts =
     data?.contexts.filter((value) => value.state === "active") ?? [];
   const agents = data?.agents ?? [];
@@ -250,7 +263,12 @@ export default function WorkspaceApp({
       label: value === "instagram" ? "Instagram caption" : "Facebook post",
     }));
   const approved = data?.installation.approved === true;
-  const sourceEnabled = data?.installation.version === "0.3.0" && data.installation.files?.includes("workflows/source-instagram.md");
+  const sourceEnabled = ["0.3.0", "0.4.0"].includes(data?.installation.version || "") && data?.installation.files?.includes("workflows/source-instagram.md");
+  const imageEnabled = data?.installation.version === "0.4.0" && data.installation.files?.includes("workflows/image-instagram.md");
+  const creationOptions = selectedSource && imageEnabled && imageBinding
+    ? [...workflowOptions, { value: "image-instagram", label: "Instagram caption and image" }]
+    : workflowOptions;
+  const isImageRun = (value: WorkspaceRun) => !!value.snapshot.capabilities?.image;
   useEffect(() => {
     setArtifact(null);
     setArtifactError(null);
@@ -305,6 +323,7 @@ export default function WorkspaceApp({
   const openRun = (value: WorkspaceRun) => {
     setSelectedArtifact("");
     setSelectedEffectId("");
+    setVerifiedImage(null);
     setSelectedRun(value.id);
     setActionError(null);
   };
@@ -327,6 +346,7 @@ export default function WorkspaceApp({
       });
       completeRequest(requestKey);
       if (identity.current !== installId) return;
+      setVerifiedImage(null);
       setCreating(false);
       setSelectedSource(null);
       setSelectedRun(created.id);
@@ -366,7 +386,7 @@ export default function WorkspaceApp({
           <span className="wa-status" data-tone={statusTone(state)}>
             {statusText(state)}
           </span>
-          <span className="wa-kicker">Text</span>
+          <span className="wa-kicker">{isImageRun(value) ? "Caption + image" : "Text"}</span>
         </div>
         <strong>
           {plainTitle(value.snapshot.inputs, value.snapshot.workflow.title)}
@@ -444,7 +464,7 @@ export default function WorkspaceApp({
     },
   ];
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
-  if (data && (data.installation.name !== "social-content" || !["0.2.0", "0.3.0"].includes(data.installation.version) || workflowOptions.length !== 2)) {
+  if (data && (data.installation.name !== "social-content" || !["0.2.0", "0.3.0", "0.4.0"].includes(data.installation.version) || workflowOptions.length !== 2)) {
     return <main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
@@ -465,7 +485,7 @@ export default function WorkspaceApp({
           <div>
               <h1>{data?.installation.title || "Workspace app"}</h1>
             <p className="wa-kicker">
-              Workspace app · text drafts and Local release
+              Workspace app · reviewed drafts and Local release
             </p>
           </div>
         </div>
@@ -483,7 +503,7 @@ export default function WorkspaceApp({
       {!canWrite && (
         <p className="wa-alert">
           <IconLock /> Read-only view. A verified operator can configure the
-          app, approve runs and release text.
+          app, approve runs and release drafts.
         </p>
       )}
       {loadError && (
@@ -514,6 +534,7 @@ export default function WorkspaceApp({
                   setContextId(value);
                   setConnectionId("");
                   setSourceConnectionId("");
+                  setImageConnectionId("");
                   setSelectedSource(null);
                   setSelectedRun(null);
                   setSelectedArtifact("");
@@ -656,14 +677,15 @@ export default function WorkspaceApp({
                   you explicitly release it to Local.
                 </p>
                 <p className="wa-kicker">
-                  Instagram and Facebook publishing and generated images
-                  aren’t connected.
+                  Instagram and Facebook publishing aren’t connected.
+                  {imageEnabled ? " Image drafts can be reviewed and released to Local." : " Generated images aren’t connected."}
                 </p>
               </section>
             )}
             {section === "Sources" && sourceEnabled && (
               <SourcesPanel
                 runs={sourceRuns}
+                imageSupported={!!imageEnabled}
                 canWrite={canWrite && approved && !!sourceBinding}
                 canCreate={canWrite && approved && !!binding}
                 onImport={() => { setActionError(null); setImporting(true); }}
@@ -784,6 +806,33 @@ export default function WorkspaceApp({
                   </div>
                   {!data.connections.some(value => value.provider === "agenticos_external") && <p className="wa-alert">No AgenticOS external connection is enrolled. Ask the operator to connect a company-scoped provider.read device credential first.</p>}
                 </section>}
+                {imageEnabled && <section className="wa-panel wa-stack">
+                  <h2>Generated image connection</h2>
+                  <p className="wa-muted">Bind a company-scoped AgenticOS device credential with provider.draft access. The daemon must also have an approved exact image CDN host; without one, price discovery stays closed. An image plan pins one charge, source post, model and asset policy.</p>
+                  {imageBinding && <p className="wa-kicker">Configured · revision {imageBinding.revision} · {imageBinding.config.account}</p>}
+                  <div className="wa-row">
+                    <div className="wa-context">
+                      <Select
+                        value={imageConnectionId || imageBinding?.config.connection_id || ""}
+                        onChange={setImageConnectionId}
+                        options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "media.generate" && mapping.action === "generate_image" && mapping.effect === "draft") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
+                        placeholder="Choose AgenticOS draft connection"
+                        aria-label="Generated image connection"
+                        disabled={!canWrite || busy}
+                        full
+                      />
+                    </div>
+                    <Button
+                      disabled={!canWrite || busy || !(imageConnectionId || imageBinding?.config.connection_id) || (imageBinding !== undefined && (imageConnectionId || imageBinding.config.connection_id) === imageBinding.config.connection_id)}
+                      loading={busy}
+                      onClick={() => void mutate(async () => {
+                        const selected = imageConnectionId || imageBinding?.config.connection_id || "";
+                        if (imageBinding) await workspaceApps.updateBinding(installId, imageBinding.id, { expected_revision: imageBinding.revision, connection_id: selected });
+                        else await workspaceApps.createBinding(installId, { slot: "image", connection_id: selected, request_id: retainedRequest(`${installId}.${contextId}.image-binding.${selected}`), ...(contextId ? { context_id: contextId } : {}) });
+                      })}
+                    >Save image connection</Button>
+                  </div>
+                </section>}
                 <section className="wa-panel wa-stack">
                   <h2>Brand contexts</h2>
                   <p className="wa-muted">
@@ -832,6 +881,7 @@ export default function WorkspaceApp({
                           setProtectedTerms("");
                           setConnectionId("");
                           setSourceConnectionId("");
+                          setImageConnectionId("");
                         }
                       });
                     }}
@@ -895,7 +945,7 @@ export default function WorkspaceApp({
                 <section className="wa-panel wa-stack">
                   <h2>Available in this version</h2>
                   <p className="wa-muted">
-                    {sourceEnabled ? "Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable." : "Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable."}
+                    {imageEnabled ? "Retained Instagram source → priced caption and image plan → independent review of text and bytes → explicit Local release. External publishing and scheduling are unavailable." : sourceEnabled ? "Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable." : "Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable."}
                   </p>
                   <details className="wa-details">
                     <summary>Installation details</summary>
@@ -913,7 +963,12 @@ export default function WorkspaceApp({
       )}
       {creating && (
         <NewPost
-          workflows={workflowOptions}
+          workflows={creationOptions}
+          installId={installId}
+          contextId={contextId || undefined}
+          imageSupported={!!imageEnabled}
+          imageBindingDigest={imageBinding?.digest}
+          onDenied={clearPrivate}
           workers={options(workers)}
           managers={options(managers)}
           busy={busy}
@@ -975,14 +1030,17 @@ export default function WorkspaceApp({
               <span className="wa-kicker">{run.id}</span>
             </div>
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
+            {isImageRun(run) && (imagePlanPriced
+              ? <p className="wa-alert">Frozen one-image charge: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong>. This covers one `image-01` square draft from the selected post. Binding {run.snapshot.capabilities?.image?.digest}. A changed price or binding stops dispatch.</p>
+              : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
             <section className="wa-stack">
               <h3>Frozen plan</h3>
               {run.snapshot.workflow.steps.map((step) => (
                 <div key={step.id} className="wa-step">
                   <span>
                     {step.kind === "review_text"
-                      ? "Independent review"
-                      : "Write text"}{" "}
+                      ? isImageRun(run) ? "Independent text and image review" : "Independent review"
+                      : isImageRun(run) ? "Write caption and retain image" : "Write text"}{" "}
                     · {step.assignee}
                   </span>
                   <span className="wa-status">
@@ -1005,7 +1063,7 @@ export default function WorkspaceApp({
               {run.state === "awaiting_approval" && (
                 <Button
                   variant="primary"
-                  disabled={!canWrite}
+                  disabled={!canWrite || (isImageRun(run) && !imagePlanPriced)}
                   loading={busy}
                   onClick={() =>
                     void mutate(async () => {
@@ -1016,13 +1074,13 @@ export default function WorkspaceApp({
                     })
                   }
                 >
-                  Approve this plan
+                  {isImageRun(run) && imagePlanPriced ? `Approve one image for USD ${(run.snapshot.quotes!.image.total_price_micros / 1_000_000).toFixed(6)} and this plan` : "Approve this plan"}
                 </Button>
               )}
               {run.state === "approved" && (
                 <Button
                   variant="primary"
-                  disabled={!canWrite}
+                  disabled={!canWrite || (isImageRun(run) && !imagePlanPriced)}
                   loading={busy}
                   onClick={() =>
                     void mutate(async () => {
@@ -1030,10 +1088,11 @@ export default function WorkspaceApp({
                     })
                   }
                 >
-                  Start writer and reviewer
+                  {isImageRun(run) ? "Start caption and image run" : "Start writer and reviewer"}
                 </Button>
               )}
             </section>
+            {isImageRun(run) && <ImageReceiptPanel run={run} onDenied={clearPrivate} onVerified={setVerifiedImage} />}
             {run.reviews.map((review, index) => (
               <div key={`${review.step_id}-${index}`} className="wa-alert">
                 <strong>
@@ -1044,6 +1103,9 @@ export default function WorkspaceApp({
                 </strong>
                 <p>{review.rationale}</p>
                 <p className="wa-digest">{review.artifact_digest}</p>
+                {isImageRun(run) && (review.asset_receipt_id && review.asset_digest
+                  ? <p className="wa-digest">Retained image {review.asset_receipt_id}<br />{review.asset_digest}</p>
+                  : <p className="wa-alert" data-tone="fail">This review has no pinned retained image. Caption and image release is unavailable.</p>)}
               </div>
             ))}
             {run.artifacts.length > 1 && (
@@ -1077,7 +1139,10 @@ export default function WorkspaceApp({
                   run.reviews.some(
                     (review) =>
                       review.artifact_digest === artifact.digest &&
-                      review.decision === "approve",
+                      review.decision === "approve" &&
+                      (!isImageRun(run) || (verifiedImage?.runId === run.id
+                        && review.asset_receipt_id === verifiedImage.receiptId
+                        && review.asset_digest === verifiedImage.digest)),
                   ) && (
                     <Button
                       disabled={!canWrite}
@@ -1103,7 +1168,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Prepare Local release
+                      {isImageRun(run) ? "Prepare caption and image Local release" : "Prepare Local release"}
                     </Button>
                   )}
               </section>
@@ -1169,7 +1234,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Release this text to Local
+                      {isImageRun(run) ? "Release caption and image to Local" : "Release this text to Local"}
                     </Button>
                     <Button
                       disabled={!canWrite}
