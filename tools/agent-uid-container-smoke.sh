@@ -6,8 +6,10 @@ set -euo pipefail
 binary="${1:-target/debug/cadence}"
 test -x "$binary"
 binary="$(realpath "$binary")"
+http_probe="$(realpath "$(dirname "$0")/agent-uid-http-probe.pl")"
 
 docker run --rm -i --network none --mount "type=bind,src=$binary,dst=/opt/cadence,readonly" \
+  --mount "type=bind,src=$http_probe,dst=/opt/http-probe.pl,readonly" \
   ubuntu:24.04 bash -euo pipefail -s <<'CONTAINER'
 groupadd -g 2200 cadence
 useradd -u 1100 -g cadence -M -d /tmp/operator cadence-operator
@@ -53,7 +55,7 @@ for socket in /tmp/state/cadence.sock /var/lib/cadence/cadence.sock; do
 done
 mkdir -p /tmp/ui
 printf '<!doctype html><title>fixture</title>\n' >/tmp/ui/index.html
-runuser -u cadence-operator -- env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
+setpriv --reuid=1100 --regid=2200 --clear-groups env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
   /opt/cadence ui run --state-dir /tmp/state --port 3115 --dist /tmp/ui >/tmp/ui.log 2>&1 &
 ui_pid=$!
 trap 'kill "$ui_pid" "$daemon_pid" 2>/dev/null || true' EXIT
@@ -67,15 +69,87 @@ if ! kill -0 "$ui_pid" 2>/dev/null; then cat /tmp/ui.log; exit 1; fi
 agent_link=$(runuser -u cadence-operator -- env HOME=/tmp/operator \
   /opt/cadence ui login --state-dir /tmp/state --port 3115 --json |
   perl -0777 -ne 'print $1 if /"link"\s*:\s*"([^"]+)"/')
-http_probe='use IO::Socket::INET; my ($url,$header)=@ARGV; $url =~ m{^http://([^/]+)/login#n=([^&]+)$} or die "bad link"; my ($host,$nonce)=($1,$2); my $body="{\"nonce\":\"$nonce\"}"; my $extra=$header ne "" ? "$header\r\n" : ""; my $s=IO::Socket::INET->new(PeerAddr=>"127.0.0.1",PeerPort=>3115,Proto=>"tcp") or die "connect: $!"; print $s "POST /api/session HTTP/1.1\r\nHost: $host\r\nOrigin: http://$host\r\nContent-Type: application/json\r\nContent-Length: ".length($body)."\r\nX-Cadence-Board: 1\r\nX-Cadence-Caller: operator\r\n${extra}Connection: close\r\n\r\n$body"; my $status=<$s>; print $status;'
-agent_status=$(runuser -u cadence-agent -- setsid perl -e "$http_probe" "$agent_link" \
+agent_status=$(runuser -u cadence-agent -- setsid perl /opt/http-probe.pl login "$agent_link" \
   'X-Forwarded-User: operator')
 operator_link=$(runuser -u cadence-operator -- env HOME=/tmp/operator \
   /opt/cadence ui login --state-dir /tmp/state --port 3115 --json |
   perl -0777 -ne 'print $1 if /"link"\s*:\s*"([^"]+)"/')
-operator_status=$(runuser -u cadence-operator -- perl -e "$http_probe" "$operator_link" '')
+operator_status=$(runuser -u cadence-operator -- perl /opt/http-probe.pl \
+  login "$operator_link" '' /tmp/operator-session)
 echo "agent login attempt: $agent_status; operator login attempt: $operator_status"
 grep -Eq '^HTTP/1\.[01] 40[13] ' <<<"$agent_status"
 grep -Eq '^HTTP/1\.[01] 200 ' <<<"$operator_status"
 echo 'board login link refused to detached agent UID despite forged headers'
+mapfile -t operator_session </tmp/operator-session
+test "${#operator_session[@]}" -eq 2
+# The daemon keeps UID 2200 pinned for this boot. Removing the private
+# record must not let the board fall back to a session-bearing NoAgent.
+mv /tmp/state/agent-uid.json /tmp/agent-uid.saved
+removed_link=$(runuser -u cadence-operator -- env HOME=/tmp/operator \
+  /opt/cadence ui login --state-dir /tmp/state --port 3115 --json |
+  perl -0777 -ne 'print $1 if /"link"\s*:\s*"([^"]+)"/')
+removed_status=$(runuser -u cadence-agent -- setsid perl /opt/http-probe.pl login "$removed_link" '')
+grep -Eq '^HTTP/1\.[01] 403 ' <<<"$removed_status"
+# A valid operator cookie and page key remain live across a board restart.
+# An old agent UID presenting both must still fail after the record vanishes.
+kill "$ui_pid"
+wait "$ui_pid" 2>/dev/null || true
+setpriv --reuid=1100 --regid=2200 --clear-groups env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
+  /opt/cadence ui run --state-dir /tmp/state --port 3115 --dist /tmp/ui >/tmp/ui-restart-normal.log 2>&1 &
+ui_pid=$!
+for n in $(seq 1 100); do
+  if perl -MIO::Socket::INET -e 'exit(IO::Socket::INET->new(PeerAddr=>"127.0.0.1",PeerPort=>3115,Proto=>"tcp") ? 0 : 1)'; then break; fi
+  sleep 0.1
+done
+if ! kill -0 "$ui_pid" 2>/dev/null; then cat /tmp/ui-restart-normal.log; exit 1; fi
+stolen_restart_status=$(runuser -u cadence-agent -- setsid perl /opt/http-probe.pl \
+  write "${operator_session[0]}" "${operator_session[1]}")
+grep -Eq '^HTTP/1\.[01] 403 ' <<<"$stolen_restart_status"
+# Restart the board with an inherited forged CADENCE_SOCKET. The fake RPC
+# endpoint reports whichever UID matches the edited record and returns a
+# synthetic successful login. Security attribution must still query the
+# actual daemon on the private state socket, so the agent gets 403.
+kill "$ui_pid"
+wait "$ui_pid" 2>/dev/null || true
+printf 'null\n' >/tmp/fake-health-uid
+fake_server='use IO::Socket::UNIX; my $path="/tmp/fake.sock"; unlink $path; my $server=IO::Socket::UNIX->new(Type=>1,Local=>$path,Listen=>16) or die "bind: $!"; chmod 0777,$path; while(my $client=$server->accept()) { my $request=<$client>; my ($method)=$request =~ /"method":"([^"]+)"/; open my $log,">>","/tmp/fake-methods" or die $!; print $log "$method\n"; close $log; open my $f,"<","/tmp/fake-health-uid" or die $!; my $uid=<$f>; chomp $uid; close $f; my $result=$method eq "health" ? "{\"agent_uid\":$uid}" : "{\"token\":\"fake\",\"session\":{\"expires_at\":9999999999},\"key\":\"fake\"}"; print $client "{\"ok\":true,\"result\":$result}\n"; close $client; }'
+perl -e "$fake_server" >/tmp/fake.log 2>&1 &
+fake_pid=$!
+for n in $(seq 1 100); do test -S /tmp/fake.sock && break; sleep 0.1; done
+test -S /tmp/fake.sock
+setpriv --reuid=1100 --regid=2200 --clear-groups env HOME=/tmp/operator \
+  CADENCE_PM_DIR=/tmp/pm CADENCE_SOCKET=/tmp/fake.sock \
+  /opt/cadence ui run --state-dir /tmp/state --port 3115 --dist /tmp/ui >/tmp/ui-restart.log 2>&1 &
+ui_pid=$!
+trap 'kill "$fake_pid" "$ui_pid" "$daemon_pid" 2>/dev/null || true' EXIT
+for n in $(seq 1 100); do
+  if perl -MIO::Socket::INET -e 'exit(IO::Socket::INET->new(PeerAddr=>"127.0.0.1",PeerPort=>3115,Proto=>"tcp") ? 0 : 1)'; then break; fi
+  sleep 0.1
+done
+if ! kill -0 "$ui_pid" 2>/dev/null; then cat /tmp/ui-restart.log; exit 1; fi
+: >/tmp/fake-methods
+spoof_link=$(runuser -u cadence-operator -- env HOME=/tmp/operator \
+  /opt/cadence ui login --state-dir /tmp/state --port 3115 --json |
+  perl -0777 -ne 'print $1 if /"link"\s*:\s*"([^"]+)"/')
+spoof_status=$(runuser -u cadence-agent -- setsid perl /opt/http-probe.pl login "$spoof_link" '')
+grep -Eq '^HTTP/1\.[01] 403 ' <<<"$spoof_status"
+# A new valid NSS UID and matching private record also must not upgrade
+# an old UID 2200 process before the daemon itself is restarted.
+usermod -u 4400 cadence-agent
+printf '{"uid":4400}\n' >/tmp/state/agent-uid.json
+chown 1100:2200 /tmp/state/agent-uid.json
+chmod 0600 /tmp/state/agent-uid.json
+printf '4400\n' >/tmp/fake-health-uid
+changed_link=$(runuser -u cadence-operator -- env HOME=/tmp/operator \
+  /opt/cadence ui login --state-dir /tmp/state --port 3115 --json |
+  perl -0777 -ne 'print $1 if /"link"\s*:\s*"([^"]+)"/')
+changed_status=$(setpriv --reuid=2200 --regid=2200 --clear-groups setsid \
+  perl /opt/http-probe.pl login "$changed_link" '')
+grep -Eq '^HTTP/1\.[01] 403 ' <<<"$changed_status"
+grep -q '^operator_session_open$' /tmp/fake-methods
+if grep -q '^health$' /tmp/fake-methods; then
+  echo 'board health proof followed forged CADENCE_SOCKET' >&2
+  exit 1
+fi
+echo "board record removal: $removed_status; stolen session after restart: $stolen_restart_status; spoofed restart: $spoof_status; valid UID drift: $changed_status"
 CONTAINER

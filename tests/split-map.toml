@@ -227,6 +227,7 @@ tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children"]
 
 [binaries.daemon]
 tests = [
+    "configured_agent_uid_binds_two_sockets_without_changing_private_clients",
     "fifo_queue_and_idempotent_send",
     "result_routing_wakes_pm",
     "upstream_param_defaults_reply_to",

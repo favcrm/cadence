@@ -342,6 +342,24 @@ pub fn rpc_timeout(
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
 }
 
+/// Query the daemon bound to this private state directory, ignoring
+/// `CADENCE_SOCKET`. The board uses this for boot-pinned UID authority;
+/// an inherited agent socket override must never choose that source.
+pub fn rpc_private_timeout(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    proto::unwrap(rpc_frame_on(
+        state_dir,
+        &socket_path(state_dir),
+        method,
+        params,
+        timeout,
+    )?)
+}
+
 /// `rpc` that tells the two failures apart: the outer `Err` is the
 /// transport — no daemon at the socket, an I/O error, a malformed
 /// frame — and the inner result is the daemon's own answer, a refusal
@@ -359,7 +377,17 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
 /// One request/response frame over the daemon socket.
 fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let socket = rpc_socket_path(state_dir)?;
-    let mut stream = UnixStream::connect(&socket).map_err(|_| {
+    rpc_frame_on(state_dir, &socket, method, params, timeout)
+}
+
+fn rpc_frame_on(
+    state_dir: &Path,
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut stream = UnixStream::connect(socket).map_err(|_| {
         Error::internal(format!(
             "Daemon is not reachable at {} — start it with `cadence daemon start`",
             socket.display()

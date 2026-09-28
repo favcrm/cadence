@@ -844,6 +844,46 @@ fn agent_uid_attribution(
     }
 }
 
+fn pinned_agent_uid(configured: Option<u32>, active: Option<u32>) -> Result<Option<u32>, String> {
+    if configured == active {
+        Ok(active)
+    } else {
+        Err("agent UID record differs from the running daemon's boot pin".to_string())
+    }
+}
+
+fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, String> {
+    let ip = opts
+        .host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "board bind address is not a concrete IP".to_string())?;
+    if ip.is_unspecified() {
+        return Err(
+            "board bind address is wildcard; client destination cannot be proved".to_string(),
+        );
+    }
+    Ok(std::net::SocketAddr::new(ip, opts.port))
+}
+
+fn active_agent_uid(state_dir: &std::path::Path) -> Result<Option<u32>, String> {
+    let health = client::rpc_private_timeout(
+        state_dir,
+        "health",
+        json!({}),
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| format!("private daemon health refused: {error}"))?;
+    match health.get("agent_uid") {
+        Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|uid| u32::try_from(uid).ok())
+            .map(Some)
+            .ok_or_else(|| "private daemon reported an invalid agent UID".to_string()),
+        _ => Err("private daemon did not report its boot-pinned agent UID".to_string()),
+    }
+}
+
 /// Attribute the TCP peer to an agent ([`crate::peer::tcp_peer_agent`]).
 /// CAD-482: a seam-asserted request carries its caller in the headers —
 /// `operator` is the same attribution a local un-owned browser gets,
@@ -855,7 +895,7 @@ fn attribute(
     opts: &ServeOpts,
     origin: &ReqOrigin,
 ) -> Attribution {
-    let agent_uid = match opts.agent_uid {
+    let configured = match opts.agent_uid {
         Some(uid) => Some(uid),
         None => match crate::agent_uid::config::configured_uid(state_dir) {
             Ok(uid) => uid,
@@ -864,10 +904,26 @@ fn attribute(
             }
         },
     };
+    let active = match active_agent_uid(state_dir) {
+        Ok(uid) => uid,
+        Err(error) => return Attribution::Unknown(error),
+    };
+    let agent_uid = match pinned_agent_uid(configured, active) {
+        Ok(uid) => uid,
+        Err(error) => return Attribution::Unknown(error),
+    };
     if agent_uid.is_some() {
+        let server = match concrete_board_server(opts) {
+            Ok(server) => server,
+            Err(error) => return Attribution::Unknown(error),
+        };
         let socket_uid = request
             .remote_addr()
-            .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+            .and_then(|peer| {
+                crate::peer::client_socket_exact(server, *peer)
+                    .ok()
+                    .flatten()
+            })
             .map(|(_, uid)| uid);
         let classified = agent_uid_attribution(socket_uid, agent_uid, Attribution::NoAgent);
         if matches!(classified, Attribution::AgentUid | Attribution::Unknown(_)) {
@@ -1515,6 +1571,34 @@ mod tests {
             decide(Some(Held::Operator), missing, ("session", "required")),
             Verdict::Refuse("caller_identity", _)
         ));
+    }
+
+    #[test]
+    fn configured_uid_guard_refuses_record_drift_and_unbound_server() {
+        assert_eq!(pinned_agent_uid(None, None).unwrap(), None);
+        assert_eq!(
+            pinned_agent_uid(Some(2000), Some(2000)).unwrap(),
+            Some(2000)
+        );
+        assert!(pinned_agent_uid(None, Some(2000)).is_err());
+        assert!(pinned_agent_uid(Some(3000), Some(2000)).is_err());
+        for host in ["0.0.0.0", "::", "localhost"] {
+            let opts = ServeOpts {
+                host: host.into(),
+                port: 3115,
+                ..ServeOpts::default()
+            };
+            assert!(concrete_board_server(&opts).is_err(), "{host}");
+        }
+        let opts = ServeOpts {
+            host: "127.0.0.1".into(),
+            port: 3115,
+            ..ServeOpts::default()
+        };
+        assert_eq!(
+            concrete_board_server(&opts).unwrap(),
+            "127.0.0.1:3115".parse().unwrap()
+        );
     }
 
     #[test]

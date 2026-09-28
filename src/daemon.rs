@@ -2161,6 +2161,9 @@ impl Shared {
                 json!({
                 "state": "ready",
                 "pid": std::process::id(),
+                // The board compares this boot-pinned UID to the private
+                // record before attributing any session-bearing peer.
+                "agent_uid": self.agent_uid,
                 "sandbox": crate::sandbox::profile(),
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),

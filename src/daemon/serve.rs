@@ -98,6 +98,7 @@ struct PeerCred {
 
 /// Reject peers outside the exact kernel-credential UID admit set;
 /// the pid still derives slot and approval-answer caller identity.
+#[cfg(any(target_os = "linux", test))]
 fn admit_peer_uid(peer_uid: u32, daemon_uid: u32, agent_uid: Option<u32>) -> bool {
     if agent_uid.is_some_and(|uid| daemon_uid == 0 || uid == 0 || uid == daemon_uid) {
         return false;
