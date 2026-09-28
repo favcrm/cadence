@@ -773,7 +773,7 @@
     }
 
     #[test]
-    fn cad713_migration_v24_to_v25_is_atomic_and_preserves_text_reviews() {
+    fn cad713_migration_v24_to_v25_is_atomic_and_idempotent() {
         let dir=TempDir::new().unwrap();
         let db=dir.path().join("asset.sqlite3");
         Store::open(&db).unwrap();

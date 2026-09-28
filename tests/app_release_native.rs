@@ -428,7 +428,7 @@ fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
 }
 
 #[test]
-fn cad713_forged_review_asset_receipt_cannot_complete_or_stage() {
+fn cad713_cross_run_review_asset_receipt_cannot_complete_or_stage() {
     let (h, _, _) = Release::with_capability();
     let context = h.context("Client A", A, "asset-forged-context");
     h.bind(&context, "asset-forged-publication");
@@ -440,6 +440,23 @@ fn cad713_forged_review_asset_receipt_cannot_complete_or_stage() {
         "request_id":"asset-forged-source"}),
         )
         .unwrap();
+    let first = h.create(&context, "asset-source-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            first["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&first);
+    h.wait_state(first["id"].as_str().unwrap(), "succeeded");
+    let other = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":first["id"]}))
+        .unwrap()["results"][0]
+        .clone();
     let run = h.create(&context, "asset-forged-run");
     std::fs::write(
         h.daemon.state.join(format!(
@@ -455,7 +472,7 @@ fn cad713_forged_review_asset_receipt_cannot_complete_or_stage() {
             "app-review-asset-override-{}.json",
             run["id"].as_str().unwrap()
         )),
-        json!({"asset_receipt_id":"app-call-forged"}).to_string(),
+        json!({"asset_receipt_id":other["id"],"asset_sha256":other["asset"]["digest"]}).to_string(),
     )
     .unwrap();
     h.dispatch(&run);
