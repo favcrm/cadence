@@ -85,7 +85,8 @@ worker's copied text as a source receipt. Only the operator can choose one
 post ID from that receipt for a caption run in the same installation and
 context. A private, missing, rate-limited, deleted or malformed source
 returns a visible refusal or an honest empty result; it never becomes
-sample content. A profile with no posts cannot verify its identity.
+sample content. An empty page verifies the profile only when the provider
+returns a matching public account identity.
 
 For the caption run, include its `source_receipt_id` and
 `selected_post_id` and omit `inputs.source`. The server freezes the
