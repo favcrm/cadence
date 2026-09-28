@@ -28,10 +28,16 @@ const receipt = { id: "image-receipt", run_id: run.id, slot: "image", digest: "r
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
 let returnedReceipt: typeof receipt = receipt;
 let returnedBytes = png;
+let holdResults: Promise<void> | null = null;
+let denyResults = false;
 const reads: string[] = [];
 globalThis.fetch = async input => {
   const path = String(input); reads.push(path);
-  if (path === "/api/app-runs/image-run/capability-results") return json({ results: [returnedReceipt] });
+  if (path === "/api/app-runs/image-run/capability-results") {
+    if (holdResults) await holdResults;
+    if (denyResults) return new Response(JSON.stringify({ error: "Access revoked" }), { status: 403 });
+    return json({ results: [returnedReceipt] });
+  }
   if (path === "/api/app-capability-results/image-receipt/asset") return json({ receipt_id: receipt.id, media_type: "image/png", digest, size: bytes.length, base64: returnedBytes });
   throw new Error(`Unexpected read ${path}`);
 };
@@ -40,28 +46,48 @@ const host = document.createElement("div"); document.body.append(host);
 const root = createRoot(host);
 const verified: Array<{ runId: string; receiptId: string; digest: string } | null> = [];
 const onVerified = (value: { runId: string; receiptId: string; digest: string } | null) => verified.push(value);
-const flush = () => React.act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-async function render() {
-  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run, onDenied: () => { throw new Error("Unexpected denial"); }, onVerified })));
-  await flush();
+let denials = 0;
+const onDenied = () => { denials++; };
+async function settleUntil(condition: () => boolean, reason: string) {
+  const deadline = Date.now() + 3000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(reason);
+    await React.act(async () => { await new Promise(resolve => setTimeout(resolve, 1)); });
+  }
+}
+async function render(nextRun = run) {
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: nextRun, onDenied, onVerified })));
 }
 async function main() {
   await render();
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !!host.querySelector("img"), "Retained image verification did not complete");
   assert(host.querySelector("img")?.getAttribute("src") === `data:image/png;base64,${png}`, "Board renders the retained asset, not a temporary provider URL");
   assert(verified.at(-1)?.receiptId === receipt.id && verified.at(-1)?.digest === digest, "Exact retained digest can unlock release");
   assert(host.textContent?.includes("Independent review pinned these bytes"), "Board explains the reviewer pin");
-  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "failed" }, onDenied: () => {}, onVerified })));
-  await flush();
+  let releaseResults!: () => void;
+  holdResults = new Promise(resolve => { releaseResults = resolve; });
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "failed" }, onDenied, onVerified })));
+  assert(host.querySelector("img")?.getAttribute("src") === `data:image/png;base64,${png}`, "A later run failure must not hide retained image bytes while a repeated read is pending");
+  releaseResults(); holdResults = null;
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !host.textContent?.includes("Checking retained image bytes"), "Retained image revalidation did not complete");
   assert(host.querySelector("img")?.getAttribute("src") === `data:image/png;base64,${png}`, "A later run failure must not hide retained image bytes");
   assert(host.textContent?.includes("This run did not complete"), "A retained image in a failed run is clearly not releasable");
+  denyResults = true;
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "running" }, onDenied, onVerified })));
+  await settleUntil(() => denials === 1, "Revoked access was not reported");
+  assert(!host.querySelector("img") && verified.at(-1) === null, "Revoked access cannot retain a previously verified image");
+  denyResults = false;
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "failed" }, onDenied, onVerified })));
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !!host.querySelector("img"), "Retained image did not recover after access was restored");
   returnedBytes = png.replace("AC1HAw", "BC1HAw");
-  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "running" }, onDenied: () => {}, onVerified })));
-  await flush();
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "running" }, onDenied, onVerified })));
+  await settleUntil(() => !!host.textContent?.includes("retained image digest changed"), "Tampered asset verification did not complete");
   assert(!host.querySelector("img") && verified.at(-1) === null, "Tampered retained bytes revoke browser verification");
   assert(host.textContent?.includes("retained image digest changed"), "Operator sees why release is blocked");
   returnedBytes = png;
   returnedReceipt = { ...receipt, run_id: "forged-run" };
-  await render();
+  await render(run);
+  await settleUntil(() => !!host.textContent?.includes("no verified retained image receipt"), "Forged receipt verification did not complete");
   assert(!host.querySelector("img") && verified.at(-1) === null, "Receipt from another run cannot unlock release");
   assert(reads.includes("/api/app-runs/image-run/capability-results"), "The panel reads a stored result from the selected run");
   await React.act(async () => root.unmount());
