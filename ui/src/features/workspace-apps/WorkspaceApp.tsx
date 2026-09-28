@@ -31,6 +31,8 @@ import {
   type WorkspaceOutbox,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
+import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
+import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 
 type Section =
@@ -69,7 +71,7 @@ export default function WorkspaceApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [section, setSection] = useState<Section>("Board");
-  const [contextId, setContextId] = useState("");
+  const [contextId, setContextId] = useState(() => rememberedContext(installId) ?? "");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [verifiedImage, setVerifiedImage] = useState<VerifiedImage | null>(null);
   const [creating, setCreating] = useState(false);
@@ -87,6 +89,9 @@ export default function WorkspaceApp({
   const [brandName, setBrandName] = useState("");
   const [brandVoice, setBrandVoice] = useState("");
   const [protectedTerms, setProtectedTerms] = useState("");
+  const [contentPrompt, setContentPrompt] = useState("");
+  const [imagePrompt, setImagePrompt] = useState("");
+  const [editingContextId, setEditingContextId] = useState("");
   const [connectionId, setConnectionId] = useState("");
   const [sourceConnectionId, setSourceConnectionId] = useState("");
   const [imageConnectionId, setImageConnectionId] = useState("");
@@ -99,12 +104,14 @@ export default function WorkspaceApp({
     activeRead.current = null;
     setLoading(false);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+    setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
+    forgetContext(installId);
     setContextId(""); setConnectionId("");
     setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
-  }, []);
+  }, [installId]);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
   const canWrite = viewer.operator && !viewer.readOnly && !accessDenied;
   const refresh = useCallback(async () => {
@@ -159,9 +166,10 @@ export default function WorkspaceApp({
   }, [installId, viewer.operator, clearPrivate]);
   useEffect(() => {
     setData(null);
-    setBrandName(""); setBrandVoice(""); setProtectedTerms(""); setConnectionId("");
+    setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+    setContentPrompt(""); setImagePrompt(""); setEditingContextId(""); setConnectionId("");
     setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
-    setContextId("");
+    setContextId(rememberedContext(installId) ?? "");
     setSelectedRun(null);
     setVerifiedImage(null);
     setSelectedEffectId("");
@@ -179,6 +187,11 @@ export default function WorkspaceApp({
       activeRead.current?.abort();
     };
   }, [refresh]);
+  useEffect(() => {
+    if (!data || data.installation.install_id !== installId) return;
+    const selected = initialContext(installId, data.contexts.filter(value => value.state === "active").map(value => value.id));
+    if (selected !== contextId) setContextId(selected);
+  }, [data, contextId, installId]);
   const mutate = async (work: () => Promise<void>) => {
     if (!canWrite || mutationLock.current) return;
     mutationLock.current = true;
@@ -231,6 +244,8 @@ export default function WorkspaceApp({
   const imageBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "image" && value.state === "configured");
   const contexts =
     data?.contexts.filter((value) => value.state === "active") ?? [];
+  const selectedContext = contexts.find(value => value.id === contextId);
+  const workflowInputs = Object.fromEntries((data?.installation.workflows ?? []).map(value => [value.name, value.inputs]));
   const agents = data?.agents ?? [];
   const workers = agents.filter(
     (agent) =>
@@ -263,11 +278,13 @@ export default function WorkspaceApp({
       label: value === "instagram" ? "Instagram caption" : "Facebook post",
     }));
   const approved = data?.installation.approved === true;
-  const sourceEnabled = ["0.3.0", "0.4.0"].includes(data?.installation.version || "") && data?.installation.files?.includes("workflows/source-instagram.md");
-  const imageEnabled = data?.installation.version === "0.4.0" && data.installation.files?.includes("workflows/image-instagram.md");
-  const creationOptions = selectedSource && imageEnabled && imageBinding
-    ? [...workflowOptions, { value: "image-instagram", label: "Instagram caption and image" }]
-    : workflowOptions;
+  const sourceEnabled = data?.installation.files?.includes("workflows/source-instagram.md");
+  const imageEnabled = data?.installation.files?.includes("workflows/image-instagram.md") || data?.installation.files?.includes("workflows/image-manual.md");
+  const creationOptions = [
+    ...workflowOptions,
+    ...(data?.installation.files?.includes("workflows/image-instagram.md") ? [{ value: "image-instagram", label: "Instagram caption and image" }] : []),
+    ...(data?.installation.files?.includes("workflows/image-manual.md") ? [{ value: "image-manual", label: "Caption and image from pasted facts" }] : []),
+  ];
   const isImageRun = (value: WorkspaceRun) => !!value.snapshot.capabilities?.image;
   useEffect(() => {
     setArtifact(null);
@@ -336,6 +353,8 @@ export default function WorkspaceApp({
         inputs: {
           subject: values.title,
           ...(!values.sourceReceiptId ? { source: values.source } : {}),
+          ...(values.contentPrompt ? { content_prompt: values.contentPrompt } : {}),
+          ...(values.imagePrompt ? { image_prompt: values.imagePrompt } : {}),
           writer: values.writer,
           reviewer: values.reviewer,
         },
@@ -532,6 +551,10 @@ export default function WorkspaceApp({
                 value={contextId}
                 onChange={(value) => {
                   setContextId(value);
+                  rememberContext(installId, value);
+                  setEditingContextId("");
+                  setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+                  setContentPrompt(""); setImagePrompt("");
                   setConnectionId("");
                   setSourceConnectionId("");
                   setImageConnectionId("");
@@ -779,8 +802,8 @@ export default function WorkspaceApp({
                   )}
                 </section>
                 {sourceEnabled && <section className="wa-panel wa-stack">
-                  <h2>Instagram source connection</h2>
-                  <p className="wa-muted">Bind this installation and brand context to a company-scoped AgenticOS device credential with provider.read access. A source run freezes this binding before any provider read.</p>
+                  <h2>Instagram source</h2>
+                  <p className="wa-muted">Choose the company connection Cadence uses to read public Instagram posts. Every source plan freezes this choice and shows its exact price before a read starts.</p>
                   {sourceBinding && <p className="wa-kicker">Configured · revision {sourceBinding.revision} · {sourceBinding.config.account}</p>}
                   <div className="wa-row">
                     <div className="wa-context">
@@ -788,7 +811,7 @@ export default function WorkspaceApp({
                         value={sourceConnectionId || sourceBinding?.config.connection_id || ""}
                         onChange={setSourceConnectionId}
                         options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "social.read" && mapping.action === "list_posts" && mapping.effect === "read") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
-                        placeholder="Choose AgenticOS connection"
+                        placeholder="Choose source connection"
                         aria-label="Instagram source connection"
                         disabled={!canWrite || busy}
                         full
@@ -804,11 +827,11 @@ export default function WorkspaceApp({
                       })}
                     >Save source connection</Button>
                   </div>
-                  {!data.connections.some(value => value.provider === "agenticos_external") && <p className="wa-alert">No AgenticOS external connection is enrolled. Ask the operator to connect a company-scoped provider.read device credential first.</p>}
+                  {!data.connections.some(value => value.provider === "agenticos_external") && <p className="wa-alert">No company source connection is available yet. Set up provider access for this Cadence app before reading Instagram posts.</p>}
                 </section>}
                 {imageEnabled && <section className="wa-panel wa-stack">
-                  <h2>Generated image connection</h2>
-                  <p className="wa-muted">Bind a company-scoped AgenticOS device credential with provider.draft access. The daemon must also have an approved exact image CDN host; without one, price discovery stays closed. An image plan pins one charge, source post, model and asset policy.</p>
+                  <h2>Image generation</h2>
+                  <p className="wa-muted">Choose the company connection Cadence uses for one draft image. Cadence checks the provider price and retains the image for review before any Local release. If the image provider is not ready, image planning stays unavailable.</p>
                   {imageBinding && <p className="wa-kicker">Configured · revision {imageBinding.revision} · {imageBinding.config.account}</p>}
                   <div className="wa-row">
                     <div className="wa-context">
@@ -816,7 +839,7 @@ export default function WorkspaceApp({
                         value={imageConnectionId || imageBinding?.config.connection_id || ""}
                         onChange={setImageConnectionId}
                         options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "media.generate" && mapping.action === "generate_image" && mapping.effect === "draft") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
-                        placeholder="Choose AgenticOS draft connection"
+                        placeholder="Choose image connection"
                         aria-label="Generated image connection"
                         disabled={!canWrite || busy}
                         full
@@ -836,13 +859,27 @@ export default function WorkspaceApp({
                 <section className="wa-panel wa-stack">
                   <h2>Brand contexts</h2>
                   <p className="wa-muted">
-                    A brand is optional app context. A project isn’t required.
+                    A brand is optional app context. Save its content and image prompts here; each new post can override them without changing these defaults. A project isn’t required.
                   </p>
+                  {selectedContext && <div className="wa-row">
+                    <p className="wa-kicker">Selected: {selectedContext.config.label} · revision {selectedContext.revision}</p>
+                    <Button disabled={!canWrite || busy} onClick={() => {
+                      setEditingContextId(selectedContext.id);
+                      setBrandName(selectedContext.config.label);
+                      setBrandVoice(selectedContext.config.input_defaults.brand_voice ?? "");
+                      setProtectedTerms(selectedContext.config.input_defaults.protected_terms ?? "");
+                      setContentPrompt(selectedContext.config.input_defaults.content_prompt ?? "");
+                      setImagePrompt(selectedContext.config.input_defaults.image_prompt ?? "");
+                      setActionError(null);
+                    }}>Edit saved defaults</Button>
+                  </div>}
                   <form
                     className="wa-stack"
                     onSubmit={(event) => {
                       event.preventDefault();
                       if (!brandName.trim()) return;
+                      const promptValidation = promptError(contentPrompt, "Content prompt") || promptError(imagePrompt, "Image prompt");
+                      if (promptValidation) { setActionError(promptValidation); return; }
                       if (
                         /[\r\n\t]/.test(brandName + brandVoice + protectedTerms)
                       ) {
@@ -852,33 +889,28 @@ export default function WorkspaceApp({
                         return;
                       }
                       void mutate(async () => {
-                        const context = await workspaceApps.createContext(
-                          installId,
-                          {
-                            label: brandName.trim(),
-                            input_defaults: {
-                              ...(brandVoice.trim()
-                                ? { brand_voice: brandVoice.trim() }
-                                : {}),
-                              ...(protectedTerms.trim()
-                                ? { protected_terms: protectedTerms.trim() }
-                                : {}),
-                            },
-                            request_id: retainedRequest(
-                              JSON.stringify({
-                                installId,
-                                brandName: brandName.trim(),
-                                brandVoice: brandVoice.trim(),
-                                protectedTerms: protectedTerms.trim(),
-                              }),
-                            ),
-                          },
-                        );
+                        const editing = editingContextId === selectedContext?.id ? selectedContext : undefined;
+                        const inputDefaults: Record<string, string> = { ...(editing?.config.input_defaults ?? {}) };
+                        for (const [key, value] of Object.entries({ brand_voice: brandVoice, protected_terms: protectedTerms, content_prompt: contentPrompt, image_prompt: imagePrompt })) {
+                          if (value.trim()) inputDefaults[key] = value.trim();
+                          else delete inputDefaults[key];
+                        }
+                        const label = brandName.trim();
+                        const context = editing
+                          ? await workspaceApps.updateContext(installId, editing.id, { expected_revision: editing.revision, label, input_defaults: inputDefaults })
+                          : await workspaceApps.createContext(installId, {
+                            label, input_defaults: inputDefaults,
+                            request_id: retainedRequest(JSON.stringify({ installId, label, inputDefaults })),
+                          });
                         if (identity.current === installId) {
                           setContextId(context.id);
+                          rememberContext(installId, context.id);
+                          setEditingContextId("");
                           setBrandName("");
                           setBrandVoice("");
                           setProtectedTerms("");
+                          setContentPrompt("");
+                          setImagePrompt("");
                           setConnectionId("");
                           setSourceConnectionId("");
                           setImageConnectionId("");
@@ -887,7 +919,7 @@ export default function WorkspaceApp({
                     }}
                   >
                     <div className="wa-field wa-context">
-                      <label htmlFor="wa-brand-name">New brand name</label>
+                      <label htmlFor="wa-brand-name">{editingContextId ? "Brand name" : "New brand name"}</label>
                       <input
                         id="wa-brand-name"
                         name="brand"
@@ -898,6 +930,22 @@ export default function WorkspaceApp({
                         required
                         disabled={!canWrite || busy}
                       />
+                    </div>
+                    <div className="wa-fields">
+                      <div className="wa-field">
+                        <label htmlFor="wa-default-content-prompt">Content prompt default</label>
+                        <textarea id="wa-default-content-prompt" name="content_prompt" className="wa-input wa-prompt-input"
+                          value={contentPrompt} onChange={event => setContentPrompt(event.target.value)} maxLength={512}
+                          placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
+                        <p className="wa-kicker">Guides caption wording. One line, up to 512 characters.</p>
+                      </div>
+                      <div className="wa-field">
+                        <label htmlFor="wa-default-image-prompt">Image prompt default</label>
+                        <textarea id="wa-default-image-prompt" name="image_prompt" className="wa-input wa-prompt-input"
+                          value={imagePrompt} onChange={event => setImagePrompt(event.target.value)} maxLength={512}
+                          placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
+                        <p className="wa-kicker">Guides the one generated draft image; provider and safety constraints stay fixed.</p>
+                      </div>
                     </div>
                     <div className="wa-fields">
                       <div className="wa-field">
@@ -934,12 +982,15 @@ export default function WorkspaceApp({
                       </div>
                     </div>
                     <p className="wa-kicker">
-                      Use one line for each default. These defaults are frozen
-                      into new plans for this brand.
+                      Use one line for each default. New plans freeze their effective values; editing this context cannot change an existing plan.
                     </p>
                     <Button type="submit" disabled={!canWrite} loading={busy}>
-                      Add brand
+                      {editingContextId ? "Save brand defaults" : "Add brand"}
                     </Button>
+                    {editingContextId && <Button disabled={busy} onClick={() => {
+                      setEditingContextId(""); setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+                      setContentPrompt(""); setImagePrompt(""); setActionError(null);
+                    }}>Cancel editing</Button>}
                   </form>
                 </section>
                 <section className="wa-panel wa-stack">
@@ -964,6 +1015,9 @@ export default function WorkspaceApp({
       {creating && (
         <NewPost
           workflows={creationOptions}
+          workflowInputs={workflowInputs}
+          contextDefaults={selectedContext?.config.input_defaults}
+          contextLabel={selectedContext?.config.label}
           installId={installId}
           contextId={contextId || undefined}
           imageSupported={!!imageEnabled}
@@ -1055,6 +1109,14 @@ export default function WorkspaceApp({
                 Responsible PM: {run.snapshot.owner_pm}. Destination and brand
                 context are frozen into this plan.
               </p>
+              {(run.snapshot.inputs.content_prompt || run.snapshot.inputs.image_prompt) && <div className="wa-stack">
+                <h4>Frozen prompts</h4>
+                {(["content_prompt", "image_prompt"] as const).map(name => run.snapshot.inputs[name] && <div key={name} className="wa-field">
+                  <span>{name === "content_prompt" ? "Content prompt" : "Image prompt"} · {run.snapshot.input_origins?.[name] === "run_override" ? "this post’s override" : run.snapshot.input_origins?.[name] === "context_default" ? "saved brand default" : run.snapshot.input_origins?.[name] === "app_default" ? "app default" : "frozen value"}</span>
+                  <p className="wa-preview">{run.snapshot.inputs[name]}</p>
+                </div>)}
+                <p className="wa-kicker">These values were frozen when the plan was created. Source facts and provider settings are separate.</p>
+              </div>}
               <details className="wa-details">
                 <summary>Inspect the exact plan</summary>
                 <pre>{JSON.stringify(run.snapshot, null, 2)}</pre>

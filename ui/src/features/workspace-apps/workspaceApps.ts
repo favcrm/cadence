@@ -8,6 +8,7 @@ export interface Installation {
   summary: string; digest: string; storage_kind: "workspace" | "legacy";
   project_link: string | null; approved: boolean | null; executable: boolean;
   approval: { state: string }; guide: string; files: string[];
+  workflows?: { name: string; inputs: { name: string; default?: string | null }[] }[];
 }
 export interface AppContext {
   id: string; install_id: string; revision: number; digest: string; state: string;
@@ -40,6 +41,7 @@ export interface WorkspaceRun {
     quotes?: Record<string, CapabilityQuote["quote"]>;
     source?: { receipt_id: string; post: { id: string; caption: string } } | null;
     assignments: Record<string, { alias: string; role: string; provider: string }>;
+    input_origins?: Record<string, "app_default" | "context_default" | "run_override">;
   };
   steps: { step_id: string; task_id: string; state: string; message_id: string | null }[];
   artifacts: ArtifactReceipt[];
@@ -142,6 +144,7 @@ export const workspaceApps = {
   effects: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ effects: AppEffect[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/effects` : `${installation(id)}/effects`, signal)).effects,
   approveInstall: (id: string, digest: string) => request<unknown>(`${installation(id)}/approve`, undefined, { digest }),
   createContext: async (id: string, body: { label: string; input_defaults: Record<string, string>; request_id: string }) => (await request<{ context: AppContext }>(`${installation(id)}/contexts`, undefined, body)).context,
+  updateContext: async (id: string, contextId: string, body: { expected_revision: number; label: string; input_defaults: Record<string, string> }) => (await request<{ context: AppContext }>(`${installation(id)}/contexts/${part(contextId)}/update`, undefined, body)).context,
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),

@@ -1,8 +1,67 @@
 //! Operator-owned local app lifecycle and turn-bound dependency artifacts.
 use super::*;
 use crate::issue::app_catalog::workspace;
-use crate::store::app_runs::{LocalRunRequest, LocalWorkflow};
+use crate::store::app_runs::{LocalRunProvenance, LocalRunRequest, LocalWorkflow};
 use std::collections::BTreeMap;
+
+/// Resolve app, context and per-run content in that order. A blank prompt
+/// field is a reset request, so it cannot erase a saved or app default.
+fn freeze_content_inputs(
+    template: &crate::issue::workflow::Template,
+    supplied: BTreeMap<String, String>,
+    context: Option<&crate::store::app_contexts::ContextConfig>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut effective: BTreeMap<String, String> = template
+        .inputs
+        .iter()
+        .filter_map(|(key, spec)| {
+            spec.default
+                .as_ref()
+                .map(|value| (key.clone(), value.clone()))
+        })
+        .collect();
+    if let Some(context) = context {
+        effective.extend(
+            context
+                .input_defaults
+                .iter()
+                .filter(|(key, _)| template.inputs.contains_key(*key))
+                .filter(|(key, value)| !value.is_empty() || template.inputs[*key].default.is_none())
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    let origins = template
+        .inputs
+        .iter()
+        .filter(|(_, spec)| spec.default.is_some())
+        .map(|(key, _)| {
+            let origin = if supplied.get(key).is_some_and(|value| !value.is_empty()) {
+                "run_override"
+            } else if context.is_some_and(|config| {
+                config
+                    .input_defaults
+                    .get(key)
+                    .is_some_and(|value| !value.is_empty())
+            }) {
+                "context_default"
+            } else {
+                "app_default"
+            };
+            (key.clone(), origin.to_string())
+        })
+        .collect();
+    for (key, value) in supplied {
+        if !value.is_empty()
+            || template
+                .inputs
+                .get(&key)
+                .is_none_or(|spec| spec.default.is_none())
+        {
+            effective.insert(key, value);
+        }
+    }
+    (effective, origins)
+}
 
 impl Shared {
     pub(super) fn rpc_app_local(
@@ -153,14 +212,28 @@ impl Shared {
                     let text = files.get(&format!("workflows/{name}.md")).ok_or_else(|| {
                         Error::rejected("workflow is not in this installed bundle")
                     })?;
+                    let manifest =
+                        crate::issue::app::parse_manifest(files.get("app.md").ok_or_else(
+                            || Error::rejected("installation manifest unavailable"),
+                        )?)?;
+                    if manifest.app == "social-content" {
+                        if name == "image-instagram" && params.get("source_receipt_id").is_none() {
+                            return Err(Error::rejected(
+                                "Instagram image run needs a selected source receipt",
+                            ));
+                        }
+                        if name == "image-manual" && params.get("source_receipt_id").is_some() {
+                            return Err(Error::rejected(
+                                "manual image run takes operator-pasted facts, not a receipt",
+                            ));
+                        }
+                    }
+                    let template = crate::issue::workflow::parse_template(text)
+                        .map_err(|_| Error::rejected("installed workflow declarations refused"))?;
                     let context = optional_str(params, "context_id")
                         .map(|context| self.store.app_context_proof(id, context))
                         .transpose()?;
                     if let Some((config, _)) = &context {
-                        let template =
-                            crate::issue::workflow::parse_template(text).map_err(|_| {
-                                Error::rejected("contextual workflow declarations refused")
-                            })?;
                         let defaults: BTreeMap<_, _> = config
                             .input_defaults
                             .iter()
@@ -168,18 +241,21 @@ impl Shared {
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect();
                         crate::issue::workflow::check_context_defaults(text, &defaults)?;
-                        let mut effective = defaults;
-                        effective.extend(inputs);
-                        inputs = effective;
-                        if serde_json::to_vec(&inputs)
-                            .map_err(|e| Error::internal(e.to_string()))?
-                            .len()
-                            > 32 * 1024
-                        {
-                            return Err(Error::rejected(
-                                "effective inputs exceed encoded byte limit",
-                            ));
-                        }
+                    }
+                    let (resolved_inputs, input_origins) = freeze_content_inputs(
+                        &template,
+                        inputs,
+                        context.as_ref().map(|(config, _)| config),
+                    );
+                    inputs = resolved_inputs;
+                    if serde_json::to_vec(&inputs)
+                        .map_err(|e| Error::internal(e.to_string()))?
+                        .len()
+                        > 32 * 1024
+                    {
+                        return Err(Error::rejected(
+                            "effective inputs exceed encoded byte limit",
+                        ));
                     }
                     if let (Some(receipt), Some(post)) = (
                         optional_str(params, "source_receipt_id"),
@@ -197,6 +273,15 @@ impl Shared {
                             ));
                         }
                         inputs.insert("source".into(), line);
+                    }
+                    if manifest.app == "social-content"
+                        && matches!(name, "image-instagram" | "image-manual")
+                    {
+                        crate::platform::agenticos_external::image_plan_preflight(
+                            &inputs,
+                            name == "image-manual",
+                        )
+                        .map_err(Error::rejected)?;
                     }
                     let workflow = LocalWorkflow::parse(text, &inputs).map_err(|error| {
                         if context.is_some() {
@@ -289,8 +374,11 @@ impl Shared {
                         binding.as_ref(),
                         &capabilities,
                         &quotes,
-                        optional_str(params, "source_receipt_id")
-                            .zip(optional_str(params, "selected_post_id")),
+                        LocalRunProvenance {
+                            selected_source: optional_str(params, "source_receipt_id")
+                                .zip(optional_str(params, "selected_post_id")),
+                            input_origins: &input_origins,
+                        },
                     )
                 })
             }
@@ -495,5 +583,52 @@ impl Shared {
             self.store
                 .app_message_admit(message, row["digest"].as_str().unwrap())
         })
+    }
+}
+
+#[cfg(test)]
+mod cad742_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_prompt_resolution_records_origin_and_ignores_later_context_edits() {
+        let template = crate::issue::workflow::parse_template(include_str!(
+            "../../workspace-apps/social-content/workflows/image-manual.md"
+        ))
+        .unwrap();
+        let saved = crate::store::app_contexts::ContextConfig::new(
+            "Fav Limited",
+            BTreeMap::from([
+                ("content_prompt".into(), "Explain a customer benefit".into()),
+                ("image_prompt".into(), "Show a quiet desk".into()),
+            ]),
+        )
+        .unwrap();
+        let supplied = BTreeMap::from([
+            ("content_prompt".into(), "".into()),
+            ("image_prompt".into(), "Use a blue background".into()),
+            ("source".into(), "Operator supplied product facts".into()),
+        ]);
+        let (frozen, origins) = freeze_content_inputs(&template, supplied, Some(&saved));
+        assert_eq!(frozen["content_prompt"], "Explain a customer benefit");
+        assert_eq!(frozen["image_prompt"], "Use a blue background");
+        assert_eq!(frozen["source"], "Operator supplied product facts");
+        assert_eq!(origins["content_prompt"], "context_default");
+        assert_eq!(origins["image_prompt"], "run_override");
+
+        let changed = crate::store::app_contexts::ContextConfig::new(
+            "Fav Limited",
+            BTreeMap::from([("content_prompt".into(), "A changed default".into())]),
+        )
+        .unwrap();
+        let (next, next_origins) =
+            freeze_content_inputs(&template, BTreeMap::new(), Some(&changed));
+        assert_eq!(frozen["content_prompt"], "Explain a customer benefit");
+        assert_eq!(next["content_prompt"], "A changed default");
+        assert_eq!(next_origins["image_prompt"], "app_default");
+        assert_eq!(
+            next["image_prompt"],
+            "Create one editorial image grounded only in the source facts."
+        );
     }
 }

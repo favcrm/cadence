@@ -389,8 +389,22 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             "installation record changed during inspection",
         ));
     }
+    let workflows = files
+        .iter()
+        .filter_map(|(path, text)| {
+            path.strip_prefix("workflows/")
+                .and_then(|name| name.strip_suffix(".md"))
+                .map(|name| (name, text))
+        })
+        .map(|(name, text)| {
+            let inputs = workflow::parse_template(text)
+                .ok()
+                .map(|template| workflow::inputs_json(&template));
+            json!({"name":name,"inputs":inputs})
+        })
+        .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"record":record,"files":files.keys().collect::<Vec<_>>() }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 pub fn list(pm: &Pm) -> Result<Value> {

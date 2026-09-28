@@ -5,7 +5,7 @@
 //! recorded, and `workflow check`/`ls`/`show` read.
 //!
 //! The format is the plan format ([`crate::issue::plan`]) plus an
-//! `inputs:` frontmatter map — `name: { ask, optional, kind, example, context_default }`
+//! `inputs:` frontmatter map — `name: { ask, optional, kind, example, context_default, default }`
 //! — and `{{name}}` placeholders anywhere in the file. `plan propose
 //! --workflow` renders the file: placeholders take the `--input`
 //! values, `inputs:` drops out of the frontmatter, and the result goes
@@ -109,6 +109,9 @@ pub struct InputSpec {
     pub example: Option<String>,
     /// Explicit content-only permission for installation context defaults.
     pub context_default: bool,
+    /// App-authored, content-only fallback frozen into a new run. A context
+    /// default and then a nonempty run input may override it.
+    pub default: Option<String>,
 }
 
 /// A declared input shape: the value must match it at render, for every
@@ -210,6 +213,7 @@ pub fn inputs_json(tpl: &Template) -> Vec<Value> {
                     "kind": spec.kind.map(InputKind::as_str),
                     "example": spec.example,
                     "context_default": spec.context_default,
+                    "default": spec.default,
                 })
             })
         })
@@ -429,6 +433,14 @@ fn parse_front(yaml: &str) -> Result<Front> {
                             (Some("context_default"), _) => {
                                 return Err(Error::rejected("context_default must be a boolean"))
                             }
+                            (Some("default"), serde_yaml::Value::String(s)) => {
+                                spec.default = Some(s)
+                            }
+                            (Some("default"), _) => {
+                                return Err(Error::rejected(
+                                    "input default must be one line of text",
+                                ))
+                            }
                             (Some("kind"), serde_yaml::Value::String(s)) => {
                                 let Some(kind) = InputKind::parse(s.trim()) else {
                                     return Err(Error::rejected(format!(
@@ -492,6 +504,20 @@ fn parse_front(yaml: &str) -> Result<Front> {
                         "input '{name}': `example: '{example}'` does not fit `kind: {}` — \
                          an example must be a value the shape accepts",
                         kind.as_str()
+                    )));
+                }
+            }
+            if let Some(default) = spec.default.as_deref() {
+                if !spec.optional
+                    || !spec.context_default
+                    || default.is_empty()
+                    || !bounded_content(default)
+                    || spec
+                        .kind
+                        .is_some_and(|kind| shape_problem(kind, default).is_some())
+                {
+                    return Err(Error::rejected(format!(
+                        "input '{name}': default must be optional, content-safe and bounded"
                     )));
                 }
             }
@@ -724,6 +750,7 @@ pub fn check_context_defaults(text: &str, defaults: &BTreeMap<String, String>) -
         if value.trim() != value
             || (!spec.optional && value.is_empty())
             || value.chars().any(bad_value_char)
+            || (spec.default.is_some() && !bounded_content(value))
             || spec
                 .kind
                 .is_some_and(|kind| shape_problem(kind, value).is_some())
@@ -821,6 +848,11 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
                 ),
             ));
         }
+        if tpl.inputs[k].default.is_some() && !v.is_empty() && !bounded_content(v) {
+            return Err(Error::rejected(format!(
+                "input '{k}' exceeds its content guidance bound"
+            )));
+        }
     }
     // A declared shape (`kind:`) is enforced on the value itself, for
     // every caller — the daemon, the CLI, the board's preview. Iterated
@@ -851,7 +883,15 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
     let values: BTreeMap<String, String> = tpl
         .inputs
         .keys()
-        .map(|k| (k.clone(), provided.get(k).cloned().unwrap_or_default()))
+        .map(|k| {
+            let value = provided
+                .get(k)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .or_else(|| tpl.inputs[k].default.clone())
+                .unwrap_or_default();
+            (k.clone(), value)
+        })
         .collect();
     let rendered = render_values(text, &values)?;
     check_rendered(text, &tpl, &rendered)?;
@@ -884,6 +924,24 @@ fn bad_value_char(c: char) -> bool {
     c.is_control()
         || INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
         || (c.is_whitespace() && c != ' ')
+}
+
+/// Short, visible, one-line guidance; never enough room to smuggle a
+/// second task or crowd out the fixed source and review instructions.
+pub(crate) fn bounded_content(value: &str) -> bool {
+    value.trim() == value
+        && value.chars().count() <= 512
+        && value.len() <= 2048
+        && !value.chars().any(bad_value_char)
+}
+
+/// Validate operator-pasted source facts at the provider boundary without
+/// rewriting their spacing or otherwise changing the frozen run input.
+pub(crate) fn visible_source_facts(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.len() <= 16 * 1024
+        && !value.chars().any(bad_value_char)
 }
 
 /// A provider caption remains byte-exact in its receipt. Only this derived
@@ -1101,6 +1159,13 @@ pub fn gate_keys(text: &str) -> Result<String> {
                 }
                 if s.context_default {
                     key.push_str(":context_default");
+                }
+                if let Some(default) = &s.default {
+                    use sha2::{Digest, Sha256};
+                    key.push_str(&format!(
+                        ":default:{:x}",
+                        Sha256::digest(default.as_bytes())
+                    ));
                 }
                 key
             })
@@ -1947,6 +2012,79 @@ mod tests {
             "Lunch served noon ❤"
         );
         assert!(source_input_line("\n\t").is_err());
+    }
+
+    #[test]
+    fn cad742_content_default_is_bounded_frozen_and_approval_affecting() {
+        let with_default = WF.replace(
+            "keyword: { ask: \"Phrase\", optional: true }",
+            "keyword: { ask: \"Phrase\", optional: true, context_default: true, default: \"Write briefly\" }",
+        );
+        let template = parse_template(&with_default).unwrap();
+        assert_eq!(
+            inputs_json(&template)[1]["default"],
+            serde_json::json!("Write briefly")
+        );
+        let fallback = render(&with_default, &inputs(&[("topic", "rust")])).unwrap();
+        assert!(fallback.contains("Write briefly"));
+        let reset = render(
+            &with_default,
+            &inputs(&[("topic", "rust"), ("keyword", "")]),
+        )
+        .unwrap();
+        assert_eq!(fallback, reset);
+        let changed = with_default.replace("Write briefly", "Write warmly");
+        assert_ne!(
+            gate_digest(&with_default).unwrap(),
+            gate_digest(&changed).unwrap()
+        );
+        for value in [" Bad", "x\u{202e}y"] {
+            let bad = with_default.replace("Write briefly", value);
+            assert!(parse_template(&bad).is_err());
+        }
+        assert!(render(
+            &with_default,
+            &inputs(&[("topic", "rust"), ("keyword", "Bad\nstep")])
+        )
+        .is_err());
+        let long = "x".repeat(513);
+        assert!(render(
+            &with_default,
+            &inputs(&[("topic", "rust"), ("keyword", &long)])
+        )
+        .is_err());
+        assert!(
+            check_context_defaults(&with_default, &BTreeMap::from([("keyword".into(), long)]))
+                .is_err()
+        );
+        assert!(visible_source_facts("Two  spaces preserve quoted facts"));
+        assert!(!visible_source_facts("Line one\nLine two"));
+    }
+
+    #[test]
+    fn cad742_manual_image_workflow_retains_prompt_guidance_for_both_steps() {
+        let text = include_str!("../../workspace-apps/social-content/workflows/image-manual.md");
+        let template = parse_template(text).unwrap();
+        assert_eq!(template.capability_slots, vec!["image"]);
+        assert_eq!(template.required_asset_slot.as_deref(), Some("image"));
+        let workflow = crate::store::app_runs::LocalWorkflow::parse(
+            text,
+            &BTreeMap::from([
+                ("subject".into(), "Customer follow-up".into()),
+                (
+                    "source".into(),
+                    "JuicySuite CRM helps teams follow up".into(),
+                ),
+                ("writer".into(), "op-social-writer".into()),
+                ("reviewer".into(), "op-social-reviewer".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(workflow.steps.len(), 2);
+        for step in &workflow.steps {
+            assert!(step.instruction.contains("Write a concise zh-HK caption"));
+            assert!(step.instruction.contains("Create one editorial image"));
+        }
     }
 
     const WF: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}} for {{keyword}}\"\n\

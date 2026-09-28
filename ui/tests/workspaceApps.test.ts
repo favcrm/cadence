@@ -70,6 +70,10 @@ async function main() {
   const context = { id: "context-a", revision: 4, digest: "context-digest", state: "active" };
   reply = { contexts: [context] };
   equal(await workspaceApps.contexts("install-a"), [context], "Context envelope is unwrapped without rewriting authority");
+  reply = { context };
+  equal(await workspaceApps.updateContext("install-a", "context-a", { expected_revision: 4, label: "Fav Limited", input_defaults: { content_prompt: "Write from facts", image_prompt: "Use warm colors" } }), context, "Existing context can save both prompt defaults");
+  equal(latest().path, "/api/app-installations/install-a/contexts/context-a/update", "Context edit uses scoped update route");
+  equal(JSON.parse(String(latest().init.body)), { expected_revision: 4, label: "Fav Limited", input_defaults: { content_prompt: "Write from facts", image_prompt: "Use warm colors" } }, "Edit includes current revision and only declared settings");
   reply = { bindings: [{ id: "binding-a", revision: 2, digest: "binding-digest" }] };
   await workspaceApps.bindings("install-a", "context-a");
   equal(latest().path, "/api/app-installations/install-a/contexts/context-a/bindings", "Brand binding reads cannot silently use installation-wide defaults");
