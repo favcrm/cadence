@@ -32,6 +32,51 @@ use super::{
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
+/// Codex's command sandbox cannot open the daemon's Unix socket on this
+/// Linux host. A thread-scoped local MCP server runs beside the provider,
+/// retaining its enrolled process ancestry for Cadence caller checks.
+fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
+    let state_dir = log_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::provider("Codex MCP cannot derive daemon state directory"))?;
+    let binary = std::env::current_exe()?;
+    Ok(json!({
+        "command": binary,
+        "args": ["--state-dir", state_dir, "mcp-agent"],
+        "env": {"CADENCE_ALIAS": agent.alias, "CADENCE_STATE_DIR": state_dir},
+        "startup_timeout_sec": 10,
+    }))
+}
+
+/// A configured but unavailable MCP server leaves the agent unable to do
+/// Cadence work. Ask Codex for this thread's actual tool inventory before
+/// advertising the endpoint as ready.
+fn check_agent_mcp(transport: &Transport, thread_id: &str) -> Result<()> {
+    let inventory = transport
+        .request_timeout(
+            "mcpServerStatus/list",
+            json!({"threadId": thread_id, "serverName":"cadence", "detail":"toolsAndAuthOnly"}),
+            Duration::from_secs(12),
+        )
+        .map_err(|error| Error::provider(format!("Codex Cadence MCP readiness failed: {error}")))?;
+    let server = inventory["data"]
+        .as_array()
+        .and_then(|servers| servers.iter().find(|server| server["name"] == "cadence"))
+        .ok_or_else(|| Error::provider("Codex Cadence MCP readiness failed: server absent"))?;
+    if server["runtimeStatus"] != "connected"
+        || !["self", "wiki_search", "wiki_read", "issue_show"]
+            .iter()
+            .all(|name| server["tools"].get(*name).is_some())
+    {
+        return Err(Error::provider(format!(
+            "Codex Cadence MCP readiness failed: status {}, tools {}",
+            server["runtimeStatus"], server["tools"]
+        )));
+    }
+    Ok(())
+}
+
 /// Silence bound before a turn is `unknown` (`params.turn_idle_secs`) —
 /// the same activity-based liveness as managed claude: a turn that keeps
 /// streaming is alive however long it runs. `params.turn_max_secs` adds
@@ -930,15 +975,25 @@ impl ProviderAdapter for CodexAdapter {
             if let Some(model) = configured_model.as_deref() {
                 params["model"] = json!(model);
             }
+            // Give only this managed thread the Cadence tool bridge. Never
+            // mutate the operator's global Codex configuration or grant
+            // command execution general network access.
+            params["config"] = json!({"mcp_servers": {
+                "cadence": agent_mcp_config(agent, &self.log_path)?
+            }});
             if let Some(effort) = configured_effort.as_deref() {
-                // Scope the reasoning setting to this managed thread. This
-                // uses the app-server config field without touching the
-                // operator's global ~/.codex configuration.
-                params["config"] = json!({"model_reasoning_effort": effort});
+                params["config"]["model_reasoning_effort"] = json!(effort);
             }
-            if let Some(instructions) = &agent.instructions {
-                params["developerInstructions"] = json!(instructions);
+            let mut instructions = agent.instructions.clone().unwrap_or_default();
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
             }
+            instructions.push_str(
+                "Use the cadence MCP tools for Cadence identity, wiki search/read, and issue reads. \
+                 The command sandbox cannot reach Cadence's RPC socket. Your final answer is the \
+                 managed turn result; do not call cadence message result from a shell.",
+            );
+            params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {
                 params["threadId"] = json!(thread);
             }
@@ -954,6 +1009,7 @@ impl ProviderAdapter for CodexAdapter {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
                 .to_string();
+            check_agent_mcp(&self.transport, &thread_id)?;
             *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
             let effective_model = result
                 .get("model")

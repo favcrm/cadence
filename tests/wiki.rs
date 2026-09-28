@@ -387,6 +387,33 @@ fn agent_cannot_read_index_health_or_force_a_refresh() {
 }
 
 #[test]
+fn managed_agent_and_detached_child_cannot_operate_wiki_index() {
+    let fx = fx();
+    let d = &fx.d;
+    d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    let before = index_status(d);
+    let mut first = ManagedWorker::start(d, "index-guard-a");
+    let mut second = ManagedWorker::start(d, "index-guard-b");
+    for method in ["wiki_index_status", "wiki_index_refresh"] {
+        for how in ["self", "detached"] {
+            let reply = first.rpc(how, method, json!({}));
+            assert_eq!(reply["ok"], false, "{how} {method}: {reply}");
+        }
+        let forged = first.rpc("self", method, json!({"operator": true}));
+        assert_eq!(forged["ok"], false, "forged {method}: {forged}");
+    }
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.rpc("self", "wiki_index_refresh", json!({})));
+        let b = scope.spawn(|| second.rpc("self", "wiki_index_refresh", json!({})));
+        assert_eq!(a.join().unwrap()["ok"], false);
+        assert_eq!(b.join().unwrap()["ok"], false);
+    });
+    let after = index_status(d);
+    assert_eq!(after["indexed_tree"], before["indexed_tree"]);
+    assert_eq!(after["last_refresh"], before["last_refresh"]);
+}
+
+#[test]
 fn index_refresh_rebuilds_even_when_current() {
     let fx = fx();
     let d = &fx.d;

@@ -74,6 +74,41 @@ fn codex_sandbox_success_preserves_workspace_write_on_app_server() {
     d.wait_agent("ready", "idle", 15);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs[0]["params"]["sandbox"], "workspace-write");
+    let bridge = &reqs[0]["params"]["config"]["mcp_servers"]["cadence"];
+    assert_eq!(bridge["env"]["CADENCE_ALIAS"], "ready");
+    assert_eq!(
+        bridge["env"]["CADENCE_STATE_DIR"],
+        d.state.to_string_lossy().as_ref()
+    );
+    assert_eq!(bridge["args"][2], "mcp-agent");
+}
+
+#[test]
+fn codex_mcp_unavailable_fences_before_dispatch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("mcp-fail");
+    d.register_codex("missing-tools");
+    let agent = d.wait_agent("missing-tools", "attention", 15);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Cadence MCP readiness failed"),
+        "{agent}"
+    );
+    assert!(
+        mock.pidfile.exists(),
+        "MCP inventory check must follow app-server start"
+    );
+    d.send(
+        "missing-tools",
+        json!({"text":"do work", "message":"mcp-missing-task"}),
+    )
+    .unwrap();
+    let show = d
+        .rpc("agent_show", json!({"alias":"missing-tools"}))
+        .unwrap();
+    assert_eq!(show["messages"][0]["state"], "queued");
 }
 
 #[test]

@@ -233,6 +233,12 @@ def handle(conn):
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+        elif method == "mcpServerStatus/list":
+            send_json(conn, {"id": mid, "result": {"data": [{"name": "cadence",
+                "runtimeStatus": "connected", "tools": {
+                    name: {"name": name} for name in
+                    ("self", "wiki_search", "wiki_read", "issue_show")}}],
+                "nextCursor": None}})
         elif method == "account/rateLimits/read":
             if mode == "no-quota":
                 send_json(conn, {"id": mid, "error": {"code": -32601,
