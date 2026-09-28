@@ -11,6 +11,18 @@ function linkify(md: string): string {
   );
 }
 
+// Agent-written Markdown must not initiate third-party image requests. The
+// board permits two CDN families for reviewed Social Content source cards,
+// which use their own receipt-bound image component instead of Md.
+function markdownImageSrc(src?: string): string | null {
+  if (!src || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("//")) return null;
+  try {
+    return new URL(src, "https://cadence.invalid/").origin === "https://cadence.invalid" ? src : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function Md({
   text,
   onOpen,
@@ -27,6 +39,10 @@ export default function Md({
       // safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}
       components={{
+        img: ({ src, alt }) => {
+          const safe = markdownImageSrc(src);
+          return safe ? <img src={safe} alt={alt ?? ""} /> : <span>{alt || "Image unavailable"}</span>;
+        },
         a: ({ href, children }) =>
           href?.startsWith("issue:") ? (
             <button
