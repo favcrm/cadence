@@ -14,6 +14,7 @@ use crate::platform::adapter::PlatformAdapter;
 use crate::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
+use crate::platform::{AppCapabilityOutput, AppCapabilityQuote};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@1";
@@ -164,7 +165,7 @@ impl AgenticosExternalAdapter {
             .post(&url)
             .header("authorization", &format!("Bearer {token}"))
             .header("idempotency-key", idempotency_key)
-            .send_json(&json!({
+            .send_json(json!({
                 "slug": POSTS_TOOL,
                 "query": {"handle": handle},
                 "max_charge_minor": ceiling,
@@ -400,6 +401,41 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
+    fn quote_app_capability(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        let (total, revision) = self.quote_fixed(credential, binding)?;
+        Ok(AppCapabilityQuote {
+            schema: 1,
+            currency: "USD".into(),
+            unit_price_micros: total,
+            units: 1,
+            total_price_micros: total,
+            price_revision: revision,
+        })
+    }
+
+    fn execute_app_capability(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, String> {
+        match authority["slot"].as_str() {
+            Some("source") => Ok(AppCapabilityOutput {
+                result: self.call_source(credential, authority, input, idempotency_key)?,
+                asset: None,
+            }),
+            // An image result must be downloaded, bounded and stored as
+            // durable bytes before any draft can cite it. No image workflow
+            // or external generation dispatch is exposed in this slice.
+            _ => Err("AgenticOS capability slot has no reviewed execution adapter".into()),
+        }
+    }
+
     fn table(&self) -> &ToolTable {
         &self.table
     }
@@ -588,5 +624,93 @@ mod tests {
         proof["quote"]["total_price_micros"] = json!(2000);
         proof["quote"]["units"] = json!(2);
         assert!(frozen_charge_ceiling(&proof).is_err());
+    }
+
+    #[test]
+    fn provider_http_call_uses_fixed_slug_frozen_handle_and_atomic_ceiling() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for index in 0..2 {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                assert_eq!(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("authorization"))
+                        .map(|header| header.value.as_str()),
+                    Some("Bearer test-token")
+                );
+                if index == 0 {
+                    assert_eq!(
+                        request.url(),
+                        "/v1/runtime/tools/scrapecreators.instagram.user.posts"
+                    );
+                    request
+                        .respond(tiny_http::Response::from_string(
+                            json!({
+                                "ok":true,"data":{
+                                    "slug":POSTS_TOOL,"effect":"read",
+                                    "chargePrecondition":"max_charge_minor@1",
+                                    "price":{"currency":"USD","scale":6,"amount":"0.002000"},
+                                    "unitPrice":null
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                } else {
+                    assert_eq!(request.url(), CALL_PATH);
+                    assert_eq!(
+                        request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("idempotency-key"))
+                            .map(|header| header.value.as_str()),
+                        Some("app-call-example")
+                    );
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    let body: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["slug"], POSTS_TOOL);
+                    assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
+                    assert_eq!(body["max_charge_minor"], 2000);
+                    assert!(body.get("company").is_none());
+                    request
+                        .respond(tiny_http::Response::from_string(json!({
+                            "ok":true,"data":{
+                                "slug":POSTS_TOOL,"repeated":false,
+                                "price":{"currency":"USD","scale":6,"amount":"0.002000"},
+                                "result":{"success":true,"status":"ok","items":[{
+                                    "id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z",
+                                    "user":{"username":"juicysuite_crm","is_private":false},
+                                    "caption":{"text":"Provider-owned caption"}
+                                }]}
+                            }
+                        }).to_string()))
+                        .unwrap();
+                }
+            }
+        });
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        let mut authority = authority();
+        let quote = adapter
+            .quote_app_capability(b"test-token", &authority["binding"])
+            .unwrap();
+        assert_eq!(quote.total_price_micros, 2000);
+        authority["quote"] = serde_json::to_value(quote).unwrap();
+        let result = adapter
+            .execute_app_capability(b"test-token", &authority, &json!({}), "app-call-example")
+            .unwrap();
+        assert_eq!(
+            result.result["posts"][0]["caption"],
+            "Provider-owned caption"
+        );
+        assert!(result.asset.is_none());
+        worker.join().unwrap();
     }
 }

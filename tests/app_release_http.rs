@@ -215,8 +215,11 @@ fn cad692_actual_agent_and_setsid_http_release_refuse_stolen_operator_sessions()
     let cases=vec![
         ("GET",b.bindings(),String::new()),
         ("GET",binding_path.clone(),String::new()),
+        ("GET",format!("{}/source/quote",b.bindings()),String::new()),
         ("GET","/api/app-effects".to_owned(),String::new()),
         ("GET",effect_path.clone(),String::new()),
+        ("GET",format!("/api/app-runs/{}/capability-results",run["id"].as_str().unwrap()),String::new()),
+        ("GET","/api/app-capability-results/receipt-fake".to_owned(),String::new()),
         ("POST",b.bindings(),json!({"context_id":binding["context_id"],"slot":"publication","connection_id":b.release.connection,"request_id":"stolen"}).to_string()),
         ("POST",format!("{binding_path}/update"),json!({"expected_revision":1,"connection_id":b.release.connection}).to_string()),
         ("POST",format!("{binding_path}/revoke"),json!({"expected_revision":1}).to_string()),

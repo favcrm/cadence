@@ -101,6 +101,9 @@ async function main() {
   assert(reads.includes("/api/app-runs/source-run/capability-results") && host.textContent?.includes("Original line one"), "Only the stored broker receipt populates source posts");
   receiptRows = [{ ...receipt, run_id: "other-run" }]; await click(button("Sources")); await click(button("Board")); await click(button("Sources"));
   assert(!button("Use as source"), "Receipt from another run cannot populate the source picker");
+  receiptRows = [{ ...receipt, binding_digest: "other-binding" }];
+  await click(button("Board")); await click(button("Sources"));
+  assert(!button("Use as source"), "Receipt from another frozen provider binding cannot populate the picker");
   receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: "https://attacker.example/track" }] } }];
   await click(button("Board")); await click(button("Sources"));
   assert(!host.querySelector(".wa-source-image"), "A tampered receipt cannot load an arbitrary browser image URL");
