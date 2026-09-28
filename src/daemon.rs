@@ -323,6 +323,9 @@ pub struct Shared {
     shutdown_facts: Mutex<Option<ShutdownFacts>>,
     provider_log_dir: PathBuf,
     state_dir: PathBuf,
+    /// Captured at boot from the private per-state record. Absent means
+    /// the original same-UID socket and caller rule, unchanged.
+    agent_uid: Option<u32>,
     /// How each agent's endpoint last came up (`"adopted"` /
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
@@ -547,6 +550,7 @@ impl Shared {
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
+            agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
@@ -3580,6 +3584,12 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
+    /// In-process fixture override; `serve()` leaves this unset and
+    /// resolves the private state record. Never sourced from an RPC.
+    pub agent_uid: Option<u32>,
+    /// In-process fixture path/gid for the second socket. Production
+    /// uses `/var/lib/cadence/cadence.sock` and the fixed cadence group.
+    pub shared_socket: Option<(PathBuf, u32)>,
     /// Provider launch overrides (`CADENCE_CLAUDE_COMMAND`, …) for this
     /// daemon only; unset names fall back to the environment.
     pub provider_env: ProviderEnv,
@@ -3703,6 +3713,15 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
+    if opts.agent_uid.is_none() {
+        opts.agent_uid = crate::agent_uid::config::configured_uid(state_dir)?;
+    }
+    let euid = unsafe { libc::geteuid() };
+    if opts.agent_uid.is_some_and(|uid| uid == 0 || uid == euid) {
+        return Err(Error::rejected(
+            "configured agent UID is root or the daemon UID",
+        ));
+    }
     // Before the marker is consumed and before recover() writes. A
     // direct `daemon run` of a different build by a non-holder must
     // leave shutdown.json and the database byte-identical. `daemon
@@ -3741,6 +3760,24 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
         eprintln!("warning: operator secret unavailable, board logins refused: {e}");
     }
+    let shared_socket = if opts.agent_uid.is_some() {
+        let (path, gid, fixture) = match &opts.shared_socket {
+            Some((path, gid)) => (path.clone(), *gid, true),
+            None => (
+                crate::agent_uid::config::shared_socket_path().to_path_buf(),
+                crate::agent_uid::config::shared_gid()?,
+                false,
+            ),
+        };
+        Some(serve::bind_shared_socket(&path, gid, fixture)?)
+    } else {
+        if opts.shared_socket.is_some() {
+            return Err(Error::rejected(
+                "shared socket needs a configured agent UID",
+            ));
+        }
+        None
+    };
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.
@@ -3843,24 +3880,28 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             shared.begin_closing();
             continue;
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let shared = Arc::clone(&shared);
-                thread::spawn(move || handle_conn(shared, stream));
+        let listeners: Vec<&UnixListener> = std::iter::once(&listener)
+            .chain(shared_socket.as_ref().map(|socket| &socket.listener))
+            .collect();
+        let mut accepted = false;
+        for listener in &listeners {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = true;
+                    let shared = Arc::clone(&shared);
+                    thread::spawn(move || handle_conn(shared, stream));
+                }
+                // Both idle and an aborted queued connection are normal.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(e) => return Err(e.into()),
             }
-            // WouldBlock is the idle nonblocking accept; ConnectionAborted
-            // is the listener race — a queued connection reset before
-            // accept (a client exiting mid-handshake) must not kill the
-            // daemon.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
-                serve::accept_wait::wait_for_connection(&listener)?;
-            }
-            Err(e) => return Err(e.into()),
+        }
+        if !accepted {
+            serve::accept_wait::wait_for_connections(&listeners)?;
         }
     }
     // Former facts snapshot lived in `shutdown`. A test holds this
@@ -3896,6 +3937,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(&socket_path);
+    drop(shared_socket);
     Ok(())
 }
 

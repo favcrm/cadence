@@ -718,6 +718,9 @@ pub(super) fn public_session(
 pub(super) enum Attribution {
     /// Tied to exactly this agent.
     Agent(String),
+    /// The kernel says this TCP socket belongs to the configured
+    /// agent UID; alias attribution is unavailable across UID.
+    AgentUid,
     /// A local process tied to no agent — the operator's browser, a
     /// relay, or a detached agent child alike.
     NoAgent,
@@ -778,6 +781,9 @@ pub(super) fn decide(
 ) -> Verdict {
     match (held, attribution) {
         (Some(_), Attribution::Agent(alias)) => Verdict::Stolen(alias),
+        (Some(_), Attribution::AgentUid) => {
+            Verdict::Stolen(crate::agent_uid::AGENT_USER.to_string())
+        }
         // The tailnet rows arise only on the tailnet origin, where a
         // named public session can never be presented — but a proven
         // login names the operator whatever cookie rode along.
@@ -806,6 +812,10 @@ pub(super) fn decide(
             ),
         ),
         (None, Attribution::Agent(alias)) => Verdict::Agent(alias),
+        (None, Attribution::AgentUid) => Verdict::Refuse(
+            "caller_identity",
+            "board writes from the agent UID use the daemon socket".to_string(),
+        ),
         (None, Attribution::NoAgent | Attribution::Proxy(_)) => {
             Verdict::Refuse(required.0, required.1.to_string())
         }
@@ -820,6 +830,20 @@ pub(super) fn decide(
     }
 }
 
+fn agent_uid_attribution(
+    socket_uid: Option<u32>,
+    agent_uid: Option<u32>,
+    fallback: Attribution,
+) -> Attribution {
+    match (socket_uid, agent_uid) {
+        (Some(socket_uid), Some(agent_uid)) if socket_uid == agent_uid => Attribution::AgentUid,
+        (None, Some(_)) => {
+            Attribution::Unknown("client socket UID could not be proved".to_string())
+        }
+        _ => fallback,
+    }
+}
+
 /// Attribute the TCP peer to an agent ([`crate::peer::tcp_peer_agent`]).
 /// CAD-482: a seam-asserted request carries its caller in the headers —
 /// `operator` is the same attribution a local un-owned browser gets,
@@ -831,6 +855,25 @@ fn attribute(
     opts: &ServeOpts,
     origin: &ReqOrigin,
 ) -> Attribution {
+    let agent_uid = match opts.agent_uid {
+        Some(uid) => Some(uid),
+        None => match crate::agent_uid::config::configured_uid(state_dir) {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Attribution::Unknown(format!("agent UID config refused: {error}"))
+            }
+        },
+    };
+    if agent_uid.is_some() {
+        let socket_uid = request
+            .remote_addr()
+            .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+            .map(|(_, uid)| uid);
+        let classified = agent_uid_attribution(socket_uid, agent_uid, Attribution::NoAgent);
+        if matches!(classified, Attribution::AgentUid | Attribution::Unknown(_)) {
+            return classified;
+        }
+    }
     if let Some(asserted) = crate::test_seam::asserted() {
         return match asserted {
             crate::test_seam::Asserted::Operator => Attribution::NoAgent,
@@ -1087,6 +1130,12 @@ pub(super) fn open(
             "session_from_agent",
             alias.clone(),
             format!("sign-in refused: this request comes from agent '{alias}' — the link is spent"),
+        )),
+        Attribution::AgentUid => Some((
+            "session_from_agent",
+            crate::agent_uid::AGENT_USER.to_string(),
+            "sign-in refused: this request comes from the agent UID — the link is spent"
+                .to_string(),
         )),
         Attribution::Unknown(why) => Some((
             "caller_identity",
@@ -1434,6 +1483,39 @@ pub(super) fn platform_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_uid_socket_never_becomes_operator_on_either_fallback_arm() {
+        for fallback in [
+            Attribution::NoAgent,
+            Attribution::Foreign("other uid".into()),
+        ] {
+            let attribution = agent_uid_attribution(Some(2000), Some(2000), fallback);
+            assert_eq!(attribution, Attribution::AgentUid);
+            assert_eq!(
+                decide(
+                    Some(Held::Operator),
+                    attribution.clone(),
+                    ("session", "required"),
+                ),
+                Verdict::Stolen(crate::agent_uid::AGENT_USER.to_string())
+            );
+            assert!(matches!(
+                decide(None, attribution, ("session", "required")),
+                Verdict::Refuse("caller_identity", _)
+            ));
+        }
+        assert_eq!(
+            agent_uid_attribution(Some(3000), Some(2000), Attribution::NoAgent),
+            Attribution::NoAgent,
+        );
+        let missing = agent_uid_attribution(None, Some(2000), Attribution::NoAgent);
+        assert!(matches!(missing, Attribution::Unknown(_)));
+        assert!(matches!(
+            decide(Some(Held::Operator), missing, ("session", "required")),
+            Verdict::Refuse("caller_identity", _)
+        ));
+    }
 
     #[test]
     fn route_table_classifies_and_fails_closed() {

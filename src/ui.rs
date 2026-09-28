@@ -324,6 +324,9 @@ pub struct UiOpts {
 /// Everything the running server needs, resolved.
 #[derive(Clone, Default)]
 pub struct ServeOpts {
+    /// In-process test override for the private per-state agent UID
+    /// record; production leaves this unset and reads that record.
+    pub agent_uid: Option<u32>,
     pub host: String,
     pub port: u16,
     pub dist: Option<PathBuf>,
@@ -647,6 +650,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         }
     }
     Ok(ServeOpts {
+        agent_uid: None,
         host,
         port,
         dist: eff.dist.clone(),

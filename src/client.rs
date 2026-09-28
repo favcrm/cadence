@@ -29,6 +29,22 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("cadence.sock")
 }
 
+fn rpc_socket_path(state_dir: &Path) -> Result<PathBuf> {
+    // ADR 0007 T3: an agent-uid pane gets only the shared socket path,
+    // never the operator's private state-dir path. Unset preserves the
+    // original behavior for every operator CLI and existing fixture.
+    match std::env::var_os("CADENCE_SOCKET") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(Error::rejected("CADENCE_SOCKET must be an absolute path"));
+            }
+            Ok(path)
+        }
+        None => Ok(socket_path(state_dir)),
+    }
+}
+
 /// The briefing file an actor agent reads —
 /// `<state>/briefings/<root>/BRIEFING-<alias>.md` — never inside the
 /// agent's cwd repository. The `<root>` segment is the upstream PM's
@@ -342,7 +358,7 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
 
 /// One request/response frame over the daemon socket.
 fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-    let socket = socket_path(state_dir);
+    let socket = rpc_socket_path(state_dir)?;
     let mut stream = UnixStream::connect(&socket).map_err(|_| {
         Error::internal(format!(
             "Daemon is not reachable at {} — start it with `cadence daemon start`",

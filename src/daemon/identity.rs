@@ -322,6 +322,15 @@ impl Shared {
     /// as if unregistered — while a row with no recorded start keeps
     /// denying (fail closed).
     pub(super) fn operator_evidence(&self, peer_pid: u32) -> std::result::Result<(), String> {
+        // The frame's uid came from SO_PEERCRED at accept. No test
+        // assertion, grant token, or later /proc observation may turn
+        // an agent-uid connection into operator authority.
+        if self.agent_uid.is_some() {
+            let uid = super::serve::frame_peer_uid(self.agent_uid).map_err(|e| e.to_string())?;
+            if uid != unsafe { libc::geteuid() } {
+                return Err(format!("socket peer uid {uid} is not the operator uid"));
+            }
+        }
         // CAD-615: a child this daemon spawned to run an approved
         // command carries a token bound to its pid. That is operator
         // authority for the life of that process, not a caller field.
@@ -398,6 +407,21 @@ impl Shared {
     /// node) refuses outright.
     pub(super) fn connection_caller(&self, peer_pid: u32) -> Result<caller_rule::Who> {
         use caller_rule::Who;
+        if let Some(agent_uid) = self.agent_uid {
+            let uid = super::serve::frame_peer_uid(self.agent_uid)?;
+            if uid == agent_uid {
+                self.revalidate_enrollments()?;
+                return Ok(match self.slot_identity(peer_pid)? {
+                    Some(who) if !who.lane().is_empty() => Who::Agent(who.lane().to_string()),
+                    _ => Who::Unproven(format!(
+                        "socket peer uid {uid} is agent-family but has no proved alias"
+                    )),
+                });
+            }
+            if uid != unsafe { libc::geteuid() } {
+                return Err(Error::rejected("socket peer UID is outside the admit set"));
+            }
+        }
         if self.grant_exec_matches(peer_pid) {
             return Ok(Who::Operator);
         }
@@ -446,6 +470,12 @@ impl Shared {
     /// hides) cannot be an agent and is skipped, as `peer::operator_proof`
     /// skips it.
     pub(super) fn sandbox_outsider(&self, peer_pid: u32) -> bool {
+        if self.agent_uid.is_some() {
+            match super::serve::frame_peer_uid(self.agent_uid) {
+                Ok(uid) if uid == unsafe { libc::geteuid() } => {}
+                _ => return false,
+            }
+        }
         if !crate::rollout::sandbox_exempt(&self.state_dir) {
             return false;
         }
