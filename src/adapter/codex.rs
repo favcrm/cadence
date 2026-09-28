@@ -319,13 +319,15 @@ fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str) -> Result<()> {
     // row must not turn into a broader `codex sandbox` default here.
     registry::codex_sandbox(sandbox)?;
     let mut probe = Command::new(&command[0]);
+    // `codex sandbox -C` requires a named permission profile in Codex
+    // 0.157.1. Set the child's cwd directly: this exercises the same
+    // workspace without requiring a separate profile or widening policy.
+    probe.current_dir(cwd);
     probe.args(&command[1..]);
     probe.args([
         "sandbox",
         "-c",
         &format!("sandbox_mode=\"{sandbox}\""),
-        "-C",
-        cwd,
         "--",
     ]);
     let file = if sandbox == "workspace-write" {

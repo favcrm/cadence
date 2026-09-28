@@ -59,9 +59,9 @@ sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 Inspect the profile source after package installation and schedule this as a
 host security change. Keep `kernel.apparmor_restrict_unprivileged_userns=1`;
 do not use `danger-full-access`, make `bwrap` setuid, or restart a production
-daemon as a shortcut. Verify `codex sandbox -c
-'sandbox_mode="workspace-write"' -C /tmp -- /bin/true` with the daemon's OS
-user and PATH. Then, in a separate Cadence state directory and lane, verify
+daemon as a shortcut. From a temporary work directory, verify `codex sandbox
+-c 'sandbox_mode="workspace-write"' -- /bin/true` with the daemon's OS user
+and PATH. Then, in a separate Cadence state directory and lane, verify
 a managed workspace-write Codex worker reaches `idle`, reads/writes a small
 file, reports a result, and retains its configured sandbox in `agent show`.
 The direct CLI check establishes the host prerequisite; the managed test

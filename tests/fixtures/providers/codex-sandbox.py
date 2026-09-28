@@ -9,9 +9,9 @@ mode, *args = sys.argv[1:]
 assert args[0] == "sandbox", args
 assert "-c" in args, args
 assert any(a in args for a in ('sandbox_mode="workspace-write"', 'sandbox_mode="read-only"')), args
-assert "-C" in args and "--" in args, args
+assert "-C" not in args and "--" in args, args
 assert "danger-full-access" not in " ".join(args), args
-cwd = args[args.index("-C") + 1]
+cwd = os.getcwd()
 command = args[args.index("--") + 1:]
 assert cwd and command, args
 
