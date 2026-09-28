@@ -758,12 +758,14 @@ export default function WorkspaceApp({
                     <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
                       onClick={() => void mutate(async () => {
                         const { source, receipt } = upgradeProposal;
+                        const requestKey = JSON.stringify([installId, "upgrade", receipt.expected_digest, receipt.expected_generation, receipt.digest]);
                         await workspaceApps.upgrade(installId, {
                           source, expected_digest: receipt.expected_digest,
                           expected_generation: receipt.expected_generation,
                           expected_new_digest: receipt.digest,
-                          request_id: retainedRequest(JSON.stringify([installId, "upgrade", receipt.expected_digest, receipt.expected_generation, receipt.digest])),
+                          request_id: retainedRequest(requestKey),
                         });
+                        completeRequest(requestKey);
                         setUpgradeProposal(null);
                         setUpgradeSource("");
                       })}>Apply checked update</Button>

@@ -21,7 +21,7 @@ const { createRoot } = require("react-dom/client") as typeof import("react-dom/c
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"] };
 let simulatedInstallation: typeof installation | null = null;
-let simulatedUpgradeNumber = 0;
+let loseUpgradeReply = false;
 const snapshot = { owner_pm: "pm-a", inputs: { subject: "Synthetic caption", source: "Synthetic source facts", writer: "writer-a", reviewer: "reviewer-a" }, workflow: { title: "Instagram caption: Synthetic caption", publication_slot: "publication", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Write" }, { id: "2", kind: "review_text", assignee: "reviewer-a", dependencies: ["1"], instruction: "Review" }] }, publication: { slot: "publication", binding: { id: "binding-a", revision: 1, digest: "binding-digest" } }, assignments: {} };
 let rows: any[] = [];
 let effects: any[] = [];
@@ -68,7 +68,8 @@ globalThis.fetch = async (input, init) => {
       if (path === "/api/app-installations/install-a/upgrade") {
         if (simulatedInstallation) {
           assert(body.expected_digest === simulatedInstallation.digest && body.expected_generation === simulatedInstallation.catalog_generation && body.expected_new_digest !== simulatedInstallation.digest, "Repeat upgrade apply matches its reviewed current version");
-          simulatedInstallation = { ...simulatedInstallation, digest: body.expected_new_digest, catalog_generation: `later-generation-${++simulatedUpgradeNumber}`, approved: false };
+          if (loseUpgradeReply) { loseUpgradeReply = false; throw new Error("Upgrade reply lost"); }
+          simulatedInstallation = { ...simulatedInstallation, digest: body.expected_new_digest, catalog_generation: body.expected_new_digest === "bundle-digest" ? "catalog-generation" : "generation-b", approved: false };
           return json(simulatedInstallation);
         }
         assert(body.source === "/tmp/social-v05" && body.expected_digest === "bundle-digest" && body.expected_generation === "catalog-generation" && body.expected_new_digest === "new-bundle-digest" && body.request_id, "Upgrade apply sends only the reviewed old/new material and a stable request");
@@ -277,10 +278,15 @@ async function main() {
   assert(writes.at(-1)?.body.request_id && writes.at(-1)?.body.request_id !== oldBindingId, "Same connection in a new bundle needs a new binding request identity");
   await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v04");
   await click(button("Check update")); await click(button("Apply checked update"));
-  assert(simulatedInstallation.digest === "bundle-digest", "Return to the earlier bundle applies as a distinct upgrade");
+  assert(simulatedInstallation.digest === "bundle-digest" && simulatedInstallation.catalog_generation === "catalog-generation", "Return to the earlier bundle restores its prior content-derived catalog generation");
   await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v05");
-  await click(button("Check update")); await click(button("Apply checked update"));
-  assert(String(simulatedInstallation.digest) === "new-bundle-digest" && writes.at(-1)?.body.request_id !== firstUpgradeId, "A later A-to-B upgrade must not reuse an earlier A-to-B request after catalog generation advances");
+  await click(button("Check update"));
+  loseUpgradeReply = true;
+  await click(button("Apply checked update"));
+  const retryUpgradeId = writes.at(-1)?.body.request_id;
+  assert(text().includes("Upgrade reply lost") && retryUpgradeId !== firstUpgradeId, "A later A-to-B operation gets a fresh identity even when old digest and catalog hash repeat");
+  await click(button("Apply checked update"));
+  assert(String(simulatedInstallation.digest) === "new-bundle-digest" && writes.at(-1)?.body.request_id === retryUpgradeId, "An uncertain A-to-B response retains its request identity for an explicit retry");
   simulatedInstallation = null;
   installation.name = "another-app"; await fresh();
   assert(text().includes("no supported board workspace") && !button("New post") && !button("Approve app"), "Unrelated workspace apps get a truthful guide without Social Content actions");
