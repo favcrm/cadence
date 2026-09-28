@@ -204,7 +204,8 @@ fn pinned_asset(
         &asset.receipt_id,
     )
     .map_err(|_| "reviewed app binary asset is unavailable or changed".to_string())?;
-    if receipt["run_id"] != text.provenance["run_id"]
+    if receipt["receipt_schema"] != 2
+        || receipt["run_id"] != text.provenance["run_id"]
         || receipt["binding_digest"] != asset.binding_digest
         || receipt["digest"] != asset.receipt_digest
         || receipt["asset"]["digest"] != asset.digest

@@ -1280,7 +1280,8 @@ impl Store {
                             (None,None) => true,
                             (Some(receipt_id),Some(asset_digest)) if decision=="approve" => {
                                 super::app_capabilities::asset_material_in(tx,receipt_id)
-                                    .is_ok_and(|(receipt,_)| receipt["run_id"]==run_id
+                                    .is_ok_and(|(receipt,_)| receipt["receipt_schema"]==2
+                                        && receipt["run_id"]==run_id
                                         && receipt["step_id"]==producer_step_id
                                         && receipt["asset"]["digest"]==*asset_digest
                                         && run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]["digest"]==receipt["binding_digest"])

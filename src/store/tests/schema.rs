@@ -793,9 +793,34 @@
             .query_map([],|r|r.get(1)).unwrap().map(|row|row.unwrap()).collect();
         assert!(!columns.contains(&"asset_receipt_id".to_string()));
         conn.execute_batch("DROP TRIGGER fail_v25").unwrap();
+        // A populated v24 binary receipt used the v1 digest, which did not
+        // cover MIME or byte count. The migration must preserve its audit
+        // read without making it eligible for a new v25 asset review.
+        let bytes = b"historical asset";
+        let asset_digest = crate::store::app_runs::artifact_digest(bytes);
+        let result = json!({"posts":[]});
+        let legacy_digest = crate::store::app_runs::material_digest(&json!({
+            "run_id":"legacy-run","step_id":"legacy-step",
+            "message_id":"legacy-message","turn_id":"legacy-turn",
+            "slot":"source","request_id":"legacy-request",
+            "binding_digest":"legacy-binding","input_digest":"legacy-input",
+            "result":result,"asset_digest":asset_digest
+        }));
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute("INSERT INTO app_capability_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params!["legacy-asset","legacy-run","legacy-step","legacy-message",
+                "legacy-turn","source","legacy-request","legacy-binding",
+                "legacy-input",result.to_string(),legacy_digest,
+                "application/octet-stream",asset_digest,bytes.as_slice(),1.0]
+        ).unwrap();
         drop(conn);
         for _ in 0..2 {
-            Store::open_for_schema_tests(&db).unwrap();
+            let store = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(store.app_capability_result("legacy-asset").unwrap()["asset"]["media_type"],
+                "application/octet-stream");
+            assert_eq!(store.app_capability_asset("legacy-asset").unwrap()["size"],bytes.len());
+            assert_eq!(super::app_capabilities::asset_material_in(&store.conn(), "legacy-asset")
+                .unwrap().0["receipt_schema"],1);
             let conn=Connection::open(&db).unwrap();
             let version:i64=conn.query_row("SELECT version FROM schema_version",[],|r|r.get(0)).unwrap();
             assert_eq!(version,crate::rollout::SCHEMA_VERSION);
@@ -803,5 +828,7 @@
                 .query_map([],|r|r.get(1)).unwrap().map(|row|row.unwrap()).collect();
             assert!(columns.contains(&"asset_receipt_id".to_string()));
             assert!(columns.contains(&"asset_digest".to_string()));
+            let receipt_schema:i64=conn.query_row("SELECT receipt_schema FROM app_capability_results WHERE id='legacy-asset'",[],|r|r.get(0)).unwrap();
+            assert_eq!(receipt_schema,1);
         }
     }

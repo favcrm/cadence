@@ -31,6 +31,28 @@ fn native(
     serde_json::from_str(text.trim()).unwrap()
 }
 
+fn rewrite_asset_receipt_as_v1(db: &rusqlite::Connection, receipt: &Value, media_type: &str) {
+    let turn_id: String = db
+        .query_row(
+            "SELECT turn_id FROM app_capability_results WHERE id=?",
+            [receipt["id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let legacy_digest = cadence_agent::store::app_runs::material_digest(&json!({
+        "run_id":receipt["run_id"],"step_id":receipt["step_id"],
+        "message_id":receipt["message_id"],"turn_id":turn_id,
+        "slot":receipt["slot"],"request_id":receipt["request_id"],
+        "binding_digest":receipt["binding_digest"],
+        "input_digest":receipt["input_digest"],"result":receipt["result"],
+        "asset_digest":receipt["asset"]["digest"]
+    }));
+    db.execute(
+        "UPDATE app_capability_results SET receipt_schema=1,result_digest=?,asset_type=? WHERE id=?",
+        rusqlite::params![legacy_digest,media_type,receipt["id"].as_str().unwrap()],
+    ).unwrap();
+}
+
 #[test]
 fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
     let (h, calls, price) = Release::with_capability();
@@ -485,6 +507,149 @@ fn cad713_cross_run_review_asset_receipt_cannot_complete_or_stage() {
             json!({"run_id":run["id"],
         "artifact_id":failed["artifacts"][0]["id"],"slot":"publication",
         "request_id":"asset-forged-stage","title":"Forged"})
+        )
+        .is_err());
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cad713_legacy_asset_receipt_cannot_release_with_unreviewed_mime() {
+    let (h, _, _) = Release::with_capability();
+    let context = h.context("Client A", A, "legacy-asset-context");
+    h.bind(&context, "legacy-asset-publication");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({"install_id":h.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":h.connection,
+                "request_id":"legacy-asset-source"}),
+        )
+        .unwrap();
+    let run = h.create(&context, "legacy-asset-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let completed = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    let receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
+        .unwrap()["results"][0]
+        .clone();
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    rewrite_asset_receipt_as_v1(&db, &receipt, "image/png");
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_run_capability_result",
+                json!({"receipt_id":receipt["id"]})
+            )
+            .unwrap()["asset"]["media_type"],
+        "image/png",
+        "historical result reads must remain available"
+    );
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_effect_stage",
+                json!({
+                    "run_id":completed["id"],"artifact_id":completed["artifacts"][0]["id"],
+                    "slot":"publication","request_id":"legacy-mime-swap","title":"Reviewed draft"
+                })
+            )
+            .is_err(),
+        "v1 asset hash does not authenticate MIME and cannot back a new release"
+    );
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cad713_legacy_asset_receipt_cannot_receive_new_asset_review() {
+    let (h, _, _) = Release::with_capability();
+    let context = h.context("Client A", A, "legacy-review-context");
+    h.bind(&context, "legacy-review-publication");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":h.connection,
+                "request_id":"legacy-review-source"
+            }),
+        )
+        .unwrap();
+    let run = h.create(&context, "legacy-review-run");
+    let run_id = run["id"].as_str().unwrap();
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("context-hold-reviewer-{run_id}")),
+        "hold",
+    )
+    .unwrap();
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("app-capability-probe-{run_id}.json")),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    let held = h
+        .daemon
+        .state
+        .join(format!("context-reviewer-{run_id}.held"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !held.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "reviewer did not reach asset hold"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run_id}))
+        .unwrap()["results"][0]
+        .clone();
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    rewrite_asset_receipt_as_v1(&db, &receipt, "application/octet-stream");
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_run_capability_result",
+                json!({"receipt_id":receipt["id"]})
+            )
+            .unwrap()["id"],
+        receipt["id"]
+    );
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("context-reviewer-{run_id}.release")),
+        "go",
+    )
+    .unwrap();
+    let failed = h.wait_state(run_id, "failed");
+    assert!(
+        failed["reviews"].as_array().unwrap().is_empty(),
+        "v1 receipt received a new binary review despite unauthenticated MIME"
+    );
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_effect_stage",
+            json!({
+                "run_id":run_id,"artifact_id":failed["artifacts"][0]["id"],
+                "slot":"publication","request_id":"legacy-review-stage","title":"Reviewed draft"
+            })
         )
         .is_err());
     assert!(h.items().as_array().unwrap().is_empty());

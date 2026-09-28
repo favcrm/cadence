@@ -91,6 +91,7 @@ pub(crate) fn asset_material_in(conn: &Connection, id: &str) -> Result<(Value, V
     }
     Ok((
         json!({"id":id,"run_id":row.0,"step_id":row.1,"slot":row.4,
+        "receipt_schema":row.14,
         "binding_digest":row.6,"digest":row.9,"asset":asset}),
         row.12,
     ))

@@ -274,7 +274,8 @@ impl Store {
             (None, None) => None,
             (Some(receipt_id), Some(asset_digest)) => {
                 let (receipt, _) = super::app_capabilities::asset_material_in(conn, receipt_id)?;
-                if receipt["run_id"] != id
+                if receipt["receipt_schema"] != 2
+                    || receipt["run_id"] != id
                     || receipt["step_id"] != step
                     || receipt["asset"]["digest"] != *asset_digest
                     || run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
