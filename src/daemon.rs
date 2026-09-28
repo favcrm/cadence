@@ -1377,6 +1377,10 @@ impl Shared {
         // slots from the pid just recorded — the daemon's own record,
         // never a caller's claim.
         self.enroll_endpoint(alias);
+        // A provider's own local tools can only authenticate after this
+        // enrollment is visible to the daemon's peer-ancestry verifier.
+        // Keep dispatch gated until that proof succeeds.
+        adapter.post_enrollment_ready(&agent)?;
         self.wake();
         let retry_base = self.pty_retry_base();
         let mut gate_notice: Option<String> = None;
@@ -2329,6 +2333,17 @@ impl Shared {
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
+            }
+            "agent_identity" => {
+                if !params.as_object().is_some_and(|fields| fields.is_empty()) {
+                    return Err(Error::rejected("agent identity accepts no fields"));
+                }
+                match self.caller_identity(peer_pid)? {
+                    Caller::Agent(verified) => Ok(json!({"alias": verified.agent.alias})),
+                    Caller::NoAgentIdentity => Err(Error::rejected(
+                        "agent identity requires a verified agent endpoint",
+                    )),
+                }
             }
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;

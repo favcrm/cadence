@@ -74,10 +74,54 @@ fn codex_sandbox_success_preserves_workspace_write_on_app_server() {
     d.wait_agent("ready", "idle", 15);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs[0]["params"]["sandbox"], "workspace-write");
+    let bridge = &reqs[0]["params"]["config"]["mcp_servers"]["cadence"];
+    assert_eq!(bridge["env"]["CADENCE_ALIAS"], "ready");
+    assert_eq!(
+        bridge["env"]["CADENCE_STATE_DIR"],
+        d.state.to_string_lossy().as_ref()
+    );
+    assert_eq!(bridge["args"][2], "mcp-agent");
 }
 
 #[test]
-fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
+fn codex_mcp_unavailable_fences_before_dispatch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("mcp-fail");
+    d.register_codex("missing-tools");
+    let agent = d.wait_agent("missing-tools", "attention", 15);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Cadence MCP readiness failed"),
+        "{agent}"
+    );
+    assert!(
+        mock.pidfile.exists(),
+        "MCP inventory check must follow app-server start"
+    );
+    d.send(
+        "missing-tools",
+        json!({"text":"do work", "message":"mcp-missing-task"}),
+    )
+    .unwrap();
+    let show = d
+        .rpc("agent_show", json!({"alias":"missing-tools"}))
+        .unwrap();
+    assert_eq!(show["messages"][0]["state"], "queued");
+}
+
+#[test]
+fn codex_mcp_inventory_finds_cadence_on_later_page() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("mcp-page");
+    d.register_codex("paged-tools");
+    d.wait_agent("paged-tools", "idle", 15);
+    assert!(mock.pidfile.exists());
+}
+
+#[test]
+fn codex_command_rpc_denial_still_opens_with_scoped_mcp() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
     sandbox_probe(&d, "deny_rpc");
@@ -88,15 +132,17 @@ fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
                "cwd":cwd, "sandbox":"workspace-write"}),
     )
     .unwrap();
-    let agent = d.wait_agent("rpc-blocked", "attention", 15);
-    let error = agent["error"].as_str().unwrap_or("");
-    assert!(error.contains("Cadence RPC socket"), "{agent}");
-    assert!(error.contains("Operation not permitted"), "{agent}");
-    assert!(!mock.pidfile.exists(), "provider started before RPC proof");
+    d.wait_agent("rpc-blocked", "idle", 15);
+    assert!(mock.pidfile.exists(), "MCP-capable provider did not start");
+    let reqs = mock_requests(&mock);
+    assert_eq!(
+        reqs[0]["params"]["config"]["mcp_servers"]["cadence"]["env"]["CADENCE_ALIAS"],
+        "rpc-blocked"
+    );
 }
 
 #[test]
-fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
+fn codex_mcp_resolves_relative_daemon_state_before_changing_cwd() {
     let daemon_cwd = std::env::current_dir().unwrap();
     let root = TempDir::new_in("/tmp").unwrap();
     let mut relative_state = PathBuf::new();
@@ -105,7 +151,7 @@ fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
     }
     relative_state.push(root.path().strip_prefix("/").unwrap());
     let d = TestDaemon::start_on(relative_state);
-    let _mock = d.mock_codex("ok");
+    let mock = d.mock_codex("ok");
     let agent_cwd = d.dir.path().to_str().unwrap();
     d.fixture_rpc(
         "agent_register",
@@ -114,6 +160,34 @@ fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
     )
     .unwrap();
     d.wait_agent("relative-state", "idle", 15);
+    let reqs = mock_requests(&mock);
+    let bridge = &reqs[0]["params"]["config"]["mcp_servers"]["cadence"];
+    let absolute_state = std::fs::canonicalize(&d.state).unwrap();
+    assert_eq!(bridge["args"][1], absolute_state.to_string_lossy().as_ref());
+}
+
+#[test]
+fn codex_mcp_identity_failure_fences_before_dispatch() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("mcp-identity-fail");
+    d.register_codex("unreachable-rpc");
+    let agent = d.wait_agent("unreachable-rpc", "attention", 15);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Cadence MCP identity proof failed"),
+        "{agent}"
+    );
+    d.send(
+        "unreachable-rpc",
+        json!({"text":"do work", "message":"mcp-rpc-unreachable-task"}),
+    )
+    .unwrap();
+    let show = d
+        .rpc("agent_show", json!({"alias":"unreachable-rpc"}))
+        .unwrap();
+    assert_eq!(show["messages"][0]["state"], "queued");
 }
 
 #[test]

@@ -29,6 +29,7 @@ mod issue;
 mod job;
 mod join;
 mod master;
+mod mcp_agent;
 mod mcp_permission;
 mod memory;
 mod message;
@@ -1491,6 +1492,9 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
+    /// Stdio MCP tools for a managed Codex endpoint.
+    #[command(hide = true)]
+    McpAgent,
 }
 
 #[derive(Subcommand)]
@@ -3879,6 +3883,7 @@ pub(crate) fn run() -> Result<i32> {
             command,
         } => confine::run(state_dir, read, write, command),
         Commands::McpPermission { timeout_secs } => mcp_permission::run(state_dir, timeout_secs),
+        Commands::McpAgent => mcp_agent::run(state_dir),
     }
 }
 

@@ -180,6 +180,7 @@ def handle(conn):
     if not handshake(conn):
         return
     approvals = set()
+    current_alias = os.environ.get("CADENCE_ALIAS", "")
     while True:
         op, payload = read_frame(conn)
         if op is None or op == 8:
@@ -226,6 +227,9 @@ def handle(conn):
             with open(pidfile + ".requests", "a") as rf:
                 rf.write(json.dumps({"method": method,
                                      "params": msg.get("params", {})}) + "\n")
+            current_alias = msg.get("params", {}).get("config", {}).get(
+                "mcp_servers", {}).get("cadence", {}).get("env", {}).get(
+                    "CADENCE_ALIAS", current_alias)
             launch = msg.get("params", {})
             effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
             model = launch.get("model", "mock-model")
@@ -233,6 +237,19 @@ def handle(conn):
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+        elif method == "mcpServerStatus/list":
+            if "serverName" in msg.get("params", {}):
+                send_json(conn, {"id": mid, "error": {"code": -32602,
+                    "message": "serverName is not supported"}})
+            else:
+                send_json(conn, {"id": mid, "result": {"data": [{"name": "cadence",
+                    "runtimeStatus": "connected", "tools": {
+                        name: {"name": name} for name in
+                        ("self", "wiki_search", "wiki_read", "issue_show")}}],
+                    "nextCursor": None}})
+        elif method == "mcpServer/tool/call":
+            send_json(conn, {"id": mid, "result": {"content": [{"type": "text",
+                "text": json.dumps({"alias": current_alias, "running": []})}]}})
         elif method == "account/rateLimits/read":
             if mode == "no-quota":
                 send_json(conn, {"id": mid, "error": {"code": -32601,

@@ -273,6 +273,12 @@ pub struct AdapterHooks {
 pub trait ProviderAdapter: Send + Sync {
     /// Open or resume the provider session for `agent`.
     fn open(&self, agent: &Agent) -> Result<Identity>;
+    /// Verify a managed provider after its process is enrolled in the
+    /// daemon's caller registry, before the actor can dispatch any work.
+    /// Most providers need no post-enrollment check.
+    fn post_enrollment_ready(&self, _agent: &Agent) -> Result<()> {
+        Ok(())
+    }
     /// Re-open after a provably clean daemon restart to adopt the
     /// recorded in-flight turn (CAD-89): the endpoint must still be
     /// the one the shutdown recorded — same pane pid, same native

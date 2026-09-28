@@ -106,6 +106,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("agent_list", Rule::Read),
     ("agent_show", Rule::Read),
     (
+        "agent_identity",
+        Rule::Handler("caller_identity (verified agent endpoint only, CAD-744)"),
+    ),
+    (
         "agent_send",
         Rule::Handler(
             "thread_sender: the operator's thread write needs proof (CAD-384); \

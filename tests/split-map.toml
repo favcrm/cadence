@@ -586,10 +586,13 @@ helpers = [
 
 [binaries.managed_claude_codex]
 tests = [
-    "codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd",
-    "codex_rpc_socket_denial_fences_before_app_server_dispatch",
+    "codex_mcp_resolves_relative_daemon_state_before_changing_cwd",
+    "codex_command_rpc_denial_still_opens_with_scoped_mcp",
     "codex_sandbox_failure_fences_before_app_server_dispatch",
     "codex_sandbox_success_preserves_workspace_write_on_app_server",
+    "codex_mcp_unavailable_fences_before_dispatch",
+    "codex_mcp_inventory_finds_cadence_on_later_page",
+    "codex_mcp_identity_failure_fences_before_dispatch",
     "codex_approval_policy_defaults_to_never_and_replays_on_resume",
     "codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields",
     "codex_quota_endpoint_failure_is_explicit_unknown",
@@ -1198,6 +1201,9 @@ tests = [
     "committed_write_refreshes_index_before_the_next_search",
     "index_status_is_operator_scoped",
     "agent_cannot_read_index_health_or_force_a_refresh",
+    "managed_agent_and_detached_child_cannot_operate_wiki_index",
+    "agent_identity_is_bound_to_the_enrolled_peer_not_request_fields",
+    "managed_mcp_server_reads_scoped_wiki_through_enrolled_peer",
     "index_refresh_rebuilds_even_when_current",
     "corrupt_index_is_visible_and_repaired_from_committed_git",
     "explicit_refresh_reads_committed_tree_not_uncommitted_worktree",
