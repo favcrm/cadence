@@ -557,7 +557,7 @@ export default function App() {
   const projectSlug = project === "all" ? null : project;
 
   return (
-    <WriteGate.Provider value={block}>
+    <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
