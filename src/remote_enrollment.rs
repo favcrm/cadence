@@ -811,6 +811,20 @@ impl ContinuityRefusal {
     }
 }
 
+fn generic_authorization_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !matches!(
+            code,
+            "lineage_terminal" | "parked" | "authority_unavailable" | "unauthorized" | "forbidden"
+        )
+}
+
 fn continuity_refusal(status: u16, bytes: &[u8]) -> ContinuityRefusal {
     // A gateway may lose the issuer's body after a bind commits. An empty 503
     // has no authority to claim, but must retain the exact-key retry path.
@@ -846,6 +860,9 @@ fn continuity_refusal(status: u16, bytes: &[u8]) -> ContinuityRefusal {
         (409, "parked", Some("session_uncertain")) => ContinuityRefusal::Parked,
         (401, "unauthorized", None) | (403, "forbidden", None) => ContinuityRefusal::Authorization,
         (503, "authority_unavailable", None) => ContinuityRefusal::Uncertain,
+        (401 | 403, code, None) if generic_authorization_code(code) => {
+            ContinuityRefusal::Authorization
+        }
         _ => ContinuityRefusal::Invalid,
     }
 }
@@ -1876,6 +1893,11 @@ mod tests {
             (409, json!({"ok":false,"code":"lineage_terminal"})),
             (403, json!({"ok":false,"code":"lineage_terminal"})),
             (401, json!({"ok":false,"code":"authority_unavailable"})),
+            (401, json!({"ok":false,"code":"other refusal"})),
+            (
+                403,
+                json!({"ok":false,"code":"other_issuer_refusal","reason":"session_expired"}),
+            ),
             (409, json!({"ok":false,"code":"parked","reason":"other"})),
             (409, json!({"ok":false,"code":"parked","reason":null})),
             (
