@@ -237,6 +237,32 @@ pub(crate) fn agent_exec_path(state_dir: &Path, env: &ProviderEnv) -> PathBuf {
     }
 }
 
+/// The operator's source briefing is not evidence that the agent can
+/// read its lane copy. In split mode ask the fixed drop helper to test
+/// that copy as the agent UID; any refusal or missing file stays
+/// `briefing_missing` in `agent show`.
+pub(crate) fn briefing_available(source: &Path, exposed: &Path, helper: Option<&Path>) -> bool {
+    if !source.is_file() {
+        return false;
+    }
+    let Some(helper) = helper else {
+        return true;
+    };
+    crate::reaper::output(
+        Command::new(helper)
+            .args([
+                "exec",
+                "--",
+                "/bin/sh",
+                "-c",
+                "test -f \"$1\" && test -r \"$1\"",
+                "cadence-briefing",
+            ])
+            .arg(exposed),
+    )
+    .is_ok_and(|out| out.status.success())
+}
+
 fn pane_uids(pid: u32) -> Option<(u32, u32)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let line = status.lines().find(|line| line.starts_with("Uid:"))?;
@@ -2072,8 +2098,8 @@ impl ProviderAdapter for PtyAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_exec_path, kill_pane, match_draft, normalize_screen, owned_lane_dir, pane_env,
-        split_pane_command, split_profile_ready, tail_chars, DraftMatch,
+        agent_exec_path, briefing_available, kill_pane, match_draft, normalize_screen,
+        owned_lane_dir, pane_env, split_pane_command, split_profile_ready, tail_chars, DraftMatch,
     };
 
     fn rows(lines: &[&str]) -> Vec<String> {
@@ -2346,5 +2372,30 @@ mod tests {
         assert!(!marker.exists(), "split mode killed an operator-uid pane");
         kill_pane(dir.path(), "worker", &env, None);
         assert!(marker.exists(), "legacy same-uid stop changed");
+    }
+
+    #[test]
+    fn cad514_agent_show_needs_readable_lane_copy_not_only_private_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("operator-source.md");
+        let exposed = dir.path().join("lane/BRIEFING-worker.md");
+        let helper = dir.path().join("fake-helper");
+        std::fs::write(&source, b"briefing").unwrap();
+        std::fs::write(
+            &helper,
+            b"#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -- ] || exit 2\nshift 2\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
+        assert!(briefing_available(&source, &source, None));
+        std::fs::create_dir(exposed.parent().unwrap()).unwrap();
+        std::fs::write(&exposed, b"briefing").unwrap();
+        assert!(briefing_available(&source, &exposed, Some(&helper)));
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
+        std::fs::write(&helper, b"#!/bin/sh\nexit 2\n").unwrap();
+        assert!(!briefing_available(&source, &exposed, Some(&helper)));
     }
 }

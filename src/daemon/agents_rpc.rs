@@ -967,11 +967,7 @@ impl Shared {
             .map(|_| adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env));
         let report =
             lane::reap_session_with(root, &opts, &still_ours, &on_intent, helper.as_deref());
-        let kind = if report.refused.is_some() {
-            "pane_tree_reap_refused"
-        } else {
-            "pane_tree_reaped"
-        };
+        let kind = report.event_kind();
         let mut payload = report.to_json();
         payload["root"] = root.to_json();
         let _ = self.store.event_public(alias, kind, payload);

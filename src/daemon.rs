@@ -2395,7 +2395,11 @@ impl Shared {
                     } else {
                         file.clone()
                     };
-                    if file.is_file() {
+                    let helper =
+                        (self.agent_uid.is_some() && agent.endpoint_kind == "pty").then(|| {
+                            adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env)
+                        });
+                    if adapter::pty::briefing_available(&file, &exposed, helper.as_deref()) {
                         agent_json["briefing"] = json!(exposed);
                     } else {
                         agent_json["briefing"] = Value::Null;

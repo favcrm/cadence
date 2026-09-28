@@ -183,28 +183,55 @@ pub fn session_members(root: &PaneRoot) -> Vec<Member> {
 /// Signal `member` only if it is still the same process in session
 /// `sid`. On Linux the identity is pinned with a pidfd first, so the
 /// check and the signal address the same process even if the pid is
-/// recycled in between. Returns whether a signal was delivered.
-fn signal_verified(member: Member, sid: u32, sig: libc::c_int, helper: Option<&Path>) -> bool {
+/// recycled in between. A helper failure on a still-live member is a
+/// refused reap, never an ordinary "not signalled" result.
+fn signal_verified(
+    member: Member,
+    sid: u32,
+    sig: libc::c_int,
+    helper: Option<&Path>,
+) -> Result<bool, String> {
     if let Some(helper) = helper {
         if !member.matches(sid) {
-            return false;
+            return Ok(false);
         }
         let name = match sig {
             libc::SIGTERM => "TERM",
             libc::SIGKILL => "KILL",
-            _ => return false,
+            _ => return Err(format!("agent UID helper signal {sig} is unsupported")),
         };
         // The helper opens a pidfd, checks the captured starttime/sid
         // after the drop, then signals through that same fd. A failed
         // helper never falls back to the operator uid's kill(2).
-        return crate::reaper::output(Command::new(helper).args([
+        let output = crate::reaper::output(Command::new(helper).args([
             "kill",
             &member.pid.to_string(),
             name,
             &member.start_time.to_string(),
             &sid.to_string(),
-        ]))
-        .is_ok_and(|out| out.status.success());
+        ]));
+        if output.as_ref().is_ok_and(|out| out.status.success()) {
+            return Ok(true);
+        }
+        if !member.matches(sid) {
+            return Ok(false);
+        }
+        let reason = match output {
+            Ok(out) => format!(
+                "exit {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+                    .trim()
+            ),
+            Err(error) => error.to_string(),
+        };
+        return Err(format!(
+            "agent UID helper kill {name} {} failed: {reason}",
+            member.pid
+        ));
     }
     #[cfg(target_os = "linux")]
     {
@@ -224,15 +251,15 @@ fn signal_verified(member: Member, sid: u32, sig: libc::c_int, helper: Option<&P
                     )
                 } == 0;
             unsafe { libc::close(fd) };
-            return sent;
+            return Ok(sent);
         }
         // ESRCH: already gone. Any other failure (ENOSYS on an old
         // kernel) falls back to verify-then-kill below.
         if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return false;
+            return Ok(false);
         }
     }
-    member.matches(sid) && unsafe { libc::kill(member.pid as libc::pid_t, sig) } == 0
+    Ok(member.matches(sid) && unsafe { libc::kill(member.pid as libc::pid_t, sig) } == 0)
 }
 
 /// What one reap did — the payload of the `pane_tree_reaped` event.
@@ -254,6 +281,14 @@ pub struct ReapReport {
 }
 
 impl ReapReport {
+    pub fn event_kind(&self) -> &'static str {
+        if self.refused.is_some() {
+            "pane_tree_reap_refused"
+        } else {
+            "pane_tree_reaped"
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         let list = |v: &[Member]| v.iter().map(|m| m.to_json()).collect::<Vec<_>>();
         json!({
@@ -360,8 +395,12 @@ pub fn reap_session_with(
         return refuse(report, why);
     }
     for m in &members {
-        if signal_verified(*m, root.sid, libc::SIGTERM, helper) {
-            report.terminated.push(*m);
+        match signal_verified(*m, root.sid, libc::SIGTERM, helper) {
+            Ok(true) => report.terminated.push(*m),
+            Ok(false) => {}
+            Err(reason) => {
+                report.refused.get_or_insert(reason);
+            }
         }
     }
     // Bounded drain: re-sample by identity until every signalled
@@ -405,8 +444,12 @@ pub fn reap_session_with(
             );
         }
         for m in survivors {
-            if signal_verified(m, root.sid, libc::SIGKILL, helper) {
-                report.killed.push(m);
+            match signal_verified(m, root.sid, libc::SIGKILL, helper) {
+                Ok(true) => report.killed.push(m),
+                Ok(false) => {}
+                Err(reason) => {
+                    report.refused.get_or_insert(reason);
+                }
             }
         }
         let deadline = Instant::now() + opts.kill_wait;
@@ -545,17 +588,70 @@ mod tests {
             kill_wait: Duration::from_millis(20),
         };
         let report = reap_session_with(&root, &opts, &|| Ok(()), &|_| {}, Some(&helper));
-        assert!(report.terminated.is_empty(), "{report:?}");
-        assert!(
-            report.residue.iter().any(|m| m.pid == child.id()),
-            "{report:?}"
-        );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "operator kill leaked through"
-        );
+        let child_pid = child.id();
+        let child_alive = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
+        assert!(report.terminated.is_empty(), "{report:?}");
+        assert!(
+            report
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("helper")),
+            "helper failure must be a refused reap event: {report:?}"
+        );
+        assert_eq!(report.event_kind(), "pane_tree_reap_refused");
+        assert!(report.to_json()["refused"].is_string());
+        assert!(
+            report.residue.iter().any(|m| m.pid == child_pid),
+            "{report:?}"
+        );
+        assert!(child_alive, "operator kill leaked through");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cad514_failed_helper_escalation_reports_refusal_with_live_residue() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("refuse-kill-helper");
+        std::fs::write(&helper, b"#!/bin/sh\n[ \"$3\" = TERM ] && exit 0\nexit 2\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new("setsid")
+            .args(["sleep", "30"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let root = loop {
+            if let Some(root) = PaneRoot::capture(child.id(), "g1") {
+                if root.sid == root.pid {
+                    break root;
+                }
+            }
+            assert!(Instant::now() < deadline, "child never detached");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let opts = ReapOptions {
+            drain: Duration::from_millis(20),
+            poll: Duration::from_millis(5),
+            kill_wait: Duration::from_millis(20),
+        };
+        let report = reap_session_with(&root, &opts, &|| Ok(()), &|_| {}, Some(&helper));
+        let child_pid = child.id();
+        let child_alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            report.terminated.iter().any(|m| m.pid == child_pid),
+            "{report:?}"
+        );
+        assert!(report.killed.is_empty(), "{report:?}");
+        assert_eq!(report.event_kind(), "pane_tree_reap_refused", "{report:?}");
+        assert!(
+            report.residue.iter().any(|m| m.pid == child_pid),
+            "{report:?}"
+        );
+        assert!(child_alive, "the fake TERM must not have killed the child");
     }
 
     #[cfg(target_os = "linux")]
