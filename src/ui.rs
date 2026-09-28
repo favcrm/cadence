@@ -324,8 +324,8 @@ pub struct UiOpts {
 /// Everything the running server needs, resolved.
 #[derive(Clone, Default)]
 pub struct ServeOpts {
-    /// In-process test override for the private per-state agent UID
-    /// record; production leaves this unset and reads that record.
+    /// This board process's boot-pinned daemon agent UID. `serve` obtains
+    /// it once from the private daemon socket; tests can inject a pin.
     pub agent_uid: Option<u32>,
     pub host: String,
     pub port: u16,
@@ -3863,6 +3863,20 @@ pub fn read_model_stats(state_dir: &Path, pm_dir: &Path) -> Value {
 /// since `/api/stream`, and issue file writes must not interleave.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn board_boot_agent_uid(state_dir: &Path, injected: Option<u32>) -> Result<Option<u32>> {
+    if injected.is_some() {
+        return Ok(injected);
+    }
+    let configured = crate::agent_uid::config::configured_uid(state_dir)?;
+    match operator::active_agent_uid(state_dir) {
+        Ok(uid) => Ok(uid),
+        Err(error) if configured.is_some() => Err(Error::rejected(format!(
+            "Configured agent UID has no private daemon boot pin: {error}"
+        ))),
+        Err(_) => Ok(None), // Standalone local board, with the split disabled.
+    }
+}
+
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     if opts.board_public_only && opts.public.is_none() {
         return Err(Error::rejected(
@@ -3886,6 +3900,7 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();
+    opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
     } else {
@@ -4712,6 +4727,19 @@ mod tests {
                 .unwrap()
                 .1
                 .board_public_only
+        );
+    }
+
+    #[test]
+    fn standalone_board_without_uid_record_does_not_need_daemon_health() {
+        let state = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::board_boot_agent_uid(state.path(), Some(2200)).unwrap(),
+            Some(2200)
         );
     }
 

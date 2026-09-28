@@ -865,7 +865,7 @@ fn concrete_board_server(opts: &ServeOpts) -> Result<std::net::SocketAddr, Strin
     Ok(std::net::SocketAddr::new(ip, opts.port))
 }
 
-fn active_agent_uid(state_dir: &std::path::Path) -> Result<Option<u32>, String> {
+pub(super) fn active_agent_uid(state_dir: &std::path::Path) -> Result<Option<u32>, String> {
     let health = client::rpc_private_timeout(
         state_dir,
         "health",
@@ -895,20 +895,14 @@ fn attribute(
     opts: &ServeOpts,
     origin: &ReqOrigin,
 ) -> Attribution {
-    let configured = match opts.agent_uid {
-        Some(uid) => Some(uid),
-        None => match crate::agent_uid::config::configured_uid(state_dir) {
-            Ok(uid) => uid,
-            Err(error) => {
-                return Attribution::Unknown(format!("agent UID config refused: {error}"))
-            }
-        },
-    };
-    let active = match active_agent_uid(state_dir) {
+    let configured = match crate::agent_uid::config::configured_uid(state_dir) {
         Ok(uid) => uid,
-        Err(error) => return Attribution::Unknown(error),
+        Err(error) => return Attribution::Unknown(format!("agent UID config refused: {error}")),
     };
-    let agent_uid = match pinned_agent_uid(configured, active) {
+    // `serve` captured the daemon's UID once before opening the port.
+    // Keep comparing the private record on every request so removal or
+    // replacement cannot downgrade a board with an active agent UID.
+    let agent_uid = match pinned_agent_uid(configured, opts.agent_uid) {
         Ok(uid) => uid,
         Err(error) => return Attribution::Unknown(error),
     };
