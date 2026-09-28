@@ -39,6 +39,22 @@ pub(crate) enum EnrollmentAction {
         #[arg(long)]
         enrollment_dir: PathBuf,
     },
+    /// Short-lived owner consent for one implementer; repeat after expiry.
+    Browser {
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        client_agent: String,
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+        /// Print the consent URL and code without attempting to open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Re-enroll after expiry using the private stored service credential.
     Renew {
         #[arg(long)]
@@ -183,6 +199,37 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                     enrollment_dir,
                 )?)
             }
+            EnrollmentAction::Browser {
+                issuer,
+                org,
+                audience,
+                client_agent,
+                enrollment_dir,
+                no_open,
+            } => Some(remote_enrollment::enroll_browser(
+                issuer,
+                org,
+                audience,
+                client_agent,
+                enrollment_dir,
+                |url, code| {
+                    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+                    if !no_open {
+                        let program = if cfg!(target_os = "macos") {
+                            "open"
+                        } else {
+                            "xdg-open"
+                        };
+                        let _ = std::process::Command::new(program)
+                            .arg(url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                    }
+                    Ok(())
+                },
+            )?),
             EnrollmentAction::Renew { enrollment_dir } => {
                 Some(remote_enrollment::renew(enrollment_dir)?)
             }
