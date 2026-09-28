@@ -15,6 +15,19 @@ serving a board + JSON API on loopback.
 - **Board:** `http://cadence.localhost:18000` through the dev gateway
   (nginx → `127.0.0.1:3010`).
 
+An AgenticOS-hosted board can opt into `cadence ui start --board-public-only`
+or set `CADENCE_BOARD_PUBLIC_ONLY=1` for `cadence setup`. The mode requires
+the complete `AGENTICOS_BOARD_HOST`, `AGENTICOS_BOARD_ISSUER`, and
+`AGENTICOS_BOARD_COMPANY` identity configuration and persists in `ui.json`
+across ordinary UI restarts. It is off for local development unless explicitly
+enabled. In this mode, every protected request must name the public board
+Host and pass its session/role gate. A local-Host `/api/health` remains only
+for setup and update probes and returns `ok` and `build`; other local-Host
+requests are refused. This closes a direct loopback read path inside the
+hosted container. The image's `:3011` relay and agent/daemon process isolation
+have separate release gates; enabling this option alone does not establish
+their security.
+
 ## Issue folder
 
 ```

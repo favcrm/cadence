@@ -10,7 +10,11 @@ use board_common::*;
 use cadence_agent::ui;
 use serde_json::json;
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -111,6 +115,139 @@ fn start_public_board(pm: &Path, state: &Path, issuer: String) -> (u16, String, 
         });
     });
     (port, format!("acme.board.localhost:{port}"), board)
+}
+
+/// CAD-747 regression: a process in the hosted container can bypass the
+/// Worker by choosing Cadence's otherwise valid local Host itself.
+#[test]
+fn hosted_public_only_refuses_local_host_before_board_reads() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        |opts| {
+            let host = format!("acme.board.localhost:{}", opts.port);
+            opts.allow_hosts.push(host.clone());
+            opts.allow_origins.push(format!("http://{host}"));
+            opts.public = Some(ui::PublicBoard {
+                host,
+                issuer: "http://api.internal".to_string(),
+                company: "co_1".to_string(),
+                authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+            });
+            opts.board_public_only = true;
+        },
+    );
+    let _board = board;
+    let local = format!("127.0.0.1:{port}");
+    let public = format!("acme.board.localhost:{port}");
+    for path in [
+        "/api/issues",
+        "/api/overview",
+        "/api/projects",
+        "/api/setup",
+    ] {
+        let (status, body) = http(port, "GET", path, &local);
+        assert_eq!(status, 421, "{path}: {body}");
+    }
+    for other_host in [
+        format!("localhost:{port}"),
+        "cadence.localhost".to_string(),
+        format!("cadence-{port}.localhost:{port}"),
+    ] {
+        let (status, body) = http(port, "GET", "/api/issues", &other_host);
+        assert_eq!(status, 421, "{other_host}: {body}");
+    }
+    for disguised_health in ["/api/health?full=1", "/api/%68ealth"] {
+        assert_eq!(http(port, "GET", disguised_health, &local).0, 421);
+    }
+    let (status, _, body) = http_write(
+        port,
+        "GET",
+        "/api/issues",
+        &local,
+        &[
+            "X-Forwarded-Host: acme.board.localhost",
+            "X-Cadence-Test-As: operator",
+        ],
+        b"",
+    );
+    assert_ne!(
+        status, 200,
+        "forged identity header escaped the host gate: {body}"
+    );
+    for join in (0..8).map(|_| {
+        let local = local.clone();
+        thread::spawn(move || http(port, "GET", "/api/issues", &local))
+    }) {
+        let (status, body) = join.join().unwrap();
+        assert_eq!(status, 421, "parallel local read: {body}");
+    }
+    // A caller can hold a write body after the headers. Once released,
+    // admission must still refuse it before any mutation is reached.
+    let mut held = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    held.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    held.write_all(format!("POST /api/issues HTTP/1.0\r\nHost: {local}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n").as_bytes()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    held.write_all(b"{}").unwrap();
+    let mut answer = String::new();
+    held.read_to_string(&mut answer).unwrap();
+    assert!(
+        answer.starts_with("HTTP/1.1 421") || answer.starts_with("HTTP/1.0 421"),
+        "{answer}"
+    );
+
+    // A detached agent-shaped process exercises the kernel TCP path,
+    // rather than an in-process call to the dispatch function.
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "hosted_public_only_detached_child_probe",
+            "--nocapture",
+        ])
+        .env("CADENCE_BOARD_PROBE_PORT", port.to_string())
+        .env("CADENCE_ALIAS", "agent:untrusted");
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(http(port, "GET", "/api/issues", &public).0, 401);
+    let (status, health) = http(port, "GET", "/api/health", &local);
+    assert_eq!(status, 200, "{health}");
+    let health: Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(health["ok"], true);
+    assert!(health["build"].is_string());
+    assert_eq!(
+        health.as_object().unwrap().len(),
+        2,
+        "local health leaked board state"
+    );
+}
+
+#[test]
+fn hosted_public_only_detached_child_probe() {
+    let Ok(port) = std::env::var("CADENCE_BOARD_PROBE_PORT") else {
+        return;
+    };
+    let port = port.parse::<u16>().unwrap();
+    let local = format!("127.0.0.1:{port}");
+    let (status, body) = http(port, "GET", "/api/issues", &local);
+    assert_eq!(status, 421, "detached agent read: {body}");
 }
 
 /// The real headers a contract exchange carries (the worker's callback
