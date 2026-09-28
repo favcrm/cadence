@@ -38,11 +38,20 @@ export interface WorkspaceRun {
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };
     capabilities?: Record<string, { id: string; revision: number; digest: string }>;
     quotes?: Record<string, CapabilityQuote["quote"]>;
+    source?: { receipt_id: string; post: { id: string; caption: string } } | null;
     assignments: Record<string, { alias: string; role: string; provider: string }>;
   };
   steps: { step_id: string; task_id: string; state: string; message_id: string | null }[];
   artifacts: ArtifactReceipt[];
-  reviews: { step_id: string; artifact_digest: string; reviewer: string; decision: string; rationale: string }[];
+  reviews: { step_id: string; artifact_digest: string; reviewer: string; decision: string; rationale: string; asset_receipt_id?: string; asset_digest?: string }[];
+}
+export interface ImageReceipt {
+  id: string; run_id: string; slot: string; digest: string; binding_digest: string;
+  asset: { media_type: string; digest: string; size: number } | null;
+  result: { schema: number; kind: string; provider: string; model: string; aspect_ratio: string; asset_sha256: string; asset_media_type: string; source_receipt_id: string; source_post_id: string };
+}
+export interface ImageAsset {
+  receipt_id: string; media_type: string; digest: string; size: number; base64: string;
 }
 export interface SourcePost {
   id: string; caption: string; permalink: string; published_at: string | null;
@@ -139,7 +148,9 @@ export const workspaceApps = {
   approveRun: (id: string, digest: string) => request<WorkspaceRun>(`${run(id)}/approve`, undefined, { digest }),
   dispatchRun: (id: string) => request<WorkspaceRun>(`${run(id)}/dispatch`, undefined, {}),
   capabilityResults: async (id: string, signal?: AbortSignal) => (await request<{ results: SourceReceipt[] }>(`${run(id)}/capability-results`, signal)).results,
+  imageResults: async (id: string, signal?: AbortSignal) => (await request<{ results: ImageReceipt[] }>(`${run(id)}/capability-results`, signal)).results,
   capabilityResult: (id: string, signal?: AbortSignal) => request<SourceReceipt>(`/api/app-capability-results/${part(id)}`, signal),
+  capabilityAsset: (id: string, signal?: AbortSignal) => request<ImageAsset>(`/api/app-capability-results/${part(id)}/asset`, signal),
   bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal) => request<CapabilityQuote>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`, signal),
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,

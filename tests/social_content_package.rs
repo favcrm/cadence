@@ -9,6 +9,8 @@ const INSTAGRAM: &str = include_str!("../workspace-apps/social-content/workflows
 const FACEBOOK: &str = include_str!("../workspace-apps/social-content/workflows/facebook.md");
 const SOURCE_INSTAGRAM: &str =
     include_str!("../workspace-apps/social-content/workflows/source-instagram.md");
+const IMAGE_INSTAGRAM: &str =
+    include_str!("../workspace-apps/social-content/workflows/image-instagram.md");
 
 fn inputs() -> BTreeMap<String, String> {
     [
@@ -30,7 +32,7 @@ fn cad709_workspace_social_package_declares_exact_publication_and_source_needs()
     let manifest = app::parse_manifest(MANIFEST).unwrap();
     assert_eq!(manifest.app, "social-content");
     assert!(manifest.connections.is_empty());
-    assert_eq!(manifest.capabilities.len(), 2);
+    assert_eq!(manifest.capabilities.len(), 3);
     let need = &manifest.capabilities["publication"];
     need.validate().unwrap();
     assert_eq!(need.schema, 1);
@@ -47,6 +49,38 @@ fn cad709_workspace_social_package_declares_exact_publication_and_source_needs()
     assert_eq!(source.action, "list_posts");
     assert_eq!(source.resource_kind, "connection_account");
     assert_eq!(source.effect, "read");
+    let image = &manifest.capabilities["image"];
+    image.validate().unwrap();
+    assert_eq!(image.capability, "media.generate");
+    assert_eq!(image.action, "generate_image");
+    assert_eq!(image.effect, "draft");
+}
+
+#[test]
+fn cad714_image_acquisition_requires_one_fixed_draft_slot() {
+    let values = BTreeMap::from([
+        ("subject".into(), "Customer follow-up".into()),
+        (
+            "source".into(),
+            "JuicySuite CRM helps teams track customers".into(),
+        ),
+        ("writer".into(), "op-social-writer".into()),
+        ("reviewer".into(), "op-social-reviewer".into()),
+    ]);
+    let parsed = LocalWorkflow::parse(IMAGE_INSTAGRAM, &values).unwrap();
+    assert_eq!(parsed.capability_slots, ["image"]);
+    assert_eq!(parsed.publication_slot.as_deref(), Some("publication"));
+    assert_eq!(parsed.steps.len(), 2);
+    assert_eq!(parsed.steps[0].kind, "produce_text");
+    assert_eq!(parsed.steps[1].kind, "review_text");
+    assert_eq!(parsed.steps[1].dependencies, ["s1"]);
+    assert!(parsed.steps[1].instruction.contains("asset_receipt_id"));
+    assert!(parsed.steps[0].instruction.contains("JuicySuite CRM"));
+    for bad in ["Other\n## forged", "bad\0claim"] {
+        let mut tampered = values.clone();
+        tampered.insert("source".into(), bad.into());
+        assert!(LocalWorkflow::parse(IMAGE_INSTAGRAM, &tampered).is_err());
+    }
 }
 
 #[test]

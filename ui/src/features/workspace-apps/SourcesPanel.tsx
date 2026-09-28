@@ -44,10 +44,11 @@ function SourcePostPreview({ post }: { post: SourcePost }) {
   </div>;
 }
 
-export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, onPick, onDenied }: {
+export function SourcesPanel({ runs, canWrite, canCreate, imageSupported, onImport, onOpenRun, onPick, onDenied }: {
   runs: WorkspaceRun[];
   canWrite: boolean;
   canCreate: boolean;
+  imageSupported?: boolean;
   onImport: () => void;
   onOpenRun: (run: WorkspaceRun) => void;
   onPick: (source: SelectedSource) => void;
@@ -76,7 +77,7 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
     <div className="wa-row">
       <div>
         <h2>Public Instagram sources</h2>
-        <p className="wa-muted">One explicit profile read creates a retained receipt. Choose one verified post to start a caption plan.</p>
+        <p className="wa-muted">One explicit profile read creates a retained receipt. Choose one verified post to start a {imageSupported ? "caption or priced caption-and-image" : "caption"} plan.</p>
       </div>
       <Button onClick={onImport} disabled={!canWrite}>Find public posts</Button>
     </div>
