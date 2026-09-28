@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import sys
@@ -43,6 +44,32 @@ def frame(method, params, detached=False):
         connection.connect(str(STATE / "cadence.sock"))
         connection.sendall((wire + "\n").encode())
         return json.loads(connection.makefile("rb").readline())
+
+
+def pi_bash_frame(method, params, nested_detach=False):
+    """Exercise Pi's real Linux bash-tool topology, not a direct provider RPC.
+
+    Pi spawns /bin/bash as a direct child with detached=true. Its shell is a
+    session leader; the cadence CLI (represented by this socket peer) remains
+    in that shell session. An extra setsid inside the tool must still refuse.
+    """
+    wire = json.dumps({"method": method, "params": params})
+    code = ("import socket,sys; s=socket.socket(socket.AF_UNIX);"
+            "s.settimeout(5); s.connect(sys.argv[1]);"
+            "s.sendall(sys.stdin.buffer.read()+b'\\n');"
+            "print(s.makefile().readline())")
+    command = " ".join(["python3", "-c", shlex.quote(code),
+                        shlex.quote(str(STATE / "cadence.sock"))])
+    if nested_detach:
+        command = "setsid " + command
+    # The trailing ':' keeps bash alive as the verified session leader until
+    # the socket caller exits; bash otherwise may exec its final command.
+    child = subprocess.run(["/bin/bash", "-c", command + "; :"],
+                           input=wire, text=True, capture_output=True,
+                           start_new_session=True, timeout=10)
+    if child.returncode != 0:
+        raise RuntimeError("Pi bash-tool native probe failed: " + child.stderr)
+    return json.loads(child.stdout)
 
 
 def rpc(method, params):
@@ -157,7 +184,7 @@ def run_prompt(prompt):
                        "slot": "source", "request_id": "source-once",
                        "input": {"source": "CONTEXT_SOURCE=" + probe["source"]}}
             with ThreadPoolExecutor(max_workers=2) as pool:
-                replies = list(pool.map(lambda _: frame("app_run_capability_call", request), range(2)))
+                replies = list(pool.map(lambda _: pi_bash_frame("app_run_capability_call", request), range(2)))
             if any(reply.get("ok") is not True for reply in replies):
                 raise RuntimeError("valid concurrent capability calls failed: " + str(replies))
             if replies[0]["result"] != replies[1]["result"]:
@@ -183,6 +210,10 @@ def run_prompt(prompt):
             if detached.get("ok") is not False:
                 raise RuntimeError("detached child invoked a run capability")
             cases.append({"kind":"setsid","refused":True})
+            nested_detached = pi_bash_frame("app_run_capability_call", request, True)
+            if nested_detached.get("ok") is not False:
+                raise RuntimeError("setsid child escaped Pi's bash-tool session")
+            cases.append({"kind":"bash-tool-setsid","refused":True})
             quote_request = {"install_id":probe["install_id"],
                              "context_id":probe["context_id"],"slot":"source"}
             for detached in [False, True]:
