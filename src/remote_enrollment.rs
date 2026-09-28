@@ -1695,6 +1695,74 @@ mod tests {
     }
 
     #[test]
+    fn browser_continuity_bind_classifies_issuer_refusals_without_losing_pending_key() {
+        for (status, code, reason, expected) in [
+            ("401 Unauthorized", "lineage_terminal", "", "fresh consent"),
+            ("409 Conflict", "parked", "session_expired", "fresh consent"),
+            ("409 Conflict", "parked", "session_uncertain", "parked"),
+            ("401 Unauthorized", "unauthorized", "", "authorization"),
+            ("403 Forbidden", "forbidden", "", "authorization"),
+            (
+                "503 Service Unavailable",
+                "authority_unavailable",
+                "",
+                "uncertain",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let at = now().unwrap();
+            let server = thread::spawn(move || {
+                let (mut challenge, _) =
+                    continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+                respond(
+                    &mut challenge,
+                    &json!({
+                        "version":"hosted-cadence-continuity.v1",
+                        "challengeId":format!("ch_{}", "A".repeat(43)),
+                        "operationId":format!("op_{}", "B".repeat(43)),
+                        "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                        "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                    }),
+                );
+                let (mut bind, _) =
+                    continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+                let body = if reason.is_empty() {
+                    json!({"ok":false,"code":code})
+                } else {
+                    json!({"ok":false,"code":code,"reason":reason})
+                }
+                .to_string();
+                write!(
+                    bind,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("enroll");
+            trust(&dir, &issuer);
+            let mut child = record(at + 120);
+            child.issuer = issuer;
+            child.source = EnrollmentSource::Browser;
+            child.service_token = None;
+            save(&dir, &child).unwrap();
+            let error = bind_browser(&dir).unwrap_err();
+            assert!(
+                format!("{error}").contains(expected),
+                "{status} {code}/{reason}: {error}"
+            );
+            server.join().unwrap();
+            assert!(matches!(
+                read_continuity_locked(&dir).unwrap().state,
+                ContinuityState::Pending
+            ));
+            assert!(bound_browser(&dir).is_err());
+        }
+    }
+
+    #[test]
     fn browser_continuity_bind_never_claims_success_after_local_save_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
