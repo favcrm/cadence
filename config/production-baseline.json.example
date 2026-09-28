@@ -1,0 +1,10 @@
+{
+  "_doc": "CAD-770 operator-pinned production baseline (copy to production-baseline.json and fill in). The automatic staging selector refuses to stage when this file is absent, names more than one release, or fails verification against the GitHub API: the pinned run must be a successful ci.yml push run on main whose head SHA equals source_sha. Never guess the baseline from a previous main CI run. verified_by names the operator who confirmed the previous production release; evidence cites the staging production-candidate artifact or rollout receipt that proves it.",
+  "schema": 1,
+  "ci_run_id": 0,
+  "source_sha": "0000000000000000000000000000000000000000",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "verified_by": "operator:REPLACE-ME",
+  "verified_at": "1970-01-01T00:00:00Z",
+  "evidence": "REPLACE-ME with the staging run or rollout receipt proving this release is live in production"
+}
