@@ -220,12 +220,13 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                         } else {
                             "xdg-open"
                         };
-                        let _ = std::process::Command::new(program)
+                        let mut opener = std::process::Command::new(program);
+                        opener
                             .arg(url)
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
+                            .stderr(std::process::Stdio::null());
+                        let _ = cadence_agent::reaper::spawn(&mut opener);
                     }
                     Ok(())
                 },
