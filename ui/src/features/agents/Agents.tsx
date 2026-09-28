@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
-import { fmtTime } from "../../lib/fmt";
+import { activityTimeMs, fmtTime } from "../../lib/fmt";
 import { provenanceDetail } from "./modelProvenance";
 import type { ResourceState } from "../../lib/cache";
 import {
@@ -827,10 +827,11 @@ function AgentQueue({ agent: a }: { agent: Agent }) {
 }
 
 function AgentActivity({ agent: a }: { agent: Agent }) {
+  const stamp = activityTimeMs(a.last_activity);
   return (
     <div className="text-label text-ink-400">
       <span className="num">
-        {a.last_activity ? fmtTime(a.last_activity) : "No activity recorded"}
+        {stamp ? fmtTime(new Date(stamp).toISOString()) : "No activity recorded"}
       </span>
       {a.stalled ? (
         <div className="text-warn mt-1">

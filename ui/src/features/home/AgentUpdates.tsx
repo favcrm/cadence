@@ -3,7 +3,8 @@ import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent, AgentDetail } from "../../lib/types";
-import { agentActivityMs, recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
+import { activityTimeMs } from "../../lib/fmt";
+import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
 
 // Cap concurrent history reads across the rail; reuse in-flight loads on rerenders.
@@ -18,7 +19,7 @@ async function historyRead<T>(read: () => Promise<T>): Promise<T> {
 const historyCache = new Map<string, { stamp: string; read: Promise<PromiseSettledResult<unknown>[]> }>();
 
 function UpdatedAt({ at }: { at: string | number | null }) {
-  const stamp = agentActivityMs(at);
+  const stamp = activityTimeMs(at);
   if (!stamp) return null;
   const date = new Date(stamp);
   return <time dateTime={date.toISOString()} title={date.toLocaleString()}>{ageLabel(Math.max(0, (Date.now() - stamp) / 1000))} ago</time>;
@@ -86,7 +87,7 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
   const reports = reportedAgentUpdates(thread.data?.entries ?? []);
   const agents = recentWorkingAgents((state.data?.agents ?? []).map((agent) => {
     const created = agent.message?.created;
-    const latest = Math.max(agentActivityMs(agent.last_activity), agentActivityMs(reports.get(agent.alias)?.[0]?.at), agentActivityMs(created));
+    const latest = Math.max(activityTimeMs(agent.last_activity), activityTimeMs(reports.get(agent.alias)?.[0]?.at), activityTimeMs(created));
     return { ...agent, last_activity: latest > 0 ? new Date(latest).toISOString() : agent.last_activity };
   }));
   return <div>

@@ -95,7 +95,7 @@ const agents: Agent[] = [
     effort_reported: "high",
     quota: { state: "available", remaining: 0, limit: 100 },
   },
-  { ...base, alias: "owner", state: "waiting_input", queued: 1 },
+  { ...base, alias: "owner", state: "waiting_input", queued: 1, last_activity: "not-a-time" },
   { ...base, alias: "stopped", state: "stopped" },
   { ...base, alias: "inbox", provider: "inbox", inbox: true, queued: 840 },
   { ...base, alias: "foreign", running: 1, on: ["SITE-8"] },
@@ -252,6 +252,10 @@ async function main() {
   );
   assert(aliases().join() === "blocked,owner,dev,foreign", "current agents are attention-first without stopped agents or mailboxes");
   assert(host.textContent?.includes("28 Sep 02:21"), "numeric epoch activity is shown as a date");
+  assert(
+    Array.from(host.querySelectorAll(".agents-table tr")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("No activity recorded"),
+    "invalid activity remains unavailable",
+  );
   await click("All6");
   assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
   await click("Stopped1");

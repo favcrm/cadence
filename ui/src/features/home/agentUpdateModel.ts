@@ -1,4 +1,5 @@
 import type { Agent, AgentDetail } from "../../lib/types";
+import { activityTimeMs } from "../../lib/fmt";
 import { asEntry } from "./thread";
 
 export interface AgentUpdate {
@@ -6,11 +7,6 @@ export interface AgentUpdate {
   label: string;
   text: string;
   at: string | null;
-}
-
-export function agentActivityMs(at: string | number | null | undefined): number {
-  const stamp = typeof at === "number" ? at * 1000 : Date.parse(at ?? "");
-  return Number.isFinite(stamp) && stamp > 0 && stamp <= 8.64e15 ? stamp : 0;
 }
 
 /** Keep provider turn completion distinct from a verified job completion. */
@@ -39,7 +35,7 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
 export function recentWorkingAgents(agents: Agent[]): Agent[] {
   return agents.filter((a) => a.alias !== "master" &&
     (a.running > 0 || a.queued > 0 || a.on.length > 0 || !!a.last_activity || (a.event_cursor ?? 0) > 0),
-  ).sort((a, b) => agentActivityMs(b.last_activity) - agentActivityMs(a.last_activity) ||
+  ).sort((a, b) => activityTimeMs(b.last_activity) - activityTimeMs(a.last_activity) ||
     (b.event_cursor ?? 0) - (a.event_cursor ?? 0))
     .slice(0, 12);
 }
