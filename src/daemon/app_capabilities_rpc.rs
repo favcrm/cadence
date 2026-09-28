@@ -68,12 +68,52 @@ impl Shared {
             .map_err(|_| Error::rejected("app capability caller session is unreadable"))?;
         let endpoint_session = crate::peer::proc_session(root)
             .map_err(|_| Error::rejected("app capability endpoint session is unreadable"))?;
-        if proof.lane != alias || caller_session != endpoint_session {
+        if proof.lane != alias
+            || (caller_session != endpoint_session
+                && !self.pi_bash_tool_session(&alias, &proof, caller_session)?)
+        {
             return Err(Error::rejected(
                 "detached child is outside the assigned app endpoint session",
             ));
         }
         Ok(alias)
+    }
+
+    /// Pi's built-in bash tool spawns a direct child of its managed endpoint
+    /// with `detached: true`: that shell is a new session leader. Bash may
+    /// also exec a single `cadence` command without changing its pid. Admit
+    /// only that live, verified direct child session, never a further
+    /// `setsid` below the shell or an arbitrary detached program. The
+    /// message/turn, binding, quote and one-result checks remain in the RPC.
+    fn pi_bash_tool_session(
+        &self,
+        alias: &str,
+        proof: &crate::slots::StrictCaller,
+        caller_session: u32,
+    ) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let agent = self.store.agent(alias)?;
+        if agent.provider != "pi" || agent.endpoint_kind != "managed" {
+            return Ok(false);
+        }
+        let Some(&tool_pid) = proof.segment.get(proof.segment.len().saturating_sub(2)) else {
+            return Ok(false);
+        };
+        if caller_session != tool_pid || crate::peer::proc_session(tool_pid).ok() != Some(tool_pid)
+        {
+            return Ok(false);
+        }
+        let Ok(tool) = std::fs::metadata(format!("/proc/{tool_pid}/exe")) else {
+            return Ok(false);
+        };
+        // Compare the executable's inode, not its caller-controlled basename.
+        // The exact daemon binary covers bash's last-command exec optimization.
+        let trusted = ["/bin/bash", "/bin/sh", "/proc/self/exe"];
+        Ok(trusted.iter().any(|path| {
+            std::fs::metadata(path)
+                .is_ok_and(|expected| expected.dev() == tool.dev() && expected.ino() == tool.ino())
+        }))
     }
 
     pub(super) fn rpc_app_capability(
