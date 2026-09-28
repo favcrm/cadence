@@ -107,6 +107,7 @@ async function main() {
   receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: "https://attacker.example/track" }] } }];
   await click(button("Board")); await click(button("Sources"));
   assert(!host.querySelector(".wa-source-image"), "A tampered receipt cannot load an arbitrary browser image URL");
+  assert(!!host.querySelector(".wa-source-image-fallback") && host.textContent?.includes("View original post"), "Unavailable previews retain a clear path to inspect the original");
   receiptRows = [receipt]; await click(button("Board")); await click(button("Sources"));
   await click(button("Use as source"));
   const sourceField = host.querySelector("#wa-post-source") as HTMLTextAreaElement;

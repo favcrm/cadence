@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { ApiError } from "../../lib/api";
-import { workspaceApps, type SourceReceipt, type WorkspaceRun } from "./workspaceApps";
+import { workspaceApps, type SourcePost, type SourceReceipt, type WorkspaceRun } from "./workspaceApps";
 import type { SelectedSource } from "./NewPost";
 
 function verifiedReceipt(receipt: SourceReceipt, run: WorkspaceRun): boolean {
@@ -30,6 +30,16 @@ function safePreviewUrl(value: string | null | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+function SourcePostPreview({ post }: { post: SourcePost }) {
+  const [failed, setFailed] = useState(false);
+  const url = safePreviewUrl(post.preview_url);
+  if (url && !failed)
+    return <img className="wa-source-image" src={url} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+  return <div className="wa-source-image-fallback" aria-label="Source image preview unavailable">
+    <span aria-hidden="true">▧</span><span>Preview unavailable · inspect the original post</span>
+  </div>;
 }
 
 export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, onPick, onDenied }: {
@@ -85,11 +95,11 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
           {!receipt.result.profile_verified && <p className="wa-alert">No public posts were returned. The profile identity cannot be verified from an empty page.</p>}
           <div className="wa-source-grid">
             {receipt.result.posts.map(post => <article key={post.id} className="wa-post-card">
-              {safePreviewUrl(post.preview_url) && <img className="wa-source-image" src={safePreviewUrl(post.preview_url)!} alt="" loading="lazy" referrerPolicy="no-referrer" />}
+              <SourcePostPreview post={post} />
               <div className="wa-card-meta"><span className="wa-kicker">{post.media_kind}</span><time dateTime={post.published_at ?? undefined}>{post.published_at ? new Date(post.published_at).toLocaleDateString() : post.published_at_unix ? new Date(post.published_at_unix * 1000).toLocaleDateString() : "Time unavailable"}</time></div>
               <p className="wa-source-caption">{post.caption || "This post has no caption."}</p>
               <div className="wa-row">
-                <a href={post.permalink} target="_blank" rel="noopener noreferrer">Original post</a>
+                <a className="wa-source-original" href={post.permalink} target="_blank" rel="noopener noreferrer">View original post ↗</a>
                 <Button size="sm" disabled={!canCreate || !post.caption} onClick={() => onPick({ receiptId: receipt.id, postId: post.id, handle: receipt.result.handle, caption: post.caption, permalink: post.permalink })}>Use as source</Button>
               </div>
             </article>)}

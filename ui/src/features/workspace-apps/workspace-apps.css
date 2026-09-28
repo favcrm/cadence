@@ -236,6 +236,31 @@ button.wa-post-card:hover {
   border-radius: 0.375rem;
   background: var(--color-ink-800);
 }
+.wa-source-image-fallback {
+  min-height: 5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  border-radius: 0.375rem;
+  border: 1px dashed var(--color-ink-700);
+  background: var(--color-ink-800);
+  color: var(--color-ink-500);
+  font-size: var(--text-secondary);
+  text-align: center;
+}
+.wa-source-image-fallback span:first-child {
+  font-size: 1.25rem;
+  line-height: 1;
+}
+.wa-source-original {
+  color: var(--color-accent);
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 0.15rem;
+}
 .wa-source-caption {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
