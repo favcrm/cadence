@@ -415,4 +415,41 @@ mod tests {
         server.join().unwrap();
         assert_eq!(outbox.get("command-1").unwrap().state(), "local_pending");
     }
+
+    #[test]
+    fn proxy_env_cannot_retarget_hosted_send() {
+        if std::env::var_os("CADENCE_PROXY_PROOF_CHILD").is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("proxy_env_cannot_retarget_hosted_send")
+                .env("CADENCE_PROXY_PROOF_CHILD", "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("http_proxy", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("all_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+            let output = cadence_agent::reaper::output(&mut child).unwrap();
+            assert!(
+                output.status.success(),
+                "proxy isolation proof failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let cmd = command();
+        let (endpoint, server) = serve_once(
+            "202 Accepted",
+            json!({"ok":true,"receipt":{"commandId":"command-1","state":"queued",
+                "acceptedAt":100,"expiresAt":200,"digest":cmd.digest()}})
+            .to_string()
+            .into_bytes(),
+            cmd.canonical_json().into(),
+        );
+        let (status, _) = post_queued(&endpoint, CHILD, cmd.canonical_json()).unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 202);
+    }
 }
