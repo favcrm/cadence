@@ -1,4 +1,4 @@
-import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates } from "../src/features/home/agentUpdateModel";
+import { agentActivityMs, recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates } from "../src/features/home/agentUpdateModel";
 import type { Agent, AgentDetail } from "../src/lib/types";
 function check(value: boolean, why: string) { if (!value) throw new Error(why); }
 const detail = { events: [
@@ -20,6 +20,13 @@ const agents = Array.from({ length: 20 }, (_, i) => ({ provider: "test", endpoin
 const selected = recentWorkingAgents([...agents, { ...agents[0], alias: "master" }]);
 check(selected.length === 12 && selected[0].alias === "a19", "bounded reads select recently active agents");
 check(!selected.some((a) => a.alias === "master"), "Master has its own conversation");
+check(agentActivityMs(1790562108.64) === 1790562108640, "daemon epoch seconds resolve to milliseconds");
+check(agentActivityMs("2026-09-28T02:21:48.640Z") === 1790562108640, "ISO activity remains supported");
+check(agentActivityMs("invalid") === 0, "invalid activity stays unavailable");
+check(recentWorkingAgents([
+  { ...agents[0], alias: "recent", last_activity: 1790562108.64 },
+  { ...agents[0], alias: "older", last_activity: "2026-09-27T00:00:00Z" },
+])[0].alias === "recent", "numeric activity sorts newer workers first");
 console.log("agentUpdates: passed");
 
 const reports = reportedAgentUpdates([

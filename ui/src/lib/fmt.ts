@@ -1,5 +1,10 @@
-/// `2026-09-17T18:27:14Z` → `17 Sep 18:27`. Non-ISO input passes through.
-export function fmtTime(iso: string): string {
+/// ISO text or daemon epoch seconds → `17 Sep 18:27`; other text passes through.
+export function fmtTime(value: string | number): string {
+  const iso = typeof value === "number"
+    ? Number.isFinite(value) && value > 0 && value <= 8.64e12
+      ? new Date(value * 1000).toISOString()
+      : "Time unavailable"
+    : value;
   const m = iso.match(
     /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/,
   );

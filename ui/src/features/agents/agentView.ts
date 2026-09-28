@@ -2,6 +2,7 @@ import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
 
 export const AGENT_FILTERS = [
+  { value: "current", label: "Current" },
   { value: "all", label: "All" },
   { value: "attention", label: "Needs attention" },
   { value: "working", label: "Working" },
@@ -14,7 +15,7 @@ export type AgentFilter = (typeof AGENT_FILTERS)[number]["value"];
 
 /** One classification drives counts, filtering and ordering. A mailbox's
  * queue is incoming mail, not evidence of a running worker. */
-export function agentCategory(a: Agent): Exclude<AgentFilter, "all"> {
+export function agentCategory(a: Agent): Exclude<AgentFilter, "all" | "current"> {
   if (
     a.fenced ||
     a.unknown > 0 ||
@@ -35,6 +36,13 @@ export function agentCategory(a: Agent): Exclude<AgentFilter, "all"> {
     return "working";
   if (a.state === "idle" || a.state === "stopped") return a.state;
   return "other";
+}
+
+export function agentMatchesFilter(a: Agent, filter: AgentFilter): boolean {
+  const category = agentCategory(a);
+  if (filter === "all") return true;
+  if (filter === "current") return category !== "stopped" && category !== "inbox";
+  return category === filter;
 }
 
 export function agentStatus(a: Agent): string {

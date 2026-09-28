@@ -682,7 +682,8 @@ export interface Agent {
   resume_hint?: string;
   dead?: boolean;
   inbox?: boolean;
-  last_activity?: string | null;
+  /** Daemon messages use epoch seconds; older observations may use ISO text. */
+  last_activity?: string | number | null;
   /** Seconds since the running turn's last observed activity. */
   silent_secs?: number;
   /** The daemon declared this running turn stalled. */

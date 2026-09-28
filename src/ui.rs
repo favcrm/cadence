@@ -1168,11 +1168,22 @@ fn agents_payload_from(state_dir: &Path, list: Option<Value>, jobs: Option<&Valu
                 for m in show["messages"].as_array().cloned().unwrap_or_default() {
                     for ts in ["completed", "started", "created"] {
                         let at = &m[ts];
-                        if at
-                            .as_str()
-                            .map(|a| last_activity.as_str().map(|cur| a > cur).unwrap_or(true))
-                            == Some(true)
+                        // Current daemon messages carry epoch seconds. Older
+                        // observations used ISO text; each response uses one
+                        // shape, and a numeric value wins if shapes are mixed.
+                        let newer = if let Some(at) =
+                            at.as_f64().filter(|at| at.is_finite() && *at > 0.0)
                         {
+                            last_activity.as_f64().map(|cur| at > cur).unwrap_or(true)
+                        } else if let Some(at) = at.as_str().filter(|at| !at.is_empty()) {
+                            last_activity
+                                .as_str()
+                                .map(|cur| at > cur)
+                                .unwrap_or(last_activity.is_null())
+                        } else {
+                            false
+                        };
+                        if newer {
                             last_activity = at.clone();
                         }
                     }

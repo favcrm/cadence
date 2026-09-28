@@ -16,7 +16,7 @@ import { IconClose, IconSearch } from "../../ui/icons";
 import Button from "../../ui/Button";
 import {
   AGENT_FILTERS,
-  agentCategory,
+  agentMatchesFilter,
   agentMatchesSearch,
   agentOrder,
   agentStatus,
@@ -889,7 +889,7 @@ export default function Agents({
   onRetryAssignments: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<AgentFilter>("all");
+  const [filter, setFilter] = useState<AgentFilter>("current");
   const payload = state.data;
   const scopeUnavailable = project !== "all" && issuesState.data === null;
   const issueProjects = issueIndex(issuesState.data ?? []);
@@ -900,15 +900,13 @@ export default function Agents({
   const counts = Object.fromEntries(
     AGENT_FILTERS.map(({ value }) => [
       value,
-      value === "all"
-        ? scoped.length
-        : scoped.filter((a) => agentCategory(a) === value).length,
+      scoped.filter((a) => agentMatchesFilter(a, value)).length,
     ]),
   ) as Record<AgentFilter, number>;
   const agents = scoped
     .filter(
       (a) =>
-        (filter === "all" || agentCategory(a) === filter) &&
+        agentMatchesFilter(a, filter) &&
         agentMatchesSearch(a, query, issueProjects),
     )
     .sort(
@@ -925,14 +923,16 @@ export default function Agents({
             !agentMatchesProject(a, project, issueProjects) &&
             !agentIsUnassigned(a, issueProjects),
         );
-  const filtered = filter !== "all" || query.trim() !== "";
+  const filtered = filter !== "current" || query.trim() !== "";
   const reset = () => {
     setQuery("");
-    setFilter("all");
+    setFilter("current");
   };
   const emptyCopy =
     scoped.length === 0
       ? agentsEmptyCopy(project)
+      : filter === "current" && counts.current === 0 && !query.trim()
+        ? "No current agents. Select All, Stopped, or Mailboxes to see the full roster."
       : "No agents match these filters.";
   const agent = allAgents.find((a) => a.alias === open);
   const summary = !payload
@@ -943,7 +943,7 @@ export default function Agents({
       ? issuesState.status === "failed"
         ? "Assignments unavailable"
         : "Loading assignments…"
-      : `${scoped.length} ${project === "all" ? "across all projects" : `in ${project}`}`;
+      : `${counts.current} current · ${scoped.length} ${project === "all" ? "total across all projects" : `total in ${project}`}`;
 
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
@@ -953,7 +953,7 @@ export default function Agents({
         <StaleChip state={state} />
       </div>
       <p className="text-label text-ink-400 mb-5">
-        See current work, waiting agents, and recent activity.
+        Current work, agent status, and recent activity.
       </p>
 
       {project !== "all" &&

@@ -1626,11 +1626,14 @@ agent by dispatch (a job task on one of the project's issues) or by
 ownership (owner of a `doing`/`review` issue) — the `cadence status`
 ISSUES rule (`ui/src/lib/scope.ts`). The Agents screen shows current work,
 queue warnings and activity in compact rows/cards. Search and status filters
-operate within the selected project, with All selected initially; stopped
-workers and mailboxes remain discoverable. Fenced agents rank first, followed
-by agents needing input, quota recovery or investigation of unknown/stalled
-work. Mailbox queues do not count as working agents. A native modal drawer
-retains model/effort/provenance/quota evidence, verbatim recovery and resume
+operate within the selected project, with Current selected initially; stopped
+workers and mailboxes remain discoverable through explicit filters and All.
+The board accepts daemon message activity times in epoch seconds and older ISO
+text, so the Last activity column uses real timestamps when supplied. Fenced
+agents rank first, followed by agents needing input, quota recovery or
+investigation of unknown/stalled work. Mailbox queues do not count as working
+agents. A native modal drawer retains model/effort/provenance/quota evidence,
+verbatim recovery and resume
 commands, identity, params, capabilities, tasks, bound issues, running messages
 and the event tail. Collection observations stay available if the detail read
 fails. Missing project issue data is reported rather than guessing assignments.
