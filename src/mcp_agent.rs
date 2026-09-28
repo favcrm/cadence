@@ -172,6 +172,18 @@ fn command_args(name: &str, args: &Value) -> Result<Vec<String>> {
 }
 
 fn invoke(state_dir: &Path, alias: &str, argv: &[String]) -> Result<String> {
+    if argv == ["self"] {
+        // The ordinary CLI `self` command reads CADENCE_ALIAS for display;
+        // an idle forged alias could therefore look valid. This RPC derives
+        // identity only from the enrolled MCP process's peer ancestry.
+        let identity = crate::client::rpc(state_dir, "agent_identity", json!({}))?;
+        if identity["alias"].as_str() != Some(alias) {
+            return Err(Error::rejected(
+                "Cadence MCP identity differs from endpoint",
+            ));
+        }
+        return Ok(identity.to_string());
+    }
     let binary = std::env::current_exe()?;
     let mut command = Command::new(binary);
     command.arg("--state-dir").arg(state_dir).args(argv);

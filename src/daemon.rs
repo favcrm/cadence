@@ -2334,6 +2334,17 @@ impl Shared {
                 }
                 Ok(json!({"agents": agents}))
             }
+            "agent_identity" => {
+                if !params.as_object().is_some_and(|fields| fields.is_empty()) {
+                    return Err(Error::rejected("agent identity accepts no fields"));
+                }
+                match self.caller_identity(peer_pid)? {
+                    Caller::Agent(verified) => Ok(json!({"alias": verified.agent.alias})),
+                    Caller::NoAgentIdentity => Err(Error::rejected(
+                        "agent identity requires a verified agent endpoint",
+                    )),
+                }
+            }
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
