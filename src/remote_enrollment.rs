@@ -501,7 +501,7 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     };
     let key = continuity.valid_for(&enrollment)?;
     let public = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
-    let challenge: ContinuityChallenge = serde_json::from_value(post(
+    let challenge: ContinuityChallenge = serde_json::from_value(post_continuity(
         &enrollment.issuer,
         "/v1/hosted-cadence/continuity/challenge",
         &enrollment.child_token,
@@ -529,16 +529,13 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     );
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(key.sign(proof.as_bytes()).as_ref());
-    let reply: ContinuityBindReply = serde_json::from_value(
-        post(
-            &enrollment.issuer,
-            "/v1/hosted-cadence/continuity/bind",
-            &enrollment.child_token,
-            json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
-            "publicKey":public,"signature":signature}),
-        )
-        .map_err(|_| reject("Hosted continuity bind uncertain; retry with the same pending key"))?,
-    )
+    let reply: ContinuityBindReply = serde_json::from_value(post_continuity(
+        &enrollment.issuer,
+        "/v1/hosted-cadence/continuity/bind",
+        &enrollment.child_token,
+        json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
+        "publicKey":public,"signature":signature}),
+    )?)
     .map_err(|_| reject("Invalid hosted continuity bind response"))?;
     if reply.version != CONTINUITY_VERSION
         || !continuity_lineage_id(&reply.lineage_id)
@@ -561,7 +558,7 @@ pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
     continuity.key_id = Some(reply.key_id);
     continuity.generation = Some(reply.generation);
     save_continuity_locked(dir, &continuity).map_err(|_| {
-        reject("Hosted continuity bind may be committed remotely; local save uncertain")
+        reject("Hosted continuity bind may be committed remotely; local save uncertain; retry with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`")
     })?;
     continuity.info()
 }
@@ -789,6 +786,105 @@ fn post(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
         return Err(reject("Issuer response too large"));
     }
     serde_json::from_slice(&bytes).map_err(|_| reject("Invalid issuer response"))
+}
+
+#[derive(Clone, Copy)]
+enum ContinuityRefusal {
+    FreshConsent,
+    Parked,
+    Authorization,
+    Uncertain,
+    Invalid,
+}
+
+impl ContinuityRefusal {
+    fn error(self) -> Error {
+        reject(match self {
+            Self::FreshConsent => {
+                "Hosted continuity requires fresh consent in a new private enrollment directory"
+            }
+            Self::Parked => "Hosted continuity is parked while original session status is uncertain",
+            Self::Authorization => "Hosted continuity authorization or issuer configuration refused",
+            Self::Uncertain => "Hosted continuity request uncertain; retry the same pending key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`",
+            Self::Invalid => "Invalid hosted continuity issuer response",
+        })
+    }
+}
+
+fn continuity_refusal(status: u16, bytes: &[u8]) -> ContinuityRefusal {
+    // A gateway may lose the issuer's body after a bind commits. An empty 503
+    // has no authority to claim, but must retain the exact-key retry path.
+    if status == 503 && bytes.is_empty() {
+        return ContinuityRefusal::Uncertain;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return ContinuityRefusal::Invalid;
+    };
+    let Some(fields) = value.as_object() else {
+        return ContinuityRefusal::Invalid;
+    };
+    if fields.get("ok") != Some(&json!(false)) {
+        return ContinuityRefusal::Invalid;
+    }
+    let Some(code) = fields.get("code").and_then(Value::as_str) else {
+        return ContinuityRefusal::Invalid;
+    };
+    let reason = match fields.get("reason") {
+        Some(reason) => match reason.as_str() {
+            Some(reason) => Some(reason),
+            None => return ContinuityRefusal::Invalid,
+        },
+        None => None,
+    };
+    if fields.len() != 2 + usize::from(reason.is_some()) {
+        return ContinuityRefusal::Invalid;
+    }
+    match (status, code, reason) {
+        (401, "lineage_terminal", None) | (409, "parked", Some("session_expired")) => {
+            ContinuityRefusal::FreshConsent
+        }
+        (409, "parked", Some("session_uncertain")) => ContinuityRefusal::Parked,
+        (401, "unauthorized", None) | (403, "forbidden", None) => ContinuityRefusal::Authorization,
+        (503, "authority_unavailable", None) => ContinuityRefusal::Uncertain,
+        _ => ContinuityRefusal::Invalid,
+    }
+}
+
+/// Only continuity has structured issuer refusals. Other hosted enrollment
+/// calls retain their existing error behavior and never inspect these codes.
+fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .build();
+    let response = ureq::Agent::new_with_config(config)
+        .post(format!("{issuer}{path}"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send_json(body)
+        .map_err(|_| ContinuityRefusal::Uncertain.error())?;
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(reject("Hosted continuity issuer redirect refused"));
+    }
+    if status != 200 && !matches!(status, 401 | 403 | 409 | 503) {
+        return Err(ContinuityRefusal::Invalid.error());
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ContinuityRefusal::Uncertain.error())?;
+    if bytes.len() as u64 > MAX_RESPONSE {
+        return Err(ContinuityRefusal::Invalid.error());
+    }
+    if status != 200 {
+        return Err(continuity_refusal(status, &bytes).error());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ContinuityRefusal::Invalid.error())
 }
 
 fn post_public(issuer: &str, path: &str, body: Value) -> Result<(u16, Value)> {
@@ -1760,6 +1856,93 @@ mod tests {
             ));
             assert!(bound_browser(&dir).is_err());
         }
+    }
+
+    #[test]
+    fn continuity_refusal_rejects_mismatched_or_forged_error_envelopes() {
+        for (status, body) in [
+            (401, json!({"ok":true,"code":"lineage_terminal"})),
+            (
+                401,
+                json!({"ok":false,"code":"parked","reason":"session_expired"}),
+            ),
+            (409, json!({"ok":false,"code":"lineage_terminal"})),
+            (409, json!({"ok":false,"code":"parked","reason":"other"})),
+            (409, json!({"ok":false,"code":"parked","reason":null})),
+            (
+                503,
+                json!({"ok":false,"code":"authority_unavailable","extra":true}),
+            ),
+            (503, json!({"ok":false,"code":"lineage_terminal"})),
+        ] {
+            assert!(matches!(
+                continuity_refusal(status, &serde_json::to_vec(&body).unwrap()),
+                ContinuityRefusal::Invalid
+            ));
+        }
+        assert!(matches!(
+            continuity_refusal(503, b"<html>upstream error</html>"),
+            ContinuityRefusal::Invalid
+        ));
+        assert!(matches!(
+            continuity_refusal(503, b""),
+            ContinuityRefusal::Uncertain
+        ));
+    }
+
+    #[test]
+    fn continuity_post_refuses_redirect_without_forwarding_child_bearer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let target = format!("http://{}/stolen", attacker.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut request, _) = continuity_request(&listener, "/continuity/challenge");
+            write!(
+                request,
+                "HTTP/1.1 302 Found\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let error =
+            post_continuity(&issuer, "/continuity/challenge", CHILD, json!({})).unwrap_err();
+        assert!(format!("{error}").contains("redirect"));
+        server.join().unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        assert!(
+            attacker.accept().is_err(),
+            "child bearer followed a redirect"
+        );
+    }
+
+    #[test]
+    fn continuity_post_bounds_errors_and_parks_lost_replies_as_uncertain() {
+        let oversized = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", oversized.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut request, _) = continuity_request(&oversized, "/continuity/bind");
+            let body = "X".repeat(MAX_RESPONSE as usize + 1);
+            write!(
+                request,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            request.write_all(body.as_bytes()).unwrap();
+        });
+        let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+        assert!(format!("{error}").contains("Invalid"));
+        server.join().unwrap();
+
+        let lost = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", lost.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (request, _) = continuity_request(&lost, "/continuity/bind");
+            drop(request);
+        });
+        let error = post_continuity(&issuer, "/continuity/bind", CHILD, json!({})).unwrap_err();
+        assert!(format!("{error}").contains("uncertain"));
+        server.join().unwrap();
     }
 
     #[test]
