@@ -94,6 +94,49 @@ invocations require it; the runner acquires the lock and prevents nested locking
 by test children. Do not invent a per-lane lock to bypass host serialization.
 Use ports 3110–3199 for boards you start and preserve production services.
 
+## Isolated board development
+
+Use a source-built sandbox for local work after the hosted coordinator becomes
+authoritative. The sandbox creates its own tracker, daemon state and board; it
+refuses the production state and port. Pick a free port in 3110–3199 and a
+short temp root (Unix socket paths have a length limit):
+
+```bash
+export CADENCE_SANDBOX_ROOT="$(mktemp -d /tmp/cadence-dev.XXXXXX)"
+export CADENCE_DEV_BOARD_PORT=3117
+export XDG_CONFIG_HOME="$CADENCE_SANDBOX_ROOT/config"
+mkdir -m 700 -p "$XDG_CONFIG_HOME"
+unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
+npx --yes pnpm@12.2.1 -C ui install --frozen-lockfile
+npx --yes pnpm@12.2.1 -C ui build
+# On a shared host, obtain the documented build-slot admission first.
+CARGO_BUILD_JOBS=4 cargo build --locked --features ui
+./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
+npx --yes pnpm@12.2.1 -C ui dev --host 127.0.0.1
+```
+
+Open the Vite URL printed by the final command. UI edits reload there without a
+Rust build or cloud deployment; `/api` proxies only to the selected sandbox
+board. The pinned pnpm command refuses a missing or out-of-range
+`CADENCE_DEV_BOARD_PORT`, including the production port 3010. For Rust edits,
+leave Vite running, then rebuild and restart the sandbox:
+
+```bash
+CARGO_BUILD_JOBS=4 cargo build --locked --features ui
+./target/debug/cadence sandbox down dev
+./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
+```
+
+Repeat that backend cycle after each Rust edit, with build-slot admission on
+shared hosts; Vite reconnects when the board returns. For CLI experiments in
+another terminal, export the same `CADENCE_SANDBOX_ROOT` and isolated
+`XDG_CONFIG_HOME`, unset `CADENCE_TOKEN`, `CADENCE_ISSUER` and `CADENCE_ORG`,
+then use `./target/debug/cadence sandbox env dev` and export its printed values
+before issuing commands. These steps isolate the Cadence login record and
+`CADENCE_TOKEN` from the sandbox. At the end, run
+`./target/debug/cadence sandbox down dev`; the temp root remains available for
+inspection and can be removed later by its owner.
+
 Choose tests by the changed contract:
 
 - Pure state/decision tests give quick feedback without process startup or waits.

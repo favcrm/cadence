@@ -1609,11 +1609,15 @@ Sans/Mono, teal `#2dd4bf` on interactive elements only.
 
 ```bash
 cd ui
-pnpm install
-pnpm dev         # vite dev server, proxies /api → 127.0.0.1:3010
-pnpm typecheck   # tsc --noEmit
-pnpm build       # → ui/dist (committed; --features ui embeds it)
+npx --yes pnpm@12.2.1 install
+CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isolated sandbox board
+npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
+npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
 ```
+
+Start an isolated sandbox board and use the Rust restart loop in
+[CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
+the Vite server. The configured dev port must match that sandbox board.
 
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
