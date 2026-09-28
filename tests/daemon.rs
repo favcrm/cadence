@@ -29,6 +29,8 @@ use tempfile::TempDir;
 fn configured_agent_uid_binds_two_sockets_without_changing_private_clients() {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
     let edge = root.path().join("edge");
     std::fs::create_dir_all(&edge).unwrap();
     std::fs::set_permissions(&edge, std::fs::Permissions::from_mode(0o700)).unwrap();

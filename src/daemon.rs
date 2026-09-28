@@ -3736,6 +3736,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // files may be the only copy of the previous store. Every start path
     // — `daemon start`, `run`, `restart` — comes through here.
     crate::backup::refuse_interrupted_restore(state_dir)?;
+    // Once split UID mode was admitted, losing its record must not
+    // restart this state dir as a legacy same-UID daemon. Persist the
+    // pin before a shared socket can accept any agent frame.
+    crate::agent_uid::config::ensure_mode_marker(state_dir, opts.agent_uid)?;
     // CAD-482: the seam confines a fixture before the lease or the
     // store writes anything — a refused arm leaves only the singleton
     // lock behind. A state dir still carrying a minted token re-arms:

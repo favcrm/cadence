@@ -36,11 +36,16 @@ if ! test -S /tmp/state/cadence.sock || ! test -S /var/lib/cadence/cadence.sock;
   cat /tmp/daemon.log
   exit 1
 fi
+test "$(stat -c %u:%a /tmp/state/agent-uid-mode.json)" = 1100:600
 test "$(stat -c %a /var/lib/cadence/cadence.sock)" = 660
 # Make both fixture paths traversable and both sockets connectable to the
 # third UID. This proves the daemon admit set itself, beyond filesystem ACLs.
 chmod 0711 /tmp/state
 chmod 0777 /tmp/state/cadence.sock /var/lib/cadence/cadence.sock
+if runuser -u cadence-agent -- perl -e 'exit(unlink("/tmp/state/agent-uid-mode.json") ? 0 : 1)'; then
+  echo 'agent UID removed persistent mode marker' >&2
+  exit 1
+fi
 probe='use IO::Socket::UNIX; my $s=IO::Socket::UNIX->new(Type=>1,Peer=>$ARGV[0]) or die "connect: $!"; my $m=$ARGV[1] // "health"; print $s "{\"method\":\"$m\",\"params\":{\"peer_uid\":1100,\"caller\":\"operator\",\"on\":false}}\n"; my $r=<$s>; defined($r) or die "closed by peer"; print $r;'
 for socket in /tmp/state/cadence.sock /var/lib/cadence/cadence.sock; do
   runuser -u cadence-operator -- perl -e "$probe" "$socket" | grep -q '"ok":true'
@@ -152,4 +157,33 @@ if grep -q '^health$' /tmp/fake-methods; then
   exit 1
 fi
 echo "board record removal: $removed_status; stolen session after restart: $stolen_restart_status; spoofed restart: $spoof_status; valid UID drift: $changed_status"
+# The record is now absent and the private daemon is gone. A board restart
+# must consult the durable mode marker and refuse to become a standalone
+# legacy board while the old agent process could still hold a session.
+kill "$ui_pid" "$daemon_pid"
+wait "$ui_pid" 2>/dev/null || true
+wait "$daemon_pid" 2>/dev/null || true
+rm /tmp/state/agent-uid.json
+if runuser -u cadence-operator -- env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
+  timeout 5 /opt/cadence ui run --state-dir /tmp/state --port 3115 --dist /tmp/ui \
+  >/tmp/ui-offline.log 2>&1; then
+  echo 'board restarted in legacy mode after UID record and daemon loss' >&2
+  exit 1
+fi
+grep -q 'Agent UID mode has no private daemon boot pin' /tmp/ui-offline.log
+if runuser -u cadence-operator -- env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
+  timeout 5 /opt/cadence daemon --state-dir /tmp/state run >/tmp/daemon-downgrade.log 2>&1; then
+  echo 'daemon restarted in legacy mode after UID record loss' >&2
+  exit 1
+fi
+grep -q 'agent UID mode marker requires its original configured UID' /tmp/daemon-downgrade.log
+printf '{"uid":2200,"forged":true}\n' >/tmp/state/agent-uid-mode.json
+if runuser -u cadence-operator -- env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
+  timeout 5 /opt/cadence ui run --state-dir /tmp/state --port 3115 --dist /tmp/ui \
+  >/tmp/ui-forged-marker.log 2>&1; then
+  echo 'board accepted forged mode marker' >&2
+  exit 1
+fi
+grep -q 'agent UID mode marker is malformed' /tmp/ui-forged-marker.log
+echo 'historical UID mode refuses standalone board restart after record and daemon loss'
 CONTAINER

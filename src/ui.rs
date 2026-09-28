@@ -3868,11 +3868,18 @@ fn board_boot_agent_uid(state_dir: &Path, injected: Option<u32>) -> Result<Optio
         return Ok(injected);
     }
     let configured = crate::agent_uid::config::configured_uid(state_dir)?;
+    let historical = crate::agent_uid::config::mode_marker_uid(state_dir)?;
+    if configured.is_some() || historical.is_some() {
+        crate::agent_uid::config::require_private_state_dir(state_dir)?;
+    }
     match operator::active_agent_uid(state_dir) {
+        Ok(uid) if historical.is_some() && uid != historical => Err(Error::rejected(
+            "Private daemon agent UID differs from persistent mode marker",
+        )),
         Ok(uid) => Ok(uid),
-        Err(error) if configured.is_some() => Err(Error::rejected(format!(
-            "Configured agent UID has no private daemon boot pin: {error}"
-        ))),
+        Err(error) if configured.is_some() || historical.is_some() => Err(Error::rejected(
+            format!("Agent UID mode has no private daemon boot pin: {error}"),
+        )),
         Err(_) => Ok(None), // Standalone local board, with the split disabled.
     }
 }
@@ -4740,6 +4747,22 @@ mod tests {
         assert_eq!(
             super::board_boot_agent_uid(state.path(), Some(2200)).unwrap(),
             Some(2200)
+        );
+    }
+
+    #[test]
+    fn historical_uid_mode_cannot_start_standalone_after_record_loss() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = state.path().join(crate::agent_uid::config::MODE_MARKER);
+        std::fs::write(&marker, br#"{"uid":2200}"#).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = super::board_boot_agent_uid(state.path(), None).unwrap_err();
+        assert!(
+            error.to_string().contains("no private daemon boot pin"),
+            "{error}"
         );
     }
 
