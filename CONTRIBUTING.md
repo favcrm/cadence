@@ -124,12 +124,13 @@ CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
 ```
 
-Repeat that backend cycle after each Rust edit; Vite reconnects when the board
-returns. For CLI experiments in another terminal, use
-`./target/debug/cadence sandbox env dev` and export its printed values there
-before issuing commands. Keep cloud tokens out of the sandbox shell. At the
-end, run `./target/debug/cadence sandbox down dev`; the temp root remains
-available for inspection and can be removed later by its owner.
+Repeat that backend cycle after each Rust edit, with build-slot admission on
+shared hosts; Vite reconnects when the board returns. For CLI experiments in
+another terminal, export the same `CADENCE_SANDBOX_ROOT`, then use
+`./target/debug/cadence sandbox env dev` and export its printed values before
+issuing commands. Keep cloud tokens out of the sandbox shell. At the end, run
+`./target/debug/cadence sandbox down dev`; the temp root remains available for
+inspection and can be removed later by its owner.
 
 Choose tests by the changed contract:
 
