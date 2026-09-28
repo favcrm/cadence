@@ -197,12 +197,48 @@ fn cad743_upgrade_is_operator_only_race_checked_and_preserves_identity() {
     std::fs::write(&source_manifest, "the source is no longer a valid bundle").unwrap();
     let replay = w
         .daemon
-        .operator_rpc("app_workspace_upgrade", params)
+        .operator_rpc("app_workspace_upgrade", params.clone())
         .unwrap();
     assert_eq!(
         replay["idempotent"], true,
         "committed replay fetched the mutable source"
     );
+    let second_source = w._root.path().join("second-source");
+    for name in [
+        "app.md",
+        "workflows/blog-post.md",
+        "rubrics/blog.md",
+        "templates/brief.md",
+        "templates/post.md",
+    ] {
+        let destination = second_source.join(name);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/blog-post")
+                .join(name),
+            destination,
+        )
+        .unwrap();
+    }
+    let second_manifest = second_source.join("app.md");
+    let second_text = std::fs::read_to_string(&second_manifest).unwrap();
+    std::fs::write(
+        &second_manifest,
+        second_text.replace("app: blog-post", "app: second-post"),
+    )
+    .unwrap();
+    let second = w
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":second_source}))
+        .unwrap();
+    assert_ne!(second["catalog_generation"], replay["catalog_generation"]);
+    let replay_after_unrelated_install = w
+        .daemon
+        .operator_rpc("app_workspace_upgrade", params)
+        .unwrap();
+    assert_eq!(replay_after_unrelated_install["idempotent"], true);
+    assert_eq!(replay_after_unrelated_install["digest"], proposed["digest"]);
     let shown = w
         .daemon
         .operator_rpc("app_workspace_show", json!({"install_id":id}))
@@ -341,6 +377,72 @@ fn cad743_upgrade_after_one_hundred_old_bindings_can_create_new_version_binding(
         .unwrap();
     assert_eq!(listed["bindings"][0]["id"], binding["binding"]["id"]);
     assert_eq!(listed["truncated"], true);
+}
+
+#[test]
+fn cad743_upgrade_compatibility_inspects_configured_bindings_beyond_inventory_limit() {
+    let w = Workspace::new();
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap();
+    let manifest = w.source().join("app.md");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, original
+        .replace("version: 0.1.0", "version: 0.2.0")
+        .replace("  connections: [publish]", "  connections: [publish]\n  capabilities:\n    publication:\n      schema: 1\n      capability: text.publish\n      version: 1\n      action: publish\n      resource_kind: connection_account\n      effect: send"))
+        .unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let mut conn = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let tx = conn.transaction().unwrap();
+    for index in 0..101 {
+        let digest = if index == 100 {
+            &proposed["digest"]
+        } else {
+            &installed["digest"]
+        };
+        let config = json!({"schema":1,"install_id":id,"context":null,
+            "bundle_digest":digest,"declaration":null});
+        let receipt = cadence_agent::store::app_runs::material_digest(&json!({
+            "kind":"app-binding-v1","install_id":id,"context_id":null,
+            "slot":"publication","config":config,
+        }));
+        tx.execute("INSERT INTO app_bindings
+            (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+            VALUES(?1,?2,NULL,?3,'publication',1,'configured',?4,?5,?6,?7,?7)",
+            rusqlite::params![format!("binding-{index:03}"),id,format!("context:fake-{index:03}"),
+                config.to_string(),receipt,format!("request-{index:03}"),index as f64],
+        ).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    let listed = w
+        .daemon
+        .operator_rpc("app_binding_list", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(listed["bindings"].as_array().unwrap().len(), 100);
+    assert_eq!(listed["truncated"], true);
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({
+                "install_id":id,"source":w.source(),"expected_digest":installed["digest"],
+                "expected_generation":installed["catalog_generation"],
+                "expected_new_digest":proposed["digest"],"request_id":"complete-binding-preflight"
+            }),
+        )
+        .unwrap();
+    let required = upgraded["compatibility"]["rebind_required"]
+        .as_array()
+        .unwrap();
+    assert_eq!(required.len(), 101);
+    assert!(required.contains(&json!("binding-000")));
+    assert_eq!(
+        upgraded["compatibility"]["incompatible_bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        101
+    );
 }
 
 #[test]
@@ -531,6 +633,36 @@ fn cad743_interrupted_upgrade_requires_explicit_recovery() {
     );
     assert_eq!(w.head(), head);
     std::fs::write(&journal_path, journal_bytes).unwrap();
+    std::fs::remove_file(w.pm.dir.join(".apps/upgrade-pending.yaml")).unwrap();
+    // Reconstruct the instant after the durable journal write but before the
+    // pending marker write. Recovery must work even when nothing was applied.
+    let staged: serde_yaml::Value =
+        serde_yaml::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    std::fs::write(
+        w.pm.dir.join(".apps/catalog.yaml"),
+        staged["before_catalog"].as_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        w.pm.dir
+            .join(".apps/installations")
+            .join(id)
+            .join("record.yaml"),
+        staged["before_record"].as_str().unwrap(),
+    )
+    .unwrap();
+    let staged_replay = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id":id,"source":source,"expected_digest":old_digest,
+        "expected_generation":generation,"expected_new_digest":proposed["digest"],
+        "request_id":"recover-once"}),
+    );
+    assert!(
+        staged_replay
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("upgrade-recover")),
+        "uncommitted journal was mistaken for a committed replay: {staged_replay:?}"
+    );
     let recovered = w
         .daemon
         .operator_rpc(
@@ -703,6 +835,33 @@ fn cad743_cli_upgrade_uses_expected_digest_and_generation() {
     assert_eq!(row["install_id"], id);
     assert_eq!(row["version"], "0.2.0");
     assert_eq!(row["approved"], false);
+    std::fs::remove_dir_all(w.source()).unwrap();
+    let repeated = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &[
+            "app",
+            "catalog",
+            "upgrade",
+            id,
+            w.source().to_str().unwrap(),
+            "--expected-digest",
+            installed["digest"].as_str().unwrap(),
+            "--expected-generation",
+            installed["catalog_generation"].as_str().unwrap(),
+            "--expected-new-digest",
+            proposed["digest"].as_str().unwrap(),
+            "--request-id",
+            "cli-upgrade",
+        ],
+    );
+    assert!(
+        repeated.status.success(),
+        "CLI replay after source removal: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated_row: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_row["idempotent"], true);
 }
 
 /// Operator-run evidence against a private *copy*. Never point these variables at live state.

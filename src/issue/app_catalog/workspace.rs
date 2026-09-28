@@ -51,6 +51,7 @@ pub(crate) struct UpgradeRequest<'a> {
 }
 
 fn committed_upgrade_repeat(
+    pm: &Pm,
     root: &Root,
     catalog: &Catalog,
     id: &InstallationId,
@@ -75,9 +76,62 @@ fn committed_upgrade_repeat(
             "upgrade request ID was reused for different material",
         ));
     }
-    if required(root, Path::new(CATALOG), CATALOG_CAP)? != journal.after_catalog {
+    // The worktree can contain the after-catalog when Git delivery failed.
+    // Only a journal present at HEAD proves that this request committed.
+    let committed_journal = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .arg("show")
+            .arg(format!(
+                "HEAD:{}",
+                upgrade_journal_path(id, request.request_id).display()
+            )),
+    )?;
+    if !committed_journal.status.success() || committed_journal.stdout != text.as_bytes() {
+        return Err(Error::rejected("workspace upgrade is staged; use app catalog upgrade-recover with its installation ID and request ID"));
+    }
+    let before: Catalog = decode(&journal.before_catalog)?;
+    let after: Catalog = decode(&journal.after_catalog)?;
+    before.validate()?;
+    after.validate()?;
+    let old_entry = before
+        .installations
+        .get(id)
+        .ok_or_else(|| Error::rejected("retained upgrade journal lacks the old installation"))?;
+    let new_entry = after
+        .installations
+        .get(id)
+        .ok_or_else(|| Error::rejected("retained upgrade journal lacks the new installation"))?;
+    let mut changed = before.clone();
+    changed.installations.insert(id.clone(), new_entry.clone());
+    if journal.schema != 1
+        || changed != after
+        || hash(&yaml(&before)?) != journal.expected_generation
+        || old_entry.app != new_entry.app
+        || old_entry.storage != Storage::Workspace
+        || new_entry.storage != Storage::Workspace
+        || old_entry.project.is_some()
+        || new_entry.project.is_some()
+        || new_entry.bundle_revision.as_deref()
+            != Some(journal.expected_new_digest.trim_start_matches("sha256:"))
+    {
         return Err(Error::rejected(
-            "retained upgrade journal diverges from the published catalog",
+            "retained upgrade journal changes installation authority",
+        ));
+    }
+    if catalog.installations.get(id) != Some(new_entry) {
+        if required(root, Path::new(CATALOG), CATALOG_CAP)? == journal.before_catalog {
+            return Err(Error::rejected("workspace upgrade is staged; use app catalog upgrade-recover with its installation ID and request ID"));
+        }
+        return Err(Error::rejected(
+            "retained upgrade journal diverges from the published installation",
+        ));
+    }
+    let (bundle, _) = new_entry.paths(id);
+    if bundle_digest(&snapshot(root, &bundle, false)?) != journal.expected_new_digest {
+        return Err(Error::rejected(
+            "retained upgrade bundle differs from the committed digest",
         ));
     }
     let mut row = describe(root, catalog, id)?;
@@ -390,7 +444,7 @@ pub(crate) fn upgrade(
         let _lock = pm.lock()?;
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
-        if let Some(row) = committed_upgrade_repeat(&root, &catalog, &id, request, None)? {
+        if let Some(row) = committed_upgrade_repeat(pm, &root, &catalog, &id, request, None)? {
             return Ok(row);
         }
     }
@@ -401,7 +455,9 @@ pub(crate) fn upgrade(
     let (mut catalog, before_catalog) = current(&root)?;
     let before_catalog =
         before_catalog.ok_or_else(|| Error::rejected("workspace catalog is missing"))?;
-    if let Some(row) = committed_upgrade_repeat(&root, &catalog, &id, request, Some(&new_digest))? {
+    if let Some(row) =
+        committed_upgrade_repeat(pm, &root, &catalog, &id, request, Some(&new_digest))?
+    {
         return Ok(row);
     }
     let journal_path = upgrade_journal_path(&id, request_id);
@@ -476,7 +532,9 @@ pub(crate) fn upgrade(
     root.put(
         Path::new(UPGRADE_PENDING),
         &yaml(&json!({"install_id":&*id,"request_id":request_id}))?,
-    )?;
+    ).map_err(|error| {
+        Error::internal(format!("workspace upgrade marker incomplete ({}); retained journal can be resumed with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
+    })?;
     let foreign = apply_upgrade(pm, &root, &journal).map_err(|error| {
         Error::internal(format!("workspace upgrade delivery incomplete ({}); recover with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
     })?;
@@ -660,6 +718,23 @@ pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Val
         return Err(Error::rejected(
             "upgrade journal identity differs from filename",
         ));
+    }
+    let pending_path = Path::new(UPGRADE_PENDING);
+    if root.read(pending_path, RECORD_CAP)?.is_none() {
+        no_pending(&root)?;
+        let observed = required(&root, Path::new(CATALOG), CATALOG_CAP)?;
+        if journal.schema != 1
+            || bundle_digest(&journal.files) != journal.expected_new_digest
+            || (observed != journal.before_catalog && observed != journal.after_catalog)
+        {
+            return Err(Error::rejected(
+                "retained upgrade journal is not safe to resume",
+            ));
+        }
+        root.put(
+            pending_path,
+            &yaml(&json!({"install_id":&*id,"request_id":request_id}))?,
+        )?;
     }
     let foreign = apply_upgrade(pm, &root, &journal)?;
     let catalog = Catalog::load(&pm.dir)?;

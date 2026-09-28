@@ -180,6 +180,21 @@ impl Store {
         Ok(json!({"bindings":bindings,"truncated":truncated}))
     }
 
+    /// Upgrade compatibility must inspect every configured binding, including
+    /// rows intentionally hidden by the bounded operator inventory.
+    pub fn app_binding_upgrade_configured(&self, install: &str) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM app_bindings WHERE install_id=? AND state='configured' ORDER BY id",
+        )?;
+        let ids = stmt
+            .query_map([install], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| binding_in(&conn, install, id))
+            .collect()
+    }
+
     /// Called under the PM upgrade lock before any journal write. Every
     /// declared slot must be usable in at least one scope after the upgrade.
     pub fn app_binding_upgrade_capacity(

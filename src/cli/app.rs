@@ -793,10 +793,24 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     let source = if source.contains("://") || source.starts_with("git@") {
                         source.clone()
                     } else {
-                        std::fs::canonicalize(source)
-                            .map_err(|e| Error::rejected(format!("workspace app source: {e}")))?
-                            .to_string_lossy()
-                            .into_owned()
+                        // A committed request is replayable after its local
+                        // checkout is removed. The daemon verifies the exact
+                        // stored source and digest before returning that row.
+                        match std::fs::canonicalize(source) {
+                            Ok(path) => path,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                std::path::absolute(source).map_err(|e| {
+                                    Error::rejected(format!("workspace app source: {e}"))
+                                })?
+                            }
+                            Err(error) => {
+                                return Err(Error::rejected(format!(
+                                    "workspace app source: {error}"
+                                )))
+                            }
+                        }
+                        .to_string_lossy()
+                        .into_owned()
                     };
                     (
                         "app_workspace_upgrade",

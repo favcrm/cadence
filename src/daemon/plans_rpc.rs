@@ -536,13 +536,10 @@ impl Shared {
                                 incompatible_contexts.push(context["id"].clone());
                             }
                         }
-                        let bindings = self.store.app_binding_list(id, None)?;
+                        let bindings = self.store.app_binding_upgrade_configured(id)?;
                         let mut rebind_required = Vec::new();
                         let mut incompatible_bindings = Vec::new();
-                        for binding in bindings["bindings"].as_array().into_iter().flatten() {
-                            if binding["state"] != "configured" {
-                                continue;
-                            }
+                        for binding in &bindings {
                             rebind_required.push(binding["id"].clone());
                             let slot = binding["slot"].as_str().unwrap_or("");
                             if manifest
