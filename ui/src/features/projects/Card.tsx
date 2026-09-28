@@ -112,7 +112,7 @@ export default function Card({
         )}
       </div>
       <h3 className="mt-2 text-secondary leading-[1.45]">
-        <Link href={issuePath(t.project, t.id)} className="text-ink-200 hover:text-accent">{t.title}</Link>
+        <Link href={issuePath(t.project, t.id)} className="board-issue-title text-ink-200 hover:text-accent">{t.title}</Link>
       </h3>
       {(t.agents?.length ?? 0) > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1.5">

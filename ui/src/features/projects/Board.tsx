@@ -86,7 +86,7 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
               <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
               <span className="num text-micro text-ink-500 ml-auto">{issue.priority}</span>
             </div>
-            <Link href={issuePath(issue.project, issue.id)} className="block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
+            <Link href={issuePath(issue.project, issue.id)} className="board-issue-title block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
               <span>{issue.owner ?? "unassigned"}</span>
               <span>{issue.component ?? "no component"}</span>
@@ -220,7 +220,13 @@ function NewIssueForm({
   };
   return (
     <form className="card board-new-issue mb-4 p-4 border-accent/40 reveal" onSubmit={submit} onKeyDown={(event) => {
-      if (event.key === "Escape" && !busy) onCancel();
+      // The shared Select uses Escape to close its own popup. Portal key
+      // events still bubble through this form, so only Escape in Title
+      // cancels the draft.
+      if (event.key === "Escape" && !busy && event.target instanceof HTMLInputElement && event.target.name === "title") {
+        event.preventDefault();
+        onCancel();
+      }
     }}>
       <div className="flex items-start gap-3 mb-3">
         <div className="min-w-0">

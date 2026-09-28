@@ -829,7 +829,7 @@ export default function App() {
             view={view}
             onView={setView}
             query={query}
-            readOnly={readOnly}
+            readOnly={readOnly || meta === null}
             actor={actor}
             onQuery={setQuery}
             filters={filters}

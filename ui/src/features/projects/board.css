@@ -30,7 +30,10 @@
 .issue-peek::backdrop { background: var(--color-scrim); }
 .issue-peek-close { min-width: 2.75rem; min-height: 2.75rem; }
 @media (max-width: 639px) {
+  .issues-board .board-issue-title { display: flex; align-items: center; min-height: 2.75rem; }
   .issues-board .board-preview-link { min-height: 2.75rem; display: inline-flex; align-items: center; }
   .issues-board .btn,
   .issue-peek .btn { min-height: 2.75rem; }
+  .issues-board .board-new-issue .field,
+  .issues-board .board-new-issue .select-trigger { min-height: 2.75rem; }
 }

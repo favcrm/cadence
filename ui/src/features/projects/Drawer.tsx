@@ -84,7 +84,10 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose }
             <dt className="slabel">Owner</dt>
             <dd className="text-secondary text-ink-200">{detail.owner ?? "unassigned"}</dd>
           </dl>
-          {readState?.status === "stale" && (
+          {readState?.inFlight && (
+            <p className="text-label text-ink-400 m-0" role="status">Refreshing preview; showing saved details.</p>
+          )}
+          {readState?.status === "stale" && !readState.inFlight && (
             <div className="flex items-center gap-2 flex-wrap" role="status">
               <span className="text-label text-warn">Showing saved details; the preview may be out of date.</span>
               {onRetry && <Button size="sm" onClick={onRetry}>Retry</Button>}
