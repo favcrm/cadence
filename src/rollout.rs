@@ -39,6 +39,8 @@ use crate::store::{self, Store};
 /// project-default tables (CAD-366); v18 adds the pending-effect and
 /// draft tables (CAD-506); v19 adds `app_grants.install_id`, the
 /// install an app-derived grant belongs to (CAD-577).
+/// CAD-753 keeps app record data in per-installation SQLite files;
+/// this version tracks core tables only.
 /// The newest migration in `store` writes this number.
 pub const SCHEMA_VERSION: i64 = 28;
 
