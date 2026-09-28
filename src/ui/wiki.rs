@@ -366,6 +366,24 @@ fn upload(
     if bytes.is_empty() {
         return err_response(400, "wiki upload: the file part is empty");
     }
+    // Text sources are first-class Git pages. Sending them through the blob
+    // route would make an uploaded Markdown or TXT file invisible to search.
+    let is_text = [".md", ".markdown", ".txt"]
+        .iter()
+        .any(|ext| path.to_ascii_lowercase().ends_with(ext));
+    if is_text {
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return err_response(400, "text upload is not UTF-8"),
+        };
+        return relay(
+            state_dir,
+            "wiki_write",
+            json!({"path":path,"text":text,
+                   "if_rev":query("if_rev").or_else(|| fields.get("if_rev").cloned())}),
+            wiki_as,
+        );
+    }
     let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
     if let Err(e) = std::fs::create_dir_all(&uploads) {
         return err_response(500, &format!("upload staging failed: {e}"));

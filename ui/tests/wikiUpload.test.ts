@@ -12,7 +12,7 @@ import {
   uploadProgress,
   type UploadItem,
 } from "../src/features/wiki/upload";
-import { WikiError } from "../src/features/wiki/api";
+import { WikiError, uploadQuery, uploadTargetPath } from "../src/features/wiki/api";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -21,6 +21,9 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 }
 
 const MB = 1024 * 1024;
+
+equal(uploadTargetPath("global/guides", "handbook.pdf"), "global/guides/handbook.pdf", "upload names the full destination");
+equal(uploadQuery("global/guides/handbook.pdf"), "/api/wiki/upload?path=global%2Fguides%2Fhandbook.pdf", "the full path reaches the server");
 
 // ---- the client pre-check (the server's cap, CAD-580) --------------------
 

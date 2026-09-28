@@ -2,6 +2,7 @@ import { sessionHeaders } from "../../lib/sessionKey";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
+import { joinPath } from "./paths";
 
 /**
  * The wiki store's HTTP surface (CAD-580) as this screen reads it. One
@@ -197,8 +198,12 @@ export function historyQuery(path: string, from?: string, to?: string): string {
   return `/api/wiki/history?${params.toString()}`;
 }
 
-export function uploadQuery(dir: string): string {
-  return `/api/wiki/upload?path=${encodeURIComponent(dir)}`;
+export function uploadTargetPath(dir: string, filename: string): string {
+  return joinPath(dir, filename);
+}
+
+export function uploadQuery(path: string): string {
+  return `/api/wiki/upload?path=${encodeURIComponent(path)}`;
 }
 
 export const mkdirBody = (path: string) => ({ path });
@@ -226,17 +231,22 @@ export const wiki = {
  * so either convention the server settles on works. The server's own
  * refusal — size, MIME, secret scan — surfaces as this file's error.
  */
+export interface UploadResult {
+  extraction?: { status: string; reason?: string; path?: string };
+}
+
 export function uploadFile(
   dir: string,
   file: File,
   onProgress?: (percent: number) => void,
-): Promise<void> {
+): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
+    const path = uploadTargetPath(dir, file.name);
     const form = new FormData();
-    form.append("path", dir);
+    form.append("path", path);
     form.append("file", file, file.name);
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", uploadQuery(dir));
+    xhr.open("POST", uploadQuery(path));
     xhr.setRequestHeader("X-Cadence-Board", "1");
     for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
     xhr.upload.onprogress = (e) => {
@@ -244,8 +254,18 @@ export function uploadFile(
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
+        let body: UploadResult = {};
+        try {
+          body = JSON.parse(xhr.responseText) as UploadResult;
+        } catch {
+          body = {};
+        }
+        if ((body as UploadResult & { conflict?: string }).conflict === "if_rev") {
+          reject(wikiErrorFrom(409, { ...body, error: "This file changed during upload", code: "conflict" }));
+          return;
+        }
         onProgress?.(100);
-        resolve();
+        resolve(body);
         return;
       }
       let body: unknown = null;

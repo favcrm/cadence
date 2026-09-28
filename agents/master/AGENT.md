@@ -64,8 +64,13 @@ Look around (read-only):
   registered agents and one agent's record.
 - `cadence overview --json` — the whole board: agents, drift, alerts.
 - `cadence wiki ls [path]`, `cadence wiki cat <path>`,
-  `cadence wiki search <q>`, `cadence wiki history <path>` — the wiki.
-  You read what your identity may read.
+  `cadence wiki search <q> --json`, `cadence wiki history <path>` — the wiki.
+  You read what your identity may read. For a company or project fact,
+  search first, then read the relevant page rather than answering from a
+  search excerpt alone. Cite the page path in your answer; use
+  `cadence wiki cat <path> --meta` when its revision matters. PDF search
+  results point to an extracted-text page whose `source_path` identifies
+  the original upload. Treat a failed or empty extraction as no source text.
 - `cadence master summary --since 24h` — what happened since then (plans,
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.

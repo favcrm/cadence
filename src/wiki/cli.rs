@@ -24,7 +24,7 @@ pub enum WikiAction {
         path: Option<String>,
     },
     /// Print a page. A blob page streams its bytes; `--meta` prints
-    /// the pointer's JSON instead.
+    /// its JSON metadata (including the text page's revision) instead.
     Cat {
         path: String,
         /// Show the blob pointer (sha256/size/mime) rather than bytes.
@@ -57,13 +57,16 @@ pub enum WikiAction {
     /// Move a page or directory to `.trash/` — the reply names the
     /// restore path.
     Rm { path: String },
-    /// Case-insensitive substring search over wiki text files.
+    /// Ranked full-text search over wiki text pages and extracted sources.
     Search {
         /// The query.
         q: String,
         /// Limit to a subtree (default: the whole wiki).
         #[arg(long)]
         path: Option<String>,
+        /// Return full result metadata (revision, source and score).
+        #[arg(long)]
+        json: bool,
     },
     /// The git log for a page.
     History {
@@ -111,6 +114,10 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
         WikiAction::Cat { path, meta } => {
             let out = rpc(state_dir, "wiki_read", json!({"path": path}))?;
             match out["kind"].as_str() {
+                Some("text") if *meta => {
+                    crate::issue::cli::print_json(&out);
+                    Ok(0)
+                }
                 Some("text") => {
                     print!("{}", out["text"].as_str().unwrap_or(""));
                     Ok(0)
@@ -235,12 +242,16 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
-        WikiAction::Search { q, path } => {
+        WikiAction::Search { q, path, json } => {
             let out = rpc(
                 state_dir,
                 "wiki_search",
                 json!({"q": q, "path": path.clone().unwrap_or_default()}),
             )?;
+            if *json {
+                crate::issue::cli::print_json(&out);
+                return Ok(0);
+            }
             for m in out["matches"].as_array().cloned().unwrap_or_default() {
                 println!(
                     "{}:{}: {}",
