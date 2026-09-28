@@ -143,7 +143,7 @@ pub(crate) enum ReviewAction {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Retain or inspect explicit offline remote result custody. No network.
+    /// Retain, inspect or explicitly send a local result to hosted queued custody.
     Remote {
         #[command(subcommand)]
         action: RemoteAction,

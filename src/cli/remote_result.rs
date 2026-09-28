@@ -1,18 +1,19 @@
-//! Explicit offline custody. No daemon, credential resolver or remote sender.
+//! Explicit local result custody and one pinned hosted sender. No daemon or credential resolver.
 use cadence_agent::error::{Error, Result};
 use cadence_agent::remote_enrollment;
 use cadence_agent::remote_result_outbox::{
-    DestinationPin, LocalReceipt, ResultCommand, ResultOutbox, MAX_COMMAND_BYTES,
+    deliver_with, DestinationPin, LocalReceipt, ResultCommand, ResultOutbox, MAX_COMMAND_BYTES,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Subcommand)]
 pub(crate) enum RemoteAction {
-    /// Retain or inspect offline result custody; no hosted transport.
+    /// Retain, inspect or explicitly send local result custody.
     Result {
         #[command(subcommand)]
         action: ResultAction,
@@ -66,6 +67,20 @@ pub(crate) enum ResultAction {
         #[command(flatten)]
         destination: DestinationArgs,
     },
+    /// POST a retained command to its original board using a child bearer from stdin.
+    Send {
+        #[arg(long)]
+        outbox_dir: PathBuf,
+        #[arg(long)]
+        command_id: String,
+    },
+    /// Inspect one command's local or queued custody; never contacts the server.
+    Status {
+        #[arg(long)]
+        outbox_dir: PathBuf,
+        #[arg(long)]
+        command_id: String,
+    },
 }
 #[derive(Args)]
 pub(crate) struct DestinationArgs {
@@ -75,7 +90,7 @@ pub(crate) struct DestinationArgs {
     /// Original organization ID (structural metadata, not membership proof).
     #[arg(long)]
     org: String,
-    /// Exact canonical HTTPS gateway origin; no request is sent.
+    /// Exact canonical HTTPS board origin, pinned before a later send.
     #[arg(long)]
     audience: String,
     #[arg(long)]
@@ -96,6 +111,38 @@ fn metadata(receipt: &LocalReceipt) -> Value {
     json!({"state":receipt.state(),"commandId":receipt.command_id(),"digest":receipt.digest(),
         "storedAt":receipt.stored_at_ms(),"destination":{"org":pin.organization_id(),
         "audience":pin.audience(),"subject":pin.subject_id(),"agent":pin.agent_id()}})
+}
+fn existing_outbox(dir: &PathBuf) -> Result<ResultOutbox> {
+    if !dir.is_absolute()
+        || !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        || !fs::symlink_metadata(dir.join("results.sqlite3")).is_ok_and(|m| m.is_file())
+    {
+        return Err(Error::rejected("Existing offline custody is required"));
+    }
+    ResultOutbox::open(dir)
+}
+fn post_queued(url: &str, bearer: &str, body: &str) -> Result<(u16, Vec<u8>)> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(12)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent
+        .post(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+        .map_err(|_| Error::rejected("Hosted result send uncertain; local custody retained"))?;
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::rejected("Hosted result response uncertain; local custody retained"))?;
+    Ok((status, bytes))
 }
 pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
     if let RemoteAction::Enrollment { action } = action {
@@ -178,23 +225,58 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
             let pin = destination.pin()?;
             // The library can initialize new custody; inspection must not do so.
             // Hostile same-UID path replacement races remain outside its boundary.
-            let existing = fs::symlink_metadata(&destination.outbox_dir).is_ok_and(|m| m.is_dir());
-            let database = fs::symlink_metadata(destination.outbox_dir.join("results.sqlite3"))
-                .is_ok_and(|m| m.is_file());
-            if !existing || !database {
-                return Err(Error::rejected(
-                    "Pending inspection requires existing offline custody",
-                ));
-            }
             // Protected open can create an init lock or recover a valid journal;
             // this is metadata-only output, not a universally read-only open.
-            let outbox = ResultOutbox::open(&destination.outbox_dir)?;
+            let outbox = existing_outbox(&destination.outbox_dir)?;
             let receipts: Vec<_> = outbox
                 .pending_for(&pin)?
                 .iter()
-                .map(|row| metadata(row.receipt()))
+                .map(|row| {
+                    let mut value = metadata(row.receipt());
+                    value["state"] = json!(row.state());
+                    value
+                })
                 .collect();
-            json!({"state":"local_pending","receipts":receipts})
+            json!({"receipts":receipts})
+        }
+        ResultAction::Send {
+            outbox_dir,
+            command_id,
+        } => {
+            let outbox = existing_outbox(outbox_dir)?;
+            let mut raw = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(129)
+                .read_to_end(&mut raw)
+                .map_err(|_| Error::rejected("Unable to read hosted child bearer from stdin"))?;
+            if raw.len() > 128 {
+                return Err(Error::rejected("Hosted child bearer is invalid"));
+            }
+            let raw = std::str::from_utf8(&raw)
+                .map_err(|_| Error::rejected("Hosted child bearer is invalid"))?;
+            let bearer = raw
+                .strip_suffix("\r\n")
+                .or_else(|| raw.strip_suffix('\n'))
+                .unwrap_or(raw);
+            let receipt = deliver_with(&outbox, command_id, bearer, post_queued)?;
+            json!({"state":"remote_queued","application":"applied_unknown", "receipt":{
+                "commandId":receipt.command_id(),"digest":receipt.digest(),
+                "acceptedAt":receipt.accepted_at(),"expiresAt":receipt.expires_at()}})
+        }
+        ResultAction::Status {
+            outbox_dir,
+            command_id,
+        } => {
+            let row = existing_outbox(outbox_dir)?.get(command_id)?;
+            let mut value = metadata(row.receipt());
+            value["state"] = json!(row.state());
+            value["application"] = json!("applied_unknown");
+            if let Some(queued) = row.queued_receipt() {
+                value["receipt"] = json!({"commandId":queued.command_id(), "digest":queued.digest(),
+                    "acceptedAt":queued.accepted_at(),"expiresAt":queued.expires_at()});
+            }
+            value
         }
     };
     println!("{output}");

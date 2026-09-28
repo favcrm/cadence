@@ -1,4 +1,4 @@
-//! Dormant offline result custody. No authentication, transport or task application.
+//! Local result custody and explicit hosted queued receipt. No task application.
 //!
 //! Explicit paths and immutable destination pins never consult the daemon,
 //! credentials, environment defaults or the selected org connection.
@@ -21,12 +21,16 @@ pub const MAX_COMMAND_BYTES: usize = 32_768;
 const VERSION: &str = "hosted-cadence-result.v1";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const APPLICATION_ID: u32 = 0x434f4231; // COB1; format guard, not authentication.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DB_NAME: &str = "results.sqlite3";
 const SCHEMA_SQL: &str = "CREATE TABLE pending_results (
     command_id TEXT PRIMARY KEY, destination TEXT NOT NULL,
     payload TEXT NOT NULL, digest TEXT NOT NULL, stored_at_ms INTEGER NOT NULL
 )";
+const RECEIPT_SQL: &str = "CREATE TABLE queued_receipts (
+    command_id TEXT PRIMARY KEY, receipt TEXT NOT NULL
+)";
+const MAX_RESPONSE_BYTES: u64 = 4096;
 
 fn invalid() -> Error {
     Error::rejected("Invalid offline result command or destination")
@@ -260,6 +264,7 @@ impl LocalReceipt {
 pub struct PendingResult {
     receipt: LocalReceipt,
     command: ResultCommand,
+    queued: Option<QueuedReceipt>,
 }
 impl PendingResult {
     pub fn receipt(&self) -> &LocalReceipt {
@@ -268,6 +273,51 @@ impl PendingResult {
     pub fn command(&self) -> &ResultCommand {
         &self.command
     }
+    pub fn queued_receipt(&self) -> Option<&QueuedReceipt> {
+        self.queued.as_ref()
+    }
+    pub fn state(&self) -> &'static str {
+        if self.queued.is_some() {
+            "remote_queued"
+        } else {
+            "local_pending"
+        }
+    }
+}
+
+/// A server's queued-custody acknowledgement, never an applied-task witness.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueuedReceipt {
+    command_id: String,
+    state: String,
+    accepted_at: u64,
+    expires_at: u64,
+    digest: String,
+}
+impl QueuedReceipt {
+    pub fn state(&self) -> &str {
+        "remote_queued"
+    }
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn accepted_at(&self) -> u64 {
+        self.accepted_at
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueuedResponse {
+    ok: bool,
+    receipt: QueuedReceipt,
 }
 
 /// Separate offline file. Does not open the daemon Store or perform recovery.
@@ -317,8 +367,12 @@ impl ResultOutbox {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)?;
         private_metadata(&file.metadata()?, false)?;
+        let old_version = if created {
+            SCHEMA_VERSION
+        } else {
+            verify_header(&mut file)?
+        };
         if !created {
-            verify_header(&mut file)?;
             let read_only = Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -327,14 +381,14 @@ impl ResultOutbox {
             match read_only.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
                 row.get::<_, i64>(0)
             }) {
-                Ok(_) => verify_schema(&read_only)?,
+                Ok(_) => verify_schema(&read_only, old_version)?,
                 Err(rusqlite::Error::SqliteFailure(code, _))
                     if code.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK =>
                 {
                     // A valid hot rollback journal needs writes even to inspect
                     // schema. Recover only a bounded private copy first, leaving
                     // original foreign DB/journal bytes untouched on refusal.
-                    recovery_preflight(dir, &path)?;
+                    recovery_preflight(dir, &path, old_version)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -349,6 +403,7 @@ impl ResultOutbox {
         if created {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA_SQL)?;
+            tx.execute_batch(RECEIPT_SQL)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
@@ -357,10 +412,17 @@ impl ResultOutbox {
         }
         let app_id: u32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if app_id != APPLICATION_ID || version != SCHEMA_VERSION {
+        if app_id != APPLICATION_ID || version != old_version {
             return Err(corrupt());
         }
-        verify_schema(&conn)?;
+        verify_schema(&conn, old_version)?;
+        if old_version == 1 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(RECEIPT_SQL)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            verify_schema(&conn, SCHEMA_VERSION)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -433,7 +495,58 @@ impl ResultOutbox {
         if rows.len() > MAX_PENDING {
             return Err(corrupt());
         }
-        rows.into_iter().map(decode_row).collect()
+        rows.into_iter()
+            .map(|raw| decode_row_with_receipt(&conn, raw))
+            .collect()
+    }
+
+    /// Look up by immutable command ID; selection never trusts a current org or caller pin.
+    pub fn get(&self, command_id: &str) -> Result<PendingResult> {
+        if !identifier(command_id) {
+            return Err(invalid());
+        }
+        let conn = self.conn.lock().map_err(|_| corrupt())?;
+        let raw = conn.query_row(
+            "SELECT command_id,destination,payload,digest,stored_at_ms FROM pending_results WHERE command_id=?",
+            [command_id], raw_row,
+        ).optional()?.ok_or_else(|| Error::rejected("Offline result command is not retained"))?;
+        decode_row_with_receipt(&conn, raw)
+    }
+
+    fn record_queued(&self, queued: &QueuedReceipt) -> Result<QueuedReceipt> {
+        let mut conn = self.conn.lock().map_err(|_| corrupt())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let raw = tx.query_row(
+            "SELECT command_id,destination,payload,digest,stored_at_ms FROM pending_results WHERE command_id=?",
+            [&queued.command_id], raw_row,
+        ).optional()?.ok_or_else(|| Error::rejected("Offline result command is not retained"))?;
+        let local = decode_row(raw)?;
+        validate_queued(queued, local.receipt())?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT receipt FROM queued_receipts WHERE command_id=?",
+                [&queued.command_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let original: QueuedReceipt = serde_json::from_str(&existing).map_err(|_| corrupt())?;
+            validate_queued(&original, local.receipt()).map_err(|_| corrupt())?;
+            if original != *queued {
+                return Err(Error::rejected(
+                    "Hosted queued receipt conflicts with original custody",
+                ));
+            }
+            tx.commit()?;
+            return Ok(original);
+        }
+        let json = serde_json::to_string(queued).map_err(|_| corrupt())?;
+        tx.execute(
+            "INSERT INTO queued_receipts VALUES (?, ?)",
+            params![queued.command_id, json],
+        )?;
+        tx.commit()?;
+        Ok(queued.clone())
     }
 }
 
@@ -465,7 +578,7 @@ fn validate_journal_path(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn recovery_preflight(dir: &Path, original: &Path) -> Result<()> {
+fn recovery_preflight(dir: &Path, original: &Path, expected_version: u32) -> Result<()> {
     let scratch = tempfile::Builder::new()
         .prefix("recovery-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -483,10 +596,10 @@ fn recovery_preflight(dir: &Path, original: &Path) -> Result<()> {
     )?;
     conn.busy_timeout(Duration::from_secs(5))?;
     // The first schema read performs recovery on the disposable copy only.
-    verify_schema(&conn)?;
+    verify_schema(&conn, expected_version)?;
     let app: u32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
     let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if app != APPLICATION_ID || version != SCHEMA_VERSION {
+    if app != APPLICATION_ID || version != expected_version {
         return Err(corrupt());
     }
     // Copy/recovery/schema failures retain originals. This preflight is not
@@ -541,7 +654,7 @@ fn acquire_init_lock(file: &File) -> Result<()> {
     }
 }
 
-fn verify_schema(conn: &Connection) -> Result<()> {
+fn verify_schema(conn: &Connection, version: u32) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name")?;
     let objects = stmt
@@ -559,7 +672,7 @@ fn verify_schema(conn: &Connection) -> Result<()> {
     // own DDL: stripping whitespace can confuse TEXT NOT NULL with TEXTNOTNULL.
     // This is format
     // compatibility, not protection against a hostile same-UID file owner.
-    if objects.len() != 2 {
+    if objects.len() != if version == 1 { 2 } else { 4 } {
         return Err(corrupt());
     }
     let (kind, name, table, sql) = &objects[0];
@@ -570,7 +683,8 @@ fn verify_schema(conn: &Connection) -> Result<()> {
     {
         return Err(corrupt());
     }
-    let (kind, name, table, sql) = &objects[1];
+    let table_index = if version == 1 { 1 } else { 2 };
+    let (kind, name, table, sql) = &objects[table_index];
     let actual_sql = sql.as_deref().ok_or_else(corrupt)?;
     if kind != "table"
         || name != "pending_results"
@@ -578,6 +692,24 @@ fn verify_schema(conn: &Connection) -> Result<()> {
         || actual_sql != SCHEMA_SQL
     {
         return Err(corrupt());
+    }
+    if version == 2 {
+        let (kind, name, table, sql) = &objects[1];
+        if kind != "index"
+            || name != "sqlite_autoindex_queued_receipts_1"
+            || table != "queued_receipts"
+            || sql.is_some()
+        {
+            return Err(corrupt());
+        }
+        let (kind, name, table, sql) = &objects[3];
+        if kind != "table"
+            || name != "queued_receipts"
+            || table != "queued_receipts"
+            || sql.as_deref() != Some(RECEIPT_SQL)
+        {
+            return Err(corrupt());
+        }
     }
     Ok(())
 }
@@ -615,7 +747,102 @@ fn decode_row(
             stored_at_ms,
         },
         command,
+        queued: None,
     })
+}
+fn decode_row_with_receipt(conn: &Connection, raw: RawRow) -> Result<PendingResult> {
+    let mut pending = decode_row(raw)?;
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT receipt FROM queued_receipts WHERE command_id=?",
+            [pending.receipt.command_id()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json) = json {
+        let queued: QueuedReceipt = serde_json::from_str(&json).map_err(|_| corrupt())?;
+        validate_queued(&queued, pending.receipt()).map_err(|_| corrupt())?;
+        if serde_json::to_string(&queued).map_err(|_| corrupt())? != json {
+            return Err(corrupt());
+        }
+        pending.queued = Some(queued);
+    }
+    Ok(pending)
+}
+fn validate_queued(receipt: &QueuedReceipt, local: &LocalReceipt) -> Result<()> {
+    if receipt.command_id != local.command_id
+        || receipt.digest != local.digest
+        || receipt.state != "queued"
+        || receipt.accepted_at == 0
+        || receipt.accepted_at > MAX_SAFE_INTEGER
+        || receipt.expires_at <= receipt.accepted_at
+        || receipt.expires_at > MAX_SAFE_INTEGER
+        || receipt.digest.len() != 64
+        || !receipt
+            .digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::rejected(
+            "Hosted queued receipt does not match local custody",
+        ));
+    }
+    Ok(())
+}
+
+/// Send only the stored canonical command to its stored board origin. The
+/// transport receives no caller-selected URL or actor fields. A failed or
+/// ambiguous HTTP exchange leaves local custody pending for an explicit retry.
+pub fn deliver_with<F>(
+    outbox: &ResultOutbox,
+    command_id: &str,
+    child_bearer: &str,
+    post: F,
+) -> Result<QueuedReceipt>
+where
+    F: FnOnce(&str, &str, &str) -> Result<(u16, Vec<u8>)>,
+{
+    let bytes = child_bearer.as_bytes();
+    if bytes.len() != 47
+        || !bytes.starts_with(b"hct_")
+        || !bytes[4..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(b))
+    {
+        return Err(Error::rejected(
+            "An enrolled hosted child bearer is required",
+        ));
+    }
+    let pending = outbox.get(command_id)?;
+    let pin = pending.receipt().destination();
+    DestinationPin::new(
+        pin.organization_id(),
+        pin.audience(),
+        pin.subject_id(),
+        pin.agent_id(),
+    )?;
+    let url = format!(
+        "{}/__platform/hosted-cadence/{}/results",
+        pin.audience(),
+        pin.organization_id()
+    );
+    let (status, body) = post(&url, child_bearer, pending.command().canonical_json())
+        .map_err(|_| Error::rejected("Hosted result send uncertain; local custody retained"))?;
+    if status != 202 || body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(Error::rejected(
+            "Hosted result was not acknowledged; local custody retained",
+        ));
+    }
+    let parsed: QueuedResponse = serde_json::from_slice(&body).map_err(|_| {
+        Error::rejected("Hosted result returned an invalid receipt; local custody retained")
+    })?;
+    if !parsed.ok {
+        return Err(Error::rejected(
+            "Hosted result was not acknowledged; local custody retained",
+        ));
+    }
+    validate_queued(&parsed.receipt, pending.receipt())?;
+    outbox.record_queued(&parsed.receipt)
 }
 fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
     let safe = meta.uid() == unsafe { libc::geteuid() }
@@ -632,7 +859,7 @@ fn private_metadata(meta: &fs::Metadata, directory: bool) -> Result<()> {
         ))
     }
 }
-fn verify_header(file: &mut File) -> Result<()> {
+fn verify_header(file: &mut File) -> Result<u32> {
     let mut header = [0u8; 100];
     file.read_exact(&mut header).map_err(|_| corrupt())?;
     // SQLite's file-format specification: big-endian user_version at60,
@@ -643,9 +870,9 @@ fn verify_header(file: &mut File) -> Result<()> {
         || header[18] != 1
         || header[19] != 1
         || app_id != APPLICATION_ID
-        || version != SCHEMA_VERSION
+        || !matches!(version, 1 | SCHEMA_VERSION)
     {
         return Err(corrupt());
     }
-    Ok(())
+    Ok(version)
 }
