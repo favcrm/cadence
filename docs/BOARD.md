@@ -1213,6 +1213,31 @@ routes 404. The login audience
 (`read draft`) never enrolls a provider connection; issuing the grant
 still needs the issuer's device flag and an approver.
 
+**SSH forwarding fallback.** An SSH-forwarded browser can show
+`signed_in: true` while operator decisions fail positive peer proof:
+the host may see the forward's client socket without a visible owning
+process. When remote device login is configured, prefer that supported
+sign-in mode rather than SSH. For SSH setups, an operator may instead
+run a separate loopback-only relay from their own host shell (outside
+every Cadence agent/pane), then forward the laptop's board port to the
+relay:
+
+```sh
+# Host: board listens on 127.0.0.1:3193; choose an unused relay port.
+setsid -f env -i PATH=/usr/bin:/bin /usr/bin/socat \
+  TCP-LISTEN:3194,bind=127.0.0.1,reuseaddr,fork TCP:127.0.0.1:3193
+# Laptop: close the old forward before replacing it.
+ssh -N -L 3193:127.0.0.1:3194 ubuntu@<board-host>
+```
+
+Open `http://cadence-3193.localhost:3193` and sign in with the
+browser's own one-time link. The relay must remain loopback-only and
+operator-owned; the board still proves the relay peer and requires the
+normal operator session. A relay without a session is refused, and
+neither the relay nor SSH changes the authorization proof. If positive
+peer proof still fails, use the CLI or supported tailnet access instead
+of weakening the check.
+
 ## Remote access — `ui tailscale`
 
 `cadence ui tailscale start` publishes the board on the tailnet through

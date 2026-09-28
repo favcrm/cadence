@@ -42,7 +42,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         <h1 className="text-section font-semibold text-ink-100">Apps</h1>
         <StaleChip state={state} />
         <span className="kicker">
-          {state.data ? `${rows.length} installed` : "Installed apps"}{project === "all" ? "" : ` · ${project}`}
+          {state.data ? `${rows.length} project apps` : "Project apps"}{project === "all" ? "" : ` · ${project}`}
         </span>
       </div>
       <ResourceGate
@@ -51,21 +51,33 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         failed="could not load apps"
         onRetry={() => void resources.apps.invalidate()}
       />
-      {viewer.operator && !viewer.readOnly && <WorkspaceCatalog />}
-      {state.data && rows.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400">
-          No apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
-          <code className="num text-ink-300">
-            cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
-          </code>{" "}
-          puts one here.
-        </div>
+      {viewer.operator && !viewer.readOnly ? <WorkspaceCatalog /> : (
+        <section aria-label="Workspace apps" className="mb-5">
+          <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Workspace apps</h2>
+          <div className="card px-4 py-3 text-label text-ink-400" role="status">
+            {viewer.readOnly
+              ? "Workspace apps are unavailable while this board is read-only."
+              : "Workspace apps are hidden because this browser is not verified as the operator; signing in alone does not show whether any are installed. Open the board from its host, or use the operator-owned loopback relay documented in docs/BOARD.md for SSH forwarding."}
+          </div>
+        </section>
       )}
-      <ul className="space-y-2.5">
-        {rows.map((row, i) => (
-          <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
-        ))}
-      </ul>
+      <section aria-label="Project apps">
+        <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Project apps</h2>
+        {state.data && rows.length === 0 && (
+          <div className="card px-4 py-5 text-secondary text-ink-400">
+            No project apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
+            <code className="num text-ink-300">
+              cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
+            </code>{" "}
+            puts one here.
+          </div>
+        )}
+        <ul className="space-y-2.5">
+          {rows.map((row, i) => (
+            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
+          ))}
+        </ul>
+      </section>
     </main>
   );
 }
