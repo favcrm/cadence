@@ -136,6 +136,55 @@ async function run() {
     assert(!host.querySelector("form.board-new-issue"), "pending write settles once after access returns");
     (api as any).create = original;
   }
+  if (scenario === "all" || scenario === "scope") {
+    const projects = [...props.projects, { key: "other", prefix: "OTH", components: [], repos: [], issues: 0 }];
+    await render({ project: "cadence", projects, readOnly: false });
+    await React.act(() => button("New issue")?.click());
+    const form = host.querySelector("form.board-new-issue");
+    const title = form?.querySelector('input[name="title"]') as HTMLInputElement | null;
+    assert(form && title, "project-scoped draft opens");
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(title, "Draft for cadence");
+      title.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await render({ project: "cadence", projects, view: "kanban" });
+    assert(host.querySelector("form.board-new-issue") === form && title.value === "Draft for cadence", "switching to board keeps the draft");
+    await render({ project: "other", projects });
+    assert(host.querySelector("form.board-new-issue") === form && form.textContent?.includes("Start work in cadence"), "changing workspace scope does not silently retarget an open draft");
+    await render({ project: "all", projects });
+    assert(host.querySelector("form.board-new-issue") === form && form.textContent?.includes("Start work in cadence"), "returning to all projects keeps a scoped draft pinned");
+    const original = api.create;
+    let sentProject = "";
+    (api as any).create = async (request: { project: string }) => { sentProject = request.project; return { card }; };
+    await React.act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert(sentProject === "cadence", "create submits into the draft's original project");
+    (api as any).create = original;
+    await render({ project: "all", projects });
+    await React.act(() => button("New issue")?.click());
+    const allForm = host.querySelector("form.board-new-issue");
+    const allTitle = allForm?.querySelector('input[name="title"]') as HTMLInputElement | null;
+    assert(allForm && allTitle, "all-project draft opens");
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(allTitle, "Draft from all projects");
+      allTitle.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await render({ project: "all", projects: [...projects].reverse() });
+    assert(allForm.textContent?.includes("Start work in cadence"), "the all-project default is pinned when project order changes");
+    const projectLabel = Array.from(allForm.querySelectorAll("label")).find((label) => label.textContent === "Project");
+    const projectTrigger = projectLabel && document.getElementById(projectLabel.htmlFor);
+    assert(projectTrigger, "all-project draft has a labeled selector");
+    await React.act(() => projectTrigger.click());
+    const other = Array.from(document.querySelectorAll('[role="option"]')).find((option) => option.textContent?.includes("other"));
+    assert(other, "other project is selectable");
+    await React.act(() => other.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await render({ project: "cadence", projects });
+    assert(host.querySelector("form.board-new-issue") === allForm && allForm.textContent?.includes("Start work in other"), "explicit all-project choice survives scope change");
+    let allSentProject = "";
+    (api as any).create = async (request: { project: string }) => { allSentProject = request.project; return { card }; };
+    await React.act(async () => allForm.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert(allSentProject === "other", "all-project draft submits to the explicit choice");
+    (api as any).create = original;
+  }
   await React.act(() => root.unmount());
   if (scenario === "all" || scenario === "drawer") {
     const opener = document.createElement("button");

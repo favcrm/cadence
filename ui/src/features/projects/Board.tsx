@@ -193,15 +193,14 @@ function NewIssueForm({
 }) {
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState("P2");
-  const [selProject, setSelProject] = useState("");
+  const [selProject, setSelProject] = useState(() => project === "all" ? projects[0]?.key ?? "" : project);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pending = useRef(false);
   const fieldId = useId();
   const projectId = useId();
   const priorityId = useId();
-  const projectKey =
-    project === "all" ? selProject || (projects[0]?.key ?? "") : project;
+  const projectKey = project === "all" ? selProject : project;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const t = title.trim();
@@ -292,6 +291,7 @@ export default function Board({
   const [over, setOver] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   const [draftSession, setDraftSession] = useState<string | null>(null);
+  const [draftProject, setDraftProject] = useState(project);
   const showNewForm = newOpen && (sessionId === undefined || sessionId === draftSession);
   useEffect(() => {
     if (newOpen && sessionId !== undefined && sessionId !== draftSession) setNewOpen(false);
@@ -510,7 +510,7 @@ export default function Board({
         </span>
         <StaleChip state={issuesState} />
         <div className="ml-auto flex items-center gap-2">
-          {!readOnly && !showNewForm && <Button variant="primary" onClick={() => { setDraftSession(sessionId ?? null); setNewOpen(true); }}>New issue</Button>}
+          {!readOnly && !showNewForm && <Button variant="primary" onClick={() => { setDraftSession(sessionId ?? null); setDraftProject(project); setNewOpen(true); }}>New issue</Button>}
           <div className="flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
             {(["kanban", "list"] as const).map((mode) => (
               <button
@@ -534,7 +534,7 @@ export default function Board({
       </div>
 
       {showNewForm && (
-        <NewIssueForm key={draftSession ?? "no-session"} projects={projects} project={project} readOnly={readOnly} writeReason={block} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
+        <NewIssueForm key={draftSession ?? "no-session"} projects={projects} project={draftProject} readOnly={readOnly} writeReason={block} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
       )}
 
       <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section
