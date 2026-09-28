@@ -225,11 +225,10 @@ pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, Str
         "image/webp" => image::ImageFormat::WebP,
         _ => unreachable!(),
     };
-    let limits = image::Limits {
-        max_image_width: Some(IMAGE_SIDE_LIMIT),
-        max_image_height: Some(IMAGE_SIDE_LIMIT),
-        max_alloc: Some(IMAGE_DECODE_ALLOC_LIMIT),
-    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
+    limits.max_image_height = Some(IMAGE_SIDE_LIMIT);
+    limits.max_alloc = Some(IMAGE_DECODE_ALLOC_LIMIT);
     let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
     probe.limits(limits.clone());
     let (width, height) = probe
