@@ -58,6 +58,11 @@ pub(crate) enum EnrollmentAction {
         #[arg(long)]
         bind_continuity: bool,
     },
+    /// Bind or retry the saved browser child with its existing continuity key.
+    BindContinuity {
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+    },
     /// Re-enroll after expiry using the private stored service credential.
     Renew {
         #[arg(long)]
@@ -248,7 +253,11 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                     },
                 )?;
                 if *bind_continuity {
-                    let bound = remote_enrollment::bind_browser(enrollment_dir)?;
+                    let bound = remote_enrollment::bind_browser(enrollment_dir).map_err(|error| {
+                        Error::rejected(format!(
+                            "Browser child enrollment was saved, but continuity bind is pending or uncertain: {error}. Retry the same saved child and key with `cadence remote enrollment bind-continuity --enrollment-dir <same-enrollment-dir>`"
+                        ))
+                    })?;
                     if bound.organization_id() != enrolled.organization_id()
                         || bound.audience() != enrolled.audience()
                         || bound.subject_id() != enrolled.subject_id()
@@ -261,6 +270,22 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                     continuity = Some(json!({"lineage":bound.lineage_id(),
                         "generation":bound.generation(),"state":"bound"}));
                 }
+                Some(enrolled)
+            }
+            EnrollmentAction::BindContinuity { enrollment_dir } => {
+                let enrolled = remote_enrollment::current(enrollment_dir)?;
+                let bound = remote_enrollment::bind_browser(enrollment_dir)?;
+                if bound.organization_id() != enrolled.organization_id()
+                    || bound.audience() != enrolled.audience()
+                    || bound.subject_id() != enrolled.subject_id()
+                    || bound.agent_id() != enrolled.agent_id()
+                {
+                    return Err(Error::rejected(
+                        "Browser enrollment changed before continuity bind",
+                    ));
+                }
+                continuity = Some(json!({"lineage":bound.lineage_id(),
+                    "generation":bound.generation(),"state":"bound"}));
                 Some(enrolled)
             }
             EnrollmentAction::Renew { enrollment_dir } => {
