@@ -988,6 +988,27 @@ operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
 
+An SSH forward can show `signed_in: true` while operator decisions still
+fail positive peer proof: the host may see the forward's client socket
+without a visible owning process. Reinstalling a workspace app does not
+change that proof. For an isolated loopback board, the operator can run a
+separate, loopback-only relay from their own host shell (outside every
+Cadence agent/pane), then forward the laptop's board port to the relay:
+
+```sh
+# Host: board listens on 127.0.0.1:3193; use an unused relay port.
+setsid -f env -i PATH=/usr/bin:/bin /usr/bin/socat \
+  TCP-LISTEN:3194,bind=127.0.0.1,reuseaddr,fork TCP:127.0.0.1:3193
+# Laptop: close the old forward before replacing it.
+ssh -N -L 3193:127.0.0.1:3194 ubuntu@<board-host>
+```
+
+The browser still opens `http://cadence-3193.localhost:3193` and signs
+in with its own one-time link. The board proves the relay's visible
+process and still requires the operator session; a relay carrying no
+session is refused. If the host cannot prove that process, use the CLI
+or the supported tailnet share instead of weakening the peer check.
+
 ## Remote access — `ui tailscale`
 
 `cadence ui tailscale start` publishes the board on the tailnet through
