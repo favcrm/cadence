@@ -26,7 +26,7 @@ function safePreviewUrl(value: string | null | undefined): string | null {
   try {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
-    return url.protocol === "https:" && !url.username && !url.password
+    return url.protocol === "https:" && !url.username && !url.password && !url.port
       && (host === "cdninstagram.com" || host.endsWith(".cdninstagram.com")
         || host === "fbcdn.net" || host.endsWith(".fbcdn.net")) ? value : null;
   } catch {

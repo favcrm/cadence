@@ -713,8 +713,9 @@ fn err_response(code: u16, message: &str) -> Response<std::io::Cursor<Vec<u8>>> 
 }
 
 /// Defence in depth on an unauthenticated loopback origin that renders
-/// agent-written Markdown.
-const CSP: &str = "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+/// agent-written Markdown. Social source previews use only these reviewed
+/// image CDNs; the client checks the same host families before rendering.
+const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
@@ -4716,7 +4717,43 @@ mod tests {
         proxied_actor, running_json, static_answer_for, static_file, StaticAnswer,
     };
     use serde_json::{json, Value};
-    use tiny_http::Response;
+    use tiny_http::{Header, Response};
+
+    #[test]
+    fn board_csp_allows_only_reviewed_social_preview_image_hosts() {
+        let mut response = Response::from_string("<html></html>");
+        response.add_header(Header::from_bytes("Content-Type", "text/html").unwrap());
+        assert!(super::add_security_headers(&mut response));
+        let policy = response
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Content-Security-Policy"))
+            .unwrap()
+            .value
+            .as_str();
+        let image_sources = policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|directive| directive.strip_prefix("img-src "))
+            .unwrap();
+        assert_eq!(
+            image_sources.split_whitespace().collect::<Vec<_>>(),
+            [
+                "'self'",
+                "data:",
+                "https://cdninstagram.com",
+                "https://*.cdninstagram.com",
+                "https://fbcdn.net",
+                "https://*.fbcdn.net",
+            ]
+        );
+        assert!(policy.contains("default-src 'self'"));
+        assert!(policy.contains("base-uri 'none'"));
+        assert!(policy.contains("frame-ancestors 'none'"));
+        assert!(!policy
+            .split_whitespace()
+            .any(|source| source == "https:" || source == "*"));
+    }
 
     #[test]
     fn hosted_public_only_is_explicit_and_requires_public_identity() {
