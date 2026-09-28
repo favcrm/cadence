@@ -6,8 +6,7 @@ use crate::worktree::layout;
 
 pub(super) fn check_worktrees(scan: &Scan) -> Check {
     let name = "worktrees";
-    let threshold =
-        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
+    let threshold = json!("warn: merged/closed-looking worktree needing owner or finish review");
     let Some(root) = repo_root(&scan.cwd) else {
         return check(
             name,
@@ -29,7 +28,11 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
             String::new(),
         );
     }
-    let (stale, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    let (stale, inventory, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    let unrecorded = stale
+        .iter()
+        .filter(|s| s["recorded_ref"] != json!(true))
+        .count();
     // The shared cargo cache counts once, at the repo level — it is
     // not part of any worktree's own footprint.
     let shared = crate::worktree::shared_target_dir(&root);
@@ -56,11 +59,16 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
             )
         })
         .unwrap_or_default();
+    let inventory_note = if inventory.is_empty() {
+        String::new()
+    } else {
+        format!("; {} unverified in inventory", inventory.len())
+    };
     let detail = if stale.is_empty() {
-        format!("{scanned} worktrees, none stale{shared_note}")
+        format!("{scanned} worktrees, none needing review{inventory_note}{shared_note}")
     } else {
         format!(
-            "{} of {} worktrees stale ({}{}{})",
+            "{} of {} worktrees need review ({unrecorded} unrecorded/unknown; {}{}{inventory_note}{shared_note})",
             stale.len(),
             scanned,
             if stale
@@ -72,7 +80,6 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
                 ""
             },
             human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum()),
-            shared_note
         )
     };
     check(
@@ -81,10 +88,11 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
         json!({
             "scanned": scanned,
             "stale": stale,
+            "inventory": inventory,
             "shared_cargo_target": shared_size,
         }),
         threshold,
         detail,
-        remedies.into_iter().take(4).collect::<Vec<_>>().join("; "),
+        remedies.into_iter().take(4).collect::<Vec<_>>().join("\n"),
     )
 }
