@@ -48,6 +48,55 @@ fn strict_metadata_binds_exact_origin_and_rejects_forged_shapes() {
 }
 
 #[test]
+fn external_provider_pin_accepts_only_the_registered_underscore_name() {
+    let config = |provider| {
+        serde_json::json!({
+            "schema": 1,
+            "providers": [{
+                "provider": provider,
+                "origin": "https://api-v2.agenticos.hk",
+                "manifest_pin": "agenticos-external-manifest@1"
+            }]
+        })
+    };
+    let trusted =
+        DeploymentMetadata::parse(&serde_json::to_vec(&config("agenticos_external")).unwrap())
+            .expect("the registered external provider must be loadable from trusted metadata");
+    assert_eq!(
+        trusted.pin("agenticos_external", "https://api-v2.agenticos.hk"),
+        Some("agenticos-external-manifest@1")
+    );
+    assert_eq!(
+        trusted.pin("agenticos_external", "https://other.agenticos.hk"),
+        None
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = dir.path().join("provider-deployments.json");
+    std::fs::write(
+        &file,
+        serde_json::to_vec(&config("agenticos_external")).unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = read_fixture(dir.path(), "provider-deployments.json", unsafe {
+        libc::geteuid()
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        loaded.pin("agenticos_external", "https://api-v2.agenticos.hk"),
+        Some("agenticos-external-manifest@1")
+    );
+    for provider in ["agenticos_other", "other_provider", "_agenticos_external"] {
+        assert!(
+            DeploymentMetadata::parse(&serde_json::to_vec(&config(provider)).unwrap()).is_err(),
+            "unexpected provider accepted: {provider}"
+        );
+    }
+}
+
+#[test]
 fn origin_requires_a_valid_authority_without_caller_url_components() {
     for origin in [
         "http://:",
@@ -119,6 +168,11 @@ fn pinned_directory_is_not_replaced_by_later_path_substitution() {
     std::fs::create_dir(&original).unwrap();
     std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(original.join("metadata.json"), CONFIG).unwrap();
+    std::fs::set_permissions(
+        original.join("metadata.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let pinned = std::fs::File::open(&original).unwrap();
     std::fs::rename(&original, parent.path().join("retained")).unwrap();
     std::fs::create_dir(&original).unwrap();
