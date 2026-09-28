@@ -3872,7 +3872,22 @@ fn board_boot_agent_uid(state_dir: &Path, injected: Option<u32>) -> Result<Optio
     if configured.is_some() || historical.is_some() {
         crate::agent_uid::config::require_private_state_dir(state_dir)?;
     }
-    match operator::active_agent_uid(state_dir) {
+    reconcile_board_agent_uid(
+        configured,
+        historical,
+        operator::active_agent_uid(state_dir),
+    )
+}
+
+fn reconcile_board_agent_uid(
+    configured: Option<u32>,
+    historical: Option<u32>,
+    health: std::result::Result<Option<u32>, String>,
+) -> Result<Option<u32>> {
+    match health {
+        Ok(uid) if configured.is_some() && uid != configured => Err(Error::rejected(
+            "Private daemon agent UID differs from configured UID",
+        )),
         Ok(uid) if historical.is_some() && uid != historical => Err(Error::rejected(
             "Private daemon agent UID differs from persistent mode marker",
         )),
@@ -4763,6 +4778,20 @@ mod tests {
         assert!(
             error.to_string().contains("no private daemon boot pin"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn first_uid_provisioning_requires_matching_private_daemon_boot() {
+        for health in [Ok(None), Ok(Some(3300))] {
+            assert!(
+                super::reconcile_board_agent_uid(Some(2200), None, health).is_err(),
+                "configured UID must match private daemon boot before board startup"
+            );
+        }
+        assert_eq!(
+            super::reconcile_board_agent_uid(Some(2200), None, Ok(Some(2200))).unwrap(),
+            Some(2200)
         );
     }
 

@@ -82,9 +82,9 @@ pub fn mode_marker_uid(state_dir: &Path) -> Result<Option<u32>> {
 pub fn require_private_state_dir(state_dir: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(state_dir)?;
     let euid = unsafe { libc::geteuid() };
-    if !meta.is_dir() || meta.uid() != euid || meta.mode() & 0o022 != 0 {
+    if !meta.is_dir() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
         return Err(Error::rejected(
-            "agent UID state directory must be owned by the operator and not group/other writable",
+            "agent UID state directory must be owned by the operator and private to it",
         ));
     }
     Ok(())
@@ -181,6 +181,13 @@ mod tests {
         ensure_mode_marker(dir.path(), Some(2200)).unwrap();
         assert!(ensure_mode_marker(dir.path(), None).is_err());
         assert!(ensure_mode_marker(dir.path(), Some(3300)).is_err());
+        for mode in [0o750, 0o755] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                ensure_mode_marker(dir.path(), Some(2200)).is_err(),
+                "agent UID mode must refuse readable state directory {mode:o}"
+            );
+        }
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
         assert!(ensure_mode_marker(dir.path(), Some(2200)).is_err());
     }

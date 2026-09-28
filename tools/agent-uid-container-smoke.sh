@@ -58,6 +58,9 @@ for socket in /tmp/state/cadence.sock /var/lib/cadence/cadence.sock; do
   fi
   echo "admit set verified on $socket"
 done
+# The private state directory must be 0700 while the board is running.
+# The temporary traversal above only isolates the daemon's UID admit test.
+chmod 0700 /tmp/state
 mkdir -p /tmp/ui
 printf '<!doctype html><title>fixture</title>\n' >/tmp/ui/index.html
 setpriv --reuid=1100 --regid=2200 --clear-groups env HOME=/tmp/operator CADENCE_PM_DIR=/tmp/pm \
