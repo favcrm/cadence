@@ -34,6 +34,7 @@ fn fake_scan(root: &TempDir) -> Scan {
             })
         }),
         census: std::cell::OnceCell::new(),
+        tracker_index: std::cell::OnceCell::new(),
     };
     for d in [
         &scan.proc_root,
@@ -2613,7 +2614,9 @@ fn worktrees_flag_merged_or_closed_only() {
         })
         .collect();
     names.sort();
-    assert_eq!(names, vec!["cad-1-x", "feat-a"]);
+    // CAD-2 is merged but dirty and has no exact ref yet: review it,
+    // without claiming it is stale or safe to remove.
+    assert_eq!(names, vec!["cad-1-x", "cad-2-y", "feat-a"]);
     let unrecorded = c.value["stale"]
         .as_array()
         .unwrap()
@@ -2636,6 +2639,8 @@ fn worktrees_flag_merged_or_closed_only() {
             repo.join(".cadence/wt/cad-2-y/../cad-2-y").display()
         ),
     );
+    // The tracker index is a snapshot for one host report.
+    let scan = fake_scan(&root);
     let c = check_worktrees(&scan);
     let mut names: Vec<String> = c.value["stale"]
         .as_array()
@@ -2663,6 +2668,163 @@ fn worktrees_flag_merged_or_closed_only() {
     assert_eq!(recorded["open_ref"], false);
     assert_eq!(recorded["clean"], false);
     assert!(!c.remedy.contains("cadence issue finish CAD-2"));
+}
+
+#[test]
+fn worktrees_resolve_cross_issue_ref_and_inventory_unmerged_unknown() {
+    let root = TempDir::new().unwrap();
+    let scan = fake_scan(&root);
+    let repo = scan.cwd.clone();
+    init_repo(&repo);
+    for (name, branch) in [
+        ("cad-7-adopted", "cadence/cad-7-adopted"),
+        ("cad-10-unknown", "cadence/cad-10-unknown"),
+    ] {
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &format!(".cadence/wt/{name}"),
+                "-b",
+                branch,
+            ],
+        );
+        let lane = repo.join(".cadence/wt").join(name);
+        std::fs::write(lane.join("unique"), name).unwrap();
+        git(&lane, &["add", "-A"]);
+        git(
+            &lane,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "unique",
+            ],
+        );
+    }
+    let adopted = repo.join(".cadence/wt/cad-7-adopted");
+    write_issue(
+        scan.pm_dir.as_ref().unwrap(),
+        "cadence",
+        "CAD-8",
+        "doing",
+        &format!(
+            "refs:\n- kind: worktree\n  path: {}\n  closed: true\n",
+            adopted.display()
+        ),
+    );
+    write_issue(
+        scan.pm_dir.as_ref().unwrap(),
+        "cadence",
+        "CAD-10",
+        "doing",
+        "",
+    );
+    std::fs::write(
+        scan.pm_dir
+            .as_ref()
+            .unwrap()
+            .join("cadence/CAD-10/issue.md"),
+        "---\nrefs: [\n",
+    )
+    .unwrap();
+
+    let c = check_worktrees(&scan);
+    let adopted_row = c.value["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == adopted.to_string_lossy().as_ref())
+        .unwrap();
+    assert_eq!(adopted_row["issue"], "CAD-8");
+    assert_eq!(adopted_row["recorded_ref"], true);
+    assert_eq!(adopted_row["tracker_closed"], true);
+    assert!(!c.remedy.contains("issue finish CAD-7"));
+    let unknown = c.value["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("cad-10-unknown"))
+        .unwrap();
+    assert!(unknown["recorded_ref"].is_null());
+    assert!(!c.value["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["path"] == unknown["path"]));
+    let indexed = scan.tracker_index.get().unwrap();
+    assert_eq!(indexed.refs.len(), 1);
+    let plan = reclaim_plan(&scan);
+    assert!(std::ptr::eq(indexed, scan.tracker_index.get().unwrap()));
+    assert!(plan["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| { r["kind"] == "worktree-inventory" && r["path"] == unknown["path"] }));
+    assert_eq!(plan["reclaimable_bytes"], 0);
+}
+
+#[test]
+fn worktree_open_ref_remedy_is_shell_valid_and_done_issue_is_not_ref_closed() {
+    let root = TempDir::new().unwrap();
+    let scan = fake_scan(&root);
+    let repo = scan.cwd.clone();
+    init_repo(&repo);
+    let lane = repo.join(".cadence/wt/cad-11 lane");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            lane.to_str().unwrap(),
+            "-b",
+            "cadence/cad-11-lane",
+        ],
+    );
+    git(&repo, &["merge", "-q", "cadence/cad-11-lane"]);
+    write_issue(
+        scan.pm_dir.as_ref().unwrap(),
+        "cadence",
+        "CAD-11",
+        "doing",
+        &format!("refs:\n- kind: worktree\n  path: {}\n", lane.display()),
+    );
+    let c = check_worktrees(&scan);
+    let command = c.remedy.lines().next().unwrap();
+    assert!(command.contains("--worktree '"), "{command}");
+    assert!(Command::new("sh")
+        .args(["-n", "-c", command])
+        .status()
+        .unwrap()
+        .success());
+
+    write_issue(
+        scan.pm_dir.as_ref().unwrap(),
+        "cadence",
+        "CAD-11",
+        "done",
+        &format!("refs:\n- kind: worktree\n  path: {}\n", lane.display()),
+    );
+    let scan = fake_scan(&root);
+    let c = check_worktrees(&scan);
+    let row = c.value["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["issue"] == "CAD-11")
+        .unwrap();
+    assert_eq!(row["open_ref"], true);
+    assert_eq!(row["tracker_closed"], false);
+    assert_eq!(row["issue_done"], true);
+    assert!(row["why"].as_str().unwrap().contains("issue marked done"));
+    assert!(!row["why"].as_str().unwrap().contains("tracker ref closed"));
+    assert!(!c.remedy.contains("issue finish CAD-11"));
 }
 
 #[test]

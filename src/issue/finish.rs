@@ -1803,7 +1803,7 @@ struct PathPreview {
 
 /// Collapse `.` and `..` without requiring the path to exist, so a
 /// missing recorded directory still compares with the path git prints.
-fn lexical_path(path: &Path) -> PathBuf {
+pub(crate) fn lexical_path(path: &Path) -> PathBuf {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {

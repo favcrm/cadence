@@ -1256,71 +1256,191 @@ fn issue_id_from_name(name: &str) -> Option<String> {
     ok.then(|| format!("{}-{}", prefix.to_uppercase(), num))
 }
 
-/// `<pm>/<project>/<ID>/issue.md` — projects are the top-level dirs.
-fn find_issue(pm_dir: &Path, id: &str) -> Option<PathBuf> {
-    for ent in std::fs::read_dir(pm_dir).ok()?.flatten() {
-        let file = ent.path().join(id).join("issue.md");
-        if file.is_file() {
-            return Some(file);
+const TRACKER_ISSUE_BUDGET: usize = 4096;
+
+struct TrackerRef {
+    path: PathBuf,
+    issue: String,
+    closed: bool,
+    issue_done: bool,
+}
+
+pub(crate) struct TrackerIndex {
+    refs: Vec<TrackerRef>,
+    canonical: BTreeMap<PathBuf, Vec<usize>>,
+    lexical: BTreeMap<PathBuf, Vec<usize>>,
+    done: BTreeMap<String, bool>,
+    complete: bool,
+}
+
+/// Scan each tracker issue once per host report. A partial index can
+/// prove an exact ref, but cannot prove that a ref is absent.
+fn tracker_index(pm_dir: Option<&Path>) -> TrackerIndex {
+    let mut index = TrackerIndex {
+        refs: Vec::new(),
+        canonical: BTreeMap::new(),
+        lexical: BTreeMap::new(),
+        done: BTreeMap::new(),
+        complete: true,
+    };
+    let Some(pm_dir) = pm_dir else {
+        index.complete = false;
+        return index;
+    };
+    let Ok(projects) = std::fs::read_dir(pm_dir) else {
+        index.complete = false;
+        return index;
+    };
+    let mut seen = 0;
+    for project in projects {
+        let Ok(project) = project else {
+            index.complete = false;
+            continue;
+        };
+        let Ok(kind) = project.file_type() else {
+            index.complete = false;
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(issues) = std::fs::read_dir(project.path()) else {
+            index.complete = false;
+            continue;
+        };
+        for issue in issues {
+            let Ok(issue) = issue else {
+                index.complete = false;
+                continue;
+            };
+            let Ok(kind) = issue.file_type() else {
+                index.complete = false;
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let file = issue.path().join("issue.md");
+            let meta = match std::fs::symlink_metadata(&file) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    index.complete = false;
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 1_048_576 {
+                index.complete = false;
+                continue;
+            }
+            if seen >= TRACKER_ISSUE_BUDGET {
+                index.complete = false;
+                return index;
+            }
+            seen += 1;
+            let parsed = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| crate::issue::parse::parse_issue(&text).ok());
+            let Some((front, _)) = parsed else {
+                index.complete = false;
+                continue;
+            };
+            let issue_done = matches!(front.status.as_str(), "done" | "dropped");
+            index.done.insert(front.id.clone(), issue_done);
+            for r in front.refs {
+                if r.kind == "worktree" {
+                    if let Some(path) = r.path {
+                        let path = PathBuf::from(path);
+                        let next = index.refs.len();
+                        if let Ok(canon) = path.canonicalize() {
+                            index.canonical.entry(canon).or_default().push(next);
+                        }
+                        index
+                            .lexical
+                            .entry(crate::issue::finish::lexical_path(&path))
+                            .or_default()
+                            .push(next);
+                        index.refs.push(TrackerRef {
+                            path,
+                            issue: front.id.clone(),
+                            closed: r.closed == Some(true),
+                            issue_done,
+                        });
+                    }
+                }
+            }
         }
     }
-    None
+    index
 }
 
 #[derive(Default)]
 struct TrackerWorktree {
+    issue: Option<String>,
     /// None means the tracker could not be checked, not that it lacks a ref.
     recorded: Option<bool>,
-    closed: Option<bool>,
+    ref_closed: Option<bool>,
     open_ref: Option<bool>,
     issue_done: bool,
 }
 
 /// An issue name/status is not ownership evidence for this exact path.
-fn tracker_worktree(scan: &Scan, wt_path: &Path, id: Option<&str>) -> TrackerWorktree {
-    let Some(pm) = scan.pm_dir.as_deref() else {
-        return TrackerWorktree::default();
-    };
-    let Some(file) = id.and_then(|id| find_issue(pm, id)) else {
-        return TrackerWorktree::default();
-    };
-    let Ok(text) = std::fs::read_to_string(file) else {
-        return TrackerWorktree::default();
-    };
-    let Ok((front, _body)) = crate::issue::parse::parse_issue(&text) else {
-        return TrackerWorktree::default();
-    };
-    let issue_done = matches!(front.status.as_str(), "done" | "dropped");
-    let matching: Vec<_> = front
-        .refs
-        .iter()
-        .filter(|r| {
-            r.kind == "worktree"
-                && r.path
-                    .as_deref()
-                    .is_some_and(|p| crate::issue::finish::same_path(Path::new(p), wt_path))
-        })
+fn tracker_worktree(index: &TrackerIndex, wt_path: &Path, hint: Option<&str>) -> TrackerWorktree {
+    let mut candidate_ids = BTreeSet::new();
+    if let Ok(canon) = wt_path.canonicalize() {
+        if let Some(ids) = index.canonical.get(&canon) {
+            candidate_ids.extend(ids);
+        }
+    }
+    if let Some(ids) = index
+        .lexical
+        .get(&crate::issue::finish::lexical_path(wt_path))
+    {
+        candidate_ids.extend(ids);
+    }
+    let matching: Vec<_> = candidate_ids
+        .into_iter()
+        .map(|i| &index.refs[*i])
+        .filter(|r| crate::issue::finish::same_path(&r.path, wt_path))
         .collect();
-    let has_ref = !matching.is_empty();
-    let has_open_ref = matching.iter().any(|r| r.closed != Some(true));
+    let issue = matching.first().map(|r| r.issue.clone());
+    if matching.iter().any(|r| Some(&r.issue) != issue.as_ref()) {
+        return TrackerWorktree::default();
+    }
+    let has_open_ref = matching.iter().any(|r| !r.closed);
+    let issue_done = matching.first().map_or_else(
+        || {
+            hint.and_then(|id| index.done.get(id))
+                .copied()
+                .unwrap_or(false)
+        },
+        |r| r.issue_done,
+    );
     TrackerWorktree {
-        recorded: Some(has_ref),
-        closed: has_ref.then_some(issue_done || !has_open_ref),
-        open_ref: has_ref.then_some(has_open_ref),
+        issue: issue.or_else(|| hint.map(str::to_owned)),
+        recorded: (!matching.is_empty())
+            .then_some(true)
+            .or_else(|| index.complete.then_some(false)),
+        ref_closed: (!matching.is_empty()).then_some(!has_open_ref),
+        open_ref: (!matching.is_empty()).then_some(has_open_ref),
         issue_done,
     }
 }
 
 /// The worktree staleness scan shared by the `worktrees` check and
-/// `--reclaim-plan`: `(<stale rows>, <remedy per row>, <dirs scanned>)`.
+/// `--reclaim-plan`: `(<candidates>, <informational inventory>, <remedies>, <dirs scanned>)`.
 pub(super) fn stale_worktrees(
     scan: &Scan,
     root: &Path,
     wt_root: &Path,
-) -> (Vec<Value>, Vec<String>, usize) {
+) -> (Vec<Value>, Vec<Value>, Vec<String>, usize) {
     let branches = worktree_branches(root);
     let base = default_base(root);
+    let tracker_index = scan
+        .tracker_index
+        .get_or_init(|| tracker_index(scan.pm_dir.as_deref()));
     let mut stale: Vec<Value> = Vec::new();
+    let mut inventory: Vec<Value> = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
     let mut scanned = 0_usize;
     if let Ok(entries) = std::fs::read_dir(wt_root) {
@@ -1347,14 +1467,25 @@ pub(super) fn stale_worktrees(
                         .is_some_and(|o| o.status.success())
                 });
             let id = issue_id_from_name(&wt_name);
-            let tracker = tracker_worktree(scan, &path, id.as_deref());
-            if !merged && tracker.closed != Some(true) && !tracker.issue_done {
+            let tracker = tracker_worktree(tracker_index, &path, id.as_deref());
+            if !merged && tracker.ref_closed != Some(true) && !tracker.issue_done {
+                if tracker.recorded != Some(true) {
+                    inventory.push(json!({
+                        "path": path, "branch": branch, "issue": tracker.issue,
+                        "recorded_ref": tracker.recorded, "open_ref": tracker.open_ref,
+                        "why": if tracker.recorded == Some(false) {
+                            "no exact tracker worktree ref; ownership needs review"
+                        } else {
+                            "tracker ownership could not be verified"
+                        },
+                    }));
+                }
                 continue;
             }
             let clean = git_out(&path, &["status", "--porcelain"])
                 .is_some_and(|o| o.status.success() && o.stdout.is_empty());
             let candidate = if tracker.recorded == Some(true) {
-                tracker.closed == Some(true) || (merged && clean)
+                tracker.ref_closed == Some(true) || tracker.issue_done || (merged && clean)
             } else {
                 // Merged/closed-looking but unrecorded paths need review,
                 // even if dirty. Neither branch ancestry nor a guessed
@@ -1369,11 +1500,16 @@ pub(super) fn stale_worktrees(
             if merged {
                 why.push(format!("merged into {}", base.as_deref().unwrap_or("?")));
             }
-            if tracker.closed == Some(true) {
+            if tracker.ref_closed == Some(true) {
                 why.push("tracker ref closed".to_string());
             }
-            if tracker.recorded != Some(true) {
+            if tracker.issue_done {
+                why.push("issue marked done".to_string());
+            }
+            if tracker.recorded == Some(false) {
                 why.push("no exact tracker worktree ref; review ownership".to_string());
+            } else if tracker.recorded.is_none() {
+                why.push("tracker ownership could not be verified".to_string());
             }
             if !clean {
                 why.push("dirty tree".to_string());
@@ -1384,9 +1520,10 @@ pub(super) fn stale_worktrees(
             stale.push(json!({
                 "path": path,
                 "branch": branch,
-                "issue": id,
+                "issue": tracker.issue,
                 "merged": merged,
-                "tracker_closed": tracker.closed,
+                "tracker_closed": tracker.ref_closed,
+                "issue_done": tracker.issue_done,
                 "recorded_ref": tracker.recorded,
                 "open_ref": tracker.open_ref,
                 "clean": clean,
@@ -1394,10 +1531,10 @@ pub(super) fn stale_worktrees(
                 "bytes_truncated": truncated,
                 "why": why.join(", "),
             }));
-            remedies.push(if tracker.open_ref == Some(true) {
+            remedies.push(if tracker.open_ref == Some(true) && !tracker.issue_done {
                 format!(
-                    "cadence issue finish {} --worktree {} (guarded; verify before cleanup)",
-                    id.as_deref().unwrap_or("?"),
+                    "cadence issue finish {} --worktree {}  # guarded; inspect refusal before cleanup",
+                    tracker.issue.as_deref().unwrap_or("?"),
                     shell_quote(&path.display().to_string())
                 )
             } else {
@@ -1408,7 +1545,7 @@ pub(super) fn stale_worktrees(
             });
         }
     }
-    (stale, remedies, scanned)
+    (stale, inventory, remedies, scanned)
 }
 
 // ---------- reclaim plan ----------
@@ -1431,11 +1568,19 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
     let mut stale_rows: Vec<Value> = Vec::new();
     let mut stale_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if wt_root.is_dir() {
-        let (stale, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
+        let (stale, inventory, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
+        for item in inventory {
+            rows.push(json!({
+                "kind": "worktree-inventory", "path": item["path"],
+                "bytes": 0, "recorded_ref": item["recorded_ref"],
+                "action": "Review owner, commits, PRs, push and active processes before cleanup",
+                "why": item["why"],
+            }));
+        }
         for s in stale {
             let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
             stale_paths.insert(path.clone());
-            let open_ref = s["open_ref"] == json!(true);
+            let open_ref = s["open_ref"] == json!(true) && s["issue_done"] != json!(true);
             stale_rows.push(json!({
                 "kind": "worktree-review",
                 "path": s["path"],
@@ -1560,7 +1705,9 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         .filter(|r| {
             !matches!(
                 r["kind"].as_str(),
-                Some("worktree-target" | "stale-worktree" | "worktree-review")
+                Some(
+                    "worktree-target" | "stale-worktree" | "worktree-review" | "worktree-inventory"
+                )
             )
         })
         .filter(|r| !(r["kind"] == "shared-cargo-cache" && r["cargo_locked"] == json!(true)))
@@ -1605,7 +1752,9 @@ pub fn render_reclaim(plan: &Value) -> String {
     }
     if let Some(rows) = plan["rows"].as_array() {
         for r in rows {
-            let size = if r["bytes_truncated"].as_bool().unwrap_or(false) {
+            let size = if r["kind"] == "worktree-inventory" {
+                "—".to_string()
+            } else if r["bytes_truncated"].as_bool().unwrap_or(false) {
                 format!("≥{}", human(r["bytes"].as_u64().unwrap_or(0)))
             } else {
                 human(r["bytes"].as_u64().unwrap_or(0))

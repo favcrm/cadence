@@ -28,7 +28,7 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
             String::new(),
         );
     }
-    let (stale, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    let (stale, inventory, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
     let unrecorded = stale
         .iter()
         .filter(|s| s["recorded_ref"] != json!(true))
@@ -59,11 +59,16 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
             )
         })
         .unwrap_or_default();
+    let inventory_note = if inventory.is_empty() {
+        String::new()
+    } else {
+        format!("; {} unverified in inventory", inventory.len())
+    };
     let detail = if stale.is_empty() {
-        format!("{scanned} worktrees, none needing review{shared_note}")
+        format!("{scanned} worktrees, none needing review{inventory_note}{shared_note}")
     } else {
         format!(
-            "{} of {} worktrees need review ({unrecorded} unrecorded/unknown; {}{}{})",
+            "{} of {} worktrees need review ({unrecorded} unrecorded/unknown; {}{}{inventory_note}{shared_note})",
             stale.len(),
             scanned,
             if stale
@@ -75,7 +80,6 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
                 ""
             },
             human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum()),
-            shared_note
         )
     };
     check(
@@ -84,6 +88,7 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
         json!({
             "scanned": scanned,
             "stale": stale,
+            "inventory": inventory,
             "shared_cargo_target": shared_size,
         }),
         threshold,
