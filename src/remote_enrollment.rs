@@ -1799,6 +1799,13 @@ mod tests {
             ("401 Unauthorized", "unauthorized", "", "authorization"),
             ("403 Forbidden", "forbidden", "", "authorization"),
             (
+                "401 Unauthorized",
+                "other_issuer_refusal",
+                "",
+                "authorization",
+            ),
+            ("403 Forbidden", "other_issuer_refusal", "", "authorization"),
+            (
                 "503 Service Unavailable",
                 "authority_unavailable",
                 "",
@@ -1867,6 +1874,8 @@ mod tests {
                 json!({"ok":false,"code":"parked","reason":"session_expired"}),
             ),
             (409, json!({"ok":false,"code":"lineage_terminal"})),
+            (403, json!({"ok":false,"code":"lineage_terminal"})),
+            (401, json!({"ok":false,"code":"authority_unavailable"})),
             (409, json!({"ok":false,"code":"parked","reason":"other"})),
             (409, json!({"ok":false,"code":"parked","reason":null})),
             (
