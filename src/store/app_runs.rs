@@ -243,7 +243,7 @@ impl Store {
                 params![id, digest],
             )?;
             if previous.as_ref().is_some_and(|(old, _)| old == digest) {
-                Self::app_effect_invalidate_in(&tx, id, None, None)?;
+                Self::app_effect_invalidate_in(&tx, id, None, None, Some(digest))?;
             }
         } else {
             // An explicit installation revoke removes authority from every
@@ -252,7 +252,7 @@ impl Store {
                 "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=?",
                 [id],
             )?;
-            Self::app_effect_invalidate_in(&tx, id, None, None)?;
+            Self::app_effect_invalidate_in(&tx, id, None, None, None)?;
         }
         tx.execute("INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
             params![id,epoch,digest,if approve{"approved"}else{"revoked"},now()])?;
@@ -1694,7 +1694,7 @@ impl Store {
     pub fn app_install_upgrade_ready(&self, install: &str) -> Result<()> {
         let conn = self.conn();
         let unresolved_effects: i64 = conn.query_row(
-            "SELECT count(*) FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.install_id=? AND e.state IN ('waiting','decided','executing')",
+            "SELECT count(*) FROM app_effect_authorizations a JOIN platform_effects e ON e.effect_id=a.effect_id WHERE a.install_id=? AND e.state IN ('waiting','decided','executing','reconcile')",
             [install],
             |row| row.get(0),
         )?;

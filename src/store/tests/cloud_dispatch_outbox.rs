@@ -204,7 +204,7 @@ fn v27_migration_converges_when_version_was_rolled_back_after_column_commit() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
 }
 
 #[test]
@@ -299,5 +299,5 @@ fn cloud_outbox_v26_migration_is_atomic() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, crate::rollout::SCHEMA_VERSION);
 }

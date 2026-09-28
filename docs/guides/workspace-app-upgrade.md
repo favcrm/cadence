@@ -12,7 +12,11 @@ cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url>
 ```
 
 An upgrade keeps the installation ID, contexts, bindings, and
-historical runs; it never creates a project.
+historical runs; it never creates a project. In the board, open the app's
+**Settings → App package**, enter the source path or Git URL, select **Check
+update**, inspect the proposed version, digest and changed files, then select
+**Apply checked update**. The board sends the same pinned arguments as the
+CLI; a stale proposal is refused.
 
 ```sh
 cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url> \
@@ -33,15 +37,33 @@ request returns the committed result; a changed proposed bundle, stale digest, s
 reused request ID with different material is refused.
 
 An installation with a run in `awaiting_approval`, `approved`, or `running`
-state cannot be upgraded. Finish or explicitly cancel that run first. The
+state, or an unresolved Local effect in `waiting`, `decided`, `executing` or `reconcile`,
+cannot be upgraded. Finish or explicitly cancel the run and decide or
+reconcile the effect first. The
 upgrade snapshots and validates the new bundle before writing a journal. The old bundle remains at its original path; new bundle
 bytes are written beneath a digest-named `revisions/` directory. The output
 reports changed, added, and removed files; incompatible context defaults; and
-bindings that require an explicit rebind. Existing context and binding rows
-are retained. A context whose defaults are incompatible with the new bundle
+bindings that require an explicit new-version binding. Existing context and
+binding rows are retained. A context whose defaults are incompatible with the new bundle
 cannot authorize a new run until its defaults are updated. Binding receipts
-pin the old bundle and cannot silently grant a new run authority. The new
+pin the old bundle and cannot silently grant a new run authority. A second
+configured binding for the new digest may use the same slot and context;
+updating an old-version binding into a new digest is refused. The new
 bundle digest is unapproved, so approve it separately before creating new runs.
+
+A completed, reviewed draft may still be released to Local from its exact
+retained old bundle, and a retained Instagram source receipt may be selected
+in a new-version post without another provider read. Both paths recheck the
+original approved epoch and immutable run/receipt, the live context, and the
+old-version binding's current connection and scopes. An explicit binding or
+installation capability revoke stops that historical use. Active runs and
+worker calls never inherit the old epoch.
+
+This code advances the daemon SQLite schema from v27 to v28 to retain approval
+epochs and index configured bindings by bundle digest. A production daemon
+upgrade therefore needs the separate Cadence rollout lease and backup receipt
+for that schema crossing; a package-only app upgrade does not migrate the
+daemon database.
 
 If Git delivery fails after staging, catalog reads and runtime admission stay
 closed while `.apps/upgrade-pending.yaml` exists. The error prints the exact

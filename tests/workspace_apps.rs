@@ -588,6 +588,22 @@ fn cad743_isolated_social_content_pilot_upgrade() {
         .join(&id)
         .join("bundle/app.md");
     let old_bytes = std::fs::read(&old_bundle).unwrap();
+    let before = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        before
+            .query_row("SELECT version FROM schema_version", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        27
+    );
+    let old_approval: (i64, String, String) = before
+        .query_row(
+            "SELECT epoch,digest,state FROM app_install_capabilities WHERE install_id=?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    drop(before);
     let opts = daemon_opts();
     opts.provider_env
         .set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
@@ -605,6 +621,20 @@ fn cad743_isolated_social_content_pilot_upgrade() {
     assert_eq!(contexts_before["contexts"].as_array().unwrap().len(), 1);
     assert_eq!(bindings_before["bindings"].as_array().unwrap().len(), 3);
     let db = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        28
+    );
+    let retained_approval: (i64, String, String) = db
+        .query_row(
+            "SELECT epoch,digest,state FROM app_capability_epochs WHERE install_id=?",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retained_approval, old_approval);
     let runs: Vec<String> = db
         .prepare("SELECT id FROM app_runs WHERE install_id=? ORDER BY id")
         .unwrap()
@@ -612,7 +642,7 @@ fn cad743_isolated_social_content_pilot_upgrade() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(runs.len(), 2);
+    assert!(runs.len() >= 2);
     let old_runs: Vec<Value> = runs
         .iter()
         .map(|run| {

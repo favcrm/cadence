@@ -69,8 +69,50 @@ fn cad743_old_reviewed_draft_releases_after_upgrade_and_new_binding() {
     })).unwrap()["binding"].clone();
     assert_ne!(old_binding["id"], new_binding["id"]);
     let effect = h.stage(&run, "cad743-old-release");
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({
+                "install_id":h.install["install_id"],"digest":upgraded["digest"]
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "app_effect_show",
+                json!({
+                    "effect_id":effect["effect_id"]
+                })
+            )
+            .unwrap()["effect"]["state"],
+        "waiting",
+        "reapproving the new bundle cannot close an old-version release"
+    );
     let done = h.decide(&effect);
     assert_eq!(done["state"], "done");
+    assert_eq!(h.items().as_array().unwrap().len(), 1);
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({
+                "install_id":h.install["install_id"],"binding_id":old_binding["id"],
+                "expected_revision":old_binding["revision"]
+            }),
+        )
+        .unwrap();
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_effect_stage",
+                json!({
+                    "run_id":run["id"],"artifact_id":run["artifacts"][0]["id"],
+                    "slot":"publication","request_id":"cad743-revoked-old-release","title":"Revoked"
+                })
+            )
+            .is_err(),
+        "explicit old binding revoke must stop historical release"
+    );
     assert_eq!(h.items().as_array().unwrap().len(), 1);
 }
 
@@ -166,6 +208,60 @@ fn cad743_old_source_receipt_selects_into_new_bundle_without_another_read() {
         1,
         "retained source was fetched twice"
     );
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({
+                "install_id":h.install["install_id"],"binding_id":old["id"],
+                "expected_revision":old["revision"]
+            }),
+        )
+        .unwrap();
+    assert!(h.daemon.operator_rpc("app_run_create", json!({
+        "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+        "inputs":{"subject":"Revoked source","writer":WRITER,"reviewer":REVIEWER},
+        "request_id":"cad743-revoked-source","owner_pm":OWNER,
+        "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+    })).is_err(), "explicit old source binding revoke must stop reuse");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cad743_uncertain_local_effect_blocks_upgrade_before_journal() {
+    let h = Release::new();
+    let context = h.context("Client A", A, "cad743-uncertain-context");
+    h.bind(&context, "cad743-uncertain-binding");
+    let run = h.complete(&context, "cad743-uncertain-run");
+    let effect = h.stage(&run, "cad743-uncertain-effect");
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE platform_effects SET state='reconcile' WHERE effect_id=?",
+        [effect["effect_id"].as_str().unwrap()],
+    )
+    .unwrap();
+    let source = h.root.path().join("bundle");
+    let manifest = source.join("app.md");
+    let old = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        old.replace("version: '0.1.0'", "version: '0.2.0'"),
+    )
+    .unwrap();
+    let proposal = h.daemon.operator_rpc("app_workspace_upgrade_check", json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],"expected_generation":h.install["catalog_generation"]
+    })).unwrap();
+    let refused = h.daemon.operator_rpc("app_workspace_upgrade", json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],"expected_generation":h.install["catalog_generation"],
+        "expected_new_digest":proposal["digest"],"request_id":"cad743-uncertain-upgrade"
+    })).unwrap_err();
+    assert!(
+        refused.to_string().contains("unresolved app effect"),
+        "{refused}"
+    );
+    assert!(!h.root.path().join("pm/.apps/upgrade-pending.yaml").exists());
+    assert_eq!(h.items().as_array().unwrap().len(), 0);
 }
 fn native(
     lane: &mut LaneShell,

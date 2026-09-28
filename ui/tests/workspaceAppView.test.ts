@@ -19,7 +19,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
-const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"] };
+const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"] };
 const snapshot = { owner_pm: "pm-a", inputs: { subject: "Synthetic caption", source: "Synthetic source facts", writer: "writer-a", reviewer: "reviewer-a" }, workflow: { title: "Instagram caption: Synthetic caption", publication_slot: "publication", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Write" }, { id: "2", kind: "review_text", assignee: "reviewer-a", dependencies: ["1"], instruction: "Review" }] }, publication: { slot: "publication", binding: { id: "binding-a", revision: 1, digest: "binding-digest" } }, assignments: {} };
 let rows: any[] = [];
 let effects: any[] = [];
@@ -40,7 +40,7 @@ function read(path: string): Response {
   if (denyReads) return json({ error: "Operator session expired" }, 403);
   if (path === "/api/app-installations/install-a") return json(installation);
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [{ id: "context-b", install_id: "install-a", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } }] });
-  if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { connection_id: "local-id", account: "default" } }] });
+  if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { bundle_digest: "bundle-digest", connection_id: "local-id", account: "default" } }] });
   if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "default" }] });
   if (path === "/api/agents") return json({ agents: [{ alias: "pm-a", role: "pm", group: "pm-a", state: "idle" }, { alias: "writer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }, { alias: "reviewer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }] });
   if (path === "/api/app-runs?install_id=install-a") return json({ runs: rows });
@@ -54,6 +54,14 @@ globalThis.fetch = async (input, init) => {
   if (init?.method === "POST") {
     const body = JSON.parse(String(init.body)); writes.push({ path, body });
     const respond = () => {
+      if (path === "/api/app-installations/install-a/upgrade/check") {
+        assert(body.source === "/tmp/social-v05" && body.expected_digest === "bundle-digest" && body.expected_generation === "catalog-generation", "Upgrade check pins current catalog and bundle");
+        return json({ install_id: "install-a", name: "social-content", version: "0.5.0", digest: "new-bundle-digest", expected_digest: "bundle-digest", expected_generation: "catalog-generation", structural_diff: { added: ["workflows/image-manual.md"], changed: ["app.md"], removed: [] }, secret_warnings: [] });
+      }
+      if (path === "/api/app-installations/install-a/upgrade") {
+        assert(body.source === "/tmp/social-v05" && body.expected_digest === "bundle-digest" && body.expected_generation === "catalog-generation" && body.expected_new_digest === "new-bundle-digest" && body.request_id, "Upgrade apply sends only the reviewed old/new material and a stable request");
+        return json({ ...installation, digest: "new-bundle-digest", approved: false });
+      }
       if (path === "/api/app-runs") {
         assert(body.inputs.source === "Synthetic source facts" && !Object.hasOwn(body.inputs, "source_text"), "Create uses exact supported package input source");
         assert(!Object.hasOwn(body, "context_id") && !Object.hasOwn(body, "project_link"), "No brand and no project require no synthetic ownership fields");
@@ -205,9 +213,16 @@ async function main() {
   assert(button("New post")?.disabled, "Read-only operator cannot create posts");
   await click(button("Settings"));
   assert(!host.querySelector("#wa-default-content-prompt") && !host.querySelector("#wa-default-image-prompt") && text().includes("needs an upgrade"), "Older installed bundles do not offer prompt defaults their workflow cannot save");
-  assert(button("Save destination")?.disabled && button("Add brand")?.disabled, "Read-only settings have no enabled mutation controls");
+  assert(button("Save destination")?.disabled && button("Add brand")?.disabled && button("Check update")?.disabled, "Read-only settings have no enabled mutation controls");
   await click(button("Save destination")); await click(button("Add brand"));
   assert(writes.length === 0, "Read-only attempted actions cause zero POSTs");
+  await fresh(); await click(button("Settings"));
+  assert(!button("Apply checked update"), "No package applies before a reviewed check");
+  await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v05");
+  await click(button("Check update"));
+  assert(Number(writes.length) === 1 && text().includes("new-bundle-digest") && text().includes("workflows/image-manual.md"), "Board shows exact proposed digest and changed files before apply");
+  await click(button("Apply checked update"));
+  assert(Number(writes.length) === 2 && writes[1].path.endsWith("/upgrade"), "Only an explicit second action applies the checked upgrade");
   await fresh(false, false);
   assert(reads.length === 0, "Unproven viewer must not request operator-only app, connection, artifact or effect receipts");
   await fresh(); await click(button("Library")); await click(host.querySelector(".wa-post-card"));

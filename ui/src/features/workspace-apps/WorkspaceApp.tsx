@@ -29,6 +29,7 @@ import {
   type AppEffect,
   type Connection,
   type WorkspaceOutbox,
+  type UpgradeProposal,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
@@ -95,6 +96,8 @@ export default function WorkspaceApp({
   const [connectionId, setConnectionId] = useState("");
   const [sourceConnectionId, setSourceConnectionId] = useState("");
   const [imageConnectionId, setImageConnectionId] = useState("");
+  const [upgradeSource, setUpgradeSource] = useState("");
+  const [upgradeProposal, setUpgradeProposal] = useState<{ source: string; receipt: UpgradeProposal } | null>(null);
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
@@ -108,6 +111,7 @@ export default function WorkspaceApp({
     forgetContext(installId);
     setContextId(""); setConnectionId("");
     setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
+    setUpgradeSource(""); setUpgradeProposal(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
@@ -169,6 +173,7 @@ export default function WorkspaceApp({
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId(""); setConnectionId("");
     setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
+    setUpgradeSource(""); setUpgradeProposal(null);
     setContextId(rememberedContext(installId) ?? "");
     setSelectedRun(null);
     setVerifiedImage(null);
@@ -238,10 +243,11 @@ export default function WorkspaceApp({
     (value) =>
       value.context_id === (contextId || null) &&
       value.slot === "publication" &&
-      value.state === "configured",
+      value.state === "configured" &&
+      value.config.bundle_digest === data.installation.digest,
   );
-  const sourceBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "source" && value.state === "configured");
-  const imageBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "image" && value.state === "configured");
+  const sourceBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "source" && value.state === "configured" && value.config.bundle_digest === data.installation.digest);
+  const imageBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "image" && value.state === "configured" && value.config.bundle_digest === data.installation.digest);
   const contexts =
     data?.contexts.filter((value) => value.state === "active") ?? [];
   const selectedContext = contexts.find(value => value.id === contextId);
@@ -721,6 +727,48 @@ export default function WorkspaceApp({
             )}
             {section === "Settings" && (
               <div className="wa-stack">
+                <section className="wa-panel wa-stack">
+                  <h2>App package</h2>
+                  <p className="wa-muted">Installed version {data.installation.version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.</p>
+                  <label className="wa-field">
+                    <span>Package path or Git URL</span>
+                    <input className="wa-input" type="text" value={upgradeSource} onChange={event => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
+                      placeholder="/absolute/path/to/app or https://github.com/owner/repo"
+                      autoComplete="off" disabled={!canWrite || busy} />
+                  </label>
+                  <div className="wa-row">
+                    <Button disabled={!canWrite || busy || !upgradeSource.trim()} loading={busy}
+                      onClick={() => void mutate(async () => {
+                        const source = upgradeSource.trim();
+                        const receipt = await workspaceApps.upgradeCheck(installId, {
+                          source, expected_digest: data.installation.digest,
+                          expected_generation: data.installation.catalog_generation,
+                        });
+                        setUpgradeProposal({ source, receipt });
+                      })}>Check update</Button>
+                  </div>
+                  {upgradeProposal && <div className="wa-stack" aria-live="polite">
+                    <p className="wa-kicker">Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
+                    <p className="wa-muted">New digest: <code>{upgradeProposal.receipt.digest}</code></p>
+                    {(["added", "changed", "removed"] as const).map(kind => <p key={kind} className="wa-muted">
+                      {kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}
+                    </p>)}
+                    {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">Package validation reported secret warnings; review the source before applying.</p>}
+                    <p className="wa-muted">Applying preserves this installation, contexts, version-pinned bindings and completed work. New-version runs need a fresh app approval and new bindings.</p>
+                    <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
+                      onClick={() => void mutate(async () => {
+                        const { source, receipt } = upgradeProposal;
+                        await workspaceApps.upgrade(installId, {
+                          source, expected_digest: receipt.expected_digest,
+                          expected_generation: receipt.expected_generation,
+                          expected_new_digest: receipt.digest,
+                          request_id: retainedRequest(`${installId}.upgrade.${receipt.digest}`),
+                        });
+                        setUpgradeProposal(null);
+                        setUpgradeSource("");
+                      })}>Apply checked update</Button>
+                  </div>}
+                </section>
                 <section className="wa-panel wa-stack">
                   <h2>Local destination</h2>
                   <p className="wa-muted">

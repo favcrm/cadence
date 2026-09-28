@@ -268,7 +268,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding update lost its revision claim"));
         }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
         Self::event(
             &tx,
             "app_bindings",
@@ -297,7 +297,7 @@ impl Store {
         if updated != 1 {
             return Err(Error::rejected("binding revoke lost its revision claim"));
         }
-        Self::app_effect_invalidate_in(&tx, install, None, Some(id))?;
+        Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
         Self::event(
             &tx,
             "app_bindings",
