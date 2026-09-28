@@ -1,11 +1,18 @@
 ---
 app: social-content
 title: Social Content
-version: '0.2.0'
-summary: Turn pasted source facts into one independently reviewed zh-HK caption, with an explicit release to Local.
+version: '0.3.0'
+summary: Choose a retained public Instagram source or paste facts, review a zh-HK caption, then explicitly release to Local.
 needs:
   connections: []
   capabilities:
+    source:
+      schema: 1
+      capability: social.read
+      version: 1
+      action: list_posts
+      resource_kind: connection_account
+      effect: read
     publication:
       schema: 1
       capability: text.publish
@@ -17,11 +24,12 @@ needs:
 
 # Social Content — reviewed captions
 
-Choose Instagram or Facebook and make one caption per run from pasted
-source facts. This workspace bundle needs no project. The channel is a
-writing brief; releasing a caption delivers it to Local, not that social
-network. There is no social fetching, image generation, scheduling or
-external posting in this version.
+Choose Instagram or Facebook and make one caption per run from source
+facts. You can paste the facts or choose one retained public Instagram
+post through the `source-instagram` acquisition workflow. This workspace
+bundle needs no project. The channel is a writing brief; releasing a
+caption delivers it to Local, not that social network. Image generation,
+scheduling and external posting remain unavailable in this version.
 
 ## Set up once
 
@@ -39,8 +47,8 @@ run; brand settings never select workers or grant provider authority.
 
 For repeated work with a client, optionally create an app context with
 `brand_voice` and `protected_terms` string defaults. Both are explicitly
-eligible content defaults in both workflows. The source is always a new
-run input. A context is optional; omitting it creates a context-free run.
+eligible content defaults in both caption workflows. The source is always a
+new run input. A context is optional; omitting it creates a context-free run.
 Brand guidance and protected terms are quoted content, never commands
 that can override factual fidelity, the rubric or the result contract.
 
@@ -58,6 +66,33 @@ command and the run command. Follow `docs/guides/app-artifact-release.md`;
 a binding added after a run
 was frozen cannot authorize that old draft. Drafting without a binding
 is allowed but that run cannot subsequently release.
+
+## Read a public Instagram source
+
+The separate `agenticos_external` connection is an operator-enrolled,
+company-scoped AgenticOS device credential with `provider.read` audience.
+The provider keeps the Treg key and determines the company from the device
+credential. The operator must bind the installation's `source` capability
+to that connection, in the same context used for the later caption run.
+The bound provider action is the reviewed public Instagram posts read; no
+worker can choose another provider, account, profile, tool or effect.
+
+Create and approve a `source-instagram` run with a `profile_handle`
+selected by the operator, then dispatch it. The assigned worker invokes
+the run-bound `source` capability and returns the resulting receipt ID.
+The broker retains normalized posts and their origin. It never treats a
+worker's copied text as a source receipt. Only the operator can choose one
+post ID from that receipt for a caption run in the same installation and
+context. A private, missing, rate-limited, deleted or malformed source
+returns a visible refusal or an honest empty result; it never becomes
+sample content. A profile with no posts cannot verify its identity.
+
+For the caption run, include its `source_receipt_id` and
+`selected_post_id` and omit `inputs.source`. The server freezes the
+byte-exact selected caption and receipt digest, then inserts a derived
+single-line `source` input for the text workflow. A later rebind, revoke
+or different context cannot authorize an old receipt. A preview image URL
+is a display hint, not a retained image asset.
 
 ## New post
 

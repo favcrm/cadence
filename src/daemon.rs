@@ -3675,6 +3675,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // registers the AgenticOS adapter before the store opens. An
     // unconfigured daemon leaves it unregistered and fails closed.
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
+    crate::platform::agenticos_external::attach(&mut opts)?;
     let lease = crate::lease::acquire(state_dir, &hosted)?;
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;

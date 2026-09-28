@@ -14,7 +14,9 @@ import {
 } from "../../ui/icons";
 import { HorizontalStrip } from "./HorizontalStrip";
 import { WorkspaceDialog } from "./WorkspaceDialog";
-import { NewPost, type NewPostValues } from "./NewPost";
+import { NewPost, type NewPostValues, type SelectedSource } from "./NewPost";
+import { SourceImport, type SourceImportValues } from "./SourceImport";
+import { SourcesPanel } from "./SourcesPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import {
   workspaceApps,
@@ -36,7 +38,8 @@ type Section =
   | "Runs"
   | "Needs you"
   | "Settings"
-  | "Schedule";
+  | "Schedule"
+  | "Sources";
 type Snapshot = {
   installation: Installation;
   contexts: AppContext[];
@@ -68,6 +71,8 @@ export default function WorkspaceApp({
   const [contextId, setContextId] = useState("");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [selectedSource, setSelectedSource] = useState<SelectedSource | null>(null);
   const [busy, setBusy] = useState(false);
   const mutationLock = useRef(false);
   const activeRead = useRef<AbortController | null>(null);
@@ -81,6 +86,7 @@ export default function WorkspaceApp({
   const [brandVoice, setBrandVoice] = useState("");
   const [protectedTerms, setProtectedTerms] = useState("");
   const [connectionId, setConnectionId] = useState("");
+  const [sourceConnectionId, setSourceConnectionId] = useState("");
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
   const [outboxError, setOutboxError] = useState<string | null>(null);
   const [selectedEffectId, setSelectedEffectId] = useState("");
@@ -91,6 +97,7 @@ export default function WorkspaceApp({
     setLoading(false);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContextId(""); setConnectionId("");
+    setSourceConnectionId(""); setImporting(false); setSelectedSource(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
   }, []);
@@ -149,6 +156,7 @@ export default function WorkspaceApp({
   useEffect(() => {
     setData(null);
     setBrandName(""); setBrandVoice(""); setProtectedTerms(""); setConnectionId("");
+    setSourceConnectionId(""); setImporting(false); setSelectedSource(null);
     setContextId("");
     setSelectedRun(null);
     setSelectedEffectId("");
@@ -187,6 +195,9 @@ export default function WorkspaceApp({
   };
   const runs =
     data?.runs.filter((run) => (run.context_id ?? "") === contextId) ?? [];
+  const isSourceRun = (value: WorkspaceRun) => !!value.snapshot.inputs.profile_handle;
+  const sourceRuns = runs.filter(isSourceRun);
+  const postRuns = runs.filter(value => !isSourceRun(value));
   const effects =
     data?.effects.filter(
       (effect) => (effect.authority.context?.id ?? "") === contextId,
@@ -204,6 +215,7 @@ export default function WorkspaceApp({
       value.slot === "publication" &&
       value.state === "configured",
   );
+  const sourceBinding = data?.bindings.find(value => value.context_id === (contextId || null) && value.slot === "source" && value.state === "configured");
   const contexts =
     data?.contexts.filter((value) => value.state === "active") ?? [];
   const agents = data?.agents ?? [];
@@ -238,6 +250,7 @@ export default function WorkspaceApp({
       label: value === "instagram" ? "Instagram caption" : "Facebook post",
     }));
   const approved = data?.installation.approved === true;
+  const sourceEnabled = data?.installation.version === "0.3.0" && data.installation.files?.includes("workflows/source-instagram.md");
   useEffect(() => {
     setArtifact(null);
     setArtifactError(null);
@@ -303,19 +316,37 @@ export default function WorkspaceApp({
         workflow: values.workflow,
         inputs: {
           subject: values.title,
-          source: values.source,
+          ...(!values.sourceReceiptId ? { source: values.source } : {}),
           writer: values.writer,
           reviewer: values.reviewer,
         },
+        request_id: retainedRequest(requestKey),
+        owner_pm: values.ownerPm,
+        ...(values.sourceReceiptId && values.selectedPostId ? { source_receipt_id: values.sourceReceiptId, selected_post_id: values.selectedPostId } : {}),
+        ...(contextId ? { context_id: contextId } : {}),
+      });
+      completeRequest(requestKey);
+      if (identity.current !== installId) return;
+      setCreating(false);
+      setSelectedSource(null);
+      setSelectedRun(created.id);
+      setSelectedArtifact("");
+    });
+  const createSource = (values: SourceImportValues) =>
+    void mutate(async () => {
+      const requestKey = `${installId}.${contextId}.source.${JSON.stringify(values)}`;
+      const created = await workspaceApps.createRun({
+        install_id: installId,
+        workflow: "source-instagram",
+        inputs: { profile_handle: values.profileHandle, writer: values.writer },
         request_id: retainedRequest(requestKey),
         owner_pm: values.ownerPm,
         ...(contextId ? { context_id: contextId } : {}),
       });
       completeRequest(requestKey);
       if (identity.current !== installId) return;
-      setCreating(false);
+      setImporting(false);
       setSelectedRun(created.id);
-      setSelectedArtifact("");
     });
   const card = (value: WorkspaceRun) => {
     const released = effects.some(
@@ -351,7 +382,7 @@ export default function WorkspaceApp({
       </button>
     );
   };
-  const needs = runs.filter(
+  const needs = postRuns.filter(
     (value) =>
       ["awaiting_approval", "approved", "succeeded", "failed"].includes(
         value.state,
@@ -368,7 +399,7 @@ export default function WorkspaceApp({
     section === "Needs you"
       ? needs
       : section === "Library"
-        ? runs.filter((value) =>
+        ? postRuns.filter((value) =>
             value.artifacts.some((item) =>
               value.reviews.some(
                 (review) =>
@@ -377,22 +408,22 @@ export default function WorkspaceApp({
               ),
             ),
           )
-        : runs;
+        : postRuns;
   const lanes = [
     {
       id: "drafting",
       label: "Drafting",
-      rows: runs.filter((value) => runLane(value) === "drafting"),
+      rows: postRuns.filter((value) => runLane(value) === "drafting"),
     },
     {
       id: "review",
       label: "In review",
-      rows: runs.filter((value) => runLane(value) === "review"),
+      rows: postRuns.filter((value) => runLane(value) === "review"),
     },
     {
       id: "waiting",
       label: "Needs you",
-      rows: runs.filter(
+      rows: postRuns.filter(
         (value) =>
           runLane(value) === "waiting" &&
           !effects.some(
@@ -404,7 +435,7 @@ export default function WorkspaceApp({
     {
       id: "released",
       label: "Released to Local",
-      rows: runs.filter((value) =>
+      rows: postRuns.filter((value) =>
         effects.some(
           (effect) =>
             effect.authority.run_id === value.id && effect.state === "done",
@@ -413,7 +444,7 @@ export default function WorkspaceApp({
     },
   ];
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
-  if (data && (data.installation.name !== "social-content" || data.installation.version !== "0.2.0" || workflowOptions.length !== 2)) {
+  if (data && (data.installation.name !== "social-content" || !["0.2.0", "0.3.0"].includes(data.installation.version) || workflowOptions.length !== 2)) {
     return <main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
@@ -482,6 +513,8 @@ export default function WorkspaceApp({
                 onChange={(value) => {
                   setContextId(value);
                   setConnectionId("");
+                  setSourceConnectionId("");
+                  setSelectedSource(null);
                   setSelectedRun(null);
                   setSelectedArtifact("");
                   setActionError(null);
@@ -550,6 +583,7 @@ export default function WorkspaceApp({
               [
                 "Board",
                 "Library",
+                ...(sourceEnabled ? ["Sources"] : []),
                 "Runs",
                 "Needs you",
                 "Schedule",
@@ -622,10 +656,21 @@ export default function WorkspaceApp({
                   you explicitly release it to Local.
                 </p>
                 <p className="wa-kicker">
-                  Instagram and Facebook publishing, remote imports and images
+                  Instagram and Facebook publishing and generated images
                   aren’t connected.
                 </p>
               </section>
+            )}
+            {section === "Sources" && sourceEnabled && (
+              <SourcesPanel
+                runs={sourceRuns}
+                canWrite={canWrite && approved && !!sourceBinding}
+                canCreate={canWrite && approved && !!binding}
+                onImport={() => { setActionError(null); setImporting(true); }}
+                onOpenRun={openRun}
+                onPick={source => { setSelectedSource(source); setCreating(true); setActionError(null); }}
+                onDenied={clearPrivate}
+              />
             )}
             {section === "Settings" && (
               <div className="wa-stack">
@@ -711,6 +756,34 @@ export default function WorkspaceApp({
                     </p>
                   )}
                 </section>
+                {sourceEnabled && <section className="wa-panel wa-stack">
+                  <h2>Instagram source connection</h2>
+                  <p className="wa-muted">Bind this installation and brand context to a company-scoped AgenticOS device credential with provider.read access. A source run freezes this binding before any provider read.</p>
+                  {sourceBinding && <p className="wa-kicker">Configured · revision {sourceBinding.revision} · {sourceBinding.config.account}</p>}
+                  <div className="wa-row">
+                    <div className="wa-context">
+                      <Select
+                        value={sourceConnectionId || sourceBinding?.config.connection_id || ""}
+                        onChange={setSourceConnectionId}
+                        options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "social.read" && mapping.action === "list_posts" && mapping.effect === "read") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
+                        placeholder="Choose AgenticOS connection"
+                        aria-label="Instagram source connection"
+                        disabled={!canWrite || busy}
+                        full
+                      />
+                    </div>
+                    <Button
+                      disabled={!canWrite || busy || !(sourceConnectionId || sourceBinding?.config.connection_id) || (sourceBinding !== undefined && (sourceConnectionId || sourceBinding.config.connection_id) === sourceBinding.config.connection_id)}
+                      loading={busy}
+                      onClick={() => void mutate(async () => {
+                        const selected = sourceConnectionId || sourceBinding?.config.connection_id || "";
+                        if (sourceBinding) await workspaceApps.updateBinding(installId, sourceBinding.id, { expected_revision: sourceBinding.revision, connection_id: selected });
+                        else await workspaceApps.createBinding(installId, { slot: "source", connection_id: selected, request_id: retainedRequest(`${installId}.${contextId}.source-binding.${selected}`), ...(contextId ? { context_id: contextId } : {}) });
+                      })}
+                    >Save source connection</Button>
+                  </div>
+                  {!data.connections.some(value => value.provider === "agenticos_external") && <p className="wa-alert">No AgenticOS external connection is enrolled. Ask the operator to connect a company-scoped provider.read device credential first.</p>}
+                </section>}
                 <section className="wa-panel wa-stack">
                   <h2>Brand contexts</h2>
                   <p className="wa-muted">
@@ -758,6 +831,7 @@ export default function WorkspaceApp({
                           setBrandVoice("");
                           setProtectedTerms("");
                           setConnectionId("");
+                          setSourceConnectionId("");
                         }
                       });
                     }}
@@ -821,9 +895,7 @@ export default function WorkspaceApp({
                 <section className="wa-panel wa-stack">
                   <h2>Available in this version</h2>
                   <p className="wa-muted">
-                    Pasted text → actual writer → independent review → explicit
-                    Local release. Remote sources, image generation, external
-                    publishing and scheduling are unavailable.
+                    {sourceEnabled ? "Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable." : "Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable."}
                   </p>
                   <details className="wa-details">
                     <summary>Installation details</summary>
@@ -846,13 +918,44 @@ export default function WorkspaceApp({
           managers={options(managers)}
           busy={busy}
           error={actionError}
+          selectedSource={selectedSource}
           onClose={() => {
-            if (!busy) setCreating(false);
+            if (!busy) { setCreating(false); setSelectedSource(null); }
           }}
           onCreate={create}
         />
       )}
-      {run && (
+      {importing && sourceEnabled && (
+        <SourceImport
+          installId={installId}
+          contextId={contextId || undefined}
+          bindingDigest={sourceBinding?.digest || ""}
+          workers={options(workers)}
+          managers={options(managers)}
+          busy={busy}
+          error={actionError}
+          onDenied={clearPrivate}
+          onClose={() => { if (!busy) setImporting(false); }}
+          onCreate={createSource}
+        />
+      )}
+      {run && isSourceRun(run) && (
+        <WorkspaceDialog title={`Read @${run.snapshot.inputs.profile_handle}`} onClose={() => { if (!busy) setSelectedRun(null); }}>
+          <div className="wa-stack">
+            {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
+            <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
+            <p className="wa-muted">This run reads public posts from the frozen @{run.snapshot.inputs.profile_handle} profile. It cannot publish or generate an image.</p>
+            {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">Frozen provider charge: <strong>USD {(run.snapshot.quotes.source.total_price_micros / 1_000_000).toFixed(6)}</strong> for one read. Binding {run.snapshot.capabilities?.source?.digest || "unavailable"}. A changed quote or binding stops dispatch.</p> : <p className="wa-alert" data-tone="fail">This source plan has no verified provider quote. It cannot be approved.</p>}
+            <details className="wa-details"><summary>Inspect the exact source plan</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
+            {run.state === "awaiting_approval" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>Approve source plan</Button>}
+            {run.state === "approved" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>Start source reader</Button>}
+            {run.state === "running" && <p className="wa-muted" role="status">Waiting for the assigned reader and provider receipt. Refresh Sources to see retained posts.</p>}
+            {run.state === "failed" && <p className="wa-alert" data-tone="fail">The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.</p>}
+            {run.state === "succeeded" && <p className="wa-muted">The provider receipt is available in Sources. Choose one post there to start a caption.</p>}
+          </div>
+        </WorkspaceDialog>
+      )}
+      {run && !isSourceRun(run) && (
         <WorkspaceDialog
           title={plainTitle(run.snapshot.inputs, run.snapshot.workflow.title)}
           onClose={() => {

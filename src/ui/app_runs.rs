@@ -17,6 +17,8 @@ pub(super) enum Route<'a> {
     List,
     Show(&'a str),
     Artifact(&'a str),
+    CapabilityResults(&'a str),
+    CapabilityResult(&'a str),
     InstallDecision(&'a str, bool),
     RunDecision(&'a str),
     Cancel(&'a str),
@@ -36,6 +38,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     if let Some(id) = path.strip_prefix("/api/app-run-artifacts/") {
         return segment(id).then_some(Route::Artifact(id));
     }
+    if let Some(id) = path.strip_prefix("/api/app-capability-results/") {
+        return segment(id).then_some(Route::CapabilityResult(id));
+    }
     if let Some(tail) = path.strip_prefix("/api/app-runs/") {
         if let Some((id, verb)) = tail.split_once('/') {
             if !segment(id) {
@@ -45,6 +50,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
                 "approve" => Some(Route::RunDecision(id)),
                 "cancel" => Some(Route::Cancel(id)),
                 "dispatch" => Some(Route::Dispatch(id)),
+                "capability-results" => Some(Route::CapabilityResults(id)),
                 _ => None,
             };
         }
@@ -63,7 +69,14 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
 }
 impl Route<'_> {
     pub(super) fn is_read(self) -> bool {
-        matches!(self, Self::List | Self::Show(_) | Self::Artifact(_))
+        matches!(
+            self,
+            Self::List
+                | Self::Show(_)
+                | Self::Artifact(_)
+                | Self::CapabilityResults(_)
+                | Self::CapabilityResult(_)
+        )
     }
 }
 #[derive(Deserialize, Serialize)]
@@ -82,6 +95,10 @@ struct Create {
         skip_serializing_if = "Option::is_none"
     )]
     context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_receipt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_post_id: Option<String>,
 }
 fn present_context<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
@@ -151,6 +168,8 @@ pub(super) fn handle(
         Route::List => ("app_run_list", params),
         Route::Show(id) => ("app_run_show", json!({"run_id":id})),
         Route::Artifact(id) => ("app_run_artifact", json!({"artifact_id":id})),
+        Route::CapabilityResults(id) => ("app_run_capability_results", json!({"run_id":id})),
+        Route::CapabilityResult(id) => ("app_run_capability_result", json!({"receipt_id":id})),
         Route::Create => {
             let bytes = match read_body(request, BODY_CAP) {
                 Ok(bytes) => bytes,
@@ -248,6 +267,14 @@ mod tests {
             Some(Route::Show("run-a"))
         ));
         assert!(matches!(
+            route("/api/app-runs/run-a/capability-results"),
+            Some(Route::CapabilityResults("run-a"))
+        ));
+        assert!(matches!(
+            route("/api/app-capability-results/receipt-a"),
+            Some(Route::CapabilityResult("receipt-a"))
+        ));
+        assert!(matches!(
             route("/api/app-installations/install-a/approve"),
             Some(Route::InstallDecision("install-a", true))
         ));
@@ -257,6 +284,8 @@ mod tests {
             "/api/app-runs/a/retry",
             "/api/app-run-artifacts/a/b",
             "/api/app-runs/",
+            "/api/app-runs/run-a/capability-results/other",
+            "/api/app-capability-results/receipt-a/asset",
         ] {
             assert!(route(path).is_none(), "route admitted {path}");
         }
@@ -271,6 +300,9 @@ mod tests {
             r#"{"install_id":"i","workflow":"w","inputs":{"x":1},"request_id":"r","owner_pm":"p"}"#
         )
         .is_err());
+        assert!(serde_json::from_str::<Create>(
+            r#"{"install_id":"i","workflow":"w","inputs":{},"request_id":"r","owner_pm":"p","selected_post_id":"p","source_receipt_id":"r","account":"other"}"#
+        ).is_err());
     }
 
     #[test]
