@@ -10,6 +10,16 @@ export interface NewPostValues {
   reviewer: string;
   ownerPm: string;
   workflow: string;
+  sourceReceiptId?: string;
+  selectedPostId?: string;
+}
+
+export interface SelectedSource {
+  receiptId: string;
+  postId: string;
+  handle: string;
+  caption: string;
+  permalink: string;
 }
 
 export function NewPost({
@@ -20,6 +30,7 @@ export function NewPost({
   error,
   onClose,
   onCreate,
+  selectedSource,
 }: {
   workflows: SelectOption[];
   workers: SelectOption[];
@@ -28,9 +39,11 @@ export function NewPost({
   error: string | null;
   onClose: () => void;
   onCreate: (values: NewPostValues) => void;
+  selectedSource?: SelectedSource | null;
 }) {
   const [title, setTitle] = useState("");
-  const [source, setSource] = useState("");
+  const [source, setSource] = useState(selectedSource?.caption ?? "");
+  const [sourceChoice, setSourceChoice] = useState(selectedSource ?? null);
   const [writer, setWriter] = useState("");
   const [reviewer, setReviewer] = useState("");
   const [ownerPm, setOwnerPm] = useState("");
@@ -49,7 +62,7 @@ export function NewPost({
     const invalid =
       !title.trim() || !source.trim()
         ? "Enter a post title and source facts."
-        : /[\r\n\t]/.test(title) || /[\r\n\t]/.test(source)
+        : /[\r\n\t]/.test(title) || (!sourceChoice && /[\r\n\t]/.test(source))
           ? "Title and source facts must be one paragraph without line breaks or tabs for this workflow."
           : !workflow
             ? "Choose a workflow."
@@ -76,15 +89,15 @@ export function NewPost({
       reviewer,
       ownerPm,
       workflow,
+      ...(sourceChoice ? { sourceReceiptId: sourceChoice.receiptId, selectedPostId: sourceChoice.postId } : {}),
     });
   };
   return (
     <WorkspaceDialog title="New post" onClose={onClose}>
       <form className="wa-stack" onSubmit={submit}>
         <p className="wa-muted">
-          Paste the facts your team should use. You’ll review the frozen plan
-          before the writer starts. Releasing the accepted text is a separate
-          decision.
+          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. The exact source receipt and post are frozen into the plan." : "Paste the facts your team should use. You’ll review the frozen plan"}
+          {!sourceChoice && " before the writer starts. Releasing the accepted text is a separate decision."}
         </p>
         {(error || validation) && (
           <p className="wa-alert" data-tone="fail" role="alert">
@@ -115,12 +128,13 @@ export function NewPost({
             required
             maxLength={10000}
             disabled={busy}
+            readOnly={!!sourceChoice}
             aria-describedby="wa-source-help"
           />
           <p id="wa-source-help" className="wa-kicker">
-            Paste one paragraph without line breaks. Text only; remote imports
-            and image generation aren’t available yet.
+            {sourceChoice ? <>From @{sourceChoice.handle} · <a href={sourceChoice.permalink} target="_blank" rel="noopener noreferrer">View original post</a> · receipt {sourceChoice.receiptId}. The selected text cannot be edited while linked to this receipt.</> : "Paste one paragraph without line breaks. Image generation isn’t available yet."}
           </p>
+          {sourceChoice && <Button onClick={() => { setSourceChoice(null); setSource(""); }}>Use pasted facts instead</Button>}
         </div>
         <div className="wa-fields">
           <div className="wa-field">

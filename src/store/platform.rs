@@ -535,8 +535,11 @@ impl Store {
         rotated: bool,
         risk: Option<&str>,
     ) -> Result<()> {
-        identifier(&record.platform, "Platform")?;
-        identifier(&record.account, "Account")?;
+        crate::platform::connections::provider_identifier(&record.platform, "Platform")?;
+        crate::platform::connections::provider_account_identifier(
+            &record.platform,
+            &record.account,
+        )?;
         identifier(&record.connection_id, "Connection id")?;
         if record.credential_revision > i64::MAX as u64 {
             return Err(Error::rejected("connection revision exceeds storage bound"));

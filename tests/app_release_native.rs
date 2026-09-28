@@ -260,6 +260,273 @@ fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
 }
 
 #[test]
+fn cad709_failed_run_retains_verified_source_for_a_new_plan_without_another_read() {
+    let (h, calls, _) = Release::with_capability();
+    let context = h.context("Recovery client", A, "source-recovery-context");
+    let binding = h
+        .daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"], "context_id":context["id"],
+                "slot":"source", "connection_id":h.connection,
+                "request_id":"source-recovery-binding"
+            }),
+        )
+        .unwrap()["binding"]
+        .clone();
+    let run = h.create(&context, "source-recovery-read");
+    let run_id = run["id"].as_str().unwrap();
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("app-capability-probe-{run_id}.json")),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    // The broker persists the paid read, then the independent reviewer fails.
+    std::fs::write(
+        h.daemon
+            .state
+            .join(format!("app-review-asset-override-{run_id}.json")),
+        json!({"asset_receipt_id":"missing-receipt","asset_sha256":"sha256:missing"}).to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+    assert_eq!(h.wait_state(run_id, "failed")["state"], "failed");
+    let receipt = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run_id}))
+        .unwrap()["results"][0]
+        .clone();
+    assert_eq!(receipt["slot"], "source");
+    assert_eq!(receipt["binding_digest"], binding["digest"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let selected = h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                "inputs":{"subject":"Recovered source","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"source-recovery-caption","owner_pm":OWNER,
+                "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        selected["snapshot"]["source"]["receipt_digest"],
+        receipt["digest"]
+    );
+    assert_eq!(selected["snapshot"]["source"]["source_run_id"], run["id"]);
+    assert_eq!(
+        selected["snapshot"]["inputs"]["source"],
+        format!("CONTEXT_SOURCE={A} Second line")
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "selection re-ran the paid provider read"
+    );
+    let mut lane = LaneShell::spawn(h.root.path());
+    plant_member_pane(
+        &h.daemon,
+        "source-native-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    for detached in [false, true] {
+        assert_eq!(
+            native(
+                &mut lane,
+                &h.daemon.state,
+                detached,
+                "app_run_create",
+                json!({
+                    "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                    "inputs":{"subject":"Stolen source","writer":WRITER,"reviewer":REVIEWER},
+                    "request_id":"source-recovery-stolen","owner_pm":OWNER,
+                    "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+                })
+            )["ok"],
+            false,
+            "agent or detached child selected an operator source receipt"
+        );
+    }
+
+    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE app_runs SET approved_digest=NULL WHERE id=?",
+        [run_id],
+    )
+    .unwrap();
+    assert!(h.daemon.operator_rpc("app_run_create", json!({
+        "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+        "inputs":{"subject":"Lost approval","writer":WRITER,"reviewer":REVIEWER},
+        "request_id":"source-recovery-no-approval","owner_pm":OWNER,
+        "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+    })).is_err(), "a failed run with lost approval cannot release a receipt");
+    db.execute(
+        "UPDATE app_runs SET approved_digest=? WHERE id=?",
+        rusqlite::params![run["snapshot_digest"].as_str(), run_id],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE app_capability_claims SET call_id='other-call' WHERE run_id=? AND slot='source'",
+        [run_id],
+    )
+    .unwrap();
+    assert!(h.daemon.operator_rpc("app_run_create", json!({
+        "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+        "inputs":{"subject":"Broken claim","writer":WRITER,"reviewer":REVIEWER},
+        "request_id":"source-recovery-no-claim","owner_pm":OWNER,
+        "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+    })).is_err(), "a receipt without the original broker claim cannot be reused");
+    db.execute(
+        "UPDATE app_capability_claims SET call_id=? WHERE run_id=? AND slot='source'",
+        rusqlite::params![receipt["id"].as_str(), run_id],
+    )
+    .unwrap();
+
+    for (request_id, context_id, post_id, supplied) in [
+        (
+            "source-recovery-forged-post",
+            context["id"].clone(),
+            "other-post",
+            None,
+        ),
+        (
+            "source-recovery-forged-caption",
+            context["id"].clone(),
+            "post-1",
+            Some("forged"),
+        ),
+    ] {
+        let mut inputs = json!({"subject":"Forged","writer":WRITER,"reviewer":REVIEWER});
+        if let Some(text) = supplied {
+            inputs["source"] = json!(text);
+        }
+        assert!(h
+            .daemon
+            .operator_rpc(
+                "app_run_create",
+                json!({
+                    "install_id":h.install["install_id"],"context_id":context_id,"workflow":"draft",
+                    "inputs":inputs,"request_id":request_id,"owner_pm":OWNER,
+                    "source_receipt_id":receipt["id"],"selected_post_id":post_id
+                })
+            )
+            .is_err());
+    }
+    let other = h.context("Other client", B, "source-recovery-other-context");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":other["id"],"slot":"source",
+                "connection_id":h.connection,"request_id":"source-recovery-other-binding"
+            }),
+        )
+        .unwrap();
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":other["id"],"workflow":"draft",
+                "inputs":{"subject":"Cross context","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"source-recovery-cross-context","owner_pm":OWNER,
+                "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+            })
+        )
+        .is_err());
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({
+                "install_id":h.install["install_id"],"binding_id":binding["id"],
+                "expected_revision":binding["revision"]
+            }),
+        )
+        .unwrap();
+    assert!(h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                "inputs":{"subject":"Stale binding","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"source-recovery-stale-binding","owner_pm":OWNER,
+                "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+            })
+        )
+        .is_err());
+}
+
+#[test]
+fn cad709_context_free_capability_run_approves_only_its_frozen_snapshot() {
+    let (h, _calls, _price) = Release::with_capability();
+    for (slot, request_id) in [
+        ("publication", "context-free-capability-publication"),
+        ("source", "context-free-capability-source"),
+    ] {
+        let binding = h
+            .daemon
+            .operator_rpc(
+                "app_binding_create",
+                json!({"install_id":h.install["install_id"],"slot":slot,
+                    "connection_id":h.connection,"request_id":request_id}),
+            )
+            .unwrap()["binding"]
+            .clone();
+        assert!(binding["context_id"].is_null());
+    }
+    let created = h
+        .daemon
+        .operator_rpc(
+            "app_run_create",
+            json!({"install_id":h.install["install_id"],"workflow":"draft",
+                "inputs":{"subject":"No brand context","source":format!("CONTEXT_SOURCE={A}"),
+                    "writer":WRITER,"reviewer":REVIEWER},
+                "request_id":"context-free-capability-run","owner_pm":OWNER}),
+        )
+        .unwrap();
+    assert_eq!(created["snapshot"]["schema"], 4);
+    assert!(created["context_id"].is_null());
+    assert_eq!(created["snapshot"].get("context"), Some(&Value::Null));
+    assert!(created["snapshot"]["capabilities"]["source"].is_object());
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({"run_id":created["id"],"digest":created["snapshot_digest"],
+                "context_id":"forged-context"}),
+            )
+            .is_err(),
+        "caller cannot supply a context to a context-free approval"
+    );
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_run_approve",
+                json!({"run_id":created["id"],"digest":"forged-snapshot-digest"}),
+            )
+            .is_err(),
+        "caller cannot approve a different snapshot"
+    );
+    let approved = h
+        .daemon
+        .operator_rpc(
+            "app_run_approve",
+            json!({"run_id":created["id"],"digest":created["snapshot_digest"]}),
+        )
+        .unwrap();
+    assert_eq!(approved["state"], "approved");
+}
+
+#[test]
 fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
     let (h, calls, _) = Release::with_capability();
     let context = h.context("Client A", A, "asset-context-a");

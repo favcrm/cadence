@@ -1,7 +1,6 @@
 //! Operator discovery and custody management. No capability grants are created.
 use super::*;
 use crate::platform;
-use crate::proto::identifier;
 use crate::store::CredentialRecord;
 
 impl Shared {
@@ -156,8 +155,14 @@ impl Shared {
                 Ok(json!({"connection":row}))
             }
             "connection_create" => {
-                let provider = identifier(required_str(params, "provider")?, "Provider")?;
-                let account = identifier(required_str(params, "account")?, "Account")?;
+                let provider = platform::connections::provider_identifier(
+                    required_str(params, "provider")?,
+                    "Provider",
+                )?;
+                let account = platform::connections::provider_account_identifier(
+                    &provider,
+                    required_str(params, "account")?,
+                )?;
                 let descriptor = self.connection_descriptor(&provider)?;
                 let shape = required_str(params, "shape")?;
                 if platform::is_builtin(&provider, &account)

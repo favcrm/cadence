@@ -36,11 +36,33 @@ export interface WorkspaceRun {
     workflow: { title: string; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
     context?: { id: string; revision: number; digest: string } | null;
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };
+    capabilities?: Record<string, { id: string; revision: number; digest: string }>;
+    quotes?: Record<string, CapabilityQuote["quote"]>;
     assignments: Record<string, { alias: string; role: string; provider: string }>;
   };
   steps: { step_id: string; task_id: string; state: string; message_id: string | null }[];
   artifacts: ArtifactReceipt[];
   reviews: { step_id: string; artifact_digest: string; reviewer: string; decision: string; rationale: string }[];
+}
+export interface SourcePost {
+  id: string; caption: string; permalink: string; published_at: string | null;
+  published_at_unix: number | null; media_kind: string; preview_url: string | null;
+}
+export interface SourceReceipt {
+  id: string; run_id: string; slot: string; digest: string; binding_digest: string;
+  result: {
+    schema: 1; kind: "social.source.posts"; provider: "agenticos_external";
+    source_tool: "scrapecreators.instagram.user.posts"; handle: string;
+    profile_verified: boolean; empty_reason: string | null;
+    posts: SourcePost[]; more_available: boolean;
+    charge?: { currency: string; scale: number; amount: string } | null;
+  };
+}
+export interface CapabilityQuote {
+  slot: string;
+  binding_digest: string;
+  quote_digest: string;
+  quote: { schema: 1; currency: "USD"; unit_price_micros: number; units: number; total_price_micros: number; price_revision: string };
 }
 export interface AppEffect {
   effect_id: string; request: string; state: string; needs_you: boolean; digest: string;
@@ -62,6 +84,7 @@ export interface AppEffect {
 export interface CreateRun {
   install_id: string; workflow: string; inputs: Record<string, string>;
   request_id: string; owner_pm: string; context_id?: string;
+  source_receipt_id?: string; selected_post_id?: string;
 }
 export interface WorkspaceOutbox {
   item: {
@@ -115,6 +138,9 @@ export const workspaceApps = {
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
   approveRun: (id: string, digest: string) => request<WorkspaceRun>(`${run(id)}/approve`, undefined, { digest }),
   dispatchRun: (id: string) => request<WorkspaceRun>(`${run(id)}/dispatch`, undefined, {}),
+  capabilityResults: async (id: string, signal?: AbortSignal) => (await request<{ results: SourceReceipt[] }>(`${run(id)}/capability-results`, signal)).results,
+  capabilityResult: (id: string, signal?: AbortSignal) => request<SourceReceipt>(`/api/app-capability-results/${part(id)}`, signal),
+  bindingQuote: (id: string, slot: string, contextId?: string, signal?: AbortSignal) => request<CapabilityQuote>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings/${part(slot)}/quote` : `${installation(id)}/bindings/${part(slot)}/quote`, signal),
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,

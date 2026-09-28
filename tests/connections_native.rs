@@ -2,17 +2,125 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::contract_fixture::FakePlatform;
+use cadence_agent::platform::agenticos_external::{AgenticosExternalAdapter, MANIFEST_PIN};
 use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
+
+const EXTERNAL_WORKSPACE: &str = "ws_11111111-1111-4111-8111-111111111111";
+const OTHER_EXTERNAL_WORKSPACE: &str = "ws_22222222-2222-4222-8222-222222222222";
 
 fn fixture() -> TestDaemon {
     let mut opts = daemon_opts();
     opts.test_seam = false;
     opts.platforms
         .insert("fixture".into(), Arc::new(FakePlatform::standard()));
+    opts.platforms.insert(
+        "agenticos_external".into(),
+        Arc::new(
+            AgenticosExternalAdapter::with_deployment_pin(
+                "https://api-v2.agenticos.hk",
+                Some(MANIFEST_PIN),
+            )
+            .unwrap(),
+        ),
+    );
     TestDaemon::start_opts(opts)
+}
+
+#[test]
+fn cad709_native_external_connection_accepts_only_registered_provider_and_operator() {
+    let d = fixture();
+    let create_external = |provider: &str, account: &str| {
+        json!({"provider":provider,"account":account,"shape":"token",
+            "token":"AAAAAAAAAAAAAAAAAAAA","scopes":["provider.read","provider.draft"],
+            "accept_same_uid_risk":true})
+    };
+    let created = d
+        .operator_rpc(
+            "connection_create",
+            create_external("agenticos_external", EXTERNAL_WORKSPACE),
+        )
+        .expect("the reviewed external provider must enroll through native RPC");
+    let id = created["connection"]["id"].as_str().unwrap();
+    assert_eq!(created["connection"]["provider"], "agenticos_external");
+    assert_eq!(
+        created["connection"]["status"]["manifest_status"],
+        "matched"
+    );
+    assert!(created["connection"]["status"]["custody_available"]
+        .as_bool()
+        .unwrap());
+    for provider in ["agenticos_other", "other_provider", "_agenticos_external"] {
+        assert!(
+            d.operator_rpc("connection_create", create_external(provider, "forged"))
+                .is_err(),
+            "unknown underscore provider enrolled: {provider}"
+        );
+    }
+    for account in [
+        "ws_fixture",
+        "ws_11111111-1111-4111-8111-111111111111/other",
+        "other",
+    ] {
+        assert!(
+            d.operator_rpc(
+                "connection_create",
+                create_external("agenticos_external", account)
+            )
+            .is_err(),
+            "non-workspace account enrolled: {account}"
+        );
+    }
+    assert!(
+        d.operator_rpc(
+            "platform_enroll",
+            json!({"platform":"agenticos_external","account":EXTERNAL_WORKSPACE,
+                "shape":"token","token":"AAAAAAAAAAAAAAAAAAAA",
+                "scopes":["provider.read"],"accept_same_uid_risk":true}),
+        )
+        .is_err(),
+        "legacy platform enrollment must not acquire the connection exception"
+    );
+    let before = d.operator_rpc("connection_list", json!({})).unwrap();
+    let mut lane = LaneShell::spawn(d.dir.path());
+    plant_member_pane(&d, "external-connection-peer", "claude", None, lane.pid());
+    for detached in [false, true] {
+        for params in [
+            create_external("agenticos_external", OTHER_EXTERNAL_WORKSPACE),
+            json!({"provider":"agenticos_external","account":OTHER_EXTERNAL_WORKSPACE,"shape":"token",
+                "token":"AAAAAAAAAAAAAAAAAAAA","scopes":["provider.read"],
+                "accept_same_uid_risk":true,"operator":true}),
+        ] {
+            let frame = native(&mut lane, &d.state, detached, "connection_create", params);
+            assert_eq!(
+                frame["ok"], false,
+                "agent/detached caller enrolled: {frame}"
+            );
+        }
+    }
+    assert_eq!(
+        d.operator_rpc("connection_list", json!({})).unwrap(),
+        before
+    );
+    assert_eq!(
+        d.operator_rpc("connection_show", json!({"connection_id":id}))
+            .unwrap(),
+        created
+    );
+    let rotated = d
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id":id,"token":"BBBBBBBBBBBBBBBBBBBB"}),
+        )
+        .unwrap();
+    assert_eq!(rotated["connection"]["id"], id);
+    d.operator_rpc("connection_revoke", json!({"connection_id":id}))
+        .unwrap();
+    assert!(d
+        .operator_rpc("connection_show", json!({"connection_id":id}))
+        .is_err());
 }
 fn create(account: &str, token: &str) -> Value {
     json!({"provider":"fixture","account":account,"shape":"token","token":token,"scopes":["widgets:read"],"accept_same_uid_risk":true})

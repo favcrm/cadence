@@ -64,12 +64,22 @@ through the existing custody lifecycle. Re-enrolling the same provider/account
 creates a new connection incarnation. An old ID cannot modify the replacement.
 No management command derives a new grant or approves an app/run.
 
-AgenticOS currently supports its hosted account, not an invented consent or
-self-hosted token flow. Default hosted registration lacks independently supplied
-deployment metadata and retains Cadence's Send approval gate. A matching trusted
-embedding assertion is not live remote verification. Recent post metadata is
-not media import; image generation and destination discovery are not added by
-this increment.
+The reviewed `agenticos_external` provider accepts a company-scoped AgenticOS
+device credential through token enrollment. Its account must be the exact
+canonical `ws_<lowercase UUID>` workspace ID returned by the device exchange;
+Cadence validates that shape but cannot derive the workspace from an opaque
+bearer during enrollment. Other underscore provider or account names remain
+invalid. Request
+`provider.read` and/or `provider.draft` at the AgenticOS consent screen and
+declare only the granted scopes on the connection. `cadence login` currently
+requests the separate `read draft` audience and does not enroll this connection.
+The external provider also needs an exact trusted deployment pin, app binding,
+quoted run and explicit run approval before any paid call. Connection checks
+are local and do not verify the credential against AgenticOS.
+
+The separate hosted `agenticos` account retains Cadence's Send approval gate
+without independently supplied deployment metadata. A matching trusted
+embedding assertion is not live remote verification.
 
 ## HTTP contract
 

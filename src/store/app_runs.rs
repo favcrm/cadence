@@ -357,7 +357,7 @@ impl Store {
             ).optional()?.ok_or_else(||Error::rejected("source receipt is unavailable"))?;
             if row.5 != install_id
                 || row.6.as_deref() != context.map(|c| c.id.as_str())
-                || row.7 != "succeeded"
+                || !matches!(row.7.as_str(), "succeeded" | "failed")
             {
                 return Err(Error::rejected(
                     "source receipt is outside this installation/context or incomplete",
@@ -365,6 +365,13 @@ impl Store {
             }
             let source_run = Self::app_run_show_in(&tx, &row.0)?;
             Self::app_current_in(&tx, &source_run, bundle_digest)?;
+            super::app_capabilities::source_receipt_recoverable_in(
+                &tx,
+                &source_run,
+                verified_source
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("source receipt is unavailable"))?,
+            )?;
             let source_binding = &source_run["snapshot"]["capabilities"][&row.1];
             if source_binding["digest"] != row.2
                 || source_binding["config"]["mapping"]["effect"] != "read"
@@ -792,7 +799,7 @@ impl Store {
             };
             Self::app_context_proof_current_in(conn, run["install_id"].as_str().unwrap(), &proof)?;
         } else if !((run["snapshot"]["schema"] == 1 && run["snapshot"].get("context").is_none())
-            || (run["snapshot"]["schema"] == 3
+            || (matches!(run["snapshot"]["schema"].as_u64(), Some(3 | 4))
                 && run["snapshot"].get("context").is_some_and(Value::is_null)))
         {
             return Err(Error::rejected(

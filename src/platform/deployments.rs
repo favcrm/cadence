@@ -74,7 +74,8 @@ impl DeploymentMetadata {
                 .or_else(|| entry.origin.strip_prefix("https://"))
                 .ok_or_else(refused)?;
             if !seen.insert(&entry.provider)
-                || crate::proto::identifier(&entry.provider, "Provider").is_err()
+                || (entry.provider != crate::platform::agenticos_external::PLATFORM
+                    && crate::proto::identifier(&entry.provider, "Provider").is_err())
                 || !valid_authority(authority)
                 || entry.manifest_pin.is_empty()
                 || entry.manifest_pin.len() > 256

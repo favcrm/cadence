@@ -11,6 +11,7 @@ const RESULT_CAP: usize = 4 * 1024 * 1024;
 pub(super) enum Route<'a> {
     Bindings(&'a str, Option<&'a str>),
     Binding(&'a str, &'a str),
+    Quote(&'a str, Option<&'a str>, &'a str),
     Update(&'a str, &'a str),
     Revoke(&'a str, &'a str),
     Stage(&'a str),
@@ -52,6 +53,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         [install, "bindings", binding] if segment(install) && segment(binding) => {
             Some(Route::Binding(install, binding))
         }
+        [install, "bindings", slot, "quote"] if segment(install) && segment(slot) => {
+            Some(Route::Quote(install, None, slot))
+        }
         [install, "bindings", binding, "update"] if segment(install) && segment(binding) => {
             Some(Route::Update(install, binding))
         }
@@ -61,6 +65,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         [install, "effects"] if segment(install) => Some(Route::Effects(Some(install), None)),
         [install, "contexts", context, "bindings"] if segment(install) && segment(context) => {
             Some(Route::Bindings(install, Some(context)))
+        }
+        [install, "contexts", context, "bindings", slot, "quote"]
+            if segment(install) && segment(context) && segment(slot) =>
+        {
+            Some(Route::Quote(install, Some(context), slot))
         }
         [install, "contexts", context, "effects"] if segment(install) && segment(context) => {
             Some(Route::Effects(Some(install), Some(context)))
@@ -72,7 +81,11 @@ impl Route<'_> {
     pub(super) fn is_read(self) -> bool {
         matches!(
             self,
-            Self::Bindings(..) | Self::Binding(..) | Self::Effects(..) | Self::Effect(_)
+            Self::Bindings(..)
+                | Self::Binding(..)
+                | Self::Quote(..)
+                | Self::Effects(..)
+                | Self::Effect(_)
         )
     }
     pub(super) fn is_write(self) -> bool {
@@ -193,6 +206,11 @@ pub(super) fn handle(
                 "app_binding_show",
                 json!({"install_id":install,"binding_id":binding}),
             ),
+            Route::Quote(install, context, slot) => {
+                let mut params = scoped(Some(install), context);
+                params["slot"] = json!(slot);
+                ("app_binding_quote", params)
+            }
             Route::Update(install, binding) => {
                 let mut params = typed::<Update>(request)?;
                 params["install_id"] = json!(install);
@@ -261,6 +279,14 @@ mod tests {
             Some(Route::Bindings("install-a", None))
         ));
         assert!(matches!(
+            route("/api/app-installations/install-a/bindings/source/quote"),
+            Some(Route::Quote("install-a", None, "source"))
+        ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/brand-a/bindings/source/quote"),
+            Some(Route::Quote("install-a", Some("brand-a"), "source"))
+        ));
+        assert!(matches!(
             route("/api/app-installations/install-a/contexts/context-a/effects"),
             Some(Route::Effects(Some("install-a"), Some("context-a")))
         ));
@@ -280,6 +306,8 @@ mod tests {
             "/api/app-effects/e/retry",
             "/api/app-effects/",
             "/api/app-installations/i/contexts/c/bindings/b",
+            "/api/app-installations/i/bindings/source/quote/other",
+            "/api/app-installations/i/contexts/c/bindings/source/quote/other",
         ] {
             assert!(route(path).is_none(), "admitted {path}");
         }

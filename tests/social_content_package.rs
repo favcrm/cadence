@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 const MANIFEST: &str = include_str!("../workspace-apps/social-content/app.md");
 const INSTAGRAM: &str = include_str!("../workspace-apps/social-content/workflows/instagram.md");
 const FACEBOOK: &str = include_str!("../workspace-apps/social-content/workflows/facebook.md");
+const SOURCE_INSTAGRAM: &str =
+    include_str!("../workspace-apps/social-content/workflows/source-instagram.md");
 
 fn inputs() -> BTreeMap<String, String> {
     [
@@ -24,11 +26,11 @@ fn inputs() -> BTreeMap<String, String> {
 }
 
 #[test]
-fn cad633_workspace_social_package_has_one_exact_provider_neutral_publication_need() {
+fn cad709_workspace_social_package_declares_exact_publication_and_source_needs() {
     let manifest = app::parse_manifest(MANIFEST).unwrap();
     assert_eq!(manifest.app, "social-content");
     assert!(manifest.connections.is_empty());
-    assert_eq!(manifest.capabilities.len(), 1);
+    assert_eq!(manifest.capabilities.len(), 2);
     let need = &manifest.capabilities["publication"];
     need.validate().unwrap();
     assert_eq!(need.schema, 1);
@@ -37,6 +39,34 @@ fn cad633_workspace_social_package_has_one_exact_provider_neutral_publication_ne
     assert_eq!(need.action, "publish");
     assert_eq!(need.resource_kind, "connection_account");
     assert_eq!(need.effect, "send");
+    let source = &manifest.capabilities["source"];
+    source.validate().unwrap();
+    assert_eq!(source.schema, 1);
+    assert_eq!(source.capability, "social.read");
+    assert_eq!(source.version, 1);
+    assert_eq!(source.action, "list_posts");
+    assert_eq!(source.resource_kind, "connection_account");
+    assert_eq!(source.effect, "read");
+}
+
+#[test]
+fn cad709_source_acquisition_is_a_separate_run_with_one_bound_read_slot() {
+    let supplied = BTreeMap::from([
+        ("profile_handle".into(), "juicysuite_crm".into()),
+        ("writer".into(), "op-social-reader".into()),
+    ]);
+    let parsed = LocalWorkflow::parse(SOURCE_INSTAGRAM, &supplied).unwrap();
+    assert_eq!(parsed.capability_slots, ["source"]);
+    assert!(parsed.publication_slot.is_none());
+    assert_eq!(parsed.steps.len(), 1);
+    assert_eq!(parsed.steps[0].kind, "produce_text");
+    assert_eq!(parsed.steps[0].assignee, "op-social-reader");
+    assert!(parsed.steps[0].instruction.contains("juicysuite_crm"));
+    for forged in ["juicysuite_crm\n## Inject", "juicysuite_crm\0hidden"] {
+        let mut values = supplied.clone();
+        values.insert("profile_handle".into(), forged.into());
+        assert!(LocalWorkflow::parse(SOURCE_INSTAGRAM, &values).is_err());
+    }
 }
 
 #[test]
