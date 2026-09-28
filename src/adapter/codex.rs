@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 /// Quota is advisory startup telemetry. A provider/auth mode that does not
 /// expose the endpoint must not hold an agent open for a turn window.
 const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
+const SANDBOX_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+const SANDBOX_PROBE_OUTPUT_LIMIT: usize = 2048;
 
 const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
@@ -299,6 +302,74 @@ fn codex_ws_command(env: &ProviderEnv) -> Vec<String> {
         .collect()
 }
 
+/// The provider's own sandbox entry point. The override is for isolated
+/// provider fixtures, like the app-server command overrides above.
+fn codex_sandbox_command(env: &ProviderEnv) -> Vec<String> {
+    if let Some(cmd) = env.var("CADENCE_CODEX_SANDBOX_COMMAND") {
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+    vec!["codex".to_string()]
+}
+
+fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str) -> Result<()> {
+    // Validation also happens before the app-server thread request. A corrupt
+    // row must not turn into a broader `codex sandbox` default here.
+    registry::codex_sandbox(sandbox)?;
+    let mut probe = Command::new(&command[0]);
+    probe.args(&command[1..]);
+    probe.args([
+        "sandbox",
+        "-c",
+        &format!("sandbox_mode=\"{sandbox}\""),
+        "-C",
+        cwd,
+        "--",
+    ]);
+    let file = if sandbox == "workspace-write" {
+        let file = tempfile::NamedTempFile::new_in(cwd).map_err(|error| {
+            Error::provider(format!("Codex workspace-write readiness file: {error}"))
+        })?;
+        probe.args([
+            "/bin/sh",
+            "-c",
+            "printf cadence > \"$1\" && test \"$(cat \"$1\")\" = cadence",
+            "--",
+        ]);
+        probe.arg(file.path());
+        Some(file)
+    } else {
+        probe.arg("/bin/true");
+        None
+    };
+    let result = crate::proc::run_bounded_limited(
+        &mut probe,
+        SANDBOX_PROBE_DEADLINE,
+        SANDBOX_PROBE_OUTPUT_LIMIT,
+    );
+    drop(file);
+    let (output, bounds) = result.map_err(|error| {
+        Error::provider(format!(
+            "Codex sandbox readiness failed ({sandbox}): {error}. Check the host's \
+             confined sandbox prerequisites before assigning this worker \
+             (Ubuntu 24.04: bwrap AppArmor user namespace profile)."
+        ))
+    })?;
+    if !output.status.success() || bounds.stdout_exceeded || bounds.stderr_exceeded {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().lines().next().unwrap_or("no error detail");
+        return Err(Error::provider(format!(
+            "Codex sandbox readiness failed ({sandbox}, exit {}): {detail}. \
+             Check the host's confined sandbox prerequisites before assigning \
+             this worker (Ubuntu 24.04: bwrap AppArmor user namespace profile).",
+            output.status
+        )));
+    }
+    Ok(())
+}
+
 /// Owned provider process + wire transport, selected by endpoint kind.
 pub enum Transport {
     Stdio(Arc<StdioAdapter>),
@@ -390,6 +461,7 @@ pub struct CodexAdapter {
     transport: Transport,
     shared: Arc<Shared>,
     log_path: PathBuf,
+    sandbox_command: Vec<String>,
 }
 
 /// `turnId → itemId → agentMessage item`, collected while a turn runs.
@@ -459,6 +531,7 @@ impl CodexAdapter {
             transport: Self::build_transport(&codex_command(env), false, &shared),
             shared,
             log_path: log_path.to_path_buf(),
+            sandbox_command: codex_sandbox_command(env),
         }
     }
 
@@ -470,6 +543,7 @@ impl CodexAdapter {
             transport: Self::build_transport(&codex_ws_command(env), true, &shared),
             shared,
             log_path: log_path.to_path_buf(),
+            sandbox_command: codex_sandbox_command(env),
         }
     }
 
@@ -751,6 +825,7 @@ impl ProviderAdapter for CodexAdapter {
         // keeps a hand-edited store from reaching `thread/start`, and
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
+        sandbox_probe(&self.sandbox_command, &agent.cwd, &agent.sandbox)?;
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.

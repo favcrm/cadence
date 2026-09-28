@@ -30,6 +30,48 @@ shasum or openssl. Installing the binary does not require Node, Rust, a GitHub
 login or an AgenticOS login. Provider CLIs, their credentials and, for native
 terminal providers, tmux are separate runtime requirements.
 
+### Managed Codex on Ubuntu 24.04
+
+Managed Codex runs its own confined command sandbox. Cadence checks that
+`codex sandbox` can run a read command, and for workspace-write agents can
+write and read a temporary workspace file, before it opens app-server. The
+10-second check runs at registration and resume; a failure puts the agent in
+`attention` with the provider error in `cadence agent show`, before a message
+can be assigned to it.
+
+On this Ubuntu 24.04 host (2026-09-28), `bubblewrap` 0.9.0 is installed at
+`/usr/bin/bwrap`, but `codex sandbox -- /bin/true` fails before the command
+starts with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`.
+The AppArmor unprivileged-user-namespace restriction is enabled and the
+`bwrap-userns-restrict` profile is absent. This is a high-confidence host
+prerequisite diagnosis pending a successful post-change retest.
+
+[OpenAI's Ubuntu 24.04 prerequisites](https://developers.openai.com/codex/concepts/sandboxing#prerequisites)
+recommend that the operator install and load the extra `bwrap` profile:
+
+```sh
+sudo apt update
+sudo apt install apparmor-profiles apparmor-utils
+sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+Inspect the profile source after package installation and schedule this as a
+host security change. Keep `kernel.apparmor_restrict_unprivileged_userns=1`;
+do not use `danger-full-access`, make `bwrap` setuid, or restart a production
+daemon as a shortcut. Verify `codex sandbox -c
+'sandbox_mode="workspace-write"' -C /tmp -- /bin/true` with the daemon's OS
+user and PATH. Then, in a separate Cadence state directory and lane, verify
+a managed workspace-write Codex worker reaches `idle`, reads/writes a small
+file, reports a result, and retains its configured sandbox in `agent show`.
+The direct CLI check establishes the host prerequisite; the managed test
+establishes the app-server path.
+
+If the profile causes a regression, unload it with `sudo apparmor_parser -R
+/etc/apparmor.d/bwrap-userns-restrict` and remove the copied file. Retest
+affected `bwrap` consumers; leave the global restriction enabled. Package
+removal is not required for rollback.
+
 ## Install an available version
 
 For a pilot prerelease, copy its exact tag from the release list. GitHub's
