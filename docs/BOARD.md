@@ -27,6 +27,12 @@ requests are refused. This closes a direct loopback read path inside the
 hosted container. The image's `:3011` relay and agent/daemon process isolation
 have separate release gates; enabling this option alone does not establish
 their security.
+The persisted mode has no `--no-board-public-only` shortcut: a hosted board
+that cannot enforce it should stay unavailable. `cadence ui start --reset`
+deletes `ui.json` before validating replacement options, so it is not a safe
+production rollback by itself. Activation needs an operator-reviewed
+image/configuration backup and restore runbook; a failed guard must not
+automatically fall back to the sessionless local surface.
 
 ## Issue folder
 
