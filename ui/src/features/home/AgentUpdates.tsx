@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent, AgentDetail } from "../../lib/types";
+import { activityTimeMs } from "../../lib/fmt";
 import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
 
@@ -17,10 +18,11 @@ async function historyRead<T>(read: () => Promise<T>): Promise<T> {
 }
 const historyCache = new Map<string, { stamp: string; read: Promise<PromiseSettledResult<unknown>[]> }>();
 
-function UpdatedAt({ at }: { at: string | null }) {
-  const stamp = Date.parse(at ?? "");
-  if (!Number.isFinite(stamp)) return null;
-  return <time dateTime={at!} title={new Date(stamp).toLocaleString()}>{ageLabel(Math.max(0, (Date.now() - stamp) / 1000))} ago</time>;
+function UpdatedAt({ at }: { at: string | number | null }) {
+  const stamp = activityTimeMs(at);
+  if (!stamp) return null;
+  const date = new Date(stamp);
+  return <time dateTime={date.toISOString()} title={date.toLocaleString()}>{ageLabel(Math.max(0, (Date.now() - stamp) / 1000))} ago</time>;
 }
 
 function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
@@ -85,8 +87,7 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
   const reports = reportedAgentUpdates(thread.data?.entries ?? []);
   const agents = recentWorkingAgents((state.data?.agents ?? []).map((agent) => {
     const created = agent.message?.created;
-    const started = typeof created === "number" ? created * 1000 : Date.parse(created ?? "");
-    const latest = Math.max(Date.parse(agent.last_activity ?? "") || 0, Date.parse(reports.get(agent.alias)?.[0]?.at ?? "") || 0, Number.isFinite(started) ? started : 0);
+    const latest = Math.max(activityTimeMs(agent.last_activity), activityTimeMs(reports.get(agent.alias)?.[0]?.at), activityTimeMs(created));
     return { ...agent, last_activity: latest > 0 ? new Date(latest).toISOString() : agent.last_activity };
   }));
   return <div>

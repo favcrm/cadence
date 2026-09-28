@@ -69,6 +69,7 @@ const agents: Agent[] = [
     alias: "dev",
     running: 1,
     state: "busy",
+    last_activity: 1790562108.64,
     on: ["DEMO-12"],
     tasks: [
       {
@@ -94,7 +95,7 @@ const agents: Agent[] = [
     effort_reported: "high",
     quota: { state: "available", remaining: 0, limit: 100 },
   },
-  { ...base, alias: "owner", state: "waiting_input", queued: 1 },
+  { ...base, alias: "owner", state: "waiting_input", queued: 1, last_activity: "not-a-time" },
   { ...base, alias: "stopped", state: "stopped" },
   { ...base, alias: "inbox", provider: "inbox", inbox: true, queued: 840 },
   { ...base, alias: "foreign", running: 1, on: ["SITE-8"] },
@@ -246,10 +247,20 @@ async function search(value: string) {
 async function main() {
   await render();
   assert(
-    button("All6").getAttribute("aria-pressed") === "true",
-    "All is default",
+    button("Current4").getAttribute("aria-pressed") === "true",
+    "Current is the default when the roster contains stopped agents and mailboxes",
   );
-  assert(aliases().length === 6, "stopped workers and inboxes remain in All");
+  assert(aliases().join() === "blocked,owner,dev,foreign", "current agents are attention-first without stopped agents or mailboxes");
+  assert(host.textContent?.includes("28 Sep 02:21"), "numeric epoch activity is shown as a date");
+  assert(
+    Array.from(host.querySelectorAll(".agents-table tr")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("No activity recorded"),
+    "invalid activity remains unavailable",
+  );
+  await click("All6");
+  assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
+  await click("Stopped1");
+  assert(aliases().join() === "stopped", "stopped agents have an explicit view");
+  await click("Current4");
   assert(
     !host.querySelector("[role='button']"),
     "cards do not wrap nested issue controls in simulated buttons",
@@ -378,9 +389,13 @@ async function main() {
   state = { ...state, status: "stale", error: "Refresh unavailable" };
   await render();
   assert(
-    host.textContent?.includes("stale") && aliases().length === 6,
+    host.textContent?.includes("stale") && aliases().length === 4,
     "stale payload stays visible",
   );
+  state = loaded({ daemon: "reachable", agents: [agents[3], agents[4]], totals: null });
+  await render();
+  assert(host.textContent?.includes("No current agents") && aliases().length === 0, "only stopped agents and mailboxes yield a clear current-view empty state");
+  state = loaded({ daemon: "reachable", agents, totals: null });
   project = "empty-project";
   await render();
   assert(
@@ -419,7 +434,7 @@ async function main() {
   project = "all";
   await render();
   assert(
-    aliases().length === 6,
+    aliases().length === 4,
     "All projects still works without the assignment index",
   );
   state = { ...state, data: null, status: "loading" };

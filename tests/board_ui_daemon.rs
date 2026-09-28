@@ -1134,6 +1134,10 @@ fn ui_agents_payload_covers_all_kinds() {
         "busy row: {busy}"
     );
     assert_eq!(busy["message"]["id"], "b1");
+    assert!(
+        busy["last_activity"].as_f64().is_some_and(|at| at > 0.0),
+        "a daemon message's epoch-second timestamp reaches the Agents view: {busy}"
+    );
 
     let fenced = row("fenced1");
     assert_eq!(fenced["fenced"], true, "fenced row: {fenced}");

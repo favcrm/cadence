@@ -1,5 +1,28 @@
-/// `2026-09-17T18:27:14Z` → `17 Sep 18:27`. Non-ISO input passes through.
-export function fmtTime(iso: string): string {
+/** Valid ISO text or daemon epoch seconds as milliseconds; zero means unavailable. */
+export function activityTimeMs(value: string | number | null | undefined): number {
+  if (typeof value === "string") {
+    const parts = value.match(
+      /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/,
+    );
+    if (!parts) return 0;
+    const [year, month, day, hour, minute, second] = parts.slice(1).map(Number);
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (
+      month < 1 || month > 12 || day < 1 || day > days[month - 1] ||
+      hour > 23 || minute > 59 || second > 59
+    ) return 0;
+  }
+  const stamp = typeof value === "number" ? value * 1000 : Date.parse(value ?? "");
+  return Number.isFinite(stamp) && stamp > 0 && stamp <= 8.64e15 ? stamp : 0;
+}
+
+/// ISO text or daemon epoch seconds → `17 Sep 18:27`; other text passes through.
+export function fmtTime(value: string | number): string {
+  const stamp = typeof value === "number" ? activityTimeMs(value) : 0;
+  const iso = typeof value === "number"
+    ? stamp ? new Date(stamp).toISOString() : "Time unavailable"
+    : value;
   const m = iso.match(
     /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/,
   );

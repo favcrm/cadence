@@ -1069,6 +1069,47 @@ fn running_json(m: &Value) -> Value {
     })
 }
 
+fn agent_activity_seconds(value: &Value) -> Option<f64> {
+    let seconds = if let Some(seconds) = value.as_f64() {
+        seconds
+    } else {
+        let source = value.as_str()?;
+        // Reuse the issue parser for calendar validation, then account for
+        // fractional seconds and an optional RFC 3339 timezone offset.
+        let base = source.get(..19)?;
+        let mut suffix = source.get(19..)?;
+        let epoch = crate::issue::time::parse_iso(&format!("{base}Z"))? as f64;
+        let fraction = if let Some(rest) = suffix.strip_prefix('.') {
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return None;
+            }
+            let (part, zone) = rest.split_at(digits);
+            suffix = zone;
+            format!("0.{part}").parse::<f64>().ok()?
+        } else {
+            0.0
+        };
+        let offset = if suffix == "Z" {
+            0
+        } else {
+            let bytes = suffix.as_bytes();
+            if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+                return None;
+            }
+            let hours = suffix.get(1..3)?.parse::<i64>().ok()?;
+            let minutes = suffix.get(4..6)?.parse::<i64>().ok()?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let direction = if bytes[0] == b'+' { 1 } else { -1 };
+            direction * (hours * 3600 + minutes * 60)
+        };
+        epoch + fraction - offset as f64
+    };
+    (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
+}
+
 /// The tail of an agent's event log for the drawer — the last `n`
 /// events via the same `events` RPC the CLI long-polls.
 fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<Value> {
@@ -1163,17 +1204,17 @@ fn agents_payload_from(state_dir: &Path, list: Option<Value>, jobs: Option<&Valu
         let (mut running, mut parked) = (0i64, 0i64);
         let mut running_msgs: Vec<Value> = Vec::new();
         let mut last_activity = Value::Null;
+        let mut latest_activity = 0.0;
         let (queued, unknown, cursor) = match &show {
             Ok(show) => {
                 for m in show["messages"].as_array().cloned().unwrap_or_default() {
                     for ts in ["completed", "started", "created"] {
                         let at = &m[ts];
-                        if at
-                            .as_str()
-                            .map(|a| last_activity.as_str().map(|cur| a > cur).unwrap_or(true))
-                            == Some(true)
-                        {
-                            last_activity = at.clone();
+                        if let Some(seconds) = agent_activity_seconds(at) {
+                            if seconds > latest_activity {
+                                latest_activity = seconds;
+                                last_activity = at.clone();
+                            }
                         }
                     }
                     match m["state"].as_str() {
@@ -4536,6 +4577,39 @@ mod tests {
     };
     use serde_json::{json, Value};
     use tiny_http::Response;
+
+    #[test]
+    fn agent_activity_uses_latest_valid_instant_across_timestamp_shapes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let list = json!({"agents": [{
+            "alias": "worker", "provider": "fake", "endpoint_kind": "fake",
+            "state": "idle", "params": Value::Null,
+            "board": {"messages": [
+                {"created": "not-a-time"},
+                {"created": 1790562108.64},
+                {"created": "2026-09-29T03:00:00+02:00"},
+                {"created": "2026-02-31T04:00:00Z"}
+            ]}
+        }]});
+        let out = agents_payload_from(dir.path(), Some(list), None);
+        assert_eq!(
+            out["agents"][0]["last_activity"],
+            "2026-09-29T03:00:00+02:00"
+        );
+        assert_eq!(super::agent_activity_seconds(&json!("not-a-time")), None);
+        assert_eq!(
+            super::agent_activity_seconds(&json!("2026-02-31T04:00:00Z")),
+            None
+        );
+        assert_eq!(
+            super::agent_activity_seconds(&json!("2026-09-28T02:21:48.640Z")),
+            Some(1790562108.64)
+        );
+        assert_eq!(
+            super::agent_activity_seconds(&json!("2026-09-28T04:21:48.640+02:00")),
+            Some(1790562108.64)
+        );
+    }
 
     /// CAD-480: a mailbox row on the Agents screen carries its unread
     /// backlog and oldest-unread age from `agent.inbox`, and the unread
