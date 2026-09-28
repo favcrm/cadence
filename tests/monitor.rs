@@ -698,7 +698,10 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(outbox_revision, 1, "monitor dispatch omitted its source fact");
+    assert_eq!(
+        outbox_revision, 1,
+        "monitor dispatch omitted its source fact"
+    );
     // Seed a second task with an existing queued kickoff while its worker is
     // stopped. The monitor retry must take the duplicate-only branch even
     // though a fresh dispatch would fail the live-worker eligibility gate.

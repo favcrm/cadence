@@ -4,7 +4,7 @@ fn draft_task() -> (TempDir, Store) {
     let (dir, s) = store();
     let cwd = dir.path().join("w");
     seeded_job(&s, &cwd);
-    reg(&s, "w1", &cwd);
+    reg_pty(&s, "w1", &cwd);
     s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
         .unwrap();
     (dir, s)
@@ -115,7 +115,7 @@ fn cloud_turn_claim_is_exact_idempotent_and_refuses_forged_or_stale_targets() {
         turn
     );
     assert!(s.claim_cloud_dispatch_turn(&mid, "org-2", "w1").is_err());
-    s.cancel(&mid, "operator", Some("revoked")).unwrap();
+    s.cancel_task("t1", "operator").unwrap();
     assert!(s.claim_cloud_dispatch_turn(&mid, "org-1", "w1").is_err());
 }
 

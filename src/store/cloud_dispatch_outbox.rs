@@ -13,6 +13,14 @@ use uuid::Uuid;
 
 use super::{now, Store};
 
+struct ClaimRow {
+    alias: String,
+    task_id: Option<String>,
+    revision: Option<i64>,
+    organization: Option<String>,
+    turn: Option<String>,
+}
+
 impl Store {
     /// Called only inside the same transaction that commits a dispatch.
     /// A failed insert aborts the message/task transition with it.
@@ -103,21 +111,30 @@ impl Store {
         }
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let row: Option<(
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        )> = tx
+        let row: Option<ClaimRow> = tx
             .query_row(
                 "SELECT audience_agent,task_id,task_revision,organization_id,remote_turn_id
                  FROM cloud_dispatch_outbox WHERE message_id=?1",
                 [message_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok(ClaimRow {
+                        alias: r.get(0)?,
+                        task_id: r.get(1)?,
+                        revision: r.get(2)?,
+                        organization: r.get(3)?,
+                        turn: r.get(4)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((alias, task_id, revision, claimed_org, claimed_turn)) = row else {
+        let Some(ClaimRow {
+            alias,
+            task_id,
+            revision,
+            organization: claimed_org,
+            turn: claimed_turn,
+        }) = row
+        else {
             return Err(Error::rejected("no committed cloud dispatch outbox record"));
         };
         if alias != audience_agent {
