@@ -460,7 +460,7 @@ fn enroll_locked(
     let child_credential = &child["credential"];
     let record = Enrollment {
         version: field(&enrollment, "version")?.into(),
-        issuer,
+        issuer: issuer.to_owned(),
         organization_id: field(&enrollment, "organization_id")?.into(),
         audience: field(&enrollment, "audience")?.into(),
         subject_id: field(child, "principal_subject_id")?.into(),
