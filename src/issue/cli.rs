@@ -372,6 +372,10 @@ pub enum IssueAction {
         /// owner/component/tags, `tags=a,b` replaces the tag list.
         #[arg(required = true)]
         args: Vec<String>,
+        /// Override the `status=done` evidence gate (CAD-756) — the
+        /// reason is recorded on the commit, never silent.
+        #[arg(long, value_name = "REASON")]
+        force: Option<String>,
     },
     /// Add or remove tags: `issue tag <ID>… add|rm <tag>…`. Bulk like
     /// `set`: one commit, all-or-nothing.
@@ -1256,7 +1260,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             print_json(&write::set_acceptance(&pm, id, from, "")?);
             Ok(0)
         }
-        IssueAction::Set { args } => {
+        IssueAction::Set { args, force } => {
             // Ids never contain `=`, pairs always do.
             let split = args
                 .iter()
@@ -1270,7 +1274,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )));
             }
             let pm = open_pm()?;
-            let out = write::set_fields(&pm, ids, pairs, "")?;
+            let out = write::set_fields(&pm, ids, pairs, "", force.as_deref())?;
             print_json(&out);
             // The post-merge reminder: a done issue with an open
             // worktree ref still holds the tree — finish it (or sweep

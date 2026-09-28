@@ -1052,10 +1052,72 @@ fn commit_staged(
     }
 }
 
+/// CAD-756: `status=done` needs evidence — one of: a recorded `ref
+/// pr:`, a worktree ref `finish` already closed, or a review/verdict
+/// artifact in the issue folder. `force` substitutes a recorded
+/// reason (it lands in the commit summary — never silent). The
+/// reconcile sweep and delivery merge path write through
+/// `mark_done_on_merge`, which IS the evidence — they never reach
+/// this gate. Only the close direction is gated: `done` → anything
+/// reopens freely, `dropped` is exempt by design, and a `done` →
+/// `done` rewrite never asked a question it could fail.
+fn check_done_evidence(pm: &Pm, front: &Front, force: Option<&str>) -> Result<()> {
+    if let Some(reason) = force {
+        return if reason.trim().is_empty() {
+            Err(Error::rejected(
+                "--force needs a reason — it is recorded on the commit",
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    if front
+        .refs
+        .iter()
+        .any(|r| r.kind == "pr" || r.kind == "commit")
+    {
+        return Ok(());
+    }
+    if front
+        .refs
+        .iter()
+        .any(|r| r.kind == "worktree" && r.closed == Some(true))
+    {
+        return Ok(());
+    }
+    let (_project, dir) = issue_dir(pm, &front.id)?;
+    let verdictish = std::fs::read_dir(dir.join("artifacts"))
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                n.starts_with("review") || n.contains("verdict")
+            })
+        })
+        .unwrap_or(false);
+    if verdictish {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "{}: status=done needs evidence — a `ref pr:`, a closed worktree \
+         ref, or a review/verdict artifact in the issue folder. \
+         `cadence issue reconcile --dry-run` shows the merge classification; \
+         `--force \"<reason>\"` records an override in the commit",
+        front.id
+    )))
+}
+
 /// `issue set <ID>… key=value…` — the writable frontmatter fields, on
 /// one issue or several. All-or-nothing: every id and every pair is
 /// validated before any file changes, and the batch is one commit.
-pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Result<Value> {
+/// `force` is the `--force <reason>` override for the status=done
+/// evidence gate ([`check_done_evidence`]); every other write ignores it.
+pub fn set_fields(
+    pm: &Pm,
+    ids: &[String],
+    pairs: &[String],
+    actor: &str,
+    force: Option<&str>,
+) -> Result<Value> {
     if ids.is_empty() || pairs.is_empty() {
         return Err(Error::rejected(
             "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
@@ -1063,6 +1125,7 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
     }
     let _lock = pm.lock()?;
     let mut changed = Vec::new();
+    let mut forced: Option<String> = None;
     let staged = stage(pm, ids, |project, front| {
         let before = front.status.clone();
         let milestone = front.milestone.clone();
@@ -1071,6 +1134,10 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         if front.status != before {
             // CAD-360: an unapproved plan's tickets stay in backlog.
             crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
+            if front.status == "done" {
+                check_done_evidence(pm, front, force)?;
+                forced = force.map(|r| r.trim().to_string());
+            }
         }
         if front.milestone != milestone {
             check_milestone(pm, project, front.milestone.as_deref())?;
@@ -1080,7 +1147,11 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         }
         Ok(true)
     })?;
-    let (ids, foreign) = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
+    let summary = match &forced {
+        Some(r) => format!("set {} (forced: {r})", changed.join(" ")),
+        None => format!("set {}", changed.join(" ")),
+    };
+    let (ids, foreign) = commit_staged(pm, &staged, &summary, actor)?;
     // The post-merge reminder (CAD-94): when this set marks an issue
     // done while a worktree ref is still open, the CLI prints the
     // one-line `issue finish` hint for each of these ids.
@@ -2223,5 +2294,179 @@ mod tests {
         )
         .unwrap();
         assert!(log.contains("Actor: master"), "{log}");
+    }
+
+    /// CAD-756 fixtures: attach a ref or an artifact to CAD-1 the same
+    /// way the real lanes leave them — front write or artifacts/ file.
+    fn attach(pm: &Pm, edit: impl FnOnce(&mut model::Front)) {
+        let (_p, dir) = issue_dir(pm, "CAD-1").unwrap();
+        let (mut front, body) = load_front(&dir).unwrap();
+        edit(&mut front);
+        save_front(&dir, &front, &body).unwrap();
+    }
+
+    fn set_done(pm: &Pm, force: Option<&str>) -> Result<Value> {
+        set_fields(
+            pm,
+            &["CAD-1".to_string()],
+            &["status=done".to_string()],
+            "t",
+            force,
+        )
+    }
+
+    /// The gate itself: a bare issue cannot be marked done — the
+    /// front is untouched and nothing was staged for the commit.
+    #[test]
+    fn done_without_evidence_is_refused() {
+        let (_tmp, pm) = tracker();
+        let e = set_done(&pm, None).unwrap_err();
+        assert!(e.to_string().contains("needs evidence"), "{e}");
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let (front, _) = load_front(&dir).unwrap();
+        assert_eq!(front.status, "backlog");
+        assert!(clean(&pm));
+    }
+
+    #[test]
+    fn done_with_pr_ref_passes() {
+        let (_tmp, pm) = tracker();
+        attach(&pm, |f| {
+            f.refs.push(model::Ref {
+                kind: "pr".to_string(),
+                url: Some("https://github.com/o/r/pull/1".to_string()),
+                path: None,
+                label: None,
+                closed: None,
+                worktree: None,
+                cargo_target: None,
+                agent: None,
+            })
+        });
+        set_done(&pm, None).unwrap();
+    }
+
+    #[test]
+    fn done_with_finished_worktree_ref_passes() {
+        let (_tmp, pm) = tracker();
+        attach(&pm, |f| {
+            f.refs.push(model::Ref {
+                kind: "worktree".to_string(),
+                path: Some("/x/lane".to_string()),
+                closed: Some(true),
+                url: None,
+                label: None,
+                worktree: None,
+                cargo_target: None,
+                agent: None,
+            })
+        });
+        set_done(&pm, None).unwrap();
+    }
+
+    /// An OPEN worktree ref alone is not evidence — the lane may still
+    /// hold unmerged work; finish is what proves survivability.
+    #[test]
+    fn done_with_open_worktree_ref_is_refused() {
+        let (_tmp, pm) = tracker();
+        attach(&pm, |f| {
+            f.refs.push(model::Ref {
+                kind: "worktree".to_string(),
+                path: Some("/x/lane".to_string()),
+                closed: None,
+                url: None,
+                label: None,
+                worktree: None,
+                cargo_target: None,
+                agent: None,
+            })
+        });
+        let e = set_done(&pm, None).unwrap_err();
+        assert!(e.to_string().contains("needs evidence"), "{e}");
+    }
+
+    #[test]
+    fn done_with_review_artifact_passes() {
+        let (_tmp, pm) = tracker();
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let artifacts = dir.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("review-r1-t.md"), "verdict\n").unwrap();
+        set_done(&pm, None).unwrap();
+    }
+
+    #[test]
+    fn done_forced_records_the_reason() {
+        let (_tmp, pm) = tracker();
+        set_done(&pm, Some("rolled forward by operator")).unwrap();
+        let log = crate::issue::git(&pm.dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert!(log.contains("forced: rolled forward by operator"), "{log}");
+    }
+
+    #[test]
+    fn force_without_reason_is_refused() {
+        let (_tmp, pm) = tracker();
+        let e = set_done(&pm, Some("   ")).unwrap_err();
+        assert!(e.to_string().contains("needs a reason"), "{e}");
+    }
+
+    #[test]
+    fn dropped_is_not_gated() {
+        let (_tmp, pm) = tracker();
+        set_fields(
+            &pm,
+            &["CAD-1".to_string()],
+            &["status=dropped".to_string()],
+            "t",
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Bulk stays all-or-nothing: one bare issue in a done batch fails
+    /// the whole commit, including any sibling that carried evidence.
+    #[test]
+    fn bulk_done_refuses_all_or_nothing() {
+        let (_tmp, pm) = tracker();
+        new_issue(
+            &pm,
+            _tmp.path(),
+            Some("cadence"),
+            "two",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        attach(&pm, |f| {
+            f.refs.push(model::Ref {
+                kind: "pr".to_string(),
+                url: Some("https://github.com/o/r/pull/1".to_string()),
+                path: None,
+                label: None,
+                closed: None,
+                worktree: None,
+                cargo_target: None,
+                agent: None,
+            })
+        });
+        let e = set_fields(
+            &pm,
+            &["CAD-1".to_string(), "CAD-2".to_string()],
+            &["status=done".to_string()],
+            "t",
+            None,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("CAD-2"), "{e}");
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let (front, _) = load_front(&dir).unwrap();
+        assert_eq!(front.status, "backlog", "evidenced sibling rolled back");
     }
 }

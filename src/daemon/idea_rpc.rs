@@ -351,7 +351,7 @@ impl Shared {
         match idea::parse_plan(&text) {
             Ok(plan) => {
                 idea::comment_once(pm, id, author, "plan", &text)?;
-                idea::set_status_tags(pm, id, "review", Some("plan-ready"), &[])?;
+                idea::set_status_tags(pm, id, "review", Some("plan-ready"), &[], None)?;
                 if let Some(rec) = records.get_mut(id) {
                     rec.state = "plan_ready".into();
                     rec.plan_ready_at = Some(now);
@@ -402,7 +402,7 @@ impl Shared {
             "stale",
             &format!("{id} has had no operator decision for 14 days; the plan is stale."),
         )?;
-        idea::set_status_tags(pm, id, "review", Some("idea-stale"), &[])?;
+        idea::set_status_tags(pm, id, "review", Some("idea-stale"), &[], None)?;
         if let Some(rec) = records.get_mut(id) {
             rec.stale = true;
         }
@@ -426,7 +426,7 @@ impl Shared {
         if idea::ymd(now) < until {
             return Ok(false);
         }
-        idea::set_status_tags(pm, id, "review", Some("plan-ready"), &["parked"])?;
+        idea::set_status_tags(pm, id, "review", Some("plan-ready"), &["parked"], None)?;
         if let Some(rec) = records.get_mut(id) {
             rec.state = "plan_ready".into();
             rec.plan_ready_at = Some(now);
