@@ -124,15 +124,14 @@ impl Shared {
         let tmp = PathBuf::from(required_str(params, "tmp")?);
         let sha256 = optional_str(params, "sha256");
         let if_rev = optional_str(params, "if_rev");
-        wiki::put_blob(
-            &self.pm()?,
-            &self.state_dir,
-            &caller,
-            path,
-            &tmp,
-            sha256,
-            if_rev,
-        )
+        let pm = self.pm()?;
+        let mut out = wiki::put_blob(&pm, &self.state_dir, &caller, path, &tmp, sha256, if_rev)?;
+        if out["mime"] == "application/pdf" {
+            if let Some(sha) = out["sha256"].as_str() {
+                out["extraction"] = wiki::ingest::pdf_result(&pm, &caller, path, sha);
+            }
+        }
+        Ok(out)
     }
 
     pub(super) fn rpc_wiki_mkdir(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -146,13 +145,55 @@ impl Shared {
         let caller = self.wiki_caller(params, peer_pid, "wiki mv")?;
         let from = required_str(params, "from")?;
         let to = required_str(params, "to")?;
-        wiki::mv(&self.pm()?, &caller, from, to)
+        let pm = self.pm()?;
+        let mut out = wiki::mv(&pm, &caller, from, to)?;
+        let destination = out["to"].as_str().unwrap_or(to).to_string();
+        let moved = match wiki::read(&pm, &caller, &destination) {
+            Ok(page) => page,
+            Err(e) => {
+                out["extraction"] = json!({"status":"failed","reason":e.to_string()});
+                return Ok(out);
+            }
+        };
+        if moved["kind"] == "dir" {
+            let source = out["from"].as_str().unwrap_or(from).to_string();
+            let old_path = if let Some(rest) = source.strip_prefix(".trash/") {
+                rest.split_once('/')
+                    .map(|(_, original)| original)
+                    .unwrap_or(&source)
+            } else {
+                &source
+            };
+            out["extraction"] = wiki::ingest::relocate_tree(&pm, &caller, old_path, &destination)
+                .unwrap_or_else(|e| json!({"status":"failed","reason":e.to_string()}));
+        } else if moved["mime"] == "application/pdf" {
+            if let Some(sha) = moved["sha256"].as_str() {
+                out["extraction"] = wiki::ingest::pdf_result(&pm, &caller, &destination, sha);
+            }
+            if !from.starts_with(".trash/") {
+                if let Err(e) = wiki::ingest::remove_generated(&pm, &caller, from) {
+                    out["extraction_cleanup_error"] = json!(e.to_string());
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub(super) fn rpc_wiki_rm(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki rm")?;
-        wiki::rm(&self.pm()?, &caller, Self::wiki_path(params)?)
+        let path = Self::wiki_path(params)?;
+        let pm = self.pm()?;
+        let pdf = wiki::read(&pm, &caller, path)
+            .ok()
+            .is_some_and(|v| v["mime"] == "application/pdf");
+        let mut out = wiki::rm(&pm, &caller, path)?;
+        if pdf {
+            if let Err(e) = wiki::ingest::remove_generated(&pm, &caller, path) {
+                out["extraction_cleanup_error"] = json!(e.to_string());
+            }
+        }
+        Ok(out)
     }
 
     pub(super) fn rpc_wiki_search(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -160,7 +201,7 @@ impl Shared {
         let caller = self.wiki_caller(params, peer_pid, "wiki search")?;
         let q = required_str(params, "q")?;
         let path = optional_str(params, "path").unwrap_or("");
-        wiki::search(&self.pm()?, &caller, q, path)
+        wiki::search(&self.pm()?, &self.state_dir, &caller, q, path)
     }
 
     pub(super) fn rpc_wiki_history(&self, params: &Value, peer_pid: u32) -> Result<Value> {

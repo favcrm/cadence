@@ -68,13 +68,18 @@ export default function UploadPane({
     running.current = true;
     setItems((current) => startUpload(current, id));
     uploadFile(dir, file, (percent) => setItems((current) => uploadProgress(current, id, percent)))
-      .then(() => setItems((current) => uploadDone(current, id)))
+      .then((result) => {
+        setItems((current) => uploadDone(current, id));
+        if (result?.extraction && result.extraction.status !== "indexed") {
+          onToast("warn", `${file.name} was saved; text extraction ${result.extraction.status}: ${result.extraction.reason ?? "review the source"}`);
+        }
+      })
       .catch((error) => setItems((current) => uploadFailed(current, id, serverErrorText(error))))
       .finally(() => {
         running.current = false;
         onUploaded();
       });
-  }, [items, dir, onUploaded, readOnly]);
+  }, [items, dir, onUploaded, onToast, readOnly]);
 
   const tally = counts(items);
   const active = items.some((item) => item.state === "queued" || item.state === "uploading");

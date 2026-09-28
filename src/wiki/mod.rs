@@ -49,6 +49,8 @@ use crate::error::{Error, Result};
 use crate::issue::Pm;
 
 pub mod cli;
+pub mod index;
+pub mod ingest;
 
 /// `if_rev` value meaning "the page does not exist yet" — a
 /// create-only write. Any real content rev is `fnv1a:<16 hex>`.
@@ -1484,95 +1486,10 @@ pub fn put_blob(
     Ok(out)
 }
 
-/// `wiki search` — case-insensitive substring match over the vault's
-/// text files under `base` ("" = everywhere), each match ACL-checked
-/// for this caller. Pointer files and dot-dirs never match.
-pub fn search(pm: &Pm, caller: &Caller, q: &str, base: &str) -> Result<Value> {
-    if q.is_empty() {
-        return Err(Error::rejected("wiki search refused: empty query"));
-    }
-    let norm = normalize(base)?;
-    let segs: Vec<&str> = if norm.is_empty() {
-        Vec::new()
-    } else {
-        norm.split('/').collect()
-    };
-    allowed(caller, Op::Read, &segs)?;
-    let vault = vault_dir(pm)?;
-    let root = if segs.is_empty() {
-        vault.clone()
-    } else {
-        resolve(&vault, &norm)?
-    };
-    let needle = q.to_lowercase();
-    let mut matches = Vec::new();
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        if matches.len() >= SEARCH_CAP {
-            break;
-        }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for e in entries.flatten() {
-            if matches.len() >= SEARCH_CAP {
-                break;
-            }
-            let path = e.path();
-            let Ok(meta) = path.symlink_metadata() else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            if meta.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !meta.is_file() || name.ends_with(".blob") {
-                continue;
-            }
-            let rel = match path.strip_prefix(&vault) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            let rel_segs: Vec<&str> = rel.split('/').collect();
-            if allowed(caller, Op::Read, &rel_segs).is_err() {
-                continue;
-            }
-            if meta.len() > TEXT_CAP {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            for (i, line) in text.lines().enumerate() {
-                if line.to_lowercase().contains(&needle) {
-                    matches.push(json!({
-                        "path": rel,
-                        "line": i + 1,
-                        "text": line.trim(),
-                    }));
-                    if matches.len() >= SEARCH_CAP {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    matches.sort_by(|a, b| {
-        a["path"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["path"].as_str().unwrap_or(""))
-            .then(a["line"].as_u64().cmp(&b["line"].as_u64()))
-    });
-    Ok(json!({"q": q, "base": norm, "matches": matches}))
+/// Search the derived index. The caller and path checks remain the wiki's
+/// existing allowlist; the index is only a candidate finder.
+pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -> Result<Value> {
+    index::search(pm, state_dir, caller, q, base)
 }
 
 /// `wiki history` — `git log` for a page, mapped to its tracker

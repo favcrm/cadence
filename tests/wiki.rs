@@ -189,6 +189,203 @@ fn operator_roundtrip_write_read_ls_mv_rm_restore_history() {
 }
 
 #[test]
+fn indexed_search_tracks_git_pages_updates_moves_and_removals() {
+    let fx = fx();
+    let d = &fx.d;
+    let first = write_op(
+        d,
+        "global/guide.md",
+        "# Launch guide\nNebula onboarding steps\n",
+    );
+    let found = d
+        .operator_rpc(
+            "wiki_search",
+            json!({"q":"nebula onboarding","path":"global"}),
+        )
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/guide.md");
+    assert_eq!(found["matches"][0]["rev"], first["rev"]);
+    assert_eq!(found["matches"][0]["source"], "global/guide.md");
+    assert!(fx.d.state.join("wiki-search.sqlite3").exists());
+
+    d.operator_rpc(
+        "wiki_write",
+        json!({"path":"global/guide.md","text":"# Launch guide\nOrion onboarding steps\n",
+               "if_rev":first["rev"]}),
+    )
+    .unwrap();
+    let old = d
+        .operator_rpc("wiki_search", json!({"q":"nebula"}))
+        .unwrap();
+    assert!(old["matches"].as_array().unwrap().is_empty(), "{old}");
+    let current = d.operator_rpc("wiki_search", json!({"q":"orion"})).unwrap();
+    assert_eq!(current["matches"][0]["path"], "global/guide.md");
+
+    d.operator_rpc(
+        "wiki_mv",
+        json!({"from":"global/guide.md","to":"global/launch.md"}),
+    )
+    .unwrap();
+    let moved = d.operator_rpc("wiki_search", json!({"q":"orion"})).unwrap();
+    assert_eq!(moved["matches"][0]["path"], "global/launch.md");
+
+    d.operator_rpc("wiki_rm", json!({"path":"global/launch.md"}))
+        .unwrap();
+    let removed = d.operator_rpc("wiki_search", json!({"q":"orion"})).unwrap();
+    assert!(
+        removed["matches"].as_array().unwrap().is_empty(),
+        "{removed}"
+    );
+}
+
+#[test]
+fn indexed_search_rebuilds_from_canonical_pages_and_keeps_private_user_notes_scoped() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/terms.md", "Vector onboarding\n");
+    write_op(d, "users/alice/note.md", "Private vector memo\n");
+    d.operator_rpc("wiki_search", json!({"q":"vector"}))
+        .unwrap();
+    std::fs::remove_file(d.state.join("wiki-search.sqlite3")).unwrap();
+    let alice = d
+        .operator_rpc("wiki_search", json!({"q":"vector","wiki_as":"user:alice"}))
+        .unwrap();
+    assert_eq!(alice["matches"].as_array().unwrap().len(), 2, "{alice}");
+    let bob = d
+        .operator_rpc("wiki_search", json!({"q":"vector","wiki_as":"user:bob"}))
+        .unwrap();
+    assert_eq!(bob["matches"].as_array().unwrap().len(), 1, "{bob}");
+    assert_eq!(bob["matches"][0]["path"], "global/terms.md");
+}
+
+#[test]
+fn pdf_upload_keeps_raw_source_and_replaces_stale_extracted_text() {
+    let fx = fx();
+    let d = &fx.d;
+    let uploads = d.state.join(cadence_agent::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&uploads).unwrap();
+    let first = uploads.join("upload-first-pdf");
+    std::fs::write(&first, include_bytes!("fixtures/wiki-valid.pdf")).unwrap();
+    let out = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path":"global/source.pdf","tmp":first}),
+        )
+        .unwrap();
+    assert_eq!(out["kind"], "blob");
+    assert_eq!(out["mime"], "application/pdf");
+    let status = out["extraction"]["status"].as_str().unwrap();
+    assert!(matches!(status, "indexed" | "failed"), "{out}");
+    let page = read_op(d, "global/source.pdf.extracted.md");
+    assert!(page["text"]
+        .as_str()
+        .unwrap()
+        .contains(out["sha256"].as_str().unwrap()));
+    if status == "indexed" {
+        let found = d
+            .operator_rpc("wiki_search", json!({"q":"beacon"}))
+            .unwrap();
+        assert_eq!(found["matches"][0]["source"], "global/source.pdf");
+    } else {
+        assert!(out["extraction"]["reason"].is_string(), "{out}");
+    }
+
+    // A replacement whose text extraction fails must not leave a previous
+    // version's searchable text behind.
+    let second = uploads.join("upload-second-pdf");
+    std::fs::write(&second, b"%PDF-1.4\nnot a PDF\n").unwrap();
+    let replacement = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path":"global/source.pdf","tmp":second}),
+        )
+        .unwrap();
+    assert_eq!(replacement["extraction"]["status"], "failed");
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"beacon"}))
+        .unwrap();
+    assert!(found["matches"].as_array().unwrap().is_empty(), "{found}");
+
+    d.operator_rpc(
+        "wiki_mv",
+        json!({"from":"global/source.pdf","to":"global/renamed.pdf"}),
+    )
+    .unwrap();
+    assert!(read_op_err(d, "global/source.pdf.extracted.md").is_err());
+    assert_eq!(
+        read_op(d, "global/renamed.pdf.extracted.md")["kind"],
+        "text"
+    );
+    let removed = d
+        .operator_rpc("wiki_rm", json!({"path":"global/renamed.pdf"}))
+        .unwrap();
+    assert!(read_op_err(d, "global/renamed.pdf.extracted.md").is_err());
+    let restored = d
+        .operator_rpc(
+            "wiki_mv",
+            json!({"from":removed["trash"],"to":"global/restored.pdf"}),
+        )
+        .unwrap();
+    assert!(restored["extraction"]["status"].is_string());
+    assert_eq!(
+        read_op(d, "global/restored.pdf.extracted.md")["kind"],
+        "text"
+    );
+}
+
+#[test]
+fn moving_and_restoring_a_pdf_folder_rewrites_extraction_provenance() {
+    let fx = fx();
+    let d = &fx.d;
+    let uploads = d.state.join(cadence_agent::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&uploads).unwrap();
+    let staged = uploads.join("upload-folder-pdf");
+    std::fs::write(&staged, include_bytes!("fixtures/wiki-valid.pdf")).unwrap();
+    d.operator_rpc(
+        "wiki_put_blob",
+        json!({"path":"global/docs/spec.pdf","tmp":staged}),
+    )
+    .unwrap();
+
+    let moved = d
+        .operator_rpc(
+            "wiki_mv",
+            json!({"from":"global/docs","to":"global/handbook"}),
+        )
+        .unwrap();
+    assert_eq!(moved["extraction"]["status"], "indexed", "{moved}");
+    assert_eq!(moved["extraction"]["updated"], 1);
+    let page = read_op(d, "global/handbook/spec.pdf.extracted.md");
+    assert!(page["text"]
+        .as_str()
+        .unwrap()
+        .contains("source_path: \"global/handbook/spec.pdf\""));
+    let found = d
+        .operator_rpc(
+            "wiki_search",
+            json!({"q":"source text","path":"global/handbook"}),
+        )
+        .unwrap();
+    assert_eq!(found["matches"][0]["source"], "global/handbook/spec.pdf");
+
+    let removed = d
+        .operator_rpc("wiki_rm", json!({"path":"global/handbook"}))
+        .unwrap();
+    let restored = d
+        .operator_rpc(
+            "wiki_mv",
+            json!({"from":removed["trash"],"to":"global/recovered"}),
+        )
+        .unwrap();
+    assert_eq!(restored["extraction"]["status"], "indexed", "{restored}");
+    let page = read_op(d, "global/recovered/spec.pdf.extracted.md");
+    assert!(page["text"]
+        .as_str()
+        .unwrap()
+        .contains("source_path: \"global/recovered/spec.pdf\""));
+}
+
+#[test]
 fn if_rev_optimistic_concurrency_conflicts_instead_of_losing_updates() {
     let fx = fx();
     let d = &fx.d;
@@ -1301,4 +1498,24 @@ fn board_upload_and_caps_apply_per_caller() {
     );
     assert_eq!(s, 400, "{body}");
     assert!(!vault(&b.fx).join("agents/global/e.png").exists());
+}
+
+#[test]
+fn board_markdown_upload_becomes_a_searchable_text_page() {
+    let b = bfx();
+    let op = board_common::sign_in(&b.fx.d.state, b.port);
+    let (status, _, body) = upload_as(
+        &b,
+        "operator",
+        Some(&op),
+        "global/handbook.md",
+        "handbook.md",
+        b"# Handbook\nApollo onboarding policy\n",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(read_op(&b.fx.d, "global/handbook.md")["kind"], "text");
+    let (status, _, body) = op_get(&op, &b, "/api/wiki/search?q=apollo&path=global");
+    assert_eq!(status, 200, "{body}");
+    let found: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/handbook.md");
 }
