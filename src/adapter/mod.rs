@@ -519,6 +519,7 @@ pub fn build(
     hooks: AdapterHooks,
     log_path: &std::path::Path,
     env: &ProviderEnv,
+    agent_uid: Option<u32>,
 ) -> Result<Box<dyn ProviderAdapter>> {
     // The registry is consulted for pair validation only — its
     // rejections carry the same per-kind text the match arms below
@@ -552,6 +553,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 // The stored permission mode rides the profile so the
                 // same argv is replayed on every open — fresh launch
                 // and `-r` resume alike.
@@ -568,6 +570,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::ClaudeProfile::new(agent, env)?,
             )?)),
             "cursor" => Ok(Box::new(pty::PtyAdapter::new(
@@ -575,6 +578,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::CursorProfile::new(agent, env)?,
             )?)),
             // Harness double: proves the adapter is profile-driven.
@@ -583,6 +587,7 @@ pub fn build(
                 log_path,
                 agent,
                 env,
+                agent_uid,
                 pty::StubProfile::new(env)?,
             )?)),
             other => Err(crate::error::Error::rejected(format!(

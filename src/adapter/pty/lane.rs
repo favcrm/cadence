@@ -22,6 +22,8 @@
 //! it belongs to the pane's session (what tmux's `pane_current_path`
 //! reports), else the pane root — and flags a deleted directory.
 
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -182,7 +184,28 @@ pub fn session_members(root: &PaneRoot) -> Vec<Member> {
 /// `sid`. On Linux the identity is pinned with a pidfd first, so the
 /// check and the signal address the same process even if the pid is
 /// recycled in between. Returns whether a signal was delivered.
-fn signal_verified(member: Member, sid: u32, sig: libc::c_int) -> bool {
+fn signal_verified(member: Member, sid: u32, sig: libc::c_int, helper: Option<&Path>) -> bool {
+    if let Some(helper) = helper {
+        if !member.matches(sid) {
+            return false;
+        }
+        let name = match sig {
+            libc::SIGTERM => "TERM",
+            libc::SIGKILL => "KILL",
+            _ => return false,
+        };
+        // The helper opens a pidfd, checks the captured starttime/sid
+        // after the drop, then signals through that same fd. A failed
+        // helper never falls back to the operator uid's kill(2).
+        return crate::reaper::output(Command::new(helper).args([
+            "kill",
+            &member.pid.to_string(),
+            name,
+            &member.start_time.to_string(),
+            &sid.to_string(),
+        ]))
+        .is_ok_and(|out| out.status.success());
+    }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: plain syscalls on integer arguments; the fd is closed
@@ -280,6 +303,18 @@ pub fn reap_session(
     still_ours: &dyn Fn() -> Result<(), String>,
     on_intent: &dyn Fn(&[Member]),
 ) -> ReapReport {
+    reap_session_with(root, opts, still_ours, on_intent, None)
+}
+
+/// Split-mode reaper. `helper` is the reviewed drop helper; its
+/// identity-pinned kill path is required for foreign-uid pane members.
+pub fn reap_session_with(
+    root: &PaneRoot,
+    opts: &ReapOptions,
+    still_ours: &dyn Fn() -> Result<(), String>,
+    on_intent: &dyn Fn(&[Member]),
+    helper: Option<&Path>,
+) -> ReapReport {
     let mut report = ReapReport {
         drain_secs: opts.drain.as_secs_f64(),
         ..ReapReport::default()
@@ -325,7 +360,7 @@ pub fn reap_session(
         return refuse(report, why);
     }
     for m in &members {
-        if signal_verified(*m, root.sid, libc::SIGTERM) {
+        if signal_verified(*m, root.sid, libc::SIGTERM, helper) {
             report.terminated.push(*m);
         }
     }
@@ -370,7 +405,7 @@ pub fn reap_session(
             );
         }
         for m in survivors {
-            if signal_verified(m, root.sid, libc::SIGKILL) {
+            if signal_verified(m, root.sid, libc::SIGKILL, helper) {
                 report.killed.push(m);
             }
         }
@@ -408,12 +443,63 @@ impl PaneCwd {
 /// in the pane's session (tmux's `pane_current_path`), else the pane
 /// root's. `None` when neither is readable.
 pub fn pane_cwd(pane_pid: u32) -> Option<PaneCwd> {
+    pane_cwd_with(pane_pid, None)
+}
+
+pub fn pane_cwd_with(pane_pid: u32, helper: Option<&Path>) -> Option<PaneCwd> {
     let root = proc_stat(pane_pid)?;
     let foreground = u32::try_from(root.tpgid)
         .ok()
         .filter(|&fg| fg > 0 && fg != pane_pid)
         .filter(|&fg| proc_stat(fg).is_some_and(|s| s.sid == root.sid && s.state != 'Z'));
-    foreground.and_then(read_cwd).or_else(|| read_cwd(pane_pid))
+    match foreground {
+        Some(pid) if helper.is_some() => read_cwd_with(pid, helper),
+        Some(pid) => read_cwd(pid).or_else(|| read_cwd(pane_pid)),
+        None => read_cwd_with(pane_pid, helper),
+    }
+}
+
+fn read_cwd_with(pid: u32, helper: Option<&Path>) -> Option<PaneCwd> {
+    let Some(helper) = helper else {
+        return read_cwd(pid);
+    };
+    let before = proc_stat(pid)?;
+    let out =
+        crate::reaper::output(Command::new(helper).args(["inspect", &pid.to_string()])).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&out.stdout).ok()?;
+    let value = |key: &str| stdout.lines().find_map(|line| line.strip_prefix(key));
+    let sid = value("sid ")?.parse::<u32>().ok()?;
+    let start = value("starttime ")?.parse::<u64>().ok()?;
+    if sid != before.sid || start != before.start_time || proc_stat(pid)? != before {
+        return None;
+    }
+    let raw = value("cwd ")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let rest = raw.as_bytes();
+        if rest[i] == b'%' {
+            let hex = raw.get(i + 1..i + 3)?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            bytes.push(rest[i]);
+            i += 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let (path, unlinked) = match text.strip_suffix(" (deleted)") {
+        Some(p) => (p.to_string(), true),
+        None => (text, false),
+    };
+    let deleted = unlinked || !Path::new(&path).is_dir();
+    Some(PaneCwd { path, deleted, pid })
 }
 
 fn read_cwd(pid: u32) -> Option<PaneCwd> {
@@ -430,6 +516,85 @@ fn read_cwd(pid: u32) -> Option<PaneCwd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cad514_refusing_helper_never_falls_back_to_operator_kill() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("refuse-helper");
+        std::fs::write(&helper, b"#!/bin/sh\nexit 2\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new("setsid")
+            .args(["sleep", "30"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let root = loop {
+            if let Some(root) = PaneRoot::capture(child.id(), "g1") {
+                if root.sid == root.pid {
+                    break root;
+                }
+            }
+            assert!(Instant::now() < deadline, "child never detached");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let opts = ReapOptions {
+            drain: Duration::from_millis(20),
+            poll: Duration::from_millis(5),
+            kill_wait: Duration::from_millis(20),
+        };
+        let report = reap_session_with(&root, &opts, &|| Ok(()), &|_| {}, Some(&helper));
+        assert!(report.terminated.is_empty(), "{report:?}");
+        assert!(
+            report.residue.iter().any(|m| m.pid == child.id()),
+            "{report:?}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "operator kill leaked through"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cad514_inspect_cwd_rejects_forged_identity_and_decodes_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("space here");
+        std::fs::create_dir(&cwd).unwrap();
+        let helper = dir.path().join("inspect-helper");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&cwd)
+            .spawn()
+            .unwrap();
+        let stat = proc_stat(child.id()).unwrap();
+        let encoded = cwd.to_string_lossy().replace(' ', "%20");
+        let write = |start: u64, path: &str| {
+            std::fs::write(
+                &helper,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' 'sid {}' 'starttime {}' 'cwd {}'\n",
+                    stat.sid, start, path
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write(stat.start_time + 1, &encoded);
+        assert!(read_cwd_with(child.id(), Some(&helper)).is_none());
+        write(stat.start_time, "%GG");
+        assert!(read_cwd_with(child.id(), Some(&helper)).is_none());
+        write(stat.start_time, &encoded);
+        let actual = read_cwd_with(child.id(), Some(&helper)).unwrap();
+        assert_eq!(actual.path, cwd.to_string_lossy());
+        assert!(!actual.deleted);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn stat_parses_fields_after_the_last_paren() {
