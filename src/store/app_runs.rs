@@ -51,12 +51,15 @@ pub struct LocalWorkflow {
     pub publication_slot: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_slots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_asset_slot: Option<String>,
 }
 impl LocalWorkflow {
     pub fn parse(text: &str, inputs: &BTreeMap<String, String>) -> Result<Self> {
         let template = workflow::parse_template(text)?;
         let publication_slot = template.publication_slot;
         let capability_slots = template.capability_slots;
+        let required_asset_slot = template.required_asset_slot;
         let rendered = workflow::render(text, inputs)?;
         let parsed = plan::parse_plan(&rendered)?;
         let (_, body) =
@@ -151,6 +154,7 @@ impl LocalWorkflow {
             steps,
             publication_slot,
             capability_slots,
+            required_asset_slot,
         })
     }
 }
@@ -702,12 +706,29 @@ impl Store {
                 "legacy snapshot cannot carry publication authority",
             ));
         }
+        if run["snapshot"]["schema"] != 4
+            && run["snapshot"]["workflow"]
+                .get("required_asset_slot")
+                .is_some()
+        {
+            return Err(Error::rejected(
+                "required asset slot needs a capability snapshot",
+            ));
+        }
         if run["snapshot"]["schema"] == 4 {
             let declared = run["snapshot"]["workflow"]["capability_slots"]
                 .as_array()
                 .ok_or_else(|| {
                     Error::rejected("capability slots are missing from frozen workflow")
                 })?;
+            if let Some(required) = run["snapshot"]["workflow"].get("required_asset_slot") {
+                required
+                    .as_str()
+                    .filter(|slot| declared.iter().any(|candidate| candidate == *slot))
+                    .ok_or_else(|| {
+                        Error::rejected("required asset slot differs from frozen capabilities")
+                    })?;
+            }
             let frozen = run["snapshot"]["capabilities"]
                 .as_object()
                 .ok_or_else(|| Error::rejected("capability binding map is missing"))?;
@@ -872,7 +893,8 @@ impl Store {
             let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
                 "source":run["snapshot"]["source"],
                 "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
-                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If reviewing a run capability binary asset, also include asset_receipt_id and asset_sha256 from the fetched exact receipt. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
+                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
             let body = envelope.to_string();
             if body.len() > super::ENQUEUE_BYTES {
                 return Err(Error::rejected(
@@ -1283,13 +1305,15 @@ impl Store {
                     && matches!(decision.as_str(), "approve" | "revise")
                 {
                     if let Some((id,digest,producer))=tx.query_row("SELECT id,digest,producer FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![run_id,producer_step_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
+                        let required_asset_slot = run["snapshot"]["workflow"]["required_asset_slot"].as_str();
                         let asset_valid = match (&asset_receipt_id,&asset_sha256) {
-                            (None,None) => true,
+                            (None,None) => required_asset_slot.is_none(),
                             (Some(receipt_id),Some(asset_digest)) if decision=="approve" => {
                                 super::app_capabilities::asset_material_in(tx,receipt_id)
                                     .is_ok_and(|(receipt,_)| receipt["receipt_schema"]==2
                                         && receipt["run_id"]==run_id
                                         && receipt["step_id"]==producer_step_id
+                                        && required_asset_slot.is_none_or(|slot| receipt["slot"]==slot)
                                         && receipt["asset"]["digest"]==*asset_digest
                                         && run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]["digest"]==receipt["binding_digest"])
                             },

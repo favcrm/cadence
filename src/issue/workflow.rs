@@ -66,6 +66,7 @@ const META_KEYS: &[&str] = &[
     "label",
     "publication_slot",
     "capability_slots",
+    "required_asset_slot",
 ];
 
 /// Workflow-only frontmatter keys: pulled out at parse and removed
@@ -76,6 +77,7 @@ const WORKFLOW_ONLY_KEYS: &[&str] = &[
     "label",
     "publication_slot",
     "capability_slots",
+    "required_asset_slot",
 ];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
@@ -187,6 +189,7 @@ pub struct Template {
     pub label: Option<String>,
     pub publication_slot: Option<String>,
     pub capability_slots: Vec<String>,
+    pub required_asset_slot: Option<String>,
 }
 
 /// The declared inputs as the board renders them — file order, each
@@ -295,6 +298,7 @@ struct Front {
     label: Option<String>,
     publication_slot: Option<String>,
     capability_slots: Vec<String>,
+    required_asset_slot: Option<String>,
 }
 
 fn parse_front(yaml: &str) -> Result<Front> {
@@ -375,6 +379,20 @@ fn parse_front(yaml: &str) -> Result<Front> {
             "workflow capability_slots must be a nonempty list of at most eight static slot names",
         )),
     };
+    let required_asset_slot =
+        match map.remove(serde_yaml::Value::String("required_asset_slot".into())) {
+            None => None,
+            Some(serde_yaml::Value::String(slot))
+                if capability_slots.iter().any(|name| name == &slot) =>
+            {
+                Some(slot)
+            }
+            Some(_) => {
+                return Err(Error::rejected(
+                    "workflow required_asset_slot must name a declared capability slot",
+                ))
+            }
+        };
     let inputs_val = map.remove(serde_yaml::Value::String("inputs".to_string()));
     let mut inputs = BTreeMap::new();
     let mut input_order: Vec<String> = Vec::new();
@@ -516,6 +534,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
         label,
         publication_slot,
         capability_slots,
+        required_asset_slot,
     })
 }
 
@@ -688,6 +707,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
         label: front.label,
         publication_slot: front.publication_slot,
         capability_slots: front.capability_slots,
+        required_asset_slot: front.required_asset_slot,
     })
 }
 
@@ -1102,6 +1122,9 @@ pub fn gate_keys(text: &str) -> Result<String> {
             ";capability_slots={}",
             tpl.capability_slots.join(",")
         ));
+    }
+    if let Some(slot) = &tpl.required_asset_slot {
+        keys.push_str(&format!(";required_asset_slot={slot}"));
     }
     keys.push('\n');
     let metas = ticket_meta(body)?;
@@ -1882,6 +1905,36 @@ mod tests {
             let bad = WF.replace(
                 "inputs:",
                 &format!("capability_slots: {declaration}\ninputs:"),
+            );
+            assert!(parse_template(&bad).is_err(), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn cad714_required_asset_slot_is_declared_and_approval_affecting() {
+        let configured = WF.replace(
+            "inputs:",
+            "capability_slots: [image]\nrequired_asset_slot: image\ninputs:",
+        );
+        assert_eq!(
+            parse_template(&configured)
+                .unwrap()
+                .required_asset_slot
+                .as_deref(),
+            Some("image")
+        );
+        let optional = configured.replace("required_asset_slot: image\n", "");
+        assert_ne!(
+            gate_digest(&configured).unwrap(),
+            gate_digest(&optional).unwrap()
+        );
+        let rendered = render(&configured, &inputs(&[("topic", "rust")])).unwrap();
+        assert!(!rendered.contains("required_asset_slot:"));
+        assert!(plan::parse_plan(&rendered).is_ok());
+        for declaration in ["source", "{{topic}}", "[image]", "null"] {
+            let bad = WF.replace(
+                "inputs:",
+                &format!("capability_slots: [image]\nrequired_asset_slot: {declaration}\ninputs:"),
             );
             assert!(parse_template(&bad).is_err(), "{declaration}");
         }

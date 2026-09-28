@@ -270,13 +270,15 @@ impl Store {
         )?;
         let reviewed =
             historical_step_receipt(conn, &run, &review.0, &review.2, &review.1, &review_turn)?;
+        let required_asset_slot = run["snapshot"]["workflow"]["required_asset_slot"].as_str();
         let asset = match (&review.4, &review.5) {
-            (None, None) => None,
+            (None, None) if required_asset_slot.is_none() => None,
             (Some(receipt_id), Some(asset_digest)) => {
                 let (receipt, _) = super::app_capabilities::asset_material_in(conn, receipt_id)?;
                 if receipt["receipt_schema"] != 2
                     || receipt["run_id"] != id
                     || receipt["step_id"] != step
+                    || required_asset_slot.is_some_and(|slot| receipt["slot"] != slot)
                     || receipt["asset"]["digest"] != *asset_digest
                     || run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]
                         ["digest"]
@@ -293,7 +295,11 @@ impl Store {
                     "size":receipt["asset"]["size"]}),
                 )
             }
-            _ => return Err(Error::rejected("reviewed binary asset pin is incomplete")),
+            _ => {
+                return Err(Error::rejected(
+                    "required reviewed binary asset pin is absent or incomplete",
+                ))
+            }
         };
         if reviewed["material"]["kind"] != "review_text"
             || reviewed["material"]["decision"] != "approve"
