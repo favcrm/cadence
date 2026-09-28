@@ -323,7 +323,14 @@ fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
     )
     .unwrap();
     assert_eq!(probes["id"], result_a["id"]);
-    assert_eq!(probes["probes"].as_array().unwrap().len(), 9);
+    let cases = probes["probes"].as_array().unwrap();
+    assert_eq!(cases.len(), 10);
+    assert!(
+        cases
+            .iter()
+            .any(|case| { case["kind"] == "bash-tool-setsid" && case["refused"] == true }),
+        "Pi bash tool's setsid child was not refused: {cases:?}"
+    );
 
     let selected = h
         .daemon
