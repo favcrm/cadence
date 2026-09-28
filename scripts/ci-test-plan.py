@@ -38,13 +38,15 @@ def select(event, changes, targets):
         if status not in {"A", "M"}:
             return full("deletion, rename or unrecognised diff status")
         if doc(path):
-            continue
+            # A Rust test can discover Markdown through a directory walk or
+            # an assembled path, so absence of a literal reference is no
+            # evidence that its contents are unused.
+            return full("documentation may be an indirect Rust test input: " + path)
         if path not in targets:
             return full("shared, production or unrecognised path: " + path)
         chosen.add(targets[path])
     if not chosen:
-        return {"schema": 1, "mode": "docs", "targets": [],
-                "reason": "only documentation changed; Rust execution not needed"}
+        return full("no provably isolated Rust targets")
     # The split manifests have cross-file inventory contracts even when
     # only one generated integration binary changed.
     if "tests/split_map_inventory.rs" in targets:

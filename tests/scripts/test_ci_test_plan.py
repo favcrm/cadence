@@ -35,12 +35,70 @@ class Selection(unittest.TestCase):
         self.assertEqual(runner.scope_args(result), ["--lib", "--bins", "--test", "foo", "--test", "split_map_inventory"])
 
     def test_documentation_and_unknown_changes(self):
-        self.assertEqual(policy.select("pull_request", [("M", "docs/CI-DELIVERY.md")], {})["mode"], "docs")
+        self.assertEqual(policy.select("pull_request", [("M", "docs/CI-DELIVERY.md")], {})["mode"], "full")
+        self.assertEqual(policy.select("pull_request", [("M", "tests/foo.rs"), ("M", "docs/CI-DELIVERY.md")], self.targets)["mode"], "full")
         for path in ("src/lib.rs", "tests/common/mod.rs", "Cargo.lock", ".github/workflows/ci.yml", "scripts/ci-test-plan.py", "AGENTS.md", "docs/AUDIT.md", "skills/cadence/SKILL.md", "tests/unknown.rs"):
             self.assertEqual(policy.select("pull_request", [("M", path)], self.targets)["mode"], "full", path)
         for status in ("D", "R100", "T", "?"):
             self.assertEqual(policy.select("pull_request", [(status, "docs/CI-DELIVERY.md")], {})["mode"], "full")
         self.assertEqual(policy.select("pull_request", [], {})["mode"], "full")
+
+    def test_indirect_markdown_reader_selects_and_executes_full_rust(self):
+        # The source walks a directory and checks contents; it never spells
+        # the changed basename. A literal-reference scan cannot prove safety.
+        rust_test = '''
+#[test]
+fn review_docs_have_owner() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    for entry in std::fs::read_dir(docs).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("md") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(contents.contains("Reviewed-by:"));
+    }
+}
+'''
+        # Assemble the fixture name so this regression itself does not add a
+        # literal match for the real documentation path.
+        changed = "docs/" + "REVIEW" + "-FLAKES.md"
+        self.assertNotIn(changed, rust_test)
+        self.assertNotIn(Path(changed).name, rust_test)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "docs").mkdir()
+            (root / "tests").mkdir()
+            (root / "tests/docs_contract.rs").write_text(rust_test)
+            doc_file = root / changed
+            doc_file.write_text("Reviewed-by: operator\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            commit = ["git", "-c", "user.name=CI", "-c", "user.email=ci@example.test", "commit", "-qm"]
+            subprocess.run([*commit, "base"], cwd=root, check=True)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+
+            # The Rust assertion above passes on the base contents and fails
+            # on this docs-only edit, as independently reproduced in CAD-748.
+            doc_file.write_text("reviewer: operator\n")
+            subprocess.run(["git", "add", changed], cwd=root, check=True)
+            subprocess.run([*commit, "head"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertIsNone(policy.referenced_changes(root, [("M", changed)]))
+            event = {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}}
+            plan = policy.make_plan(root, "pull_request", event)
+
+            with patch.object(runner.subprocess, "run") as run:
+                runner.run(root, plan, "inventory")
+                runner.run(root, plan, "tests")
+                commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(
+                (plan["mode"], plan["changes"], commands),
+                ("full", [{"status": "M", "path": changed}], [
+                    [str(root / "scripts/nextest-inventory"), "all-targets", "--features", "test-seam"],
+                    [str(root / "scripts/cadence-nextest"), "--all-targets", "--locked", "--features", "test-seam"],
+                ]),
+            )
 
     def test_nul_diff_preserves_paths_and_rejects_truncation(self):
         self.assertEqual(policy.parse_changes(b"M\0docs/a b.md\0"), [("M", "docs/a b.md")])
