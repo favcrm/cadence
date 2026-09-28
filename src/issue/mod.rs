@@ -31,6 +31,7 @@ pub mod reconcile;
 pub mod relay;
 pub mod report;
 pub mod retro;
+pub mod sprint;
 pub mod start;
 pub mod summary;
 pub mod sync;

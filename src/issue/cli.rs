@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::issue::{
     blocked, board, claim, doctor, finish, history, hooks, lint, model, project, reconcile, retro,
-    start, sync, work, write, Pm,
+    sprint, start, sync, work, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -498,6 +498,47 @@ pub enum IssueAction {
         /// before it parks [default: 86400].
         #[arg(long, value_name = "SECS")]
         grace: Option<i64>,
+    },
+    /// Sprint pick-batch verbs (CAD-758): `close` ends a batch tag
+    /// with a velocity report and moves survivors in one commit;
+    /// `open` refills the next batch from ready in priority order.
+    /// Any tag scheme works — `sprint-*`, `batch-*`, project-local.
+    Sprint {
+        #[command(subcommand)]
+        action: SprintAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SprintAction {
+    /// Close a batch: report each tagged item (done / in-flight /
+    /// untouched / blocked stragglers), strip the tag from finished
+    /// work, and move every survivor — `--next <tag>` re-tags them
+    /// into the next batch, `--drop` returns them to plain status.
+    Close {
+        /// The pick-batch tag being closed (e.g. sprint-2026w40).
+        tag: String,
+        /// Re-tag every survivor to this tag in the same commit.
+        #[arg(long, value_name = "TAG", conflicts_with = "drop")]
+        next: Option<String>,
+        /// Drop the tag from survivors — they keep their status.
+        #[arg(long)]
+        drop: bool,
+        /// Report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Open a batch: tag the first `--cap` computed-ready leaves in
+    /// priority order; blocked items are skipped and named.
+    Open {
+        /// The pick-batch tag to populate.
+        tag: String,
+        /// Batch size cap [default: 10].
+        #[arg(long, default_value_t = 10)]
+        cap: usize,
+        /// Report without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1682,6 +1723,30 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 Some(state_dir),
                 "",
             )?;
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Sprint { action } => {
+            let pm = open_pm()?;
+            let out = match action {
+                SprintAction::Close {
+                    tag,
+                    next,
+                    drop,
+                    dry_run,
+                } => sprint::close(
+                    &pm,
+                    tag,
+                    next.as_deref(),
+                    *drop,
+                    *dry_run,
+                    Some(state_dir),
+                    "",
+                )?,
+                SprintAction::Open { tag, cap, dry_run } => {
+                    sprint::open(&pm, tag, *cap, *dry_run, Some(state_dir), "")?
+                }
+            };
             print_json(&out);
             Ok(0)
         }
