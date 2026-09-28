@@ -4531,9 +4531,14 @@ fn instructions_file_with_no_bootstrap_refused_except_codex() {
     d.wait_agent("r-codex", "idle", 20);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs[0]["method"], "thread/start", "{reqs:?}");
-    assert_eq!(
-        reqs[0]["params"]["developerInstructions"],
-        "Role: reviewer."
+    let instructions = reqs[0]["params"]["developerInstructions"].as_str().unwrap();
+    assert!(
+        instructions.starts_with("Role: reviewer.\n\n"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Use the cadence MCP tools"),
+        "{instructions}"
     );
 }
 
