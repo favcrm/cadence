@@ -815,12 +815,12 @@ mod tests {
             "https://images.example.test/generated.png"
         );
         for bad in [
-            json!({"data":{"image_urls":[]}}),
-            json!({"base_resp":{"status_code":0},"data":{"image_urls":["https://images.example.test/a","https://images.example.test/b"]}}),
-            json!({"base_resp":{"status_code":1},"data":{"image_urls":["https://images.example.test/a"]}}),
-            json!({"base_resp":{"status_code":0},"data":{"image_urls":["http://127.0.0.1/a"]}}),
-            json!({"base_resp":{"status_code":0},"data":{"image_urls":["https://images.example.test.evil.test/a"]}}),
-            json!({"base_resp":{"status_code":0},"data":{"image_urls":["https://user@images.example.test/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":[]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a","https://images.example.test/b"]}}),
+            json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["http://127.0.0.1/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test.evil.test/a"]}}),
+            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://user@images.example.test/a"]}}),
         ] {
             assert!(image_url(&bad, &["images.example.test".into()]).is_err());
         }

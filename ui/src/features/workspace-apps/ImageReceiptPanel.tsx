@@ -43,7 +43,6 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
   useEffect(() => {
     setReceipt(null); setImage(null); setError(null);
     onVerified(null);
-    if (!["running", "succeeded"].includes(run.state)) return;
     const controller = new AbortController();
     setLoading(true);
     void workspaceApps.imageResults(run.id, controller.signal).then(async results => {
@@ -67,6 +66,7 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
     && review.asset_receipt_id === receipt.id && review.asset_digest === receipt.asset?.digest);
   return <section className="wa-stack" aria-label="Retained generated image">
     <h3>Generated image</h3>
+    {run.state === "failed" && <p className="wa-alert" data-tone="fail" role="status">This run did not complete. Any retained image remains available for inspection, but Local release is blocked.</p>}
     {loading && <p className="wa-muted" role="status">Checking retained image bytes…</p>}
     {error && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
     {!loading && !receipt && !error && <p className="wa-muted">No image asset has been retained yet. A provider URL or worker description cannot stand in for one.</p>}

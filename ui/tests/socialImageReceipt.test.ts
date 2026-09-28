@@ -50,6 +50,10 @@ async function main() {
   assert(host.querySelector("img")?.getAttribute("src") === `data:image/png;base64,${png}`, "Board renders the retained asset, not a temporary provider URL");
   assert(verified.at(-1)?.receiptId === receipt.id && verified.at(-1)?.digest === digest, "Exact retained digest can unlock release");
   assert(host.textContent?.includes("Independent review pinned these bytes"), "Board explains the reviewer pin");
+  await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "failed" }, onDenied: () => {}, onVerified })));
+  await flush();
+  assert(host.querySelector("img")?.getAttribute("src") === `data:image/png;base64,${png}`, "A later run failure must not hide retained image bytes");
+  assert(host.textContent?.includes("This run did not complete"), "A retained image in a failed run is clearly not releasable");
   returnedBytes = png.replace("AC1HAw", "BC1HAw");
   await React.act(async () => root.render(React.createElement(ImageReceiptPanel, { run: { ...run, state: "running" }, onDenied: () => {}, onVerified })));
   await flush();
