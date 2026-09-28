@@ -3190,30 +3190,22 @@ fn delivery_agent_cannot_mark_ticket_done() {
 #[test]
 fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     #[cfg(feature = "test-seam")]
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    #[cfg(feature = "test-seam")]
     use std::sync::{mpsc, Arc, Mutex};
 
     #[cfg(feature = "test-seam")]
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     #[cfg(feature = "test-seam")]
     let (release_tx, release_rx) = mpsc::sync_channel(1);
-    #[cfg(feature = "test-seam")]
-    let armed = Arc::new(AtomicBool::new(false));
-    #[cfg(feature = "test-seam")]
-    let failures = Arc::new(AtomicUsize::new(0));
     let options = daemon::ServeOptions {
         report_router: Some(3600),
         ..daemon_opts()
     };
     #[cfg(feature = "test-seam")]
     let options = {
-        let armed = Arc::clone(&armed);
-        let failures = Arc::clone(&failures);
         let release_rx = Mutex::new(release_rx);
         daemon::ServeOptions {
-            after_done_write_failure: Some(Arc::new(move || {
-                if armed.load(Ordering::SeqCst) && failures.fetch_add(1, Ordering::SeqCst) == 1 {
+            after_done_retry_saved: Some(Arc::new(move |id| {
+                if id == "D-3" {
                     entered_tx.send(()).unwrap();
                     release_rx
                         .lock()
@@ -3275,19 +3267,20 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     let hooks = hook.parent().unwrap().to_path_buf();
     use std::os::unix::fs::PermissionsExt;
     lf.set_gh(&b, "MERGED", true, false);
-    #[cfg(feature = "test-seam")]
-    armed.store(true, Ordering::SeqCst);
     let row3 = lf.sync_of("D-3");
     assert_eq!(row3["ticket"]["outcome"], "pending", "{row3}");
-    // Under CI's test-seam feature, stop the router immediately after
-    // its second failed done write rolled back. It holds delivery_lock
-    // here, not the tracker lock: inspection and the independent writer
-    // cannot consume the third attempt or carry staged done status.
+    // Under CI's test-seam feature, stop the router after the second
+    // failed done write is saved as pending. It holds delivery_lock,
+    // not the tracker lock: inspection and the independent writer cannot
+    // consume the third attempt or carry staged done status.
     #[cfg(feature = "test-seam")]
     {
         lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        assert_eq!(failures.load(Ordering::SeqCst), 2);
+        let pending = lf.rec_of("D-3");
+        assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
+        assert_eq!(pending["ticket_done"]["attempts"], 2, "{pending}");
+        assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
         assert_eq!(
             std::fs::read_to_string(&done_runs).unwrap().lines().count(),
             2,

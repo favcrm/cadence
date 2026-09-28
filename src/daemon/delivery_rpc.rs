@@ -709,6 +709,8 @@ impl Shared {
             let pm = self.pm()?;
             let mut notices = Vec::new();
             let mut moved = 0;
+            #[cfg(feature = "test-seam")]
+            let mut saved_second_retries = Vec::new();
             for id in open {
                 let Some(rec) = all.get_mut(&id) else {
                     continue;
@@ -817,10 +819,23 @@ impl Shared {
                     _ => continue,
                 };
                 rec.ticket_done = Some(next);
+                #[cfg(feature = "test-seam")]
+                if matches!(
+                    rec.ticket_done.as_ref(),
+                    Some(TicketDone::Pending { attempts: 2, .. })
+                ) {
+                    saved_second_retries.push(id.clone());
+                }
                 moved += 1;
             }
             if moved > 0 {
                 delivery::save(&self.state_dir, &all)?;
+            }
+            #[cfg(feature = "test-seam")]
+            if let Some(pause) = &self.after_done_retry_saved {
+                for id in saved_second_retries {
+                    pause(&id);
+                }
             }
             (moved, notices, pm)
         };
