@@ -268,7 +268,8 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                         ));
                     }
                     continuity = Some(json!({"lineage":bound.lineage_id(),
-                        "generation":bound.generation(),"state":"bound"}));
+                        "generation":bound.generation(),"state":"locally_bound",
+                        "remoteAuthority":"unverified"}));
                 }
                 Some(enrolled)
             }
@@ -285,7 +286,8 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                     ));
                 }
                 continuity = Some(json!({"lineage":bound.lineage_id(),
-                    "generation":bound.generation(),"state":"bound"}));
+                    "generation":bound.generation(),"state":"locally_bound",
+                    "remoteAuthority":"unverified"}));
                 Some(enrolled)
             }
             EnrollmentAction::Renew { enrollment_dir } => {
