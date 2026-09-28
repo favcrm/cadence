@@ -586,6 +586,8 @@ helpers = [
 
 [binaries.managed_claude_codex]
 tests = [
+    "codex_sandbox_failure_fences_before_app_server_dispatch",
+    "codex_sandbox_success_preserves_workspace_write_on_app_server",
     "codex_approval_policy_defaults_to_never_and_replays_on_resume",
     "codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields",
     "codex_quota_endpoint_failure_is_explicit_unknown",
