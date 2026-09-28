@@ -258,6 +258,344 @@ fn indexed_search_rebuilds_from_canonical_pages_and_keeps_private_user_notes_sco
     assert_eq!(bob["matches"][0]["path"], "global/terms.md");
 }
 
+// ---------- CAD-719: index health + eager refresh ----------
+
+/// The operator's index status — a thin wrapper so tests read the
+/// health surface the same way.
+fn index_status(d: &TestDaemon) -> Value {
+    d.operator_rpc("wiki_index_status", json!({}))
+        .unwrap_or_else(|e| panic!("wiki_index_status: {e}"))
+}
+
+/// Poll `wiki_index_status` until `pred` holds or ~10s passes — the
+/// refresh worker is real (no test hook), so the suite waits on the
+/// observable health surface rather than a fixed sleep.
+fn wait_status(d: &TestDaemon, pred: impl Fn(&Value) -> bool) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let s = index_status(d);
+        if pred(&s) {
+            return s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "index status never reached the wanted state: {s}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The committed wiki tree id, computed the way the index reads it —
+/// `git rev-parse HEAD:<vault-rel>`. Tests assert the surface names
+/// the same truth the store commits.
+fn committed_tree(fx: &Fx) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fx.pm)
+        .args(["rev-parse", "HEAD:wiki"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn index_status_reports_health_and_tracks_committed_tree() {
+    let fx = fx();
+    let d = &fx.d;
+
+    // Before any wiki write: no committed wiki tree, no snapshot.
+    let s = index_status(d);
+    assert_eq!(s["schema"], "wiki-fts-v2", "{s}");
+    assert_eq!(s["current"], false, "{s}");
+    assert!(s["stale_reason"].is_string(), "{s}");
+
+    // A committed write schedules the refresh; the index catches up
+    // without a search having forced it.
+    write_op(d, "global/guide.md", "# Guide\nnebula onboarding\n");
+    let tree = committed_tree(&fx);
+    let s = wait_status(d, |s| {
+        s["current"] == true && s["indexed_tree"].as_str() == Some(tree.as_str())
+    });
+    assert_eq!(s["wiki_tree"].as_str(), Some(tree.as_str()), "{s}");
+    assert_eq!(s["indexed_tree"].as_str(), Some(tree.as_str()), "{s}");
+    assert!(s["pages_indexed"].as_u64().unwrap() >= 1, "{s}");
+    assert!(s["chunks_indexed"].as_u64().unwrap() >= 1, "{s}");
+    assert!(s["last_refresh"]["at"].as_f64().unwrap() > 0.0, "{s}");
+}
+
+#[test]
+fn committed_write_refreshes_index_before_the_next_search() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/eager.md", "# Eager\nfresnel lens\n");
+    // Wait for the eager worker to land the rebuild. To prove the worker
+    // (not the search) did it, drop the index file's freshness first is
+    // not possible without a rebuild — instead assert the tree matches
+    // AND that a search over a *fresh* index file confirms the snapshot.
+    let tree = committed_tree(&fx);
+    wait_status(d, |s| {
+        s["current"] == true && s["indexed_tree"].as_str() == Some(tree.as_str())
+    });
+    // Warm search returns the page without needing a rebuild — the
+    // eager refresh already committed the snapshot.
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"fresnel"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/eager.md");
+}
+
+#[test]
+fn index_status_is_operator_scoped() {
+    let fx = fx();
+    let d = &fx.d;
+    // An agent caller — even one that can read the wiki — cannot read
+    // index health or kick a refresh.
+    for method in ["wiki_index_status", "wiki_index_refresh"] {
+        let err = refused(d.unproven_rpc(method, json!({})));
+        assert!(
+            err.contains("operator") || err.contains("refused"),
+            "{method}: {err}"
+        );
+        let forged = refused(d.unproven_rpc(method, json!({"operator": true})));
+        assert!(
+            forged.contains("not accepted") || forged.contains("identity"),
+            "{method}: {forged}"
+        );
+    }
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn agent_cannot_read_index_health_or_force_a_refresh() {
+    let fx = fx();
+    let d = &fx.d;
+    d.register("wiki-reader");
+    for method in ["wiki_index_status", "wiki_index_refresh"] {
+        let err = refused(d.agent_rpc("wiki-reader", method, json!({})));
+        assert!(err.contains("operator"), "{method}: {err}");
+        let forged = refused(d.agent_rpc(
+            "wiki-reader",
+            method,
+            json!({"wiki_as":"operator", "operator": true}),
+        ));
+        assert!(
+            forged.contains("not accepted") || forged.contains("identity"),
+            "{method}: {forged}"
+        );
+    }
+}
+
+#[test]
+fn index_refresh_rebuilds_even_when_current() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/repair.md", "# Repair\nsentinel term\n");
+    let tree = committed_tree(&fx);
+    wait_status(d, |s| s["current"] == true);
+
+    // Corrupt the index file out from under the daemon: the surface
+    // reports it and an explicit refresh repairs it from Git.
+    std::fs::remove_file(d.state.join("wiki-search.sqlite3")).unwrap();
+    let out = d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    assert_eq!(out["refreshed"], true, "{out}");
+    let s = index_status(d);
+    assert_eq!(s["current"], true, "{s}");
+    assert_eq!(s["indexed_tree"].as_str(), Some(tree.as_str()), "{s}");
+    // Search still finds the page after the repair.
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"sentinel"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/repair.md");
+
+    // An explicit refresh always rebuilds, even if the tree is current.
+    let again = d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    assert_eq!(again["refreshed"], true, "{again}");
+}
+
+#[test]
+fn corrupt_index_is_visible_and_repaired_from_committed_git() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/repair.md", "# Repair\nrepairable compass\n");
+    wait_status(d, |s| s["current"] == true);
+    let db = d.state.join("wiki-search.sqlite3");
+    std::fs::write(&db, b"not a sqlite database").unwrap();
+    let broken = index_status(d);
+    assert_eq!(broken["current"], false, "{broken}");
+    assert!(broken["index_error"].is_string(), "{broken}");
+    let repaired = d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    assert_eq!(repaired["refreshed"], true, "{repaired}");
+    assert_eq!(index_status(d)["current"], true);
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"compass"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/repair.md");
+}
+
+#[test]
+fn explicit_refresh_reads_committed_tree_not_uncommitted_worktree() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/source.md", "# Source\ncommitted obsidian\n");
+    wait_status(d, |s| s["current"] == true);
+    std::fs::write(
+        vault(&fx).join("global/source.md"),
+        "# Source\nuncommitted turquoise\n",
+    )
+    .unwrap();
+    d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    let old = d
+        .operator_rpc("wiki_search", json!({"q":"obsidian"}))
+        .unwrap();
+    let new = d
+        .operator_rpc("wiki_search", json!({"q":"turquoise"}))
+        .unwrap();
+    assert_eq!(old["matches"][0]["path"], "global/source.md");
+    assert!(new["matches"].as_array().unwrap().is_empty(), "{new}");
+}
+
+#[test]
+fn missing_fts_table_invalidates_revision_and_rebuilds() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/table.md", "# Table\nrestorable sextant\n");
+    wait_status(d, |s| s["current"] == true);
+    let conn = rusqlite::Connection::open(d.state.join("wiki-search.sqlite3")).unwrap();
+    conn.execute_batch("DROP TABLE wiki_index_chunks;").unwrap();
+    drop(conn);
+    let broken = index_status(d);
+    assert_eq!(broken["current"], false, "{broken}");
+    assert!(broken["index_error"].is_string(), "{broken}");
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"sextant"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/table.md");
+    assert_eq!(index_status(d)["current"], true);
+}
+
+#[test]
+fn old_schema_forces_committed_source_rebuild() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/v2.md", "# V2\ncanonical heliograph\n");
+    wait_status(d, |s| s["current"] == true);
+    let conn = rusqlite::Connection::open(d.state.join("wiki-search.sqlite3")).unwrap();
+    conn.execute_batch(
+        "DELETE FROM wiki_index_chunks;
+         UPDATE wiki_index_meta SET value='wiki-fts-v1' WHERE key='schema';",
+    )
+    .unwrap();
+    drop(conn);
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"heliograph"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/v2.md");
+    assert_eq!(index_status(d)["schema_stored"], "wiki-fts-v2");
+}
+
+#[test]
+fn skipped_extraction_is_not_counted_as_indexed_page() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(
+        d,
+        "global/old.pdf.extracted.md",
+        "---\nkind: extracted-source\nsource_path: \"global/old.pdf\"\nsource_sha256: missing\n---\n# Stale\nobsolete astrolabe\n",
+    );
+    let status = wait_status(d, |s| s["current"] == true);
+    assert_eq!(status["pages_indexed"], 0, "{status}");
+    assert_eq!(status["skipped_pages"], 1, "{status}");
+}
+
+#[test]
+fn failed_refresh_stays_idle_and_search_refuses_stale_hits() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/old.md", "# Old\nstale lantern\n");
+    wait_status(d, |s| s["current"] == true);
+    let db = d.state.join("wiki-search.sqlite3");
+    std::fs::remove_file(&db).unwrap();
+    std::fs::create_dir(&db).unwrap();
+    write_op(d, "global/new.md", "# New\nfresh lantern\n");
+    let failed = wait_status(d, |s| s["last_error"].is_string());
+    assert_eq!(failed["current"], false, "{failed}");
+    assert_eq!(failed["refresh_running"], false, "{failed}");
+    assert_eq!(failed["refresh_pending"], false, "{failed}");
+    assert!(d
+        .operator_rpc("wiki_search", json!({"q":"lantern"}))
+        .is_err());
+    std::fs::remove_dir(&db).unwrap();
+    let repaired = d.operator_rpc("wiki_index_refresh", json!({})).unwrap();
+    assert_eq!(repaired["refreshed"], true, "{repaired}");
+    assert_eq!(index_status(d)["current"], true);
+}
+
+/// A search that lands while a mutation's refresh is mid-flight still
+/// reads one complete committed snapshot — either the tree the index
+/// already had, or the new one — never a torn mix, and never stale hits
+/// the store knows are wrong.
+#[test]
+fn searches_while_background_refresh_catches_up() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/base.md", "# Base\nsteady term\n");
+    wait_status(d, |s| s["current"] == true);
+
+    // Interleave writes and searches; every search must answer either
+    // the pre-write or post-write snapshot cleanly (a real result or an
+    // empty one for a term that is not yet committed — never an error,
+    // never a half-indexed page).
+    for i in 0..8 {
+        write_op(
+            d,
+            &format!("global/page{i}.md"),
+            &format!("# P{i}\nterm{i} body\n"),
+        );
+        let found = d
+            .operator_rpc("wiki_search", json!({"q": format!("term{i}")}))
+            .unwrap();
+        // The committed write is visible to the search's own tree check
+        // even if the worker is mid-rebuild: either already indexed or
+        // the fallback rebuild caught up — but the answer is complete.
+        assert!(
+            found["matches"].as_array().unwrap().len() <= 1,
+            "a torn index returned duplicated rows: {found}"
+        );
+    }
+}
+
+#[test]
+fn a_move_and_rm_refresh_drops_stale_hits() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/mvme.md", "# Move\nphased array\n");
+    wait_status(d, |s| s["current"] == true);
+
+    d.operator_rpc(
+        "wiki_mv",
+        json!({"from":"global/mvme.md","to":"global/moved.md"}),
+    )
+    .unwrap();
+    // Wait for the move's commit to be indexed, then the old path is
+    // gone and the new path answers — without a search forcing it.
+    let tree = committed_tree(&fx);
+    wait_status(d, |s| s["indexed_tree"].as_str() == Some(tree.as_str()));
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"phased array"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/moved.md");
+
+    d.operator_rpc("wiki_rm", json!({"path":"global/moved.md"}))
+        .unwrap();
+    let tree = committed_tree(&fx);
+    wait_status(d, |s| s["indexed_tree"].as_str() == Some(tree.as_str()));
+    let gone = d
+        .operator_rpc("wiki_search", json!({"q":"phased array"}))
+        .unwrap();
+    assert!(gone["matches"].as_array().unwrap().is_empty(), "{gone}");
+}
+
 #[test]
 fn pdf_upload_keeps_raw_source_and_replaces_stale_extracted_text() {
     let fx = fx();

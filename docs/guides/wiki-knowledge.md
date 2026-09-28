@@ -2,9 +2,11 @@
 
 Cadence keeps the wiki in Git-backed text pages and content-addressed raw
 attachments. The SQLite full-text index under the daemon state directory is a
-disposable search cache. It is rebuilt from the current wiki Git tree when that
-tree changes, so edits, uploads, moves, removals, restarts, and a lost index file
-do not require a separate indexing job. Search results include the page path,
+disposable search cache. A committed wiki write schedules an asynchronous,
+coalesced refresh. Search checks the committed wiki Git tree as a correctness
+fallback and repairs an absent or corrupt index before answering. A refresh
+reads immutable objects from one captured Git tree and commits rows plus the
+indexed tree revision atomically. Search results include the page path,
 line, heading, revision, source path, excerpt, and rank. A caller must fetch the
 page before using an excerpt as evidence. The existing wiki path permissions
 apply to both search results and fetches; this feature does not change them.
@@ -66,6 +68,34 @@ removing a PDF cleans up its generated page. Moving a folder rewrites the
 `source_path` on generated pages inside it; an incomplete rewrite is excluded
 from search until corrected. A failed conversion remains visible as an
 extraction status, with the raw source still available.
+
+## Index health and repair
+
+An operator can inspect the derived index without triggering a rebuild:
+
+```sh
+cadence wiki index status
+cadence wiki index refresh
+```
+
+Status reports the current and indexed Git tree IDs, schema, whether the index
+is current, stale or error reasons, page/chunk/skipped counts, last successful
+refresh time and duration, and the latest refresh error. `refresh` forces a
+complete rebuild from the committed tree, including when the index already
+reports current. A normal wiki write succeeds once committed even if its
+background refresh fails. The next search retries synchronously and returns an
+error if it cannot produce a current index; it does not return stale hits.
+Corrupt SQLite files are retained beside the new index as
+`wiki-search.sqlite3.corrupt-*` for diagnosis. Status and repair require an
+operator connection; agents cannot invoke them.
+
+Back up the wiki's Git repository and the wiki `.blobs/` directory together.
+Git holds the text pages, blob pointers, and extraction provenance; `.blobs/`
+holds the bytes named by those pointers. Restore both before restarting the
+daemon, then run `cadence wiki index refresh`. The SQLite file under the daemon
+state directory is derived and is not needed for restoration. Retain Git
+history and the blob bytes referenced by its pointer history when planning
+backup retention or eventual garbage collection.
 
 ## Agent retrieval
 

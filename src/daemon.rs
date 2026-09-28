@@ -439,6 +439,11 @@ pub struct Shared {
     /// cost tiers from — the pi-devin cache file wins fresh every call;
     /// only the spawned CLI path memoizes ([`crate::devin_catalog`]).
     devin_catalog: crate::devin_catalog::CatalogCache,
+    /// CAD-719: the post-commit wiki index refresh scheduler. Every
+    /// committed wiki mutation `kick()`s it; the worker runs one
+    /// coalesced rebuild while the query-time tree check remains the
+    /// correctness fallback.
+    wiki_index: Arc<crate::wiki::index::IndexRefresh>,
     #[cfg(feature = "test-seam")]
     after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -516,6 +521,11 @@ impl Shared {
         let mut slots = Slots::new(resolve_slot_config(opts));
         slots.persist_to(state_dir.join("slots.json"));
         let boot_events = slots.restore(crate::slots::SlotClock::at(slot_clock(), epoch_secs()));
+        // CAD-719: the wiki index refresh worker reads the tracker through
+        // the same lease/fence the write path holds; resolved before the
+        // `Arc` so `lease` can move into the struct.
+        let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
+        let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
         let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
@@ -584,6 +594,11 @@ impl Shared {
             #[cfg(feature = "test-seam")]
             after_done_write_failure: opts.after_done_write_failure.clone(),
             devin_catalog: crate::devin_catalog::CatalogCache::default(),
+            wiki_index: crate::wiki::index::IndexRefresh::new(
+                state_dir.to_path_buf(),
+                wiki_pm_dir,
+                wiki_pm_lease,
+            ),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2769,6 +2784,11 @@ impl Shared {
             "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),
             "wiki_search" => self.rpc_wiki_search(params, peer_pid),
             "wiki_history" => self.rpc_wiki_history(params, peer_pid),
+            // CAD-719: operator-scoped index health + the explicit
+            // refresh; the wiki allowlist does not apply — these gate
+            // on `operator_connection`, never `wiki_caller`/`wiki_as`.
+            "wiki_index_status" => self.rpc_wiki_index_status(params, peer_pid),
+            "wiki_index_refresh" => self.rpc_wiki_index_refresh(params, peer_pid),
             // CAD-129: the deterministic test queue. Submit is attributed
             // to the caller; status, log and the queue summary are reads.
             "test_submit" => self.rpc_test_submit(params),
@@ -2783,10 +2803,7 @@ impl Shared {
     /// `CADENCE_PM_DIR` (its per-instance env — tests), else the
     /// process default.
     fn pm_dir(&self) -> Result<PathBuf> {
-        match self.provider_env.var("CADENCE_PM_DIR") {
-            Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-            _ => crate::issue::default_dir(),
-        }
+        pm_dir_of(&self.provider_env)
     }
 
     /// The one way daemon code opens the tracker — `Pm::at` over this
@@ -2999,6 +3016,17 @@ fn is_terminal(state: &str) -> bool {
 
 fn is_task_terminal(state: &str) -> bool {
     matches!(state, "verified" | "done" | "cancelled" | "failed")
+}
+
+/// The tracker dir a daemon (or its index worker) reads: the instance's
+/// own `CADENCE_PM_DIR` from `provider_env`, else the process default.
+/// Pulled out of [`Shared::pm_dir`] so `Shared::new_leased` can name it
+/// before the `Arc` exists.
+fn pm_dir_of(provider_env: &ProviderEnv) -> Result<PathBuf> {
+    match provider_env.var("CADENCE_PM_DIR") {
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        _ => crate::issue::default_dir(),
+    }
 }
 
 /// Content hash for spec-drift detection — the same value the CLI
@@ -3772,6 +3800,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
+    // CAD-719: the wiki index refresh worker — a committed wiki
+    // mutation kicks one coalesced rebuild; the query-time tree check
+    // stays the correctness fallback. Joined at shutdown so a rebuild
+    // never outlives the daemon.
+    let wiki_index_worker = shared.wiki_index.spawn();
     // CAD-538: the hosted lease heartbeat — joined in the shutdown
     // tail so no renew can race the flush and release.
     let lease_heartbeat = shared.lease.clone().map(|lease| {
@@ -3820,6 +3853,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Some(heartbeat) = lease_heartbeat {
         let _ = heartbeat.join();
     }
+    // CAD-719: stop the refresh worker, then join it — a rebuild already
+    // mid-flight finishes against the same committed tree it started on;
+    // the query-time fallback still covers a daemon that restarts stale.
+    shared.wiki_index.close();
+    let _ = wiki_index_worker.join();
     shared.shutdown();
     // CAD-538: flush before exit — WAL fold + the tracker's staged
     // index — then release the lease LAST: a successor may start the
