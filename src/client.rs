@@ -46,13 +46,23 @@ fn rpc_socket_path(state_dir: &Path) -> Result<PathBuf> {
 }
 
 /// The briefing file an actor agent reads —
-/// `<state>/briefings/<root>/BRIEFING-<alias>.md` — never inside the
-/// agent's cwd repository. The `<root>` segment is the upstream PM's
+/// `<state>/briefings/<root>/BRIEFING-<alias>.md` — the operator-owned
+/// source copy. Split-mode pty panes get a separate lane copy. The
+/// `<root>` segment is the upstream PM's
 /// alias when `params` wires one, else the agent's own alias.
 pub fn briefing_path(state_dir: &Path, params: &Value, alias: &str) -> PathBuf {
     let root = params["upstream"].as_str().unwrap_or(alias);
     state_dir
         .join("briefings")
+        .join(root)
+        .join(format!("BRIEFING-{alias}.md"))
+}
+
+/// Agent-UID panes cannot traverse the operator's private state dir.
+/// Their briefing copy lives under the lane, using the same root name.
+pub fn lane_briefing_path(cwd: &Path, params: &Value, alias: &str) -> PathBuf {
+    let root = params["upstream"].as_str().unwrap_or(alias);
+    cwd.join(".cadence")
         .join(root)
         .join(format!("BRIEFING-{alias}.md"))
 }

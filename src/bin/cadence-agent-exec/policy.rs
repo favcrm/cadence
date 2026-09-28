@@ -96,8 +96,14 @@ pub enum Request {
         env: Vec<(OsString, OsString)>,
         argv: Vec<OsString>,
     },
-    /// `kill <pid> <signal>` — signal an agent-uid pid.
-    Kill { pid: i32, signal: i32 },
+    /// `kill <pid> <signal> [<starttime> <sid>]` — signal an agent-uid pid.
+    Kill {
+        pid: i32,
+        signal: i32,
+        /// The daemon's reaper supplies the captured process identity.
+        /// The helper pins the pid with pidfd before checking it.
+        expected: Option<(u64, u32)>,
+    },
     /// `inspect <pid>` — read-only `/proc` facts about an agent-uid
     /// pid (cwd is the read that fails cross-uid, §6).
     Inspect { pid: i32 },
@@ -121,7 +127,7 @@ pub fn parse(args: &[OsString]) -> Result<Request, String> {
             String::from_utf8_lossy(other)
         )),
         None => Err("usage: cadence-agent-exec exec [--env K=V]… -- <argv…> | \
-                     kill <pid> <signal> | inspect <pid>"
+                     kill <pid> <signal> [<starttime> <sid>] | inspect <pid>"
             .into()),
     }
 }
@@ -240,13 +246,38 @@ fn env_allowed_in(
 }
 
 fn parse_kill(rest: &[OsString]) -> Result<Request, String> {
-    if rest.len() != 2 {
-        return Err("kill takes exactly <pid> <signal>".into());
+    if rest.len() != 2 && rest.len() != 4 {
+        return Err("kill takes <pid> <signal> [<starttime> <sid>]".into());
     }
+    let expected = if rest.len() == 4 {
+        Some((
+            parse_positive_u64(&rest[2], "starttime")?,
+            u32::try_from(parse_positive_u64(&rest[3], "sid")?)
+                .map_err(|_| "sid out of range".to_string())?,
+        ))
+    } else {
+        None
+    };
     Ok(Request::Kill {
         pid: parse_pid(&rest[0])?,
         signal: parse_signal(&rest[1])?,
+        expected,
     })
+}
+
+fn parse_positive_u64(arg: &OsStr, label: &str) -> Result<u64, String> {
+    let bytes = arg.as_bytes();
+    if bytes.is_empty() || bytes.len() > 20 || !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{label} must be positive decimal digits"));
+    }
+    let n = std::str::from_utf8(bytes)
+        .unwrap_or("")
+        .parse::<u64>()
+        .map_err(|_| format!("{label} out of range"))?;
+    if n == 0 {
+        return Err(format!("{label} must be > 0"));
+    }
+    Ok(n)
 }
 
 fn parse_inspect(rest: &[OsString]) -> Result<Request, String> {
@@ -511,13 +542,31 @@ mod tests {
             parse(&args(&["kill", "1", "TERM"])).unwrap(),
             Request::Kill {
                 pid: 1,
-                signal: libc::SIGTERM
+                signal: libc::SIGTERM,
+                expected: None
             }
         ));
         assert!(matches!(
             parse(&args(&["inspect", "7"])).unwrap(),
             Request::Inspect { pid: 7 }
         ));
+    }
+
+    #[test]
+    fn cad514_verified_kill_requires_exact_process_identity() {
+        // The daemon's reaper cannot trade its pidfd-pinned signal for
+        // a uid-only kill: a reused pid may belong to a different
+        // agent lane. The four-field form carries the captured start
+        // time and session into the helper's atomic pidfd path.
+        assert!(parse(&args(&["kill", "71", "TERM", "424242", "70"])).is_ok());
+        for forged in [
+            ["kill", "71", "TERM", "0", "70"],
+            ["kill", "71", "TERM", "424242", "0"],
+            ["kill", "71", "TERM", "-1", "70"],
+            ["kill", "71", "TERM", "424242", "-1"],
+        ] {
+            assert!(parse(&args(&forged)).is_err(), "{forged:?}");
+        }
     }
 
     #[test]

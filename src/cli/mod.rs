@@ -3012,7 +3012,9 @@ pub(crate) fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<P
     }
     let file = client::briefing_path(state_dir, &agent["params"], alias);
     let opted_in = agent["params"]["agents_md"].as_bool() == Some(true);
-    if file.exists() && !opted_in {
+    let split_pty = agent["endpoint_kind"].as_str() == Some("pty")
+        && cadence_agent::agent_uid::config::configured_uid(state_dir)?.is_some();
+    if file.exists() && !opted_in && !split_pty {
         return Ok(None);
     }
     brief_agent(state_dir, alias, false, None).map(Some)

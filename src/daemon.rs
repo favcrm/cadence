@@ -1296,7 +1296,7 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        let adapter = adapter::build(&agent, hooks, &log_path, &self.provider_env)?;
+        let adapter = adapter::build(&agent, hooks, &log_path, &self.provider_env, self.agent_uid)?;
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
@@ -2377,21 +2377,33 @@ impl Shared {
                 if agent.endpoint_kind == "pty" {
                     self.pty_lane_facts(&agent, &mut agent_json);
                 }
-                // The briefing lives under the state dir — actors read
-                // it there, never inside their cwd repository. The path
-                // is advertised only while the file exists; a missing
-                // one is named as missing, never as a live path.
+                // In split mode the operator copy remains private in
+                // state; the agent receives a separate copy inside its
+                // lane, written by the drop helper after briefing.
                 if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
                     let file = client::briefing_path(
                         &self.state_dir,
                         agent.params.as_ref().unwrap_or(&Value::Null),
                         &agent.alias,
                     );
-                    if file.is_file() {
-                        agent_json["briefing"] = json!(file);
+                    let exposed = if self.agent_uid.is_some() && agent.endpoint_kind == "pty" {
+                        client::lane_briefing_path(
+                            std::path::Path::new(&agent.cwd),
+                            agent.params.as_ref().unwrap_or(&Value::Null),
+                            &agent.alias,
+                        )
+                    } else {
+                        file.clone()
+                    };
+                    let helper =
+                        (self.agent_uid.is_some() && agent.endpoint_kind == "pty").then(|| {
+                            adapter::pty::agent_exec_path(&self.state_dir, &self.provider_env)
+                        });
+                    if adapter::pty::briefing_available(&file, &exposed, helper.as_deref()) {
+                        agent_json["briefing"] = json!(exposed);
                     } else {
                         agent_json["briefing"] = Value::Null;
-                        agent_json["briefing_missing"] = json!(file);
+                        agent_json["briefing_missing"] = json!(exposed);
                     }
                 }
                 // CAD-556: the emitted Landlock policy for a confined
@@ -2591,7 +2603,12 @@ impl Shared {
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
                     if agent.endpoint_kind == "pty" {
-                        adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
+                        adapter::pty::kill_pane(
+                            &self.state_dir,
+                            &alias,
+                            &self.provider_env,
+                            self.agent_uid,
+                        );
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
                     notify
@@ -2632,6 +2649,7 @@ impl Shared {
                                     &self.state_dir,
                                     &agent.alias,
                                     &self.provider_env,
+                                    self.agent_uid,
                                 );
                             }
                             self.open_attach.lock().unwrap().remove(&agent.alias);
