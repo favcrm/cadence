@@ -919,6 +919,54 @@ mod tests {
     }
 
     #[test]
+    fn image_call_refuses_rate_limit_and_uncertain_provider_outcomes_with_stable_key() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let worker = std::thread::spawn(move || {
+            for status in [429, 502, 200] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("provider request");
+                assert_eq!(request.url(), CALL_PATH);
+                assert_eq!(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("idempotency-key"))
+                        .map(|header| header.value.as_str()),
+                    Some("stable-image-request")
+                );
+                let body = if status == 200 {
+                    json!({"ok":true,"data":{"slug":IMAGE_TOOL,"repeated":true,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"0","failed_count":"1"},"data":{"image_urls":[]}}}})
+                } else {
+                    json!({"ok":false,"error":{"code":"provider_unavailable"}})
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
+        adapter.image_hosts = vec!["images.example.test".into()];
+        let mut proof = authority();
+        proof["slot"] = json!("image");
+        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
+        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
+        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
+        proof["quote"] = json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"fixed-test-quote"});
+        for _ in 0..3 {
+            assert!(adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "stable-image-request")
+                .is_err());
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn provider_http_call_uses_fixed_slug_frozen_handle_and_atomic_ceiling() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr().to_ip().unwrap());

@@ -1,5 +1,6 @@
 //! Fixed image-01 generation and custody of its short-lived URL result.
 //! The CDN location is transport input only; the run receipt contains bytes.
+use std::io::Cursor;
 use std::net::IpAddr;
 
 use serde_json::Value;
@@ -11,6 +12,11 @@ use crate::platform::AppCapabilityAsset;
 use super::{IMAGE_TOOL, PLATFORM};
 
 const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+// The fixed image-01 operation asks for one square image. Keep decode work
+// independent of the compressed byte count: a tiny file can expand enormously.
+const IMAGE_SIDE_LIMIT: u32 = 2048;
+const IMAGE_PIXEL_LIMIT: u64 = 2048 * 2048;
+const IMAGE_DECODE_ALLOC_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub(crate) fn valid_host(host: &str) -> bool {
     host.len() <= 253
@@ -45,11 +51,17 @@ impl Resolver for PublicResolver {
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
         let addresses = DefaultResolver::default().resolve(uri, config, timeout)?;
-        if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
-            return Err(ureq::Error::HostNotFound);
-        }
-        Ok(addresses)
+        checked_public_addresses(addresses)
     }
+}
+
+fn checked_public_addresses(
+    addresses: ResolvedSocketAddrs,
+) -> Result<ResolvedSocketAddrs, ureq::Error> {
+    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+        return Err(ureq::Error::HostNotFound);
+    }
+    Ok(addresses)
 }
 
 pub(super) fn public_ip(ip: IpAddr) -> bool {
@@ -207,6 +219,37 @@ pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, Str
     if header.trim().to_ascii_lowercase() != sniffed {
         return Err("downloaded image MIME differs from its bytes".into());
     }
+    let format = match sniffed {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/webp" => image::ImageFormat::WebP,
+        _ => unreachable!(),
+    };
+    let limits = image::Limits {
+        max_image_width: Some(IMAGE_SIDE_LIMIT),
+        max_image_height: Some(IMAGE_SIDE_LIMIT),
+        max_alloc: Some(IMAGE_DECODE_ALLOC_LIMIT),
+    };
+    let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
+    probe.limits(limits.clone());
+    let (width, height) = probe
+        .into_dimensions()
+        .map_err(|_| "downloaded image dimensions are invalid or exceed custody limit")?;
+    if width == 0
+        || height == 0
+        || width != height
+        || u64::from(width) * u64::from(height) > IMAGE_PIXEL_LIMIT
+    {
+        return Err("downloaded image is not a bounded square image".into());
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| "downloaded image cannot be decoded within custody limits")?;
+    if decoded.width() != width || decoded.height() != height {
+        return Err("downloaded image dimensions changed during decode".into());
+    }
     Ok(sniffed)
 }
 
@@ -254,19 +297,84 @@ mod tests {
         bytes
     }
 
+    fn encoded_jpeg(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = vec![0u8; (width * height) as usize];
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .write_image(&pixels, width, height, image::ExtendedColorType::L8)
+            .unwrap();
+        bytes
+    }
+
+    fn encoded_webp(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let pixels = vec![0u8; (width * height * 4) as usize];
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
     #[test]
     fn custody_decodes_and_bounds_supported_images() {
         let mut corrupt = encoded_png(1, 1);
-        let payload = corrupt.windows(4).position(|window| window == b"IDAT").unwrap() + 4;
+        let payload = corrupt
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .unwrap()
+            + 4;
         corrupt[payload] ^= 0x40;
-        assert!(image_mime(&corrupt, "image/png").is_err(), "plausible PNG with damaged payload must refuse");
-        assert!(image_mime(&encoded_png(2, 1), "image/png").is_err(), "non-square output must refuse");
-        assert!(image_mime(&encoded_png(2049, 2049), "image/png").is_err(), "oversized encoded square must refuse");
-        assert_eq!(image_mime(&encoded_png(1, 1), "image/png").unwrap(), "image/png");
+        assert!(
+            image_mime(&corrupt, "image/png").is_err(),
+            "plausible PNG with damaged payload must refuse"
+        );
+        assert!(
+            image_mime(&encoded_png(2, 1), "image/png").is_err(),
+            "non-square output must refuse"
+        );
+        assert!(
+            image_mime(&encoded_png(2049, 2049), "image/png").is_err(),
+            "oversized encoded square must refuse"
+        );
+        assert_eq!(
+            image_mime(&encoded_png(1, 1), "image/png").unwrap(),
+            "image/png"
+        );
+        for (mime, square, rectangle) in [
+            ("image/jpeg", encoded_jpeg(1, 1), encoded_jpeg(2, 1)),
+            ("image/webp", encoded_webp(1, 1), encoded_webp(2, 1)),
+        ] {
+            assert_eq!(image_mime(&square, mime).unwrap(), mime);
+            assert!(
+                image_mime(&rectangle, mime).is_err(),
+                "non-square {mime} must refuse"
+            );
+        }
+        let mut jpeg = vec![0xff, 0xd8, 0xff];
+        jpeg.extend([0; 27]);
+        jpeg.extend([0xff, 0xd9]);
+        assert!(image_mime(&jpeg, "image/jpeg").is_err());
+        let mut webp = b"RIFF".to_vec();
+        webp.extend(16u32.to_le_bytes());
+        webp.extend(b"WEBPVP8 ");
+        webp.extend([0; 8]);
+        assert!(image_mime(&webp, "image/webp").is_err());
     }
 
     #[test]
     fn resolver_rejects_private_target_even_with_an_approved_name() {
+        let mut rebound = PublicResolver.empty();
+        rebound.push("1.1.1.1:443".parse().unwrap());
+        rebound.push("10.0.0.8:443".parse().unwrap());
+        assert!(
+            checked_public_addresses(rebound).is_err(),
+            "one rebound private answer must poison the entire DNS set"
+        );
+        let mut public = PublicResolver.empty();
+        public.push("1.1.1.1:443".parse().unwrap());
+        assert!(checked_public_addresses(public).is_ok());
         assert!(image_agent()
             .get("http://127.0.0.1:3191/image")
             .call()
