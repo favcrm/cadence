@@ -178,6 +178,12 @@ async function main() {
   await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
   assert(host.textContent?.includes("no supported board workspace") && !button("New post"), "Incomplete v0.5 workflows cannot be mistaken for a supported board contract");
   await React.act(async () => root.unmount());
+  installation.version = "constructor";
+  installation.files = ["workflows/instagram.md"];
+  root = createRoot(host);
+  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator: true, readOnly: false } }))); await flush();
+  assert(host.textContent?.includes("no supported board workspace") && !button("New post"), "An arbitrary installed version matching an object prototype key cannot crash the board");
+  await React.act(async () => root.unmount());
   console.log("social source mounted flow passed");
 }
 void main();
