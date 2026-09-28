@@ -112,6 +112,30 @@ async function run() {
     await render({ readOnly: true });
     assert(!button("New issue"), "read-only workspace does not offer creation");
   }
+  if (scenario === "all" || scenario === "pending") {
+    await render({ readOnly: false });
+    await React.act(() => button("New issue")?.click());
+    const form = host.querySelector("form.board-new-issue");
+    const title = form?.querySelector('input[name="title"]') as HTMLInputElement | null;
+    assert(form && title, "pending-write form opens");
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(title, "Keep this pending request");
+      title.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const original = api.create;
+    let requests = 0, finish!: (response: unknown) => void;
+    (api as any).create = () => { requests++; return new Promise((resolve) => { finish = resolve; }); };
+    await React.act(() => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert(requests === 1, "one create request is pending");
+    await render({ readOnly: true });
+    assert(host.querySelector("form.board-new-issue") === form && title.value === "Keep this pending request", "access loss does not unmount a pending write");
+    await React.act(() => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    assert(requests === 1, "access loss cannot start a duplicate write");
+    await render({ readOnly: false });
+    await React.act(async () => finish({ card }));
+    assert(!host.querySelector("form.board-new-issue"), "pending write settles once after access returns");
+    (api as any).create = original;
+  }
   await React.act(() => root.unmount());
   if (scenario === "all" || scenario === "drawer") {
     const opener = document.createElement("button");

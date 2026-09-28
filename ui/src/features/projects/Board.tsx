@@ -1,5 +1,5 @@
 import { useWriteBlock } from "../auth/WriteGate";
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { api, type WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
 import { epicProgress, matches, type BoardFilters } from "../../lib/filters";
@@ -160,6 +160,8 @@ interface Props {
   onView: (view: ProjectView) => void;
   query: string;
   readOnly: boolean;
+  /** Undefined while metadata is unresolved; null when resolved without a session. */
+  sessionId?: string | null;
   actor: string;
   onQuery: (q: string) => void;
   filters: BoardFilters;
@@ -178,12 +180,16 @@ function NewIssueForm({
   onCreated,
   onError,
   onCancel,
+  readOnly,
+  writeReason,
 }: {
   projects: Project[];
   project: string;
   onCreated: (resp: WriteResp, verb: string) => void;
   onError: (e: unknown, verb: string) => void;
   onCancel: () => void;
+  readOnly: boolean;
+  writeReason: string | null;
 }) {
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState("P2");
@@ -199,7 +205,7 @@ function NewIssueForm({
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const t = title.trim();
-    if (!t || !projectKey || pending.current) return;
+    if (!t || !projectKey || readOnly || pending.current) return;
     pending.current = true;
     setError(null);
     setBusy(true);
@@ -238,22 +244,23 @@ function NewIssueForm({
       <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,14rem)_7rem] items-end">
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={fieldId}>Title</label>
-          <input id={fieldId} name="title" autoFocus required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} disabled={busy} className="field w-full" placeholder="What needs to happen?" />
+          <input id={fieldId} name="title" autoFocus required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} disabled={busy || readOnly} className="field w-full" placeholder="What needs to happen?" />
         </div>
         {project === "all" ? (
           <div className="min-w-0">
             <label className="slabel block mb-1" htmlFor={projectId}>Project</label>
-            <Select id={projectId} full value={projectKey} onChange={setSelProject} disabled={busy || projects.length === 0} options={projects.map((p) => ({ value: p.key, label: p.key }))} />
+            <Select id={projectId} full value={projectKey} onChange={setSelProject} disabled={busy || readOnly || projects.length === 0} options={projects.map((p) => ({ value: p.key, label: p.key }))} />
           </div>
         ) : <div className="min-w-0"><span className="slabel block mb-1">Project</span><span className="block text-label text-ink-300 py-2">{projectKey}</span></div>}
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={priorityId}>Priority</label>
-          <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
+          <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy || readOnly} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
         </div>
       </div>
       {error && <p className="text-label text-fail mt-3" role="alert">Could not create issue: {error}</p>}
+      {readOnly && <p className="text-label text-ink-400 mt-3" role="status">Draft saved. {writeReason ?? "Writes are unavailable."}</p>}
       <div className="flex justify-end mt-3">
-        <Button variant="primary" type="submit" loading={busy} disabled={!title.trim() || !projectKey}>Create issue</Button>
+        <Button variant="primary" type="submit" loading={busy} disabled={readOnly || !title.trim() || !projectKey}>Create issue</Button>
       </div>
     </form>
   );
@@ -270,6 +277,7 @@ export default function Board({
   onView,
   query,
   readOnly,
+  sessionId,
   actor,
   onQuery,
   filters,
@@ -283,6 +291,11 @@ export default function Board({
   const block = useWriteBlock(readOnly);
   const [over, setOver] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
+  const [draftSession, setDraftSession] = useState<string | null>(null);
+  const showNewForm = newOpen && (sessionId === undefined || sessionId === draftSession);
+  useEffect(() => {
+    if (newOpen && sessionId !== undefined && sessionId !== draftSession) setNewOpen(false);
+  }, [newOpen, sessionId, draftSession]);
   const issues = issuesState.data ?? [];
   const loaded = issuesState.data !== null;
   // `scope` is what the project and the search box leave; the filter
@@ -497,7 +510,7 @@ export default function Board({
         </span>
         <StaleChip state={issuesState} />
         <div className="ml-auto flex items-center gap-2">
-          {!readOnly && !newOpen && <Button variant="primary" onClick={() => setNewOpen(true)}>New issue</Button>}
+          {!readOnly && !showNewForm && <Button variant="primary" onClick={() => { setDraftSession(sessionId ?? null); setNewOpen(true); }}>New issue</Button>}
           <div className="flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
             {(["kanban", "list"] as const).map((mode) => (
               <button
@@ -520,8 +533,8 @@ export default function Board({
         />
       </div>
 
-      {newOpen && !readOnly && (
-        <NewIssueForm projects={projects} project={project} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
+      {showNewForm && (
+        <NewIssueForm key={draftSession ?? "no-session"} projects={projects} project={project} readOnly={readOnly} writeReason={block} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
       )}
 
       <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section

@@ -1610,7 +1610,9 @@ artifacts. The Issues workspace opens in list view; each title in the list
 or board links to the full issue, while an explicit Preview action opens a
 modal summary with load/error/retry feedback. Writable users can create an
 issue from either view using the same form, which preserves its draft on a
-failed request; read-only users see no creation action. In I3 the board is live: the SPA
+failed request or transient metadata read failure. The form stays visible but
+cannot submit while write access is unknown; a different session starts a new
+draft. Read-only users see no creation action. In I3 the board is live: the SPA
 opens an `EventSource` on `/api/stream` and each frame refetches only the
 resources its data names (`ui/src/lib/cache.ts`: one store per resource,
 requests coalesced, a failed refresh keeps the last good payload as

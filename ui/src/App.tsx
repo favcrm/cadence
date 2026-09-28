@@ -238,6 +238,7 @@ export default function App() {
   const metaIdentity = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const [credentialGeneration, setCredentialGeneration] = useState(0);
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const request = ++metaRequest.current;
@@ -246,6 +247,7 @@ export default function App() {
       metaKey.current = sentKey;
       metaIdentity.current = null;
       operatorKnown.current = false;
+      setCredentialGeneration((generation) => generation + 1);
       setMeta(null);
     }
     const asked = !operatorKnown.current;
@@ -265,6 +267,7 @@ export default function App() {
           setSessionKey(null);
           metaKey.current = null;
           expectedKey = null;
+          setCredentialGeneration((generation) => generation + 1);
         }
         if (changed && !asked) {
           operatorKnown.current = false;
@@ -820,6 +823,7 @@ export default function App() {
         )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
+            key={credentialGeneration}
             issues={issuesState}
             onRetry={() => void resources.issues.refresh()}
             projects={projects}
@@ -830,6 +834,7 @@ export default function App() {
             onView={setView}
             query={query}
             readOnly={readOnly || meta === null}
+            sessionId={meta === null ? undefined : meta.session?.id ?? null}
             actor={actor}
             onQuery={setQuery}
             filters={filters}
