@@ -1982,9 +1982,9 @@ pub fn run(opts: &Options) -> Result<i32> {
     if opts.full && suite_lock_path.is_none() && !opts.no_suite_lock {
         return Err(Error::rejected(
             "CADENCE_SUITE_LOCK is unset — the full suite would run beside \
-             every other suite on this host. Set it (see docs/SESSION.md: \
-             export CADENCE_SUITE_LOCK=$HOME/.local/state/cadence/suite.lock), \
-             or pass --no-full or --no-suite-lock",
+             every other suite on this host. Set it to this host's designated \
+             suite lock path (see CONTRIBUTING.md); obtain build/test admission \
+             separately, or pass --no-full or --no-suite-lock",
         ));
     }
     let root = worktree::main_root(&opts.cwd)?;
