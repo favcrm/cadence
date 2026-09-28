@@ -136,3 +136,12 @@ Only a passing review pinned to that head permits merge-queue enrollment:
 `gh pr merge <PR> -R favcrm/cadence --auto --squash --match-head-commit <REVIEWED-SHA>`.
 Disable auto-merge before changing a queued head. The full delivery and
 production-safety rules remain in [AGENTS.md](AGENTS.md).
+
+After your PR merges, preview recorded merged lanes with
+`cadence issue finish --merged --dry-run`; the preview removes nothing. Finish
+only your recorded lane with `cadence issue finish <ID> --worktree <path>`.
+Its activity, clean-tree and commit-survival guards may refuse cleanup. An
+unrecorded lane needs its owner's review; its directory name is not ownership
+proof. To clear local `origin/*` tracking refs for branches gone from the
+remote, run `git fetch --prune origin`. This does not remove local branches or
+worktrees, or prove that either is safe to remove.
