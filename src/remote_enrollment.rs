@@ -7,6 +7,7 @@
 use crate::remote_result_outbox::DestinationPin;
 use crate::{Error, Result};
 use base64::Engine;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,8 @@ const MAX_SERVICE_TOKEN: usize = 128;
 const RECORD: &str = "enrollment.json";
 const TRUSTED_ISSUER: &str = "trusted-issuer";
 const DEVICE_VERSION: &str = "hosted-cadence-device.v1";
+const CONTINUITY_VERSION: &str = "hosted-cadence-continuity.v1";
+const CONTINUITY_RECORD: &str = "continuity.json";
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -205,6 +208,342 @@ impl Enrollment {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContinuityState {
+    Pending,
+    Bound,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinuityRecord {
+    version: String,
+    issuer: String,
+    organization_id: String,
+    audience: String,
+    subject_id: String,
+    bridge_id: String,
+    agent_id: String,
+    credential_id: String,
+    seed: String,
+    state: ContinuityState,
+    lineage_id: Option<String>,
+    key_id: Option<String>,
+    generation: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedContinuity {
+    record: ContinuityRecord,
+    checksum: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContinuityInfo {
+    lineage_id: String,
+    organization_id: String,
+    audience: String,
+    subject_id: String,
+    agent_id: String,
+    generation: u64,
+}
+impl ContinuityInfo {
+    pub fn lineage_id(&self) -> &str {
+        &self.lineage_id
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn organization_id(&self) -> &str {
+        &self.organization_id
+    }
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+    pub fn subject_id(&self) -> &str {
+        &self.subject_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl ContinuityRecord {
+    fn for_child(enrollment: &Enrollment, seed: String) -> Self {
+        Self {
+            version: CONTINUITY_VERSION.into(),
+            issuer: enrollment.issuer.clone(),
+            organization_id: enrollment.organization_id.clone(),
+            audience: enrollment.audience.clone(),
+            subject_id: enrollment.subject_id.clone(),
+            bridge_id: enrollment.bridge_id.clone(),
+            agent_id: enrollment.agent_id.clone(),
+            credential_id: enrollment.credential_id.clone(),
+            seed,
+            state: ContinuityState::Pending,
+            lineage_id: None,
+            key_id: None,
+            generation: None,
+        }
+    }
+
+    fn valid_for(&self, enrollment: &Enrollment) -> Result<Ed25519KeyPair> {
+        if self.version != CONTINUITY_VERSION
+            || enrollment.source != EnrollmentSource::Browser
+            || self.issuer != enrollment.issuer
+            || self.organization_id != enrollment.organization_id
+            || self.audience != enrollment.audience
+            || self.subject_id != enrollment.subject_id
+            || self.bridge_id != enrollment.bridge_id
+            || self.agent_id != enrollment.agent_id
+            || self.credential_id != enrollment.credential_id
+            || !continuity_b64(&self.seed)
+            || match self.state {
+                ContinuityState::Pending => {
+                    self.lineage_id.is_some() || self.key_id.is_some() || self.generation.is_some()
+                }
+                ContinuityState::Bound => {
+                    self.lineage_id.as_deref().is_none_or(|value| !id(value))
+                        || self
+                            .key_id
+                            .as_deref()
+                            .is_none_or(|value| !continuity_minted(value, "key_"))
+                        || self.generation != Some(1)
+                }
+            }
+        {
+            return Err(reject(
+                "Hosted continuity record does not match browser enrollment",
+            ));
+        }
+        let seed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&self.seed)
+            .map_err(|_| reject("Invalid hosted continuity key"))?;
+        Ed25519KeyPair::from_seed_unchecked(&seed)
+            .map_err(|_| reject("Invalid hosted continuity key"))
+    }
+
+    fn info(&self) -> Result<ContinuityInfo> {
+        if self.state != ContinuityState::Bound {
+            return Err(reject("Hosted continuity bind is pending or uncertain"));
+        }
+        Ok(ContinuityInfo {
+            lineage_id: self
+                .lineage_id
+                .clone()
+                .ok_or_else(|| reject("Invalid lineage"))?,
+            organization_id: self.organization_id.clone(),
+            audience: self.audience.clone(),
+            subject_id: self.subject_id.clone(),
+            agent_id: self.agent_id.clone(),
+            generation: self
+                .generation
+                .ok_or_else(|| reject("Invalid generation"))?,
+        })
+    }
+}
+
+fn continuity_b64(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+fn continuity_minted(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(continuity_b64)
+}
+fn continuity_checksum(record: &ContinuityRecord) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|_| reject("Invalid hosted continuity record"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+fn read_continuity_locked(dir: &Path) -> Result<ContinuityRecord> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(CONTINUITY_RECORD))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject(
+            "Hosted continuity record must be a private owned file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RESPONSE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESPONSE {
+        return Err(reject("Hosted continuity record too large"));
+    }
+    let sealed: SealedContinuity =
+        serde_json::from_slice(&bytes).map_err(|_| reject("Invalid hosted continuity record"))?;
+    if sealed.checksum != continuity_checksum(&sealed.record)? {
+        return Err(reject("Hosted continuity record checksum mismatch"));
+    }
+    Ok(sealed.record)
+}
+fn save_continuity_locked(dir: &Path, record: &ContinuityRecord) -> Result<()> {
+    let path = dir.join(CONTINUITY_RECORD);
+    match fs::symlink_metadata(&path) {
+        Ok(meta)
+            if !meta.is_file()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o077 != 0 =>
+        {
+            return Err(reject("Hosted continuity path is not a private owned file"));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let sealed = SealedContinuity {
+        record: record.clone(),
+        checksum: continuity_checksum(record)?,
+    };
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temp.write_all(&serde_json::to_vec(&sealed).map_err(|_| reject("Invalid continuity"))?)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|_| reject("Unable to save hosted continuity"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuityChallenge {
+    version: String,
+    challenge_id: String,
+    operation_id: String,
+    nonce: String,
+    registry_epoch: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuityBindReply {
+    version: String,
+    lineage_id: String,
+    key_id: String,
+    generation: u64,
+    delivery: String,
+    organization_id: String,
+    audience: String,
+    subject_id: String,
+    bridge_id: String,
+    agent_id: String,
+    credential_kind: String,
+}
+
+/// Bind a browser child while its short-lived bearer and original owner consent
+/// are still live. A private pending seed is durable before either HTTP request;
+/// a lost bind response never manufactures a bound lineage.
+pub fn bind_browser(dir: &Path) -> Result<ContinuityInfo> {
+    private_dir(dir, false)?;
+    let _guard = lock(dir, true)?;
+    let enrollment = read_locked(dir)?;
+    enrollment.valid(now()?)?;
+    require_trusted_issuer(dir, &enrollment.issuer)?;
+    if enrollment.source != EnrollmentSource::Browser {
+        return Err(reject(
+            "Only browser enrollment supports browser continuity",
+        ));
+    }
+    let mut continuity = match fs::symlink_metadata(dir.join(CONTINUITY_RECORD)) {
+        Ok(_) => {
+            let stored = read_continuity_locked(dir)?;
+            stored.valid_for(&enrollment)?;
+            if stored.state == ContinuityState::Bound {
+                return stored.info();
+            }
+            stored
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut bytes = [0_u8; 32];
+            getrandom::fill(&mut bytes).map_err(|_| reject("Unable to create continuity key"))?;
+            let seed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            let pending = ContinuityRecord::for_child(&enrollment, seed);
+            save_continuity_locked(dir, &pending)?;
+            pending
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let key = continuity.valid_for(&enrollment)?;
+    let public = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+    let challenge: ContinuityChallenge = serde_json::from_value(post(
+        &enrollment.issuer,
+        "/v1/hosted-cadence/continuity/challenge",
+        &enrollment.child_token,
+        json!({"version":CONTINUITY_VERSION}),
+    )?)
+    .map_err(|_| reject("Invalid hosted continuity challenge"))?;
+    let at = now()?
+        .checked_mul(1000)
+        .ok_or_else(|| reject("Invalid system clock"))?;
+    if challenge.version != CONTINUITY_VERSION
+        || !continuity_minted(&challenge.challenge_id, "ch_")
+        || !continuity_minted(&challenge.operation_id, "op_")
+        || !continuity_b64(&challenge.nonce)
+        || !continuity_b64(&challenge.registry_epoch)
+        || challenge.issued_at_ms > at.saturating_add(2_000)
+        || challenge.expires_at_ms <= at
+        || challenge.expires_at_ms <= challenge.issued_at_ms
+        || challenge.expires_at_ms - challenge.issued_at_ms > 30_000
+    {
+        return Err(reject("Invalid or expired hosted continuity challenge"));
+    }
+    let proof = format!(
+        "{{\"version\":\"{CONTINUITY_VERSION}\",\"action\":\"bind_key\",\"challengeId\":\"{}\",\"nonce\":\"{}\",\"registryEpoch\":\"{}\",\"publicKey\":\"{public}\"}}",
+        challenge.challenge_id, challenge.nonce, challenge.registry_epoch,
+    );
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(key.sign(proof.as_bytes()).as_ref());
+    let reply: ContinuityBindReply = serde_json::from_value(post(
+        &enrollment.issuer,
+        "/v1/hosted-cadence/continuity/bind",
+        &enrollment.child_token,
+        json!({"version":CONTINUITY_VERSION,"challengeId":challenge.challenge_id,
+            "publicKey":public,"signature":signature}),
+    )?)
+    .map_err(|_| reject("Invalid hosted continuity bind response"))?;
+    if reply.version != CONTINUITY_VERSION
+        || !id(&reply.lineage_id)
+        || !continuity_minted(&reply.key_id, "key_")
+        || reply.generation != 1
+        || (reply.delivery != "bound" && reply.delivery != "metadata")
+        || reply.organization_id != enrollment.organization_id
+        || reply.audience != enrollment.audience
+        || reply.subject_id != enrollment.subject_id
+        || reply.bridge_id != enrollment.bridge_id
+        || reply.agent_id != enrollment.agent_id
+        || reply.credential_kind != "child"
+    {
+        return Err(reject("Issuer continuity bind did not match browser child"));
+    }
+    require_trusted_issuer(dir, &enrollment.issuer)?;
+    enrollment.valid(now()?)?;
+    continuity.state = ContinuityState::Bound;
+    continuity.lineage_id = Some(reply.lineage_id);
+    continuity.key_id = Some(reply.key_id);
+    continuity.generation = Some(reply.generation);
+    save_continuity_locked(dir, &continuity)?;
+    continuity.info()
+}
+
+/// Metadata only; the local key never leaves the protected record.
+pub fn bound_browser(dir: &Path) -> Result<ContinuityInfo> {
+    private_dir(dir, false)?;
+    let _guard = lock(dir, false)?;
+    let enrollment = read_locked(dir)?;
+    enrollment.valid(0)?;
+    require_trusted_issuer(dir, &enrollment.issuer)?;
+    let continuity = read_continuity_locked(dir)?;
+    continuity.valid_for(&enrollment)?;
+    continuity.info()
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Sealed {
@@ -343,7 +682,19 @@ pub fn remove(dir: &Path) -> Result<()> {
     let _guard = lock(dir, true)?;
     let path = dir.join(RECORD);
     let _ = read_locked(dir)?;
+    let continuity = dir.join(CONTINUITY_RECORD);
+    match fs::symlink_metadata(&continuity) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+                return Err(reject("Hosted continuity path is not a private owned file"));
+            }
+            fs::remove_file(continuity)?;
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     fs::remove_file(path)?;
+    File::open(dir)?.sync_all()?;
     Ok(())
 }
 fn save_locked(dir: &Path, record: &Enrollment) -> Result<()> {
@@ -1181,6 +1532,168 @@ mod tests {
             0o600
         );
         assert!(!fs::read_to_string(file).unwrap().contains(CHILD));
+        let original = fs::read(dir.join(CONTINUITY_RECORD)).unwrap();
+        let mut tampered: Value = serde_json::from_slice(&original).unwrap();
+        tampered["record"]["agent_id"] = json!("hca_attacker");
+        fs::write(dir.join(CONTINUITY_RECORD), tampered.to_string()).unwrap();
+        assert!(bound_browser(&dir).is_err());
+        fs::write(dir.join(CONTINUITY_RECORD), &original).unwrap();
+        fs::set_permissions(
+            dir.join(CONTINUITY_RECORD),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(bound_browser(&dir).is_err());
+        fs::set_permissions(
+            dir.join(CONTINUITY_RECORD),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        remove(&dir).unwrap();
+        assert!(!dir.join(CONTINUITY_RECORD).exists());
+        assert!(bound_browser(&dir).is_err());
+    }
+
+    #[test]
+    fn browser_continuity_bind_rejects_forged_identity_and_lineage_metadata() {
+        for (field, wrong) in [
+            ("organizationId", json!("ws_other")),
+            ("audience", json!("https://attacker.board.example.test")),
+            ("subjectId", json!("hsp_other")),
+            ("bridgeId", json!("hcb_other")),
+            ("agentId", json!("hca_other")),
+            ("credentialKind", json!("parent")),
+            ("generation", json!(2)),
+            ("keyId", json!("key_invalid")),
+            ("sessionId", json!("private_session")),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let at = now().unwrap();
+            let server = thread::spawn(move || {
+                let (mut challenge, _) =
+                    continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+                respond(
+                    &mut challenge,
+                    &json!({
+                        "version":"hosted-cadence-continuity.v1",
+                        "challengeId":format!("ch_{}", "A".repeat(43)),
+                        "operationId":format!("op_{}", "B".repeat(43)),
+                        "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                        "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                    }),
+                );
+                let (mut bind, _) =
+                    continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+                let mut reply = json!({
+                    "version":"hosted-cadence-continuity.v1", "delivery":"bound",
+                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "generation":1, "organizationId":"ws_real",
+                    "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                    "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
+                });
+                reply[field] = wrong;
+                respond(&mut bind, &reply);
+            });
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("enroll");
+            trust(&dir, &issuer);
+            let mut child = record(at + 120);
+            child.issuer = issuer;
+            child.source = EnrollmentSource::Browser;
+            child.service_token = None;
+            save(&dir, &child).unwrap();
+            assert!(
+                bind_browser(&dir).is_err(),
+                "forged field {field} was accepted"
+            );
+            server.join().unwrap();
+            assert!(bound_browser(&dir).is_err());
+        }
+    }
+
+    #[test]
+    fn browser_continuity_bind_refuses_expired_challenge_before_proof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let at = now().unwrap();
+        let server = thread::spawn(move || {
+            let (mut challenge, _) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+            respond(
+                &mut challenge,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1",
+                    "challengeId":format!("ch_{}", "A".repeat(43)),
+                    "operationId":format!("op_{}", "B".repeat(43)),
+                    "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                    "issuedAtMs":at*1000-31_000,"expiresAtMs":at*1000-1_000
+                }),
+            );
+            listener.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                listener.accept().is_err(),
+                "expired challenge caused bind request"
+            );
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        trust(&dir, &issuer);
+        let mut child = record(at + 120);
+        child.issuer = issuer;
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        save(&dir, &child).unwrap();
+        assert!(bind_browser(&dir).is_err());
+        server.join().unwrap();
+        assert!(bound_browser(&dir).is_err());
+    }
+
+    #[test]
+    fn browser_continuity_bind_never_claims_success_after_local_save_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let at = now().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        trust(&dir, &issuer);
+        let mut child = record(at + 120);
+        child.issuer = issuer;
+        child.source = EnrollmentSource::Browser;
+        child.service_token = None;
+        save(&dir, &child).unwrap();
+        let changed_dir = dir.clone();
+        let server = thread::spawn(move || {
+            let (mut challenge, _) =
+                continuity_request(&listener, "/v1/hosted-cadence/continuity/challenge");
+            respond(
+                &mut challenge,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1",
+                    "challengeId":format!("ch_{}", "A".repeat(43)),
+                    "operationId":format!("op_{}", "B".repeat(43)),
+                    "nonce":"C".repeat(43), "registryEpoch":"D".repeat(43),
+                    "issuedAtMs":at*1000,"expiresAtMs":at*1000+30_000
+                }),
+            );
+            let (mut bind, _) = continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
+            fs::remove_file(changed_dir.join(CONTINUITY_RECORD)).unwrap();
+            fs::create_dir(changed_dir.join(CONTINUITY_RECORD)).unwrap();
+            respond(
+                &mut bind,
+                &json!({
+                    "version":"hosted-cadence-continuity.v1", "delivery":"bound",
+                    "lineageId":"lineage_agent", "keyId":format!("key_{}", "E".repeat(43)),
+                    "generation":1, "organizationId":"ws_real",
+                    "audience":"https://real.board.example.test", "subjectId":"hsp_subject",
+                    "bridgeId":"hcb_bridge", "agentId":"hca_agent", "credentialKind":"child"
+                }),
+            );
+        });
+        assert!(bind_browser(&dir).is_err());
+        server.join().unwrap();
+        assert!(bound_browser(&dir).is_err());
     }
 
     #[test]

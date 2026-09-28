@@ -54,6 +54,9 @@ pub(crate) enum EnrollmentAction {
         /// Print the consent URL and code without attempting to open a browser.
         #[arg(long)]
         no_open: bool,
+        /// Opt in to an immediate, private same-agent continuity key bind.
+        #[arg(long)]
+        bind_continuity: bool,
     },
     /// Re-enroll after expiry using the private stored service credential.
     Renew {
@@ -178,6 +181,7 @@ fn show_browser_consent(
 }
 pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
     if let RemoteAction::Enrollment { action } = action {
+        let mut continuity = None;
         let record = match action {
             EnrollmentAction::Bootstrap {
                 issuer,
@@ -217,30 +221,48 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                 client_agent,
                 enrollment_dir,
                 no_open,
-            } => Some(remote_enrollment::enroll_browser(
-                issuer,
-                org,
-                audience,
-                client_agent,
-                enrollment_dir,
-                |url, code| {
-                    show_browser_consent(url, code, *no_open, |url| {
-                        let program = if cfg!(target_os = "macos") {
-                            "open"
-                        } else {
-                            "xdg-open"
-                        };
-                        let mut opener = std::process::Command::new(program);
-                        opener
-                            .arg(url)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null());
-                        cadence_agent::reaper::spawn(&mut opener).map(|_| ())
-                    });
-                    Ok(())
-                },
-            )?),
+                bind_continuity,
+            } => {
+                let enrolled = remote_enrollment::enroll_browser(
+                    issuer,
+                    org,
+                    audience,
+                    client_agent,
+                    enrollment_dir,
+                    |url, code| {
+                        show_browser_consent(url, code, *no_open, |url| {
+                            let program = if cfg!(target_os = "macos") {
+                                "open"
+                            } else {
+                                "xdg-open"
+                            };
+                            let mut opener = std::process::Command::new(program);
+                            opener
+                                .arg(url)
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null());
+                            cadence_agent::reaper::spawn(&mut opener).map(|_| ())
+                        });
+                        Ok(())
+                    },
+                )?;
+                if *bind_continuity {
+                    let bound = remote_enrollment::bind_browser(enrollment_dir)?;
+                    if bound.organization_id() != enrolled.organization_id()
+                        || bound.audience() != enrolled.audience()
+                        || bound.subject_id() != enrolled.subject_id()
+                        || bound.agent_id() != enrolled.agent_id()
+                    {
+                        return Err(Error::rejected(
+                            "Browser enrollment changed before continuity bind",
+                        ));
+                    }
+                    continuity = Some(json!({"lineage":bound.lineage_id(),
+                        "generation":bound.generation(),"state":"bound"}));
+                }
+                Some(enrolled)
+            }
             EnrollmentAction::Renew { enrollment_dir } => {
                 Some(remote_enrollment::renew(enrollment_dir)?)
             }
@@ -252,13 +274,16 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                 None
             }
         };
-        let output = if let Some(record) = record {
+        let mut output = if let Some(record) = record {
             json!({"org":record.organization_id(),"audience":record.audience(),
                 "subject":record.subject_id(),"agent":record.agent_id(),
                 "expiresAt":record.expires_at()})
         } else {
             json!({"removed":true})
         };
+        if let Some(bound) = continuity {
+            output["continuity"] = bound;
+        }
         println!("{output}");
         return Ok(0);
     }
