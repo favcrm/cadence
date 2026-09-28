@@ -1267,21 +1267,48 @@ fn find_issue(pm_dir: &Path, id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Is this worktree's issue closed? `Some(true)` provably closed
-/// (status done/dropped, or the worktree ref marked `closed: true`),
-/// `Some(false)` still open, `None` no tracker truth available.
-fn tracker_closed(scan: &Scan, wt_path: &Path, id: Option<&str>) -> Option<bool> {
-    let pm = scan.pm_dir.as_deref()?;
-    let file = find_issue(pm, id?)?;
-    let text = std::fs::read_to_string(&file).ok()?;
-    let (front, _body) = crate::issue::parse::parse_issue(&text).ok()?;
-    if matches!(front.status.as_str(), "done" | "dropped") {
-        return Some(true);
+#[derive(Default)]
+struct TrackerWorktree {
+    /// None means the tracker could not be checked, not that it lacks a ref.
+    recorded: Option<bool>,
+    closed: Option<bool>,
+    open_ref: Option<bool>,
+    issue_done: bool,
+}
+
+/// An issue name/status is not ownership evidence for this exact path.
+fn tracker_worktree(scan: &Scan, wt_path: &Path, id: Option<&str>) -> TrackerWorktree {
+    let Some(pm) = scan.pm_dir.as_deref() else {
+        return TrackerWorktree::default();
+    };
+    let Some(file) = id.and_then(|id| find_issue(pm, id)) else {
+        return TrackerWorktree::default();
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return TrackerWorktree::default();
+    };
+    let Ok((front, _body)) = crate::issue::parse::parse_issue(&text) else {
+        return TrackerWorktree::default();
+    };
+    let issue_done = matches!(front.status.as_str(), "done" | "dropped");
+    let matching: Vec<_> = front
+        .refs
+        .iter()
+        .filter(|r| {
+            r.kind == "worktree"
+                && r.path
+                    .as_deref()
+                    .is_some_and(|p| crate::issue::finish::same_path(Path::new(p), wt_path))
+        })
+        .collect();
+    let has_ref = !matching.is_empty();
+    let has_open_ref = matching.iter().any(|r| r.closed != Some(true));
+    TrackerWorktree {
+        recorded: Some(has_ref),
+        closed: has_ref.then_some(issue_done || !has_open_ref),
+        open_ref: has_ref.then_some(has_open_ref),
+        issue_done,
     }
-    let wt = wt_path.to_string_lossy();
-    Some(front.refs.iter().any(|r| {
-        r.kind == "worktree" && r.closed == Some(true) && r.path.as_deref() == Some(wt.as_ref())
-    }))
 }
 
 /// The worktree staleness scan shared by the `worktrees` check and
@@ -1320,14 +1347,21 @@ pub(super) fn stale_worktrees(
                         .is_some_and(|o| o.status.success())
                 });
             let id = issue_id_from_name(&wt_name);
-            let closed = tracker_closed(scan, &path, id.as_deref());
-            if !merged && closed != Some(true) {
+            let tracker = tracker_worktree(scan, &path, id.as_deref());
+            if !merged && tracker.closed != Some(true) && !tracker.issue_done {
                 continue;
             }
             let clean = git_out(&path, &["status", "--porcelain"])
                 .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-            let is_stale = closed == Some(true) || (merged && clean);
-            if !is_stale {
+            let candidate = if tracker.recorded == Some(true) {
+                tracker.closed == Some(true) || (merged && clean)
+            } else {
+                // Merged/closed-looking but unrecorded paths need review,
+                // even if dirty. Neither branch ancestry nor a guessed
+                // issue id is permission to suggest worktree removal.
+                merged || tracker.issue_done
+            };
+            if !candidate {
                 continue;
             }
             let (bytes, truncated) = dir_size(&path);
@@ -1335,8 +1369,11 @@ pub(super) fn stale_worktrees(
             if merged {
                 why.push(format!("merged into {}", base.as_deref().unwrap_or("?")));
             }
-            if closed == Some(true) {
+            if tracker.closed == Some(true) {
                 why.push("tracker ref closed".to_string());
+            }
+            if tracker.recorded != Some(true) {
+                why.push("no exact tracker worktree ref; review ownership".to_string());
             }
             if !clean {
                 why.push("dirty tree".to_string());
@@ -1349,19 +1386,25 @@ pub(super) fn stale_worktrees(
                 "branch": branch,
                 "issue": id,
                 "merged": merged,
-                "tracker_closed": closed,
+                "tracker_closed": tracker.closed,
+                "recorded_ref": tracker.recorded,
+                "open_ref": tracker.open_ref,
                 "clean": clean,
                 "bytes": bytes,
                 "bytes_truncated": truncated,
                 "why": why.join(", "),
             }));
-            remedies.push(match &id {
-                Some(id) => format!("cadence issue finish {id}"),
-                None => format!(
-                    "git -C {} worktree remove {}",
-                    shell_quote(&root.display().to_string()),
+            remedies.push(if tracker.open_ref == Some(true) {
+                format!(
+                    "cadence issue finish {} --worktree {} (guarded; verify before cleanup)",
+                    id.as_deref().unwrap_or("?"),
                     shell_quote(&path.display().to_string())
-                ),
+                )
+            } else {
+                format!(
+                    "review worktree {} and its owner, commits, PRs, push, and active processes",
+                    path.display()
+                )
             });
         }
     }
@@ -1370,32 +1413,21 @@ pub(super) fn stale_worktrees(
 
 // ---------- reclaim plan ----------
 
-/// What `--reclaim-plan` lists: live lanes' `target/` dirs
-/// (informational — they free only when the lane does), the shared
-/// cache's reclaimable subdirs (cleared contents-only, and only when
-/// no build holds one of cargo's lock files), retired shared dirs an
-/// older cadence planted, and stale worktrees. The stale scan runs
-/// first: a stale lane's *whole* dir — `target/` included — is freed
-/// by that row's own `issue finish`/`worktree remove` command, so its
-/// bytes count toward `reclaimable_bytes` and it gets no separate
-/// informational row. Live-lane `target/` rows report separately as
-/// `freed_with_lanes_bytes` — the headline number is what the plan's
-/// own commands free today. A locked shared cache emits no freeing
-/// command, so its bytes stay out of the total too. Listing only:
-/// nothing here deletes or signals anything, and every emitted
-/// command is shell-quoted so a path with a space can never split
-/// into extra `rm -rf` arguments.
+/// The plan lists live lanes' `target/` dirs, worktree candidates
+/// needing finish/owner checks, and shared cache dirs. Worktree bytes
+/// are informational until the finish guard proves idleness and commit
+/// coverage; only an unlocked cache contributes to `reclaimable_bytes`.
+/// Nothing here deletes or signals anything.
 pub fn reclaim_plan(scan: &Scan) -> Value {
     use crate::worktree::{RETIRED_DEBUG_DIRS, SHARED_DEBUG_DIRS, SHARED_DEBUG_FILES};
     let mut rows: Vec<Value> = Vec::new();
     let Some(root) = repo_root(&scan.cwd) else {
-        return json!({"rows": rows, "reclaimable_bytes": 0, "freed_with_lanes_bytes": 0,
+        return json!({"rows": rows, "reclaimable_bytes": 0, "review_worktree_bytes": 0,
+                      "review_worktree_bytes_truncated": false, "freed_with_lanes_bytes": 0,
                       "skipped": format!("{} is not inside a git repo", scan.cwd.display())});
     };
     let wt_root = layout::worktrees_dir(&root);
-    // Stale scan first — a stale lane's whole dir is freed by its own
-    // row's command, so it must not also emit an informational
-    // worktree-target row.
+    // Candidate scan first, so each worktree footprint appears once.
     let mut stale_rows: Vec<Value> = Vec::new();
     let mut stale_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if wt_root.is_dir() {
@@ -1403,19 +1435,23 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         for s in stale {
             let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
             stale_paths.insert(path.clone());
+            let open_ref = s["open_ref"] == json!(true);
             stale_rows.push(json!({
-                "kind": "stale-worktree",
+                "kind": "worktree-review",
                 "path": s["path"],
                 "bytes": s["bytes"],
                 "bytes_truncated": s["bytes_truncated"],
                 "filesystem": fs_label(&path),
-                "action": match s["issue"].as_str() {
-                    Some(id) => format!("cadence issue finish {id}"),
-                    None => format!(
-                        "git -C {} worktree remove {}",
-                        shell_quote(&root.display().to_string()),
+                "recorded_ref": s["recorded_ref"],
+                "open_ref": s["open_ref"],
+                "action": if open_ref {
+                    format!(
+                        "cadence issue finish {} --worktree {}  # guarded; inspect refusal before cleanup",
+                        s["issue"].as_str().unwrap_or("?"),
                         shell_quote(s["path"].as_str().unwrap_or("?"))
-                    ),
+                    )
+                } else {
+                    "Review ownership, PR/push, unique commits and active processes before any cleanup".to_string()
                 },
                 "why": s["why"],
             }));
@@ -1437,16 +1473,9 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
                     "bytes": bytes,
                     "bytes_truncated": truncated,
                     "filesystem": fs_label(&target),
-                    "action": match issue_id_from_name(&name) {
-                        // "Freed with the lane" — a live lane's target
-                        // is not a recommendation to finish its work.
-                        Some(id) => format!("freed with the lane — cadence issue finish {id} removes it"),
-                        None => format!(
-                            "freed with the lane — git -C {} worktree remove {}",
-                            shell_quote(&root.display().to_string()),
-                            shell_quote(&ent.path().display().to_string())
-                        ),
-                    },
+                    // A directory name alone cannot select a cleanup
+                    // command; this is informational for every live lane.
+                    "action": format!("freed with the lane after its owner and finish guards verify {}", name),
                 }));
             }
         }
@@ -1524,15 +1553,35 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         }
     }
     rows.extend(stale_rows);
-    // `reclaimable_bytes` = what the emitted commands free today:
-    // every row except live-lane targets (freed with their lane) and
-    // a lock-blocked shared cache (no command emitted).
+    // Worktree rows need an independent finish/owner proof, including
+    // process idleness and commit survivability, so they stay out.
     let reclaimable: u64 = rows
         .iter()
-        .filter(|r| r["kind"] != "worktree-target")
+        .filter(|r| {
+            !matches!(
+                r["kind"].as_str(),
+                Some("worktree-target" | "stale-worktree" | "worktree-review")
+            )
+        })
         .filter(|r| !(r["kind"] == "shared-cargo-cache" && r["cargo_locked"] == json!(true)))
         .map(|r| r["bytes"].as_u64().unwrap_or(0))
         .sum();
+    let review_worktree: u64 = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r["kind"].as_str(),
+                Some("stale-worktree" | "worktree-review")
+            )
+        })
+        .map(|r| r["bytes"].as_u64().unwrap_or(0))
+        .sum();
+    let review_truncated = rows.iter().any(|r| {
+        matches!(
+            r["kind"].as_str(),
+            Some("stale-worktree" | "worktree-review")
+        ) && r["bytes_truncated"] == json!(true)
+    });
     let with_lanes: u64 = rows
         .iter()
         .filter(|r| r["kind"] == "worktree-target")
@@ -1541,6 +1590,8 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
     json!({
         "rows": rows,
         "reclaimable_bytes": reclaimable,
+        "review_worktree_bytes": review_worktree,
+        "review_worktree_bytes_truncated": review_truncated,
         "freed_with_lanes_bytes": with_lanes,
     })
 }
@@ -1577,6 +1628,18 @@ pub fn render_reclaim(plan: &Value) -> String {
         "total reclaimable: {}\n",
         human(plan["reclaimable_bytes"].as_u64().unwrap_or(0))
     ));
+    let review = plan["review_worktree_bytes"].as_u64().unwrap_or(0);
+    if review > 0 {
+        out.push_str(&format!(
+            "worktrees needing owner/finish review: {}{} (not counted above)\n",
+            if plan["review_worktree_bytes_truncated"] == json!(true) {
+                "at least "
+            } else {
+                ""
+            },
+            human(review)
+        ));
+    }
     let with_lanes = plan["freed_with_lanes_bytes"].as_u64().unwrap_or(0);
     if with_lanes > 0 {
         out.push_str(&format!(

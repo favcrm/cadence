@@ -1824,7 +1824,7 @@ fn lexical_path(path: &Path) -> PathBuf {
     out
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
         return a == b;
     }

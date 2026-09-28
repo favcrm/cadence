@@ -2523,7 +2523,8 @@ fn worktrees_flag_merged_or_closed_only() {
             "wip",
         ],
     );
-    // wt3: unmerged but tracker says done → stale.
+    // wt3: unmerged with unique work; a same-ID done issue has no
+    // exact worktree ref, so it is review-only.
     git(
         &repo,
         &[
@@ -2554,7 +2555,10 @@ fn worktrees_flag_merged_or_closed_only() {
         "cadence",
         "CAD-1",
         "done",
-        "",
+        &format!(
+            "refs:\n- kind: worktree\n  path: {}\n  closed: true\n",
+            repo.join(".cadence/wt/cad-1-other").display()
+        ),
     );
     // wt4: merged branch but dirty tree and open tracker → not stale.
     git(
@@ -2610,7 +2614,15 @@ fn worktrees_flag_merged_or_closed_only() {
         .collect();
     names.sort();
     assert_eq!(names, vec!["cad-1-x", "feat-a"]);
-    assert!(c.remedy.contains("cadence issue finish CAD-1"));
+    let unrecorded = c.value["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["issue"] == "CAD-1")
+        .unwrap();
+    assert_eq!(unrecorded["recorded_ref"], false);
+    assert!(!c.remedy.contains("cadence issue finish CAD-1"));
+    assert!(!c.remedy.contains("worktree remove"));
 
     // Now close CAD-2's worktree ref in the tracker — dirty tree or
     // not, a closed ref means finished.
@@ -2621,7 +2633,7 @@ fn worktrees_flag_merged_or_closed_only() {
         "doing",
         &format!(
             "refs:\n- kind: worktree\n  path: {}\n  closed: true\n",
-            repo.join(".cadence/wt/cad-2-y").display()
+            repo.join(".cadence/wt/cad-2-y/../cad-2-y").display()
         ),
     );
     let c = check_worktrees(&scan);
@@ -2641,6 +2653,96 @@ fn worktrees_flag_merged_or_closed_only() {
         .collect();
     names.sort();
     assert_eq!(names, vec!["cad-1-x", "cad-2-y", "feat-a"]);
+    let recorded = c.value["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["issue"] == "CAD-2")
+        .unwrap();
+    assert_eq!(recorded["recorded_ref"], true);
+    assert_eq!(recorded["open_ref"], false);
+    assert_eq!(recorded["clean"], false);
+    assert!(!c.remedy.contains("cadence issue finish CAD-2"));
+}
+
+#[test]
+fn reclaim_plan_requires_finish_or_owner_proof_for_worktree_bytes() {
+    let root = TempDir::new().unwrap();
+    let scan = fake_scan(&root);
+    let repo = scan.cwd.clone();
+    init_repo(&repo);
+    for (id, name) in [("CAD-3", "cad-3-open"), ("CAD-4", "cad-4-invalid")] {
+        let rel = format!(".cadence/wt/{name}");
+        let branch = format!("cadence/{name}");
+        git(&repo, &["worktree", "add", "-q", &rel, "-b", &branch]);
+        let lane = repo.join(&rel);
+        std::fs::write(lane.join(format!("{name}.txt")), b"work").unwrap();
+        git(&lane, &["add", "-A"]);
+        git(
+            &lane,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "work",
+            ],
+        );
+        git(&repo, &["merge", "-q", &branch]);
+        real_bytes(&lane.join("target/dep.rlib"), 4096);
+        if id == "CAD-3" {
+            write_issue(
+                scan.pm_dir.as_ref().unwrap(),
+                "cadence",
+                id,
+                "doing",
+                &format!(
+                    "refs:\n- kind: worktree\n  path: {}\n  closed: true\n- kind: worktree\n  path: {}\n- kind: worktree\n  path: {}\n",
+                    lane.display(),
+                    lane.display(),
+                    repo.join(".cadence/wt/cad-3-other").display()
+                ),
+            );
+            // A process in the lane is not proven idle by Git status.
+            let proc = scan.proc_root.join("4242");
+            std::fs::create_dir_all(&proc).unwrap();
+            std::os::unix::fs::symlink(&lane, proc.join("cwd")).unwrap();
+        } else {
+            write_issue(scan.pm_dir.as_ref().unwrap(), "cadence", id, "done", "");
+            std::fs::write(
+                scan.pm_dir.as_ref().unwrap().join("cadence/CAD-4/issue.md"),
+                "---\nrefs: [\n",
+            )
+            .unwrap();
+        }
+    }
+    let plan = reclaim_plan(&scan);
+    let rows = plan["rows"].as_array().unwrap();
+    let open = rows
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("cad-3-open"))
+        .unwrap();
+    let unknown = rows
+        .iter()
+        .find(|r| r["path"].as_str().unwrap().ends_with("cad-4-invalid"))
+        .unwrap();
+    assert_eq!(open["kind"], "worktree-review");
+    assert_eq!(open["recorded_ref"], true);
+    assert_eq!(open["open_ref"], true);
+    assert!(open["action"]
+        .as_str()
+        .unwrap()
+        .contains("issue finish CAD-3"));
+    assert!(open["action"].as_str().unwrap().contains("--worktree"));
+    assert_eq!(unknown["kind"], "worktree-review");
+    assert!(unknown["recorded_ref"].is_null());
+    assert!(!unknown["action"].as_str().unwrap().contains("issue finish"));
+    assert_eq!(plan["reclaimable_bytes"], 0);
+    assert!(plan["review_worktree_bytes"].as_u64().unwrap() >= 8192);
+    assert!(repo.join(".cadence/wt/cad-3-open").is_dir());
+    assert!(repo.join(".cadence/wt/cad-4-invalid").is_dir());
 }
 
 #[test]
@@ -2691,8 +2793,8 @@ fn reclaim_plan_lists_without_deleting() {
     let repo = scan.cwd.clone();
     init_repo(&repo);
     // A live lane with a per-lane target/, the shared cache, and
-    // a stale lane with its own target/ — all listed, none
-    // deleted, and the stale lane's bytes never count its
+    // an unrecorded merged lane with its own target/ — all listed, none
+    // deleted, and the review lane's bytes never count its
     // target/ twice.
     git(
         &repo,
@@ -2737,7 +2839,7 @@ fn reclaim_plan_lists_without_deleting() {
     );
     let gone = repo.join(".cadence/wt/feat-gone");
     // Committed content keeps the tree clean past the merge; the
-    // ignored target/ adds reclaimable bytes without dirtying it.
+    // ignored target/ adds review-only bytes without dirtying it.
     real_bytes(&gone.join("notes.txt"), 64 * 1024);
     git(&gone, &["add", "-A"]);
     git(
@@ -2766,16 +2868,16 @@ fn reclaim_plan_lists_without_deleting() {
     assert!(
         kinds.contains(&"worktree-target")
             && kinds.contains(&"shared-cargo-cache")
-            && kinds.contains(&"stale-worktree")
+            && kinds.contains(&"worktree-review")
             && kinds.contains(&"retired-shared-dir"),
         "{kinds:?}"
     );
-    // Live-lane target rows are informational — excluded from the
-    // reclaimable total and surfaced on their own line instead.
+    // Worktree rows are informational until the finish guard proves
+    // idleness and commit coverage; only cache rows count immediately.
     assert_eq!(
         plan["reclaimable_bytes"].as_u64().unwrap(),
         rows.iter()
-            .filter(|r| r["kind"] != "worktree-target")
+            .filter(|r| r["kind"] != "worktree-target" && r["kind"] != "worktree-review")
             .map(|r| r["bytes"].as_u64().unwrap())
             .sum::<u64>()
     );
@@ -2786,20 +2888,32 @@ fn reclaim_plan_lists_without_deleting() {
             .map(|r| r["bytes"].as_u64().unwrap())
             .sum::<u64>()
     );
-    // A stale lane's whole dir — target/ included — is freed by
-    // its own row's command, so its bytes are the full dir.
-    for stale in rows.iter().filter(|r| r["kind"] == "stale-worktree") {
-        let (whole, _) = dir_size(Path::new(stale["path"].as_str().unwrap()));
-        assert_eq!(stale["bytes"].as_u64().unwrap(), whole, "{stale}");
+    assert_eq!(
+        plan["review_worktree_bytes"].as_u64().unwrap(),
+        rows.iter()
+            .filter(|r| r["kind"] == "worktree-review")
+            .map(|r| r["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    );
+    // A review lane reports its whole footprint, including target/,
+    // but offers no cleanup command or reclaimable-byte credit.
+    for review in rows.iter().filter(|r| r["kind"] == "worktree-review") {
+        let (whole, _) = dir_size(Path::new(review["path"].as_str().unwrap()));
+        assert_eq!(review["bytes"].as_u64().unwrap(), whole, "{review}");
+        assert!(!review["action"]
+            .as_str()
+            .unwrap()
+            .contains("worktree remove"));
+        assert!(!review["action"].as_str().unwrap().contains("issue finish"));
     }
     let gone_row = rows
         .iter()
         .find(|r| {
-            r["kind"] == "stale-worktree" && r["path"].as_str().unwrap().ends_with("feat-gone")
+            r["kind"] == "worktree-review" && r["path"].as_str().unwrap().ends_with("feat-gone")
         })
         .unwrap();
     assert!(gone_row["bytes"].as_u64().unwrap() >= 512 * 1024);
-    // A stale lane never also emits an informational target row.
+    // A review lane never also emits an informational target row.
     assert!(!rows.iter().any(|r| r["kind"] == "worktree-target"
         && r["path"]
             .as_str()
@@ -2858,39 +2972,14 @@ fn reclaim_plan_quotes_paths_and_reports_lock() {
 
     let plan = reclaim_plan(&scan);
     let rows = plan["rows"].as_array().unwrap();
-    // Every emitted command's path args round-trip through a real
-    // shell word-split: `set -- <quoted>` must hand back exactly
-    // the original paths.
+    // The unrecorded lane has no cleanup command, including when its
+    // path contains spaces. Shared-cache commands still quote paths.
     let actions: Vec<String> = rows
         .iter()
         .map(|r| r["action"].as_str().unwrap().to_string())
         .collect();
-    let stale = actions
-        .iter()
-        .find(|a| a.contains("worktree remove"))
-        .expect("stale row")
-        .clone();
-    // The git -C line: `git -C <root> worktree remove <path>` —
-    // extract the two path args and ask `sh` to split them.
-    let (root_q, path_q) = stale
-        .strip_prefix("git -C ")
-        .unwrap()
-        .split_once(" worktree remove ")
-        .unwrap();
-    for (q, want) in [
-        (root_q, repo.display().to_string()),
-        (
-            path_q,
-            repo.join(".cadence/wt/feat gone").display().to_string(),
-        ),
-    ] {
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(format!("set -- {q}; printf %s \"$1\""))
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{stale}");
-    }
+    assert!(!actions.iter().any(|a| a.contains("worktree remove")));
+    assert!(!actions.iter().any(|a| a.contains("issue finish")));
     // The shared row's rm -rf clears *contents*, one quoted glob
     // per shared subdir — run it through a real `sh` and prove
     // the dirs themselves (every lane's symlink target) survive.

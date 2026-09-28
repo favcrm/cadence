@@ -6,8 +6,7 @@ use crate::worktree::layout;
 
 pub(super) fn check_worktrees(scan: &Scan) -> Check {
     let name = "worktrees";
-    let threshold =
-        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
+    let threshold = json!("warn: merged/closed-looking worktree needing owner or finish review");
     let Some(root) = repo_root(&scan.cwd) else {
         return check(
             name,
@@ -30,6 +29,10 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
         );
     }
     let (stale, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    let unrecorded = stale
+        .iter()
+        .filter(|s| s["recorded_ref"] != json!(true))
+        .count();
     // The shared cargo cache counts once, at the repo level — it is
     // not part of any worktree's own footprint.
     let shared = crate::worktree::shared_target_dir(&root);
@@ -57,10 +60,10 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
         })
         .unwrap_or_default();
     let detail = if stale.is_empty() {
-        format!("{scanned} worktrees, none stale{shared_note}")
+        format!("{scanned} worktrees, none needing review{shared_note}")
     } else {
         format!(
-            "{} of {} worktrees stale ({}{}{})",
+            "{} of {} worktrees need review ({unrecorded} unrecorded/unknown; {}{}{})",
             stale.len(),
             scanned,
             if stale
