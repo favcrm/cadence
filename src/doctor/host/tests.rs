@@ -3051,6 +3051,7 @@ fn reclaim_plan_lists_without_deleting() {
         kinds.contains(&"worktree-target")
             && kinds.contains(&"shared-cargo-cache")
             && kinds.contains(&"worktree-review")
+            && kinds.contains(&"worktree-inventory")
             && kinds.contains(&"retired-shared-dir"),
         "{kinds:?}"
     );
@@ -3059,10 +3060,14 @@ fn reclaim_plan_lists_without_deleting() {
     assert_eq!(
         plan["reclaimable_bytes"].as_u64().unwrap(),
         rows.iter()
-            .filter(|r| r["kind"] != "worktree-target" && r["kind"] != "worktree-review")
+            .filter(|r| r["kind"] == "shared-cargo-cache" || r["kind"] == "retired-shared-dir")
             .map(|r| r["bytes"].as_u64().unwrap())
             .sum::<u64>()
     );
+    assert!(rows
+        .iter()
+        .filter(|r| r["kind"] == "worktree-inventory")
+        .all(|r| r["bytes"].is_null()));
     assert_eq!(
         plan["freed_with_lanes_bytes"].as_u64().unwrap(),
         rows.iter()
