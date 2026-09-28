@@ -743,4 +743,70 @@ mod tests {
         .is_err());
         assert!(!dir.join(RECORD).exists());
     }
+
+    #[test]
+    fn remove_orders_after_inflight_renew_and_cannot_be_undone_by_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let audience = "http://127.0.0.1:1";
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        trust(&dir, &issuer);
+        let mut old = record(u64::MAX);
+        old.issuer = issuer.clone();
+        old.audience = audience.into();
+        save(&dir, &old).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let at = now().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = request(&listener, "/v1/hosted-cadence/service/exchange", SERVICE);
+            seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            respond(
+                &mut first,
+                &json!({"version":VERSION,"organization_id":"ws_real",
+                "audience":audience,"principal":{"kind":"service","subject_id":"hsp_subject",
+                "current_role":"member","provisioned_by":"owner_1"},
+                "capabilities":["bridge.enroll","results.submit"],
+                "credential":{"credential_id":"hcb_new","access_token":BRIDGE,
+                    "token_type":"Bearer","issued_at":at,"expires_at":at+120,
+                    "renewal":"reexchange"}}),
+            );
+            let mut second = request(&listener, "/v1/hosted-cadence/service/enroll", BRIDGE);
+            respond(
+                &mut second,
+                &json!({"version":VERSION,"organization_id":"ws_real",
+                "audience":audience,"bridge_id":"hcb_new_bridge","agents":[{
+                "agent_id":"hca_new","bridge_id":"hcb_new_bridge","client_agent_id":"worker",
+                "principal_subject_id":"hsp_subject","organization_id":"ws_real",
+                "audience":audience,"role":"implementer","capabilities":["results.submit"],
+                "credential":{"credential_id":"hcc_new","access_token":CHILD,
+                    "token_type":"Bearer","issued_at":at,"expires_at":at+120,
+                    "renewal":"reexchange"}}]}),
+            );
+        });
+        let renew_dir = dir.clone();
+        let renewing = thread::spawn(move || renew(&renew_dir).unwrap());
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let remove_dir = dir.clone();
+        let removing = thread::spawn(move || {
+            remove(&remove_dir).unwrap();
+            removed_tx.send(()).unwrap();
+        });
+        let removed_while_renewing = removed_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        renewing.join().unwrap();
+        removing.join().unwrap();
+        server.join().unwrap();
+        assert!(
+            !removed_while_renewing,
+            "remove returned while renew was in flight"
+        );
+        assert!(
+            !dir.join(RECORD).exists(),
+            "renew recreated removed credential"
+        );
+    }
 }
