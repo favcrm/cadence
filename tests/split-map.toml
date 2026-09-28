@@ -750,6 +750,8 @@ tests = [
     "session_end_host_fail_caps_at_warn",
     "session_end_orphans_report_exe_and_argc_never_argv",
     "session_host_report_flag_labels_errors_and_env_is_dead",
+    "session_verbs_reject_malformed_host_report_before_mutation",
+    "session_start_shows_tailscale_fix_failure_in_text_and_json",
     "issue_ls_survives_a_closed_downstream_pipe",
     "issue_start_writes_slot_env",
     "issue_comment_and_report_refuse_credential_shaped_text",
