@@ -132,8 +132,8 @@ shared hosts; Vite reconnects when the board returns. For CLI experiments in
 another terminal, export the same `CADENCE_SANDBOX_ROOT` and isolated
 `XDG_CONFIG_HOME`, unset `CADENCE_TOKEN`, `CADENCE_ISSUER` and `CADENCE_ORG`,
 then use `./target/debug/cadence sandbox env dev` and export its printed values
-before issuing commands. The sandbox uses no production Cadence login record or
-cloud token from the shell. At the end, run
+before issuing commands. These steps isolate the Cadence login record and
+`CADENCE_TOKEN` from the sandbox. At the end, run
 `./target/debug/cadence sandbox down dev`; the temp root remains available for
 inspection and can be removed later by its owner.
 
