@@ -462,6 +462,21 @@ impl Shared {
         self.operator_connection("workspace app catalog", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "app_workspace_install" => &["source"],
+            "app_workspace_upgrade" => &[
+                "install_id",
+                "source",
+                "expected_digest",
+                "expected_generation",
+                "expected_new_digest",
+                "request_id",
+            ],
+            "app_workspace_upgrade_check" => &[
+                "install_id",
+                "source",
+                "expected_digest",
+                "expected_generation",
+            ],
+            "app_workspace_upgrade_recover" => &["install_id", "request_id"],
             "app_workspace_migration_recover" => &["journal_id", "rollback"],
             "app_workspace_show" | "app_workspace_recover" => &["install_id"],
             _ => &[],
@@ -479,6 +494,74 @@ impl Shared {
             "app_workspace_install" => {
                 workspace::install(&pm, &self.state_dir, required_str(params, "source")?)
             }
+            "app_workspace_upgrade_check" => workspace::upgrade_check(
+                &pm,
+                required_str(params, "install_id")?,
+                required_str(params, "source")?,
+                required_str(params, "expected_digest")?,
+                required_str(params, "expected_generation")?,
+            ),
+            "app_workspace_upgrade" => {
+                let id = required_str(params, "install_id")?;
+                workspace::upgrade(
+                    &pm,
+                    &workspace::UpgradeRequest {
+                        id,
+                        source: required_str(params, "source")?,
+                        expected_digest: required_str(params, "expected_digest")?,
+                        expected_generation: required_str(params, "expected_generation")?,
+                        expected_new_digest: required_str(params, "expected_new_digest")?,
+                        request_id: required_str(params, "request_id")?,
+                    },
+                    |files, manifest| {
+                        self.store.app_install_upgrade_ready(id)?;
+                        self.store.app_binding_upgrade_capacity(
+                            id,
+                            required_str(params, "expected_new_digest")?,
+                            &manifest.capabilities.keys().cloned().collect::<Vec<_>>(),
+                        )?;
+                        let contexts = self.store.app_context_list(id)?;
+                        let mut incompatible_contexts = Vec::new();
+                        for context in contexts["contexts"].as_array().into_iter().flatten() {
+                            if context["state"] != "active" {
+                                continue;
+                            }
+                            let defaults: std::collections::BTreeMap<String, String> =
+                                serde_json::from_value(context["config"]["input_defaults"].clone())
+                                    .map_err(|_| {
+                                        Error::rejected("stored context defaults are invalid")
+                                    })?;
+                            if super::app_contexts_rpc::validate_defaults(files, &defaults).is_err()
+                            {
+                                incompatible_contexts.push(context["id"].clone());
+                            }
+                        }
+                        let bindings = self.store.app_binding_upgrade_configured(id)?;
+                        let mut rebind_required = Vec::new();
+                        let mut incompatible_bindings = Vec::new();
+                        for binding in &bindings {
+                            rebind_required.push(binding["id"].clone());
+                            let slot = binding["slot"].as_str().unwrap_or("");
+                            if manifest
+                                .capabilities
+                                .get(slot)
+                                .and_then(|need| serde_json::to_value(need).ok())
+                                .as_ref()
+                                != Some(&binding["config"]["declaration"])
+                            {
+                                incompatible_bindings.push(binding["id"].clone());
+                            }
+                        }
+                        Ok(json!({"incompatible_contexts":incompatible_contexts,
+                            "rebind_required":rebind_required,"incompatible_bindings":incompatible_bindings}))
+                    },
+                )
+            }
+            "app_workspace_upgrade_recover" => workspace::upgrade_recover(
+                &pm,
+                required_str(params, "install_id")?,
+                required_str(params, "request_id")?,
+            ),
             "app_workspace_list" => workspace::list(&pm),
             "app_workspace_show" => workspace::show(&pm, required_str(params, "install_id")?),
             "app_workspace_migrate" => workspace::migrate(&pm),

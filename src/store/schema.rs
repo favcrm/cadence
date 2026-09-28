@@ -732,6 +732,27 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 28 {
+            // A package upgrade preserves the exact approval epoch of completed
+            // work. Backfill only the current, independently recorded epoch;
+            // older epochs discarded by pre-v28 code cannot be reconstructed.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_capability_epochs(
+                    install_id TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch>0),
+                    digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked')),
+                    created REAL NOT NULL, PRIMARY KEY(install_id,epoch));
+                 INSERT OR IGNORE INTO app_capability_epochs(install_id,epoch,digest,state,created)
+                 SELECT install_id,epoch,digest,state,created FROM app_install_capabilities;
+                 DROP INDEX IF EXISTS app_binding_live_slot;
+                 CREATE UNIQUE INDEX IF NOT EXISTS app_binding_live_slot_version
+                 ON app_bindings(install_id,scope_key,slot,
+                   coalesce(json_extract(config,'$.bundle_digest'),''))
+                 WHERE state='configured';
+                 UPDATE schema_version SET version=28;",
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

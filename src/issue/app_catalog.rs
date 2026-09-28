@@ -69,6 +69,8 @@ struct Entry {
     app: String,
     project: Option<String>,
     storage: Storage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_revision: Option<String>,
 }
 impl Entry {
     fn paths(&self, id: &InstallationId) -> (PathBuf, PathBuf) {
@@ -79,7 +81,11 @@ impl Entry {
             }
             Storage::Workspace => {
                 let base = Path::new(".apps/installations").join(&**id);
-                (base.join("bundle"), base.join("record.yaml"))
+                let bundle = match &self.bundle_revision {
+                    Some(revision) => base.join("revisions").join(revision).join("bundle"),
+                    None => base.join("bundle"),
+                };
+                (bundle, base.join("record.yaml"))
             }
         }
     }
@@ -266,6 +272,7 @@ impl Snapshot {
                 project: self.project.clone(),
                 name: self.name.clone(),
             },
+            bundle_revision: None,
         }
     }
     fn path(&self) -> PathBuf {
@@ -492,6 +499,16 @@ impl Catalog {
             if let Some(project) = &entry.project {
                 model::check_key(project)?;
             }
+            if let Some(revision) = &entry.bundle_revision {
+                if entry.storage != Storage::Workspace
+                    || revision.len() != 64
+                    || !revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
+                    return Err(Error::rejected("invalid workspace bundle revision"));
+                }
+            }
             if let Storage::Legacy { project, name } = &entry.storage {
                 model::check_key(project)?;
                 if name != &entry.app
@@ -623,6 +640,12 @@ fn record(text: &str, name: &str) -> Result<Record> {
     Ok(record)
 }
 fn no_pending(root: &Root) -> Result<()> {
+    if root
+        .read(Path::new(".apps/upgrade-pending.yaml"), RECORD_CAP)?
+        .is_some()
+    {
+        return Err(Error::rejected("workspace upgrade is pending; use app catalog upgrade-recover with its installation ID and request ID"));
+    }
     if root
         .read(Path::new(".apps/install-pending.yaml"), RECORD_CAP)?
         .is_some()

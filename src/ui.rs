@@ -2232,6 +2232,18 @@ fn write_route(
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
         .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade_recovery = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade/recover"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade_check = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade/check"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
+    let install_upgrade = path
+        .strip_prefix("/api/app-installations/")
+        .and_then(|tail| tail.strip_suffix("/upgrade"))
+        .filter(|id| !id.is_empty() && !id.contains('/'));
     let install_recovery = path
         .strip_prefix("/api/app-installations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -2239,6 +2251,9 @@ fn write_route(
     if path == "/api/app-installations/migrate"
         || catalog_recovery.is_some()
         || install_recovery.is_some()
+        || install_upgrade.is_some()
+        || install_upgrade_check.is_some()
+        || install_upgrade_recovery.is_some()
     {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2246,6 +2261,12 @@ fn write_route(
         }
         let (operation, id) = if let Some(id) = catalog_recovery {
             ("app_workspace_migration_recover", Some(id))
+        } else if let Some(id) = install_upgrade_recovery {
+            ("app_workspace_upgrade_recover", Some(id))
+        } else if let Some(id) = install_upgrade_check {
+            ("app_workspace_upgrade_check", Some(id))
+        } else if let Some(id) = install_upgrade {
+            ("app_workspace_upgrade", Some(id))
         } else if let Some(id) = install_recovery {
             ("app_workspace_recover", Some(id))
         } else {

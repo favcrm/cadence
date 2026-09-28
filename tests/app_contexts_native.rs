@@ -17,6 +17,76 @@ struct Contexts {
     install: Value,
     workflow: String,
 }
+
+#[test]
+fn cad743_upgrade_keeps_context_but_blocks_removed_default_from_new_run() {
+    let h = Contexts::new();
+    let context = h.context("Fav Limited", A, "upgrade-context");
+    let source = h.root.path().join("bundle");
+    let workflow = source.join("workflows/draft.md");
+    let original = std::fs::read_to_string(&workflow).unwrap();
+    assert!(original.contains("source: { context_default: true, ask:"));
+    std::fs::write(
+        &workflow,
+        original.replace("source: { context_default: true, ask:", "source: { ask:"),
+    )
+    .unwrap();
+    let proposed = h
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade_check",
+            json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],
+        "expected_generation":h.install["catalog_generation"]}),
+        )
+        .unwrap();
+    let upgraded = h
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({
+        "install_id":h.install["install_id"],"source":source,
+        "expected_digest":h.install["digest"],
+        "expected_generation":h.install["catalog_generation"],
+        "expected_new_digest":proposed["digest"],
+        "request_id":"remove-source-default"}),
+        )
+        .unwrap();
+    assert_eq!(upgraded["install_id"], h.install["install_id"]);
+    assert_eq!(upgraded["approved"], false);
+    assert_eq!(
+        upgraded["compatibility"]["incompatible_contexts"],
+        json!([context["id"]])
+    );
+    let kept = h
+        .daemon
+        .operator_rpc(
+            "app_context_show",
+            json!({
+        "install_id":h.install["install_id"],"context_id":context["id"]}),
+        )
+        .unwrap();
+    assert_eq!(kept["context"]["config"]["label"], "Fav Limited");
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({
+        "install_id":h.install["install_id"],"digest":upgraded["digest"]}),
+        )
+        .unwrap();
+    let run = h.daemon.operator_rpc(
+        "app_run_create",
+        json!({
+        "install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+        "inputs":{"subject":"Context draft","writer":WRITER,"reviewer":REVIEWER},
+        "request_id":"stale-default-run","owner_pm":OWNER}),
+    );
+    assert!(
+        run.is_err(),
+        "removed context default silently authorized a new run"
+    );
+}
 impl Contexts {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();

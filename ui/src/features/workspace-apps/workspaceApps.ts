@@ -5,7 +5,7 @@ import type { Agent } from "../../lib/types";
 export type { Agent };
 export interface Installation {
   install_id: string; name: string; title: string; version: string;
-  summary: string; digest: string; storage_kind: "workspace" | "legacy";
+  summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   project_link: string | null; approved: boolean | null; executable: boolean;
   approval: { state: string }; guide: string; files: string[];
   workflows?: { name: string; inputs: { name: string; default?: string | null }[] }[];
@@ -26,7 +26,13 @@ export interface Connection {
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
-  config: { connection_id: string; provider: string; account: string; mapping: ActionMapping };
+  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
+}
+export interface UpgradeProposal {
+  install_id: string; name: string; version: string; digest: string;
+  expected_digest: string; expected_generation: string;
+  structural_diff: { added: string[]; changed: string[]; removed: string[] };
+  secret_warnings: unknown[];
 }
 export interface ArtifactReceipt { id: string; step_id: string; digest: string; media_type: string; size: number }
 export interface TextArtifact { id: string; digest: string; media_type: string; size: number; text: string }
@@ -132,6 +138,10 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
 export const workspaceApps = {
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
+  upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string }) =>
+    request<UpgradeProposal>(`${installation(id)}/upgrade/check`, undefined, body),
+  upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string }) =>
+    request<Installation>(`${installation(id)}/upgrade`, undefined, body),
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,
   connections: async (signal?: AbortSignal) => (await request<{ connections: Connection[] }>("/api/connections", signal)).connections,

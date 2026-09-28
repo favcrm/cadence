@@ -141,7 +141,12 @@ impl Shared {
                         .unwrap_or_else(|e| e.into_inner());
                     let proof = self
                         .store
-                        .app_binding_for_slot(install, context, slot)?
+                        .app_binding_for_slot(
+                            install,
+                            context,
+                            slot,
+                            required_str(bundle, "digest")?,
+                        )?
                         .ok_or_else(|| Error::rejected("capability binding is absent"))?;
                     self.app_binding_receipt_current(
                         install, context, slot, &proof, bundle, files,

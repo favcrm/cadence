@@ -234,6 +234,7 @@ impl Shared {
                         .map(|context| self.store.app_context_proof(id, context))
                         .transpose()?;
                     if let Some((config, _)) = &context {
+                        super::app_contexts_rpc::validate_defaults(files, &config.input_defaults)?;
                         let defaults: BTreeMap<_, _> = config
                             .input_defaults
                             .iter()
@@ -308,6 +309,7 @@ impl Shared {
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
+                                required_str(row, "digest")?,
                             )?;
                             if let Some(proof) = &binding {
                                 self.app_binding_receipt_current(
@@ -344,6 +346,7 @@ impl Shared {
                                 id,
                                 context.as_ref().map(|(_, proof)| proof.id.as_str()),
                                 slot,
+                                required_str(row, "digest")?,
                             )?
                             .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
                         self.app_binding_receipt_current(
