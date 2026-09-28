@@ -99,6 +99,48 @@ def referenced_changes(root, changes):
     return None
 
 
+def root_readme_content_reference(root):
+    """Find Rust source that actually embeds or directly reads the root README.
+
+    Bare README names in fixtures and tracker code are not references to the
+    checkout's README. Keep a full PR scope for direct source-content reads;
+    an expression too complex to resolve is also a full-scope fallback.
+    """
+    files = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                           capture_output=True, check=True).stdout.decode("utf-8").split("\0")
+    target = (root / "README.md").resolve()
+    direct = re.compile(
+        rb'(?P<call>include_(?:str|bytes)!|fs::read(?:_to_string)?|File::open|Path::new)'
+        rb'\s*\(\s*"(?P<path>[^"\n]*README\.md)"'
+    )
+    calls = re.compile(rb'include_(?:str|bytes)!|fs::read(?:_to_string)?|File::open|Path::new')
+    for source in files:
+        if not source.endswith(".rs"):
+            continue
+        file = root / source
+        if not file.is_file():
+            continue
+        text = file.read_bytes()
+        if b"README.md" not in text:
+            continue
+        for call in calls.finditer(text):
+            match = direct.match(text, call.start())
+            if match:
+                literal = match.group("path").decode("utf-8", errors="replace")
+                # Compile-time includes resolve from the source file; runtime
+                # relative paths use the repository cwd or remain uncertain.
+                base = file.parent if match.group("call").startswith(b"include_") else root
+                if literal.startswith("../") and base == root:
+                    return source + " may read README.md"
+                if (base / literal).resolve() == target:
+                    return source + " reads README.md"
+            elif b"README.md" in text[call.end():].split(b";", 1)[0]:
+                # concat!, a variable argument, or a more complex expression
+                # that mentions README: do not guess where it resolves.
+                return source + " may read README.md"
+    return None
+
+
 def make_plan(root, event, payload):
     if event != "pull_request":
         return full("non-PR events retain all-targets")
@@ -111,7 +153,12 @@ def make_plan(root, event, payload):
         cwd=root, capture_output=True, check=True,
     )
     changes = parse_changes(result.stdout)
-    reference = referenced_changes(root, changes)
+    # The root README is explicitly a documentation path, but the broad
+    # basename scan catches unrelated tracker/fixture README strings. Use a
+    # content-read check only for this exact one-file documentation edit.
+    readme_only = len(changes) == 1 and changes[0][0] in {"A", "M"} and changes[0][1] == "README.md"
+    reference = (root_readme_content_reference(root) if readme_only
+                 else referenced_changes(root, changes))
     if reference:
         return full("shared file: " + reference)
     # Documentation can be classified without Cargo or a toolchain install.

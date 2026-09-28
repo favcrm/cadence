@@ -58,6 +58,79 @@ class Selection(unittest.TestCase):
                     with patch.object(policy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"tests/foo.rs\0tests/consumer.rs\0")):
                         self.assertIn("consumer.rs references tests/foo.rs", policy.referenced_changes(root, [("M", "tests/foo.rs")]))
 
+    def test_root_readme_mentions_do_not_erase_docs_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("# root\n")
+            contract = root / "contracts/connected-platform/v1"
+            contract.mkdir(parents=True)
+            (contract / "README.md").write_text("# contract\n")
+            (contract / "vectors.json").write_text('{"comment":"See README.md for semantics"}\n')
+            (root / "src").mkdir()
+            (root / "src/issue.rs").write_text('let readme = dir.join("README.md");\n')
+            files = b"README.md\0contracts/connected-platform/v1/README.md\0contracts/connected-platform/v1/vectors.json\0src/issue.rs\0"
+            changes = b"M\0README.md\0"
+            with patch.object(policy.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, changes),
+                subprocess.CompletedProcess([], 0, files),
+            ]):
+                plan = policy.make_plan(root, "pull_request", self.payload())
+            self.assertEqual(plan["mode"], "docs", plan)
+            with patch.object(runner.subprocess, "run") as run:
+                runner.run(root, plan, "tests")
+                run.assert_not_called()
+
+    def test_root_readme_content_reads_keep_full_scope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("# root\n")
+            (root / "src").mkdir()
+            source = root / "src/consumer.rs"
+            files = b"README.md\0src/consumer.rs\0"
+            changes = b"M\0README.md\0"
+            for text in (
+                'const README: &str = include_str!("../README.md");\n',
+                'const README: &str = include_str!(\n  "../README.md"\n);\n',
+                'let readme = std::fs::read_to_string("README.md")?;\n',
+                'let readme = std::fs::read_to_string(\n  "README.md"\n)?;\n',
+                'const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));\n',
+            ):
+                with self.subTest(text=text):
+                    source.write_text(text)
+                    with patch.object(policy.subprocess, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, changes),
+                        subprocess.CompletedProcess([], 0, files),
+                    ]):
+                        plan = policy.make_plan(root, "pull_request", self.payload())
+                    self.assertEqual(plan["mode"], "full", plan)
+
+    def test_nested_readme_embed_does_not_mean_root_readme(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("# root\n")
+            contract = root / "contracts/connected-platform/v1"
+            contract.mkdir(parents=True)
+            (contract / "README.md").write_text("# contract\n")
+            (contract / "fixture.rs").write_text('const README: &str = include_str!("README.md");\n')
+            files = b"README.md\0contracts/connected-platform/v1/README.md\0contracts/connected-platform/v1/fixture.rs\0"
+            with patch.object(policy.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, b"M\0README.md\0"),
+                subprocess.CompletedProcess([], 0, files),
+            ]):
+                plan = policy.make_plan(root, "pull_request", self.payload())
+            self.assertEqual(plan["mode"], "docs", plan)
+
+    def test_nested_readme_is_not_the_root_docs_exception(self):
+        self.assertFalse(policy.doc("contracts/connected-platform/v1/README.md"))
+        self.assertEqual(
+            policy.select("pull_request", [("M", "contracts/connected-platform/v1/README.md")], self.targets)["mode"],
+            "full",
+        )
+
+    @staticmethod
+    def payload():
+        return {"pull_request": {"base": {"sha": "a" * 40}, "head": {"sha": "b" * 40}}}
+
     def test_bad_event_or_missing_tool_falls_back_in_real_cli(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
