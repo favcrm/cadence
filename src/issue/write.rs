@@ -330,13 +330,20 @@ pub fn project_add(
     let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
     crate::issue::project_new::check_prefix(&prefix)?;
-    if project::list(&pm.dir)?.iter().any(|p| p.key == key) {
+    let _lock = pm.lock()?;
+    let projects = project::list(&pm.dir)?;
+    if projects.iter().any(|p| p.key == key) {
         return Err(Error::rejected(format!(
             "Project '{key}' already exists — edit {} directly",
             pm.dir.join(key).join("project.yaml").display()
         )));
     }
-    let _lock = pm.lock()?;
+    if let Some(other) = projects.iter().find(|p| p.prefix == prefix) {
+        return Err(Error::rejected(format!(
+            "Prefix {prefix} is project '{}''s — pass another --prefix",
+            other.key
+        )));
+    }
     let mut repo_entries = Vec::new();
     for repo in repos {
         let path = project::expand_home(repo);
@@ -2036,6 +2043,61 @@ mod tests {
     fn clean(pm: &Pm) -> bool {
         crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok()
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+    }
+
+    #[test]
+    fn lint_reports_duplicate_ids_across_project_folders() {
+        let (_tmp, pm) = tracker();
+        // Plant a legacy tracker with two project folders owning the
+        // same prefix; project_add must refuse to create this state.
+        let mut other = project::load(&pm.dir.join("cadence/project.yaml")).unwrap();
+        other.key = "other".to_string();
+        std::fs::create_dir_all(pm.dir.join("other")).unwrap();
+        std::fs::write(
+            pm.dir.join("other/project.yaml"),
+            serde_yaml::to_string(&other).unwrap(),
+        )
+        .unwrap();
+        let duplicate_dir = pm.dir.join("other/CAD-1");
+        std::fs::create_dir_all(&duplicate_dir).unwrap();
+        std::fs::copy(
+            pm.dir.join("cadence/CAD-1/issue.md"),
+            duplicate_dir.join("issue.md"),
+        )
+        .unwrap();
+
+        let report = crate::issue::lint::run(&pm, None).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(report["ok"], false, "{report}");
+        assert!(
+            errors.iter().any(|e| {
+                e.as_str().is_some_and(|e| {
+                    e.contains("CAD-1: duplicated id")
+                        && e.contains("cadence/CAD-1")
+                        && e.contains("other/CAD-1")
+                })
+            }),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn project_add_refuses_another_projects_normalized_prefix() {
+        let (_tmp, pm) = tracker();
+        let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+        let err = project_add(&pm, "other", "cad", &[], &[], &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Prefix CAD") && err.contains("cadence"),
+            "{err}"
+        );
+        assert!(!pm.dir.join("other").exists());
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+        assert!(clean(&pm), "refused project add left tracker changes");
     }
 
     /// CAD-449: a failed done commit restores `issue.md` and its index

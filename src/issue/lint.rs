@@ -243,7 +243,14 @@ pub fn run_with(
                             project.key, name, front.id
                         ));
                     }
-                    fronts.insert(front.id.clone(), (project.key.clone(), front, name));
+                    if let Some((first_project, _, first_folder)) = fronts.get(&front.id) {
+                        lint.err(format!(
+                            "{}: duplicated id in {first_project}/{first_folder} and {}/{}",
+                            front.id, project.key, name
+                        ));
+                    } else {
+                        fronts.insert(front.id.clone(), (project.key.clone(), front, name));
+                    }
                 }
                 Err(e) => lint.err(format!("{}/{name}: {e}", project.key)),
             }
@@ -251,12 +258,8 @@ pub fn run_with(
     }
 
     // Per-issue field checks + link targets.
-    let mut seen_ids = HashSet::new();
     for (project_key, front, folder) in fronts.values() {
         let id = front.id.as_str();
-        if !seen_ids.insert(id.to_string()) {
-            lint.err(format!("{id}: duplicated id"));
-        }
         if !model::valid_id(id) {
             lint.err(format!("{project_key}/{folder}: bad id grammar '{id}'"));
         }
