@@ -1,4 +1,4 @@
-# AgenticOS issuer sign-in and hosted enrollment (CAD-539, CAD-717)
+# AgenticOS issuer sign-in and hosted enrollment (CAD-539, CAD-717, CAD-729)
 
 CAD-539 authenticates a named principal with an AgenticOS issuer. It does
 **not** connect issue, message or team commands to hosted Cadence. Those commands
@@ -123,6 +123,37 @@ agent, and invokes the pinned HTTP sender only inside that callback. Send takes
 `--enrollment-dir`, not caller-provided `--org` or `--audience` assertions. The
 sender remains subject to independent review and the production gateway stays
 off.
+
+## Short-lived hosted browser enrollment (CAD-729)
+
+When the AOS-76 device and gateway flags are enabled on the chosen issuer, an
+owner may approve a separate hosted browser grant:
+
+```sh
+cadence remote enrollment browser \
+  --issuer https://your-agenticos-api.example --org ws_company \
+  --audience https://company.board.example --client-agent worker \
+  --enrollment-dir /absolute/private/hosted-worker
+```
+
+The same independently created `trusted-issuer` pin is required before the
+first request. `--no-open` prints the URL and code for another device. The CLI
+requests only `bridge.enroll` and `results.submit`, proves possession with a
+fresh PKCE verifier, and accepts only the issuer's matching owner grant. It
+uses the one-time `hct_` bridge to enroll an implementer child through
+`/v1/hosted-cadence/enroll`. It does not use the unrelated `agc_` tools login or
+an `hcs_` service token. The record stores only the child, not the device code,
+PKCE verifier, bridge bearer, or browser cookie. The child identity and
+capability request are explicit so later team work can enroll a distinct
+reviewer rather than sharing one identity.
+
+The child expires no later than its bridge, which is capped at five minutes.
+After expiry, repeat `browser` and owner consent; `renew` deliberately refuses
+a browser record. This is a short-lived result sender, not persistent team
+login. AOS-68's continuity routes are not mounted and no browser renewal or
+sleep/wake guarantee is implied. Local removal does not revoke the hosted
+credential; the server checks live membership and revocation at receipt.
+Production flags remain off until a separate rollout approves them.
 
 ## Remaining cloud contract
 

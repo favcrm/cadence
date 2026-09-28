@@ -39,6 +39,22 @@ pub(crate) enum EnrollmentAction {
         #[arg(long)]
         enrollment_dir: PathBuf,
     },
+    /// Short-lived owner consent for one implementer; repeat after expiry.
+    Browser {
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        org: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        client_agent: String,
+        #[arg(long)]
+        enrollment_dir: PathBuf,
+        /// Print the consent URL and code without attempting to open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Re-enroll after expiry using the private stored service credential.
     Renew {
         #[arg(long)]
@@ -149,6 +165,17 @@ fn post_queued(url: &str, bearer: &str, body: &str) -> Result<(u16, Vec<u8>)> {
         .map_err(|_| Error::rejected("Hosted result response uncertain; local custody retained"))?;
     Ok((status, bytes))
 }
+fn show_browser_consent(
+    url: &str,
+    code: &str,
+    no_open: bool,
+    open: impl FnOnce(&str) -> std::io::Result<()>,
+) {
+    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+    if !no_open {
+        let _ = open(url);
+    }
+}
 pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
     if let RemoteAction::Enrollment { action } = action {
         let record = match action {
@@ -183,6 +210,37 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
                     enrollment_dir,
                 )?)
             }
+            EnrollmentAction::Browser {
+                issuer,
+                org,
+                audience,
+                client_agent,
+                enrollment_dir,
+                no_open,
+            } => Some(remote_enrollment::enroll_browser(
+                issuer,
+                org,
+                audience,
+                client_agent,
+                enrollment_dir,
+                |url, code| {
+                    show_browser_consent(url, code, *no_open, |url| {
+                        let program = if cfg!(target_os = "macos") {
+                            "open"
+                        } else {
+                            "xdg-open"
+                        };
+                        let mut opener = std::process::Command::new(program);
+                        opener
+                            .arg(url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        cadence_agent::reaper::spawn(&mut opener).map(|_| ())
+                    });
+                    Ok(())
+                },
+            )?),
             EnrollmentAction::Renew { enrollment_dir } => {
                 Some(remote_enrollment::renew(enrollment_dir)?)
             }
@@ -295,6 +353,23 @@ mod tests {
     const CHILD: &str = "hct_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
     const AUDIENCE: &str = "https://board.example.invalid";
     const ROUTE: &str = "/__platform/hosted-cadence/org-1/results";
+
+    #[test]
+    fn browser_prompt_preserves_manual_fallback_without_an_opener() {
+        let url = "https://app.agenticos.test/device/hosted-cadence?code=K7PM-2QNF";
+        let mut calls = 0;
+        show_browser_consent(url, "K7PM-2QNF", true, |_| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 0);
+        show_browser_consent(url, "K7PM-2QNF", false, |opened| {
+            calls += 1;
+            assert_eq!(opened, url);
+            Err(std::io::Error::other("no browser installed"))
+        });
+        assert_eq!(calls, 1);
+    }
 
     fn command() -> ResultCommand {
         ResultCommand::parse_json(&json!({
