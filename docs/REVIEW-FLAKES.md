@@ -23,5 +23,6 @@ Contention timeout reports an error without appending. The kernel releases the
 lock when its file descriptor closes. Queries read saved bytes without taking
 an exclusive lock; an incomplete concurrent append is ignored until complete.
 
-The host suite slot is configured with
-`export CADENCE_SUITE_LOCK=$HOME/.local/state/cadence/suite.lock`.
+Before a full `cadence review`, obtain build/test admission and set
+`CADENCE_SUITE_LOCK` to the host's designated suite lock path. These are
+separate requirements; see [CONTRIBUTING.md](../CONTRIBUTING.md).
