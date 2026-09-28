@@ -406,6 +406,9 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
+        if binding["config"]["mapping"]["capability"] != "social.read" {
+            return Err("AgenticOS image generation has no reviewed durable asset workflow".into());
+        }
         let (total, revision) = self.quote_fixed(credential, binding)?;
         Ok(AppCapabilityQuote {
             schema: 1,
@@ -624,6 +627,23 @@ mod tests {
         proof["quote"]["total_price_micros"] = json!(2000);
         proof["quote"]["units"] = json!(2);
         assert!(frozen_charge_ceiling(&proof).is_err());
+    }
+
+    #[test]
+    fn image_capability_cannot_obtain_an_executable_quote_before_asset_review() {
+        let adapter = AgenticosExternalAdapter::with_deployment_pin(
+            "https://api.example.test",
+            Some(MANIFEST_PIN),
+        )
+        .unwrap();
+        let mut binding = authority()["binding"].clone();
+        binding["config"]["mapping"]["capability"] = json!("media.generate");
+        binding["config"]["mapping"]["action"] = json!("generate_image");
+        binding["config"]["mapping"]["tool"] = json!(IMAGE_TOOL);
+        binding["config"]["mapping"]["effect"] = json!("draft");
+        assert!(adapter
+            .quote_app_capability(b"test-token", &binding)
+            .is_err());
     }
 
     #[test]
