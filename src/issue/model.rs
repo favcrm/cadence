@@ -82,6 +82,13 @@ pub struct Claim {
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// CAD-755: daemon-written staleness marker — why the holder's agent
+    /// no longer counts as live ("stopped at …", "attention since …").
+    /// A set marker means the claim does not block take-over; a live
+    /// holder clears it on the next liveness pass. `owner` is untouched
+    /// either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says

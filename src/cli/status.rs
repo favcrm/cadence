@@ -214,6 +214,20 @@ pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> R
         "scope": scope,
         "footer": {
             "states": states,
+            // CAD-755: rows that count as live capacity — not dead, and
+            // not in a terminal/fenced state. Summing `states` minus
+            // `stopped` overcounts (attention rows are fenced, dead
+            // rows can sit in any state).
+            "live": rows
+                .iter()
+                .filter(|r| {
+                    !r["dead"].as_bool().unwrap_or(false)
+                        && !matches!(
+                            r["state"].as_str().unwrap_or_default(),
+                            "stopping" | "stopped" | "attention" | "offline"
+                        )
+                })
+                .count(),
             "unread_inboxes": unread_inboxes,
             "stale_inboxes": stale_inboxes,
             "slots": slots,
@@ -346,6 +360,11 @@ pub(super) fn print_status_table(view: &Value) {
         })
         .unwrap_or_else(|| "none".to_string());
     println!("agents: {states}");
+    // CAD-755: live capacity next to the raw state counts — dead and
+    // fenced rows are out.
+    if let Some(live) = view["footer"]["live"].as_i64() {
+        println!("live: {live}");
+    }
     let unread = view["footer"]["unread_inboxes"]
         .as_array()
         .map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>())

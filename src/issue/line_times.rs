@@ -427,6 +427,7 @@ mod tests {
             by: "pm".into(),
             at: "1970-01-01T00:33:20Z".into(),
             note: None,
+            stale: None,
         });
         assert_eq!(Clock::new(Some(&times)).since("demo", &front), Some(2_000));
         front.claim = None;

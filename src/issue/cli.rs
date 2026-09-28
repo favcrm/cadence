@@ -257,7 +257,8 @@ pub enum IssueAction {
     /// note), backlog|ready → doing, and a comment; owner (the lane) is
     /// left alone except on a take-over.
     /// Re-claiming your own claim refreshes its time. Someone else's
-    /// doing/review issue refuses unless --take-over.
+    /// doing/review issue refuses unless --take-over — or unless the
+    /// daemon marked the claim stale, which needs no flag (CAD-755).
     Claim {
         id: String,
         /// Claimant [default: CADENCE_ALIAS, else operator].
@@ -1777,6 +1778,11 @@ fn print_ls_table(views: &[&board::View]) {
         if v.container {
             flags.push('C');
         }
+        // CAD-755: S — the daemon marked this claim stale (holder's
+        // agent dead past grace); it no longer blocks take-over.
+        if f.claim.as_ref().is_some_and(|c| c.stale.is_some()) {
+            flags.push('S');
+        }
         rows.push(vec![
             f.id.clone(),
             v.status.clone(),
@@ -1789,7 +1795,7 @@ fn print_ls_table(views: &[&board::View]) {
     }
     print_table(&rows);
     eprintln!(
-        "{} issues · B=blocked ~=derived-status C=container",
+        "{} issues · B=blocked ~=derived-status C=container S=stale-claim",
         views.len()
     );
 }
