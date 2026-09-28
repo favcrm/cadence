@@ -109,7 +109,13 @@ impl Shared {
         let path = Self::wiki_path(params)?;
         let text = required_str(params, "text")?;
         let if_rev = optional_str(params, "if_rev");
-        wiki::write(&self.pm()?, &caller, path, text, if_rev)
+        let out = wiki::write(&self.pm()?, &caller, path, text, if_rev)?;
+        // CAD-719: a committed write schedules the coalesced refresh —
+        // an `if_rev` conflict (no commit) kicks nothing.
+        if out["committed"] == true {
+            self.wiki_index.kick();
+        }
+        Ok(out)
     }
 
     /// The board's upload relay: `{path, tmp, sha256?, if_rev?}` —
@@ -126,10 +132,16 @@ impl Shared {
         let if_rev = optional_str(params, "if_rev");
         let pm = self.pm()?;
         let mut out = wiki::put_blob(&pm, &self.state_dir, &caller, path, &tmp, sha256, if_rev)?;
+        let committed = out["rev"].is_string();
         if out["mime"] == "application/pdf" {
             if let Some(sha) = out["sha256"].as_str() {
                 out["extraction"] = wiki::ingest::pdf_result(&pm, &caller, path, sha);
             }
+        }
+        // CAD-719: the pointer commit (and any extraction page it
+        // spawned) moved the wiki tree — schedule the refresh.
+        if committed {
+            self.wiki_index.kick();
         }
         Ok(out)
     }
@@ -137,7 +149,12 @@ impl Shared {
     pub(super) fn rpc_wiki_mkdir(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki mkdir")?;
-        wiki::mkdir(&self.pm()?, &caller, Self::wiki_path(params)?)
+        let out = wiki::mkdir(&self.pm()?, &caller, Self::wiki_path(params)?)?;
+        // CAD-719: a created dir commits a .gitkeep — the tree moved.
+        if out["created"] == true {
+            self.wiki_index.kick();
+        }
+        Ok(out)
     }
 
     pub(super) fn rpc_wiki_mv(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -147,11 +164,15 @@ impl Shared {
         let to = required_str(params, "to")?;
         let pm = self.pm()?;
         let mut out = wiki::mv(&pm, &caller, from, to)?;
+        let moved_flag = out["moved"] == true;
         let destination = out["to"].as_str().unwrap_or(to).to_string();
         let moved = match wiki::read(&pm, &caller, &destination) {
             Ok(page) => page,
             Err(e) => {
                 out["extraction"] = json!({"status":"failed","reason":e.to_string()});
+                if moved_flag {
+                    self.wiki_index.kick();
+                }
                 return Ok(out);
             }
         };
@@ -176,6 +197,11 @@ impl Shared {
                 }
             }
         }
+        // CAD-719: the move committed (plus any relocate/extraction
+        // writes) — schedule the refresh once.
+        if moved_flag {
+            self.wiki_index.kick();
+        }
         Ok(out)
     }
 
@@ -188,10 +214,16 @@ impl Shared {
             .ok()
             .is_some_and(|v| v["mime"] == "application/pdf");
         let mut out = wiki::rm(&pm, &caller, path)?;
+        let removed = out["removed"] == true;
         if pdf {
             if let Err(e) = wiki::ingest::remove_generated(&pm, &caller, path) {
                 out["extraction_cleanup_error"] = json!(e.to_string());
             }
+        }
+        // CAD-719: the removal committed — schedule the refresh so the
+        // old hits are dropped promptly, not on the next search.
+        if removed {
+            self.wiki_index.kick();
         }
         Ok(out)
     }
@@ -210,6 +242,22 @@ impl Shared {
         let path = Self::wiki_path(params)?;
         let limit = optional_u64(params, "limit").unwrap_or(50) as usize;
         wiki::history(&self.pm()?, &caller, path, limit)
+    }
+
+    /// CAD-719: the operator's read-only index health — schema, committed
+    /// vs indexed tree, freshness and its reason, indexed counts and the
+    /// last refresh outcome. Never rebuilds; operator-scope only.
+    pub(super) fn rpc_wiki_index_status(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("wiki index status", params, peer_pid)?;
+        self.wiki_index.status()
+    }
+
+    /// CAD-719: the operator's explicit refresh — one rebuild through the
+    /// same serialized write path the worker and the query-time check
+    /// share, so it never doubles an in-flight rebuild.
+    pub(super) fn rpc_wiki_index_refresh(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("wiki index refresh", params, peer_pid)?;
+        self.wiki_index.refresh()
     }
 }
 

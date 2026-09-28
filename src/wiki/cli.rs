@@ -75,6 +75,21 @@ pub enum WikiAction {
         #[arg(long)]
         limit: Option<u64>,
     },
+    /// Index health and refresh (operator only) — CAD-719.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+}
+
+/// `cadence wiki index …` — the operator's index health and repair.
+#[derive(Subcommand)]
+pub enum IndexAction {
+    /// Show index health: schema, committed vs indexed tree, freshness
+    /// reason, page/chunk counts and the last refresh outcome.
+    Status,
+    /// Rebuild the index now from the committed wiki tree.
+    Refresh,
 }
 
 fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
@@ -280,6 +295,15 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                 );
                 let _ = at;
             }
+            Ok(0)
+        }
+        WikiAction::Index { action } => {
+            let method = match action {
+                IndexAction::Status => "wiki_index_status",
+                IndexAction::Refresh => "wiki_index_refresh",
+            };
+            let out = rpc(state_dir, method, json!({}))?;
+            crate::issue::cli::print_json(&out);
             Ok(0)
         }
     }

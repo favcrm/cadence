@@ -696,6 +696,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "wiki_history",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
+    // CAD-719: index health is operator-only — a read-only status and
+    // an explicit rebuild. These do not bind `wiki_caller`: they gate
+    // on `operator_connection` like the other operator actions, and an
+    // agent or relayed caller can never read or kick the index.
+    (
+        "wiki_index_status",
+        Rule::Handler("operator_connection (CAD-719)"),
+    ),
+    (
+        "wiki_index_refresh",
+        Rule::Handler("operator_connection (CAD-719)"),
+    ),
     // CAD-129: submitting a test run is a mutation attributed to the
     // caller. Reading a job, its log, or the queue is not.
     (
