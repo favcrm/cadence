@@ -3259,6 +3259,8 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         r["ticket_done"]["attempts"] == 2
     });
     assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
+    // CAD-735 red probe: force the final retry to arrive while this
+    // test owns the inspection lock, reproducing the queue failure.
     // Hold the tracker lock while checking that the failed retry left
     // neither issue.md nor the index changed.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -3271,6 +3273,11 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         assert!(Instant::now() < deadline, "the tracker lock never freed");
         thread::sleep(Duration::from_millis(20));
     }
+    lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
+    let consumed = lf.wait_of("D-3", "third retry under inspection lock", |r| {
+        r["ticket_done"]["outcome"] == "refused"
+    });
+    assert_eq!(consumed["ticket_done"]["outcome"], "pending", "{consumed}");
     assert_eq!(lf.f.front("D-3").status, d3_status);
     assert!(
         git(&["diff", "--cached", "--quiet"]).status.success(),
