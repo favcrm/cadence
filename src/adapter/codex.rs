@@ -51,6 +51,19 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
         "args": ["--state-dir", state_dir, "mcp-agent"],
         "env": {"CADENCE_ALIAS": agent.alias, "CADENCE_STATE_DIR": state_dir},
         "startup_timeout_sec": 10,
+        // Managed Codex runs with approvalPolicy=never. Without these
+        // per-tool approvals, it lists the MCP tools but rejects every
+        // model-initiated call before the daemon can apply its own scope.
+        // Keep future tools undiscoverable and subject to a prompt, which
+        // the unattended worker cannot grant.
+        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show"],
+        "default_tools_approval_mode": "prompt",
+        "tools": {
+            "self": {"approval_mode": "approve"},
+            "wiki_search": {"approval_mode": "approve"},
+            "wiki_read": {"approval_mode": "approve"},
+            "issue_show": {"approval_mode": "approve"},
+        },
     }))
 }
 
