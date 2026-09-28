@@ -149,6 +149,57 @@ def run_prompt(prompt):
     }
     if kickoff["kind"] == "produce_text":
         draft = source_text(kickoff)
+        cap_probe = STATE / ("app-capability-probe-" + kickoff["run_id"] + ".json")
+        if cap_probe.exists():
+            from concurrent.futures import ThreadPoolExecutor
+            probe = json.loads(cap_probe.read_text())
+            request = {"message": turn["id"], "token": turn["turn_id"],
+                       "slot": "source", "request_id": "source-once",
+                       "input": {"source": "CONTEXT_SOURCE=" + probe["source"]}}
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                replies = list(pool.map(lambda _: frame("app_run_capability_call", request), range(2)))
+            if any(reply.get("ok") is not True for reply in replies):
+                raise RuntimeError("valid concurrent capability calls failed: " + str(replies))
+            if replies[0]["result"] != replies[1]["result"]:
+                raise RuntimeError("concurrent calls did not return one durable receipt")
+            receipt = replies[0]["result"]
+            cases = []
+            second_charge = frame("app_run_capability_call", dict(request, request_id="second-charge"))
+            if second_charge.get("ok") is not False:
+                raise RuntimeError("one approved slot allowed a second paid provider call")
+            cases.append({"kind":"second-charge","refused":True})
+            for changed in [
+                dict(request, token="forged"),
+                dict(request, context_id=probe["context_id"]),
+                dict(request, run_id=kickoff["run_id"]),
+                dict(request, slot="publication"),
+                dict(request, input={"source": "OTHER_CLIENT"}),
+            ]:
+                answer = frame("app_run_capability_call", changed)
+                if answer.get("ok") is not False:
+                    raise RuntimeError("forged capability call was accepted")
+                cases.append({"kind":"forged","refused":True})
+            detached = frame("app_run_capability_call", request, True)
+            if detached.get("ok") is not False:
+                raise RuntimeError("detached child invoked a run capability")
+            cases.append({"kind":"setsid","refused":True})
+            quote_request = {"install_id":probe["install_id"],
+                             "context_id":probe["context_id"],"slot":"source"}
+            for detached in [False, True]:
+                answer = frame("app_binding_quote", quote_request, detached)
+                if answer.get("ok") is not False:
+                    raise RuntimeError("agent or detached child fetched operator price quote")
+                cases.append({"kind":"quote-operator-only","refused":True})
+            if probe.get("other_receipt_id"):
+                cross = frame("app_run_capability_result",
+                    {"receipt_id":probe["other_receipt_id"],
+                     "message":turn["id"],"token":turn["turn_id"]})
+                if cross.get("ok") is not False:
+                    raise RuntimeError("shared worker fetched another context receipt")
+                cases.append({"kind":"cross-context","refused":True})
+            receipt["probes"] = cases
+            (STATE / ("app-capability-result-" + kickoff["run_id"] + ".json")).write_text(
+                json.dumps(receipt))
         if (STATE / ("context-hold-writer-" + kickoff["run_id"])).exists():
             hold(kickoff, "writer")
         result = dict(
@@ -178,6 +229,28 @@ def run_prompt(prompt):
             or artifact["size"] != len(artifact["text"].encode())
         ):
             raise RuntimeError("actual fetched artifact does not match its pinned receipt")
+        cap_result_path = STATE / ("app-capability-result-" + kickoff["run_id"] + ".json")
+        if cap_result_path.exists():
+            cap_receipt = json.loads(cap_result_path.read_text())
+            exact = frame("app_run_capability_result", {
+                "receipt_id":cap_receipt["id"], "message":turn["id"],
+                "token":turn["turn_id"]})
+            asset = frame("app_run_capability_asset", {
+                "receipt_id":cap_receipt["id"], "message":turn["id"],
+                "token":turn["turn_id"]})
+            if exact.get("ok") is not True or exact["result"] != {
+                key: value for key, value in cap_receipt.items() if key != "probes"}:
+                raise RuntimeError("reviewer could not fetch exact dependency capability receipt")
+            if asset.get("ok") is not True:
+                raise RuntimeError("reviewer could not fetch exact dependency asset")
+            import base64
+            decoded = base64.b64decode(asset["result"]["base64"], validate=True)
+            if ("sha256:" + hashlib.sha256(decoded).hexdigest()) != asset["result"]["digest"]:
+                raise RuntimeError("reviewer asset bytes differ from durable digest")
+            if frame("app_run_capability_asset", {
+                "receipt_id":cap_receipt["id"], "message":turn["id"],
+                "token":turn["turn_id"]}, True).get("ok") is not False:
+                raise RuntimeError("detached reviewer fetched capability asset")
         probe_path = STATE / ("app-release-probe-" + kickoff["run_id"] + ".json")
         if probe_path.exists():
             probe = json.loads(probe_path.read_text())

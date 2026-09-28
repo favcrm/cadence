@@ -82,6 +82,35 @@ pub trait PlatformAdapter: Send + Sync {
         })
     }
 
+    /// Provider-owned execution of a frozen app read/draft action. The broker
+    /// proves the active assigned turn, exact binding and frozen price before
+    /// calling this. Implementations must validate their own resource fields
+    /// against `authority`. A repeated idempotency key must return the same
+    /// recorded provider outcome without another charged operation; reuse
+    /// with changed input or approved price must refuse. Paid providers must
+    /// enforce `authority.quote.total_price_micros` atomically at the charged
+    /// call, not merely compare an earlier discovery response. The default
+    /// refuses every provider.
+    fn execute_app_capability(
+        &self,
+        _credential: &[u8],
+        _authority: &Value,
+        _input: &Value,
+        _idempotency_key: &str,
+    ) -> std::result::Result<super::AppCapabilityOutput, String> {
+        Err("provider does not support run-bound app capabilities".into())
+    }
+
+    /// Quote the exact reviewed mapping and credential account in a frozen
+    /// binding. Providers without live price discovery remain unavailable.
+    fn quote_app_capability(
+        &self,
+        _credential: &[u8],
+        _binding: &Value,
+    ) -> std::result::Result<super::AppCapabilityQuote, String> {
+        Err("provider does not support app capability price discovery".into())
+    }
+
     /// Translate trusted persisted text into the provider's exact input.
     /// Unsupported providers refuse; this does not stage or publish anything.
     fn prepare_app_text(

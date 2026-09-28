@@ -172,6 +172,180 @@ fn start_local_step(s: &Store, run: &Value, step: usize, alias: &str) -> Message
     s.mark_running(&taken.id, &token).unwrap();
     s.message(&taken.id).unwrap().unwrap()
 }
+
+#[test]
+fn cad632_capability_result_is_bounded_durable_and_bound_to_active_turn() {
+    let (dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    let dispatched = s.app_run_dispatch(id, "sha256:bundle").unwrap();
+    let writer = start_local_step(&s, &dispatched, 0, "writer");
+    let turn = writer.turn_id.as_deref().unwrap();
+    let input_digest = crate::store::app_runs::material_digest(&json!({"handle":"client_a"}));
+    let result = json!({"posts":[{"id":"p1","caption":"First\npost"}]});
+    s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+        run: id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "req-1",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        call_id: "call-1",
+    })
+    .unwrap();
+    assert!(
+        s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-2",
+            binding_digest: "binding-a",
+            input_digest: &input_digest,
+            call_id: "call-2",
+        })
+        .is_err(),
+        "an unrecorded provider outcome must still reserve the approved slot"
+    );
+    assert!(
+        s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-1",
+            binding_digest: "binding-a",
+            input_digest: "forged",
+            call_id: "call-1",
+        })
+        .is_err(),
+        "an interrupted call cannot change its payload"
+    );
+    s.app_capability_claim(super::super::app_capabilities::AppCapabilityClaim {
+        run: id,
+        step: "s1",
+        message: &writer.id,
+        turn,
+        slot: "source",
+        request: "req-1",
+        binding_digest: "binding-a",
+        input_digest: &input_digest,
+        call_id: "call-1",
+    })
+    .unwrap();
+    let first = s
+        .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+            id: "call-1",
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-1",
+            binding_digest: "binding-a",
+            input_digest: &input_digest,
+            result: &result,
+            asset: None,
+        })
+        .unwrap();
+    assert_eq!(first["result"], result);
+    assert!(
+        first.get("turn_id").is_none(),
+        "active turn token leaked in receipt"
+    );
+    assert_eq!(
+        s.app_capability_results(id).unwrap()["results"][0]["id"],
+        "call-1"
+    );
+    assert_eq!(
+        s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+            id: "call-1",
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-1",
+            binding_digest: "binding-a",
+            input_digest: &input_digest,
+            result: &result,
+            asset: None,
+        })
+        .unwrap(),
+        first
+    );
+    assert!(s
+        .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+            id: "call-2",
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-1",
+            binding_digest: "binding-a",
+            input_digest: "different",
+            result: &result,
+            asset: None,
+        })
+        .is_err());
+    assert!(
+        s.app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+            id: "call-3",
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-2",
+            binding_digest: "binding-a",
+            input_digest: &input_digest,
+            result: &result,
+            asset: None,
+        })
+        .is_err(),
+        "one approved slot must not permit a second charge"
+    );
+    s.app_run_decide(id, None, true, None).unwrap();
+    let restarted = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+    assert_eq!(
+        restarted
+            .conn()
+            .query_row(
+                "SELECT call_id FROM app_capability_claims WHERE run_id=? AND slot='source'",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "call-1",
+        "durable slot claim must survive daemon restart"
+    );
+    assert!(s
+        .app_capability_record(super::super::app_capabilities::AppCapabilityRecord {
+            id: "call-3",
+            run: id,
+            step: "s1",
+            message: &writer.id,
+            turn,
+            slot: "source",
+            request: "req-2",
+            binding_digest: "binding-a",
+            input_digest: &input_digest,
+            result: &result,
+            asset: None,
+        })
+        .is_err());
+}
 fn producer_result(run: &str, message: &Message) -> Value {
     json!({"turn_id":message.turn_id,"text":json!({"schema":1,"kind":"produce_text","run_id":run,"step_id":"s1","revision":1,"outcome":"succeeded","artifacts":[{"media_type":"text/markdown","text":"# Local draft\nBased on the supplied source."}]}).to_string()})
 }

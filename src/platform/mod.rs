@@ -16,7 +16,72 @@ pub mod local;
 
 pub use adapter::{AppArtifactError, PlatformAdapter};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Exact operator-visible price of one frozen provider capability call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppCapabilityQuote {
+    pub schema: u32,
+    pub currency: String,
+    pub unit_price_micros: u64,
+    pub units: u32,
+    pub total_price_micros: u64,
+    pub price_revision: String,
+}
+
+impl AppCapabilityQuote {
+    pub fn valid(&self) -> bool {
+        self.schema == 1
+            && self.currency == "USD"
+            && (1..=100).contains(&self.units)
+            && self.unit_price_micros > 0
+            && self.total_price_micros == self.unit_price_micros.saturating_mul(self.units as u64)
+            && self.total_price_micros <= 1_000_000_000
+            && !self.price_revision.is_empty()
+            && self.price_revision.len() <= 128
+    }
+}
+
+#[cfg(test)]
+mod app_capability_quote_tests {
+    use super::AppCapabilityQuote;
+
+    #[test]
+    fn cad632_quote_refuses_forged_total_currency_or_revision() {
+        let valid = AppCapabilityQuote {
+            schema: 1,
+            currency: "USD".into(),
+            unit_price_micros: 1_880,
+            units: 1,
+            total_price_micros: 1_880,
+            price_revision: "price-v1".into(),
+        };
+        assert!(valid.valid());
+        let mut changed = valid.clone();
+        changed.total_price_micros += 1;
+        assert!(!changed.valid());
+        changed = valid.clone();
+        changed.currency = "EUR".into();
+        assert!(!changed.valid());
+        changed = valid;
+        changed.price_revision.clear();
+        assert!(!changed.valid());
+    }
+}
+
+/// Bounded provider output. The broker stores the JSON receipt and optional
+/// downloaded bytes before exposing either to an app caller.
+pub struct AppCapabilityOutput {
+    pub result: Value,
+    pub asset: Option<AppCapabilityAsset>,
+}
+
+pub struct AppCapabilityAsset {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
 
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};

@@ -451,7 +451,7 @@ pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
 }
 
 /// The session id (`/proc/<pid>/stat` field 6).
-fn proc_session(pid: u32) -> Result<u32, String> {
+pub(crate) fn proc_session(pid: u32) -> Result<u32, String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|e| format!("/proc/{pid}/stat: {e}"))?;
     // comm (field 2) may hold spaces and parens — split after the last

@@ -65,11 +65,18 @@ const META_KEYS: &[&str] = &[
     "distinct",
     "label",
     "publication_slot",
+    "capability_slots",
 ];
 
 /// Workflow-only frontmatter keys: pulled out at parse and removed
 /// before rendering, because the plan parser denies unknown fields.
-const WORKFLOW_ONLY_KEYS: &[&str] = &["inputs", "distinct", "label", "publication_slot"];
+const WORKFLOW_ONLY_KEYS: &[&str] = &[
+    "inputs",
+    "distinct",
+    "label",
+    "publication_slot",
+    "capability_slots",
+];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
 /// the approval-affecting fields later stages add (a `reviewer:` line
@@ -179,6 +186,7 @@ pub struct Template {
     pub distinct: Vec<String>,
     pub label: Option<String>,
     pub publication_slot: Option<String>,
+    pub capability_slots: Vec<String>,
 }
 
 /// The declared inputs as the board renders them — file order, each
@@ -286,6 +294,7 @@ struct Front {
     distinct: Vec<String>,
     label: Option<String>,
     publication_slot: Option<String>,
+    capability_slots: Vec<String>,
 }
 
 fn parse_front(yaml: &str) -> Result<Front> {
@@ -341,6 +350,30 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 "workflow publication_slot must be one static slot name",
             ))
         }
+    };
+    let capability_slots = match map.remove(serde_yaml::Value::String("capability_slots".into())) {
+        None => Vec::new(),
+        Some(serde_yaml::Value::Sequence(slots)) if !slots.is_empty() && slots.len() <= 8 => {
+            let mut names = Vec::new();
+            for slot in slots {
+                let name = slot
+                    .as_str()
+                    .filter(|s| model::valid_tag(s))
+                    .ok_or_else(|| {
+                        Error::rejected("workflow capability_slots must contain static slot names")
+                    })?;
+                if names.iter().any(|existing| existing == name)
+                    || publication_slot.as_deref() == Some(name)
+                {
+                    return Err(Error::rejected("workflow capability_slots must be distinct from each other and publication_slot"));
+                }
+                names.push(name.to_string());
+            }
+            names
+        }
+        Some(_) => return Err(Error::rejected(
+            "workflow capability_slots must be a nonempty list of at most eight static slot names",
+        )),
     };
     let inputs_val = map.remove(serde_yaml::Value::String("inputs".to_string()));
     let mut inputs = BTreeMap::new();
@@ -482,6 +515,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
         distinct,
         label,
         publication_slot,
+        capability_slots,
     })
 }
 
@@ -653,6 +687,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
         distinct: front.distinct,
         label: front.label,
         publication_slot: front.publication_slot,
+        capability_slots: front.capability_slots,
     })
 }
 
@@ -829,6 +864,23 @@ fn bad_value_char(c: char) -> bool {
     c.is_control()
         || INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
         || (c.is_whitespace() && c != ' ')
+}
+
+/// A provider caption remains byte-exact in its receipt. Only this derived
+/// display line enters a rendered workflow, whose input grammar is deliberately
+/// single-line to prevent provider data from becoming plan structure.
+pub fn source_input_line(caption: &str) -> Result<String> {
+    let clean: String = caption
+        .chars()
+        .map(|c| if bad_value_char(c) { ' ' } else { c })
+        .collect();
+    let line = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() || line.len() > 16 * 1024 {
+        return Err(Error::rejected(
+            "selected source caption is empty or too large after normalization",
+        ));
+    }
+    Ok(line)
 }
 
 /// Parse a rendered plan into its doc and per-ticket metadata lines —
@@ -1044,6 +1096,12 @@ pub fn gate_keys(text: &str) -> Result<String> {
     }
     if let Some(slot) = &tpl.publication_slot {
         keys.push_str(&format!(";publication_slot={slot}"));
+    }
+    if !tpl.capability_slots.is_empty() {
+        keys.push_str(&format!(
+            ";capability_slots={}",
+            tpl.capability_slots.join(",")
+        ));
     }
     keys.push('\n');
     let metas = ticket_meta(body)?;
@@ -1805,6 +1863,37 @@ mod tests {
             let bad = WF.replace("inputs:", &format!("publication_slot: {slot}\ninputs:"));
             assert!(parse_template(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cad632_capability_slots_are_static_distinct_gate_material() {
+        let configured = WF.replace("inputs:", "capability_slots: [source, image]\ninputs:");
+        let template = parse_template(&configured).unwrap();
+        assert_eq!(template.capability_slots, vec!["source", "image"]);
+        assert_ne!(
+            gate_digest(&configured).unwrap(),
+            gate_digest(WF).unwrap(),
+            "capability declarations must require fresh installation approval"
+        );
+        assert!(!render(&configured, &inputs(&[("topic", "rust")]))
+            .unwrap()
+            .contains("capability_slots:"));
+        for declaration in ["[source, source]", "[]", "[{{source}}]"] {
+            let bad = WF.replace(
+                "inputs:",
+                &format!("capability_slots: {declaration}\ninputs:"),
+            );
+            assert!(parse_template(&bad).is_err(), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn cad632_provider_caption_is_derived_as_one_safe_line() {
+        assert_eq!(
+            source_input_line("  Lunch\nserved\tnoon ❤️  ").unwrap(),
+            "Lunch served noon ❤"
+        );
+        assert!(source_input_line("\n\t").is_err());
     }
 
     const WF: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}} for {{keyword}}\"\n\
