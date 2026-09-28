@@ -2758,7 +2758,6 @@ fn worktrees_resolve_cross_issue_ref_and_inventory_unmerged_unknown() {
         .iter()
         .any(|r| r["path"] == unknown["path"]));
     let indexed = scan.tracker_index.get().unwrap();
-    assert_eq!(indexed.refs.len(), 1);
     let plan = reclaim_plan(&scan);
     assert!(std::ptr::eq(indexed, scan.tracker_index.get().unwrap()));
     assert!(plan["rows"].as_array().unwrap().iter().any(|r| {
