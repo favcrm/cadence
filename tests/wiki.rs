@@ -306,7 +306,7 @@ fn index_status_reports_health_and_tracks_committed_tree() {
 
     // Before any wiki write: no committed wiki tree, no snapshot.
     let s = index_status(d);
-    assert_eq!(s["schema"], "wiki-fts-v1", "{s}");
+    assert_eq!(s["schema"], "wiki-fts-v2", "{s}");
     assert_eq!(s["current"], false, "{s}");
     assert!(s["stale_reason"].is_string(), "{s}");
 
@@ -453,6 +453,59 @@ fn explicit_refresh_reads_committed_tree_not_uncommitted_worktree() {
         .unwrap();
     assert_eq!(old["matches"][0]["path"], "global/source.md");
     assert!(new["matches"].as_array().unwrap().is_empty(), "{new}");
+}
+
+#[test]
+fn missing_fts_table_invalidates_revision_and_rebuilds() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/table.md", "# Table\nrestorable sextant\n");
+    wait_status(d, |s| s["current"] == true);
+    let conn = rusqlite::Connection::open(d.state.join("wiki-search.sqlite3")).unwrap();
+    conn.execute_batch("DROP TABLE wiki_index_chunks;").unwrap();
+    drop(conn);
+    let broken = index_status(d);
+    assert_eq!(broken["current"], false, "{broken}");
+    assert!(broken["index_error"].is_string(), "{broken}");
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"sextant"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/table.md");
+    assert_eq!(index_status(d)["current"], true);
+}
+
+#[test]
+fn old_schema_forces_committed_source_rebuild() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(d, "global/v2.md", "# V2\ncanonical heliograph\n");
+    wait_status(d, |s| s["current"] == true);
+    let conn = rusqlite::Connection::open(d.state.join("wiki-search.sqlite3")).unwrap();
+    conn.execute_batch(
+        "DELETE FROM wiki_index_chunks;
+         UPDATE wiki_index_meta SET value='wiki-fts-v1' WHERE key='schema';",
+    )
+    .unwrap();
+    drop(conn);
+    let found = d
+        .operator_rpc("wiki_search", json!({"q":"heliograph"}))
+        .unwrap();
+    assert_eq!(found["matches"][0]["path"], "global/v2.md");
+    assert_eq!(index_status(d)["schema_stored"], "wiki-fts-v2");
+}
+
+#[test]
+fn skipped_extraction_is_not_counted_as_indexed_page() {
+    let fx = fx();
+    let d = &fx.d;
+    write_op(
+        d,
+        "global/old.pdf.extracted.md",
+        "---\nkind: extracted-source\nsource_path: \"global/old.pdf\"\nsource_sha256: missing\n---\n# Stale\nobsolete astrolabe\n",
+    );
+    let status = wait_status(d, |s| s["current"] == true);
+    assert_eq!(status["pages_indexed"], 0, "{status}");
+    assert_eq!(status["skipped_pages"], 1, "{status}");
 }
 
 #[test]

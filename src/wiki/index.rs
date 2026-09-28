@@ -19,7 +19,9 @@ use super::{allowed, normalize, vault_dir, Caller, Op, SEARCH_CAP, TEXT_CAP};
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
-const SCHEMA: &str = "wiki-fts-v1";
+// v2 rebuilds indexes created before committed Git objects became the
+// source of the indexed text (v1 read the mutable worktree).
+const SCHEMA: &str = "wiki-fts-v2";
 const CHUNK_BYTES: usize = 4096;
 
 fn db_error(error: rusqlite::Error) -> Error {
@@ -38,13 +40,26 @@ fn open(state_dir: &Path) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(db_error)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS wiki_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE VIRTUAL TABLE IF NOT EXISTS wiki_index_chunks USING fts5(
+        "CREATE TABLE IF NOT EXISTS wiki_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )
+    .map_err(db_error)?;
+    let chunks_exist: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !chunks_exist {
+        conn.execute_batch(
+            "DELETE FROM wiki_index_meta WHERE key IN ('revision','schema');
+             CREATE VIRTUAL TABLE wiki_index_chunks USING fts5(
              path UNINDEXED, title, heading, body, line UNINDEXED,
              rev UNINDEXED, source UNINDEXED, tokenize='unicode61 remove_diacritics 2'
          );",
-    )
-    .map_err(db_error)?;
+        )
+        .map_err(db_error)?;
+    }
     let check: String = conn
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .map_err(db_error)?;
@@ -72,6 +87,16 @@ fn open_status(state_dir: &Path) -> Result<Option<Connection>> {
         return Err(Error::internal(format!(
             "wiki index integrity check: {check}"
         )));
+    }
+    let chunks_exist: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_index_chunks')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !chunks_exist {
+        return Err(Error::internal("wiki index FTS table is missing"));
     }
     Ok(Some(conn))
 }
@@ -414,7 +439,6 @@ fn rebuild(conn: &mut Connection, pm: &Pm, vault: &Path, source: &Source) -> Res
                 scan.skipped += 1;
                 continue;
             };
-            scan.pages += 1;
             let extraction_ok = match source {
                 Source::Tree(_) => {
                     let pointer = format!("{}.blob", path.trim_end_matches(".extracted.md"));
@@ -430,6 +454,7 @@ fn rebuild(conn: &mut Connection, pm: &Pm, vault: &Path, source: &Source) -> Res
                 scan.skipped += 1;
                 continue;
             }
+            scan.pages += 1;
             let title = text
                 .lines()
                 .find_map(|line| line.strip_prefix("# "))
@@ -850,6 +875,17 @@ impl IndexRefresh {
 }
 
 pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -> Result<Value> {
+    search_with_hook(pm, state_dir, caller, q, base, || {})
+}
+
+fn search_with_hook(
+    pm: &Pm,
+    state_dir: &Path,
+    caller: &Caller,
+    q: &str,
+    base: &str,
+    mut after_hits: impl FnMut(),
+) -> Result<Value> {
     let norm = normalize(base)?;
     let segs = if norm.is_empty() {
         Vec::new()
@@ -860,13 +896,28 @@ pub fn search(pm: &Pm, state_dir: &Path, caller: &Caller, q: &str, base: &str) -
     let expression = query_terms(q)?;
     let vault = vault_dir(pm)?;
     // A write may commit between the first freshness check and the
-    // query. Validate the same connection's indexed revision after the
-    // read; retry against the new committed tree or fail under churn.
+    // query. Pin hits and metadata to one SQLite read transaction,
+    // compare Git before and after it, then retry on any mismatch.
+    // Without the explicit transaction a background refresh could
+    // advance metadata after the rows are read and make old hits look
+    // current against the new Git tree.
     for _ in 0..3 {
-        let conn = ensure_current(pm, state_dir)?;
-        let matches = search_from_connection(&conn, caller, &norm, &expression)?;
-        let source = source_revision(pm, &vault)?;
-        if matches!(source, Source::Untracked) || is_current(&conn, &source) {
+        let mut conn = ensure_current(pm, state_dir)?;
+        let before = source_revision(pm, &vault)?;
+        let tx = conn.transaction().map_err(db_error)?;
+        // Read metadata first to establish the SQLite snapshot before
+        // any concurrent index commit can land.
+        let indexed = stored_meta(&tx);
+        let matches = search_from_connection(&tx, caller, &norm, &expression)?;
+        after_hits();
+        let after = source_revision(pm, &vault)?;
+        let current = matches!(after, Source::Untracked)
+            || (before == after
+                && indexed
+                    .as_ref()
+                    .is_some_and(|(schema, rev)| schema == SCHEMA && rev == after.value()));
+        tx.rollback().map_err(db_error)?;
+        if current {
             return Ok(json!({"q":q,"base":norm,"matches":matches}));
         }
     }
@@ -920,4 +971,33 @@ fn search_from_connection(
         }
     }
     Ok(matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_retries_when_a_removal_commits_after_hits_are_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        super::super::write(
+            &pm,
+            &Caller::Operator,
+            "global/old.md",
+            "# Old\nretired theodolite\n",
+            None,
+        )
+        .unwrap();
+        let state = root.path().join("state");
+        let mut removed = false;
+        let result = search_with_hook(&pm, &state, &Caller::Operator, "theodolite", "", || {
+            if !removed {
+                super::super::rm(&pm, &Caller::Operator, "global/old.md").unwrap();
+                removed = true;
+            }
+        })
+        .unwrap();
+        assert!(result["matches"].as_array().unwrap().is_empty(), "{result}");
+    }
 }
