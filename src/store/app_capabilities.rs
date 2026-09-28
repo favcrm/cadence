@@ -208,14 +208,12 @@ impl Store {
                 .as_str()
                 .ok_or_else(|| Error::rejected("source run receipt is invalid"))?,
         )?;
-        if run["install_id"] != install
-            || run["context_id"] != json!(context)
-            || run["state"] != "succeeded"
-        {
+        if run["install_id"] != install || run["context_id"] != json!(context) {
             return Err(Error::rejected(
                 "source receipt is outside this installation/context or incomplete",
             ));
         }
+        source_receipt_recoverable_in(&self.conn(), &run, &receipt)?;
         let posts = receipt["result"]["posts"]
             .as_array()
             .ok_or_else(|| Error::rejected("source receipt has no posts"))?;
@@ -466,4 +464,42 @@ impl Store {
             "size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
         )
     }
+}
+
+/// A later failed step does not erase a broker-recorded read. Recovery is
+/// limited to terminal runs with the original approval and the exact claim,
+/// assigned message and turn that recorded this immutable receipt. The
+/// caller must still verify the current installation/context and binding in
+/// the run-creation transaction before freezing a selected post.
+pub(super) fn source_receipt_recoverable_in(
+    conn: &Connection,
+    run: &Value,
+    receipt: &Value,
+) -> Result<()> {
+    if !matches!(run["state"].as_str(), Some("succeeded" | "failed"))
+        || run["approved_digest"] != run["snapshot_digest"]
+        || receipt["run_id"] != run["id"]
+    {
+        return Err(Error::rejected(
+            "source run has no recoverable approved receipt",
+        ));
+    }
+    let belongs_to_broker_turn: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_capability_results r
+         JOIN app_capability_claims c ON c.run_id=r.run_id AND c.slot=r.slot
+         JOIN app_run_steps s ON s.run_id=r.run_id AND s.step_id=r.step_id
+         JOIN messages m ON m.id=s.message_id
+         WHERE r.id=?1 AND r.run_id=?2 AND r.message_id=s.message_id
+         AND r.turn_id=m.turn_id AND c.step_id=r.step_id
+         AND c.request_id=r.request_id AND c.binding_digest=r.binding_digest
+         AND c.input_digest=r.input_digest AND c.call_id=r.id)",
+        params![receipt["id"].as_str(), run["id"].as_str()],
+        |r| r.get(0),
+    )?;
+    if !belongs_to_broker_turn {
+        return Err(Error::rejected(
+            "source receipt lacks its original broker turn",
+        ));
+    }
+    Ok(())
 }

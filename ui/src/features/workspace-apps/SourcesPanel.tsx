@@ -6,12 +6,14 @@ import type { SelectedSource } from "./NewPost";
 
 function verifiedReceipt(receipt: SourceReceipt, run: WorkspaceRun): boolean {
   const result = receipt.result;
-  return receipt.run_id === run.id && receipt.slot === "source"
+  return run.approved_digest === run.snapshot_digest
+    && receipt.run_id === run.id && receipt.slot === "source"
+    && typeof receipt.digest === "string" && receipt.digest.length > 0
     && receipt.binding_digest === run.snapshot.capabilities?.source?.digest
     && result?.schema === 1 && result.kind === "social.source.posts"
     && result.provider === "agenticos_external"
     && result.source_tool === "scrapecreators.instagram.user.posts"
-    && typeof result.handle === "string" && Array.isArray(result.posts)
+    && result.handle === run.snapshot.inputs.profile_handle && Array.isArray(result.posts)
     && result.posts.length <= 24
     && (result.profile_verified === true || (result.profile_verified === false && result.posts.length === 0))
     && result.posts.every(post => typeof post.id === "string" && post.id.length > 0
@@ -56,7 +58,7 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
   useEffect(() => {
     const controller = new AbortController();
     setReceipts({}); setErrors({});
-    for (const run of runs.filter(value => value.state === "succeeded")) {
+    for (const run of runs.filter(value => value.state === "succeeded" || value.state === "failed")) {
       void workspaceApps.capabilityResults(run.id, controller.signal).then(list => {
         if (!controller.signal.aborted)
           setReceipts(previous => ({ ...previous, [run.id]: list.filter(value => verifiedReceipt(value, run)) }));
@@ -88,8 +90,9 @@ export function SourcesPanel({ runs, canWrite, canCreate, onImport, onOpenRun, o
           <Button size="sm" onClick={() => onOpenRun(run)}>Inspect run</Button>
         </div>
         {errors[run.id] && <p className="wa-alert" data-tone="fail" role="alert">{errors[run.id]}</p>}
-        {run.state === "failed" && <p className="wa-alert" data-tone="fail">The source read failed. Inspect the run for the provider refusal; no sample posts are shown.</p>}
-        {run.state === "succeeded" && !list && !errors[run.id] && <p className="wa-muted" role="status">Loading retained source receipts…</p>}
+        {run.state === "failed" && list && list.length > 0 && <p className="wa-alert" data-tone="fail">The source run failed after the retained read. Verified posts remain available to start a new caption plan; inspect the run for the later failure.</p>}
+        {run.state === "failed" && list?.length === 0 && <p className="wa-alert" data-tone="fail">The source run failed without a usable retained read. Inspect the run before starting another paid read.</p>}
+        {(run.state === "succeeded" || run.state === "failed") && !list && !errors[run.id] && <p className="wa-muted" role="status">Loading retained source receipts…</p>}
         {list?.map(receipt => <div key={receipt.id} className="wa-stack">
           <p className="wa-kicker">Receipt {receipt.id} · @{receipt.result.handle} · {receipt.result.more_available ? "more posts available at provider" : "page complete"}</p>
           {receipt.result.posts.length === 0 && <p className="wa-alert" role="status">{receipt.result.profile_verified

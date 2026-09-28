@@ -99,6 +99,21 @@ async function main() {
   await click(host.querySelector('button[aria-label="Close Read @juicysuite_crm"]'));
   rows = [sourceRun("succeeded")]; await click(button("Refresh")); await flush();
   assert(reads.includes("/api/app-runs/source-run/capability-results") && host.textContent?.includes("Original line one"), "Only the stored broker receipt populates source posts");
+  const readsBeforeFailure = reads.filter(path => path === "/api/app-runs/source-run/capability-results").length;
+  rows = [sourceRun("failed")]; await click(button("Refresh")); await flush();
+  assert(reads.filter(path => path === "/api/app-runs/source-run/capability-results").length > readsBeforeFailure,
+    "A failed run still fetches its retained broker receipt");
+  assert(host.textContent?.includes("Original line one") && button("Use as source"),
+    "A later run failure does not discard an already retained paid read");
+  assert(host.textContent?.includes("failed after the retained read"),
+    "The failed run is still clearly identified when its verified posts are recoverable");
+  receiptRows = []; await click(button("Board")); await click(button("Sources"));
+  assert(!button("Use as source") && host.textContent?.includes("failed without a usable retained read"),
+    "A failed run without a broker receipt does not fabricate a recoverable post");
+  receiptRows = [receipt]; rows = [{ ...sourceRun("failed"), approved_digest: null }];
+  await click(button("Refresh")); await flush();
+  assert(!button("Use as source"), "A failed run without its matching approval cannot expose a source");
+  rows = [sourceRun("succeeded")]; await click(button("Refresh")); await flush();
   receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [], profile_verified: true, empty_reason: "no_public_posts" } }];
   await click(button("Board")); await click(button("Sources"));
   assert(host.textContent?.includes("No public posts were returned for this verified profile"), "A verified empty provider page has an explicit honest state");

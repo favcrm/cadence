@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use common::{
-    app_release::{Release, A},
+    app_release::{Release, A, OWNER, REVIEWER, WRITER},
     plant_member_pane, LaneShell,
 };
 use serde_json::{json, Value};
@@ -139,6 +139,140 @@ impl Drop for Board {
             result.unwrap().unwrap();
         }
     }
+}
+
+#[test]
+fn cad709_http_recovers_paid_source_receipt_after_later_run_failure() {
+    let (release, calls, _) = Release::with_capability();
+    let context = release.context("HTTP recovery", A, "http-source-recovery-context");
+    release
+        .daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":release.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":release.connection,
+                "request_id":"http-source-recovery-binding"
+            }),
+        )
+        .unwrap();
+    let source = release.create(&context, "http-source-recovery-read");
+    let run_id = source["id"].as_str().unwrap();
+    std::fs::write(
+        release
+            .daemon
+            .state
+            .join(format!("app-capability-probe-{run_id}.json")),
+        json!({"source":A,"context_id":context["id"],"install_id":release.install["install_id"]})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        release
+            .daemon
+            .state
+            .join(format!("app-review-asset-override-{run_id}.json")),
+        json!({"asset_receipt_id":"missing-receipt","asset_sha256":"sha256:missing"}).to_string(),
+    )
+    .unwrap();
+    release.dispatch(&source);
+    release.wait_state(run_id, "failed");
+    let b = Board::from_release(release);
+    let receipts = b.value(
+        "GET",
+        &format!("/api/app-runs/{run_id}/capability-results"),
+        json!({}),
+    );
+    let receipt = &receipts["results"][0];
+    assert_eq!(receipt["run_id"], source["id"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let body = json!({
+        "install_id":b.release.install["install_id"],"context_id":context["id"],
+        "workflow":"draft","inputs":{"subject":"Recovered HTTP source","writer":WRITER,"reviewer":REVIEWER},
+        "request_id":"http-source-recovery-caption","owner_pm":OWNER,
+        "source_receipt_id":receipt["id"],"selected_post_id":"post-1"
+    });
+    let created = b.value("POST", "/api/app-runs", body.clone());
+    assert_eq!(
+        created["snapshot"]["source"]["receipt_digest"],
+        receipt["digest"]
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "HTTP selection caused a second paid read"
+    );
+    assert_eq!(
+        b.value("POST", "/api/app-runs", body.clone())["id"],
+        created["id"],
+        "same request is idempotent"
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let concurrent = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let state = b.release.daemon.state.clone();
+                let payload = body.to_string();
+                let barrier = barrier.clone();
+                let port = b.port;
+                scope.spawn(move || {
+                    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &state, port);
+                    barrier.wait();
+                    let (status, _, response) =
+                        common::op::raw(port, &session.request("POST", "/api/app-runs", &payload));
+                    assert_eq!(
+                        status, 200,
+                        "concurrent source selection failed: {response}"
+                    );
+                    serde_json::from_str::<Value>(&response).unwrap()["id"].clone()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        concurrent.iter().all(|id| id == &created["id"]),
+        "concurrent recovery must use one exact caption plan"
+    );
+    let mut forged = body.clone();
+    forged["request_id"] = json!("http-source-forged-field");
+    forged["operator"] = json!(true);
+    assert_eq!(
+        b.operator("POST", "/api/app-runs", &forged.to_string()).0,
+        400
+    );
+    let mut lane = LaneShell::spawn(b.release.root.path());
+    plant_member_pane(
+        &b.release.daemon,
+        "source-http-worker",
+        "claude",
+        None,
+        lane.pid(),
+    );
+    for prefix in ["", "setsid "] {
+        let stolen = common::op::sign_in(
+            env!("CARGO_BIN_EXE_cadence"),
+            &b.release.daemon.state,
+            b.port,
+        );
+        let wire = stolen.request_as("POST", "/api/app-runs", &body.to_string(), "");
+        let file = lane
+            .dir
+            .path()
+            .join(format!("source-recovery-http-{}.txt", lane.seq));
+        std::fs::write(&file, wire).unwrap();
+        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+        assert_eq!(rc, 0);
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("403"),
+            "worker or detached child reused an operator session"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
