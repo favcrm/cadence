@@ -832,3 +832,130 @@
             assert_eq!(receipt_schema,1);
         }
     }
+
+    #[test]
+    fn cad743_migration_v27_to_v28_backfills_epochs_and_versions_binding_slots() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("app-upgrade.sqlite3");
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        // Reconstruct the v27 objects and populate rows written under its
+        // single-epoch, single-live-binding contract.
+        conn.execute_batch(
+            "DROP TABLE app_capability_epochs;
+             DROP INDEX app_binding_live_slot_version;
+             CREATE UNIQUE INDEX app_binding_live_slot
+               ON app_bindings(install_id,scope_key,slot) WHERE state='configured';
+             UPDATE schema_version SET version=27;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_install_capabilities(install_id,epoch,digest,state,created)
+             VALUES('app-one',3,'sha256:old-bundle','approved',11.5),
+                   ('app-two',2,'sha256:revoked-bundle','revoked',12.5)",
+            [],
+        )
+        .unwrap();
+        let old_config = json!({"schema":1,"install_id":"app-one","bundle_digest":"sha256:old-bundle","connection_id":"local-one"}).to_string();
+        let new_config = json!({"schema":1,"install_id":"app-one","bundle_digest":"sha256:new-bundle","connection_id":"local-one"}).to_string();
+        let insert_binding = "INSERT INTO app_bindings
+            (id,install_id,context_id,scope_key,slot,revision,state,config,digest,request_id,created,updated)
+            VALUES(?1,'app-one',NULL,'installation','publication',1,'configured',?2,?3,?4,13.5,13.5)";
+        conn.execute(
+            insert_binding,
+            params!["binding-old", old_config, "proof-old", "request-old"],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                insert_binding,
+                params!["binding-new", new_config, "proof-new", "request-new"],
+            )
+            .is_err(), "v27 permits only one configured binding per slot");
+        // The checkpoint shares its transaction with the table/index change.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_v28 BEFORE UPDATE ON schema_version
+             WHEN NEW.version=28 BEGIN SELECT RAISE(ABORT,'forced v28 checkpoint failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(Store::open_for_schema_tests(&db).is_err());
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 27);
+        let exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE name=?",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+        };
+        assert!(!exists("app_capability_epochs"));
+        assert!(exists("app_binding_live_slot"));
+        assert!(!exists("app_binding_live_slot_version"));
+        conn.execute_batch("DROP TRIGGER fail_v28").unwrap();
+        drop(conn);
+
+        Store::open_for_schema_tests(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+        let rows: Vec<(String, i64, String, String, f64)> = conn
+            .prepare("SELECT install_id,epoch,digest,state,created FROM app_capability_epochs ORDER BY install_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("app-one".into(), 3, "sha256:old-bundle".into(), "approved".into(), 11.5),
+                ("app-two".into(), 2, "sha256:revoked-bundle".into(), "revoked".into(), 12.5),
+            ]
+        );
+        let index_exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+        };
+        assert!(!index_exists("app_binding_live_slot"));
+        assert!(index_exists("app_binding_live_slot_version"));
+        assert_eq!(
+            conn.execute(insert_binding, params!["binding-new", new_config, "proof-new", "request-new"]).unwrap(),
+            1,
+            "v28 permits the same slot and connection for a distinct bundle digest"
+        );
+        assert!(conn
+            .execute(insert_binding, params!["binding-duplicate", new_config, "proof-duplicate", "request-duplicate"])
+            .is_err(), "v28 still rejects a second live binding for the same bundle");
+        conn.execute("UPDATE schema_version SET version=27", []).unwrap();
+        drop(conn);
+
+        Store::open_for_schema_tests(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+        let epoch_count: i64 = conn
+            .query_row("SELECT count(*) FROM app_capability_epochs", [], |row| row.get(0))
+            .unwrap();
+        let binding_count: i64 = conn
+            .query_row("SELECT count(*) FROM app_bindings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(epoch_count, 2, "replay cannot duplicate historical epochs");
+        assert_eq!(binding_count, 2, "replay cannot discard versioned bindings");
+    }
