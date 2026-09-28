@@ -559,7 +559,16 @@ impl Store {
         )?);
         value["steps"]=Value::Array(conn.prepare("SELECT step_id,task_id,state,message_id FROM app_run_steps WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"message_id":r.get::<_,Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
         value["artifacts"]=Value::Array(conn.prepare("SELECT id,step_id,digest,media_type,length(content) FROM app_run_artifacts WHERE run_id=? ORDER BY step_id")?.query_map([id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"step_id":r.get::<_,String>(1)?,"digest":r.get::<_,String>(2)?,"media_type":r.get::<_,String>(3)?,"size":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
-        value["reviews"]=Value::Array(conn.prepare("SELECT step_id,artifact_digest,reviewer,decision,rationale FROM app_run_reviews WHERE run_id=?")?.query_map([id],|r|Ok(json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        value["reviews"]=Value::Array(conn.prepare("SELECT step_id,artifact_digest,reviewer,decision,rationale,asset_receipt_id,asset_digest FROM app_run_reviews WHERE run_id=?")?.query_map([id],|r|{
+            let mut review=json!({"step_id":r.get::<_,String>(0)?,"artifact_digest":r.get::<_,String>(1)?,"reviewer":r.get::<_,String>(2)?,"decision":r.get::<_,String>(3)?,"rationale":r.get::<_,String>(4)?});
+            let asset:Option<String>=r.get(5)?;
+            let digest:Option<String>=r.get(6)?;
+            if let (Some(asset),Some(digest))=(asset,digest) {
+                review["asset_receipt_id"]=json!(asset);
+                review["asset_digest"]=json!(digest);
+            }
+            Ok(review)
+        })?.collect::<rusqlite::Result<Vec<_>>>()?);
         Ok(value)
     }
     pub fn app_run_list(&self, install_id: Option<&str>) -> Result<Value> {
@@ -856,7 +865,7 @@ impl Store {
             let envelope = json!({"schema":1,"run_id":id,"step_id":step_id,"revision":1,"kind":step.kind,"instruction":step.instruction,"dependencies":dependencies,
                 "source":run["snapshot"]["source"],
                 "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
-                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If reviewing a run capability binary asset, also include asset_receipt_id and asset_sha256 from the fetched exact receipt. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
             let body = envelope.to_string();
             if body.len() > super::ENQUEUE_BYTES {
                 return Err(Error::rejected(
@@ -1050,6 +1059,10 @@ enum LocalResult {
         producer_step_id: String,
         producer_revision: u32,
         artifact_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_receipt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_sha256: Option<String>,
         decision: String,
         rationale: String,
     },
@@ -1246,6 +1259,8 @@ impl Store {
                 producer_step_id,
                 producer_revision,
                 artifact_sha256,
+                asset_receipt_id,
+                asset_sha256,
                 decision,
                 rationale,
             } => {
@@ -1261,8 +1276,19 @@ impl Store {
                     && matches!(decision.as_str(), "approve" | "revise")
                 {
                     if let Some((id,digest,producer))=tx.query_row("SELECT id,digest,producer FROM app_run_artifacts WHERE run_id=? AND step_id=?",params![run_id,producer_step_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
-                        if digest==artifact_sha256 && producer!=message.alias {
-                            tx.execute("INSERT INTO app_run_reviews VALUES(?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,message.alias,message.id,decision,rationale])?;
+                        let asset_valid = match (&asset_receipt_id,&asset_sha256) {
+                            (None,None) => true,
+                            (Some(receipt_id),Some(asset_digest)) if decision=="approve" => {
+                                super::app_capabilities::asset_material_in(tx,receipt_id)
+                                    .is_ok_and(|(receipt,_)| receipt["run_id"]==run_id
+                                        && receipt["step_id"]==producer_step_id
+                                        && receipt["asset"]["digest"]==*asset_digest
+                                        && run["snapshot"]["capabilities"][receipt["slot"].as_str().unwrap_or("")]["digest"]==receipt["binding_digest"])
+                            },
+                            _ => false,
+                        };
+                        if digest==artifact_sha256 && producer!=message.alias && asset_valid {
+                            tx.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,message.alias,message.id,decision,rationale,asset_receipt_id,asset_sha256])?;
                             Self::event(tx,Self::DAEMON_STREAM,"app_run_step_reviewed",json!({"run_id":run_id,"step_id":step_id,"artifact_digest":digest,"reviewer":message.alias,"decision":decision}))?;
                             valid=decision=="approve";
                         }

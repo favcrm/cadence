@@ -763,6 +763,16 @@ impl PlatformAdapter for LocalAdapter {
     ) -> Result<Value, String> {
         app_text::prepare(title, body, provenance)
     }
+
+    fn prepare_app_artifact(
+        &self,
+        title: &str,
+        body: &str,
+        provenance: &Value,
+        asset: Option<&Value>,
+    ) -> std::result::Result<Value, String> {
+        app_text::prepare_with_asset(title, body, provenance, asset)
+    }
     fn connection_descriptor(&self) -> Option<crate::platform::connections::ProviderDescriptor> {
         use crate::platform::connections::{
             BoundActionMapping, CapabilityDescriptor, ProviderDescriptor,

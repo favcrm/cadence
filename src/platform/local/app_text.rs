@@ -22,6 +22,19 @@ struct AppTextInput {
     title: String,
     body: String,
     provenance: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asset: Option<AppTextAsset>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AppTextAsset {
+    receipt_id: String,
+    receipt_digest: String,
+    binding_digest: String,
+    digest: String,
+    media_type: String,
+    size: usize,
 }
 
 fn parse(input: &Value) -> Result<AppTextInput, String> {
@@ -41,6 +54,15 @@ fn parse(input: &Value) -> Result<AppTextInput, String> {
             .provenance
             .as_object()
             .is_none_or(|object| object.is_empty())
+        || text.asset.as_ref().is_some_and(|asset| {
+            crate::proto::identifier(&asset.receipt_id, "asset receipt id").is_err()
+                || asset.size == 0
+                || asset.size > crate::store::app_capabilities::ASSET_BYTES
+                || !asset.digest.starts_with("sha256:")
+                || !asset.receipt_digest.starts_with("sha256:")
+                || asset.media_type.is_empty()
+                || asset.media_type.len() > 127
+        })
     {
         return Err("invalid app text material or provenance".into());
     }
@@ -54,6 +76,20 @@ fn render(text: &AppTextInput) -> String {
 pub(super) fn prepare(title: &str, body: &str, provenance: &Value) -> Result<Value, String> {
     let input = json!({"schema":1,"title":title,"body":body,"provenance":provenance});
     parse(&input)?;
+    Ok(input)
+}
+
+pub(super) fn prepare_with_asset(
+    title: &str,
+    body: &str,
+    provenance: &Value,
+    asset: Option<&Value>,
+) -> Result<Value, String> {
+    let mut input = prepare(title, body, provenance)?;
+    if let Some(asset) = asset {
+        input["asset"] = asset.clone();
+        parse(&input)?;
+    }
     Ok(input)
 }
 
@@ -122,7 +158,7 @@ fn bucket(path: &Path, create: bool) -> Result<File, String> {
     Ok(directory)
 }
 
-fn read_file(parent: &File, component: &str) -> Result<Vec<u8>, String> {
+fn read_file_limited(parent: &File, component: &str, limit: usize) -> Result<Vec<u8>, String> {
     let component = name(component.as_bytes())?;
     let fd = unsafe {
         libc::openat(
@@ -143,13 +179,42 @@ fn read_file(parent: &File, component: &str) -> Result<Vec<u8>, String> {
         return Err("app outbox record is not regular".into());
     }
     let mut bytes = Vec::new();
-    file.take(128 * 1024 + 1)
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| "cannot read app record".to_string())?;
-    if bytes.len() > 128 * 1024 {
+    if bytes.len() > limit {
         return Err("app outbox record exceeds its bound".into());
     }
     Ok(bytes)
+}
+
+fn read_file(parent: &File, component: &str) -> Result<Vec<u8>, String> {
+    read_file_limited(parent, component, 128 * 1024)
+}
+
+fn pinned_asset(
+    adapter: &LocalAdapter,
+    text: &AppTextInput,
+) -> Result<Option<(Value, Vec<u8>)>, String> {
+    let Some(asset) = &text.asset else {
+        return Ok(None);
+    };
+    let (receipt, bytes) = crate::store::app_capabilities::read_asset_material(
+        &adapter.state_dir.join("cadence.sqlite3"),
+        &asset.receipt_id,
+    )
+    .map_err(|_| "reviewed app binary asset is unavailable or changed".to_string())?;
+    if receipt["run_id"] != text.provenance["run_id"]
+        || receipt["binding_digest"] != asset.binding_digest
+        || receipt["digest"] != asset.receipt_digest
+        || receipt["asset"]["digest"] != asset.digest
+        || receipt["asset"]["media_type"] != asset.media_type
+        || receipt["asset"]["size"] != asset.size
+        || text.provenance["asset"] != json!(asset)
+    {
+        return Err("reviewed app binary asset differs from accepted provenance".into());
+    }
+    Ok(Some((receipt, bytes)))
 }
 
 fn write_file(parent: &File, component: &str, bytes: &[u8]) -> Result<(), String> {
@@ -187,6 +252,7 @@ pub(super) fn execute(
     .map_err(|_| "persisted app artifact execution permit is unavailable".to_string())?;
     let input_digest = format!("sha256:{}", sha256_hex(input.to_string().as_bytes()));
     let artifact_digest = format!("sha256:{}", sha256_hex(text.body.as_bytes()));
+    let binary = pinned_asset(adapter, &text)?;
     if permit.effect_id != effect_id
         || permit.platform != "local"
         || permit.account != "local"
@@ -215,6 +281,7 @@ pub(super) fn execute(
             || index["input_digest"] != input_digest
             || index["authority_digest"] != permit.authority_digest
             || read_file(&item, "post.md")? != render(&text).as_bytes()
+            || !asset_intact(&item, &index, binary.as_ref())
         {
             return Err("app outbox replay differs from recorded material".into());
         }
@@ -226,15 +293,26 @@ pub(super) fn execute(
     let board_url = format!("{}/outbox?item={effect_id}", adapter.board_url());
     let result = json!({"schema":1,"scope":{"kind":"app_artifact","install_id":text.provenance["install_id"],"context_id":text.provenance["context_id"]},
         "platform_ref":format!("outbox/{APP_BUCKET}/{effect_id}"),"board_url":board_url,"url":board_url,
-        "path":adapter.outbox.join(APP_BUCKET).join(effect_id).display().to_string(),"attachments":0});
+        "path":adapter.outbox.join(APP_BUCKET).join(effect_id).display().to_string(),"attachments":usize::from(binary.is_some())});
+    let attachments=binary.as_ref().map_or_else(Vec::new,|(_,bytes)| vec![json!({
+        "name":"asset.bin","sha256":sha256_hex(bytes),"media_type":text.asset.as_ref().unwrap().media_type,
+        "size":bytes.len(),"receipt_id":text.asset.as_ref().unwrap().receipt_id
+    })]);
     let index = json!({"schema":1,"effect_id":effect_id,"scope":result["scope"],"project":null,"title":text.title,
         "provenance":text.provenance,"authority_digest":permit.authority_digest,"input_digest":input_digest,
         "input_sha256":sha256_hex(input.to_string().as_bytes()),"post_sha256":sha256_hex(post.as_bytes()),
         "content_sha256":sha256_hex(post.as_bytes()),"published_at":crate::issue::time::iso(crate::issue::time::now_epoch()),
-        "attachments":[],"result":result});
+        "attachments":attachments,"result":result});
     let mut committed = false;
     let landed: Result<(), String> = (|| {
         write_file(&item, "post.md", post.as_bytes())?;
+        if let Some((_, bytes)) = &binary {
+            let directory = child(&item, b"attachments", true)?;
+            write_file(&directory, "asset.bin", bytes)?;
+            directory
+                .sync_all()
+                .map_err(|_| "cannot sync app attachment".to_string())?;
+        }
         write_file(&item, "index.json", index.to_string().as_bytes())?;
         item.sync_all()
             .map_err(|_| "cannot sync app item".to_string())?;
@@ -261,6 +339,16 @@ pub(super) fn execute(
         // the already-complete item. The broker retains that uncertainty.
         if committed {
             return Err(AppArtifactError::Uncertain(error));
+        }
+        if let Ok(directory) = child(&item, b"attachments", false) {
+            let component = name(b"asset.bin")?;
+            unsafe {
+                libc::unlinkat(directory.as_raw_fd(), component.as_ptr(), 0);
+            }
+            let component = name(b"attachments")?;
+            unsafe {
+                libc::unlinkat(item.as_raw_fd(), component.as_ptr(), libc::AT_REMOVEDIR);
+            }
         }
         for component in ["post.md", "index.json"] {
             let component = name(component.as_bytes())?;
@@ -318,9 +406,43 @@ pub(super) fn read_back(adapter: &LocalAdapter, input: &Value) -> Verified {
     {
         return Verified::False;
     }
-    if read_file(&item, "post.md").is_ok_and(|bytes| bytes == render(&text).as_bytes()) {
+    let binary = match pinned_asset(adapter, &text) {
+        Ok(binary) => binary,
+        Err(_) => return Verified::False,
+    };
+    if read_file(&item, "post.md").is_ok_and(|bytes| bytes == render(&text).as_bytes())
+        && asset_intact(&item, &index, binary.as_ref())
+    {
         Verified::True
     } else {
         Verified::False
+    }
+}
+
+fn asset_intact(item: &File, index: &Value, binary: Option<&(Value, Vec<u8>)>) -> bool {
+    match binary {
+        None => index["attachments"] == json!([]) && child(item, b"attachments", false).is_err(),
+        Some((receipt, bytes)) => {
+            let Some(attachments) = index["attachments"].as_array() else {
+                return false;
+            };
+            if attachments.len() != 1
+                || attachments[0]["name"] != "asset.bin"
+                || attachments[0]["sha256"] != sha256_hex(bytes)
+                || attachments[0]["media_type"] != receipt["asset"]["media_type"]
+                || attachments[0]["size"] != bytes.len()
+                || attachments[0]["receipt_id"] != receipt["id"]
+            {
+                return false;
+            }
+            child(item, b"attachments", false).is_ok_and(|directory| {
+                read_file_limited(
+                    &directory,
+                    "asset.bin",
+                    crate::store::app_capabilities::ASSET_BYTES,
+                )
+                .is_ok_and(|actual| actual == *bytes)
+            })
+        }
     }
 }

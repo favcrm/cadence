@@ -285,6 +285,12 @@ def run_prompt(prompt):
             decision="approve",
             rationale="The fetched context draft retains its exact source canary.",
         )
+        if cap_result_path.exists():
+            result["asset_receipt_id"] = cap_receipt["id"]
+            result["asset_sha256"] = asset["result"]["digest"]
+        override_path = STATE / ("app-review-asset-override-" + kickoff["run_id"] + ".json")
+        if override_path.exists():
+            result.update(json.loads(override_path.read_text()))
         receipt.update(artifact_sha256=actual_digest, dependency_fetched=True)
         if (STATE / ("context-hold-reviewer-" + kickoff["run_id"])).exists():
             hold(kickoff, "reviewer")

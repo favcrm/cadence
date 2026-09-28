@@ -4,7 +4,7 @@ use cadence_agent::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
 use cadence_agent::platform::{
-    AppCapabilityAsset, AppCapabilityOutput, AppCapabilityQuote, PlatformAdapter,
+    AppArtifactError, AppCapabilityAsset, AppCapabilityOutput, AppCapabilityQuote, PlatformAdapter,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,6 +99,16 @@ impl PlatformAdapter for SourceAdapter {
     ) -> Result<Value, String> {
         self.inner.prepare_app_text(title, body, provenance)
     }
+    fn prepare_app_artifact(
+        &self,
+        title: &str,
+        body: &str,
+        provenance: &Value,
+        asset: Option<&Value>,
+    ) -> Result<Value, String> {
+        self.inner
+            .prepare_app_artifact(title, body, provenance, asset)
+    }
     fn reported_manifest_version(&self) -> Option<String> {
         self.inner.reported_manifest_version()
     }
@@ -114,6 +124,17 @@ impl PlatformAdapter for SourceAdapter {
         hash: Option<&str>,
     ) -> Result<Value, String> {
         self.inner.execute(credential, tool, input, key, hash)
+    }
+    fn execute_app_artifact(
+        &self,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        key: &str,
+        hash: Option<&str>,
+    ) -> Result<Value, AppArtifactError> {
+        self.inner
+            .execute_app_artifact(credential, tool, input, key, hash)
     }
     fn execute_app_capability(
         &self,

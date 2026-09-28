@@ -122,6 +122,21 @@ pub trait PlatformAdapter: Send + Sync {
         Err("provider does not support app text publication".into())
     }
 
+    /// Optional server-read binary receipt accompanies the accepted text.
+    /// Providers must opt in; the caller supplies no path or raw bytes.
+    fn prepare_app_artifact(
+        &self,
+        title: &str,
+        body: &str,
+        provenance: &Value,
+        asset: Option<&Value>,
+    ) -> std::result::Result<Value, String> {
+        if asset.is_some() {
+            return Err("provider does not support reviewed binary assets".into());
+        }
+        self.prepare_app_text(title, body, provenance)
+    }
+
     /// The manifest version the *platform* reports now — the platform
     /// side of the pin. `None` reports nothing, so every call gates as
     /// `send` (a call argument can never assert the match).

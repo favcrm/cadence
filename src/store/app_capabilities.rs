@@ -23,6 +23,85 @@ CREATE TABLE IF NOT EXISTS app_capability_claims(
 pub const RESULT_BYTES: usize = 256 * 1024;
 pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 
+/// Return the exact immutable asset and its complete provider receipt. This
+/// works inside a finishing/release SQL transaction, so neither review nor
+/// release can observe a different row between the proof and byte read.
+pub(crate) fn asset_material_in(conn: &Connection, id: &str) -> Result<(Value, Vec<u8>)> {
+    let row = conn
+        .query_row(
+            "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,
+                result,result_digest,asset_type,asset_digest,
+                substr(asset,1,?2),length(asset),receipt_schema
+         FROM app_capability_results WHERE id=?1 AND asset IS NOT NULL",
+            params![id, (ASSET_BYTES + 1) as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, String>(11)?,
+                    r.get::<_, Vec<u8>>(12)?,
+                    r.get::<_, i64>(13)?,
+                    r.get::<_, i64>(14)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::rejected("app capability asset unavailable"))?;
+    let result: Value = serde_json::from_str(&row.8)?;
+    let asset = json!({"media_type":row.10,"digest":row.11,"size":row.12.len()});
+    let hash_material = if row.14 == 2 {
+        json!({"run_id":row.0,"step_id":row.1,"message_id":row.2,"turn_id":row.3,
+            "slot":row.4,"request_id":row.5,"binding_digest":row.6,
+            "input_digest":row.7,"result":result,"asset":asset})
+    } else {
+        json!({"run_id":row.0,"step_id":row.1,"message_id":row.2,"turn_id":row.3,
+            "slot":row.4,"request_id":row.5,"binding_digest":row.6,
+            "input_digest":row.7,"result":result,"asset_digest":asset["digest"]})
+    };
+    if !matches!(row.14, 1 | 2)
+        || row.12.is_empty()
+        || row.13 <= 0
+        || row.13 as usize != row.12.len()
+        || row.12.len() > ASSET_BYTES
+        || app_runs::artifact_digest(&row.12) != asset["digest"]
+        || !asset["media_type"].as_str().is_some_and(|mime| {
+            mime.len() <= 127
+                && mime.split_once('/').is_some_and(|(major, minor)| {
+                    !major.is_empty()
+                        && !minor.is_empty()
+                        && major.bytes().chain(minor.bytes()).all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'.' | b'+' | b'-')
+                        })
+                })
+        })
+        || app_runs::material_digest(&hash_material) != row.9
+    {
+        return Err(Error::rejected("app capability asset receipt is corrupt"));
+    }
+    Ok((
+        json!({"id":id,"run_id":row.0,"step_id":row.1,"slot":row.4,
+        "binding_digest":row.6,"digest":row.9,"asset":asset}),
+        row.12,
+    ))
+}
+
+/// Local's executing adapter independently checks the persisted bytes after
+/// the broker's checked claim and before writing the confined outbox item.
+pub fn read_asset_material(path: &std::path::Path, id: &str) -> Result<(Value, Vec<u8>)> {
+    asset_material_in(&open_read_only(path)?, id)
+}
+
 pub(crate) struct AppCapabilityRecord<'a> {
     pub id: &'a str,
     pub run: &'a str,
@@ -235,7 +314,9 @@ impl Store {
         let digest = app_runs::material_digest(&json!({
             "run_id":run,"step_id":step,"message_id":message,"turn_id":turn,
             "slot":slot,"request_id":request,"binding_digest":binding_digest,
-            "input_digest":input_digest,"result":result,"asset_digest":asset_digest
+            "input_digest":input_digest,"result":result,
+            "asset":asset.map(|(kind,bytes)|json!({"media_type":kind,
+                "digest":app_runs::artifact_digest(bytes),"size":bytes.len()}))
         }));
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
@@ -290,7 +371,9 @@ impl Store {
             return self.app_capability_result(&existing_id);
         }
         tx.execute(
-            "INSERT INTO app_capability_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO app_capability_results(id,run_id,step_id,message_id,turn_id,slot,
+                request_id,binding_digest,input_digest,result,result_digest,asset_type,
+                asset_digest,asset,created,receipt_schema) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2)",
             params![
                 id,
                 run,
@@ -323,13 +406,13 @@ impl Store {
     pub(crate) fn app_capability_result(&self, id: &str) -> Result<Value> {
         let conn = self.conn();
         let row = conn.query_row(
-            "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,asset_type,asset_digest,length(asset) FROM app_capability_results WHERE id=?",
+            "SELECT run_id,step_id,message_id,turn_id,slot,request_id,binding_digest,input_digest,result,result_digest,asset_type,asset_digest,length(asset),receipt_schema FROM app_capability_results WHERE id=?",
             [id], |r| Ok((
                 r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
                 r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
                 r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,
                 r.get::<_,String>(9)?,r.get::<_,Option<String>>(10)?,
-                r.get::<_,Option<String>>(11)?,r.get::<_,Option<i64>>(12)?
+                r.get::<_,Option<String>>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,i64>(13)?
             )),
         ).optional()?.ok_or_else(|| Error::rejected("app capability result unavailable"))?;
         let result: Value = serde_json::from_str(&row.8)?;
@@ -337,13 +420,25 @@ impl Store {
             "slot":row.4,"request_id":row.5,"binding_digest":row.6,
             "input_digest":row.7,"result":result,"digest":row.9,
             "asset":row.10.as_ref().map(|kind|json!({"media_type":kind,"digest":row.11,"size":row.12}))});
-        if app_runs::material_digest(&json!({
-            "run_id":receipt["run_id"],"step_id":receipt["step_id"],
-            "message_id":receipt["message_id"],"turn_id":row.3,
-            "slot":receipt["slot"],"request_id":receipt["request_id"],
-            "binding_digest":receipt["binding_digest"],"input_digest":receipt["input_digest"],
-            "result":receipt["result"],"asset_digest":receipt["asset"]["digest"]
-        })) != receipt["digest"]
+        let hash_material = if row.13 == 2 {
+            json!({
+                "run_id":receipt["run_id"],"step_id":receipt["step_id"],
+                "message_id":receipt["message_id"],"turn_id":row.3,
+                "slot":receipt["slot"],"request_id":receipt["request_id"],
+                "binding_digest":receipt["binding_digest"],"input_digest":receipt["input_digest"],
+                "result":receipt["result"],"asset":receipt["asset"]
+            })
+        } else {
+            json!({
+                "run_id":receipt["run_id"],"step_id":receipt["step_id"],
+                "message_id":receipt["message_id"],"turn_id":row.3,
+                "slot":receipt["slot"],"request_id":receipt["request_id"],
+                "binding_digest":receipt["binding_digest"],"input_digest":receipt["input_digest"],
+                "result":receipt["result"],"asset_digest":receipt["asset"]["digest"]
+            })
+        };
+        if !matches!(row.13, 1 | 2)
+            || app_runs::material_digest(&hash_material) != receipt["digest"]
         {
             return Err(Error::rejected("app capability result receipt is corrupt"));
         }
@@ -363,19 +458,11 @@ impl Store {
     }
 
     pub(crate) fn app_capability_asset(&self, id: &str) -> Result<Value> {
-        let conn = self.conn();
-        let (kind,digest,bytes):(String,String,Vec<u8>) = conn.query_row(
-            "SELECT asset_type,asset_digest,asset FROM app_capability_results WHERE id=? AND asset IS NOT NULL",
-            [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).optional()?.ok_or_else(||Error::rejected("app capability asset unavailable"))?;
-        if bytes.is_empty()
-            || bytes.len() > ASSET_BYTES
-            || app_runs::artifact_digest(&bytes) != digest
-        {
-            return Err(Error::rejected("app capability asset receipt is corrupt"));
-        }
+        let (receipt, bytes) = asset_material_in(&self.conn(), id)?;
         use base64::Engine;
-        Ok(json!({"receipt_id":id,"media_type":kind,"digest":digest,
-            "size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}))
+        Ok(
+            json!({"receipt_id":id,"media_type":receipt["asset"]["media_type"],"digest":receipt["asset"]["digest"],
+            "size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+        )
     }
 }
