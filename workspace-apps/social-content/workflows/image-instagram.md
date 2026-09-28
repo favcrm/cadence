@@ -31,10 +31,13 @@ Protected terms (quoted content): {{protected_terms}}
 Before returning a caption, use your active kickoff's capability command
 to call `image` with an empty JSON object and one stable request ID. The
 broker constructs the fixed square `image-01` prompt from the selected
-post and frozen brand context; it retains the downloaded image bytes.
+post and frozen brand context. It retains the downloaded bytes only when
+the PNG, JPEG or WebP fully decodes as a square within the 2 MiB download,
+2048-pixel side, 4,194,304-pixel and 64 MiB decoder allocation limits.
 Do not add a model, prompt, company, account, URL, aspect ratio, count,
 effect or destination. If the provider refuses, times out or the CDN
-cannot pass custody checks, return outcome=failed with artifacts=[].
+cannot pass custody checks (including corrupt or non-square bytes), return
+outcome=failed with artifacts=[]. No image receipt or review follows a refusal.
 Retry only with the same request ID; do not create a second paid request.
 
 Write exactly one zh-HK Instagram caption from the quoted facts. Preserve

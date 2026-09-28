@@ -119,11 +119,15 @@ reviewer. The run freezes the selected caption, brand voice and current one-imag
 The operator approves that exact run and cost before dispatch. The worker
 calls the `image` capability with an empty object; it cannot choose the
 provider, model, image count, prompt, aspect ratio or destination. The
-broker stores the verified bytes as a run-scoped image receipt or records
-a refusal. The reviewer checks the caption and the exact retained bytes
-in this same run, pinning both digests. A later Local draft may cite only
-that reviewer-pinned asset through the separate CAD-713 release gate. Do not release from a
-temporary provider URL or from an unreviewed worker description.
+broker retains only a PNG, JPEG or WebP of at most 2 MiB that fully decodes
+to a nonzero square no wider than 2048 pixels (at most 4,194,304 pixels),
+within a 64 MiB decoder allocation budget. Corrupt, non-square, oversized
+or MIME-mismatched bytes are refused without an image receipt; they cannot
+reach review or Local release. The independent reviewer checks the caption
+and exact retained bytes in this run, pinning both digests. A later Local
+draft may cite only that reviewer-pinned asset through the CAD-713 release
+gate. Do not release from a temporary provider URL or unreviewed worker
+description.
 
 ## New post
 
