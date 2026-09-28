@@ -142,6 +142,7 @@ fn stale_github(
     slugs: &[String],
     error: Option<String>,
 ) -> (HashMap<String, Value>, Value) {
+    let cached = cached.filter(|c| c.slugs.as_slice() == slugs);
     let at = cached.as_ref().map(|c| c.at);
     let stale: HashMap<String, Value> = cached
         .map(|c| {
@@ -204,9 +205,12 @@ fn refresh_github(
         // Every call failed: keep the last good rows for this slug set.
         return stale_github(cached, slugs, first_err);
     }
-    // Partial failure: stale rows fill the missing slugs when the
-    // cache covered them, so one flaky repo can't blank its PRs.
-    if let Some(c) = cached {
+    // Partial failure: stale rows fill the missing slugs only when the
+    // cache belongs to this slug set. A partial result is not a fresh
+    // snapshot even if the failed slug had no cached row.
+    let prior = cached.filter(|c| c.slugs.as_slice() == slugs);
+    let prior_at = prior.as_ref().map(|c| c.at);
+    if let Some(c) = prior {
         for slug in slugs {
             if !repos.contains_key(slug) {
                 if let Some(v) = c.repos.get(slug) {
@@ -215,10 +219,20 @@ fn refresh_github(
             }
         }
     }
+    if first_err.is_some() {
+        // Keep the oldest applicable snapshot age so the next request
+        // retries. Without a matching cache, do not persist an
+        // incomplete result as a fresh cache hit.
+        if let Some(at) = prior_at {
+            let _ = std::fs::create_dir_all(state_dir);
+            write_cache(&cache_file(state_dir), slugs, &repos, at);
+        }
+        return (
+            repos,
+            json!({"state": "stale", "error": first_err, "as_of": prior_at}),
+        );
+    }
     let _ = std::fs::create_dir_all(state_dir);
     write_cache(&cache_file(state_dir), slugs, &repos, now);
-    (
-        repos,
-        json!({"state": "ok", "error": first_err, "as_of": now}),
-    )
+    (repos, json!({"state": "ok", "as_of": now}))
 }

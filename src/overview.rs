@@ -4129,6 +4129,87 @@ mod tests {
     }
 
     #[test]
+    fn partial_gh_failure_keeps_reused_rows_stale_until_all_repos_refresh() {
+        fn partial(slug: &str) -> Result<Value, String> {
+            if slug == "acme/stale" {
+                Err("fixture outage".to_string())
+            } else {
+                Ok(json!({"prs": [{"number": 2}]}))
+            }
+        }
+        fn fresh(_slug: &str) -> Result<Value, String> {
+            Ok(json!({"prs": [{"number": 3}]}))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let slugs = vec!["acme/fresh".to_string(), "acme/stale".to_string()];
+        let prior = HashMap::from([
+            (slugs[0].clone(), json!({"prs": [{"number": 1}]})),
+            (slugs[1].clone(), json!({"prs": [{"number": 1}]})),
+        ]);
+        let old = now_epoch() - 120;
+        write_cache(&cache_file(dir.path()), &slugs, &prior, old);
+        let wait = Duration::from_secs(2);
+
+        for _ in 0..2 {
+            let (got, state) = github_bounded(dir.path(), &slugs, wait, 60, partial);
+            assert_eq!(got[&slugs[0]]["prs"][0]["number"], 2);
+            assert_eq!(got[&slugs[1]]["prs"][0]["number"], 1);
+            assert_eq!(state["state"], "stale", "{state}");
+            assert_eq!(state["as_of"], old, "{state}");
+            assert_eq!(read_cache(&cache_file(dir.path())).unwrap().at, old);
+        }
+
+        let (got, state) = github_bounded(dir.path(), &slugs, wait, 60, fresh);
+        assert_eq!(state["state"], "ok", "{state}");
+        assert_eq!(got[&slugs[1]]["prs"][0]["number"], 3);
+        assert!(read_cache(&cache_file(dir.path())).unwrap().at > old);
+    }
+
+    #[test]
+    fn gh_failure_does_not_reuse_cache_from_a_different_slug_set() {
+        fn partial(slug: &str) -> Result<Value, String> {
+            if slug == "acme/new" {
+                Err("fixture outage".to_string())
+            } else {
+                Ok(json!({"prs": [{"number": 2}]}))
+            }
+        }
+        fn failing(_slug: &str) -> Result<Value, String> {
+            Err("fixture outage".to_string())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let prior_slugs = vec!["acme/fresh".to_string(), "acme/old".to_string()];
+        let requested = vec!["acme/fresh".to_string(), "acme/new".to_string()];
+        let prior = HashMap::from([
+            (prior_slugs[0].clone(), json!({"prs": [{"number": 1}]})),
+            (prior_slugs[1].clone(), json!({"prs": [{"number": 1}]})),
+        ]);
+        write_cache(
+            &cache_file(dir.path()),
+            &prior_slugs,
+            &prior,
+            now_epoch() - 120,
+        );
+
+        let (got, state) =
+            github_bounded(dir.path(), &requested, Duration::from_secs(2), 60, failing);
+        assert!(got.is_empty());
+        assert_eq!(state["state"], "unavailable", "{state}");
+
+        let (got, state) =
+            github_bounded(dir.path(), &requested, Duration::from_secs(2), 60, partial);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[&requested[0]]["prs"][0]["number"], 2);
+        assert_eq!(state["state"], "stale", "{state}");
+        assert!(state["as_of"].is_null(), "{state}");
+        assert_eq!(state["error"], "fixture outage");
+        assert_eq!(
+            read_cache(&cache_file(dir.path())).unwrap().slugs,
+            prior_slugs
+        );
+    }
+
+    #[test]
     fn cad627_overview_probe_requests_active_history() {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
