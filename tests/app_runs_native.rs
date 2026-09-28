@@ -4,6 +4,7 @@ mod common;
 use cadence_agent::issue::Pm;
 use common::{daemon_opts, pi_policy_pm, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,9 @@ struct LocalRun {
 }
 impl LocalRun {
     fn new() -> Self {
+        Self::with_result_format(None)
+    }
+    fn with_result_format(format: Option<&str>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         pi_policy_pm(&pm.dir);
@@ -34,6 +38,9 @@ impl LocalRun {
             format!("python3 {}", script.display()),
         );
         let daemon = TestDaemon::start_opts(opts);
+        if format == Some("fenced") {
+            std::fs::write(daemon.state.join("app-run-fenced-result"), "enabled").unwrap();
+        }
         daemon.fixture_rpc("agent_register", json!({"alias":OWNER,"provider":"inbox","endpoint_kind":"inbox","role":"pm","cwd":daemon.dir.path()})).unwrap();
         for alias in [WRITER, REVIEWER] {
             daemon.register_pi(
@@ -95,7 +102,15 @@ impl LocalRun {
             }
             assert!(
                 !matches!(run["state"].as_str(), Some("failed" | "cancelled")),
-                "actual provider run failed: {run}"
+                "actual provider run failed with task error {:?}: {run}",
+                rusqlite::Connection::open(self.daemon.state.join("cadence.sqlite3"))
+                    .unwrap()
+                    .query_row(
+                        "SELECT error FROM tasks WHERE id=?",
+                        [format!("{}-s1", self.run["id"].as_str().unwrap())],
+                        |row| row.get::<_, Option<String>>(0)
+                    )
+                    .unwrap()
             );
             assert!(
                 Instant::now() < deadline,
@@ -147,6 +162,33 @@ impl LocalRun {
         assert!(head.status.success());
         json!({"counts":counts,"capability":capability,"events":events,"run":run,"pm_head":String::from_utf8(head.stdout).unwrap()})
     }
+}
+
+#[test]
+fn cad749_real_pi_fenced_single_result_completes_app_material_handoff() {
+    let run = LocalRun::with_result_format(Some("fenced"));
+    let finished = run.finish();
+    let db = rusqlite::Connection::open(run.daemon.state.join("cadence.sqlite3")).unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT result FROM messages WHERE source='app_run_dispatch' AND alias=?",
+            [WRITER],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let final_text = serde_json::from_str::<Value>(&raw).unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(final_text.starts_with("The source capability call succeeded"));
+    assert!(final_text.contains("\n```json\n"));
+    assert!(final_text.contains("\n## Scope compliance\n"));
+    assert_eq!(finished["state"], "succeeded");
+    assert_eq!(
+        finished["artifacts"][0]["digest"],
+        format!("sha256:{:x}", sha2::Sha256::digest(DRAFT.as_bytes()))
+    );
+    assert_eq!(finished["reviews"][0]["decision"], "approve");
 }
 
 fn native(

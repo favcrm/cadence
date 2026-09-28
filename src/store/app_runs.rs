@@ -909,7 +909,7 @@ impl Store {
                 "source":run["snapshot"]["source"],
                 "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
                 "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
             let body = envelope.to_string();
             if body.len() > super::ENQUEUE_BYTES {
                 return Err(Error::rejected(
@@ -1111,6 +1111,48 @@ enum LocalResult {
         rationale: String,
     },
 }
+
+/// Pi sometimes surrounds its final material envelope with explanatory
+/// prose. Accept only a standalone, single JSON fence in that case; never
+/// search arbitrary prose for the first parseable object. The decoded result
+/// still passes the active-turn, pinned-run, artifact and review checks below.
+fn parse_local_result_text(text: &str) -> Option<LocalResult> {
+    if let Ok(result) = serde_json::from_str::<LocalResult>(text) {
+        return Some(result);
+    }
+    // A max-size artifact can expand when JSON-escaped. Bound the alternate
+    // path before scanning or allocating; raw JSON retains its old behavior.
+    if text.len() > ARTIFACT_BYTES * 6 + 64 * 1024 {
+        return None;
+    }
+    let mut opening = None;
+    let mut closing = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let marker = line.trim_end_matches(['\r', '\n']);
+        match marker {
+            "```json" if opening.is_none() && closing.is_none() => {
+                opening = Some((offset, offset + line.len()));
+            }
+            "```" if opening.is_some() && closing.is_none() => {
+                closing = Some((offset, offset + line.len()));
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    let ((open_start, body_start), (body_end, close_end)) = (opening?, closing?);
+    let before = &text[..open_start];
+    let after = &text[close_end..];
+    if [before, after]
+        .iter()
+        .any(|part| part.contains("```") || part.contains('{') || part.contains('}'))
+    {
+        return None;
+    }
+    serde_json::from_str::<LocalResult>(&text[body_start..body_end]).ok()
+}
+
 impl Store {
     /// Material transitions occur only on the actual active app kickoff. This
     /// transaction records durable eligibility; it never acquires the PM lock.
@@ -1226,11 +1268,11 @@ impl Store {
                 .map(|_| true);
         };
         let decoded = if let Some(text) = result.get("text").and_then(Value::as_str) {
-            serde_json::from_str::<LocalResult>(text)
+            parse_local_result_text(text)
         } else {
-            serde_json::from_value::<LocalResult>(result.clone())
+            serde_json::from_value::<LocalResult>(result.clone()).ok()
         };
-        let Ok(decoded) = decoded else {
+        let Some(decoded) = decoded else {
             return self
                 .app_step_failed_in(
                     tx,
@@ -1692,5 +1734,49 @@ impl Store {
             return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod result_envelope_tests {
+    use super::parse_local_result_text;
+
+    const PRODUCER: &str = r##"{"schema":1,"kind":"produce_text","run_id":"run-a","step_id":"s1","revision":1,"outcome":"succeeded","artifacts":[{"media_type":"text/markdown","text":"# Twelve retained posts"}]}"##;
+
+    #[test]
+    fn cad749_accepts_one_complete_fenced_result_but_no_ambiguous_or_forged_envelope() {
+        assert!(parse_local_result_text(PRODUCER).is_some());
+        let observed = format!(
+            "The source call succeeded; the broker receipt is authoritative.\n\n```json\n{PRODUCER}\n```\n\n## Scope compliance\nNo outward action."
+        );
+        assert!(parse_local_result_text(&observed).is_some());
+
+        let cases = [
+            format!("```json\n{PRODUCER}\n```\n```json\n{PRODUCER}\n```"),
+            format!("{{\"another\":true}}\n```json\n{PRODUCER}\n```"),
+            format!("```json\n{PRODUCER}\n{PRODUCER}\n```"),
+            format!("```json\n{PRODUCER}"),
+            format!("```text\n{PRODUCER}\n```"),
+            format!("```json\n{PRODUCER}\n```\n{{\"another\":true}}"),
+            format!(
+                "```json\n{}\n```",
+                PRODUCER.replace("\"schema\":1,", "\"schema\":1,\"turn_id\":\"forged\",")
+            ),
+            format!(
+                "```json\n{}\n```",
+                PRODUCER.replace("\"revision\":1", "\"revision\":1,\"revision\":2")
+            ),
+        ];
+        for (n, case) in cases.iter().enumerate() {
+            assert!(
+                parse_local_result_text(case).is_none(),
+                "accepted ambiguous or forged envelope case {n}"
+            );
+        }
+        assert!(parse_local_result_text(&format!(
+            "```json\n{PRODUCER}\n```{}",
+            "x".repeat(2 * 1024 * 1024)
+        ))
+        .is_none());
     }
 }
