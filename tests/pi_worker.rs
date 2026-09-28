@@ -156,6 +156,30 @@ fn worker_argv_carries_a_session_file_and_the_dev_tools() {
 }
 
 #[test]
+fn hosted_agenticos_read_opt_in_does_not_expand_worker_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let extension = dir.path().join("agenticos-read.mjs");
+    std::fs::write(&extension, "// synthetic operator-owned read extension").unwrap();
+    let ad = adapter(
+        "normal",
+        dir.path(),
+        &[(
+            "CADENCE_PI_AGENTICOS_READ_EXTENSION",
+            extension.to_string_lossy().into(),
+        )],
+    );
+    ad.open(&worker("w-read", dir.path(), json!({}))).unwrap();
+    ad.close();
+    let rec = record(dir.path(), "w-read");
+    let argv: Vec<String> = serde_json::from_value(rec["argv"].clone()).unwrap();
+    assert!(!argv.iter().any(|a| a == extension.to_str().unwrap()));
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--tools", "read,bash,edit,write,grep,find,ls"]));
+    assert!(argv.iter().any(|a| a == "--no-extensions"));
+}
+
+#[test]
 fn worker_env_is_an_allowlist() {
     // Credentials planted in the daemon's own environment — the worker
     // must never see them however they are spelled. The plants ride in

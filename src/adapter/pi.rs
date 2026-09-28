@@ -389,6 +389,30 @@ pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master:
 /// `--no-extensions` there is none anyway; the flag is the belt).
 const PI_WORKER_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+/// An operator-supplied image file, never a company-configured extension.
+/// The managed master only exposes these two reviewed AgenticOS GET tools;
+/// all other extension tools remain absent from Pi's --tools allowlist.
+const AGENTICOS_READ_EXTENSION_ENV: &str = "CADENCE_PI_AGENTICOS_READ_EXTENSION";
+const AGENTICOS_READ_TOOLS: &[&str] = &["workspace_get", "account_get"];
+
+fn agenticos_read_extension(env: &ProviderEnv) -> Result<Option<PathBuf>> {
+    let Some(raw) = env.var(AGENTICOS_READ_EXTENSION_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(&raw);
+    if !path.is_absolute()
+        || std::fs::symlink_metadata(&path)
+            .map(|meta| !meta.file_type().is_file())
+            .unwrap_or(true)
+        || path.canonicalize().ok().as_deref() != Some(path.as_path())
+    {
+        return Err(Error::rejected(format!(
+            "{AGENTICOS_READ_EXTENSION_ENV} must name an existing absolute regular file with no symlink components"
+        )));
+    }
+    Ok(Some(path))
+}
+
 /// The tracker dir `[pi]` policy is read from (CAD-559): the daemon's
 /// `CADENCE_PM_DIR`, else the process default — the same seam
 /// `pi_confine_inputs` uses for its tracker grant.
@@ -472,6 +496,7 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     // is an explicit `-e` file inside its pinned package dir.
     let packages = provider_packages(env)?;
     if crate::master::is_master(&agent.alias) {
+        let agenticos_read = agenticos_read_extension(env)?;
         cmd.push("--no-context-files".to_string());
         cmd.extend([
             "--no-extensions".to_string(),
@@ -486,11 +511,21 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
                 ]);
             }
         }
+        if let Some(path) = &agenticos_read {
+            cmd.extend([
+                "--extension".to_string(),
+                path.to_string_lossy().to_string(),
+            ]);
+        }
         // bash (guard-checked `cadence` verbs), `read` and `write`.
         // The guard confines both file tools to `master/tmp`: read
         // re-opens Pi's spilled bash output (CAD-552); write is how
         // the master stages `--file` input (CAD-614).
-        cmd.extend(["--tools".to_string(), "bash,read,write".to_string()]);
+        let mut tools = vec!["bash", "read", "write"];
+        if agenticos_read.is_some() {
+            tools.extend(AGENTICOS_READ_TOOLS);
+        }
+        cmd.extend(["--tools".to_string(), tools.join(",")]);
     } else {
         cmd.push("--no-extensions".to_string());
         for pkg in &packages {
@@ -619,6 +654,9 @@ fn pi_confine_inputs(
     // of `master/claude` (or its `.credentials.json`) is in the policy.
     let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
     extra_read.push(pi_guard_path(state_dir));
+    if let Ok(Some(path)) = agenticos_read_extension(env) {
+        extra_read.push(path);
+    }
     // CAD-559: exactly the pinned provider package dirs — read-only.
     // `build_command` resolves the same list and refuses the launch on
     // a bad pin, so a policy with an unresolvable package never runs.
@@ -935,6 +973,7 @@ export default function (pi) {
   // argv-prefix match on the allowlist. `args: true` entries are the
   // `Bash(cadence <verb…> *)` forms — they need at least one arg.
   const RULES = __RULES__;
+  const AGENTICOS_READ_TOOLS = __AGENTICOS_READ_TOOLS__;
   // The master's own tmp dir — Pi's bash spills long output here
   // (CAD-552) and the write tool stages `--file` input here (CAD-614).
   // Lexical normalization refuses `..` and prefix siblings; a second
@@ -1176,6 +1215,9 @@ export default function (pi) {
     } catch (e) {}
   }
   pi.on("tool_call", async (event) => {
+    if (AGENTICOS_READ_TOOLS.includes(event.toolName)) {
+      return;
+    }
     if (event.toolName === "read") {
       const p = event.input && event.input.path;
       if (!piReadPathAllowed(p)) {
@@ -1239,11 +1281,20 @@ fn pi_guard_rules() -> Vec<Value> {
 
 /// Write the guard extension; a missing or stale file never weakens
 /// the posture because `open` regenerates it per launch.
-fn write_pi_guard(state_dir: &Path) -> Result<PathBuf> {
+fn write_pi_guard(state_dir: &Path, agenticos_reads: bool) -> Result<PathBuf> {
     // JSON strings are valid JS literals — the substitution needs no
     // escaping of its own.
     let source = PI_GUARD_HEAD
         .replace("__RULES__", &json!(pi_guard_rules()).to_string())
+        .replace(
+            "__AGENTICOS_READ_TOOLS__",
+            &json!(if agenticos_reads {
+                AGENTICOS_READ_TOOLS
+            } else {
+                &[]
+            })
+            .to_string(),
+        )
         .replace(
             "__MASTER_TMP__",
             &json!(crate::master::tmpdir(state_dir).to_string_lossy()).to_string(),
@@ -1895,7 +1946,8 @@ impl ProviderAdapter for PiAdapter {
         )?;
         self.shared.master.store(master, Ordering::SeqCst);
         if master {
-            write_pi_guard(&self.state_dir)?;
+            let agenticos_reads = agenticos_read_extension(&self.env)?.is_some();
+            write_pi_guard(&self.state_dir, agenticos_reads)?;
         }
         let (command, confinement) = launch_command(&self.env, &self.state_dir, agent)?;
         if let Some(policy) = &confinement {
