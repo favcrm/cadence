@@ -93,6 +93,6 @@ pub(super) fn check_worktrees(scan: &Scan) -> Check {
         }),
         threshold,
         detail,
-        remedies.into_iter().take(4).collect::<Vec<_>>().join("; "),
+        remedies.into_iter().take(4).collect::<Vec<_>>().join("\n"),
     )
 }

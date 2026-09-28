@@ -382,7 +382,7 @@ pub struct Scan {
     /// it for remedies and `processes` reports it; lazily shared here.
     pub(crate) census: std::cell::OnceCell<Census>,
     /// Exact tracker worktree refs, shared by the check and reclaim plan.
-    pub(crate) tracker_index: std::cell::OnceCell<TrackerIndex>,
+    pub(crate) tracker_index: std::cell::OnceCell<util::TrackerIndex>,
 }
 
 impl Scan {

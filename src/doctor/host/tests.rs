@@ -2761,11 +2761,9 @@ fn worktrees_resolve_cross_issue_ref_and_inventory_unmerged_unknown() {
     assert_eq!(indexed.refs.len(), 1);
     let plan = reclaim_plan(&scan);
     assert!(std::ptr::eq(indexed, scan.tracker_index.get().unwrap()));
-    assert!(plan["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| { r["kind"] == "worktree-inventory" && r["path"] == unknown["path"] }));
+    assert!(plan["rows"].as_array().unwrap().iter().any(|r| {
+        r["kind"] == "worktree-inventory" && r["path"] == unknown["path"] && r["bytes"].is_null()
+    }));
     assert_eq!(plan["reclaimable_bytes"], 0);
 }
 
@@ -2795,14 +2793,39 @@ fn worktree_open_ref_remedy_is_shell_valid_and_done_issue_is_not_ref_closed() {
         "doing",
         &format!("refs:\n- kind: worktree\n  path: {}\n", lane.display()),
     );
+    let second = repo.join(".cadence/wt/cad-12-lane");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            second.to_str().unwrap(),
+            "-b",
+            "cadence/cad-12-lane",
+        ],
+    );
+    write_issue(
+        scan.pm_dir.as_ref().unwrap(),
+        "cadence",
+        "CAD-12",
+        "doing",
+        &format!("refs:\n- kind: worktree\n  path: {}\n", second.display()),
+    );
     let c = check_worktrees(&scan);
-    let command = c.remedy.lines().next().unwrap();
+    let command = c
+        .remedy
+        .lines()
+        .find(|line| line.contains("CAD-11"))
+        .unwrap();
     assert!(command.contains("--worktree '"), "{command}");
     assert!(Command::new("sh")
-        .args(["-n", "-c", command])
+        .args(["-n", "-c", &c.remedy])
         .status()
         .unwrap()
         .success());
+    assert_eq!(c.remedy.lines().count(), 2);
+    assert!(c.remedy.lines().any(|line| line.contains("CAD-12")));
 
     write_issue(
         scan.pm_dir.as_ref().unwrap(),
@@ -2893,11 +2916,9 @@ fn reclaim_plan_requires_finish_or_owner_proof_for_worktree_bytes() {
     assert_eq!(open["kind"], "worktree-review");
     assert_eq!(open["recorded_ref"], true);
     assert_eq!(open["open_ref"], true);
-    assert!(open["action"]
-        .as_str()
-        .unwrap()
-        .contains("issue finish CAD-3"));
-    assert!(open["action"].as_str().unwrap().contains("--worktree"));
+    // A malformed *other* issue could also claim this path, so even
+    // a visible exact open ref cannot select a finish command.
+    assert!(!open["action"].as_str().unwrap().contains("issue finish"));
     assert_eq!(unknown["kind"], "worktree-review");
     assert!(unknown["recorded_ref"].is_null());
     assert!(!unknown["action"].as_str().unwrap().contains("issue finish"));

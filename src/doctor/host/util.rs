@@ -1348,26 +1348,26 @@ fn tracker_index(pm_dir: Option<&Path>) -> TrackerIndex {
             let issue_done = matches!(front.status.as_str(), "done" | "dropped");
             index.done.insert(front.id.clone(), issue_done);
             for r in front.refs {
-                if r.kind == "worktree" {
-                    if let Some(path) = r.path {
-                        let path = PathBuf::from(path);
-                        let next = index.refs.len();
-                        if let Ok(canon) = path.canonicalize() {
-                            index.canonical.entry(canon).or_default().push(next);
-                        }
-                        index
-                            .lexical
-                            .entry(crate::issue::finish::lexical_path(&path))
-                            .or_default()
-                            .push(next);
-                        index.refs.push(TrackerRef {
-                            path,
-                            issue: front.id.clone(),
-                            closed: r.closed == Some(true),
-                            issue_done,
-                        });
-                    }
+                if r.kind != "worktree" {
+                    continue;
                 }
+                let Some(path) = r.path else { continue };
+                let path = PathBuf::from(path);
+                let next = index.refs.len();
+                if let Ok(canon) = path.canonicalize() {
+                    index.canonical.entry(canon).or_default().push(next);
+                }
+                index
+                    .lexical
+                    .entry(crate::issue::finish::lexical_path(&path))
+                    .or_default()
+                    .push(next);
+                index.refs.push(TrackerRef {
+                    path,
+                    issue: front.id.clone(),
+                    closed: r.closed == Some(true),
+                    issue_done,
+                });
             }
         }
     }
@@ -1386,21 +1386,23 @@ struct TrackerWorktree {
 
 /// An issue name/status is not ownership evidence for this exact path.
 fn tracker_worktree(index: &TrackerIndex, wt_path: &Path, hint: Option<&str>) -> TrackerWorktree {
-    let mut candidate_ids = BTreeSet::new();
-    if let Ok(canon) = wt_path.canonicalize() {
-        if let Some(ids) = index.canonical.get(&canon) {
-            candidate_ids.extend(ids);
-        }
+    let mut candidate_ids: BTreeSet<usize> = BTreeSet::new();
+    if let Some(ids) = wt_path
+        .canonicalize()
+        .ok()
+        .and_then(|canon| index.canonical.get(&canon))
+    {
+        candidate_ids.extend(ids.iter().copied());
     }
     if let Some(ids) = index
         .lexical
         .get(&crate::issue::finish::lexical_path(wt_path))
     {
-        candidate_ids.extend(ids);
+        candidate_ids.extend(ids.iter().copied());
     }
     let matching: Vec<_> = candidate_ids
         .into_iter()
-        .map(|i| &index.refs[*i])
+        .map(|i| &index.refs[i])
         .filter(|r| crate::issue::finish::same_path(&r.path, wt_path))
         .collect();
     let issue = matching.first().map(|r| r.issue.clone());
@@ -1511,6 +1513,9 @@ pub(super) fn stale_worktrees(
             } else if tracker.recorded.is_none() {
                 why.push("tracker ownership could not be verified".to_string());
             }
+            if !tracker_index.complete {
+                why.push("tracker scan incomplete; check other claims".to_string());
+            }
             if !clean {
                 why.push("dirty tree".to_string());
             }
@@ -1526,12 +1531,16 @@ pub(super) fn stale_worktrees(
                 "issue_done": tracker.issue_done,
                 "recorded_ref": tracker.recorded,
                 "open_ref": tracker.open_ref,
+                "tracker_complete": tracker_index.complete,
                 "clean": clean,
                 "bytes": bytes,
                 "bytes_truncated": truncated,
                 "why": why.join(", "),
             }));
-            remedies.push(if tracker.open_ref == Some(true) && !tracker.issue_done {
+            remedies.push(if tracker.open_ref == Some(true)
+                && !tracker.issue_done
+                && tracker_index.complete
+            {
                 format!(
                     "cadence issue finish {} --worktree {}  # guarded; inspect refusal before cleanup",
                     tracker.issue.as_deref().unwrap_or("?"),
@@ -1572,7 +1581,7 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         for item in inventory {
             rows.push(json!({
                 "kind": "worktree-inventory", "path": item["path"],
-                "bytes": 0, "recorded_ref": item["recorded_ref"],
+                "recorded_ref": item["recorded_ref"],
                 "action": "Review owner, commits, PRs, push and active processes before cleanup",
                 "why": item["why"],
             }));
@@ -1580,7 +1589,9 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         for s in stale {
             let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
             stale_paths.insert(path.clone());
-            let open_ref = s["open_ref"] == json!(true) && s["issue_done"] != json!(true);
+            let open_ref = s["open_ref"] == json!(true)
+                && s["issue_done"] != json!(true)
+                && s["tracker_complete"] == json!(true);
             stale_rows.push(json!({
                 "kind": "worktree-review",
                 "path": s["path"],
