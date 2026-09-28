@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SECRET: &str = concat!("cadp_conn_fixture_", "b1c2d3e4f5g6");
 const EXTERNAL_WORKSPACE: &str = "ws_11111111-1111-4111-8111-111111111111";
@@ -23,6 +23,12 @@ struct Board {
 }
 impl Board {
     fn new() -> Self {
+        Self::new_with_after_probe(|_| None)
+    }
+
+    fn new_with_after_probe(
+        after_probe: impl FnOnce(u16) -> Option<std::net::TcpListener>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         let mut opts = daemon_opts();
@@ -41,31 +47,50 @@ impl Board {
             ),
         );
         let daemon = TestDaemon::start_opts(opts);
-        let port = (3110..3200)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let opts = cadence_agent::ui::ServeOpts {
-            host: "127.0.0.1".into(),
-            port,
-            stop: Some(stop.clone()),
-            test_seam: cfg!(feature = "test-seam"),
-            ..Default::default()
-        };
-        let state = daemon.state.clone();
-        let thread = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm.dir, &opts));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
+        let mut after_probe = Some(after_probe);
+        for _ in 0..20 {
+            // The OS assigns an ephemeral port; the bind can still race between
+            // this probe and `ui::serve`, so trust only its startup channel.
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let held = after_probe.take().and_then(|hook| hook(port));
+            let (startup, ready) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                test_seam: cfg!(feature = "test-seam"),
+                startup: Some(startup),
+                ..Default::default()
+            };
+            let state = daemon.state.clone();
+            let pm_dir = pm.dir.clone();
+            let thread =
+                std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm_dir, &opts));
+            match ready
+                .recv_timeout(Duration::from_secs(10))
+                .expect("board startup timed out")
+            {
+                Ok(()) => {
+                    drop(held);
+                    return Self {
+                        root,
+                        daemon,
+                        port,
+                        stop,
+                        thread: Some(thread),
+                    };
+                }
+                Err(std::io::ErrorKind::AddrInUse) => {
+                    thread.join().unwrap().unwrap_err();
+                    drop(held);
+                }
+                Err(kind) => panic!("board failed to start on {port}: {kind}"),
+            }
         }
-        Self {
-            root,
-            daemon,
-            port,
-            stop,
-            thread: Some(thread),
-        }
+        panic!("board could not reserve an ephemeral port after 20 attempts")
     }
     fn operator(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         let session =
@@ -180,8 +205,28 @@ fn cad709_http_external_connection_keeps_native_enrollment_boundary() {
 impl Drop for Board {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap().unwrap();
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !std::thread::panicking() {
+                result.unwrap().unwrap();
+            }
+        }
     }
+}
+
+#[test]
+fn cad772_busy_handoff_retries_and_keeps_its_own_operator_seam() {
+    let mut occupied = None;
+    let b = Board::new_with_after_probe(|port| {
+        occupied = Some(port);
+        Some(std::net::TcpListener::bind(("127.0.0.1", port)).unwrap())
+    });
+    assert_ne!(
+        b.port,
+        occupied.unwrap(),
+        "fixture reused a port stolen after its probe"
+    );
+    assert!(b.value("GET", "/api/connections", json!({}))["connections"].is_array());
 }
 
 #[test]
