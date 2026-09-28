@@ -238,6 +238,7 @@ export default function App() {
   const metaIdentity = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const [credentialGeneration, setCredentialGeneration] = useState(0);
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const request = ++metaRequest.current;
@@ -246,6 +247,7 @@ export default function App() {
       metaKey.current = sentKey;
       metaIdentity.current = null;
       operatorKnown.current = false;
+      setCredentialGeneration((generation) => generation + 1);
       setMeta(null);
     }
     const asked = !operatorKnown.current;
@@ -265,6 +267,7 @@ export default function App() {
           setSessionKey(null);
           metaKey.current = null;
           expectedKey = null;
+          setCredentialGeneration((generation) => generation + 1);
         }
         if (changed && !asked) {
           operatorKnown.current = false;
@@ -557,7 +560,7 @@ export default function App() {
   const projectSlug = project === "all" ? null : project;
 
   return (
-    <WriteGate.Provider value={block}>
+    <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
@@ -820,6 +823,7 @@ export default function App() {
         )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
+            key={credentialGeneration}
             issues={issuesState}
             onRetry={() => void resources.issues.refresh()}
             projects={projects}
@@ -829,7 +833,8 @@ export default function App() {
             view={view}
             onView={setView}
             query={query}
-            readOnly={readOnly}
+            readOnly={readOnly || meta === null}
+            sessionId={meta === null ? undefined : meta.session?.id ?? null}
             actor={actor}
             onQuery={setQuery}
             filters={filters}
@@ -962,6 +967,8 @@ export default function App() {
           key={openId}
           id={openId}
           detail={detailState?.data?.id === openId ? detailState.data : null}
+          readState={detailState}
+          onRetry={() => void resources.issue(openId).refresh()}
           href={(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
             const fromCard = issues.find((i) => i.id === openId)?.project ?? null;

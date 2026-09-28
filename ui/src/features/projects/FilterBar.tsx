@@ -7,6 +7,7 @@ import {
   type Facet,
 } from "../../lib/filters";
 import type { IssueCard } from "../../lib/types";
+import type { ProjectView } from "../../lib/urlState";
 
 interface Props {
   /** Cards in scope before the chips apply — the facet values and
@@ -16,6 +17,7 @@ interface Props {
   issues: IssueCard[];
   filters: BoardFilters;
   onChange: (f: BoardFilters) => void;
+  view: ProjectView;
 }
 
 /// value → how many cards in scope carry it, most used first.
@@ -27,7 +29,7 @@ function tally(values: (string | undefined)[][]): [string, number][] {
   return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
-export default function FilterBar({ scope, issues, filters, onChange }: Props) {
+export default function FilterBar({ scope, issues, filters, onChange, view }: Props) {
   const titleOf = new Map(issues.map((i) => [i.id, i.title]));
   const facets: [Facet, string, [string, number][]][] = [
     ["tags", "tag", tally(scope.map((t) => t.tags ?? []))],
@@ -110,20 +112,18 @@ export default function FilterBar({ scope, issues, filters, onChange }: Props) {
             done {doneCount}
           </button>
         )}
-        <button
-          aria-pressed={filters.groupByEpic}
-          onClick={() =>
-            onChange({ ...filters, groupByEpic: !filters.groupByEpic })
-          }
-          className={`chip !py-[.15rem] transition-colors ${
-            filters.groupByEpic
-              ? "bg-accent/10 text-accent"
-              : "bg-ink-800 text-ink-400 hover:text-ink-200"
-          }`}
-          title="one swimlane per epic, with its progress"
-        >
-          group by epic
-        </button>
+        {view === "kanban" && (
+          <button
+            aria-pressed={filters.groupByEpic}
+            onClick={() => onChange({ ...filters, groupByEpic: !filters.groupByEpic })}
+            className={`chip !py-[.15rem] transition-colors ${
+              filters.groupByEpic ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-400 hover:text-ink-200"
+            }`}
+            title="one swimlane per epic, with its progress"
+          >
+            group by epic
+          </button>
+        )}
         {active > 0 && (
           <button
             onClick={() =>

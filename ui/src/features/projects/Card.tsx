@@ -67,8 +67,6 @@ export default function Card({
 
   return (
     <article
-      tabIndex={0}
-      role="button"
       aria-label={`${t.id} ${t.title}`}
       draggable={!noDrag}
       title={noDrag ?? undefined}
@@ -79,13 +77,6 @@ export default function Card({
         e.currentTarget.classList.add("opacity-35");
       }}
       onDragEnd={(e) => e.currentTarget.classList.remove("opacity-35")}
-      onClick={() => onOpen(t.id)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen(t.id);
-        }
-      }}
       className={`card tcard p-3 ${t.status === "done" ? "opacity-70" : ""} ${
         noDrag ? "cursor-default" : "cursor-grab active:cursor-grabbing"
       }`}
@@ -94,7 +85,6 @@ export default function Card({
         <Link
           href={issuePath(t.project, t.id)}
           className="num text-label text-ink-100 font-medium"
-          onClick={(e) => e.stopPropagation()}
         >
           {t.id}
         </Link>
@@ -121,8 +111,8 @@ export default function Card({
           </span>
         )}
       </div>
-      <h3 className="mt-2 text-secondary text-ink-200 leading-[1.45]">
-        {t.title}
+      <h3 className="mt-2 text-secondary leading-[1.45]">
+        <Link href={issuePath(t.project, t.id)} className="board-issue-title text-ink-200 hover:text-accent">{t.title}</Link>
       </h3>
       {(t.agents?.length ?? 0) > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -180,6 +170,7 @@ export default function Card({
           {t.blocked ? "waits on" : "after"} {t.blocked_by.join(" · ")}
         </div>
       )}
+      <button type="button" className="board-preview-link mt-3" aria-label={`Preview ${t.id}`} onClick={() => onOpen(t.id)}>Preview</button>
     </article>
   );
 }
