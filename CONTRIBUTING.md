@@ -104,17 +104,20 @@ short temp root (Unix socket paths have a length limit):
 ```bash
 export CADENCE_SANDBOX_ROOT="$(mktemp -d /tmp/cadence-dev.XXXXXX)"
 export CADENCE_DEV_BOARD_PORT=3117
-pnpm -C ui install --frozen-lockfile
-pnpm -C ui build
+export XDG_CONFIG_HOME="$CADENCE_SANDBOX_ROOT/config"
+mkdir -m 700 -p "$XDG_CONFIG_HOME"
+unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
+npx --yes pnpm@12.2.1 -C ui install --frozen-lockfile
+npx --yes pnpm@12.2.1 -C ui build
 # On a shared host, obtain the documented build-slot admission first.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
-pnpm -C ui dev --host 127.0.0.1
+npx --yes pnpm@12.2.1 -C ui dev --host 127.0.0.1
 ```
 
 Open the Vite URL printed by the final command. UI edits reload there without a
 Rust build or cloud deployment; `/api` proxies only to the selected sandbox
-board. `pnpm -C ui dev` refuses a missing or out-of-range
+board. The pinned pnpm command refuses a missing or out-of-range
 `CADENCE_DEV_BOARD_PORT`, including the production port 3010. For Rust edits,
 leave Vite running, then rebuild and restart the sandbox:
 
@@ -126,9 +129,11 @@ CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 
 Repeat that backend cycle after each Rust edit, with build-slot admission on
 shared hosts; Vite reconnects when the board returns. For CLI experiments in
-another terminal, export the same `CADENCE_SANDBOX_ROOT`, then use
-`./target/debug/cadence sandbox env dev` and export its printed values before
-issuing commands. Keep cloud tokens out of the sandbox shell. At the end, run
+another terminal, export the same `CADENCE_SANDBOX_ROOT` and isolated
+`XDG_CONFIG_HOME`, unset `CADENCE_TOKEN`, `CADENCE_ISSUER` and `CADENCE_ORG`,
+then use `./target/debug/cadence sandbox env dev` and export its printed values
+before issuing commands. The sandbox uses no production Cadence login record or
+cloud token from the shell. At the end, run
 `./target/debug/cadence sandbox down dev`; the temp root remains available for
 inspection and can be removed later by its owner.
 

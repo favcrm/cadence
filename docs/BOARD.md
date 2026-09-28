@@ -1609,10 +1609,10 @@ Sans/Mono, teal `#2dd4bf` on interactive elements only.
 
 ```bash
 cd ui
-pnpm install
-CADENCE_DEV_BOARD_PORT=3117 pnpm dev  # Vite HMR; /api → isolated sandbox board
-pnpm typecheck   # tsc --noEmit
-pnpm build       # → local ui/dist (--features ui embeds it)
+npx --yes pnpm@12.2.1 install
+CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isolated sandbox board
+npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
+npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
 ```
 
 Start an isolated sandbox board and use the Rust restart loop in
