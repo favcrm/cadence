@@ -31,6 +31,8 @@ The selected workflow declares `publication_slot: publication` in its frontmatte
 
 An adapter's reviewed action mapping resolves the capability to its provider tool, required scopes, effect classification and input/output contracts. An unsupported mapping refuses the binding. The app declaration cannot select a provider tool or change the mapping's effect. The new Local `publish_app_text` tool is reserved for the reviewed app-artifact broker; legacy `platform_call` cannot invoke it even with a publish grant.
 
+A managed Pi worker may invoke `cadence app run capability-call` from Pi's built-in bash tool during its assigned app turn. Pi launches that bash as a direct child of its enrolled endpoint in a new Linux session; bash may exec a single final `cadence` command. The broker verifies that direct-child session and executable as well as the active message, turn token, frozen slot, binding and quote. A further `setsid` child, an arbitrary detached program, or a call after the turn closes has no capability authority. Concurrent calls to one approved slot still resolve to one durable receipt and one provider request.
+
 ## Operator flow
 
 Use the stable IDs and digests returned by each command. The examples assume an installed, approved app, a registered team and a completed independently reviewed run.
