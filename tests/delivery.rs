@@ -3190,12 +3190,19 @@ fn delivery_agent_cannot_mark_ticket_done() {
 #[test]
 fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     #[cfg(feature = "test-seam")]
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    };
 
     #[cfg(feature = "test-seam")]
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     #[cfg(feature = "test-seam")]
     let (release_tx, release_rx) = mpsc::sync_channel(1);
+    #[cfg(feature = "test-seam")]
+    let lock_on_failure = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "test-seam")]
+    let retry_lock = Arc::new(OnceLock::<PathBuf>::new());
     let options = daemon::ServeOptions {
         report_router: Some(3600),
         ..daemon_opts()
@@ -3203,7 +3210,14 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     #[cfg(feature = "test-seam")]
     let options = {
         let release_rx = Mutex::new(release_rx);
+        let lock_on_failure = Arc::clone(&lock_on_failure);
+        let retry_lock = Arc::clone(&retry_lock);
         daemon::ServeOptions {
+            after_done_write_failure: Some(Arc::new(move || {
+                if lock_on_failure.swap(false, Ordering::SeqCst) {
+                    std::fs::write(retry_lock.get().unwrap(), "").unwrap();
+                }
+            })),
             after_done_retry_saved: Some(Arc::new(move |id| {
                 if id == "D-3" {
                     entered_tx.send(()).unwrap();
@@ -3218,6 +3232,8 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         }
     };
     let mut lf = LoopFixture::dispatched_plan_with(LOOP_PLAN, options);
+    #[cfg(feature = "test-seam")]
+    retry_lock.set(lf.f.pm_dir.join(".write.lock")).unwrap();
     for id in ["D-3", "D-4"] {
         let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
         assert!(ok, "{id}: {sent}");
@@ -3266,13 +3282,16 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     let (hook, done_runs) = refuse_done_commits(&lf);
     let hooks = hook.parent().unwrap().to_path_buf();
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(feature = "test-seam")]
+    lock_on_failure.store(true, Ordering::SeqCst);
     lf.set_gh(&b, "MERGED", true, false);
     let row3 = lf.sync_of("D-3");
     assert_eq!(row3["ticket"]["outcome"], "pending", "{row3}");
-    // Under CI's test-seam feature, stop the router after the second
-    // failed done write is saved as pending. It holds delivery_lock,
-    // not the tracker lock: inspection and the independent writer cannot
-    // consume the third attempt or carry staged done status.
+    // Under CI's test-seam feature, hold the tracker lock after the first
+    // failed hook write. The second attempt must fail before the hook, yet
+    // still consume a retry. Stop the router after that failure is saved:
+    // it holds delivery_lock, so inspection and the independent writer
+    // cannot consume the third attempt or carry staged done status.
     #[cfg(feature = "test-seam")]
     {
         lf.f.d.operator_rpc("reports_changed", json!({})).unwrap();
@@ -3280,11 +3299,18 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
         let pending = lf.rec_of("D-3");
         assert_eq!(pending["ticket_done"]["outcome"], "pending", "{pending}");
         assert_eq!(pending["ticket_done"]["attempts"], 2, "{pending}");
+        assert!(
+            pending["ticket_done"]["why"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("locked by another writer"),
+            "{pending}"
+        );
         assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
         assert_eq!(
             std::fs::read_to_string(&done_runs).unwrap().lines().count(),
-            2,
-            "the hook counts only done writes"
+            1,
+            "a lock-contention retry must not reach the hook"
         );
     }
     // Without the seam, the first completed failure still proves the
@@ -3309,6 +3335,8 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     );
     // Heal the hook while the seam prevents another delivery pass.
     std::fs::remove_file(&hook).unwrap();
+    #[cfg(feature = "test-seam")]
+    std::fs::remove_file(retry_lock.get().unwrap()).unwrap();
     // The next writer after the hook is gone commits only its own file.
     let (ok, out) =
         lf.f.cli_as("w1", &["issue", "comment", "D-3", "-m", "progress"]);
