@@ -84,6 +84,30 @@ fn codex_sandbox_success_preserves_workspace_write_on_app_server() {
 }
 
 #[test]
+fn codex_mcp_read_tools_can_run_without_global_approval() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    d.register_codex("scoped-reads");
+    d.wait_agent("scoped-reads", "idle", 15);
+    let reqs = mock_requests(&mock);
+    let launch = &reqs[0]["params"];
+    assert_eq!(launch["approvalPolicy"], "never");
+    let bridge = &launch["config"]["mcp_servers"]["cadence"];
+    let tools = ["self", "wiki_search", "wiki_read", "issue_show"];
+    assert_eq!(bridge["enabled_tools"], json!(tools));
+    assert_eq!(bridge["default_tools_approval_mode"], "prompt");
+    let approvals = bridge["tools"].as_object().expect("MCP tool approval map");
+    assert_eq!(
+        approvals.len(),
+        tools.len(),
+        "no future tool gets auto-approval"
+    );
+    for tool in tools {
+        assert_eq!(approvals[tool]["approval_mode"], "approve", "{tool}");
+    }
+}
+
+#[test]
 fn codex_mcp_unavailable_fences_before_dispatch() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("mcp-fail");
