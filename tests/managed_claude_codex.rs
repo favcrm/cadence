@@ -1709,8 +1709,27 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
         .unwrap();
     // Reconcile leaves the agent stopped; resume is the explicit step.
     assert_eq!(unfenced["state"], "stopped", "{unfenced}");
-    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
-        .unwrap();
+    // CAD-763: `attention` is written by `unknown()` while the dead
+    // actor still owns the alias — ownership is released only after
+    // cleanup and the final state write in `run_actor` — so this
+    // resume can land while the teardown still holds it. The rejection
+    // names the remedy (`retry shortly`); retry it boundedly, the way
+    // an operator would. Any other error propagates immediately, and
+    // the `resume_rejected_while_actor_stopping` guard is untouched:
+    // a live stop still rejects, it just stops being a flake here.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match d.operator_rpc("agent_resume", json!({"alias": "w1"})) {
+            Ok(_) => break,
+            Err(e)
+                if e.to_string().contains("still starting or stopping")
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("agent_resume failed: {e}"),
+        }
+    }
     d.wait_agent("w1", "idle", 15);
     // `idle` only proves the transport opened — under load the
     // relaunched mock can still be booting, so `.argv` may still hold
