@@ -78,8 +78,22 @@ impl Shared {
         allowed_scopes: Option<&[String]>,
         metadata_projection: Option<&CredentialMetadataProjection<'_>>,
     ) -> Result<Value> {
-        let platform = identifier(required_str(params, "platform")?, "Platform")?;
-        let account = identifier(required_str(params, "account")?, "Account")?;
+        let platform = if allowed_scopes.is_some() {
+            platform::connections::provider_identifier(
+                required_str(params, "platform")?,
+                "Platform",
+            )?
+        } else {
+            identifier(required_str(params, "platform")?, "Platform")?
+        };
+        let account = if allowed_scopes.is_some() {
+            platform::connections::provider_account_identifier(
+                &platform,
+                required_str(params, "account")?,
+            )?
+        } else {
+            identifier(required_str(params, "account")?, "Account")?
+        };
         let accept_risk = params
             .get("accept_same_uid_risk")
             .and_then(Value::as_bool)
@@ -262,8 +276,22 @@ impl Shared {
     }
 
     pub(super) fn revoke_inner(&self, params: &Value, expected_id: Option<&str>) -> Result<Value> {
-        let platform = identifier(required_str(params, "platform")?, "Platform")?;
-        let account = identifier(required_str(params, "account")?, "Account")?;
+        let platform = if expected_id.is_some() {
+            platform::connections::provider_identifier(
+                required_str(params, "platform")?,
+                "Platform",
+            )?
+        } else {
+            identifier(required_str(params, "platform")?, "Platform")?
+        };
+        let account = if expected_id.is_some() {
+            platform::connections::provider_account_identifier(
+                &platform,
+                required_str(params, "account")?,
+            )?
+        } else {
+            identifier(required_str(params, "account")?, "Account")?
+        };
         let reason = optional_str(params, "reason");
         // Same lock the enroll path serializes on: a revoke racing a
         // rotate must not interleave remove with put.

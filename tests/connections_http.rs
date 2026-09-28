@@ -1,6 +1,7 @@
 //! Operator connection management: real TCP peers, stolen sessions, no app grants.
 #![allow(clippy::disallowed_methods)]
 mod common;
+use cadence_agent::platform::agenticos_external::{AgenticosExternalAdapter, MANIFEST_PIN};
 use cadence_agent::{contract_fixture::FakePlatform, issue::Pm};
 use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
@@ -11,6 +12,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const SECRET: &str = concat!("cadp_conn_fixture_", "b1c2d3e4f5g6");
+const EXTERNAL_WORKSPACE: &str = "ws_11111111-1111-4111-8111-111111111111";
+const OTHER_EXTERNAL_WORKSPACE: &str = "ws_22222222-2222-4222-8222-222222222222";
 struct Board {
     root: tempfile::TempDir,
     daemon: TestDaemon,
@@ -27,6 +30,16 @@ impl Board {
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         opts.platforms
             .insert("fixture".into(), Arc::new(FakePlatform::standard()));
+        opts.platforms.insert(
+            "agenticos_external".into(),
+            Arc::new(
+                AgenticosExternalAdapter::with_deployment_pin(
+                    "https://api-v2.agenticos.hk",
+                    Some(MANIFEST_PIN),
+                )
+                .unwrap(),
+            ),
+        );
         let daemon = TestDaemon::start_opts(opts);
         let port = (3110..3200)
             .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
@@ -80,6 +93,89 @@ impl Board {
             })
             .collect()
     }
+}
+
+#[test]
+fn cad709_http_external_connection_keeps_native_enrollment_boundary() {
+    let b = Board::new();
+    let create_external = |provider: &str, account: &str| {
+        json!({"provider":provider,"account":account,"shape":"token",
+            "token":SECRET,"scopes":["provider.read","provider.draft"],
+            "accept_same_uid_risk":true})
+    };
+    let created = b.value(
+        "POST",
+        "/api/connections",
+        create_external("agenticos_external", EXTERNAL_WORKSPACE),
+    )["connection"]
+        .clone();
+    assert_eq!(created["provider"], "agenticos_external");
+    assert_eq!(created["status"]["manifest_status"], "matched");
+    assert_eq!(created["status"]["custody_available"], true);
+    for provider in ["agenticos_other", "other_provider", "_agenticos_external"] {
+        let (code, _) = b.operator(
+            "POST",
+            "/api/connections",
+            &create_external(provider, "forged").to_string(),
+        );
+        assert_eq!(
+            code, 409,
+            "unknown underscore provider admitted: {provider}"
+        );
+    }
+    for account in [
+        "ws_fixture",
+        "ws_11111111-1111-4111-8111-111111111111/other",
+        "other",
+    ] {
+        let (code, _) = b.operator(
+            "POST",
+            "/api/connections",
+            &create_external("agenticos_external", account).to_string(),
+        );
+        assert_eq!(code, 409, "non-workspace account admitted: {account}");
+    }
+    let before = b.value("GET", "/api/connections", json!({}));
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(&b.daemon, "external-http-peer", "claude", None, lane.pid());
+    for prefix in ["", "setsid "] {
+        for body in [
+            create_external("agenticos_external", OTHER_EXTERNAL_WORKSPACE).to_string(),
+            json!({"provider":"agenticos_external","account":OTHER_EXTERNAL_WORKSPACE,"shape":"token",
+                "token":SECRET,"scopes":["provider.read"],"accept_same_uid_risk":true,
+                "operator":true})
+            .to_string(),
+        ] {
+            let stolen =
+                common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+            let wire = stolen.request_as("POST", "/api/connections", &body, "");
+            let file = lane
+                .dir
+                .path()
+                .join(format!("external-request-{}.txt", lane.seq));
+            std::fs::write(&file, wire).unwrap();
+            let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}",b.port,file.display()));
+            assert_eq!(rc, 0);
+            assert_eq!(
+                response.split_whitespace().nth(1),
+                Some("403"),
+                "agent/detached caller admitted: {response}"
+            );
+        }
+    }
+    assert_eq!(b.value("GET", "/api/connections", json!({})), before);
+    let id = created["id"].as_str().unwrap();
+    let rotated = b.value(
+        "POST",
+        &format!("/api/connections/{id}/rotate"),
+        json!({"token":"BBBBBBBBBBBBBBBBBBBB"}),
+    );
+    assert_eq!(rotated["connection"]["id"], id);
+    assert_eq!(
+        b.value("POST", &format!("/api/connections/{id}/revoke"), json!({}))["revoked"],
+        true
+    );
+    assert!(b.operator("GET", &format!("/api/connections/{id}"), "").0 >= 400);
 }
 impl Drop for Board {
     fn drop(&mut self) {

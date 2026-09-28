@@ -8,6 +8,38 @@ use serde::Serialize;
 /// Shared schemas understood by the text publication v1 broker.
 pub const TEXT_PUBLICATION_INPUT_V1: &str = "text.publish.input@1";
 pub const TEXT_PUBLICATION_RECEIPT_V1: &str = "text.publish.receipt@1";
+
+/// Connection custody admits the one reviewed provider whose registered name
+/// predates the hyphen-only platform identifier grammar. This is an exact
+/// allowlist, not permission for caller-chosen underscore names.
+pub fn provider_identifier(value: &str, what: &str) -> Result<String> {
+    if value == crate::platform::agenticos_external::PLATFORM {
+        Ok(value.to_owned())
+    } else {
+        crate::proto::identifier(value, what)
+    }
+}
+
+/// AgenticOS workspace records are minted as `ws_<UUID>`. The generic
+/// issuer ID schema is broader, but this connection account is a workspace,
+/// not an arbitrary hosted actor ID.
+pub fn provider_account_identifier(provider: &str, value: &str) -> Result<String> {
+    if provider != crate::platform::agenticos_external::PLATFORM {
+        return crate::proto::identifier(value, "Account");
+    }
+    let id = value.strip_prefix("ws_").and_then(|suffix| {
+        uuid::Uuid::parse_str(suffix)
+            .ok()
+            .filter(|id| id.to_string() == suffix)
+    });
+    if id.is_none() {
+        return Err(Error::rejected(
+            "AgenticOS external account must be a canonical workspace ID",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilitySemantics {
