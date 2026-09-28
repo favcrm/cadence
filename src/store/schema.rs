@@ -648,6 +648,90 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=25", [])?;
             tx.commit()?;
         }
+        if version < 26 {
+            // CAD-720: historical v26 source rows are inert. No migration
+            // backfills older messages: their cloud enrollment and restore
+            // generation are unknown. v27 fences every v26 row as local.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cloud_dispatch_outbox(
+                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+                    source TEXT NOT NULL CHECK(source IN ('dispatch','job_dispatch')),
+                    task_id TEXT,
+                    task_revision INTEGER,
+                    audience_agent TEXT NOT NULL,
+                    expected_head TEXT,
+                    payload_digest TEXT NOT NULL,
+                    organization_id TEXT,
+                    remote_turn_id TEXT UNIQUE,
+                    created REAL NOT NULL,
+                    claimed REAL,
+                    CHECK ((task_id IS NULL AND task_revision IS NULL)
+                        OR (task_id IS NOT NULL AND task_revision IS NOT NULL)),
+                    CHECK ((organization_id IS NULL AND remote_turn_id IS NULL AND claimed IS NULL)
+                        OR (organization_id IS NOT NULL AND remote_turn_id IS NOT NULL AND claimed IS NOT NULL))
+                );
+                CREATE TRIGGER IF NOT EXISTS cloud_dispatch_source_immutable
+                BEFORE UPDATE ON cloud_dispatch_outbox
+                WHEN NEW.message_id IS NOT OLD.message_id
+                  OR NEW.source IS NOT OLD.source
+                  OR NEW.task_id IS NOT OLD.task_id
+                  OR NEW.task_revision IS NOT OLD.task_revision
+                  OR NEW.audience_agent IS NOT OLD.audience_agent
+                  OR NEW.expected_head IS NOT OLD.expected_head
+                  OR NEW.payload_digest IS NOT OLD.payload_digest
+                  OR NEW.created IS NOT OLD.created
+                  OR (OLD.remote_turn_id IS NOT NULL AND (
+                      NEW.organization_id IS NOT OLD.organization_id
+                      OR NEW.remote_turn_id IS NOT OLD.remote_turn_id
+                      OR NEW.claimed IS NOT OLD.claimed))
+                BEGIN SELECT RAISE(ABORT, 'cloud dispatch source or claim is immutable'); END;
+                UPDATE schema_version SET version=26;",
+            )?;
+            tx.commit()?;
+        }
+        if version < 27 {
+            // Every v26 row was created by a local dispatch without issuer
+            // enrollment. Preserve it for audit, but make it permanently
+            // ineligible for a future cloud turn claim. No current insert
+            // path is permitted to create an eligible row either.
+            let tx = conn.unchecked_transaction()?;
+            let columns = tx
+                .prepare("PRAGMA table_info(cloud_dispatch_outbox)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "cloud_eligible") {
+                tx.execute_batch(
+                    "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
+                     cloud_eligible INTEGER NOT NULL DEFAULT 0 CHECK(cloud_eligible=0);",
+                )?;
+            }
+            let invalid: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible IS NOT 0",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid != 0 {
+                return Err(crate::error::Error::rejected(
+                    "cloud dispatch eligibility contains an unverified row",
+                ));
+            }
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_immutable;
+                 DROP TRIGGER IF EXISTS cloud_dispatch_eligibility_insert_guard;
+                 CREATE TRIGGER cloud_dispatch_eligibility_immutable
+                 BEFORE UPDATE ON cloud_dispatch_outbox
+                 WHEN NEW.cloud_eligible IS NOT OLD.cloud_eligible
+                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is immutable'); END;
+                 CREATE TRIGGER cloud_dispatch_eligibility_insert_guard
+                 BEFORE INSERT ON cloud_dispatch_outbox
+                 WHEN NEW.cloud_eligible IS NOT 0
+                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is unverified'); END;
+                 UPDATE schema_version SET version=27;",
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

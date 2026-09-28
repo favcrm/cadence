@@ -37,6 +37,7 @@ pub use threads::{
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
 
 mod agents;
+mod cloud_dispatch_outbox;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
 mod delivery;
 mod events;
