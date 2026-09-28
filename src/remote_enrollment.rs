@@ -994,6 +994,18 @@ mod tests {
         write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", bytes.len()).unwrap();
         socket.write_all(&bytes).unwrap();
     }
+    fn respond_error(socket: &mut std::net::TcpStream, error: &str) {
+        let bytes = json!({"error":error}).to_string();
+        write!(socket, "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", bytes.len()).unwrap();
+        socket.write_all(bytes.as_bytes()).unwrap();
+    }
+    fn browser_code(expires_in: u64) -> Value {
+        json!({"version":DEVICE_VERSION,
+            "device_code":format!("hcd_{}", "A".repeat(43)),"user_code":"K7PM-2QNF",
+            "verification_uri":"https://app.agenticos.test/device/hosted-cadence",
+            "verification_uri_complete":"https://app.agenticos.test/device/hosted-cadence?code=K7PM-2QNF",
+            "expires_in":expires_in,"interval":5})
+    }
     fn request(listener: &TcpListener, path: &str, bearer: &str) -> std::net::TcpStream {
         request_with_audience(listener, path, bearer, "http://127.0.0.1:1")
     }
@@ -1158,7 +1170,207 @@ mod tests {
     }
 
     #[test]
+    fn browser_public_request_ignores_ambient_proxy() {
+        if std::env::var_os("CAD729_PROXY_PROOF_CHILD").is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("browser_public_request_ignores_ambient_proxy")
+                .env("CAD729_PROXY_PROOF_CHILD", "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("http_proxy", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("all_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+            let output = crate::reaper::output(&mut child).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
+            assert_eq!(body["organization_id"], "ws_real");
+            respond(&mut socket, &browser_code(60));
+        });
+        let (status, _) = post_public(
+            &issuer,
+            "/v1/hosted-cadence/device/code",
+            json!({"organization_id":"ws_real"}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn browser_poll_pending_slow_down_obeys_deadline_without_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut code, _) = public_request(&listener, "/v1/hosted-cadence/device/code");
+            respond(&mut code, &browser_code(16));
+            for error in ["authorization_pending", "slow_down"] {
+                let (mut token, request) =
+                    public_request(&listener, "/v1/hosted-cadence/device/token");
+                assert_eq!(request["device_code"], format!("hcd_{}", "A".repeat(43)));
+                assert_eq!(request["code_verifier"].as_str().unwrap().len(), 43);
+                respond_error(&mut token, error);
+            }
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        let started = Instant::now();
+        let err = enroll_browser(
+            &issuer,
+            "ws_real",
+            "https://real.board.example.test",
+            "worker",
+            &dir,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("expired"));
+        assert!(started.elapsed() >= Duration::from_secs(15));
+        let listener = server.join().unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "deadline allowed another token or child request"
+        );
+        assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn browser_poll_terminal_denial_and_expiry_never_create_child() {
+        for error in ["access_denied", "expired_token"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut code, _) = public_request(&listener, "/v1/hosted-cadence/device/code");
+                respond(&mut code, &browser_code(60));
+                let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+                respond_error(&mut token, error);
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("e");
+            trust(&dir, &issuer);
+            let err = enroll_browser(
+                &issuer,
+                "ws_real",
+                "https://real.board.example.test",
+                "worker",
+                &dir,
+                |_, _| Ok(()),
+            )
+            .unwrap_err();
+            assert!(format!("{err}").contains(if error == "access_denied" {
+                "denied"
+            } else {
+                "expired"
+            }));
+            let listener = server.join().unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "terminal response allowed child request"
+            );
+            assert!(!dir.join(RECORD).exists());
+        }
+    }
+
+    #[test]
+    fn browser_long_poll_orders_concurrent_remove_before_any_later_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut code, _) = public_request(&listener, "/v1/hosted-cadence/device/code");
+            respond(&mut code, &browser_code(60));
+            let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
+            respond_error(&mut token, "access_denied");
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        let mut existing = record(u64::MAX);
+        existing.issuer = issuer.clone();
+        save(&dir, &existing).unwrap();
+        let (shown_tx, shown_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let browser_dir = dir.clone();
+        let browser = thread::spawn(move || {
+            enroll_browser(
+                &issuer,
+                "ws_real",
+                "https://real.board.example.test",
+                "worker",
+                &browser_dir,
+                |_, _| {
+                    shown_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        shown_rx.recv().unwrap();
+        let (remove_started_tx, remove_started_rx) = std::sync::mpsc::channel();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let remove_dir = dir.clone();
+        let removing = thread::spawn(move || {
+            remove_started_tx.send(()).unwrap();
+            let result = remove(&remove_dir);
+            removed_tx.send(result).unwrap();
+        });
+        remove_started_rx.recv().unwrap();
+        assert!(removed_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        continue_tx.send(()).unwrap();
+        assert!(format!("{}", browser.join().unwrap().unwrap_err()).contains("denied"));
+        removing.join().unwrap();
+        removed_rx.recv().unwrap().unwrap();
+        let listener = server.join().unwrap();
+        assert!(
+            listener.accept().is_err(),
+            "denied browser made a child request"
+        );
+        assert!(!dir.join(RECORD).exists());
+        assert!(
+            with_current(&dir, &pin(&existing.audience), |_| -> Result<()> {
+                panic!("bearer callback ran after concurrent removal")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn browser_fixture_binds_one_child_without_storing_bridge_or_verifier() {
+        if let Some(path) = std::env::var_os("CAD729_RESTART_PROOF_DIR") {
+            let dir = Path::new(&path);
+            let info = current(dir).unwrap();
+            assert_eq!(info.subject_id(), "user_1");
+            assert!(with_current(
+                dir,
+                &DestinationPin::new(
+                    "ws_real",
+                    "https://real.board.example.test",
+                    "user_1",
+                    "hca_agent"
+                )
+                .unwrap(),
+                |secret| Ok(secret == CHILD)
+            )
+            .unwrap());
+            return;
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let audience = "https://real.board.example.test";
@@ -1241,6 +1453,17 @@ mod tests {
             .contains(BRIDGE));
         assert!(renew(&dir).is_err());
         assert_eq!(current(&dir).unwrap().agent_id(), "hca_agent");
+        let mut restart = std::process::Command::new(std::env::current_exe().unwrap());
+        restart
+            .arg("browser_fixture_binds_one_child_without_storing_bridge_or_verifier")
+            .env("CAD729_RESTART_PROOF_DIR", &dir);
+        let output = crate::reaper::output(&mut restart).unwrap();
+        assert!(
+            output.status.success(),
+            "fresh process could not use saved browser child: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
     #[test]
     fn local_issuer_fixture_binds_service_exchange_to_child_and_never_prints_secret() {
