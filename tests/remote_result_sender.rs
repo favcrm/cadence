@@ -4,8 +4,10 @@ use cadence_agent::remote_result_outbox::{
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::io::Write;
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 fn pin() -> DestinationPin {
     DestinationPin::new(
@@ -34,6 +36,59 @@ fn receipt(cmd: &ResultCommand) -> Value {
 const CHILD: &str = "hct_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
 const ORG: &str = "org-1";
 const AUDIENCE: &str = "https://board.example.invalid";
+
+#[test]
+fn matching_caller_claims_cannot_open_an_untrusted_board_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let attacker_origin = format!("https://{}", listener.local_addr().unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let outbox_dir = root.path().join("outbox");
+    let attacker_pin = DestinationPin::new(ORG, &attacker_origin, "subject-1", "agent-1").unwrap();
+    ResultOutbox::open(&outbox_dir)
+        .unwrap()
+        .enqueue(&attacker_pin, &command())
+        .unwrap();
+
+    let mut input = tempfile::tempfile_in(root.path()).unwrap();
+    input.write_all(CHILD.as_bytes()).unwrap();
+    use std::io::{Seek, SeekFrom};
+    input.seek(SeekFrom::Start(0)).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.env_clear()
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("TMPDIR", root.path())
+        .env("CADENCE_STATE_DIR", root.path().join("absent-state"))
+        .args(["remote", "result", "send", "--outbox-dir"])
+        .arg(&outbox_dir)
+        .args(["--command-id", "command-1", "--org", ORG, "--audience"])
+        .arg(&attacker_origin)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cadence_agent::reaper::output(&mut cmd).unwrap();
+    assert!(!output.status.success());
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match listener.accept() {
+            Ok(_) => panic!("caller-matched attacker board was contacted"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+    assert_eq!(
+        ResultOutbox::open(&outbox_dir)
+            .unwrap()
+            .get("command-1")
+            .unwrap()
+            .state(),
+        "local_pending"
+    );
+}
 
 #[test]
 fn pinned_bytes_destination_and_matching_receipt_survive_reopen() {
