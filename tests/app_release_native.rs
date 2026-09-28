@@ -106,7 +106,7 @@ fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
     )
     .unwrap();
     assert_eq!(probes["id"], result_a["id"]);
-    assert_eq!(probes["probes"].as_array().unwrap().len(), 8);
+    assert_eq!(probes["probes"].as_array().unwrap().len(), 9);
 
     let selected = h
         .daemon

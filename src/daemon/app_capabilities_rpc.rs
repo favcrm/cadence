@@ -196,15 +196,16 @@ impl Shared {
                         ));
                     }
                     let input_digest = app_runs::material_digest(input);
-                    if let Some(existing) = self
-                        .store
-                        .app_capability_result_for_request(&run_id, &step, &slot, &request)?
+                    if let Some(existing) =
+                        self.store.app_capability_result_for_slot(&run_id, &slot)?
                     {
-                        if existing["input_digest"] != input_digest
+                        if existing["step_id"] != step
+                            || existing["request_id"] != request
+                            || existing["input_digest"] != input_digest
                             || existing["binding_digest"] != proof.digest
                         {
                             return Err(Error::rejected(
-                                "capability request id is already used for different authority",
+                                "approved run capability slot already has its one result",
                             ));
                         }
                         return Ok(existing);
@@ -213,10 +214,23 @@ impl Shared {
                         "app-call-{}",
                         uuid::Uuid::new_v5(
                             &uuid::Uuid::NAMESPACE_OID,
-                            format!("{run_id}:{step}:{slot}:{request}").as_bytes(),
+                            format!("{run_id}:{slot}").as_bytes(),
                         )
                         .simple()
                     );
+                    self.store.app_capability_claim(
+                        crate::store::app_capabilities::AppCapabilityClaim {
+                            run: &run_id,
+                            step: &step,
+                            message,
+                            turn,
+                            slot: &slot,
+                            request: &request,
+                            binding_digest: &proof.digest,
+                            input_digest: &input_digest,
+                            call_id: &call_id,
+                        },
+                    )?;
                     let authority = json!({
                         "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                         "install_id":install,"context_id":run["context_id"],

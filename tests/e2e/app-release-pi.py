@@ -164,6 +164,10 @@ def run_prompt(prompt):
                 raise RuntimeError("concurrent calls did not return one durable receipt")
             receipt = replies[0]["result"]
             cases = []
+            second_charge = frame("app_run_capability_call", dict(request, request_id="second-charge"))
+            if second_charge.get("ok") is not False:
+                raise RuntimeError("one approved slot allowed a second paid provider call")
+            cases.append({"kind":"second-charge","refused":True})
             for changed in [
                 dict(request, token="forged"),
                 dict(request, context_id=probe["context_id"]),

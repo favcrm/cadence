@@ -10,9 +10,14 @@ CREATE TABLE IF NOT EXISTS app_capability_results(
  slot TEXT NOT NULL, request_id TEXT NOT NULL, binding_digest TEXT NOT NULL,
  input_digest TEXT NOT NULL, result TEXT NOT NULL, result_digest TEXT NOT NULL,
  asset_type TEXT, asset_digest TEXT, asset BLOB, created REAL NOT NULL,
- UNIQUE(run_id,step_id,slot,request_id));
+ UNIQUE(run_id,slot));
 CREATE INDEX IF NOT EXISTS app_capability_results_run
  ON app_capability_results(run_id,created,id);
+CREATE TABLE IF NOT EXISTS app_capability_claims(
+ run_id TEXT NOT NULL REFERENCES app_runs(id), slot TEXT NOT NULL,
+ step_id TEXT NOT NULL, request_id TEXT NOT NULL, binding_digest TEXT NOT NULL,
+ input_digest TEXT NOT NULL, call_id TEXT NOT NULL UNIQUE, created REAL NOT NULL,
+ PRIMARY KEY(run_id,slot));
 ";
 
 pub const RESULT_BYTES: usize = 256 * 1024;
@@ -32,7 +37,84 @@ pub(crate) struct AppCapabilityRecord<'a> {
     pub asset: Option<(&'a str, &'a [u8])>,
 }
 
+pub(crate) struct AppCapabilityClaim<'a> {
+    pub run: &'a str,
+    pub step: &'a str,
+    pub message: &'a str,
+    pub turn: &'a str,
+    pub slot: &'a str,
+    pub request: &'a str,
+    pub binding_digest: &'a str,
+    pub input_digest: &'a str,
+    pub call_id: &'a str,
+}
+
 impl Store {
+    /// Reserve the one paid operation for this run slot before provider I/O.
+    /// A failed/uncertain result can only retry the same operation and key.
+    pub(crate) fn app_capability_claim(&self, claim: AppCapabilityClaim<'_>) -> Result<()> {
+        let AppCapabilityClaim {
+            run,
+            step,
+            message,
+            turn,
+            slot,
+            request,
+            binding_digest,
+            input_digest,
+            call_id,
+        } = claim;
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id
+             JOIN messages m ON m.id=s.message_id WHERE s.run_id=? AND s.step_id=?
+             AND s.message_id=? AND s.state='dispatched' AND r.state='running'
+             AND r.approved_digest=r.snapshot_digest AND m.state='running' AND m.turn_id=?)",
+            params![run, step, message, turn],
+            |r| r.get(0),
+        )?;
+        if !active {
+            return Err(Error::rejected(
+                "app capability needs its active assigned turn",
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO app_capability_claims VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                run,
+                slot,
+                step,
+                request,
+                binding_digest,
+                input_digest,
+                call_id,
+                now()
+            ],
+        )?;
+        let existing: (String, String, String, String, String) = tx.query_row(
+            "SELECT step_id,request_id,binding_digest,input_digest,call_id
+             FROM app_capability_claims WHERE run_id=? AND slot=?",
+            params![run, slot],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        if existing
+            != (
+                step.into(),
+                request.into(),
+                binding_digest.into(),
+                input_digest.into(),
+                call_id.into(),
+            )
+        {
+            return Err(Error::rejected(
+                "approved run capability slot already claimed another operation",
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn app_selected_source_input(
         &self,
         install: &str,
@@ -112,17 +194,19 @@ impl Store {
         Ok(receipt)
     }
 
-    pub(crate) fn app_capability_result_for_request(
+    pub(crate) fn app_capability_result_for_slot(
         &self,
         run: &str,
-        step: &str,
         slot: &str,
-        request: &str,
     ) -> Result<Option<Value>> {
-        let id = self.conn().query_row(
-            "SELECT id FROM app_capability_results WHERE run_id=? AND step_id=? AND slot=? AND request_id=?",
-            params![run,step,slot,request], |r| r.get::<_,String>(0),
-        ).optional()?;
+        let id = self
+            .conn()
+            .query_row(
+                "SELECT id FROM app_capability_results WHERE run_id=? AND slot=?",
+                params![run, slot],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
         id.map(|id| self.app_capability_result(&id)).transpose()
     }
 
@@ -168,15 +252,37 @@ impl Store {
                 "app capability turn ended before result was recorded",
             ));
         }
+        let claimed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_capability_claims WHERE run_id=? AND slot=?
+             AND step_id=? AND request_id=? AND binding_digest=? AND input_digest=? AND call_id=?)",
+            params![run, slot, step, request, binding_digest, input_digest, id],
+            |r| r.get(0),
+        )?;
+        if !claimed {
+            return Err(Error::rejected(
+                "app capability result has no matching pre-call claim",
+            ));
+        }
         let existing = tx.query_row(
-            "SELECT id,input_digest FROM app_capability_results WHERE run_id=? AND step_id=? AND slot=? AND request_id=?",
-            params![run,step,slot,request],
-            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)),
+            "SELECT id,step_id,request_id,binding_digest,input_digest FROM app_capability_results WHERE run_id=? AND slot=?",
+            params![run,slot],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)),
         ).optional()?;
-        if let Some((existing_id, existing_input)) = existing {
-            if existing_input != input_digest {
+        if let Some((
+            existing_id,
+            existing_step,
+            existing_request,
+            existing_binding,
+            existing_input,
+        )) = existing
+        {
+            if existing_step != step
+                || existing_request != request
+                || existing_binding != binding_digest
+                || existing_input != input_digest
+            {
                 return Err(Error::rejected(
-                    "capability request id is already used for different input",
+                    "approved run capability slot already has its one result",
                 ));
             }
             tx.commit()?;
