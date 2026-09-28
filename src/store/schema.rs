@@ -697,10 +697,28 @@ impl Store {
             // ineligible for a future cloud turn claim. No current insert
             // path is permitted to create an eligible row either.
             let tx = conn.unchecked_transaction()?;
+            let columns = tx
+                .prepare("PRAGMA table_info(cloud_dispatch_outbox)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "cloud_eligible") {
+                tx.execute_batch(
+                    "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
+                     cloud_eligible INTEGER NOT NULL DEFAULT 0 CHECK(cloud_eligible=0);",
+                )?;
+            }
+            let invalid: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM cloud_dispatch_outbox WHERE cloud_eligible != 0",
+                [],
+                |row| row.get(0),
+            )?;
+            if invalid != 0 {
+                return Err(crate::error::Error::rejected(
+                    "cloud dispatch eligibility contains an unverified row",
+                ));
+            }
             tx.execute_batch(
-                "ALTER TABLE cloud_dispatch_outbox ADD COLUMN
-                    cloud_eligible INTEGER NOT NULL DEFAULT 0 CHECK(cloud_eligible=0);
-                 CREATE TRIGGER cloud_dispatch_eligibility_immutable
+                "CREATE TRIGGER IF NOT EXISTS cloud_dispatch_eligibility_immutable
                  BEFORE UPDATE ON cloud_dispatch_outbox
                  WHEN NEW.cloud_eligible IS NOT OLD.cloud_eligible
                  BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is immutable'); END;

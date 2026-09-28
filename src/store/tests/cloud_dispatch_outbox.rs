@@ -191,6 +191,23 @@ fn concurrent_claims_cannot_turn_legacy_local_work_into_cloud_work() {
 }
 
 #[test]
+fn v27_migration_converges_when_version_was_rolled_back_after_column_commit() {
+    let (dir, s) = store();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("UPDATE schema_version SET version=26", [])
+        .unwrap();
+    drop(conn);
+    Store::open_for_schema_tests(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 27);
+}
+
+#[test]
 fn cloud_outbox_v26_migration_is_atomic() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("t.sqlite3");
