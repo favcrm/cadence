@@ -11,6 +11,78 @@ fn draft_task() -> (TempDir, Store) {
 }
 
 #[test]
+fn ordinary_local_dispatch_never_creates_a_cloud_claim_candidate() {
+    let (_dir, s) = draft_task();
+    let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    assert!(!duplicate);
+    let count: i64 = s
+        .conn()
+        .query_row("SELECT COUNT(*) FROM cloud_dispatch_outbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "local work must not accumulate cloud candidates");
+    assert!(s.claim_cloud_dispatch_turn(&mid, "later-org", "w1").is_err());
+    assert_eq!(s.task("t1").unwrap().state, "dispatched");
+}
+
+#[test]
+fn restored_v26_local_row_is_permanently_ineligible_even_with_later_org() {
+    let (dir, s) = draft_task();
+    let (_, mid, ..) = s.dispatch_task("t1", None, None, "operator").unwrap();
+    drop(s);
+    let db = dir.path().join("t.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER cloud_dispatch_source_immutable;
+         DROP TABLE cloud_dispatch_outbox;
+         CREATE TABLE cloud_dispatch_outbox(
+           cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+           message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+           source TEXT NOT NULL,
+           task_id TEXT,
+           task_revision INTEGER,
+           audience_agent TEXT NOT NULL,
+           expected_head TEXT,
+           payload_digest TEXT NOT NULL,
+           organization_id TEXT,
+           remote_turn_id TEXT UNIQUE,
+           created REAL NOT NULL,
+           claimed REAL
+         );
+         UPDATE schema_version SET version=26;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO cloud_dispatch_outbox(message_id,source,task_id,task_revision,
+         audience_agent,payload_digest,created) VALUES (?1,'job_dispatch','t1',1,'w1','sha256:legacy',1)",
+        [&mid],
+    )
+    .unwrap();
+    drop(conn);
+    let restored = Store::open_for_schema_tests(&db).unwrap();
+    let eligible: i64 = restored
+        .conn()
+        .query_row(
+            "SELECT cloud_eligible FROM cloud_dispatch_outbox WHERE message_id=?1",
+            [&mid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(eligible, 0);
+    assert!(restored
+        .claim_cloud_dispatch_turn(&mid, "later-org", "w1")
+        .is_err());
+    let unchanged: (Option<String>, Option<String>) = restored
+        .conn()
+        .query_row(
+            "SELECT organization_id,remote_turn_id FROM cloud_dispatch_outbox WHERE message_id=?1",
+            [&mid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(unchanged, (None, None));
+}
+
+#[test]
 fn cloud_dispatch_outbox_is_committed_with_job_kickoff_and_retry_is_same_fact() {
     let (_dir, s) = draft_task();
     let (_, mid, duplicate, _) = s.dispatch_task("t1", None, None, "operator").unwrap();
