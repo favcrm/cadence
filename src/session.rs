@@ -463,12 +463,21 @@ fn host_report(scan: &doctor::host::Scan, fixture: Option<&Path>) -> Result<Valu
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| Error::rejected(format!("--host-report {}: {e}", path.display())))?;
-            serde_json::from_str(&text).map_err(|e| {
+            let report: Value = serde_json::from_str(&text).map_err(|e| {
                 Error::rejected(format!(
                     "--host-report {}: not a doctor --host report ({e})",
                     path.display()
                 ))
-            })
+            })?;
+            if !matches!(report["level"].as_str(), Some("ok" | "warn" | "fail"))
+                || !report["checks"].is_array()
+            {
+                return Err(Error::rejected(format!(
+                    "--host-report {}: not a doctor --host report (expected level and checks array)",
+                    path.display()
+                )));
+            }
+            Ok(report)
         }
     }
 }
@@ -1566,6 +1575,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         }
         Some(pid) => {
             let mut detail = format!("pid {pid}, :{port}");
+            let mut ts_fix_result = None;
             let unhealthy = ui::health(&opts.state_dir).is_none();
             if unhealthy {
                 detail.push_str(", health probe failed");
@@ -1582,16 +1592,19 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                         Ok(_) => {
                             live = ui::serve_has_target(&ts.target).unwrap_or(false);
                             if live {
-                                board.fixed = Some(format!("ui tailscale start → {}", ts.url()));
-                                fixes.push(format!("ui tailscale start → {}", ts.url()));
+                                ts_fix_result =
+                                    Some((true, format!("ui tailscale start → {}", ts.url())));
                             } else {
-                                fixes.push(
+                                ts_fix_result = Some((
+                                    false,
                                     "ui tailscale start ran but the mapping is still not live"
                                         .to_string(),
-                                );
+                                ));
                             }
                         }
-                        Err(e) => fixes.push(format!("ui tailscale start failed: {e}")),
+                        Err(e) => {
+                            ts_fix_result = Some((false, format!("ui tailscale start failed: {e}")))
+                        }
                     }
                 }
                 ts_live = live;
@@ -1608,6 +1621,13 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             } else {
                 board.ok(detail)
             };
+            if let Some((succeeded, result)) = ts_fix_result {
+                if succeeded {
+                    board.fixed = Some(result);
+                } else {
+                    board.items.push(result);
+                }
+            }
         }
     }
     rows.push(board);
