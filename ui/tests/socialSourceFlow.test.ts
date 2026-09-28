@@ -127,6 +127,26 @@ async function main() {
   await click(button("Board")); await click(button("Sources"));
   assert(!host.querySelector(".wa-source-image"), "A tampered receipt cannot load an arbitrary browser image URL");
   assert(!!host.querySelector(".wa-source-image-fallback") && host.textContent?.includes("View original post"), "Unavailable previews retain a clear path to inspect the original");
+  for (const previewUrl of [
+    "https://cdninstagram.com.attacker.example/track",
+    "https://fbcdn.net.attacker.example/track",
+    "http://scontent.cdninstagram.com/post.jpg",
+    "https://user:password@scontent.cdninstagram.com/post.jpg",
+    "https://scontent.cdninstagram.com:444/post.jpg",
+  ]) {
+    receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: previewUrl }] } }];
+    await click(button("Board")); await click(button("Sources"));
+    assert(!host.querySelector(".wa-source-image"), `Untrusted preview URL must stay blocked: ${previewUrl}`);
+  }
+  for (const previewUrl of [
+    "https://scontent.cdninstagram.com/post.jpg",
+    "https://scontent.fbcdn.net/post.jpg",
+  ]) {
+    receiptRows = [{ ...receipt, result: { ...receipt.result, posts: [{ ...receipt.result.posts[0], preview_url: previewUrl }] } }];
+    await click(button("Board")); await click(button("Sources"));
+    assert((host.querySelector(".wa-source-image") as HTMLImageElement | null)?.src === previewUrl,
+      `Reviewed CDN preview should be rendered: ${previewUrl}`);
+  }
   receiptRows = [receipt]; await click(button("Board")); await click(button("Sources"));
   await click(button("Use as source"));
   const sourceField = host.querySelector("#wa-post-source") as HTMLTextAreaElement;
