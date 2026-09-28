@@ -107,8 +107,12 @@ fn current_extraction(vault: &Path, path: &str, text: &str) -> bool {
     let Some(sha) = meta["sha256"].as_str() else {
         return false;
     };
-    text.lines()
-        .any(|line| line == format!("source_sha256: {sha}"))
+    let Ok(source_path) = serde_json::to_string(source) else {
+        return false;
+    };
+    text.starts_with(&format!(
+        "---\nkind: extracted-source\nsource_path: {source_path}\nsource_sha256: {sha}\n"
+    ))
 }
 
 fn split_line(line: &str) -> Vec<&str> {

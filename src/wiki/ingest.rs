@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{blobs_dir, read, rm, vault_dir, write, Caller, ABSENT};
+use super::{blobs_dir, ls, read, rm, vault_dir, write, Caller, ABSENT};
 use crate::error::Result;
 use crate::issue::Pm;
 
@@ -103,4 +103,64 @@ pub fn remove_generated(pm: &Pm, caller: &Caller, source: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A directory move carries generated pages and blob pointers together. Fix
+/// each moved page's source path while preserving its extracted body and hash.
+/// A conflicting edit is reported; the index excludes its stale path until it
+/// is resolved, so agents never follow a false provenance pointer.
+pub fn relocate_tree(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
+    let mut stack = vec![to.to_string()];
+    let mut updated = 0usize;
+    let mut conflicts = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let listing = ls(pm, caller, &dir)?;
+        let Some(entries) = listing["entries"].as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(path) = entry["path"].as_str() else {
+                continue;
+            };
+            if entry["kind"] == "dir" {
+                stack.push(path.to_string());
+                continue;
+            }
+            let Some(source) = path.strip_suffix(".extracted.md") else {
+                continue;
+            };
+            let Some(suffix) = source.strip_prefix(to).filter(|s| s.starts_with('/')) else {
+                continue;
+            };
+            let old_source = format!("{from}{suffix}");
+            let Some(page) = read(pm, caller, path).ok() else {
+                continue;
+            };
+            let Some(text) = page["text"].as_str() else {
+                continue;
+            };
+            let old_prefix = format!(
+                "---\nkind: extracted-source\nsource_path: {}\n",
+                serde_json::to_string(&old_source)?
+            );
+            if !text.starts_with(&old_prefix) {
+                continue;
+            }
+            let new_prefix = format!(
+                "---\nkind: extracted-source\nsource_path: {}\n",
+                serde_json::to_string(source)?
+            );
+            let revised = text.replacen(&old_prefix, &new_prefix, 1);
+            let saved = write(pm, caller, path, &revised, page["rev"].as_str())?;
+            if saved.get("conflict").is_some() {
+                conflicts.push(path.to_string());
+            } else {
+                updated += 1;
+            }
+        }
+    }
+    Ok(
+        json!({"status":if conflicts.is_empty() {"indexed"} else {"conflict"},
+              "updated":updated,"conflicts":conflicts}),
+    )
 }

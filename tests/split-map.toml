@@ -1189,6 +1189,7 @@ tests = [
     "indexed_search_tracks_git_pages_updates_moves_and_removals",
     "indexed_search_rebuilds_from_canonical_pages_and_keeps_private_user_notes_scoped",
     "pdf_upload_keeps_raw_source_and_replaces_stale_extracted_text",
+    "moving_and_restoring_a_pdf_folder_rewrites_extraction_provenance",
     "if_rev_optimistic_concurrency_conflicts_instead_of_losing_updates",
     "blob_upload_hashes_caps_and_commits_pointer",
     "blob_upload_roundtrip_and_tmp_confinement",

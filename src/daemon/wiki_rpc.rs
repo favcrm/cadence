@@ -146,16 +146,34 @@ impl Shared {
         let from = required_str(params, "from")?;
         let to = required_str(params, "to")?;
         let pm = self.pm()?;
-        let pdf = wiki::read(&pm, &caller, from).ok().and_then(|v| {
-            (v["mime"] == "application/pdf")
-                .then(|| v["sha256"].as_str().map(str::to_string))
-                .flatten()
-        });
         let mut out = wiki::mv(&pm, &caller, from, to)?;
-        if let Some(sha) = pdf {
-            out["extraction"] = wiki::ingest::pdf_result(&pm, &caller, to, &sha);
-            if let Err(e) = wiki::ingest::remove_generated(&pm, &caller, from) {
-                out["extraction_cleanup_error"] = json!(e.to_string());
+        let destination = out["to"].as_str().unwrap_or(to).to_string();
+        let moved = match wiki::read(&pm, &caller, &destination) {
+            Ok(page) => page,
+            Err(e) => {
+                out["extraction"] = json!({"status":"failed","reason":e.to_string()});
+                return Ok(out);
+            }
+        };
+        if moved["kind"] == "dir" {
+            let source = out["from"].as_str().unwrap_or(from).to_string();
+            let old_path = if let Some(rest) = source.strip_prefix(".trash/") {
+                rest.split_once('/')
+                    .map(|(_, original)| original)
+                    .unwrap_or(&source)
+            } else {
+                &source
+            };
+            out["extraction"] = wiki::ingest::relocate_tree(&pm, &caller, old_path, &destination)
+                .unwrap_or_else(|e| json!({"status":"failed","reason":e.to_string()}));
+        } else if moved["mime"] == "application/pdf" {
+            if let Some(sha) = moved["sha256"].as_str() {
+                out["extraction"] = wiki::ingest::pdf_result(&pm, &caller, &destination, sha);
+            }
+            if !from.starts_with(".trash/") {
+                if let Err(e) = wiki::ingest::remove_generated(&pm, &caller, from) {
+                    out["extraction_cleanup_error"] = json!(e.to_string());
+                }
             }
         }
         Ok(out)

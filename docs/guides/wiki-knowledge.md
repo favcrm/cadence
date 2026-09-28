@@ -62,8 +62,10 @@ cadence wiki cat global/onboarding.md
 `cat --meta`, then pass that value to `put --if-rev <rev>`; a conflict means
 another writer won and the caller must reread. The board editor does this
 automatically. A PDF replacement updates the generated text page; moving or
-removing a PDF cleans up its generated page. A failed conversion remains visible
-as an extraction status, with the raw source still available.
+removing a PDF cleans up its generated page. Moving a folder rewrites the
+`source_path` on generated pages inside it; an incomplete rewrite is excluded
+from search until corrected. A failed conversion remains visible as an
+extraction status, with the raw source still available.
 
 ## Agent retrieval
 
