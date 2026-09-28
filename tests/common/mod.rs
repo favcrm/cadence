@@ -1121,7 +1121,21 @@ impl TestDaemon {
                 mode
             ),
         );
+        self.mock_codex_sandbox(self.dir.path());
         MockCodex { pidfile }
+    }
+
+    fn mock_codex_sandbox(&self, dir: &Path) {
+        let script = dir.join("codex-sandbox.py");
+        std::fs::write(
+            &script,
+            include_str!("../fixtures/providers/codex-sandbox.py"),
+        )
+        .unwrap();
+        test_env().set(
+            "CADENCE_CODEX_SANDBOX_COMMAND",
+            format!("python3 {} ok", script.display()),
+        );
     }
 
     /// Install a mock WebSocket app-server command for `mode`. `dir`
@@ -1140,6 +1154,7 @@ impl TestDaemon {
                 mode
             ),
         );
+        self.mock_codex_sandbox(dir);
         MockCodex { pidfile }
     }
 
@@ -1181,6 +1196,7 @@ impl Drop for MockCodex {
     fn drop(&mut self) {
         test_env().remove("CADENCE_CODEX_COMMAND");
         test_env().remove("CADENCE_CODEX_WS_COMMAND");
+        test_env().remove("CADENCE_CODEX_SANDBOX_COMMAND");
     }
 }
 

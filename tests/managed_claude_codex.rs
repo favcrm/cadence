@@ -18,6 +18,64 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 
+fn sandbox_probe(d: &TestDaemon, mode: &str) {
+    let script = d.dir.path().join("codex-sandbox.py");
+    std::fs::write(&script, include_str!("fixtures/providers/codex-sandbox.py")).unwrap();
+    test_env().set(
+        "CADENCE_CODEX_SANDBOX_COMMAND",
+        format!("python3 {} {mode}", script.display()),
+    );
+}
+
+#[test]
+fn codex_sandbox_failure_fences_before_app_server_dispatch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    sandbox_probe(&d, "fail");
+    let cwd = d.dir.path().to_str().unwrap();
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias":"blocked", "provider":"codex", "endpoint_kind":"managed",
+               "cwd":cwd, "sandbox":"workspace-write"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("blocked", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("bwrap: loopback: Failed RTM_NEWADDR"),
+        "{agent}"
+    );
+    assert!(error.contains("AppArmor"), "{agent}");
+    assert!(
+        !mock.pidfile.exists(),
+        "provider started before sandbox proof"
+    );
+    d.send(
+        "blocked",
+        json!({"text":"do work", "message":"blocked-message"}),
+    )
+    .unwrap();
+    let show = d.rpc("agent_show", json!({"alias":"blocked"})).unwrap();
+    assert_eq!(show["messages"][0]["state"], "queued");
+}
+
+#[test]
+fn codex_sandbox_success_preserves_workspace_write_on_app_server() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    sandbox_probe(&d, "ok");
+    let cwd = d.dir.path().to_str().unwrap();
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias":"ready", "provider":"codex", "endpoint_kind":"managed",
+               "cwd":cwd, "sandbox":"workspace-write"}),
+    )
+    .unwrap();
+    d.wait_agent("ready", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs[0]["params"]["sandbox"], "workspace-write");
+}
+
 #[test]
 fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     let d = TestDaemon::start();
