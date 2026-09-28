@@ -52,7 +52,7 @@ cadence skill install          # ship the `cadence` skill to your agent CLIs
 
 cadence claude --alias pm --role pm       # named headless PM
 cadence join pm devin --alias w1 --detach # named worker; keep this shell free
-cadence dispatch CAD-1 --to w1           # replace CAD-1 with an existing issue
+cadence dispatch CAD-1 --to w1 --reply-to pm # use an existing issue ID
 
 cadence status                 # one-screen fleet overview
 cadence ui status              # check the board started by setup
