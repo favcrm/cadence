@@ -16,7 +16,7 @@ Manage account is a top-level new-tab anchor to `https://app-v2.agenticos.hk/acc
 
 ## Dependencies that remain unresolved
 
-Member display cannot be wired credential-free against the inspected upstream contract. The panel explicitly says it is unavailable. Upstream must define and approve an appropriate read-only company-bound member projection before member rows can be exposed; no owner-session forwarding or browser-origin account calls are added as a workaround.
+Member display cannot be wired credential-free against the inspected upstream contract. The Account page explicitly says member information is unavailable, without presenting an empty member-data panel. Upstream must define and approve an appropriate read-only company-bound member projection before member rows can be exposed; no owner-session forwarding or browser-origin account calls are added as a workaround.
 
 No securely authenticated platform-to-Cadence subject-revocation hook was found in the inspected upstream runtime/account/member code. No unauthenticated callback is implemented. Proposed contract for discussion with the parent: dedicated signed platform event assertion with explicit event type, issuer, board-host audience, company, subject, event ID, issued/expiry time, short TTL and trusted JWKS; validate actor allowlist and persist replay/subject revocation state under the auth lock. A local operator subject-revoke RPC would separately require native operator process proof. New sign-in after a role change/removal needs an explicit revocation ordering contract so a delayed old assertion cannot re-open revoked authority. HTTP must enforce the same proof as daemon, and both need agent/detached/forged/concurrent adversarial tests before the guard.
 
