@@ -424,9 +424,18 @@ fn save_continuity_locked(dir: &Path, record: &ContinuityRecord) -> Result<()> {
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     temp.write_all(&serde_json::to_vec(&sealed).map_err(|_| reject("Invalid continuity"))?)?;
     temp.as_file().sync_all()?;
+    if record.state == ContinuityState::Bound {
+        // The pending key is already durable. Sync the new temp entry before
+        // publication, then make rename the last fallible step. A crash can
+        // recover either Pending (retry the same key) or a complete Bound file.
+        File::open(dir)?.sync_all()?;
+    }
     temp.persist(path)
         .map_err(|_| reject("Unable to save hosted continuity"))?;
-    File::open(dir)?.sync_all()?;
+    if record.state == ContinuityState::Pending {
+        // No network request is allowed until the recovery key itself is durable.
+        File::open(dir)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -1713,8 +1722,13 @@ mod tests {
                 }),
             );
             let (mut bind, _) = continuity_request(&listener, "/v1/hosted-cadence/continuity/bind");
-            fs::remove_file(changed_dir.join(CONTINUITY_RECORD)).unwrap();
-            fs::create_dir(changed_dir.join(CONTINUITY_RECORD)).unwrap();
+            // Fail the private-file check before the Bound rename. The durable
+            // Pending seed remains available for an exact-key retry.
+            fs::set_permissions(
+                changed_dir.join(CONTINUITY_RECORD),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
             respond(
                 &mut bind,
                 &json!({
@@ -1730,10 +1744,26 @@ mod tests {
         assert!(format!("{error}").contains("uncertain"), "{error}");
         server.join().unwrap();
         assert!(bound_browser(&dir).is_err());
+        fs::set_permissions(
+            dir.join(CONTINUITY_RECORD),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_continuity_locked(&dir).unwrap().state,
+            ContinuityState::Pending
+        ));
+        assert!(bound_browser(&dir).is_err());
     }
 
     #[test]
     fn browser_continuity_bind_metadata_recovers_only_the_same_pending_key() {
+        if let Some(path) = std::env::var_os("CAD740_BIND_RETRY_DIR") {
+            let dir = Path::new(&path);
+            assert_eq!(bind_browser(dir).unwrap().lineage_id(), LINEAGE);
+            assert_eq!(bound_browser(dir).unwrap().generation(), 1);
+            return;
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let at = now().unwrap();
@@ -1812,7 +1842,17 @@ mod tests {
             bound_browser(&dir).is_err(),
             "pending key claimed a lineage"
         );
-        assert_eq!(bind_browser(&dir).unwrap().lineage_id(), LINEAGE);
+        let mut restart = std::process::Command::new(std::env::current_exe().unwrap());
+        restart
+            .arg("browser_continuity_bind_metadata_recovers_only_the_same_pending_key")
+            .env("CAD740_BIND_RETRY_DIR", &dir);
+        let output = crate::reaper::output(&mut restart).unwrap();
+        assert!(
+            output.status.success(),
+            "fresh process could not recover pending bind: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         server.join().unwrap();
         assert_eq!(bound_browser(&dir).unwrap().generation(), 1);
     }
