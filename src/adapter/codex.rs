@@ -376,6 +376,11 @@ fn sandbox_probe(command: &[String], cwd: &str, sandbox: &str, log_path: &Path) 
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| Error::provider("Codex readiness cannot locate daemon state directory"))?;
+    let state_dir = std::fs::canonicalize(state_dir).map_err(|error| {
+        Error::provider(format!(
+            "Codex readiness cannot resolve daemon state directory: {error}"
+        ))
+    })?;
     let cadence = std::env::current_exe().map_err(|error| {
         Error::provider(format!(
             "Codex readiness cannot locate Cadence binary: {error}"

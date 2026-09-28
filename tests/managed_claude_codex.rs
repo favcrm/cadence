@@ -96,6 +96,23 @@ fn codex_rpc_socket_denial_fences_before_app_server_dispatch() {
 }
 
 #[test]
+fn codex_rpc_probe_resolves_relative_daemon_state_before_changing_cwd() {
+    let daemon_cwd = std::env::current_dir().unwrap();
+    let root = TempDir::new_in(&daemon_cwd).unwrap();
+    let relative_state = root.path().strip_prefix(&daemon_cwd).unwrap().to_path_buf();
+    let d = TestDaemon::start_on(relative_state);
+    let _mock = d.mock_codex("ok");
+    let agent_cwd = d.dir.path().to_str().unwrap();
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias":"relative-state", "provider":"codex", "endpoint_kind":"managed",
+               "cwd":agent_cwd, "sandbox":"workspace-write"}),
+    )
+    .unwrap();
+    d.wait_agent("relative-state", "idle", 15);
+}
+
+#[test]
 fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
