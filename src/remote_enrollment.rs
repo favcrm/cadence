@@ -476,7 +476,7 @@ pub fn enroll(
     {
         return Err(reject("Issuer child did not match service grant"));
     }
-    record.valid(at)?;
+    record.valid(now()?)?;
     require_trusted_issuer(dir, &record.issuer)?;
     save(dir, &record)?;
     Ok(record.info())
@@ -612,7 +612,7 @@ mod tests {
         socket.write_all(&bytes).unwrap();
     }
     fn request(listener: &TcpListener, path: &str, bearer: &str) -> std::net::TcpStream {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
