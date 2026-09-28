@@ -117,12 +117,12 @@ child-token revocation introspection endpoint, so local preflight can detect
 expiry and mismatch, but revocation after enrollment is rejected by the server
 at result receipt. This is not a claim of local pre-network revocation proof.
 
-CAD-716 must consume this binding before it may send: load the immutable
-outbox destination, use `remote_enrollment::with_current` to compare its org,
-board origin, subject and agent, and invoke the pinned HTTP sender only inside
-that callback. `--org` and `--audience` on the send command are caller assertions
-and cannot authorize bearer transmission. The sender PR remains draft until it
-uses this gate and passes independent review.
+CAD-716's send command loads the immutable outbox destination, uses
+`remote_enrollment::with_current` to compare its org, board origin, subject and
+agent, and invokes the pinned HTTP sender only inside that callback. Send takes
+`--enrollment-dir`, not caller-provided `--org` or `--audience` assertions. The
+sender remains subject to independent review and the production gateway stays
+off.
 
 ## Remaining cloud contract
 

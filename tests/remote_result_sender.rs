@@ -50,12 +50,9 @@ fn matching_caller_claims_cannot_open_an_untrusted_board_connection() {
         .enqueue(&attacker_pin, &command())
         .unwrap();
 
-    let mut input = tempfile::tempfile_in(root.path()).unwrap();
-    input.write_all(CHILD.as_bytes()).unwrap();
-    use std::io::{Seek, SeekFrom};
-    input.seek(SeekFrom::Start(0)).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
-    cmd.env_clear()
+    let mut legacy = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    legacy
+        .env_clear()
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path())
         .env("TMPDIR", root.path())
@@ -64,16 +61,34 @@ fn matching_caller_claims_cannot_open_an_untrusted_board_connection() {
         .arg(&outbox_dir)
         .args(["--command-id", "command-1", "--org", ORG, "--audience"])
         .arg(&attacker_origin)
-        .stdin(Stdio::from(input))
+        .stdin(Stdio::null());
+    let old_flags = cadence_agent::reaper::output(&mut legacy).unwrap();
+    assert!(!old_flags.status.success());
+    let old_error = String::from_utf8_lossy(&old_flags.stderr);
+    assert!(
+        old_error.contains("unexpected argument") && old_error.contains("--org"),
+        "legacy caller-supplied destination flags were accepted: {old_error}"
+    );
+
+    let enrollment_dir = root.path().join("enrollment");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.env_clear()
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env("TMPDIR", root.path())
+        .env("CADENCE_STATE_DIR", root.path().join("absent-state"))
+        .args(["remote", "result", "send", "--outbox-dir"])
+        .arg(&outbox_dir)
+        .args(["--command-id", "command-1", "--enrollment-dir"])
+        .arg(&enrollment_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = cadence_agent::reaper::output(&mut cmd).unwrap();
     assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        error.contains("unexpected argument") && error.contains("--org"),
-        "legacy caller-supplied destination flags were accepted: {error}"
-    );
+    let send_error = String::from_utf8_lossy(&output.stderr);
+    assert!(!send_error.contains("unexpected argument"));
+    assert!(!send_error.contains("Hosted result send uncertain"));
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         match listener.accept() {
@@ -287,14 +302,15 @@ fn v1_custody_upgrades_to_v2_without_losing_original_result() {
 }
 
 #[test]
-fn cli_requires_stdin_child_bearer_and_does_not_consult_tools_token() {
+fn cli_requires_private_enrollment_and_does_not_consult_tools_token() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("outbox");
     ResultOutbox::open(&path)
         .unwrap()
         .enqueue(&pin(), &command())
         .unwrap();
-    let send = |stdin: &[u8], org: &str, audience: &str| {
+    let enrollment_dir = root.path().join("missing-enrollment");
+    let send = |stdin: &[u8]| {
         let mut file = tempfile::tempfile_in(root.path()).unwrap();
         file.write_all(stdin).unwrap();
         use std::io::{Seek, SeekFrom};
@@ -309,14 +325,8 @@ fn cli_requires_stdin_child_bearer_and_does_not_consult_tools_token() {
             .env("CADENCE_TOKEN", "agc_tools-secret-must-not-print")
             .args(["remote", "result", "send", "--outbox-dir"])
             .arg(&path)
-            .args([
-                "--command-id",
-                "command-1",
-                "--org",
-                org,
-                "--audience",
-                audience,
-            ])
+            .args(["--command-id", "command-1", "--enrollment-dir"])
+            .arg(&enrollment_dir)
             .stdin(Stdio::from(file))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -335,7 +345,7 @@ fn cli_requires_stdin_child_bearer_and_does_not_consult_tools_token() {
         b"agc_tools-secret-must-not-print",
         b"hct_bad\nHeader: forged",
     ] {
-        let output = send(token, ORG, AUDIENCE);
+        let output = send(token);
         assert!(!output.status.success());
         for stream in [&output.stdout, &output.stderr] {
             let message = String::from_utf8_lossy(stream);
@@ -352,9 +362,9 @@ fn cli_requires_stdin_child_bearer_and_does_not_consult_tools_token() {
             "local_pending"
         );
     }
-    let mismatch = send(CHILD.as_bytes(), ORG, "https://other.example.invalid");
-    assert!(!mismatch.status.success());
-    assert!(!String::from_utf8_lossy(&mismatch.stderr).contains(CHILD));
+    let missing = send(CHILD.as_bytes());
+    assert!(!missing.status.success());
+    assert!(!String::from_utf8_lossy(&missing.stderr).contains(CHILD));
     assert_eq!(
         ResultOutbox::open(&path)
             .unwrap()

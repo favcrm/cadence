@@ -2,7 +2,8 @@
 
 `remote_result_outbox` provides CAD-682's immutable local custody. CAD-700 adds
 an explicit offline CLI wrapper. CAD-716 sends a retained command to AOS-74's
-board-host queued-custody route using an enrolled child bearer from stdin.
+board-host queued-custody route using the issuer-bound child bearer in a private
+enrollment record.
 There is no daemon integration, automatic credential resolver, assignment
 transport or applied-task witness. CAD-675 retains those integration gates.
 The publication Outbox UI is a separate feature.
@@ -70,32 +71,31 @@ output do not echo result text.
 
 ## Explicit hosted queued-custody send
 
-After an enrolled implementer child bearer is obtained through the separate
-AgenticOS exchange/enrollment flow, pass it to `send` on stdin from a protected
-source. For example, with a mode-0600 file outside shell history:
+First bootstrap the private [issuer-bound enrollment](REMOTE-AUTH.md) using the
+AgenticOS service credential. Then send with that enrollment directory:
 
 ```sh
 cadence remote result send --outbox-dir /absolute/private/results \
-  --command-id command-1 --org org-1 \
-  --audience https://board.example.invalid \
-  < /absolute/private/child-bearer.txt
+  --command-id command-1 --enrollment-dir /absolute/private/hosted-worker
 cadence remote result status --outbox-dir /absolute/private/results \
   --command-id command-1
 ```
 
-Stdin is the **only** credential source. A final LF or CRLF is allowed. There
-is no argv, `CADENCE_TOKEN`, `agc_`, config, environment, selected-org or browser
-fallback; missing or invalid input leaves `local_pending` unchanged. `--org`
-and `--audience` are required independent confirmations from the trusted
-enrollment context. Both must exactly match the retained pin before network
-I/O. They cannot retarget the send; copying them from the outbox alone does not
-authenticate the endpoint. Keep the
-bearer out of shell arguments and result JSON. The sender does not print the
-bearer, command text, HTTP error body or response URL.
+The private enrollment record is the **only** send credential source. Stdin,
+argv, `CADENCE_TOKEN`, `agc_`, config, environment, selected-org and browser
+state do not supply a send bearer; missing, expired or mismatched enrollment
+leaves `local_pending` unchanged. The independent operator-created trusted
+issuer pin is rechecked on use. The bound organization, exact board origin,
+subject and agent must all match the original outbox destination before the
+send callback or any network I/O. A caller cannot use `--org` or `--audience`
+to assert destination authority. The sender does not print the bearer, command
+text, HTTP error body or response URL.
 
 The sender loads the original canonical JSON and exact organization/HTTPS board
 origin from protected local custody by command ID. It validates the stored pin
-before network I/O, posts to
+against the issuer enrollment while holding the enrollment read lock through
+the network exchange. A concurrent remove or renewal orders after that send.
+The sender then posts to
 `/__platform/hosted-cadence/<organizationId>/results`, disables redirects and
 ambient proxies,
 bounds the entire exchange to 12 seconds and the response body to 4 KiB. Only
@@ -236,8 +236,9 @@ numeric retry, malformed/oversized stdin before creation, missing custody,
 foreign/symlink database/journal unchanged bytes, and concurrent process retry.
 `tests/remote_result_sender.rs` checks the exact pinned body/URL, strict 202
 receipt, altered command and pin conflict, wrong credentials/statuses, receipt
-reopen, v1 migration, concurrent duplicate send and actual CLI stdin/status
-behavior. `src/cli/remote_result.rs` also drives the production HTTP helper
+reopen, v1 migration, concurrent duplicate send and actual CLI enrollment/status
+behavior, including zero connection to an untrusted outbox origin.
+`src/cli/remote_result.rs` also drives the production HTTP helper
 through a loopback server to inspect its actual Authorization header, content
 type and canonical bytes, matching 202 receipt, redirect handling and response
 bound. This local transport fixture uses HTTP because CI has no publicly trusted

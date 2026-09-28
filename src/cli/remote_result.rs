@@ -67,18 +67,15 @@ pub(crate) enum ResultAction {
         #[command(flatten)]
         destination: DestinationArgs,
     },
-    /// POST a retained command to its original board using a child bearer from stdin.
+    /// POST a retained command using its issuer-bound child enrollment.
     Send {
         #[arg(long)]
         outbox_dir: PathBuf,
         #[arg(long)]
         command_id: String,
-        /// Organization ID from the trusted enrollment context; must match custody.
+        /// Private enrollment directory whose issuer binding must match custody.
         #[arg(long)]
-        org: String,
-        /// Canonical HTTPS board origin from the trusted enrollment context.
-        #[arg(long)]
-        audience: String,
+        enrollment_dir: PathBuf,
     },
     /// Inspect one command's local or queued custody; never contacts the server.
     Status {
@@ -250,26 +247,21 @@ pub(crate) fn run(action: &RemoteAction) -> Result<i32> {
         ResultAction::Send {
             outbox_dir,
             command_id,
-            org,
-            audience,
+            enrollment_dir,
         } => {
             let outbox = existing_outbox(outbox_dir)?;
-            let mut raw = Vec::new();
-            std::io::stdin()
-                .lock()
-                .take(129)
-                .read_to_end(&mut raw)
-                .map_err(|_| Error::rejected("Unable to read hosted child bearer from stdin"))?;
-            if raw.len() > 128 {
-                return Err(Error::rejected("Hosted child bearer is invalid"));
-            }
-            let raw = std::str::from_utf8(&raw)
-                .map_err(|_| Error::rejected("Hosted child bearer is invalid"))?;
-            let bearer = raw
-                .strip_suffix("\r\n")
-                .or_else(|| raw.strip_suffix('\n'))
-                .unwrap_or(raw);
-            let receipt = deliver_with(&outbox, command_id, org, audience, bearer, post_queued)?;
+            let row = outbox.get(command_id)?;
+            let pin = row.receipt().destination();
+            let receipt = remote_enrollment::with_current(enrollment_dir, pin, |bearer| {
+                deliver_with(
+                    &outbox,
+                    command_id,
+                    pin.organization_id(),
+                    pin.audience(),
+                    bearer,
+                    post_queued,
+                )
+            })?;
             json!({"state":"remote_queued","application":"applied_unknown", "receipt":{
                 "commandId":receipt.command_id(),"digest":receipt.digest(),
                 "acceptedAt":receipt.accepted_at(),"expiresAt":receipt.expires_at()}})

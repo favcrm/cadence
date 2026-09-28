@@ -502,6 +502,7 @@ fn enroll_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_result_outbox::{deliver_with, ResultCommand, ResultOutbox};
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
@@ -564,6 +565,70 @@ mod tests {
             .with_pin(&pin(&valid.audience), |_| calls += 1)
             .unwrap();
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn enrolled_sender_uses_original_pin_and_never_posts_to_attacker_board() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        let enrolled = record(u64::MAX);
+        trust(&dir, &enrolled.issuer);
+        save(&dir, &enrolled).unwrap();
+        let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
+        let command = ResultCommand::parse_json(
+            &json!({"version":"hosted-cadence-result.v1","commandId":"command-1",
+                "kind":"agent_result","assignmentId":"assignment-1","taskId":"task-1",
+                "taskRevision":1,"turnId":"turn-1","reportedHeadSha":"a".repeat(40),
+                "text":"private result"})
+            .to_string(),
+        )
+        .unwrap();
+        let genuine = pin(&enrolled.audience);
+        outbox.enqueue(&genuine, &command).unwrap();
+        let row = outbox.get("command-1").unwrap();
+        let original = row.receipt().destination();
+        let queued = with_current(&dir, original, |child| {
+            deliver_with(
+                &outbox,
+                "command-1",
+                original.organization_id(),
+                original.audience(),
+                child,
+                |url, bearer, body| {
+                    assert_eq!(
+                        url,
+                        "https://real.board.example.test/__platform/hosted-cadence/ws_real/results"
+                    );
+                    assert_eq!(bearer, CHILD);
+                    assert_eq!(body, command.canonical_json());
+                    Ok((
+                        202,
+                        json!({"ok":true,"receipt":{"commandId":"command-1",
+                        "state":"queued","acceptedAt":100,"expiresAt":200,
+                        "digest":command.digest()}})
+                        .to_string()
+                        .into_bytes(),
+                    ))
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(queued.state(), "remote_queued");
+
+        let mut calls = 0;
+        for forged in [
+            pin("https://attacker.board.example.test"),
+            DestinationPin::new("ws_other", &enrolled.audience, "hsp_subject", "hca_agent")
+                .unwrap(),
+            DestinationPin::new("ws_real", &enrolled.audience, "hsp_subject", "hca_other").unwrap(),
+        ] {
+            assert!(with_current(&dir, &forged, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+        }
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -639,6 +704,46 @@ mod tests {
         sending.join().unwrap();
         replacing.join().unwrap();
         saved_rx.recv().unwrap();
+    }
+
+    #[test]
+    fn removal_waits_for_inflight_send_and_blocks_every_later_send() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("enroll");
+        let original = record(u64::MAX);
+        trust(&dir, &original.issuer);
+        save(&dir, &original).unwrap();
+        let expected = pin(&original.audience);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let send_dir = dir.clone();
+        let sending = thread::spawn(move || {
+            with_current(&send_dir, &expected, |child| {
+                assert_eq!(child, CHILD);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let remove_dir = dir.clone();
+        let removing = thread::spawn(move || {
+            remove(&remove_dir).unwrap();
+            removed_tx.send(()).unwrap();
+        });
+        assert!(removed_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        release_tx.send(()).unwrap();
+        sending.join().unwrap();
+        removing.join().unwrap();
+        removed_rx.recv().unwrap();
+        assert!(
+            with_current(&dir, &pin(&original.audience), |_| -> Result<()> {
+                panic!("send callback ran after removal")
+            })
+            .is_err()
+        );
     }
 
     fn respond(socket: &mut std::net::TcpStream, body: &Value) {
