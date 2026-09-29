@@ -144,7 +144,7 @@ jobs:
     if: >
       !cancelled() && (
         (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.select.outputs.decision == 'stage')
+        (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.select.result == 'success' && needs.select.outputs.decision == 'stage')
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 40
