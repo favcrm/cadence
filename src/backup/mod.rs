@@ -11,11 +11,19 @@
 //!   is copied the same way — online backup from a read-only connection,
 //!   so WAL contents ride along and the daemon's writer is never blocked —
 //!   then integrity-checked, hashed, and bound into the same manifest by
-//!   installation ID, file-schema version, digest/size and the core
-//!   snapshot it was taken with. The manifest is written last, then the
-//!   whole set is re-verified from disk. A failed partial backup removes
-//!   every partial, copy and manifest it staged, so it never appears
-//!   complete. `keep` prunes the oldest backups *with the same reason* in
+//!   installation ID, file-schema version, digest/size, integrity and the
+//!   core copy's hash (`core_sha256`). The manifest also records the core
+//!   snapshot's installation catalog (`app_installations`: distinct
+//!   installation IDs across core tables carrying `install_id`), read from
+//!   the snapshot copy itself: a record file whose installation is absent
+//!   from the catalog — forged, deleted, or never installed — refuses as
+//!   orphaned, while catalog installations without files are allowed
+//!   (contexts and capabilities predate the first record write, and
+//!   no-App installs stay compatible). The manifest is written last, then
+//!   the whole set is re-verified from disk — entries against the backup
+//!   core copy's catalog, never the manifest text alone. A failed partial
+//!   backup removes every partial, copy and manifest it staged, so it
+//!   never appears complete. `keep` prunes the oldest backups *with the
 //!   that directory. Age comes from the stamp in the file name (then
 //!   mtime), never from manifest content; the set just written is never
 //!   pruned; a copy is deleted only when it is the regular file the
@@ -28,33 +36,45 @@
 //!   directory. App record files are never read into an export bundle.
 //!   Nothing else in the state dir is ever read into the bundle.
 //! - [`restore`] verifies a manifest and every copy it names, refuses a
-//!   schema newer than this binary (core or record-file), refuses a state
-//!   dir whose daemon holds `cadence.lock` (and holds that lock itself
-//!   while it works), refuses interrupted-restore asides, refuses to
-//!   replace an existing store or record file without `force` (and backs
-//!   the existing store — core plus record files — up first when forced),
-//!   then rewrites repo paths by matching remote URLs. Core and record
-//!   copies are staged and jointly verified before anything is activated;
-//!   activation replaces files one by one without ever deleting the file
-//!   being replaced first, so a failure leaves asides to put back and the
-//!   verified pre-restore backup to recover from. Record-file identity
-//!   (filename, `record_identity` row) and file schema are verified before
-//!   activation; catalog binding itself is enforced when the daemon opens
-//!   each file and proves the installation and live context per action.
+//!   schema newer than this binary (core or record-file), refuses a
+//!   mixed-generation set (a record entry stamped with another core
+//!   snapshot's hash, or outside the core copy's installation catalog),
+//!   refuses a state dir whose daemon holds `cadence.lock` (and holds that
+//!   lock itself while it works), refuses interrupted-restore asides,
+//!   refuses to replace an existing store or record file without `force`
+//!   (and backs the existing store — core plus record files — up first
+//!   when forced), then rewrites repo paths by matching remote URLs. Core
+//!   and record copies are staged and jointly verified before anything
+//!   activates — including a catalog check of every entry against the
+//!   staged core copy that will actually go live — then the complete
+//!   staged state activates at once ([`activate_all`]: every live file
+//!   moves aside first, every staged file links in, and any failure
+//!   renames every aside back, so a returned error never leaves a partial
+//!   replacement). Record-file identity (filename, `record_identity` row)
+//!   and file schema are verified before activation; catalog binding
+//!   itself is enforced when the daemon opens each file and proves the
+//!   installation and live context per action.
 //! - [`before_self_update`] is the backup a self-update takes before it
 //!   swaps the binary. `cadence upgrade` (`upgrade::run`) calls it before
 //!   it installs anything or moves the link, and refuses on `Err`.
 //!
 //! Cross-file reconciliation: core and app files are snapshotted in
 //! sequence, never in one transaction — the manifest is the atomic commit
-//! point. A backup that fails partway removes everything it staged. A
-//! restore verifies everything before activating anything; if activation
-//! fails midway, the files already replaced are covered by the verified
-//! pre-restore backup, and any `.replaced-*` asides refuse the next
-//! restore and the next daemon start until the operator puts the previous
-//! files back. Core-only manifests (written before CAD-767, or from a
-//! state with no `app-records/`) verify and restore with an empty record
-//! set; a state with no record files backs up and restores the same way.
+//! point, binding each record entry to the core generation it was taken
+//! with. A backup that fails partway removes everything it staged. A
+//! restore stages everything (core remap included) and proves the staged
+//! core's catalog admits every record entry before moving a single live
+//! file; activation then moves all live files aside and links all staged
+//! files in, rolling every aside back on any failure. If activation fails,
+//! the verified pre-restore backup remains the crash-independent recovery
+//! path, and any `.replaced-*` asides a killed process leaves behind
+//! refuse the next restore and the next daemon start until the operator
+//! puts the previous files back. Core-only manifests (written before
+//! CAD-767, or from a state with no `app-records/`) verify and restore
+//! with an empty record set; a state with no record files backs up and
+//! restores the same way. Older binaries ignore the new manifest fields
+//! and restore core only (their pruning leaves record copies behind
+//! rather than deleting blindly).
 //!
 //! Nothing here opens the live store for writing. Record bodies never
 //! enter manifests, logs or errors — only installation IDs, digests,
@@ -211,13 +231,22 @@ pub struct Manifest {
     /// a missing field both mean "no record files".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub app_records: Vec<AppRecordFile>,
+    /// The core snapshot's installation catalog at backup time: sorted
+    /// distinct installation IDs across every core table carrying an
+    /// `install_id` column (contexts, capabilities, runs, bindings,
+    /// grants). Absent on older manifests. Restore proves the staged
+    /// core copy yields the same catalog before activating anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_installations: Vec<String>,
 }
 
 /// One installation's record-file snapshot inside a backup manifest.
 /// The entry binds the installation ID to the copy's file name,
 /// file-schema version, digest/size and integrity verdict, taken with
-/// the core snapshot this manifest describes. Record bodies never appear
-/// here — only identity, shape and hashes.
+/// the core snapshot this manifest describes; `core_sha256` repeats the
+/// manifest's core copy hash so a record entry lifted from another backup
+/// (same installation, different generation) refuses. Record bodies never
+/// appear here — only identity, shape and hashes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppRecordFile {
     pub install_id: String,
@@ -228,6 +257,11 @@ pub struct AppRecordFile {
     /// `record_schema.version` read from the copy itself.
     pub file_schema: i64,
     pub integrity_check: String,
+    /// The manifest's core copy hash at backup time. Manifests written
+    /// before this binding (including the unmerged CAD-767 draft head)
+    /// carry `""` and refuse whenever they name record entries.
+    #[serde(default)]
+    pub core_sha256: String,
 }
 
 /// The default backup directory: `<state dir>/backups`.
@@ -239,12 +273,12 @@ pub fn default_dir(state_dir: &Path) -> PathBuf {
 
 /// Live per-installation record-file IDs, sorted. A missing
 /// `app-records/` directory means no record files (core-only state).
-/// Anything that cannot be an installation file refuses the backup:
-/// a non-identifier filename, a symlink or non-regular file, or a
-/// `-wal`/`-shm` sidecar mistaken for a database. Dotfiles (staging
-/// partials from an interrupted restore) are ignored — they are never
-/// live record files. The error names the installation ID or file name,
-/// never a record body.
+/// WAL sidecars (`*.sqlite3-wal`/`-shm`) and dotfiles (staging partials
+/// from an interrupted restore) are not live databases and are ignored —
+/// the online backup reads WAL state through the database file itself.
+/// Anything else that cannot be an installation file refuses the backup:
+/// a non-identifier filename or a symlink or non-regular file. The error
+/// names the installation ID or file name, never a record body.
 fn inventory_app_records(state_dir: &Path) -> Result<Vec<String>> {
     let dir = state_dir.join(crate::store::app_records::RECORDS_DIR);
     let entries = match fs::read_dir(&dir) {
@@ -331,17 +365,82 @@ fn newer_record_schema_refusal(schema: i64) -> Result<()> {
     Ok(())
 }
 
+/// The core snapshot's installation catalog: sorted distinct
+/// installation IDs across every core table carrying an `install_id`
+/// column (contexts, capabilities, runs, bindings, grants — discovered
+/// through `sqlite_master`, so older schemas without app tables yield
+/// whatever they carry and future tables are covered). Read from a core
+/// copy, read-only, never the live store. A stored ID outside the
+/// installation grammar refuses — core data must name installations the
+/// same way files do. Errors name the table or installation, never
+/// record bodies (which live outside core by design).
+fn core_installations(db: &Path) -> Result<Vec<String>> {
+    let conn = crate::store::open_read_only(db).map_err(|e| {
+        Error::rejected(format!(
+            "cannot read installation catalog from {}: {e}",
+            db.display()
+        ))
+    })?;
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut set = std::collections::BTreeSet::new();
+    for table in &tables {
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|c| c == "install_id") {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT install_id FROM {}",
+            quote_ident(table)
+        ))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids.into_iter().flatten() {
+            if crate::proto::identifier(&id, "installation ID").is_err() {
+                return Err(Error::rejected(format!(
+                    "core catalog in {} names an invalid installation in {table:?}; inspect the store before backing up",
+                    db.display()
+                )));
+            }
+            set.insert(id);
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
 /// Snapshot every inventoried record file into `dir` under
 /// `<stem>.app-<install_id>.sqlite3`, bound into manifest entries sorted
-/// by installation ID. A file created after `inventoried` refuses the
-/// backup so a partial set never appears complete. Staged copies are
-/// caller-cleaned on error (see `backup`).
+/// by installation ID. Every file's installation must appear in
+/// `catalog` (the core snapshot's installation set): a forged file for a
+/// deleted or never-installed ID refuses as orphaned. Catalog
+/// installations without files are allowed — contexts and capabilities
+/// predate the first record write, and no-App installs stay compatible.
+/// A file created after `inventoried` refuses the backup so a partial set
+/// never appears complete. Each entry stamps `core_sha256` with the core
+/// copy's hash. Staged copies are caller-cleaned on error (see `backup`).
 fn snapshot_app_records(
     state_dir: &Path,
     dir: &Path,
     stem: &str,
     inventoried: &[String],
+    catalog: &[String],
+    core_sha256: &str,
 ) -> Result<Vec<AppRecordFile>> {
+    for install_id in inventoried {
+        if !catalog.contains(install_id) {
+            return Err(Error::rejected(format!(
+                "record file for installation {install_id:?} has no installation in the core snapshot; restore the installation backup or remove the file after inspection"
+            )));
+        }
+    }
     let mut out = Vec::new();
     for install_id in inventoried {
         let live = crate::store::app_records::record_db_path(state_dir, install_id)?;
@@ -384,6 +483,7 @@ fn snapshot_app_records(
                 bytes,
                 file_schema,
                 integrity_check: integrity,
+                core_sha256: core_sha256.to_string(),
             })
         })();
         match staged {
@@ -434,13 +534,17 @@ fn manifest_app_candidates(dir: &Path, stem: &str) -> Vec<PathBuf> {
 ///
 /// Each record file is snapshotted with the same online-backup API as the
 /// core store, so WAL contents ride along without blocking the daemon.
-/// A record file that is missing mid-snapshot, corrupt, foreign (identity
-/// or schema mismatch), orphaned (a filename no installation ID grammar
-/// accepts, a symlink, or an identity row that disagrees with its
-/// filename), or newly created after the inventory refuses the whole
-/// backup — the error names the installation ID, never a record body —
-/// and everything staged is removed, so a partial backup never appears
-/// complete. A state with no `app-records/` backs up core-only.
+/// The core snapshot's installation catalog (distinct installation IDs
+/// across core tables carrying `install_id`) gates every file: a record
+/// file whose installation is absent from the catalog — forged, deleted,
+/// or never installed — refuses as orphaned. Catalog installations
+/// without files are allowed (contexts predate the first record write;
+/// no-App installs stay compatible). A record file that is missing
+/// mid-snapshot, corrupt, foreign (identity or schema mismatch), or newly
+/// created after the inventory refuses the whole backup — the error names
+/// the installation ID, never a record body — and everything staged is
+/// removed, so a partial backup never appears complete. A state with no
+/// `app-records/` backs up core-only.
 pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result<Value> {
     validate_reason(reason)?;
     if keep == 0 {
@@ -474,7 +578,11 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
         let repos = discover_repos(&partial)?;
         fs::rename(&partial, &db)?;
         let (sha256, bytes) = hash_file(&db)?;
-        let app_records = snapshot_app_records(state_dir, dir, &stem, &inventoried)?;
+        // The catalog comes from the snapshot copy, so it describes the
+        // exact core generation the record files are bound to.
+        let catalog = core_installations(&db)?;
+        let app_records =
+            snapshot_app_records(state_dir, dir, &stem, &inventoried, &catalog, &sha256)?;
         let manifest = Manifest {
             format: FORMAT.into(),
             kind: Kind::Backup,
@@ -490,6 +598,7 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
             repos,
             export: None,
             app_records,
+            app_installations: catalog,
         };
         write_private(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
         sync_dir(dir);
@@ -820,12 +929,33 @@ pub fn verify(manifest_path: &Path) -> Result<(Manifest, PathBuf)> {
 /// Prove every record copy a manifest names. Duplicate installation IDs
 /// or file names, a non-identifier installation, a non-plain file name,
 /// a sha/size mismatch, a failed integrity check, a schema newer than
-/// this binary (or differing from the manifest entry), or an identity row
-/// that disagrees with the entry all refuse. Errors name the installation
-/// ID or file name, never a record body.
+/// this binary (or differing from the manifest entry), an identity row
+/// that disagrees with the entry, a record entry lifted from another core
+/// generation (`core_sha256` differs from the manifest's core hash), a
+/// record entry outside the backup core copy's installation catalog, or a
+/// recorded catalog that disagrees with that copy all refuse. The catalog
+/// is read from the backup's own core copy — never trusted from the
+/// manifest alone — so core from backup A with records from backup B
+/// cannot pass. Errors name the installation ID or file name, never a
+/// record body.
 fn verify_app_records(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
     use std::collections::BTreeSet;
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    // The catalog this backup's core copy carries. Every entry must be
+    // a member; catalog installations without entries are allowed (see
+    // `snapshot_app_records`: contexts predate the first record write).
+    let catalog = core_installations(&dir.join(&manifest.db_file)).map_err(|e| {
+        Error::rejected(format!(
+            "{} core copy has no readable installation catalog: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    if !manifest.app_installations.is_empty() && manifest.app_installations != catalog {
+        return Err(Error::rejected(format!(
+            "{} records an installation catalog that differs from its core copy",
+            manifest_path.display()
+        )));
+    }
     let mut installs = BTreeSet::new();
     let mut files = BTreeSet::new();
     for entry in &manifest.app_records {
@@ -920,6 +1050,18 @@ fn verify_app_records(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
                 entry.install_id
             )));
         }
+        if entry.core_sha256 != manifest.sha256 {
+            return Err(Error::rejected(format!(
+                "record entry for installation {:?} was taken with a different core snapshot; refusing a mixed-generation backup",
+                entry.install_id
+            )));
+        }
+        if !catalog.contains(&entry.install_id) {
+            return Err(Error::rejected(format!(
+                "record entry for installation {:?} has no installation in the backup core snapshot; refusing a mixed-generation backup",
+                entry.install_id
+            )));
+        }
     }
     Ok(())
 }
@@ -1002,6 +1144,7 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
             scan_warnings: scan.warnings.len(),
         }),
         app_records: Vec::new(),
+        app_installations: Vec::new(),
     };
     let text = serde_json::to_string_pretty(&manifest)?;
     secret::guard_with("export manifest", &text, allow)?;
@@ -1403,7 +1546,6 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
     }
     let live = db_file(state_dir);
     let wal = sidecar(&live, "-wal");
-    let shm = sidecar(&live, "-shm");
     // Existing record files for the installations this manifest lists.
     // Unlisted files are left alone — they may belong to installations
     // the snapshot predates, and user data is never deleted here.
@@ -1448,9 +1590,11 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
             pre_restore = Some(taken["manifest"].clone());
         }
     }
+    // Phase 1: stage the core copy. No target file is touched: the copy
+    // is hashed, remapped and integrity-checked as a partial.
     let partial = state_dir.join(format!(".{BUNDLE_DB}.restore-partial"));
     let _ = fs::remove_file(&partial);
-    let placed = (|| -> Result<Vec<usize>> {
+    let rows = (|| -> Result<Vec<usize>> {
         copy_private(&src_db, &partial)?;
         let (sha256, _) = hash_file(&partial)?;
         if sha256 != manifest.sha256 {
@@ -1463,32 +1607,79 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
         let (integrity, _) = inspect(&partial)?;
         require_ok(&partial, &integrity)?;
         sync_file(&partial)?;
-        install_no_clobber(&partial, &live, &[&live, &wal, &shm])?;
-        sync_dir(state_dir);
         Ok(rows)
     })();
-    let rows = match placed {
+    let rows = match rows {
         Ok(rows) => rows,
         Err(error) => {
             let _ = fs::remove_file(&partial);
             return Err(error);
         }
     };
-    // Record files activate after the core store: every copy was already
-    // verified from the manifest, and each staged partial is re-verified
-    // before its install. A failure here leaves the core store replaced
-    // (covered by the pre-restore backup) and the remaining record files
-    // untouched — never a half-written file.
-    let mut restored_records = Vec::new();
+    // Phase 1b: the staged core's installation catalog must admit every
+    // record entry — checked here, before any target mutation, against
+    // the file that will actually activate (not just the manifest text).
+    // `verify` already proved the backup dir's core copy; the staged
+    // partial is hash-equal to it, and the per-entry `core_sha256`
+    // binding plus this catalog check refuse core-from-A with records
+    // from-B. Catalog installations without entries are allowed:
+    // contexts predate the first record write.
     if !manifest.app_records.is_empty() {
-        let records_dir = state_dir.join(crate::store::app_records::RECORDS_DIR);
+        let staged_catalog = core_installations(&partial).map_err(|e| {
+            let _ = fs::remove_file(&partial);
+            Error::rejected(format!(
+                "staged core copy has no readable installation catalog: {e}"
+            ))
+        })?;
+        if !manifest.app_installations.is_empty() && manifest.app_installations != staged_catalog {
+            let _ = fs::remove_file(&partial);
+            return Err(Error::rejected(
+                "backup manifest records an installation catalog that differs from its staged core copy; refusing a mixed-generation restore"
+                    .to_string(),
+            ));
+        }
+        for entry in &manifest.app_records {
+            if entry.core_sha256 != manifest.sha256 {
+                let _ = fs::remove_file(&partial);
+                return Err(Error::rejected(format!(
+                    "record entry for installation {:?} was taken with a different core snapshot; refusing a mixed-generation restore",
+                    entry.install_id
+                )));
+            }
+            if !staged_catalog.contains(&entry.install_id) {
+                let _ = fs::remove_file(&partial);
+                return Err(Error::rejected(format!(
+                    "record entry for installation {:?} has no installation in the staged core snapshot; refusing a mixed-generation restore",
+                    entry.install_id
+                )));
+            }
+        }
+    }
+    // Phase 1c: stage every record copy. Every staged partial is
+    // re-verified (sha, integrity, file schema, identity) before anything
+    // activates; a failure here removes the staged partials and leaves
+    // the target — core included — untouched.
+    struct StagedRecord {
+        install_id: String,
+        partial: PathBuf,
+        dest: PathBuf,
+        sha256: String,
+        bytes: u64,
+        file_schema: i64,
+    }
+    let mut staged_records: Vec<StagedRecord> = Vec::new();
+    // Owned sidecar paths: `sidecar(&live, ..)` would borrow temporaries.
+    let live_wal = sidecar(&live, "-wal");
+    let live_shm = sidecar(&live, "-shm");
+    let records_dir = state_dir.join(crate::store::app_records::RECORDS_DIR);
+    if !manifest.app_records.is_empty() {
         ensure_private_dir(&records_dir)?;
         for entry in &manifest.app_records {
             let src = manifest_dir.join(&entry.db_file);
             let dest = crate::store::app_records::record_db_path(state_dir, &entry.install_id)?;
             let app_partial = sidecar(&dest, ".restore-partial");
             let _ = fs::remove_file(&app_partial);
-            let staged = (|| -> Result<()> {
+            let staged = (|| -> Result<StagedRecord> {
                 copy_private(&src, &app_partial)?;
                 let (sha256, size) = hash_file(&app_partial)?;
                 if sha256 != entry.sha256 || size != entry.bytes {
@@ -1516,28 +1707,68 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
                 }
                 newer_record_schema_refusal(file_schema)?;
                 sync_file(&app_partial)?;
-                let dest_wal = sidecar(&dest, "-wal");
-                let dest_shm = sidecar(&dest, "-shm");
-                install_no_clobber(&app_partial, &dest, &[&dest, &dest_wal, &dest_shm])?;
-                Ok(())
+                Ok(StagedRecord {
+                    install_id: entry.install_id.clone(),
+                    partial: app_partial.clone(),
+                    dest,
+                    sha256: entry.sha256.clone(),
+                    bytes: entry.bytes,
+                    file_schema: entry.file_schema,
+                })
             })();
             match staged {
-                Ok(()) => {
-                    // Tighten to the record file's owner-only mode; a
-                    // restored copy inherits the backup dir's mode via
-                    // hard link otherwise.
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o600));
-                    restored_records.push(json!({"install_id": entry.install_id, "db": dest, "sha256": entry.sha256, "bytes": entry.bytes, "file_schema": entry.file_schema}));
-                }
+                Ok(staged) => staged_records.push(staged),
                 Err(error) => {
                     let _ = fs::remove_file(&app_partial);
+                    for staged in &staged_records {
+                        let _ = fs::remove_file(&staged.partial);
+                    }
+                    let _ = fs::remove_file(&partial);
                     return Err(error);
                 }
             }
         }
+    }
+    // Phase 2: activate the complete staged state at once. Core plus
+    // every record file move aside first, then link in; any failure
+    // renames every aside back, so a returned error never leaves a
+    // partial replacement of a healthy target. Only a process crash
+    // between the moves and the cleanup leaves asides behind — those
+    // refuse the next restore and daemon start until recovered.
+    let mut pairs: Vec<(PathBuf, PathBuf, Vec<PathBuf>)> = vec![(
+        partial.clone(),
+        live.clone(),
+        vec![live.clone(), live_wal, live_shm],
+    )];
+    for staged in &staged_records {
+        pairs.push((
+            staged.partial.clone(),
+            staged.dest.clone(),
+            vec![
+                staged.dest.clone(),
+                sidecar(&staged.dest, "-wal"),
+                sidecar(&staged.dest, "-shm"),
+            ],
+        ));
+    }
+    if let Err(error) = activate_all(&pairs) {
+        let _ = fs::remove_file(&partial);
+        for staged in &staged_records {
+            let _ = fs::remove_file(&staged.partial);
+        }
+        return Err(error);
+    }
+    sync_dir(state_dir);
+    let mut restored_records = Vec::new();
+    if !staged_records.is_empty() {
         sync_dir(&records_dir);
-        sync_dir(state_dir);
+        for staged in &staged_records {
+            // Tighten to the record file's owner-only mode; a restored
+            // copy inherits the backup dir's mode via hard link.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&staged.dest, fs::Permissions::from_mode(0o600));
+            restored_records.push(json!({"install_id": staged.install_id, "db": staged.dest, "sha256": staged.sha256, "bytes": staged.bytes, "file_schema": staged.file_schema}));
+        }
     }
     let mut remapped = Vec::new();
     let mut unchanged = Vec::new();
@@ -1798,33 +2029,62 @@ fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
     }
 }
 
+/// Single-pair [`activate_all`], kept for the focused no-clobber tests.
+#[cfg(test)]
 fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> {
+    activate_all(&[(
+        partial.to_path_buf(),
+        live.to_path_buf(),
+        old.iter().map(|p| (*p).to_path_buf()).collect(),
+    )])
+}
+
+/// Activate staged `pairs` — `(partial, live, olds)` — without ever
+/// deleting a file being replaced first. Every existing file in every
+/// `olds` (each live file and its `-wal`/`-shm` sidecars — a stale `-wal`
+/// must never replay onto a restored file) is renamed aside under one
+/// tag; every partial is then hard-linked into place, which refuses an
+/// existing target; partials and asides are removed only after every
+/// link succeeded. Any failure renames every aside back, so a returned
+/// error leaves the previous files in place — never a partial
+/// replacement spanning core and record files. Callers stage and fully
+/// verify every partial before calling: nothing here checks content.
+/// A process crash mid-activation leaves `.replaced-*` asides behind,
+/// which refuse the next restore and daemon start until the operator
+/// recovers them (see [`interrupted_restore_leftovers`]).
+fn activate_all(pairs: &[(PathBuf, PathBuf, Vec<PathBuf>)]) -> Result<()> {
     let tag = format!(
         ".replaced-{}-{}",
         crate::issue::time::basic(epoch_now() as i64),
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for path in old {
-        if fs::symlink_metadata(path).is_err() {
-            continue;
+    for (_, _, olds) in pairs {
+        for old in olds {
+            if fs::symlink_metadata(old).is_err() {
+                continue;
+            }
+            let aside = sidecar(old, &tag);
+            if let Err(e) = fs::rename(old, &aside) {
+                return Err(put_back(
+                    &moved,
+                    format!("could not move {} aside ({e})", old.display()),
+                ));
+            }
+            moved.push((old.clone(), aside));
         }
-        let aside = sidecar(path, &tag);
-        if let Err(e) = fs::rename(path, &aside) {
+    }
+    for (partial, live, _) in pairs {
+        if let Err(e) = fs::hard_link(partial, live) {
             return Err(put_back(
                 &moved,
-                format!("could not move {} aside ({e})", path.display()),
+                format!("could not install {} ({e})", live.display()),
             ));
         }
-        moved.push((path.to_path_buf(), aside));
     }
-    if let Err(e) = fs::hard_link(partial, live) {
-        return Err(put_back(
-            &moved,
-            format!("could not install {} ({e})", live.display()),
-        ));
+    for (partial, _, _) in pairs {
+        let _ = fs::remove_file(partial);
     }
-    let _ = fs::remove_file(partial);
     for (_, aside) in &moved {
         let _ = fs::remove_file(aside);
     }

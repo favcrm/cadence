@@ -1588,9 +1588,16 @@ fn cad767_concurrent_creation_refuses_backup() {
     let dir = root.path().join("backups");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let err = snapshot_app_records(&state, &dir, "cadence-manual-stem-deadbeef", &stale)
-        .unwrap_err()
-        .to_string();
+    let err = snapshot_app_records(
+        &state,
+        &dir,
+        "cadence-manual-stem-deadbeef",
+        &stale,
+        &stale,
+        "deadbeef",
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(err.contains("changed during backup"), "{err}");
     assert!(fs::read_dir(&dir).unwrap().next().is_none());
@@ -1738,9 +1745,10 @@ fn cad767_legacy_manifest_without_app_records_field_verifies() {
     let dir = root.path().join("backups");
     let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
     let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
-    // Rewrite as a pre-767 manifest: drop the field entirely.
+    // Rewrite as a pre-767 manifest: drop the record fields entirely.
     let mut m = read_json(&manifest_path);
     m.as_object_mut().unwrap().remove("app_records");
+    m.as_object_mut().unwrap().remove("app_installations");
     // Drop the record copies too: a legacy backup has core only.
     for entry in taken["app_records"].as_array().unwrap() {
         std::fs::remove_file(dir.join(entry["db_file"].as_str().unwrap())).unwrap();
@@ -1833,4 +1841,236 @@ fn cad767_prune_removes_record_copies_with_the_manifest() {
     for path in &first_apps {
         assert!(!path.exists(), "old record copy survived pruning: {path:?}");
     }
+}
+
+#[test]
+fn cad767_backup_refuses_orphan_against_core_catalog() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    // A well-formed file for an installation the core snapshot never
+    // names — forged, deleted, or never installed — refuses the backup.
+    let forged = RecordStore::open(&state, "install-forged").unwrap();
+    forged
+        .app_record_create("ctx-x", "customer-1", &parsed_profile(&profile_a()))
+        .unwrap();
+    drop(forged);
+    let dir = root.path().join("backups");
+
+    let err = backup(&state, &dir, DEFAULT_KEEP, "manual")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("install-forged") && err.contains("core snapshot"),
+        "{err}"
+    );
+    assert!(!err.contains("Amina Diallo"), "record body leaked: {err}");
+    assert!(fs::read_dir(&dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true));
+
+    // Catalog installations without files are allowed: contexts and
+    // capabilities predate the first record write, and no-App installs
+    // stay compatible. The manifest records the full catalog.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(
+            state
+                .join(RECORDS_DIR)
+                .join(format!("install-forged.sqlite3{suffix}")),
+        );
+    }
+    let store = Store::open(&live(&state)).unwrap();
+    let cfg = ContextConfig::new("Client C", BTreeMap::new()).unwrap();
+    store
+        .app_context_create("install-c", &cfg, "req-c")
+        .unwrap();
+    drop(store);
+
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let m = read_json(Path::new(taken["manifest"].as_str().unwrap()));
+    assert_eq!(m["app_records"].as_array().unwrap().len(), 2);
+    let installs: Vec<&str> = m["app_installations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(installs, vec!["install-a", "install-b", "install-c"]);
+}
+
+/// One filed installation plus one contexts-only installation (no record
+/// file): the subset policy's backup/restore shape.
+fn catalog_state(root: &Path, name: &str) -> (PathBuf, String) {
+    let state = fresh_state(root, name);
+    let store = Store::open(&live(&state)).unwrap();
+    let cfg = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+    let ctx_a = store
+        .app_context_create("install-a", &cfg, "req-a")
+        .unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    store
+        .app_context_create("install-c", &cfg, "req-c")
+        .unwrap();
+    drop(store);
+    let rec = RecordStore::open(&state, "install-a").unwrap();
+    rec.app_record_create(&ctx_a, "customer-1", &parsed_profile(&profile_a()))
+        .unwrap();
+    (state, ctx_a)
+}
+
+#[test]
+fn cad767_restore_allows_catalog_installs_without_record_files() {
+    let root = TempDir::new().unwrap();
+    let (state, ctx_a) = catalog_state(root.path(), "state");
+    let before = record_body(&state, "install-a", &ctx_a, "customer-1");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+
+    let target = root.path().join("restored");
+    let out = restore(
+        Path::new(taken["manifest"].as_str().unwrap()),
+        &target,
+        &RestoreOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(out["app_records"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        record_body(&target, "install-a", &ctx_a, "customer-1")["record"],
+        before["record"]
+    );
+    let core = Connection::open(live(&target)).unwrap();
+    let count: i64 = core
+        .query_row("SELECT count(*) FROM app_contexts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+/// A single filed installation: the mixed-generation test's building block.
+fn single_install_state(root: &Path, name: &str, install: &str) -> PathBuf {
+    let state = fresh_state(root, name);
+    let store = Store::open(&live(&state)).unwrap();
+    let cfg = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+    let ctx = store.app_context_create(install, &cfg, "req-1").unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(store);
+    let rec = RecordStore::open(&state, install).unwrap();
+    rec.app_record_create(&ctx, "customer-1", &parsed_profile(&profile_a()))
+        .unwrap();
+    state
+}
+
+#[test]
+fn cad767_mixed_generation_core_and_records_refuse() {
+    let root = TempDir::new().unwrap();
+    let state_a = single_install_state(root.path(), "a", "install-a");
+    let state_b = single_install_state(root.path(), "b", "install-b");
+    let dir_a = root.path().join("ba");
+    let dir_b = root.path().join("bb");
+    let taken_a = backup(&state_a, &dir_a, DEFAULT_KEEP, "manual").unwrap();
+    let taken_b = backup(&state_b, &dir_b, DEFAULT_KEEP, "manual").unwrap();
+    // Craft core-from-A with records-from-B: the core copy, manifest
+    // shell and sha stay A's; the entries and files come from B.
+    let mixed = root.path().join("mixed");
+    std::fs::create_dir_all(&mixed).unwrap();
+    let core_name = PathBuf::from(taken_a["db"].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let manifest_name = PathBuf::from(taken_a["manifest"].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::copy(dir_a.join(&core_name), mixed.join(&core_name)).unwrap();
+    let mut m = read_json(Path::new(taken_a["manifest"].as_str().unwrap()));
+    m["app_records"] = taken_b["app_records"].clone();
+    std::fs::write(mixed.join(&manifest_name), serde_json::to_vec(&m).unwrap()).unwrap();
+    for entry in taken_b["app_records"].as_array().unwrap() {
+        let file = entry["db_file"].as_str().unwrap();
+        std::fs::copy(dir_b.join(file), mixed.join(file)).unwrap();
+    }
+    let manifest_path = mixed.join(manifest_name);
+
+    let target = root.path().join("target");
+    let err = restore(&manifest_path, &target, &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("mixed-generation"), "{err}");
+    assert!(!target.join("cadence.sqlite3").exists());
+    assert!(
+        !target.join(RECORDS_DIR).join("install-b.sqlite3").exists(),
+        "a mixed record file activated"
+    );
+}
+
+#[test]
+fn cad767_activation_failure_rolls_back_core_and_first_record() {
+    let root = TempDir::new().unwrap();
+    let dir = root.path();
+    let live_core = dir.join("cadence.sqlite3");
+    let live_a = dir.join("a.sqlite3");
+    let live_b = dir.join("b.sqlite3");
+    for (path, body) in [
+        (&live_core, "old core"),
+        (&live_a, "old a"),
+        (&live_b, "old b"),
+    ] {
+        std::fs::write(path, body).unwrap();
+    }
+    // Staged replacements for core and the first record; the second
+    // record's partial is missing, so activation fails deterministically
+    // at the second record link — after core and the first record moved
+    // aside and linked.
+    let new_core = dir.join("new-core.partial");
+    let new_a = dir.join("new-a.partial");
+    let missing_b = dir.join("new-b.partial");
+    std::fs::write(&new_core, "new core").unwrap();
+    std::fs::write(&new_a, "new a").unwrap();
+    let pairs = |b: &Path| {
+        vec![
+            (new_core.clone(), live_core.clone(), vec![live_core.clone()]),
+            (new_a.clone(), live_a.clone(), vec![live_a.clone()]),
+            (b.to_path_buf(), live_b.clone(), vec![live_b.clone()]),
+        ]
+    };
+
+    let err = activate_all(&pairs(&missing_b)).unwrap_err().to_string();
+
+    assert!(err.contains("put back"), "{err}");
+    // Core plus all record files unchanged; asides renamed back, nothing
+    // left behind but the staged partials.
+    assert_eq!(std::fs::read(&live_core).unwrap(), b"old core");
+    assert_eq!(std::fs::read(&live_a).unwrap(), b"old a");
+    assert_eq!(std::fs::read(&live_b).unwrap(), b"old b");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "a.sqlite3",
+            "b.sqlite3",
+            "cadence.sqlite3",
+            "new-a.partial",
+            "new-core.partial"
+        ]
+    );
+
+    // A clean run activates everything and cleans up.
+    std::fs::write(&missing_b, "new b").unwrap();
+    activate_all(&pairs(&missing_b)).unwrap();
+    assert_eq!(std::fs::read(&live_core).unwrap(), b"new core");
+    assert_eq!(std::fs::read(&live_a).unwrap(), b"new a");
+    assert_eq!(std::fs::read(&live_b).unwrap(), b"new b");
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 3);
 }
