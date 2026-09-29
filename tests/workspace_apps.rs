@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
+use common::{daemon_opts, plant_member_pane, test_port, LaneShell, TestDaemon};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -694,9 +694,8 @@ fn cad743_http_upgrade_has_same_operator_and_field_gate() {
     .unwrap();
     let mut lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "upgrade-http-agent", "claude", None, lane.pid());
-    let port = (3110..3200)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap();
+    let lease = test_port();
+    let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
     let opts = cadence_agent::ui::ServeOpts {
         host: "127.0.0.1".into(),
@@ -1150,9 +1149,8 @@ fn cad667_http_install_and_reads_share_operator_authority() {
     let w = Workspace::new();
     let lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
-    let port = (3110..3200)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap();
+    let lease = test_port();
+    let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
     let opts = cadence_agent::ui::ServeOpts {
         host: "127.0.0.1".into(),
@@ -1250,9 +1248,8 @@ fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_rea
     let w = Workspace::new();
     let mut lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
-    let port = (3110..3200)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap();
+    let lease = test_port();
+    let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
     let opts = cadence_agent::ui::ServeOpts {
         host: "127.0.0.1".into(),

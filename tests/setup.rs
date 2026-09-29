@@ -142,49 +142,12 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A board port in 3110-3199 — never production's 3010 — held for
-/// the test's lifetime. Tests may run as separate processes (nextest)
-/// or as threads (cargo test), so the lease is an exclusive `flock` on
-/// `/tmp/cadence-test-ports/<port>.lock`: it excludes other threads and
-/// other processes alike, and the kernel releases it when the test
-/// ends, however it ends. The scan starts at a pid-derived offset so
-/// concurrent processes rarely contend, and a port something else
-/// already listens on is skipped. `sandbox up`'s free pick shares the
-/// range; under `CADENCE_TEST_PORT_LOCK_DIR` (tests/sandbox.rs sets it
-/// to this dir) it honours these leases and holds its own while its
-/// board binds, so neither side can take the other's port mid-pick.
-struct PortLease {
-    port: u16,
-    _lock: std::fs::File,
-}
+#[path = "common/port.rs"]
+mod port;
+use port::test_port;
 
-fn test_port() -> PortLease {
-    use std::os::fd::AsRawFd;
-    let dir = Path::new("/tmp/cadence-test-ports");
-    std::fs::create_dir_all(dir).unwrap();
-    let span = 90;
-    let start = std::process::id() as usize * 31 % span;
-    for i in 0..span {
-        let port = 3110 + ((start + i) % span) as u16;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(format!("{port}.lock")))
-            .unwrap();
-        // SAFETY: plain syscall on a descriptor this function owns.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            continue;
-        }
-        // The file's contents name whose claim the holder protects —
-        // clear whatever the previous holder left so a fenced port is
-        // never mistaken for a sandbox's own claim.
-        lock.set_len(0).unwrap();
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return PortLease { port, _lock: lock };
-        }
-    }
-    panic!("no free port in 3110-3199");
+fn bindable(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 fn by_check(lines: &[Value]) -> BTreeMap<String, Value> {
@@ -865,4 +828,96 @@ fn board_setup_shares_one_run_and_throttles_rechecks() {
     assert_eq!(again["ran_now"], true, "{again}");
     assert_ne!(again["checked_at"], first);
     assert_eq!(claude_runs(&host), 2);
+}
+
+/// The port fence is the whole contract (the sandbox flake it fixes:
+/// a parallel unfenced scan stole the fenced port mid-`down` and its
+/// board answered the health probe). Fence the port the old
+/// `bind`-scan pattern would pick, exactly the way sandbox's
+/// `fence_port` does, and every consecutive lease must skip it.
+#[test]
+fn test_port_never_returns_a_fenced_port() {
+    use std::os::fd::AsRawFd;
+    let dir = Path::new("/tmp/cadence-test-ports");
+    std::fs::create_dir_all(dir).unwrap();
+    // The port a naive `(3110..3200).find(bindable)` scan would take;
+    // skip ahead while its lock is already held so the test stays
+    // robust when the whole range contends under parallel runs.
+    let (naive, _fence) = (3110..3200)
+        .filter(|port| bindable(*port))
+        .find_map(|port| {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(format!("{port}.lock")))
+                .unwrap();
+            // SAFETY: plain syscall on a descriptor this test owns.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return None;
+            }
+            Some((port, lock))
+        })
+        .expect("no fenceable port in 3110-3199");
+    // Five consecutive picks, all alive: none may be the fenced port.
+    let leases: Vec<port::PortLease> = (0..5).map(|_| test_port()).collect();
+    for lease in &leases {
+        assert_ne!(lease.port, naive, "lease took the fenced port {naive}");
+    }
+}
+
+/// The fence only works if every 3110-3199 pick goes through
+/// `test_port`. A board-port `bind` scan outside `tests/common/port.rs`
+/// reopens the sandbox flake window, so the suite fails naming the
+/// offending lines. Heuristic, documented: a sandbox-range literal
+/// with a listener `bind` within the next 3 lines. Assertions like
+/// `(3110..=3199).contains(&port)` bind nothing and are fine;
+/// `bind("127.0.0.1:0")` probes are outside the range.
+#[test]
+fn no_unfenced_board_port_scans() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut dirs = vec![root.clone()];
+    let mut files = Vec::new();
+    let mut offenders = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                // tests/common/port.rs is the fence itself. The needles
+                // are built so this file's own literals never match.
+                let is_fence = path.file_name().unwrap() == "port.rs"
+                    && path.parent().unwrap().ends_with("common");
+                if !is_fence {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    for path in files {
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            let ranges = ["3110", "..3200"].concat();
+            let range_incl = ["3110", "..=3199"].concat();
+            if !(line.contains(&ranges) || line.contains(&range_incl)) {
+                continue;
+            }
+            let bind = ["TcpListener", "::bind"].concat();
+            if lines[i..lines.len().min(i + 4)]
+                .iter()
+                .any(|l| l.contains(&bind))
+            {
+                offenders.push(format!("{}:{}", path.display(), i + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "unfenced board-port scans outside tests/common/port.rs: {offenders:?}"
+    );
 }
