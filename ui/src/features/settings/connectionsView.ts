@@ -88,6 +88,15 @@ export function capabilityWords(provider: ConnectionProvider): string | null {
   return caps.map((c) => c.id).join(", ");
 }
 
+/** One connection's provider capabilities, or null when unknown. */
+export function connectionCapabilities(
+  providers: ConnectionProvider[],
+  providerName: string,
+): string | null {
+  const found = providers.find((p) => p.provider === providerName);
+  return found ? capabilityWords(found) : null;
+}
+
 /** Can this provider enroll a token — the only shape the wizard offers. */
 export function acceptsToken(provider: ConnectionProvider): boolean {
   return (provider.descriptor?.enrollment_shapes ?? []).includes("token");

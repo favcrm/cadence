@@ -4,6 +4,7 @@ import {
   acceptsToken,
   canManage,
   capabilityWords,
+  connectionCapabilities,
   connectionLabel,
   isAvailable,
   isLocalOutbox,
@@ -169,6 +170,13 @@ equal(
 );
 equal(scopeHint(provider()), ["publish"], "scope hint dedupes");
 equal(scopeHint(provider({ descriptor: null })), [], "no descriptor, no hint");
+equal(
+  connectionCapabilities([provider()], "local"),
+  "blog.publish, social.post",
+  "connection capabilities",
+);
+equal(connectionCapabilities([provider()], "unknown"), null, "unknown provider");
+equal(connectionCapabilities([], "local"), null, "no providers");
 
 // The Settings Connections route survives refresh and paste.
 equal(matchRoute("/settings/connections"), { screen: "settings", section: "connections" }, "match connections");

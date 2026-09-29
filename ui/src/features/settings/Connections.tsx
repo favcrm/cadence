@@ -11,6 +11,7 @@ import {
   acceptsToken,
   canManage,
   capabilityWords,
+  connectionCapabilities,
   connectionLabel,
   isAvailable,
   pickerConnections,
@@ -168,12 +169,7 @@ export default function Connections({
                 <ConnectionDetail
                   key={current.id}
                   row={current}
-                  capabilities={capabilityWords(
-                    providers.find((p) => p.provider === current.provider) ?? {
-                      provider: current.provider,
-                      descriptor: null,
-                    } as ConnectionProvider,
-                  )}
+                  capabilities={connectionCapabilities(providers, current.provider)}
                   canWrite={canWrite}
                   onChanged={refresh}
                   onRevoked={() => {
@@ -538,7 +534,10 @@ function AddConnection({
   const scopesId = useId();
   const tokenId = useId();
   const candidates = providers.filter((p) => p.descriptor_available && acceptsToken(p));
-  const [provider, setProvider] = useState(candidates[0]?.provider ?? "");
+  // The providers load behind the resource: the selection follows the
+  // first candidate until the operator picks one explicitly.
+  const [explicit, setExplicit] = useState<string | null>(null);
+  const provider = explicit ?? candidates[0]?.provider ?? "";
   const [account, setAccount] = useState("");
   const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
@@ -547,14 +546,6 @@ function AddConnection({
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
   const hint = chosen ? scopeHint(chosen) : [];
-
-  useEffect(() => {
-    if (!candidates.some((p) => p.provider === provider)) {
-      setProvider(candidates[0]?.provider ?? "");
-    }
-    // The candidate set is derived from props; re-seed only when it moves.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [providers]);
 
   const submit = () => {
     if (busy) return;
@@ -609,7 +600,7 @@ function AddConnection({
             <select
               id={providerId}
               value={provider}
-              onChange={(e) => setProvider(e.target.value)}
+              onChange={(e) => setExplicit(e.target.value)}
               className="field w-full mt-1"
               disabled={busy}
             >
@@ -752,7 +743,7 @@ export function SlotConnectionPicker({
   const [choice, setChoice] = useState<string>("");
   const { offered, withheld } = pickerConnections(connections ?? []);
   const id = useId();
-  const match = connections?.find((c) => c.account === bound || c.id === bound) ?? null;
+  const rebind = bound != null && bound !== "" && bound !== choice;
   return (
     <div className="mt-1.5 min-w-0">
       <label htmlFor={id} className="text-micro text-ink-500">
@@ -790,7 +781,7 @@ export function SlotConnectionPicker({
         <p className="text-micro text-ink-400 mt-1 break-words">
           To bind it, the operator runs{" "}
           <code className="num">cadence app set {project} {app} {slot}={choice}</code>
-          {match && bound !== choice && (
+          {rebind && (
             <> — currently bound to <span className="num">{bound}</span>, so this rebind
             re-requires app approval.</>
           )}
