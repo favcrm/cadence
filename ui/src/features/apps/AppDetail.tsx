@@ -442,6 +442,10 @@ function SettingsTab({
               </li>
             ))}
           </ul>
+          <p className="text-micro text-ink-500 mt-2 break-words">
+            Slot binding lives on the installed app — open it under Workspace apps on the
+            Apps screen, then bind a slot in its Settings.
+          </p>
         </section>
       )}
       <section className="card px-4 py-3.5 min-w-0" aria-label="app">

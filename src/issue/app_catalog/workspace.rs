@@ -943,7 +943,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 pub fn list(pm: &Pm) -> Result<Value> {
@@ -1118,4 +1118,106 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
         ));
     }
     callback(&json!({"digest":digest}), &files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}} for {{keyword}}\"\n\
+inputs:\n  topic: { ask: \"About what?\" }\n  keyword: { ask: \"Phrase\", optional: true }\n---\n\n\
+Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n\n\
+## Write\nagent: dev-2\ndepends_on: 1\n\n### Acceptance\n- [ ] post done\n";
+    const MANIFEST_A: &str = "---\napp: fixture-app\ntitle: Fixture\nversion: '1'\nneeds:\n  connections: [cms]\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n---\n\nGuide.\n";
+    const MANIFEST_B: &str = "---\napp: fixture-app\ntitle: Fixture\nversion: '2'\nneeds:\n  connections: []\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n    source: {schema: 1, capability: social.read, version: 1, action: list_posts, resource_kind: connection_account, effect: read}\n---\n\nGuide.\n";
+
+    fn bundle(dir: &std::path::Path, manifest: &str) {
+        std::fs::create_dir_all(dir.join("workflows")).unwrap();
+        std::fs::write(dir.join("app.md"), manifest).unwrap();
+        std::fs::write(dir.join("workflows").join("do.md"), WORKFLOW).unwrap();
+    }
+
+    fn installed() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        String,
+    ) {
+        let pm_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        // The tracker refuses its own tree as an installation source.
+        let sources = tempfile::tempdir().unwrap();
+        let pm = Pm::init(pm_dir.path()).unwrap();
+        let source = sources.path().join("bundle-a");
+        bundle(&source, MANIFEST_A);
+        let out = install(&pm, state_dir.path(), source.to_str().unwrap()).unwrap();
+        let id = out["install_id"].as_str().unwrap().to_string();
+        (pm_dir, state_dir, sources, id)
+    }
+
+    /// CAD-585: the show receipt exposes the declared slot contract —
+    /// typed capability slots plus untyped legacy slots — exactly as the
+    /// installed manifest declares them. Without the projection these
+    /// fields are absent and the board cannot match slots to reviewed
+    /// provider capabilities.
+    #[test]
+    fn show_exposes_declared_slot_capabilities_exactly() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let shown = show(&pm, &id).unwrap();
+        let publication = &shown["capabilities"]["publication"];
+        assert_eq!(publication["capability"], "text.publish");
+        assert_eq!(publication["version"], 1);
+        assert_eq!(publication["action"], "publish");
+        assert_eq!(publication["resource_kind"], "connection_account");
+        assert_eq!(publication["effect"], "send");
+        assert_eq!(shown["connection_slots"], json!(["cms"]));
+    }
+
+    /// The projection derives from the live bundle snapshot, never a
+    /// stored record: after an upgrade the receipt reflects the new
+    /// manifest, so a stale cached contract cannot survive a rebind.
+    #[test]
+    fn show_reflects_upgraded_manifest_capabilities() {
+        let (pm_dir, _state, sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let before = show(&pm, &id).unwrap();
+        let source_b = sources.path().join("bundle-b");
+        bundle(&source_b, MANIFEST_B);
+        let digest = before["digest"].as_str().unwrap();
+        let generation = before["catalog_generation"].as_str().unwrap();
+        let check =
+            upgrade_check(&pm, &id, source_b.to_str().unwrap(), digest, generation).unwrap();
+        let new_digest = check["digest"].as_str().unwrap().to_string();
+        upgrade(
+            &pm,
+            &UpgradeRequest {
+                id: &id,
+                source: source_b.to_str().unwrap(),
+                expected_digest: digest,
+                expected_generation: generation,
+                expected_new_digest: &new_digest,
+                request_id: "fixture-upgrade",
+            },
+            |_, _| Ok(json!({})),
+        )
+        .unwrap();
+        let after = show(&pm, &id).unwrap();
+        assert_eq!(after["capabilities"]["source"]["capability"], "social.read");
+        assert_eq!(after["capabilities"]["source"]["effect"], "read");
+        assert_eq!(after["connection_slots"], json!([]));
+    }
+
+    /// Forged or unknown installation IDs never describe a bundle —
+    /// the exact-ID parse refuses path traversal and the lookup
+    /// refuses anything that is not a live installation.
+    #[test]
+    fn show_refuses_forged_and_unknown_installation_ids() {
+        let (pm_dir, _state, _sources, _id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        for forged in ["", "install-a", "../catalog", "a/b", "not-a-uuid"] {
+            assert!(show(&pm, forged).is_err(), "admitted {forged}");
+        }
+        assert!(show(&pm, "0123456789abcdef0123456789abcdef").is_err());
+    }
 }
