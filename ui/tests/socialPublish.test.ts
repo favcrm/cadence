@@ -9,8 +9,8 @@ const calls: { url: string; method: string; body: any }[] = [];
 const intents: any[] = [{
   intent_id: "intent-a", install_id: "install-a", context_id: null, run_id: "run-a",
   effect_id: "effect-a", state: "queued", channel: "instagram",
-  destination_id: "17841400008460056", destination_handle: "@sakeboyhk",
-  caption_digest: "c-digest", image_digest: "i-digest", destination_digest: "d-digest",
+  destination_id: "17841400008460056",
+  caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest",
   idempotency_key: "key-a", due_epoch: 1790601000, timezone: "Asia/Hong_Kong",
   grant_id: "grant-a", approval_id: "op-a", writer: "writer-a", reviewer: "reviewer-a",
   permalink: null, receipt: null, refusal: null, reconcile: null,
@@ -33,7 +33,7 @@ const intents: any[] = [{
 };
 async function main() {
   const listed = await store.socialPublish.list("install-a", null);
-  assert(listed.intents.length === 1 && listed.intents[0].destination_handle === "@sakeboyhk", "List returns exact-destination intents");
+  assert(listed.intents.length === 1 && listed.intents[0].destination_id === "17841400008460056" && !Object.hasOwn(listed.intents[0], "destination_handle"), "List echoes the destination id only — the handle is the UI display constant");
   const shown = await store.socialPublish.show("intent-a");
   assert(shown.intent.destination_id === "17841400008460056", "Show pins the pilot account id, never a source handle");
   const scheduled = await store.socialPublish.schedule({
@@ -64,7 +64,7 @@ async function main() {
   assert(!store.showsUncertainReading({ ...base, state: "processing", reconcile: { lost_response: false, checked_epoch: 1 } }), "Negative evidence shows no uncertain display");
   assert(!store.showsUncertainReading({ ...base, state: "held", reconcile: { lost_response: true, checked_epoch: 1 } }), "Held never shows the uncertain display");
   assert(!store.showsUncertainReading({ ...base, state: "posted", reconcile: { lost_response: true, checked_epoch: 1 } }), "Terminal states never show the uncertain display");
-  const vocabulary = ["bad_key", "bad_connection", "bad_destination", "bad_caption_digest", "bad_image_digest", "bad_run", "bad_effect", "bad_grant", "bad_intent", "bad_revision", "bad_timezone", "cancel_closed", "cross_workspace", "grant_mismatch", "binding_mismatch", "grant_revoked", "grant_exhausted", "grant_window", "grant_approval", "grant_bounds", "image_required", "key_conflict", "not_publishable", "wrong_connection", "wrong_destination", "wrong_toolkit", "unknown_key", "send_disabled"];
+  const vocabulary = ["bad_key", "bad_connection", "bad_destination", "bad_caption_digest", "bad_image_digest", "bad_run", "bad_effect", "bad_grant", "bad_intent", "bad_revision", "bad_timezone", "cancel_closed", "cross_workspace", "grant_mismatch", "grant_binding_mismatch", "grant_revoked", "grant_exhausted", "grant_window", "grant_approval", "grant_bounds", "image_required", "key_conflict", "not_publishable", "wrong_connection", "wrong_destination", "wrong_toolkit", "unknown_key", "send_disabled"];
   assert(vocabulary.length === 28, "Refusal vocabulary is exactly the 28-code list");
   for (const code of vocabulary) {
     const copy = store.refusalCopy({ code, message: "" }).toLowerCase();

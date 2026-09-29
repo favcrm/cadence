@@ -138,7 +138,7 @@ export default function PublishPreview({ readonly = false }) {
               entries={[
                 ["caption digest", frozen.captionDigest],
                 ["media digest", frozen.mediaDigest],
-                ["destination digest", frozen.destinationDigest],
+                ["binding digest", frozen.frozenDigest],
                 ["idempotency key", frozen.idempotencyKey],
                 ["writer", frozen.writer],
                 ["reviewer", `${frozen.reviewer} · ${frozen.reviewedAt}`],

@@ -38,7 +38,7 @@ const stub = {
   schedule: async (body: any) => {
     assert(body.slot === "publication" && body.timezone === "Asia/Hong_Kong" && body.destination_id === "17841400008460056", "Panel schedules exact pilot destination with timezone");
     assert(!Object.hasOwn(body, "caption_digest"), "Panel never invents digests");
-    const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, destination_handle: "@sakeboyhk", caption_digest: "c-digest", image_digest: "i-digest", destination_digest: "d-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null };
+    const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null, reconcile: null };
     scheduled.push(body); intents = [intent, ...intents];
     return { intent };
   },
@@ -74,6 +74,7 @@ async function main() {
   await React.act(async () => { button("Post now")?.click(); });
   await flush(); await flush();
   assert(scheduled.length === 1 && text().includes("intent-0"), "Post now schedules with due at now");
+  assert(text().includes("17841400008460056") && text().includes("binding-digest") && text().includes("never relay-vouched"), "Card echoes the destination id and binding digest; the handle stays a display constant");
   // Schedule path needs a due time.
   await React.act(async () => { host.querySelector('input[value="schedule"]')?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });
   await flush();

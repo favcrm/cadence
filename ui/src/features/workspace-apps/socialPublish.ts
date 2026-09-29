@@ -46,13 +46,18 @@ export interface PublishIntent {
   run_id: string;
   effect_id: string;
   state: PublishState;
+  /** Channel is the request toolkit, echoed back. */
   channel: "instagram" | "facebook";
-  /** Exact operator-selected destination, never inferred from a source. */
+  /** Exact operator-selected destination id, echoed by the relay only.
+   *  The handle is NEVER relay-vouched (id mapping is backend
+   *  discovery-owned): the UI renders its PILOT_DESTINATION display
+   *  constant and never infers a destination from any handle. */
   destination_id: string;
-  destination_handle: string;
   caption_digest: string;
   image_digest: string | null;
-  destination_digest: string;
+  /** The exact-binding digest. No separate destination_digest exists. */
+  frozen_digest: string;
+  /** Taken from the schedule request — the relay derives it there. */
   idempotency_key: string;
   due_epoch: number;
   timezone: string;
@@ -192,6 +197,11 @@ export function reconcileReading(state: PublishState): string | null {
  *  revoked/exhausted/window/approval/bounds, image_required, key_conflict,
  *  not_publishable, wrong_connection/destination/toolkit, unknown_key,
  *  send_disabled. Unknown codes stay visible with their raw message.
+ *
+ * Field mappings (771 binding): idempotency_key comes from the schedule
+ * request; channel is the request toolkit; frozen_digest is the
+ * exact-binding digest (writer/reviewer resolve via a relay read-only run
+ * join); destination_id is echoed only, never handle-vouched.
  */
 export function refusalCopy(refusal: PublishRefusal): string {
   switch (refusal.code) {
@@ -205,7 +215,7 @@ export function refusalCopy(refusal: PublishRefusal): string {
       return "The send grant was revoked. Nothing was published.";
     case "grant_mismatch":
       return "The grant id does not match this binding. Nothing was published.";
-    case "binding_mismatch":
+    case "grant_binding_mismatch":
       return "The binding does not match this grant and destination. Nothing was published.";
     case "grant_window":
       return "The send grant is outside its validity window. Nothing was published.";

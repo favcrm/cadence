@@ -86,7 +86,7 @@ test("publish preview gates post-now/schedule on exact approval and covers all d
     assert.match(host.textContent, /@sakeboyhk/);
     assert.match(host.textContent, /caption digest/);
     assert.match(host.textContent, /media digest/);
-    assert.match(host.textContent, /destination digest/);
+    assert.match(host.textContent, /binding digest/);
     assert.match(host.textContent, /idempotency key/);
     assert.match(host.textContent, /HK\$12/);
     assert.match(host.textContent, /Fixtures only/);

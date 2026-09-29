@@ -156,7 +156,7 @@ export default function PublishPanel({
     return (
     <article key={intent.intent_id} className="wa-panel wa-stack">
       <div className="wa-row">
-        <h3>{intent.destination_handle}</h3>
+        <h3>{PILOT_DESTINATION.handle}</h3>
         <span className="wa-status" data-tone={publishStateTone(intent.state)}>
           {publishStateText(intent.state)}
         </span>
@@ -165,13 +165,18 @@ export default function PublishPanel({
         {intent.intent_id} · due {dueLabel(intent.due_epoch, intent.timezone)}
       </p>
       <p className="wa-muted">
+        Destination id echoed <code>{intent.destination_id}</code> (handle
+        never relay-vouched)
+      </p>
+      <p className="wa-muted">
         Caption <code>{intent.caption_digest}</code>
         {intent.image_digest ? (
           <> · image <code>{intent.image_digest}</code></>
         ) : (
           " · text-only"
         )}{" "}
-        · key <code>{intent.idempotency_key}</code>
+        · binding <code>{intent.frozen_digest}</code> · key{" "}
+        <code>{intent.idempotency_key}</code>
       </p>
       {intent.state === "posted" && (
         <p className="wa-muted">

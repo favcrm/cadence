@@ -30,7 +30,7 @@ export const publishFrozen = {
   media: ["chef flame (retained bytes)"],
   captionDigest: "sha256:9f2c…a41d (fixture)",
   mediaDigest: "sha256:77b0…c932 (fixture)",
-  destinationDigest: "sha256:1e64…08bb (fixture)",
+  frozenDigest: "sha256:1e64…08bb (fixture binding digest)",
   idempotencyKey: "fixture illustration — not a secret key",
   writer: "writer (fixture)",
   reviewer: "editor (fixture)",
