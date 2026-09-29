@@ -155,23 +155,18 @@ fn issue_cli_end_to_end() {
     assert!(ok);
     assert_eq!(lint["ok"], true);
 
-    // status=ready while a blocker is open → warning, not an error.
-    assert!(
-        cli(
-            pm.path(),
-            state.path(),
-            &["issue", "set", "CAD-3", "status=ready"]
-        )
-        .0
+    // CAD-757: status=ready while a blocker is open → refused, not a
+    // warning. Nothing is written, so lint stays clean.
+    let (ok, err) = cli(
+        pm.path(),
+        state.path(),
+        &["issue", "set", "CAD-3", "status=ready"],
     );
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("CAD-2"));
     let (ok, lint) = cli(pm.path(), state.path(), &["issue", "lint"]);
     assert!(ok);
     assert_eq!(lint["ok"], true);
-    assert!(lint["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w.as_str().unwrap().contains("CAD-3")));
 }
 
 #[test]
@@ -1827,6 +1822,20 @@ fn issue_bulk_edits_are_one_atomic_commit() {
             .unwrap()
             .to_string()
     };
+    let before = commits(pm);
+    // CAD-757: the ready gate composes with batch atomicity — X-5 waits
+    // on doing X-4, so a batch moving it to ready is refused whole,
+    // writing nothing.
+    let (ok, out) = cli(pm, state, &["issue", "set", "X-5", "X-7", "status=ready"]);
+    assert!(!ok, "{out}");
+    assert!(out.to_string().contains("X-4"), "{out}");
+    assert_eq!(commits(pm), before, "refused batch writes nothing");
+    assert!(tree_is_clean(pm));
+    assert_eq!(status_of("X-5"), "backlog");
+    // Unblock X-5; the atomic batch below then exercises the commit
+    // shape it was written for, not the gate.
+    let (ok, out) = cli(pm, state, &["issue", "unlink", "X-5", "blocked_by", "X-4"]);
+    assert!(ok, "{out}");
     let before = commits(pm);
     let (ok, out) = cli(
         pm,

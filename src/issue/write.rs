@@ -1138,6 +1138,11 @@ pub fn set_fields(
                 check_done_evidence(pm, front, force)?;
                 forced = force.map(|r| r.trim().to_string());
             }
+            // CAD-757: `ready` is the dispatch queue — a blocked ticket
+            // cannot sit in it.
+            if front.status == "ready" {
+                crate::issue::blocked::check_ready(&pm.dir, front)?;
+            }
         }
         if front.milestone != milestone {
             check_milestone(pm, project, front.milestone.as_deref())?;
@@ -1501,6 +1506,9 @@ pub fn patch_issue(
     if let Some(v) = &patch.status {
         model::check_status(v)?;
         crate::issue::plan::check_status_write(&pm.dir, &front, v)?;
+        if v == "ready" {
+            crate::issue::blocked::check_ready(&pm.dir, &front)?;
+        }
         front.status = v.clone();
         changed.push(format!("status={v}"));
     }
@@ -1672,6 +1680,12 @@ pub fn link(
     let warnings = blocked_warnings(pm, id, state_dir)?;
     let mut out = json!({"id": id, "link": kind, "target": target,
               "unlink": unlink, "committed": true, "warnings": warnings});
+    // CAD-757: a new blocker on an active issue tells its holders —
+    // by name, best-effort, never blocking the link itself.
+    if kind == "blocked_by" && !unlink {
+        out["blocker_notice"] =
+            crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
+    }
     attach_foreign(&mut out, &foreign);
     Ok(out)
 }
@@ -1862,6 +1876,7 @@ pub(crate) fn commit_front_with_comment(
     front: &Front,
     body: &str,
     author: &str,
+    kind: &str,
     text: &str,
     subject: &str,
     actor: &str,
@@ -1881,7 +1896,7 @@ pub(crate) fn commit_front_with_comment(
     let meta = model::CommentFront {
         author: author.to_string(),
         at: time::iso(epoch),
-        kind: Some("claim".to_string()),
+        kind: Some(kind.to_string()),
     };
     let rendered = parse::render(&meta, text)?;
     let path = create_exclusive(
