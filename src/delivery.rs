@@ -235,6 +235,12 @@ pub struct Record {
     /// the message id dedupes to one wake.
     #[serde(default)]
     pub ready_epoch: u32,
+    /// CAD-362: the diff-size risk class measured when this head was
+    /// routed (or last classified). `oversized` means the record sits
+    /// unstaffed waiting for the worker to split the diff, not for a
+    /// reviewer — the note says so.
+    #[serde(default)]
+    pub risk: Option<String>,
 }
 
 impl Record {
@@ -260,6 +266,7 @@ impl Record {
             excluded: vec![],
             ticket_done: None,
             ready_epoch: 0,
+            risk: None,
         }
     }
 
@@ -332,6 +339,52 @@ pub fn pr_ref(url: &str) -> Option<String> {
     Some(format!("{}#{n}", slug.to_ascii_lowercase()))
 }
 
+/// CAD-362: the diff-size tier a review runs under. `small` is the
+/// ordinary kickoff; `heavy` annotates it so the reviewer reads with
+/// more care; `oversized` never reaches a reviewer — the diff is
+/// flagged for splitting first, because a reviewer skims a 40-file
+/// diff and the verdict stops meaning anything. Measured from the
+/// PR's `additions + deletions` and `changedFiles` — the same fields
+/// an observation already records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Risk {
+    Small,
+    Heavy,
+    Oversized,
+}
+
+/// Diff-size thresholds. A review over `OVERSIZED_*` cannot be
+/// diligent — flagged for splitting before a reviewer is asked.
+pub const OVERSIZED_FILES: u64 = 40;
+pub const OVERSIZED_LINES: u64 = 3000;
+/// `HEAVY_*` annotates the kickoff so the reviewer slows down.
+pub const HEAVY_FILES: u64 = 10;
+pub const HEAVY_LINES: u64 = 800;
+
+impl Risk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Risk::Small => "small",
+            Risk::Heavy => "heavy",
+            Risk::Oversized => "oversized",
+        }
+    }
+}
+
+/// Classify a diff's review risk from `additions + deletions` lines
+/// and `changedFiles` — the fields `gh pr view` and the record's
+/// `observed` both carry.
+pub fn risk_class(additions: u64, deletions: u64, files: u64) -> Risk {
+    let lines = additions + deletions;
+    if files > OVERSIZED_FILES || lines > OVERSIZED_LINES {
+        Risk::Oversized
+    } else if files > HEAVY_FILES || lines > HEAVY_LINES {
+        Risk::Heavy
+    } else {
+        Risk::Small
+    }
+}
+
 pub fn path(state_dir: &Path) -> PathBuf {
     state_dir.join("delivery.json")
 }
@@ -379,12 +432,151 @@ pub const REVIEWER_ROLE: &str = "reviewer";
 pub struct Candidate {
     pub alias: String,
     pub provider: String,
+    /// The model the endpoint is running, when registered — the
+    /// vendor half of the cross-vendor rule: two `pi` agents on
+    /// `devin/…` and `opencode-go/…` models are different vendors.
+    pub model: Option<String>,
     pub state: String,
     pub enabled: bool,
     /// The agent's PM (`params.upstream`), when it is a group member.
     pub upstream: Option<String>,
     /// Launch role stored at registration (`pm`, `worker`, or `reviewer`).
     pub role: String,
+}
+
+/// The vendor a `(provider, model)` pair counts as. A model names its
+/// vendor in its namespace: `devin/swe-2-high` → `devin`,
+/// `opencode-go/muse-spark` → `opencode-go`. A transport namespace that
+/// itself proxies vendors carries it one segment deeper:
+/// `openrouter/z-ai/glm-5.3` → `z-ai`. A bare model name or no model
+/// at all resolves to the launch provider.
+pub fn vendor(provider: &str, model: Option<&str>) -> String {
+    let Some(model) = model else {
+        return provider.to_string();
+    };
+    let segs: Vec<&str> = model.split('/').collect();
+    match segs.as_slice() {
+        [transport, vendor, ..] if *transport == "openrouter" => vendor.to_string(),
+        [vendor, ..] if segs.len() > 1 => vendor.to_string(),
+        _ => provider.to_string(),
+    }
+}
+
+/// The pm.yaml `review:` section — the operator's catalog override for
+/// reviewer pairing (CAD-340/362). `pair` pins an author's reviews to
+/// one reviewer when that reviewer qualifies; `never` bars a pair
+/// outright. Both key on the worker's alias. Empty means the measured
+/// rules decide everything.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReviewRules {
+    /// `worker-alias: reviewer-alias` — always this reviewer when it
+    /// qualifies.
+    #[serde(default)]
+    pub pair: std::collections::BTreeMap<String, String>,
+    /// `worker-alias: [reviewer-alias…]` — pairs that never happen.
+    #[serde(default)]
+    pub never: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Why a reviewer was chosen — recorded on the ticket and the
+/// `review_routed` event so a same-vendor fallback is never silent
+/// (CAD-340's "collision launches the role fallback and records the
+/// reason").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickReason {
+    /// The previous round's reviewer kept the ticket.
+    Held,
+    /// pm.yaml `review.pair` pinned this worker's reviews to it.
+    Catalog,
+    /// A prior convergence on this worker's tickets outranked the
+    /// vendor heuristic.
+    ProvenPair,
+    /// A different vendor from the worker's.
+    CrossVendor,
+    /// No cross-vendor reviewer was idle — the vendor rule fell back.
+    SameVendorFallback,
+    /// The worker's vendor could not be determined — vendor preference
+    /// had nothing to compare against.
+    VendorUnknown,
+}
+
+impl PickReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PickReason::Held => "held",
+            PickReason::Catalog => "catalog-pair",
+            PickReason::ProvenPair => "proven-pair",
+            PickReason::CrossVendor => "cross-vendor",
+            PickReason::SameVendorFallback => "same-vendor-fallback",
+            PickReason::VendorUnknown => "vendor-unknown",
+        }
+    }
+
+    /// The fallback forms CAD-340 wants recorded on the task.
+    pub fn is_fallback(self) -> bool {
+        matches!(
+            self,
+            PickReason::SameVendorFallback | PickReason::VendorUnknown
+        )
+    }
+
+    /// The phrase the routed comment and record note carry.
+    pub fn describe(self) -> &'static str {
+        match self {
+            PickReason::Held => "kept from the previous round",
+            PickReason::Catalog => "pinned by pm.yaml review.pair",
+            PickReason::ProvenPair => "proven pair record",
+            PickReason::CrossVendor => "cross-vendor",
+            PickReason::SameVendorFallback => {
+                "same-vendor fallback — no cross-vendor reviewer was idle"
+            }
+            PickReason::VendorUnknown => "vendor unknown — the worker registered no model",
+        }
+    }
+}
+
+/// The pick's answer: the reviewer alias plus why it was chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub alias: String,
+    pub reason: PickReason,
+}
+
+/// How this (worker, reviewer) pair has done before — measured
+/// precision from `delivery.json` history, per the CAD-340 rule that
+/// pairings are chosen by measured review precision, not just vendor:
+///
+/// - a PASS on this worker's ticket that the merge queue upheld
+///   (the record reached `merged`) is worth the most;
+/// - a PASS awaiting its merge still counts;
+/// - a ticket `escalated` while this reviewer held it, or one where
+///   the reviewer is in `excluded` (it was on duty when the head moved
+///   without the worker — its review may have covered its own push),
+///   count against the pair.
+///
+/// Scoreless pairs are `0` — history only demotes proven-bad and
+/// rewards proven-good; it never locks out an unpaired reviewer.
+pub fn pair_score(worker: &str, reviewer: &str, history: &[&Record]) -> i32 {
+    let mut score = 0;
+    for r in history.iter().filter(|r| r.worker == worker) {
+        if r.excluded.iter().any(|e| e == reviewer) {
+            score -= 3;
+        }
+        if r.state == State::Escalated && r.reviewer.as_deref() == Some(reviewer) {
+            score -= 2;
+        }
+        if r.verdict
+            .as_ref()
+            .is_some_and(|v| v.reviewer == reviewer && v.verdict == "pass")
+        {
+            score += match r.state {
+                State::Merged => 2,
+                State::Declined => -2,
+                _ => 1,
+            };
+        }
+    }
+    score
 }
 
 /// Every alias in `worker`'s group line: the worker itself, its
@@ -439,31 +631,38 @@ fn foreign_pm(worker_pm: Option<&str>, candidate: &Candidate) -> bool {
     }
 }
 
-/// The reviewer for a worker's head (CAD-591). Only an agent whose
-/// launch role is [`REVIEWER_ROLE`]. Never the worker or anyone in its
-/// group line ([`worker_group`]), never a member of another PM's group,
-/// never the master, never an alias in `exclude`, never a disabled,
-/// fenced (`attention`) or inbox agent. An implementer (`worker` /
-/// `pm`) is never chosen, busy or idle. A fresh review goes only to an
-/// idle reviewer. When none is idle the review stays unassigned. The
+/// The reviewer for a worker's head (CAD-591, CAD-362). Only an agent
+/// whose launch role is [`REVIEWER_ROLE`]. Never the worker or anyone
+/// in its group line ([`worker_group`]), never a member of another
+/// PM's group, never the master, never an alias in `exclude` or in the
+/// catalog's `never` list for this worker, never a disabled, fenced
+/// (`attention`) or inbox agent. An implementer (`worker` / `pm`) is
+/// never chosen, busy or idle. A fresh review goes only to an idle
+/// reviewer. When none is idle the review stays unassigned. The
 /// previous round's reviewer keeps the ticket while it still qualifies
-/// and is idle. A busy previous reviewer is not reused while an idle
-/// reviewer can take the ticket; it stays only when every qualifying
-/// reviewer is busy, so the verdicts on that head stay comparable. A
-/// caller passes `None` for `previous` (and the old reviewer in
-/// `exclude`) when the head moved without the worker, since whoever
-/// pushed must not review its own commits. Among idle reviewers, a
-/// different provider from the worker's wins when one is staffed, else
-/// another session of the same provider, then alias order.
+/// and is idle; a busy holder yields when an idle reviewer can take
+/// the ticket — it stays only when every qualifying reviewer is busy,
+/// so the verdicts on that head stay comparable. A catalog `pair` pin
+/// for the worker wins next. Among the rest, the measured pair score
+/// ([`pair_score`]) ranks first — a proven pairing outranks vendor
+/// heuristics — then the cross-vendor rule: a reviewer whose model
+/// vendor differs from the worker's wins over a same-vendor one, then
+/// alias order. The returned [`Pick`] records why — a same-vendor
+/// fallback is never silent. A caller passes `None` for `previous`
+/// (and the old reviewer in `exclude`) when the head moved without the
+/// worker, since whoever pushed must not review its own commits.
 pub fn pick_reviewer(
     worker: &str,
-    worker_provider: Option<&str>,
+    worker_vendor: Option<&str>,
     previous: Option<&str>,
     exclude: &[String],
     agents: &[Candidate],
-) -> Option<String> {
+    rules: &ReviewRules,
+    history: &[&Record],
+) -> Option<Pick> {
     let group = worker_group(worker, agents);
     let worker_pm = group_pm(worker, agents);
+    let never: &[String] = rules.never.get(worker).map(Vec::as_slice).unwrap_or(&[]);
     let qualifies = |a: &&Candidate| {
         a.role == REVIEWER_ROLE
             && a.enabled
@@ -471,6 +670,7 @@ pub fn pick_reviewer(
             && a.provider != "inbox"
             && !group.contains(&a.alias)
             && !exclude.contains(&a.alias)
+            && !never.contains(&a.alias)
             && !crate::master::is_master(&a.alias)
             && !foreign_pm(worker_pm, a)
     };
@@ -480,17 +680,54 @@ pub fn pick_reviewer(
         if let Some(held) = eligible.iter().find(|a| a.alias == prev) {
             // A busy holder yields when an idle reviewer can take over.
             if held.state == "idle" || !idle_exists {
-                return Some(prev.to_string());
+                return Some(Pick {
+                    alias: prev.to_string(),
+                    reason: PickReason::Held,
+                });
             }
         }
     }
-    let mut ranked: Vec<&Candidate> = eligible.into_iter().filter(|a| a.state == "idle").collect();
+    if let Some(pin) = rules.pair.get(worker) {
+        if let Some(pinned) = eligible.iter().find(|a| &a.alias == pin) {
+            // Same rule as the previous round's holder: a busy pin
+            // yields to an idle reviewer rather than stall the review.
+            if pinned.state == "idle" || !idle_exists {
+                return Some(Pick {
+                    alias: pin.clone(),
+                    reason: PickReason::Catalog,
+                });
+            }
+        }
+    }
+    let cross = |c: &Candidate| {
+        worker_vendor.is_some_and(|wv| vendor(&c.provider, c.model.as_deref()) != wv)
+    };
+    let mut ranked: Vec<(i32, bool, &Candidate)> = eligible
+        .into_iter()
+        .filter(|a| a.state == "idle")
+        .map(|a| (pair_score(worker, &a.alias, history), cross(a), a))
+        .collect();
+    // Measured pair score first, then cross-vendor, then alias —
+    // all descending except the alias tiebreak.
     ranked.sort_by(|a, b| {
-        let same = |c: &Candidate| Some(c.provider.as_str()) == worker_provider;
-        // A different provider, then alias. Every candidate here is idle.
-        same(a).cmp(&same(b)).then(a.alias.cmp(&b.alias))
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then(a.2.alias.cmp(&b.2.alias))
     });
-    ranked.first().map(|a| a.alias.clone())
+    let (score, is_cross, chosen) = ranked.first()?;
+    let reason = if worker_vendor.is_none() {
+        PickReason::VendorUnknown
+    } else if *score > 0 {
+        PickReason::ProvenPair
+    } else if *is_cross {
+        PickReason::CrossVendor
+    } else {
+        PickReason::SameVendorFallback
+    };
+    Some(Pick {
+        alias: chosen.alias.clone(),
+        reason,
+    })
 }
 
 /// Filing order of one agent's reports on a ticket: `(UTC second,
@@ -515,10 +752,10 @@ pub fn filing_order(name: &str, agent: &str) -> (String, u32) {
 }
 
 /// The daemon-composed review kickoff: one line, so a pty reviewer can
-/// take it as it is. It carries the PR, the head, the acceptance
-/// criteria and the pinning rules. When the criteria do not fit
-/// `ceiling`, the line points at the ticket file instead of cutting
-/// them.
+/// take it as it is. It carries the PR, the head, the risk tier
+/// (CAD-362), the acceptance criteria and the pinning rules. When the
+/// criteria do not fit `ceiling`, the line points at the ticket file
+/// instead of cutting them.
 #[allow(clippy::too_many_arguments)]
 pub fn review_kickoff(
     issue: &str,
@@ -526,14 +763,17 @@ pub fn review_kickoff(
     pr: &str,
     sha: &str,
     worker: &str,
+    risk: Option<&str>,
     acceptance: Option<&str>,
     note: &Path,
     ceiling: usize,
 ) -> String {
     let build = |criteria: &str| {
+        let risk_clause = risk.map(|r| format!("Risk: {r}. ")).unwrap_or_default();
         format!(
             "[review] {issue} round {round}: independently review PR {pr} at head {sha} \
-             (worker {worker}; ticket {note}). {criteria}Rules: judge exactly this head — \
+             (worker {worker}; ticket {note}). {criteria}{risk_clause}Rules: judge exactly \
+             this head — \
              check out {sha}, not the branch tip; never push to the branch; the verdict is \
              pinned to the sha, and if the head moves the daemon sends a new review. File \
              the verdict: `cadence report file --task {issue} --kind verdict --file <f>` \
@@ -761,7 +1001,7 @@ pub fn merge(state_dir: &Path, issue: &str, gh_bin: &str) -> Result<Value> {
     )
 }
 
-fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
+pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
     let out = crate::proc::run_bounded(Command::new(gh_bin).args(args), GH_TIMEOUT)
         .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?;
     if !out.status.success() {
@@ -791,11 +1031,44 @@ mod tests {
         Candidate {
             alias: alias.into(),
             provider: provider.into(),
+            model: None,
             state: "idle".into(),
             enabled: true,
             upstream: None,
             role: REVIEWER_ROLE.into(),
         }
+    }
+
+    /// `pick_reviewer` with no catalog and no history — most routing
+    /// tests want only the chosen alias.
+    fn pick(
+        worker: &str,
+        worker_vendor: Option<&str>,
+        previous: Option<&str>,
+        exclude: &[String],
+        agents: &[Candidate],
+    ) -> Option<String> {
+        pick_reviewer(
+            worker,
+            worker_vendor,
+            previous,
+            exclude,
+            agents,
+            &ReviewRules::default(),
+            &[],
+        )
+        .map(|p| p.alias)
+    }
+
+    /// The pick and its reason together.
+    fn pick_why(
+        worker: &str,
+        worker_vendor: Option<&str>,
+        agents: &[Candidate],
+        rules: &ReviewRules,
+        history: &[&Record],
+    ) -> Option<Pick> {
+        pick_reviewer(worker, worker_vendor, None, &[], agents, rules, history)
     }
 
     fn staff(alias: &str, role: &str, state: &str, upstream: Option<&str>) -> Candidate {
@@ -817,7 +1090,7 @@ mod tests {
         ];
         // A different provider wins over alias order.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            pick("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("z-codex")
         );
         // None staffed: another session of the same provider.
@@ -827,29 +1100,29 @@ mod tests {
             cand("r", "claude"),
         ];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &same).as_deref(),
+            pick("w1", Some("claude"), None, &[], &same).as_deref(),
             Some("r")
         );
         // Never the worker, never the master.
         let alone = vec![cand("master", "codex"), cand("w1", "claude")];
-        assert_eq!(pick_reviewer("w1", Some("claude"), None, &[], &alone), None);
+        assert_eq!(pick("w1", Some("claude"), None, &[], &alone), None);
         // Fenced or disabled agents are skipped; the previous reviewer
         // keeps the ticket while it qualifies.
         let mut fenced = cand("z-codex", "codex");
         fenced.state = "attention".into();
         let agents = vec![cand("a-claude", "claude"), fenced, cand("w1", "claude")];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            pick("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("a-claude")
         );
         let agents = vec![cand("a", "codex"), cand("b", "codex"), cand("w1", "claude")];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("b"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("b"), &[], &agents).as_deref(),
             Some("b")
         );
         // A previous reviewer that is the worker now is not reused.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("w1"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("w1"), &[], &agents).as_deref(),
             Some("a")
         );
     }
@@ -901,25 +1174,22 @@ mod tests {
             with_up("sib", "pm"), // a sibling under the same PM
         ];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            pick("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("sib")
         );
         // Nor as the sticky previous reviewer.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("a1"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("a1"), &[], &agents).as_deref(),
             Some("sib")
         );
         // A reviewer excluded (it pushed the moved head) is skipped.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &["sib".into()], &agents),
+            pick("w1", Some("claude"), None, &["sib".into()], &agents),
             None
         );
         // An upstream cycle ends.
         let cyc = vec![with_up("w1", "x"), with_up("x", "w1"), cand("r", "codex")];
-        assert_eq!(
-            pick_reviewer("w1", None, None, &[], &cyc).as_deref(),
-            Some("r")
-        );
+        assert_eq!(pick("w1", None, None, &[], &cyc).as_deref(), Some("r"));
     }
 
     /// CAD-591: the alias that would win under the old "any peer" rule
@@ -946,29 +1216,29 @@ mod tests {
             staff("z-root", "reviewer", "idle", None),
         ];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            pick("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("rev")
         );
         // The author is not eligible even when their own role is reviewer.
         let mut author = agents.clone();
         author.iter_mut().find(|a| a.alias == "w1").unwrap().role = "reviewer".into();
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &author).as_deref(),
+            pick("w1", Some("claude"), None, &[], &author).as_deref(),
             Some("rev")
         );
         // Sticky previous reviewer that no longer qualifies is not reused.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("d-foreign"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("d-foreign"), &[], &agents).as_deref(),
             Some("rev")
         );
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("b-busy-impl"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("b-busy-impl"), &[], &agents).as_deref(),
             Some("rev")
         );
         // Sticky previous is busy, and an idle reviewer exists: hand it
         // to the idle one, not back to the busy holder.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("c-busy-rev"), &[], &agents).as_deref(),
+            pick("w1", Some("claude"), Some("c-busy-rev"), &[], &agents).as_deref(),
             Some("rev")
         );
         // No idle reviewer: a fresh review stays unassigned. The busy
@@ -980,21 +1250,172 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &busy_only).as_deref(),
+            pick("w1", Some("claude"), None, &[], &busy_only).as_deref(),
             None
         );
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("c-busy-rev"), &[], &busy_only).as_deref(),
+            pick("w1", Some("claude"), Some("c-busy-rev"), &[], &busy_only).as_deref(),
             Some("c-busy-rev")
         );
         let implementers: Vec<_> = busy_only
             .into_iter()
             .filter(|a| a.role != REVIEWER_ROLE)
             .collect();
+        assert_eq!(pick("w1", Some("claude"), None, &[], &implementers), None);
+    }
+
+    /// A record whose reviewer filed a PASS, in `state`.
+    fn passed(worker: &str, rev: &str, state: State) -> Record {
+        let mut r = Record::new("CAD-1", "demo", worker, 0);
+        r.state = state;
+        r.reviewer = Some(rev.into());
+        r.verdict = Some(VerdictRec {
+            verdict: "pass".into(),
+            sha: "s".repeat(40),
+            reviewer: rev.into(),
+            summary: String::new(),
+            report: "CAD-1/reports/x.md".into(),
+            at: 0,
+        });
+        r
+    }
+
+    #[test]
+    fn vendor_comes_from_the_model_namespace() {
+        assert_eq!(vendor("pi", Some("devin/swe-2-high")), "devin");
+        assert_eq!(vendor("pi", Some("opencode-go/muse-spark")), "opencode-go");
+        // A transport that proxies vendors carries its own segment.
+        assert_eq!(vendor("pi", Some("openrouter/z-ai/glm-5.3")), "z-ai");
+        // Bare model or none: the launch provider is the vendor.
+        assert_eq!(vendor("pi", Some("glm-5.3")), "pi");
+        assert_eq!(vendor("pi", None), "pi");
+    }
+
+    /// CAD-362: two agents on the same launch provider are different
+    /// vendors when their models differ — the model namespace, not the
+    /// transport, is what the rule compares.
+    #[test]
+    fn the_model_namespace_decides_cross_vendor() {
+        let mut a = cand("a-same", "pi");
+        a.model = Some("devin/swe-2-high".into());
+        let mut z = cand("z-cross", "pi");
+        z.model = Some("opencode-go/muse-spark".into());
+        let agents = vec![a, cand("w1", "pi"), z];
+        // Alias order prefers a-same; the vendor rule overrides it.
+        let p = pick_why("w1", Some("devin"), &agents, &ReviewRules::default(), &[]).unwrap();
+        assert_eq!(p.alias, "z-cross");
+        assert_eq!(p.reason, PickReason::CrossVendor);
+    }
+
+    /// The pm.yaml catalog: `pair` pins, `never` bars (CAD-340).
+    #[test]
+    fn the_catalog_pins_and_bars_pairs() {
+        let mut rules = ReviewRules::default();
+        rules.pair.insert("w1".into(), "pin".into());
+        rules.never.insert("w1".into(), vec!["barred".into()]);
+        let agents = vec![
+            cand("barred", "codex"),
+            cand("pin", "codex"),
+            cand("other", "codex"),
+            cand("w1", "claude"),
+        ];
+        let p = pick_why("w1", Some("claude"), &agents, &rules, &[]).unwrap();
+        assert_eq!((p.alias.as_str(), p.reason), ("pin", PickReason::Catalog));
+        // `never` bars even when it is the catalog pin's only rival —
+        // and a barred pin itself cannot win.
+        rules.pair.insert("w1".into(), "barred".into());
+        let p = pick_why("w1", Some("claude"), &agents, &rules, &[]).unwrap();
+        assert_eq!(p.alias, "other");
+        // Only the barred reviewer remains: unassigned, never barred-in.
+        let thin = vec![cand("barred", "codex"), cand("w1", "claude")];
+        assert_eq!(pick_why("w1", Some("claude"), &thin, &rules, &[]), None);
+        // A busy pin yields to an idle reviewer rather than stall.
+        let mut rules = ReviewRules::default();
+        rules.pair.insert("w1".into(), "pin".into());
+        let mut agents = vec![cand("pin", "codex"), cand("other", "codex")];
+        agents[0].state = "busy".into();
+        agents.push(cand("w1", "claude"));
+        let p = pick_why("w1", Some("claude"), &agents, &rules, &[]).unwrap();
+        assert_eq!(p.alias, "other");
+    }
+
+    /// A measured-good pairing outranks the cross-vendor rule, and a
+    /// measured-bad one loses to it (CAD-340's measured precision).
+    #[test]
+    fn measured_pair_history_ranks_above_vendor() {
+        let mut a = cand("a-same", "pi");
+        a.model = Some("devin/swe-2-high".into());
+        let mut z = cand("z-cross", "pi");
+        z.model = Some("opencode-go/muse-spark".into());
+        let agents = vec![a, z, cand("w1", "pi")];
+        // a-same twice reviewed w1 to a merge — the pair is proven.
+        let good1 = passed("w1", "a-same", State::Merged);
+        let good2 = passed("w1", "a-same", State::Merged);
+        let hist: Vec<&Record> = vec![&good1, &good2];
+        let p = pick_why("w1", Some("devin"), &agents, &ReviewRules::default(), &hist).unwrap();
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &[], &implementers),
-            None
+            (p.alias.as_str(), p.reason),
+            ("a-same", PickReason::ProvenPair)
         );
+        // The same reviewer whose record is bad loses to cross-vendor:
+        // it was on duty when a head moved (excluded), or escalated.
+        let mut bad = passed("w1", "a-same", State::Escalated);
+        bad.excluded.push("a-same".into());
+        let hist: Vec<&Record> = vec![&bad];
+        let p = pick_why("w1", Some("devin"), &agents, &ReviewRules::default(), &hist).unwrap();
+        assert_eq!(
+            (p.alias.as_str(), p.reason),
+            ("z-cross", PickReason::CrossVendor)
+        );
+        // A PASS whose merge the operator declined counts against.
+        let declined = passed("w1", "a-same", State::Declined);
+        let hist: Vec<&Record> = vec![&declined];
+        let p = pick_why("w1", Some("devin"), &agents, &ReviewRules::default(), &hist).unwrap();
+        assert_eq!(p.alias, "z-cross");
+    }
+
+    /// CAD-340: a fallback is never silent — the pick says why.
+    #[test]
+    fn a_same_vendor_fallback_records_its_reason() {
+        let mut a = cand("a-same", "pi");
+        a.model = Some("devin/swe-2-high".into());
+        let agents = vec![a, cand("w1", "pi")];
+        let p = pick_why("w1", Some("devin"), &agents, &ReviewRules::default(), &[]).unwrap();
+        assert_eq!(p.alias, "a-same");
+        assert_eq!(p.reason, PickReason::SameVendorFallback);
+        assert!(p.reason.is_fallback());
+        // And when the worker's own vendor is unknown — never
+        // registered, no model — the pick says that instead.
+        let p = pick_why("w1", None, &agents, &ReviewRules::default(), &[]).unwrap();
+        assert_eq!(p.reason, PickReason::VendorUnknown);
+    }
+
+    #[test]
+    fn risk_tiers_classify_the_diff() {
+        assert_eq!(risk_class(10, 10, 3), Risk::Small);
+        assert_eq!(risk_class(400, 400, 9), Risk::Small);
+        assert_eq!(risk_class(0, 0, HEAVY_FILES + 1), Risk::Heavy);
+        assert_eq!(risk_class(HEAVY_LINES + 1, 0, 3), Risk::Heavy);
+        assert_eq!(risk_class(400, 401, 3), Risk::Heavy);
+        assert_eq!(risk_class(0, 0, OVERSIZED_FILES + 1), Risk::Oversized);
+        assert_eq!(risk_class(OVERSIZED_LINES, 1, 3), Risk::Oversized);
+        // The boundary values themselves stay in the lower tier.
+        assert_eq!(risk_class(HEAVY_LINES, 0, HEAVY_FILES), Risk::Small);
+        assert_eq!(risk_class(OVERSIZED_LINES, 0, OVERSIZED_FILES), Risk::Heavy);
+    }
+
+    /// `risk` rides the record file and defaults absent for records
+    /// written before CAD-362.
+    #[test]
+    fn risk_round_trips_and_defaults_absent() {
+        let mut r = Record::new("CAD-1", "demo", "w1", 0);
+        r.risk = Some("heavy".into());
+        let back: Record = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back.risk.as_deref(), Some("heavy"));
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("risk");
+        let back: Record = serde_json::from_value(v).unwrap();
+        assert_eq!(back.risk, None);
     }
 
     #[test]
@@ -1007,6 +1428,7 @@ mod tests {
             "https://github.com/o/r/pull/7",
             &sha,
             "w1",
+            Some("heavy"),
             Some("1) [ ] \"x\""),
             note,
             4000,
@@ -1014,8 +1436,9 @@ mod tests {
         assert!(!k.contains('\n'), "{k}");
         assert!(k.contains(&sha) && k.contains("pull/7") && k.contains("1) [ ] \"x\""));
         assert!(k.contains("--kind verdict"), "{k}");
+        assert!(k.contains("Risk: heavy."), "{k}");
         let long = "y".repeat(5000);
-        let k = review_kickoff("D-2", 1, "u", &sha, "w1", Some(&long), note, 4000);
+        let k = review_kickoff("D-2", 1, "u", &sha, "w1", None, Some(&long), note, 4000);
         assert!(!k.contains(&long));
         assert!(k.contains("/pm/demo/D-2/issue.md"), "{k}");
     }

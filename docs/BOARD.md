@@ -41,7 +41,8 @@ local surface.
 ```
 ~/pm/
 ├── pm.yaml                 # schema, statuses, link types, artifact cap, notes_dir,
-│                           #   [pi] model/provider-package allowlists (CAD-559)
+│                           #   [pi] model/provider-package allowlists (CAD-559),
+│                           #   [review] pair/never reviewer catalog (CAD-362)
 ├── README.md               # the rules, for agents and humans
 ├── cadence/
 │   ├── project.yaml        # key, prefix: CAD, repos, components, tags, default_owner

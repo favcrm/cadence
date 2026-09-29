@@ -80,6 +80,10 @@ pub struct PmConfig {
     /// file over it before the blob lands).
     #[serde(default)]
     pub wiki: WikiConfig,
+    /// CAD-362: the operator's reviewer-pairing catalog — `pair` pins
+    /// an author's reviews to one reviewer, `never` bars a pair.
+    #[serde(default)]
+    pub review: crate::delivery::ReviewRules,
 }
 
 /// `pm.yaml`'s `wiki:` section.
@@ -124,6 +128,7 @@ impl Default for PmConfig {
             artifact_max_bytes: default_artifact_cap(),
             notes_dir: default_notes_dir(),
             wiki: WikiConfig::default(),
+            review: crate::delivery::ReviewRules::default(),
         }
     }
 }
