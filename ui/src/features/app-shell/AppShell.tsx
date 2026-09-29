@@ -19,7 +19,7 @@ import {
 } from "../home/thread";
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { initialContext, rememberedContext, rememberContext } from "../workspace-apps/contextSelection";
+import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type OutletView } from "./CrmOutlet";
 import { assertRecordId, type HostScope } from "./hostActions";
 import "./app-shell.css";
@@ -64,6 +64,10 @@ export default function AppShell({
   const [loading, setLoading] = useState(true);
   const [contextId, setContextId] = useState("");
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
+  // Social-content's picker owns its selection; the shell observes it
+  // in the same tab so chat sends carry the current scope, never the
+  // one from the shell's last render.
+  const [socialContext, setSocialContext] = useState<string | null>(null);
   // Outlet state lives in the URL (`ctx`, `appview`, `record`) so
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
@@ -137,6 +141,13 @@ export default function AppShell({
     return () => controller.abort();
   }, [installId, viewer.operator]);
 
+  useEffect(() => {
+    setSocialContext(rememberedContext(installId));
+    return subscribeContext((changed, next) => {
+      if (changed === installId) setSocialContext(next);
+    });
+  }, [installId]);
+
   // Installation switch: stale outlet state must never follow the
   // operator across the boundary. The first mount keeps direct links.
   useEffect(() => {
@@ -149,6 +160,9 @@ export default function AppShell({
     setLinkNotice(null);
     setContextId("");
     writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
+    // The strip marks the emptied query handled: unmark so adoption
+    // still runs once the new installation's contexts load.
+    handledQuery.current = undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installId]);
 
@@ -162,7 +176,15 @@ export default function AppShell({
   // a stale, inactive or ambiguous link clears the selection with a
   // notice instead of guessing. Malformed record ids are stripped.
   useEffect(() => {
-    if (loading || installation === null) return;
+    // The loaded receipts must belong to this installation: on a
+    // switch commit the state still holds the previous install while
+    // the URL already names the next one — adopting there would clear
+    // or poison the wrong scope.
+    if (loading || installation === null || installation.install_id !== installId) return;
+    // Social-content owns its context end to end (the shell renders
+    // no selector there): adoption must not read, write, or clear its
+    // remembered selection.
+    if (installation.name === "social-content") return;
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
@@ -177,7 +199,7 @@ export default function AppShell({
       }
     }
     if (urlCtx !== null && !activeIds.includes(urlCtx)) {
-      setContextId(initialContext(installId, activeIds));
+      setContextId(fallbackContext());
       setLinkNotice(
         "The linked context is not active in this installation — the selection was cleared.",
       );
@@ -193,12 +215,17 @@ export default function AppShell({
     // No linked context: a record link without scope is ambiguous.
     if (urlRecord !== null) {
       setLinkNotice("The record link names no context — the selection was cleared.");
-      setContextId(initialContext(installId, activeIds));
+      setContextId(fallbackContext());
       writeQuery({ record: null }, { replace: true });
       return;
     }
-    setContextId(initialContext(installId, activeIds));
+    setContextId(fallbackContext());
   }, [loading, installation, activeIds, query, installId, writeQuery]);
+
+  // The default selection, without persisting an empty choice when
+  // this installation has no active contexts to choose from.
+  const fallbackContext = () =>
+    activeIds.length > 0 ? initialContext(installId, activeIds) : "";
 
   const pickContext = useCallback(
     (next: string) => {
@@ -232,12 +259,16 @@ export default function AppShell({
 
   // The App binding for chat sends: install plus the concrete context
   // the shell owns (generic outlet) or the workspace screen owns
-  // (social, via its own remembered selection). Empty context sends
-  // plain chat — there is no App scope to bind.
-  const chatApp =
-    installation?.name === "social-content"
-      ? rememberedOrNull(installId)
-      : contextId || null;
+  // (social, observed live via subscription). Empty context sends
+  // plain chat — there is no App scope to bind. A selected context
+  // that is no longer active blocks the send early with a clear
+  // message; the server re-proves every binding on send regardless.
+  const binding = chatBinding({
+    installId,
+    wanted: (installation?.name === "social-content" ? socialContext || "" : contextId),
+    known: installation !== null && !loading && loadError === null,
+    activeIds,
+  });
   const scope: HostScope = { installId, contextId };
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
@@ -288,9 +319,7 @@ export default function AppShell({
           <ChatPane
             viewer={viewer}
             contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
-            appScope={
-              chatApp ? { install_id: installId, context_id: chatApp } : null
-            }
+            binding={binding}
           />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
@@ -380,8 +409,33 @@ export default function AppShell({
   );
 }
 
-function rememberedOrNull(installId: string): string | null {
-  return rememberedContext(installId) || null;
+export interface ChatScope {
+  install_id: string;
+  context_id: string;
+}
+
+export interface ChatBinding {
+  scope: ChatScope | null;
+  error: string | null;
+}
+
+/** The chat send's App scope: empty wants plain chat, a selected but
+ *  inactive context blocks early, otherwise the server proves the
+ *  binding on send. Pure — unit-tested through the mounted suite. */
+export function chatBinding({ installId, wanted, known, activeIds }: {
+  installId: string;
+  wanted: string;
+  known: boolean;
+  activeIds: string[];
+}): ChatBinding {
+  if (wanted === "") return { scope: null, error: null };
+  if (known && !activeIds.includes(wanted)) {
+    return {
+      scope: null,
+      error: `Context “${wanted}” is not active in this installation — pick a current one before sending.`,
+    };
+  }
+  return { scope: { install_id: installId, context_id: wanted }, error: null };
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
@@ -416,11 +470,11 @@ export function entryApp(payload: unknown): {
 function ChatPane({
   viewer,
   contextLabel,
-  appScope,
+  binding,
 }: {
   viewer: Viewer;
   contextLabel: string | null;
-  appScope: { install_id: string; context_id: string } | null;
+  binding: ChatBinding;
 }) {
   const thread = useQuery(resources.masterThread);
   const [draft, setDraft] = useState("");
@@ -448,11 +502,15 @@ function ChatPane({
   const send = () => {
     const body = draft.trim();
     if (!body || !canSend) return;
+    if (binding.error !== null) {
+      setSendError(binding.error);
+      return;
+    }
     const message = newMessageId();
     setSendError(null);
     resources.masterThread.write((s) => addPending(s, message, body, Date.now()));
     api
-      .threadSend(MASTER, body, message, undefined, appScope ?? undefined)
+      .threadSend(MASTER, body, message, undefined, binding.scope ?? undefined)
       .then(() => {
         resources.masterThread.write((s) => settlePending(s, message, { ok: true }));
         void resources.masterState.refresh();

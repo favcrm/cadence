@@ -4129,3 +4129,256 @@ fn cad802_thread_send_app_binding_is_server_verified() {
         "concurrent app sends stored {matching} entries"
     );
 }
+
+/// CAD-802 hint fixture: a daemon with a real PM dir plus one
+/// workspace installation and one active context, installed through
+/// the catalog path (not a fixture row).
+fn hint_daemon() -> (TempDir, TestDaemon, String, String) {
+    let root = tempfile::tempdir().unwrap();
+    let pm = cadence_agent::issue::Pm::init(&root.path().join("pm")).unwrap();
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+    let d = TestDaemon::start_opts(opts);
+    let source = root.path().join("app-source");
+    for name in [
+        "app.md",
+        "workflows/blog-post.md",
+        "rubrics/blog.md",
+        "templates/brief.md",
+        "templates/post.md",
+    ] {
+        let destination = source.join(name);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/blog-post")
+                .join(name),
+            &destination,
+        )
+        .unwrap();
+    }
+    let installed = d
+        .operator_rpc("app_workspace_install", json!({"source": source}))
+        .unwrap();
+    let install = installed["install_id"].as_str().unwrap().to_string();
+    (root, d, install, pm.dir.to_str().unwrap().to_string())
+}
+
+fn hint_context(d: &TestDaemon, install: &str, label: &str, request: &str) -> Value {
+    d.operator_rpc(
+        "app_context_create",
+        json!({"install_id": install, "label": label, "input_defaults": {}, "request_id": request}),
+    )
+    .unwrap()["context"]
+        .clone()
+}
+
+/// CAD-802: the daemon-verified App binding reaches the actual master
+/// turn as a context hint — never as authority.
+///
+/// ADVERSARIAL-FIRST (RED): `thread_send` stores the operator's exact
+/// text, but provider delivery (non-PTY body) carries a bounded hint
+/// envelope, the PTY pull carries it as receipt metadata, and the PTY
+/// notice carries a one-line segment. Unbound messages deliver byte
+/// for byte; a context revised or archived after send loses the hint
+/// (fail closed) while the message still delivers; customer record
+/// content never enters the hint.
+#[test]
+fn cad802_thread_send_app_hint_reaches_provider_and_pull_paths() {
+    let (_root, d, install, _pm) = hint_daemon();
+    d.register("lead");
+    d.wait_agent("lead", "idle", 15);
+    let context = hint_context(&d, &install, "Client", "ctx-hint-1");
+    let context_id = context["id"].as_str().unwrap().to_string();
+    let app = || json!({"install_id": install, "context_id": context_id});
+    // Customer content that must never leak into any hint.
+    let marker = "hint-leak-check-aBcDeFgH";
+    d.operator_rpc(
+        "app_record_create",
+        json!({"install_id": install, "context_id": context_id, "record_id": "customer-1",
+               "profile": {"schema": 1, "display_name": marker, "email": "leak@example.com", "tags": [], "consent": {"email": "denied"}}}),
+    )
+    .unwrap();
+
+    // The bound send stores the operator's exact words…
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "plain question", "message": "h-1", "app": app()}),
+    )
+    .unwrap();
+    d.wait_message("lead", "h-1", &["completed"], 20);
+    let entries = d
+        .rpc(
+            "thread_read",
+            json!({"alias": "lead", "after": 0, "limit": 50}),
+        )
+        .unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let stored = entries
+        .iter()
+        .find(|e| e["message"] == json!("h-1") && e["role"] == json!("operator"))
+        .expect("bound operator entry stored");
+    assert_eq!(stored["text"], json!("plain question"), "{stored}");
+    assert_eq!(
+        stored["payload"]["app"]["verified"],
+        json!(true),
+        "{stored}"
+    );
+    // …while the delivered provider turn carries the hint envelope
+    // ahead of those exact words — and none of the customer record.
+    let turn = entries
+        .iter()
+        .find(|e| e["message"] == json!("h-1") && e["kind"] == json!("turn_result"))
+        .expect("bound turn delivered");
+    let delivered = turn["text"].as_str().unwrap();
+    // The fake provider echoes the delivered prompt as
+    // `FAKE_REPLY: <prompt>` — the envelope must head the prompt.
+    assert!(
+        delivered.contains("[App context — hint only, not authorization:"),
+        "{delivered}"
+    );
+    assert!(
+        delivered.contains("hint only, not authorization"),
+        "{delivered}"
+    );
+    assert!(delivered.contains(&install), "{delivered}");
+    assert!(delivered.contains(&context_id), "{delivered}");
+    assert!(delivered.contains("Client"), "{delivered}");
+    assert!(delivered.contains("revision 1"), "{delivered}");
+    assert!(delivered.ends_with("plain question"), "{delivered}");
+    assert!(
+        !delivered.contains(marker),
+        "customer content leaked: {delivered}"
+    );
+    assert!(
+        !delivered.contains("leak@example.com"),
+        "customer content leaked: {delivered}"
+    );
+
+    // Unbound messages deliver byte for byte on every path.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "bare question", "message": "h-2"}),
+    )
+    .unwrap();
+    d.wait_message("lead", "h-2", &["completed"], 20);
+    let entries = d
+        .rpc(
+            "thread_read",
+            json!({"alias": "lead", "after": 0, "limit": 50}),
+        )
+        .unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let bare = entries
+        .iter()
+        .find(|e| e["message"] == json!("h-2") && e["kind"] == json!("turn_result"))
+        .expect("unbound turn delivered");
+    assert_eq!(bare["text"], json!("FAKE_REPLY: bare question"), "{bare}");
+
+    // The PTY pull carries the hint as receipt metadata — the pulled
+    // text stays exactly the stored body, so windows never shift.
+    let read = d.rpc("message_read", json!({"message": "h-1"})).unwrap();
+    assert_eq!(read["text"], json!("plain question"), "{read}");
+    assert_eq!(read["app_context"]["install_id"], json!(install), "{read}");
+    assert_eq!(
+        read["app_context"]["context_id"],
+        json!(context_id),
+        "{read}"
+    );
+    assert_eq!(read["app_context"]["label"], json!("Client"), "{read}");
+    assert_eq!(read["app_context"]["revision"], 1, "{read}");
+    assert!(
+        !read.to_string().contains(marker),
+        "customer content leaked: {read}"
+    );
+    let bare_read = d.rpc("message_read", json!({"message": "h-2"})).unwrap();
+    assert_eq!(bare_read["app_context"], Value::Null, "{bare_read}");
+
+    // A context revised after send loses the hint on later pulls —
+    // the stamp no longer matches — while the message itself stands.
+    d.operator_rpc(
+        "app_context_update",
+        json!({"install_id": install, "context_id": context_id, "expected_revision": 1,
+               "label": "Client Renamed", "input_defaults": {}}),
+    )
+    .unwrap();
+    let stale = d.rpc("message_read", json!({"message": "h-1"})).unwrap();
+    assert_eq!(stale["app_context"], Value::Null, "{stale}");
+    assert_eq!(stale["text"], json!("plain question"), "{stale}");
+    // A fresh send re-stamps at the new revision and hints again.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "second question", "message": "h-3", "app": app()}),
+    )
+    .unwrap();
+    d.wait_message("lead", "h-3", &["completed"], 20);
+    let fresh = d.rpc("message_read", json!({"message": "h-3"})).unwrap();
+    assert_eq!(fresh["app_context"]["revision"], 2, "{fresh}");
+    assert_eq!(
+        fresh["app_context"]["label"],
+        json!("Client Renamed"),
+        "{fresh}"
+    );
+}
+
+/// CAD-802: the PTY one-line notice carries the verified App segment
+/// for bound messages and none for unbound ones.
+#[test]
+fn cad802_thread_send_app_hint_rides_pty_notice() {
+    let (_root, d, install, _pm) = hint_daemon();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    let context = hint_context(&d, &install, "Client", "ctx-hint-pty-1");
+    let context_id = context["id"].as_str().unwrap().to_string();
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "dv1", "text": "seed the thread", "message": "t0"}),
+    )
+    .unwrap();
+    pty_report_done(&d, "dv1", "t0");
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "dv1", "text": "scoped work", "message": "n-1",
+               "app": {"install_id": install, "context_id": context_id}}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "n-1");
+    let pasted = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(pasted.contains("n-1"), "{pasted}");
+    assert!(
+        pasted.contains(&format!("[app install \"{install}\"")),
+        "{pasted}"
+    );
+    assert!(
+        pasted.contains(&format!("ctx \"{context_id}\"")),
+        "{pasted}"
+    );
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "dv1", "text": "plain followup", "message": "n-2"}),
+    )
+    .unwrap();
+    // One report-owing turn at a time (CAD-250): n-1's turn is still
+    // open here, so report it before n-2 can be claimed.
+    pty_report_done(&d, "dv1", "n-1");
+    pty_token(&d, "dv1", "n-2");
+    let pasted = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    // The pane accumulates every paste: scope the unbound assertion
+    // to n-2's own notice line.
+    let notice = pasted
+        .lines()
+        .find(|line| line.contains("n-2 from operator"))
+        .expect("unbound notice pasted");
+    assert!(
+        !notice.contains("[app install"),
+        "unbound notice carried a hint: {notice}"
+    );
+}

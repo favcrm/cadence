@@ -111,7 +111,7 @@ await rejected(
 // single context owner, verified send binding, neutral outlet copy.
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
@@ -170,6 +170,7 @@ const contextsFor: Record<string, unknown> = {
   ] },
   "install-social": { contexts: [
     { id: "ctx-brand", install_id: "install-social", revision: 1, state: "active", digest: "cs", config: { schema: 1, label: "Brand", input_defaults: {} } },
+    { id: "ctx-beta", install_id: "install-social", revision: 1, state: "active", digest: "cb2", config: { schema: 1, label: "Beta brand", input_defaults: {} } },
   ] },
 };
 const thread = {
@@ -221,6 +222,14 @@ async function fill(selector: string, value: string) {
 }
 const panes = () => host.querySelectorAll("[data-chat-pane]").length;
 const boxes = () => host.querySelectorAll("#app-shell-chat-box").length;
+async function settle(check: () => void) {
+  for (let i = 0; i < 25; i++) {
+    await flush();
+    try { check(); return; } catch { /* keep polling */ }
+  }
+  await flush();
+  check();
+}
 
 // A new browser: no stored preference, no scope in the link.
 win.sessionStorage.clear();
@@ -329,23 +338,85 @@ equal(panes(), 1, "install switch keeps one chat pane");
 equal(eventSources, 1, "install switch opens no second stream");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
 
+// chatBinding: empty wants plain chat, inactive blocks early with the
+// server as final proof, active or unknown binds for the daemon.
+const chatBinding = AppShellModule.chatBinding;
+equal(chatBinding({ installId: "i", wanted: "", known: true, activeIds: ["a"] }), { scope: null, error: null }, "empty scope sends plain chat");
+equal(chatBinding({ installId: "i", wanted: "a", known: true, activeIds: ["a", "b"] }).scope, { install_id: "i", context_id: "a" }, "active scope binds");
+equal(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"] }).scope, null, "stale scope binds nothing");
+assert(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"] }).error?.includes("not active"), "stale scope explains itself");
+equal(chatBinding({ installId: "i", wanted: "gone", known: false, activeIds: [] }).scope, { install_id: "i", context_id: "gone" }, "unknown receipts defer to the server");
+
 // Social-content owns its context selector: the shell shows none and
 // claims no context in the chat label. The existing mounted social
 // flow (workspaceAppView suite) proves that selector still works.
+// The stub below mimics WorkspaceApp's picker exactly (local state +
+// rememberContext, no parent rerender): the shell must observe the
+// switch in the same tab and send the new scope immediately.
+const { rememberContext: rememberCtx } = require("../src/features/workspace-apps/contextSelection");
+function StubPicker({ installId }: { installId: string }) {
+  const [value, setValue] = React.useState("");
+  return React.createElement("div", null,
+    React.createElement("label", { htmlFor: "brand" }, "Optional brand context"),
+    React.createElement("select", {
+      id: "brand", value,
+      onChange: (e: any) => { setValue(e.target.value); rememberCtx(installId, e.target.value); },
+    },
+      React.createElement("option", { value: "" }, "No brand context"),
+      React.createElement("option", { value: "ctx-brand" }, "Brand"),
+      React.createElement("option", { value: "ctx-beta" }, "Beta brand")));
+}
+// A stale remembered scope blocks the send before anything posts.
+win.sessionStorage.setItem("cadence.workspace-app.context.install-social", "ctx-gone");
 await React.act(async () => {
   root.render(React.createElement(AppShell, {
     installId: "install-social",
     viewer: { operator: true, readOnly: false },
-    children: React.createElement("div", null,
-      React.createElement("label", { htmlFor: "brand" }, "Optional brand context"),
-      React.createElement("select", { id: "brand" },
-        React.createElement("option", null, "Brand"))),
+    children: React.createElement(StubPicker, { installId: "install-social" }),
   }));
 });
 await flush(); await flush(); await flush();
 assert(!host.querySelector('[aria-label="App context"]'), "no second shell selector beside the workspace one");
 assert(host.querySelector("#brand"), "the workspace keeps its own selector");
 assert(text().includes("managed inside the workspace screen"), "shell display defers to the workspace owner");
+posts.length = 0;
+await fill("#app-shell-chat-box", "stale scope question");
+await click(host.querySelector(".app-chat-form button[type=submit]"));
+await flush();
+assert(!posts.some((p) => p.path === "/api/threads/master/messages"), "stale social scope posts nothing");
+assert(text().includes("not active"), "stale social scope explains itself");
+// The workspace picker switches scope; the shell's immediate next
+// send carries the new context ID with no intervening navigation.
+const brand = host.querySelector("#brand") as HTMLSelectElement;
+await React.act(async () => {
+  const proto = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!;
+  proto.set!.call(brand, "ctx-beta");
+  brand.dispatchEvent(new Event("change", { bubbles: true }));
+});
+await flush();
+posts.length = 0;
+await fill("#app-shell-chat-box", "beta scope question");
+await click(host.querySelector(".app-chat-form button[type=submit]"));
+await flush();
+const socialPost = posts.find((p) => p.path === "/api/threads/master/messages");
+assert(socialPost, "social chat send posted");
+equal(socialPost?.body.app, { install_id: "install-social", context_id: "ctx-beta" }, "send carries the just-picked scope, never the stale one");
+// Switching installation clears the stale social scope: the next
+// install sends its own scope, never the social one.
+await React.act(async () => {
+  root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
+});
+await settle(() => assert(
+  host.querySelector('[aria-label="App context"]')?.textContent?.includes("Only"),
+  "second install adopts its sole active context",
+));
+posts.length = 0;
+await fill("#app-shell-chat-box", "second install question");
+await click(host.querySelector(".app-chat-form button[type=submit]"));
+await flush();
+const secondPost = posts.find((p) => p.path === "/api/threads/master/messages");
+assert(secondPost, "second install send posted");
+equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-only" }, "install switch clears stale social scope");
 
 await React.act(async () => { root.unmount(); });
 console.log("app shell checks passed");

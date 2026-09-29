@@ -372,6 +372,15 @@ impl Shared {
             .min(MESSAGE_READ_LIMIT as u64) as usize;
         let total = message.body.chars().count();
         let text: String = message.body.chars().skip(offset).take(limit).collect();
+        // CAD-802: the verified App hint as receipt metadata — the
+        // pulled text stays exactly the stored body (offsets stable).
+        // A hint that cannot be re-proved is null, never an error.
+        let app_context = self
+            .store
+            .message_app(&message.id)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
         Ok(json!({
             "message": message.id,
             "text": text,
@@ -379,6 +388,7 @@ impl Shared {
             "limit": limit,
             "chars_total": total,
             "truncated": offset + text.chars().count() < total,
+            "app_context": app_context,
         }))
     }
 
