@@ -61,9 +61,8 @@
 //!   caches, the PM tracker and its own dir under the state dir —
 //!   reads the toolchain and system trees, and denies every `$HOME`
 //!   secret (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
-//!   cargo `credentials.toml`, `~/.local/share` itself) — except the
-//!   single Devin provider-auth file, and only for workers whose
-//!   effective model is a Devin provider model (CAD-751) — every other agent's dir and the daemon store
+//!   cargo `credentials.toml`, `~/.local/share` itself, and Devin
+//!   credentials) — every other agent's dir and the daemon store
 //!   by omission. `TMPDIR` is redirected into the worker dir (a shared
 //!   `/tmp` grant would expose every lane, and a denied one makes
 //!   rustc retry for ~1s) and `GIT_CONFIG_GLOBAL` at the worker's own
@@ -755,11 +754,9 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
 ///   an unreadable config (proven), and this file carries the
 ///   rustc-wrapper/source-mirror settings builds need. Cargo's
-///   `credentials.toml` (registry tokens) is never in the policy;
-///   the Devin CLI login (`~/.local/share/devin/credentials.toml`)
-///   is the one deliberate exception — read-only, the single file,
-///   never its parents, and only for workers whose effective model
-///   is a Devin provider model (CAD-751). The pinned `[pi].providers`
+///   `credentials.toml` (registry tokens) and the Devin CLI login
+///   (`~/.local/share/devin/credentials.toml`) are never granted.
+///   The pinned `[pi].providers`
 ///   package dirs the `-e` argv loads (CAD-559).
 /// - **denied** by omission: `$HOME` itself and everything under it
 ///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
@@ -771,19 +768,39 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 /// `GIT_CONFIG_GLOBAL` is redirected to the worker's own file by
 /// `open` (git fatals on an unreadable `~/.gitconfig` — proven).
 ///
-/// CAD-751: does this worker run a Devin provider model? Only those
-/// workers are granted the read of the Devin CLI login — every other
-/// confined worker is denied the file, so a non-Devin worker never
-/// gains the operator's Devin credential. The provider namespace is
-/// the part before the first `/` (the same convention
-/// `pi_policy::require_allowed` uses); a bare id names no provider
-/// and earns no grant — confined Devin workers use `devin/<model>`
-/// form.
-fn worker_uses_devin_model(params: &Value) -> bool {
-    params
-        .get("model")
-        .and_then(Value::as_str)
-        .is_some_and(|m| m.starts_with("devin/"))
+/// A confined managed Pi worker cannot use the Devin provider: pi-devin
+/// reads the operator's login file on every turn, and granting that file
+/// to a worker would let its tools copy or transmit the credential.
+/// Call this before persisting a registration, changing a launch model,
+/// dispatching work, and opening an existing row.
+pub fn refuse_confined_devin(alias: &str, confined: bool, model: &str) -> Result<()> {
+    if confined && model.starts_with("devin/") {
+        return Err(Error::rejected(format!(
+            "pi worker '{alias}' cannot use model '{model}' while confined: \
+             pi-devin requires the operator's Devin credential, which a confined \
+             worker cannot safely read. Choose a non-Devin model or have the \
+             operator register an unconfined worker (CAD-751)"
+        )));
+    }
+    Ok(())
+}
+
+pub fn refuse_confined_devin_agent(agent: &Agent) -> Result<()> {
+    if agent.provider == "pi"
+        && agent.endpoint_kind == "managed"
+        && !crate::master::is_master(&agent.alias)
+    {
+        let params = agent.params.as_ref().unwrap_or(&Value::Null);
+        refuse_confined_devin(
+            &agent.alias,
+            params.get("confine").and_then(Value::as_bool) == Some(true),
+            params
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )?;
+    }
+    Ok(())
 }
 pub fn pi_worker_confinement(
     env: &ProviderEnv,
@@ -910,31 +927,7 @@ pub fn pi_worker_confinement(
         read.push(home.join(".config/sccache"));
         read.push(home.join(".ssh/config"));
         read.push(home.join(".ssh/known_hosts"));
-        // CAD-751: the pinned pi-devin provider (0.2.1) derives its
-        // OAuth auth from the operator's Devin CLI login on EVERY
-        // turn — `readCredentials()` opens
-        // `$HOME/.local/share/devin/credentials.toml` via
-        // `os.homedir()`, ignoring `XDG_DATA_HOME` (on this host
-        // `XDG_DATA_HOME` is unset, so both conventions coincide) —
-        // and under Landlock that read EACCES'd, failing bootstrap
-        // and every dispatch with "OAuth auth derivation failed for
-        // devin". The grant is the single credential FILE,
-        // read-only, scoped to Devin-model workers
-        // ([`worker_uses_devin_model`]): `~/.local/share`,
-        // `~/.local/share/devin` and every sibling stay denied, as
-        // do cargo registry tokens and every other login. A missing
-        // file is skipped by `cadence confine` (never widened to its
-        // parent). Cadence itself never reads or copies these bytes
-        // into logs, events, argv or worktrees — the grant names the
-        // path only. Residual risk, accepted: Landlock is a
-        // filesystem boundary, not a capability sandbox, so a model
-        // with this granted read could exfiltrate the bytes through
-        // its own worktree writes or task output; the canary sweep in
-        // `tests/pi_worker_confinement.rs` guards the ordinary path
-        // only.
-        if worker_uses_devin_model(&params) {
-            read.push(home.join(".local/share/devin/credentials.toml"));
-        }
+        // Devin login remains outside every worker's filesystem policy.
     }
     // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
     // named explicitly so the write set shows it — it is inside the
@@ -1962,6 +1955,7 @@ impl ProviderAdapter for PiAdapter {
     /// `set_thinking_level` and is verified against `get_state`, since
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
+        refuse_confined_devin_agent(agent)?;
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator

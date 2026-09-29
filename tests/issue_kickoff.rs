@@ -110,6 +110,50 @@ fn msg(err: impl ToString) -> String {
     err.to_string()
 }
 
+/// A configured confined Devin worker is refused before issue start,
+/// including racing requests. Existing caller-proof tests below cover
+/// agent, detached-child and forged-field attempts at this same RPC.
+#[test]
+fn confined_devin_kickoff_leaves_issue_and_lane_unchanged() {
+    let lab = Lab::new();
+    let (ok, _, err) = lab.cli(&["issue", "new", "Safe", "--project", "demo"]);
+    assert!(ok, "{err}");
+    lab.accept("D-1");
+    let pm_yaml = lab.pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("\nhost:\n  confine_pi_workers: true\npi:\n  models:\n    allow: [\"devin/swe-2-high\"]\n    default: {worker: \"devin/swe-2-high\"}\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let before = std::fs::read_to_string(lab.pm_dir.join("demo/D-1/issue.md")).unwrap();
+
+    thread::scope(|s| {
+        for alias in ["unsafe-a", "unsafe-b"] {
+            let d = &lab.d;
+            s.spawn(move || {
+                let err = d
+                    .operator_rpc(
+                        "issue_kickoff",
+                        json!({
+                            "issue": "D-1", "group": "pm", "provider": "pi", "alias": alias
+                        }),
+                    )
+                    .unwrap_err();
+                assert!(msg(err).contains("Choose a non-Devin model"));
+            });
+        }
+    });
+    assert!(lab.lanes().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(lab.pm_dir.join("demo/D-1/issue.md")).unwrap(),
+        before
+    );
+    for alias in ["unsafe-a", "unsafe-b"] {
+        assert!(lab
+            .d
+            .operator_rpc("agent_show", json!({"alias": alias}))
+            .is_err());
+    }
+}
+
 /// Agent, detached child, and forged identity fields never open a lane.
 #[test]
 fn cad606_kickoff_refuses_agent_detached_and_forged_fields() {

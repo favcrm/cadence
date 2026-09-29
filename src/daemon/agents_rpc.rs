@@ -143,6 +143,12 @@ impl Shared {
                     // instead of naming it explicit.
                     Some(model) => {
                         crate::pi_policy::require_allowed(policy.as_ref(), role_key, &model)?;
+                        crate::adapter::pi::refuse_confined_devin(
+                            alias,
+                            parsed.get("confine").and_then(Value::as_bool) == Some(true)
+                                && role_key == "worker",
+                            &model,
+                        )?;
                         parsed
                     }
                     // Nothing resolved — `[pi].models.default` fills
@@ -153,6 +159,12 @@ impl Shared {
                     None => {
                         let model =
                             crate::pi_policy::resolve_model(policy.as_ref(), role_key, None)?;
+                        crate::adapter::pi::refuse_confined_devin(
+                            alias,
+                            parsed.get("confine").and_then(Value::as_bool) == Some(true)
+                                && role_key == "worker",
+                            &model,
+                        )?;
                         let mut merged = match resolved.params.as_deref() {
                             Some(raw) => serde_json::from_str::<Value>(raw)?
                                 .as_object()
@@ -388,6 +400,21 @@ impl Shared {
                     ))
                 }
             }
+        }
+        if agent.provider == "pi" && agent.endpoint_kind == "managed" {
+            let mut effective = agent.params.clone().unwrap_or_else(|| json!({}));
+            if let (Some(current), Some(changes)) = (effective.as_object_mut(), patch.as_object()) {
+                current.extend(changes.clone());
+            }
+            crate::adapter::pi::refuse_confined_devin(
+                &alias,
+                effective.get("confine").and_then(Value::as_bool) == Some(true)
+                    && !crate::master::is_master(&alias),
+                effective
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )?;
         }
         let mut audit = caller_audit(&caller);
         audit["caller_pid"] = json!(peer_pid);

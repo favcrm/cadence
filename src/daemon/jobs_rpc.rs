@@ -285,6 +285,11 @@ impl Shared {
             .transpose()?;
         let by = required_str(params, "by")?;
         self.plan_gate_task(required_str(params, "task")?)?;
+        let pending = self.store.task(required_str(params, "task")?)?;
+        if let Some(alias) = to.as_deref().or(pending.assignee.as_deref()) {
+            let target = self.store.agent(alias)?;
+            crate::adapter::pi::refuse_confined_devin_agent(&target)?;
+        }
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
             required_str(params, "task")?,
             to.as_deref(),

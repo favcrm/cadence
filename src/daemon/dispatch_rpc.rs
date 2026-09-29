@@ -79,6 +79,7 @@ impl Shared {
             .store
             .agent_opt(&alias)?
             .ok_or_else(|| Error::rejected(format!("{VERB}: unknown agent '{alias}'")))?;
+        crate::adapter::pi::refuse_confined_devin_agent(&target)?;
         if target.endpoint_kind == "pty" && crate::adapter::pty::has_control_chars(text) {
             return Err(Error::rejected(
                 "PTY messages must be a single line without control characters \
@@ -425,6 +426,45 @@ impl Shared {
         // so a reserved name never opens a worktree.
         crate::master::refuse_reserved_alias(&alias)?;
 
+        // `issue start` creates a lane before `rpc_register` runs. Apply
+        // the same effective-model gate here so a refused configuration
+        // leaves no worktree or issue side effect behind.
+        if provider == "pi" && kind == "managed" {
+            let pm_dir = self.pm_dir()?;
+            let confined = crate::doctor::host::read_host_overrides(&pm_dir)
+                .map_err(Error::rejected)?
+                .and_then(|o| o.confine_pi_workers)
+                == Some(true);
+            if confined {
+                let defaults = self.store.model_defaults()?;
+                let requested = model.map(|m| json!({"model": m}).to_string());
+                let selected =
+                    crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+                        provider,
+                        endpoint_kind: kind,
+                        runtime_role: "worker",
+                        team_role: None,
+                        model_policy: None,
+                        params: requested.as_deref(),
+                        config: &defaults.config,
+                        revision: defaults.revision,
+                    })?;
+                let effective = selected
+                    .model_selection
+                    .as_ref()
+                    .and_then(|s| s.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let effective = match effective {
+                    Some(m) => m,
+                    None => {
+                        let policy = crate::pi_policy::read(&pm_dir)?;
+                        crate::pi_policy::resolve_model(policy.as_ref(), "worker", None)?
+                    }
+                };
+                crate::adapter::pi::refuse_confined_devin(&alias, true, &effective)?;
+            }
+        }
         let start_args = issue::start::StartArgs {
             repo: None,
             name: None,
