@@ -1,0 +1,103 @@
+import type { Connection, ConnectionProvider } from "../../lib/types";
+
+/**
+ * The Settings Connections page's view of provider connections
+ * (CAD-585) — the adapters between the `/api/connection-providers` and
+ * `/api/connections` rows and what the page and the app pickers need,
+ * kept pure so the rules are unit-tested in plain node
+ * (tests/connections.test.ts).
+ *
+ * Every helper reads metadata only: rows never carry secret bytes, and
+ * nothing here stores a token.
+ */
+
+/** Is this the built-in Local outbox — always present, provider local. */
+export function isLocalOutbox(row: Pick<Connection, "provider" | "account">): boolean {
+  return row.provider === "local" && row.account === "local";
+}
+
+/** The connection's plain name: "Local outbox", else `provider · account`. */
+export function connectionLabel(row: Pick<Connection, "provider" | "account">): string {
+  if (isLocalOutbox(row)) return "Local outbox";
+  return `${row.provider} · ${row.account}`;
+}
+
+/** Is this connection usable — registered, described and in custody? */
+export function isAvailable(row: Connection): boolean {
+  return (
+    row.status.adapter_registered === true &&
+    row.status.descriptor_available === true &&
+    row.status.custody_available === true
+  );
+}
+
+/** Can the operator rotate or revoke it — only enrolled credentials. */
+export function canManage(row: Pick<Connection, "kind">): boolean {
+  return row.kind === "enrolled";
+}
+
+/** The deployment pin in plain words — a declaration, never a probe. */
+export function pinWord(status: Pick<Connection["status"], "manifest_status">): string {
+  switch (status.manifest_status) {
+    case "matched":
+      return "reviewed contract matches the deployment";
+    case "missing":
+      return "deployment has no reported contract to compare";
+    default:
+      return "deployment differs from the reviewed contract";
+  }
+}
+
+/** The connection's readiness in one plain line. */
+export function readinessText(row: Connection): string {
+  if (isLocalOutbox(row)) return "Built-in — always present, no credential to manage.";
+  if (!row.status.adapter_registered) return "Provider is not registered on this daemon.";
+  if (!row.status.descriptor_available)
+    return "Provider has no reviewed descriptor — unavailable.";
+  if (row.kind === "enrolled" && !row.status.custody_available)
+    return "Credential is missing from custody.";
+  return pinWord(row.status);
+}
+
+/**
+ * The connections an app slot picker may offer (CAD-585): the usable
+ * ones, Local outbox first, then enrolled accounts by provider. Rows
+ * that are not usable are excluded — the picker names their count so
+ * the operator knows to look in Settings → Connections.
+ */
+export function pickerConnections(rows: Connection[]): {
+  offered: Connection[];
+  withheld: number;
+} {
+  const offered = rows
+    .filter(isAvailable)
+    .sort((a, b) => {
+      const local = Number(isLocalOutbox(b)) - Number(isLocalOutbox(a));
+      if (local !== 0) return local;
+      const byProvider = a.provider.localeCompare(b.provider);
+      if (byProvider !== 0) return byProvider;
+      return a.account.localeCompare(b.account);
+    });
+  return { offered, withheld: rows.length - offered.length };
+}
+
+/** The provider's capabilities in plain words — "blog.publish, social.post". */
+export function capabilityWords(provider: ConnectionProvider): string | null {
+  const caps = provider.descriptor?.capabilities ?? [];
+  if (caps.length === 0) return null;
+  return caps.map((c) => c.id).join(", ");
+}
+
+/** Can this provider enroll a token — the only shape the wizard offers. */
+export function acceptsToken(provider: ConnectionProvider): boolean {
+  return (provider.descriptor?.enrollment_shapes ?? []).includes("token");
+}
+
+/** The wizard's scope hint: the union of the reviewed capability scopes. */
+export function scopeHint(provider: ConnectionProvider): string[] {
+  const seen = new Set<string>();
+  for (const cap of provider.descriptor?.capabilities ?? []) {
+    for (const scope of cap.scopes ?? []) seen.add(scope);
+  }
+  return [...seen].sort();
+}

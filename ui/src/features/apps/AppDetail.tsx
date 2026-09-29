@@ -15,6 +15,7 @@ import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import SectionTabs from "../../ui/SectionTabs";
 import Md from "../../ui/Md";
+import { SlotConnectionPicker } from "../settings/Connections";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconClose } from "../../ui/icons";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -428,6 +429,14 @@ function SettingsTab({
   const action = primaryAction(app);
   const wf = action?.wf ?? (app.workflows ?? [])[0];
   const slots = usedSlots(app);
+  // The operator's connections, for the per-slot compatible picker
+  // (CAD-585): fetched only when the board proves the operator, like
+  // the outputs read above.
+  const connRes = viewer.operator ? resources.connections : null;
+  const connState = useMaybeResource(connRes);
+  useEffect(() => {
+    if (connRes) void connRes.revalidate();
+  }, [connRes]);
   return (
     <div className="app-settings min-w-0">
       {wf && <TeamEditor app={app} wf={wf} runs={runs} viewer={viewer} />}
@@ -435,12 +444,24 @@ function SettingsTab({
       {slots.length > 0 && (
         <section className="card px-4 py-3.5 min-w-0" aria-label="publishing">
           <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Publishing</h2>
-          <ul className="space-y-1">
-            {slots.map((slot) => (
-              <li key={slot} className="text-label text-ink-200">
-                Publishes to: <span className="text-ink-100">{publishTarget(app, slot)}</span>
-              </li>
-            ))}
+          <ul className="space-y-2">
+            {slots.map((slot) => {
+              const bound = (app.connections ?? []).find((c) => c.slot === slot)?.bound ?? null;
+              return (
+                <li key={slot} className="text-label text-ink-200 min-w-0">
+                  Publishes to: <span className="text-ink-100">{publishTarget(app, slot)}</span>
+                  {viewer.operator && (
+                    <SlotConnectionPicker
+                      project={app.project}
+                      app={app.name}
+                      slot={slot}
+                      bound={bound}
+                      connections={connState?.data ?? null}
+                    />
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}

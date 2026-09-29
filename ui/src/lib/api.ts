@@ -8,6 +8,9 @@ import type {
   AppOutputsPayload,
   AppRunsPayload,
   AppsPayload,
+  ConnectionPayload,
+  ConnectionProvidersPayload,
+  ConnectionsPayload,
   Health,
   IssueCard,
   IssueDetail,
@@ -478,6 +481,54 @@ export const api = {
   /** `GET /api/outbox?effect_id=` — one item, rendered post included. */
   outboxItem: (effectId: string) =>
     get<OutboxDetail>(`/api/outbox?effect_id=${encodeURIComponent(effectId)}`),
+  /**
+   * `GET /api/connection-providers` — every registered provider with
+   * its reviewed descriptor (CAD-688). Operator-only: the Settings
+   * Connections page fetches it only when the board proves the
+   * operator, so a viewer without the read never sees a 403.
+   */
+  connectionProviders: () => get<ConnectionProvidersPayload>("/api/connection-providers"),
+  /** `GET /api/connections` — every exact provider account (operator-only). */
+  connections: () => get<ConnectionsPayload>("/api/connections"),
+  /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
+  connection: (id: string) =>
+    get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),
+  /**
+   * `POST /api/connections` — enroll a scoped token for a supported
+   * provider (CAD-688). Operator-only. The token crosses this one
+   * request into daemon custody; the caller clears it immediately and
+   * never stores it.
+   */
+  connectionCreate: (body: {
+    provider: string;
+    account: string;
+    shape: "token";
+    token: string;
+    scopes: string[];
+    accept_same_uid_risk?: boolean;
+  }) => post<ConnectionPayload>("/api/connections", body),
+  /**
+   * `POST /api/connections/<id>/rotate` — replace the credential,
+   * preserving the connection's identity (operator-only). Omitting
+   * `scopes` keeps the current scopes.
+   */
+  connectionRotate: (
+    id: string,
+    body: { token: string; scopes?: string[]; accept_same_uid_risk?: boolean },
+  ) => post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/rotate`, body),
+  /** `POST /api/connections/<id>/revoke` — revoke it (operator-only). */
+  connectionRevoke: (id: string) =>
+    post<{ connection_id: string; revoked: boolean }>(
+      `/api/connections/${encodeURIComponent(id)}/revoke`,
+      {},
+    ),
+  /**
+   * `POST /api/connections/<id>/status` — the local configuration
+   * check (operator-only). It inspects local configuration only: it
+   * sends no provider effect and proves no upstream connectivity.
+   */
+  connectionCheck: (id: string) =>
+    post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/status`, {}),
   /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query

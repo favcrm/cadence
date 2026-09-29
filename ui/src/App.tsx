@@ -15,6 +15,7 @@ import MasterPermissions from "./features/settings/MasterPermissions";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
+import Connections from "./features/settings/Connections";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
@@ -920,6 +921,7 @@ export default function App() {
             label="settings"
             tabs={[
               { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
+              { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
               ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
@@ -935,6 +937,9 @@ export default function App() {
           <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
+        {route.screen === "settings" && route.section === "connections" && (
+          <Connections viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
         {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={{ readOnly, operator: meta?.operator === true }} />
