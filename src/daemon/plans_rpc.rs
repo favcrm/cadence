@@ -378,6 +378,14 @@ impl Shared {
     /// commit, whose `git add -A` may sweep in an agent's edit); readers
     /// and stage moves apply the keys only while the file still matches
     /// it. Operator only, connection-bound like `plan approve`.
+    ///
+    /// CAD-826: the same approval covers the `delivery:` policy — the
+    /// daemon reads the section itself and records the resolved policy
+    /// and its digest (the policy `null` and the digest of the default
+    /// policy when there is no section). A malformed `delivery:`
+    /// refuses the whole approval. Params named `delivery` or
+    /// `delivery_digest` are ignored — both fields come only from the
+    /// file, so a caller cannot forge the approved policy.
     pub(super) fn rpc_project_work_approve(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("project work approve", params, peer_pid)?;
         let project = required_str(params, "project")?;
@@ -390,12 +398,28 @@ impl Shared {
             return Err(crate::issue::project::unknown_project(project, &pm_dir));
         }
         let cfg = crate::issue::work::load_config(&pm_dir, project)?;
+        // A malformed delivery: section refuses the whole approval.
+        let delivery = crate::issue::delivery_policy::load(&pm_dir, project)?;
+        let (delivery_json, delivery_digest) = match &delivery {
+            Some(p) => (
+                serde_json::to_value(p).unwrap_or(Value::Null),
+                crate::issue::delivery_policy::digest(p),
+            ),
+            None => (
+                Value::Null,
+                crate::issue::delivery_policy::digest(
+                    &crate::issue::delivery_policy::default_policy(),
+                ),
+            ),
+        };
         let payload = json!({
             "project": project,
             "digest": crate::issue::work::gate_digest(&cfg),
             "stages": cfg.stage_ids(),
             "operator_stages": cfg.operator_stages,
             "default": crate::issue::work::gates_default(&cfg),
+            "delivery": delivery_json,
+            "delivery_digest": delivery_digest,
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
         });

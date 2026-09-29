@@ -24,17 +24,21 @@ impl Lint {
 }
 
 pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
-    run_with(pm, only_project, None)
+    run_with(pm, only_project, None, None)
 }
 
 /// [`run`] with the operator's work-gate approvals when the caller has
 /// them (`issue lint` asks the daemon). Without them (the commit hook,
 /// sync, doctor) custom gate keys are warned about as possibly
 /// unapproved and stages are checked against the file's own list.
+/// `delivery_approvals` is the same for the CAD-826 `delivery:`
+/// policy: the approved policy half of each `project_work_approve`
+/// payload.
 pub fn run_with(
     pm: &Pm,
     only_project: Option<&str>,
     approvals: Option<&crate::issue::work::Approvals>,
+    delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
 ) -> Result<Value> {
     let mut lint = Lint {
         errors: vec![],
@@ -100,6 +104,33 @@ pub fn run_with(
             crate::issue::areas::load_or_error(&pm.dir, &project.key),
         ) {
             lint.warn(format!("{err} — area checks are skipped"));
+        }
+        // CAD-826: a malformed `delivery:` is a warning — every reader
+        // falls back and the section is unenforceable until it parses
+        // and the operator approves it. A custom section takes effect
+        // only while it matches the approval.
+        use crate::issue::delivery_policy as dp;
+        let file = dp::load(&pm.dir, &project.key);
+        match delivery_approvals {
+            Some(ap) => {
+                let eff = dp::effective(&project.key, file, ap.get(&project.key));
+                if let Some(note) = eff.note {
+                    lint.warn(note);
+                }
+            }
+            None => match file {
+                Err(e) => lint.warn(format!("{e} — the default delivery policy applies")),
+                Ok(Some(p)) if dp::digest(&p) != dp::digest(&dp::default_policy()) => {
+                    lint.warn(format!(
+                        "{}/PROJECT.md: delivery: differs from the defaults — it \
+                         applies only if the operator approved exactly this ({}); \
+                         `cadence issue lint` checks the approval",
+                        project.key,
+                        dp::digest(&p)
+                    ));
+                }
+                _ => {}
+            },
         }
     }
     // CAD-339: `<pm>/agents/` holds the agent files — never a project.

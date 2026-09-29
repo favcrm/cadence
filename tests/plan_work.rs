@@ -3956,6 +3956,203 @@ fn work_model_unapproved_gate_edits_fall_back_to_defaults() {
     assert!(stage()["config_unapproved"].is_string());
 }
 
+/// CAD-826 (CAD-814 slice 1): `project_work_approve` records the
+/// resolved `delivery:` policy and its digest — computed by the daemon
+/// from the file, never from a param — and refuses while the section
+/// is malformed. Until CAD-814 slice 2 nothing consumes it; readers
+/// report `source`/`digest`/`note`.
+#[test]
+fn delivery_policy_approval_and_resolution() {
+    use cadence_agent::issue::delivery_policy::{default_policy, digest, DeliveryPolicy};
+    let f = PlanFixture::start();
+    let project_md = f.pm_dir.join("demo/PROJECT.md");
+    let delivery_yaml = concat!(
+        "delivery:\n",
+        "  max_revise: 5\n",
+        "  reviews:\n",
+        "    review: {kind: agent, focus: general}\n",
+        "    gate: {kind: operator}\n",
+        "  risk:\n",
+        "    - require: [review]\n",
+        "    - when: {paths: [\"ui/**\"]}\n",
+        "      require: [review, gate]\n",
+    );
+    let file_policy: DeliveryPolicy =
+        cadence_agent::issue::delivery_policy::parse(&format!("---\n{delivery_yaml}---\n"))
+            .unwrap()
+            .unwrap();
+    std::fs::write(
+        &project_md,
+        format!("---\nproject: demo\n{delivery_yaml}---\n# Demo\n"),
+    )
+    .unwrap();
+    let ls_delivery = |f: &PlanFixture| -> Value {
+        let (ok, out) = f.cli(&["issue", "project", "ls", "--json"]);
+        assert!(ok, "{out}");
+        out["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["key"] == "demo")
+            .unwrap()["delivery"]
+            .clone()
+    };
+
+    // A pane and a detached agent-env caller cannot approve.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "project_work_approve",
+        json!({"project": "demo"}),
+    );
+    assert!(frame_err(&r).contains("operator action"), "{r}");
+    let r = unprovable_rpc(&f.d, "project_work_approve", json!({"project": "demo"}));
+    assert!(frame_err(&r).contains("operator action"), "{r}");
+
+    // Before approval the custom section resolves as default + note.
+    let d = ls_delivery(&f);
+    assert_eq!(d["source"], "default", "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery_unapproved"),
+        "{d}"
+    );
+
+    // Forged `delivery`/`delivery_digest` params are ignored — the
+    // daemon computes both fields from the file it read.
+    let out =
+        f.d.operator_rpc(
+            "project_work_approve",
+            json!({"project": "demo", "delivery_digest": "sha256:forged",
+                   "delivery": {"max_revise": 9}}),
+        )
+        .unwrap();
+    assert_eq!(out["delivery_digest"], json!(digest(&file_policy)), "{out}");
+    let recorded: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+    assert_eq!(digest(&recorded), out["delivery_digest"].as_str().unwrap());
+    assert_eq!(recorded.max_revise, 5, "{out}");
+    let d = ls_delivery(&f);
+    assert_eq!(
+        (d["source"].as_str(), d["note"].is_null()),
+        (Some("approved"), true),
+        "{d}"
+    );
+
+    // An agent-style edit afterwards: the approved policy stays in
+    // force, reported with the old digest and a delivery_unapproved
+    // note; lint warns the same.
+    std::fs::write(
+        &project_md,
+        concat!(
+            "---\nproject: demo\ndelivery:\n  max_revise: 9\n",
+            "  reviews:\n    review: {kind: agent, focus: general}\n",
+            "  risk:\n    - require: [review]\n---\n",
+        ),
+    )
+    .unwrap();
+    let d = ls_delivery(&f);
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("changed since approval"),
+        "{d}"
+    );
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "{lint}");
+    assert!(
+        lint["warnings"].to_string().contains("delivery_unapproved"),
+        "{lint}"
+    );
+
+    // Removing the section keeps the approved policy in force.
+    std::fs::write(&project_md, "---\nproject: demo\n---\n").unwrap();
+    let d = ls_delivery(&f);
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("was removed since approval"),
+        "{d}"
+    );
+
+    // A malformed section: same resolution, and approve refuses.
+    std::fs::write(&project_md, "---\ndelivery: {risk: []}\n---\n").unwrap();
+    let d = ls_delivery(&f);
+    assert_eq!(d["source"], "approved", "{d}");
+    assert!(d["note"].as_str().unwrap().contains("malformed"), "{d}");
+    let err =
+        f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("delivery"), "{err}");
+
+    // A project without a section records `delivery: null` and the
+    // default policy's digest; a file racing the approve never yields
+    // a delivery/delivery_digest mismatch.
+    std::fs::remove_file(&project_md).unwrap();
+    let out =
+        f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+            .unwrap();
+    assert!(out["delivery"].is_null(), "{out}");
+    assert_eq!(
+        out["delivery_digest"],
+        json!(digest(&default_policy())),
+        "{out}"
+    );
+    assert_eq!(out["stages"].as_array().unwrap().len(), 5, "{out}");
+    let d = ls_delivery(&f);
+    assert_eq!(d["source"], "default", "{d}");
+    assert!(d["note"].is_null(), "{d}");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let pm = project_md.clone();
+    let writer = thread::spawn(move || {
+        let mut flip = false;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let base = "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                        risk: [{require: [r]}]";
+            let yaml = if flip {
+                format!("---\n{base}, max_revise: 3}}\n---\n")
+            } else {
+                format!("---\n{base}, max_revise: 4}}\n---\n")
+            };
+            let _ = std::fs::write(&pm, yaml);
+            flip = !flip;
+        }
+    });
+    for _ in 0..10 {
+        let out =
+            f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+                .unwrap();
+        if out["delivery"].is_null() {
+            assert_eq!(
+                out["delivery_digest"],
+                json!(digest(&default_policy())),
+                "{out}"
+            );
+        } else {
+            let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+            assert_eq!(
+                out["delivery_digest"].as_str().unwrap(),
+                digest(&p),
+                "{out}"
+            );
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
 // ---- CAD-358: `cadence project new` ----
 
 /// CAD-358: `cadence project new <key> --repo <path>` registers the repo
