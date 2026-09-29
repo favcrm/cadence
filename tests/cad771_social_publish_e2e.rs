@@ -117,6 +117,9 @@ struct FakeDoor {
     /// Adversarial hook: when set, ok responses carry a mismatched
     /// binding (different destination/caption) under the same key.
     corrupt_binding: Arc<std::sync::atomic::AtomicBool>,
+    /// Adversarial hook: forged status outcomes keyed by stable key. A
+    /// hostile provider answering the same key with a foreign binding.
+    status_forgeries: Arc<Mutex<HashMap<String, Value>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -131,12 +134,14 @@ impl FakeDoor {
         let expected_destination = Arc::new(Mutex::new(None));
         let omit_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let corrupt_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let status_forgeries = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
         let worker_expected = Arc::clone(&expected_destination);
         let worker_omit = Arc::clone(&omit_binding);
+        let worker_forgeries = Arc::clone(&status_forgeries);
         let worker_corrupt = Arc::clone(&corrupt_binding);
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
@@ -148,15 +153,15 @@ impl FakeDoor {
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap_or(0);
                 let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                let reply = Self::route(
-                    &worker_grants,
-                    &worker_ledger,
-                    &worker_expected,
-                    &worker_omit,
-                    &worker_corrupt,
-                    request.url(),
-                    &value,
-                );
+                let shared = DoorShared {
+                    grants: &worker_grants,
+                    ledger: &worker_ledger,
+                    expected: &worker_expected,
+                    omit_binding: &worker_omit,
+                    corrupt_binding: &worker_corrupt,
+                    forgeries: &worker_forgeries,
+                };
+                let reply = Self::route(&shared, request.url(), &value);
                 let _ = request.respond(tiny_http::Response::from_string(reply.to_string()));
             }
         });
@@ -168,6 +173,7 @@ impl FakeDoor {
             expected_destination,
             omit_binding,
             corrupt_binding,
+            status_forgeries,
             stop,
             worker: Some(worker),
         }
@@ -183,21 +189,21 @@ impl FakeDoor {
             .store(corrupt, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Hostile provider: answer one stable key with a forged outcome.
+    fn forge_status(&self, key: &str, outcome: Value) {
+        self.status_forgeries
+            .lock()
+            .unwrap()
+            .insert(key.into(), outcome);
+    }
+
     fn expect_destination(&self, destination_id: &str) {
         *self.expected_destination.lock().unwrap() = Some(destination_id.into());
     }
 
     /// Native-vs-HTTP parity core: the HTTP door reaches exactly the verdicts
     /// the native [`FakePublishLedger`] gate computes for the same binding.
-    fn route(
-        grants: &Mutex<GrantAuthority>,
-        ledger: &FakePublishLedger,
-        expected: &Mutex<Option<String>>,
-        omit_binding: &std::sync::atomic::AtomicBool,
-        corrupt_binding: &std::sync::atomic::AtomicBool,
-        url: &str,
-        value: &Value,
-    ) -> Value {
+    fn route(shared: &DoorShared<'_>, url: &str, value: &Value) -> Value {
         let toolkit =
             Toolkit::parse(value["toolkit"].as_str().unwrap_or("")).unwrap_or(Toolkit::Facebook);
         let binding = SendBinding {
@@ -216,7 +222,7 @@ impl FakeDoor {
         // enforces destination-exactness against owner-authorized
         // discovery (explicit expectation) or echo (liveness-only paths).
         dest.connection_id = binding.connection_id.clone();
-        if let Some(expected) = expected.lock().unwrap().clone() {
+        if let Some(expected) = shared.expected.lock().unwrap().clone() {
             dest.destination_id = expected;
         } else {
             dest.destination_id = binding.destination_id.clone();
@@ -237,12 +243,15 @@ impl FakeDoor {
             expires_at_epoch: 1_800_000_000,
         };
         // Backend liveness first: the schedule-time copy is never trusted.
-        let live = grants.lock().unwrap().check(&binding.grant_id);
+        let live = shared.grants.lock().unwrap().check(&binding.grant_id);
         if url.ends_with("/preflight") {
             if let Err(code) = live {
                 return json!({"verdict": "refused", "code": code});
             }
-            return match ledger.preflight(&binding, &dest, &grant, "ws_harbour", NOW) {
+            return match shared
+                .ledger
+                .preflight(&binding, &dest, &grant, "ws_harbour", NOW)
+            {
                 Ok(staged) => json!({"verdict": "ok", "staged": staged}),
                 Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
             };
@@ -256,9 +265,16 @@ impl FakeDoor {
                 "lose" => FakeProviderBehavior::LoseResponseAfterAccept,
                 _ => FakeProviderBehavior::Post,
             };
-            return match ledger.execute(&binding, &dest, &mut grant, "ws_harbour", NOW, behavior) {
+            return match shared.ledger.execute(
+                &binding,
+                &dest,
+                &mut grant,
+                "ws_harbour",
+                NOW,
+                behavior,
+            ) {
                 Ok(outcome) => {
-                    grants.lock().unwrap().consume(&binding.grant_id);
+                    shared.grants.lock().unwrap().consume(&binding.grant_id);
                     let mut reply = json!({"verdict": "ok", "state": outcome.state.as_str(),
                         "permalink": outcome.permalink,
                         "provider_ids": outcome.provider_ids,
@@ -267,13 +283,19 @@ impl FakeDoor {
                         "caption_digest": outcome.caption_digest,
                         "image_digest": outcome.image_digest,
                         "repeated": outcome.repeated});
-                    if omit_binding.load(std::sync::atomic::Ordering::SeqCst) {
+                    if shared
+                        .omit_binding
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         // Adversarial hook: upstream echo goes missing.
                         for field in ["destination_id", "caption_digest", "image_digest"] {
                             reply.as_object_mut().unwrap().remove(field);
                         }
                     }
-                    if corrupt_binding.load(std::sync::atomic::Ordering::SeqCst) {
+                    if shared
+                        .corrupt_binding
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         // Adversarial hook: same key, foreign binding.
                         let forged = reply.as_object_mut().unwrap();
                         forged.insert(
@@ -294,7 +316,10 @@ impl FakeDoor {
             };
         }
         if url.starts_with("/v1/device/publish/status") {
-            return match ledger.status(&binding.key) {
+            if let Some(forged) = shared.forgeries.lock().unwrap().get(&binding.key) {
+                return forged.clone();
+            }
+            return match shared.ledger.status(&binding.key) {
                 Ok(outcome) => json!({"verdict": "ok", "state": outcome.state.as_str(),
                     "permalink": outcome.permalink,
                     "provider_ids": outcome.provider_ids,
@@ -322,6 +347,17 @@ impl FakeDoor {
     fn provider_calls(&self) -> u64 {
         *self.calls.lock().unwrap()
     }
+}
+
+/// Shared fake state bundled so the route stays under the argument
+/// limit: six handles, one struct.
+struct DoorShared<'a> {
+    grants: &'a Mutex<GrantAuthority>,
+    ledger: &'a FakePublishLedger,
+    expected: &'a Mutex<Option<String>>,
+    omit_binding: &'a std::sync::atomic::AtomicBool,
+    corrupt_binding: &'a std::sync::atomic::AtomicBool,
+    forgeries: &'a Mutex<HashMap<String, Value>>,
 }
 
 impl Drop for FakeDoor {
@@ -1566,4 +1602,77 @@ fn cad771_e2e_corrupt_status_binding_fails_closed_at_claim() {
         .clone();
     assert_eq!(shown["state"], "processing");
     assert!(shown["upstream"].is_null());
+}
+
+#[test]
+fn cad771_e2e_hostile_status_binding_fails_closed_at_reconcile() {
+    // Same key, foreign binding at status time: the hostile outcome is
+    // visible on the HTTP wire, but the daemon reconcile refuses to
+    // persist it — processing retained, honest evidence intact.
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "hostile");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-hostile",
+                "cad_fx_hostile_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let key = intent["request"].as_str().unwrap().to_owned();
+    let recheck = recheck_for(&intent);
+    let claimed = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    // Hostile provider: same stable key, B destination and digest.
+    door.forge_status(
+        &key,
+        json!({"verdict": "ok", "state": "posted",
+            "permalink": "https://www.instagram.com/p/HOSTILE/",
+            "provider_ids": ["provider-post-9"],
+            "provider_payload": "{\"id\":\"hostile\"}",
+            "destination_id": "222222222222222",
+            "caption_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "image_digest": null,
+            "repeated": false}),
+    );
+    // HTTP peer shows the hostile bytes on the wire.
+    let raw = door.post("/v1/device/publish/status", &json!({"key": key}));
+    assert_eq!(raw["destination_id"], "222222222222222");
+    // Daemon reconcile refuses to persist them.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_reconcile",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match the frozen intent"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc(
+            "social_publish_show",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(shown["state"], "processing");
+    assert_eq!(shown["upstream"]["destination_id"], DEST_FB);
+    assert_eq!(door.ledger.provider_calls(), 1);
 }
