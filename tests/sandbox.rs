@@ -1005,7 +1005,8 @@ fn a_forged_marker_beside_a_symlink_onto_production_is_refused() {
 #[test]
 fn sandbox_env_exports_the_recorded_opt_in() {
     let mut host = Host::new();
-    host.up_free("ga", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")]);
+    let v = host.up_free("ga", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
     let root = host.base().join("ga");
     let marker: Value =
         serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
@@ -1016,6 +1017,10 @@ fn sandbox_env_exports_the_recorded_opt_in() {
         env_file.contains("export CADENCE_SANDBOX_ALLOW_GLOBAL=1"),
         "{env_file}"
     );
+    assert!(
+        env_file.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n"),
+        "granted: the unset line stays minimal: {env_file}"
+    );
     let out = host.run(&["sandbox", "env", "ga"], &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(
@@ -1024,7 +1029,20 @@ fn sandbox_env_exports_the_recorded_opt_in() {
         text(&out)
     );
 
-    // `up` again without the variable revokes it — marker and env file.
+    // Granted and running: `up` without the variable is refused — the
+    // live processes keep the grant they were started with; the marker
+    // is unchanged and the board stays up.
+    let out = host.run(&["sandbox", "up", "ga"], &[]);
+    refused(&out, "is running with CADENCE_SANDBOX_ALLOW_GLOBAL granted");
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(marker["allow_global"], true, "marker unchanged: {marker}");
+    assert!(daemon_answers(&state), "board/daemon still up");
+
+    // Down frees the grant change; `up` without the variable revokes it.
+    let out = host.run(&["sandbox", "down", "ga"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
     host.up("ga", &[]);
     let marker: Value =
         serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
@@ -1032,18 +1050,44 @@ fn sandbox_env_exports_the_recorded_opt_in() {
     assert_eq!(marker["allow_global"], false, "{marker}");
     let env_file = std::fs::read_to_string(root.join("sandbox.env")).unwrap();
     assert!(
-        !env_file.contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
-        "{env_file}"
+        env_file.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL\n"),
+        "revoked: env actively clears the variable: {env_file}"
     );
     let out = host.run(&["sandbox", "env", "ga"], &[]);
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
+        !String::from_utf8_lossy(&out.stdout).contains("export CADENCE_SANDBOX_ALLOW_GLOBAL"),
         "{}",
         text(&out)
     );
+    // Shell proof: eval'ing the revoked env clears a leaked variable.
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "export CADENCE_SANDBOX_ALLOW_GLOBAL=1; eval \"$(cat {})\"; \
+             echo \"${{CADENCE_SANDBOX_ALLOW_GLOBAL-unset}}\"",
+            root.join("sandbox.env").display()
+        ))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "unset");
 
-    // A forged value at `up` is not "1": recorded false, never exported.
-    host.up_free("gb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", " 1")]);
+    // Ungranted and running: `up` with the variable is refused the
+    // same way; a forged value (" 1") records false, never exports.
+    host.up_free("gb", &[]);
+    let out = host.run(
+        &["sandbox", "up", "gb"],
+        &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")],
+    );
+    refused(
+        &out,
+        "is running with CADENCE_SANDBOX_ALLOW_GLOBAL not granted",
+    );
+    let marker: Value = serde_json::from_str(
+        &std::fs::read_to_string(host.base().join("gb").join(".cadence-sandbox")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["allow_global"], false, "{marker}");
+    host.up("gb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", " 1")]);
     let marker: Value = serde_json::from_str(
         &std::fs::read_to_string(host.base().join("gb").join(".cadence-sandbox")).unwrap(),
     )
@@ -1051,7 +1095,7 @@ fn sandbox_env_exports_the_recorded_opt_in() {
     assert_eq!(marker["allow_global"], false, "{marker}");
     let env_file = std::fs::read_to_string(host.base().join("gb").join("sandbox.env")).unwrap();
     assert!(
-        !env_file.contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
+        !env_file.contains("export CADENCE_SANDBOX_ALLOW_GLOBAL"),
         "{env_file}"
     );
 }

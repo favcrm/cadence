@@ -650,13 +650,20 @@ fn sh_quote(s: &str) -> String {
 }
 
 fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
+    // A revoked grant must not linger in an eval'd shell: unset it.
+    let unset = if allow_global {
+        "CADENCE_ALIAS CADENCE_ROLLOUT_AS"
+    } else {
+        "CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL"
+    };
     let mut text = format!(
         "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
-         unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n\
+         unset {unset}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
          export CADENCE_PROFILE={profile}\n",
         name = sb.name,
+        unset = unset,
         state = sh_quote(&sb.state_dir().to_string_lossy()),
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
@@ -755,9 +762,27 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         .as_ref()
         .and_then(|m| m["created_at"].as_str().map(str::to_string))
         .unwrap_or_else(|| crate::issue::time::iso(crate::issue::time::now_epoch()));
-    // Record the opt-in at up time: `sandbox env` re-exports exactly
-    // what was granted, so a later `up` without it revokes it.
+    // The opt-in is granted at `up` and recorded in the marker —
+    // `sandbox env` re-exports exactly what was granted. The grant is
+    // process environment: changing it under a live daemon or board
+    // would lie about what they run with, so it needs a down first.
     let allow_global = std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1");
+    let recorded = existing
+        .as_ref()
+        .and_then(|m| m["allow_global"].as_bool())
+        .unwrap_or(false);
+    if recorded != allow_global
+        && (daemon_running(&sb.state_dir()) || crate::ui::detached_pid(&sb.state_dir()).is_some())
+    {
+        return Err(Error::rejected(format!(
+            "sandbox '{}' is running with {ALLOW_GLOBAL_ENV} {}; its processes \
+             keep that environment — `cadence sandbox down {}` first, then `up` \
+             with the grant you want",
+            sb.name,
+            if recorded { "granted" } else { "not granted" },
+            sb.name
+        )));
+    }
     let marker = json!({
         "name": sb.name,
         "created_at": created_at,
@@ -1087,9 +1112,10 @@ mod tests {
             text.contains("export CADENCE_PROFILE='sandbox:q'"),
             "{text}"
         );
-        // Like the sandbox's own children, never a pane or rollout identity.
+        // Like the sandbox's own children, never a pane or rollout
+        // identity — and no grant the marker did not record.
         assert!(
-            text.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n"),
+            text.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL\n"),
             "{text}"
         );
         assert!(text.contains("127.0.0.1:3111"), "{text}");
