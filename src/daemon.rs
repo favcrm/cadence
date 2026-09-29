@@ -445,6 +445,9 @@ pub struct Shared {
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
+    /// `test-seam`: parks the send worker between recipient rows.
+    #[cfg(feature = "test-seam")]
+    crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
     /// CAD-506: the registered platform adapters the effect gate drives
     /// (`platform` name → adapter). A platform with none fails closed —
     /// no reviewed table means no classification, so no call.
@@ -651,6 +654,8 @@ impl Shared {
                 opts.crm_send_interval_ms
             }),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
+            #[cfg(feature = "test-seam")]
+            crm_send_row_gate: opts.crm_send_row_gate.clone(),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
@@ -4125,6 +4130,10 @@ pub struct ServeOptions {
     /// `crm_send_prepare`. Never sourced from RPC, PM or env —
     /// daemon configuration sets it.
     pub unsubscribe_origin: Option<String>,
+    /// `test-seam`: budget gate parked on between campaign-send rows.
+    /// `None` in production — the field does not exist there.
+    #[cfg(feature = "test-seam")]
+    pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
 /// Run the daemon in the foreground until `shutdown` or a signal.

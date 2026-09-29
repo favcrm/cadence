@@ -1103,6 +1103,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-786: production pacing unless the test pins a small
         // value.
         crm_send_interval_ms: 0,
+        #[cfg(feature = "test-seam")]
+        crm_send_row_gate: None,
     }
 }
 

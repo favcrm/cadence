@@ -8,6 +8,7 @@
 //! rustls rig whose CA the fixture daemon pins via `smtp_test_ca_pem`.
 #![allow(clippy::disallowed_methods)]
 mod common;
+use cadence_agent::daemon::ServeOptions;
 use cadence_agent::issue::Pm;
 use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
 use serde_json::{json, Value};
@@ -377,6 +378,11 @@ struct Crm {
     root: tempfile::TempDir,
     _pm: Pm,
     daemon: TestDaemon,
+    /// The options the daemon started with — `restart` reuses them.
+    opts: ServeOptions,
+    /// State dirs of replaced daemons, kept so their contents survive
+    /// a restart.
+    holds: Vec<tempfile::TempDir>,
 }
 
 impl Crm {
@@ -390,11 +396,13 @@ impl Crm {
         cadence_agent::platform::smtp::attach(&mut opts);
         opts.crm_send_interval_ms = interval_ms;
         opts.unsubscribe_origin = origin;
-        let daemon = TestDaemon::start_opts(opts);
+        let daemon = TestDaemon::start_opts(opts.clone());
         Self {
             root,
             _pm: pm,
             daemon,
+            opts,
+            holds: Vec::new(),
         }
     }
 
@@ -417,11 +425,46 @@ impl Crm {
         opts.crm_send_interval_ms = interval_ms;
         opts.unsubscribe_origin = origin;
         opts.smtp_test_ca_pem = Some(std::fs::read(ca.path().join("ca.pem")).unwrap());
-        let daemon = TestDaemon::start_opts(opts);
+        let daemon = TestDaemon::start_opts(opts.clone());
         Self {
             root: dir,
             _pm: pm,
             daemon,
+            opts,
+            holds: Vec::new(),
+        }
+    }
+
+    /// Same, with a per-row budget gate parked into the send worker.
+    /// `test-seam` builds only — the type does not exist elsewhere.
+    #[cfg(feature = "test-seam")]
+    fn with_ca_gated(
+        ca: &tempfile::TempDir,
+        interval_ms: u64,
+        origin: Option<String>,
+        gate: Option<Arc<cadence_agent::test_seam::SendRowGate>>,
+    ) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        Self::copy_source(&dir.path().join("source"), "blog-post");
+        let mut opts = daemon_opts();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+        cadence_agent::platform::smtp::attach(&mut opts);
+        opts.crm_send_interval_ms = interval_ms;
+        opts.unsubscribe_origin = origin;
+        opts.smtp_test_ca_pem = Some(std::fs::read(ca.path().join("ca.pem")).unwrap());
+        #[cfg(feature = "test-seam")]
+        {
+            opts.crm_send_row_gate = gate;
+        }
+        let daemon = TestDaemon::start_opts(opts.clone());
+        Self {
+            root: dir,
+            _pm: pm,
+            daemon,
+            opts,
+            holds: Vec::new(),
         }
     }
 
@@ -456,6 +499,33 @@ impl Crm {
 
     fn install(&self) -> String {
         self.install_as("blog-post")
+    }
+
+    /// Restart the daemon on the same state dir — crash-recovery
+    /// coverage for the send reconciler. `TestDaemon.state` lives
+    /// inside its `dir` TempDir, which Drop deletes — so the dir is
+    /// swapped out and kept alive for the fixture's lifetime before
+    /// the old daemon is dropped (shutdown + join releases the
+    /// state flock `await_singleton_released` waits on).
+    fn restart(&mut self) {
+        let state = self.daemon.state.clone();
+        let dummy_dir = tempfile::tempdir().unwrap();
+        let dummy_state = dummy_dir.path().join("state");
+        let mut old = std::mem::replace(
+            &mut self.daemon,
+            TestDaemon {
+                dir: dummy_dir,
+                state: dummy_state,
+                handle: None,
+                process: None,
+            },
+        );
+        self.holds.push(std::mem::replace(
+            &mut old.dir,
+            tempfile::tempdir().unwrap(),
+        ));
+        drop(old);
+        self.daemon = TestDaemon::start_on_opts(state, self.opts.clone());
     }
 
     /// A fresh install of the same source under a new app name — a
@@ -617,6 +687,7 @@ impl Crm {
             .unwrap()
     }
 
+    #[cfg(feature = "test-seam")]
     fn suppress_customer(&self, install: &str, context: &str, customer: &str) {
         self.daemon
             .operator_rpc(
@@ -1372,7 +1443,7 @@ fn cad786_stale_inputs_refuse_zero_rows_zero_traffic() {
 fn cad786_concurrent_approves_one_wins_once() {
     let rig_dir = ca();
     let rig = Rig::start(rig_dir, Default::default());
-    let crm = Crm::with_ca(&rig._dir, 10, "https://board.example".into());
+    let mut crm = Crm::with_ca(&rig._dir, 10, "https://board.example".into());
     let (install, context, _) = crm.ready(&rig);
     let prepared = crm.prepare(&install, &context, "launch-1", "freeze-1", "send-race");
     let digest = prepared["send_digest"].as_str().unwrap().to_string();
@@ -1421,6 +1492,33 @@ fn cad786_concurrent_approves_one_wins_once() {
         .unwrap();
     assert_eq!(core_state, "completed", "core send row: {core_state}");
     assert_eq!(core_install, install);
+    // A losing approve's `crm_send_open` hit the same PK — exactly
+    // one core row exists for this send.
+    let core_rows: i64 = core
+        .query_row(
+            "SELECT COUNT(*) FROM crm_sends WHERE send_id=?",
+            rusqlite::params![send_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(core_rows, 1, "losing approves left stray core rows");
+    drop(core);
+    // A restart reconciles nothing: the core intent is completed,
+    // so no second worker spawns and no row is touched.
+    crm.restart();
+    let after = crm.show(&install, &context, &send_id);
+    assert_eq!(after["send"]["state"], "completed");
+    assert_eq!(after["counts"]["accepted"], 2, "{after}");
+    assert_eq!(after["deliveries"].as_array().unwrap().len(), 2);
+    let rcpts = rig.rcpt_log.lock().unwrap().clone();
+    assert_eq!(
+        rcpts
+            .iter()
+            .filter(|r| *r != "operator@example.com")
+            .count(),
+        2,
+        "restart resent a recipient"
+    );
     // Exactly one submission per recipient at the rig.
     let log = rig.rcpt_log.lock().unwrap();
     for email in ["amina@example.com", "cleo@example.com"] {
@@ -1434,12 +1532,21 @@ fn cad786_concurrent_approves_one_wins_once() {
 
 // ---------- mid-send suppression and link revoke (B4) ----------
 
+#[cfg(feature = "test-seam")]
 #[test]
 fn cad786_mid_send_suppression_and_revoke() {
     let rig_dir = ca();
     let rig = Rig::start(rig_dir, Default::default());
-    // A long interval keeps the queue mid-flight between claims.
-    let crm = Crm::with_ca(&rig._dir, 400, "https://board.example".into());
+    // The row gate parks the worker between recipients — the test
+    // mutates state while the worker is provably stopped, never on
+    // a wall-clock interval.
+    let gate = cadence_agent::test_seam::SendRowGate::new();
+    let crm = Crm::with_ca_gated(
+        &rig._dir,
+        10,
+        Some("https://board.example".into()),
+        Some(gate.clone()),
+    );
     let (install, context, _) = crm.ready_custom(
         &rig,
         &[
@@ -1457,15 +1564,21 @@ fn cad786_mid_send_suppression_and_revoke() {
     let send_id = prepared["send"]["send_id"].as_str().unwrap().to_string();
     crm.approve(&install, &context, &send_id, &digest);
 
-    // Wait for the first (customer_id order) recipient to be sent.
-    assert!(wait_until(30, || {
-        rig.rcpt_log
-            .lock()
-            .unwrap()
-            .contains(&"amina@example.com".to_string())
-    }));
-    // Suppress the second recipient and revoke the third's consent
-    // before either is claimed.
+    // Budget 0: the worker parked on its first iteration — nothing
+    // can submit until the test admits a row.
+    gate.allow(1);
+    assert!(
+        wait_until(30, || {
+            rig.rcpt_log
+                .lock()
+                .unwrap()
+                .contains(&"amina@example.com".to_string())
+        }),
+        "first row never submitted"
+    );
+
+    // The worker is parked again. Suppress the second recipient and
+    // revoke the third's consent before either is claimed.
     crm.suppress_customer(&install, &context, "customer-c");
     crm.daemon
         .operator_rpc(
@@ -1476,7 +1589,9 @@ fn cad786_mid_send_suppression_and_revoke() {
                     "tags": [], "consent": {"email": "denied"}}}),
         )
         .unwrap();
-    assert!(wait_until(60, || {
+    // Two rows + one exit-check iteration.
+    gate.allow(3);
+    assert!(wait_until(30, || {
         crm.show(&install, &context, &send_id)["send"]["state"] == "completed"
     }));
     let shown = crm.show(&install, &context, &send_id);
@@ -1488,7 +1603,8 @@ fn cad786_mid_send_suppression_and_revoke() {
     assert_eq!(log.iter().filter(|r| *r == "dana@example.com").count(), 0);
     drop(log);
 
-    // A second send, link revoked mid-flight: remaining rows close,
+    // A second send, link revoked mid-flight: the parked worker's
+    // next row dies at the authority check — remaining rows close,
     // the send and the core intent close, nothing else submits.
     crm.freeze(&install, &context, "freeze-2", json!({"mode": "all"}), 50);
     let prepared = crm.prepare(&install, &context, "launch-1", "freeze-2", "mid-2");
@@ -1502,9 +1618,13 @@ fn cad786_mid_send_suppression_and_revoke() {
             json!({"install_id": install, "context_id": context, "expected_revision": 1}),
         )
         .unwrap();
-    assert!(wait_until(60, || {
-        crm.show(&install, &context, &send_id2)["send"]["state"] == "closed"
-    }));
+    gate.allow(1); // one row: claim → authority dead → close all
+    assert!(
+        wait_until(30, || {
+            crm.show(&install, &context, &send_id2)["send"]["state"] == "closed"
+        }),
+        "send never closed"
+    );
     let shown = crm.show(&install, &context, &send_id2);
     assert_eq!(shown["counts"]["accepted"], 0, "{shown}");
     assert_eq!(

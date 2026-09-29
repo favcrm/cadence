@@ -722,6 +722,12 @@ impl Shared {
             return Ok(());
         }
         loop {
+            // test-seam: a fixture budget parks the worker between
+            // rows so mid-send mutations are deterministic.
+            #[cfg(feature = "test-seam")]
+            if let Some(gate) = &self.crm_send_row_gate {
+                gate.take();
+            }
             let deliveries = records.app_campaign_deliveries(context, send_id)?;
             let Some(next) = deliveries.iter().find(|d| d.state == "queued") else {
                 break;
