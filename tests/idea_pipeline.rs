@@ -568,3 +568,45 @@ fn board_idea_decisions_bind_the_shown_issue_and_decide() {
     assert_eq!(status, 200, "{reply}");
     assert_eq!(f.front(&stale_id).status, "done");
 }
+
+/// CAD-140: a tailnet-shaped `request_actor` persists verbatim on the
+/// recorded decision — the board forwards its proven login through the
+/// same field (authority stays with the connection, gated above).
+#[test]
+fn board_idea_decision_records_tailscale_actor() {
+    let f = PlanFixture::start_idea_router();
+    let id = file_idea(&f, "tailnet idea\ndecided from the phone");
+    let rec = json!({
+        "issue": id, "project": "demo", "state": "plan_ready",
+        "event_emitted": true, "stale": false, "tickets": [],
+    });
+    std::fs::write(
+        f.d.state.join("idea-pipeline.json"),
+        serde_json::to_string_pretty(&json!({"records": {id.clone(): rec}})).unwrap(),
+    )
+    .unwrap();
+    let rev = cadence_agent::issue::write::issue_rev(&f.pm_dir.join("demo").join(&id)).unwrap();
+    let out =
+        f.d.operator_rpc(
+            "idea_decide",
+            json!({
+                "issue": &id,
+                "action": "approve",
+                "expect_rev": rev,
+                "request_actor": "fable@example.com (tailscale)",
+            }),
+        )
+        .unwrap();
+    assert_eq!(out["decision"]["action"], "approve", "{out}");
+    assert_eq!(
+        out["decision"]["actor"], "fable@example.com (tailscale)",
+        "{out}"
+    );
+    let events = f.daemon_events("idea_decision");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0]["actor"], "fable@example.com (tailscale)",
+        "{events:?}"
+    );
+    assert_eq!(f.front(&id).status, "done");
+}

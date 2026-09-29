@@ -511,7 +511,7 @@ pub(super) fn decide_delivery(
             client::rpc(
                 state_dir,
                 "delivery_decline",
-                json!({"issue": id, "reason": reason}),
+                json!({"issue": id, "reason": reason, "request_actor": actor}),
             ),
             "delivery_decline",
         )

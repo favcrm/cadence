@@ -1400,6 +1400,10 @@ impl Shared {
             )));
         }
         crate::secret::guard(&format!("{id}: decline"), reason)?;
+        // CAD-140: who declined — the record, the comment and the
+        // event carry the deciding actor (attribution only; authority
+        // is this connection, gated above).
+        let actor = request_actor(params)?;
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -1413,6 +1417,7 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.note = Some(reason.to_string());
+        rec.declined_by = Some(actor.clone());
         rec.enter(State::Declined, now());
         let out = rec.to_json();
         let ended = rec.clone();
@@ -1422,7 +1427,7 @@ impl Shared {
             let _ = issue::write::add_comment(
                 &pm,
                 id,
-                &format!("Merge declined by the operator: {reason}"),
+                &format!("Merge declined by {actor}: {reason}"),
                 Some("operator"),
                 Some("review"),
                 None,
@@ -1432,7 +1437,7 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "merge_declined",
-            json!({"issue": id, "reason": reason}),
+            json!({"issue": id, "reason": reason, "actor": actor}),
         );
         self.wake();
         Ok(out)

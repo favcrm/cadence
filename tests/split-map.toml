@@ -223,7 +223,7 @@ helpers = [
 ]
 
 [binaries.idea_pipeline]
-tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children", "board_idea_decisions_bind_the_shown_issue_and_decide"]
+tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children", "board_idea_decisions_bind_the_shown_issue_and_decide", "board_idea_decision_records_tailscale_actor"]
 
 [binaries.daemon]
 tests = [
@@ -1054,6 +1054,9 @@ tests = [
     "cad776_merge_ready_wake_grants_no_merge_authority",
     "board_merge_approves_and_lands_without_board_gh",
     "board_decline_states_its_reason",
+    "delivery_approve_gate_forgeries_race_and_attribution",
+    "delivery_decline_gate_forgeries_and_races",
+    "delivery_approve_records_tailscale_actor",
 ]
 helpers = [
     "daemon_methods",

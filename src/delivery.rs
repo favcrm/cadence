@@ -225,6 +225,10 @@ pub struct Record {
     /// Why the operator was brought in, or the decline reason.
     #[serde(default)]
     pub note: Option<String>,
+    /// Who declined the merge (CAD-140) — the deciding actor, so a
+    /// tailnet decline is attributed to the operator's login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declined_by: Option<String>,
     /// Reviewers barred from this ticket: each was on duty when the head
     /// moved without the worker, so it may have pushed that head.
     #[serde(default)]
@@ -268,6 +272,7 @@ impl Record {
             observed: None,
             disable_auto: false,
             note: None,
+            declined_by: None,
             excluded: vec![],
             ticket_done: None,
             ready_epoch: 0,
