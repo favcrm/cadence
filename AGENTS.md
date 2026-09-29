@@ -23,9 +23,44 @@ this workflow exactly.
 - Work in the lane worktree that `cadence issue start <ID>` creates,
   never on main.
 
+### Review: what a merge needs (interim, CAD-815)
+Until the delivery loop enforces a per-project policy (CAD-814), every
+PR needs each of the following as a PASS on the exact head you enqueue:
+- **Standards** and **Spec/security** reviews, by two different
+  independent reviewers. Neither may be the author. Prefer a reviewer
+  whose model vendor differs from the author's.
+- **Browser QA** at desktop and narrow widths when the PR changes
+  `ui/**`.
+- **Operator approval** when any `human` trigger in
+  `docs/roles/risk-classes.md` applies. This covers every change to
+  `.github/**`, `scripts/**`, `Cargo.toml`, `Cargo.lock`,
+  `ui/package.json`, `cadence-review.toml`, `src/review.rs`,
+  `docs/roles/**` and this file. Most gates on a PR run from the PR's
+  own workflow files, so review is the only control on a change to them.
+  The operator, or an agent the operator designates, gives this
+  approval. It never comes from the PR's author.
+
+Record the evidence so that every merge can be audited:
+- The PR title carries the issue id (`CAD-123: …`). A PR without a
+  ticket does not merge.
+- Each review files one verdict note in the notes dir with `Type:
+  verdict`. The note names the PR number and the full head SHA, says
+  `pass` or `revise`, and lists the gates run and what was read. Link it
+  from the ticket.
+- Before you enqueue, post one ticket comment that lists every required
+  verdict note and the green CI run, all for the head you enqueue.
+- A new head voids every verdict on the old head.
+
+Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
+- Before a PASS, the reviewer reads the bot's findings on that head. In
+  the verdict, the reviewer either blocks on or refutes each severe bug
+  and each critical security finding.
+- Never make a bot's check a required check. Never let a bot push to a
+  PR branch (auto-fix, or applying edits from a bot's chat).
+
 ### Merging: use the merge queue, never `--admin`
-- A PR merges only after an independent review passes, pinned to a head
-  SHA.
+- A PR merges only after every review that the section above requires
+  has passed, pinned to the same head SHA.
 - To enqueue:
   `gh pr merge <n> -R favcrm/cadence --auto --squash --match-head-commit <reviewed-sha>`.
   The queue re-tests the PR on the newest main plus every entry ahead of
