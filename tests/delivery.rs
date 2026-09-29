@@ -4039,3 +4039,265 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
         "{rec}"
     );
 }
+
+// ==== CAD-776: wake the live master when reviewed delivery CI readiness changes ====
+
+/// This test's merge-ready wakes: master `sys-wake-…` messages naming a
+/// delivery ready to merge.
+fn ready_wakes(f: &PlanFixture) -> Vec<Value> {
+    master_wakes(f)
+        .into_iter()
+        .filter(|m| {
+            m["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("is ready to merge"))
+        })
+        .collect()
+}
+
+fn ready_woken_events(lf: &LoopFixture) -> Vec<Value> {
+    lf.daemon_events("master_woken")
+        .into_iter()
+        .filter(|e| e["payload"]["event"] == "merge_ready")
+        .collect()
+}
+
+/// CAD-776 acceptance 1+2: an operator-authenticated observation that
+/// makes a reviewed, open, exact-head delivery merge-ready queues one
+/// durable wake naming the issue, PR, reviewed head and operator
+/// action; a replay queues no second wake; a regression then recovery
+/// wakes again under a new key; a moved head never presents the old
+/// review as ready.
+#[test]
+fn cad776_observe_queues_one_merge_ready_wake_per_readiness_streak() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    assert_eq!(lf.rec()["merge_ready"], false);
+
+    // Green CI on the open, reviewed head: one durable wake.
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    let wake = lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    assert_eq!(wake["role"], "system", "{wake}");
+    let text = wake["text"].as_str().unwrap();
+    assert!(text.contains("D-2"), "{text}");
+    assert!(text.contains("acme/app#7"), "{text}");
+    assert!(text.contains(&a), "{text}");
+    assert!(text.contains("delivery_observe"), "{text}");
+    assert!(text.contains("grants nothing"), "{text}");
+    let first = cadence_agent::master::wake_id("merge_ready", &format!("D-2/{a}@1"));
+    assert_eq!(
+        ready_wakes(&lf.f)
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(first)],
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+
+    // A replay of the same observation (and a second sync) queues no
+    // second wake: the message id dedupes it.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": a.clone(), "pr_state": "OPEN", "ci_green": true}),
+        )
+        .unwrap();
+    let (ok, _) = lf.operator(&["delivery", "sync", "D-2"]);
+    assert!(ok);
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+
+    // A readiness regression (CI red) wakes nobody; the recovery wakes
+    // again under a new epoch key.
+    lf.set_gh(&a, "OPEN", false, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], false, "{row}");
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ready_wakes(&lf.f).len() == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:#?}", ready_wakes(&lf.f));
+        thread::sleep(Duration::from_millis(100));
+    }
+    let second = cadence_agent::master::wake_id("merge_ready", &format!("D-2/{a}@2"));
+    assert!(
+        ready_wakes(&lf.f)
+            .iter()
+            .any(|m| m["id"] == second.as_str()),
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+    assert_eq!(ready_woken_events(&lf).len(), 2);
+
+    // A moved head never presents the old review as ready: no new wake,
+    // and no wake names the moved head.
+    let b = "b".repeat(40);
+    let out =
+        lf.f.d
+            .operator_rpc(
+                "delivery_observe",
+                json!({"issue": "D-2", "head": b.clone(), "pr_state": "OPEN", "ci_green": true}),
+            )
+            .unwrap();
+    assert_eq!(out["merge_ready"], false, "{out}");
+    assert_eq!(lf.rec()["state"], "reviewing", "{}", lf.rec());
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 2, "{:#?}", ready_wakes(&lf.f));
+    assert!(
+        !ready_wakes(&lf.f)
+            .iter()
+            .any(|m| m["body"].as_str().unwrap_or_default().contains(&b)),
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+}
+
+/// CAD-776 acceptance 3 (gate): agent callers, detached children and
+/// forged fields cannot cause a wake — the existing operator-only
+/// observation gate refuses them before any wake logic runs.
+#[test]
+fn cad776_agent_detached_and_forged_observe_cannot_wake() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    let obs = json!({"issue": "D-2", "head": a, "pr_state": "OPEN", "ci_green": true});
+    let before = lf.snapshot();
+
+    // An agent caller, its child, its detached setsid grandchild and a
+    // bare one with no alias: all refused as non-operator.
+    for who in [&mut lf.w1, &mut lf.r1] {
+        for how in ["self", "child", "detached", "detached-bare"] {
+            let r = who.rpc(how, "delivery_observe", obs.clone());
+            assert_eq!(r["ok"], false, "{how}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator"),
+                "{how}: {r}"
+            );
+        }
+    }
+    // Forged identity/authority fields on the operator's own connection
+    // are refused, never read.
+    for (field, value) in [
+        ("alias", json!("w1")),
+        ("operator", json!(true)),
+        ("actor", json!("operator")),
+        ("by", json!("operator")),
+        ("attribution", json!("operator")),
+    ] {
+        let mut forged = obs.clone();
+        forged[field] = value;
+        let r = lf.f.d.operator_rpc("delivery_observe", forged);
+        assert!(r.is_err(), "{field}: {r:?}");
+        assert!(
+            r.unwrap_err().to_string().contains("connection-bound"),
+            "{field}"
+        );
+    }
+    // Nothing was written and nobody was woken.
+    assert_eq!(lf.snapshot(), before, "a refused observation wrote");
+    assert_eq!(lf.rec()["merge_ready"], false);
+    assert!(ready_wakes(&lf.f).is_empty(), "{:#?}", ready_wakes(&lf.f));
+    assert!(ready_woken_events(&lf).is_empty());
+}
+
+/// CAD-776 acceptance 3 (concurrency): concurrent observations of the
+/// same ready-making read preserve one outcome per transition — the
+/// delivery lock serializes them and exactly one wake fires.
+#[test]
+fn cad776_concurrent_observe_wakes_once() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    let obs = json!({"issue": "D-2", "head": a, "pr_state": "OPEN", "ci_green": true});
+    thread::scope(|scope| {
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    lf.f.d
+                        .operator_rpc("delivery_observe", obs.clone())
+                        .unwrap()
+                })
+            })
+            .collect();
+        for c in calls {
+            let out = c.join().unwrap();
+            assert_eq!(out["merge_ready"], true, "{out}");
+        }
+    });
+    lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+}
+
+/// CAD-776 acceptance 4: the wake grants no merge authority. The
+/// operator-only, independent-review and head-pinned merge checks are
+/// untouched: agents still cannot merge after the wake, a wrong pin is
+/// still refused, and a regressed delivery still refuses the check.
+#[test]
+fn cad776_merge_ready_wake_grants_no_merge_authority() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    let eligible = lf.rec();
+
+    // Agents cannot merge on the back of the wake.
+    for how in ["self", "detached", "detached-bare"] {
+        for phase in ["authorize", "check"] {
+            let r = lf.w1.rpc(
+                how,
+                "delivery_merge",
+                json!({"issue": "D-2", "phase": phase, "sha": a.clone()}),
+            );
+            assert_eq!(r["ok"], false, "{how} {phase}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator"),
+                "{how} {phase}: {r}"
+            );
+        }
+    }
+    // The head pin is still enforced for the operator.
+    let r = lf.f.d.operator_rpc(
+        "delivery_merge",
+        json!({"issue": "D-2", "phase": "enqueued", "sha": "b".repeat(40)}),
+    );
+    assert!(r.is_err(), "{r:?}");
+    assert!(r.unwrap_err().to_string().contains("pinned"));
+    // The wake changed nothing about eligibility: same state, same
+    // verdict, same head and PR.
+    for field in ["state", "verdict", "head", "pr"] {
+        assert_eq!(lf.rec()[field], eligible[field], "{field}");
+    }
+    // After a regression the check refuses again — the wake stuck
+    // nothing open.
+    lf.set_gh(&a, "OPEN", false, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], false, "{row}");
+    let r =
+        lf.f.d
+            .operator_rpc("delivery_merge", json!({"issue": "D-2", "phase": "check"}));
+    assert!(r.is_err(), "{r:?}");
+    assert!(r.unwrap_err().to_string().contains("not ready to merge"));
+}
