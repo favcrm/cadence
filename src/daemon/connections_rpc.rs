@@ -63,9 +63,45 @@ impl Shared {
         let custody_available = record.is_none()
             || platform::load_credential(&self.store, &self.platform_custody, provider, account)
                 .is_ok();
+        // CAD-785: enrolled SMTP senders project their non-secret
+        // transport/sender material from custody. Best-effort: before
+        // the first custody write (or after a concurrent revoke) the
+        // load fails and the projection is simply absent — never an
+        // error, never a secret.
+        let smtp = match record {
+            Some(record) if record.exchange == platform::smtp::ENROLLMENT_SHAPE => self
+                .smtp_projection(record)
+                .ok()
+                .map(|projection| projection.to_json()),
+            _ => None,
+        };
         Ok(
-            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
+            json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
+    }
+    /// Live non-secret SMTP material for one enrolled record.
+    /// Custody-only: the secret never enters the projection by
+    /// construction, and the projection is screened before return.
+    pub(super) fn smtp_projection(
+        &self,
+        record: &CredentialRecord,
+    ) -> Result<platform::smtp::SmtpProjection> {
+        if record.exchange != platform::smtp::ENROLLMENT_SHAPE {
+            return Err(Error::rejected("connection is not an SMTP sender"));
+        }
+        let bytes = platform::load_credential(
+            &self.store,
+            &self.platform_custody,
+            &record.platform,
+            &record.account,
+        )?;
+        let (envelope, projection) = platform::smtp::custody_decode(&bytes)?;
+        platform::refuse_leak(
+            "smtp connection projection",
+            &projection.to_json().to_string(),
+            envelope.secret(),
+        )?;
+        Ok(projection)
     }
     fn connection_metadata_projection(&self, record: &CredentialRecord) -> Result<Value> {
         let mut projection =
@@ -102,15 +138,38 @@ impl Shared {
         let allowed: &[&str] = match method {
             "connection_providers" | "connection_list" => &[],
             "connection_show" | "connection_check" | "connection_revoke" => &["connection_id"],
+            // CAD-785: the `smtp` shape carries typed host, port,
+            // TLS mode, username, secret and sender fields instead of
+            // an opaque token. Both shapes share one allowlist; each
+            // shape refuses the other's credential field below.
             "connection_create" => &[
                 "provider",
                 "account",
                 "shape",
                 "token",
+                "host",
+                "port",
+                "tls_mode",
+                "username",
+                "secret",
+                "sender",
+                "sender_name",
                 "scopes",
                 "accept_same_uid_risk",
             ],
-            "connection_rotate" => &["connection_id", "token", "scopes", "accept_same_uid_risk"],
+            "connection_rotate" => &[
+                "connection_id",
+                "token",
+                "host",
+                "port",
+                "tls_mode",
+                "username",
+                "secret",
+                "sender",
+                "sender_name",
+                "scopes",
+                "accept_same_uid_risk",
+            ],
             _ => return Err(Error::rejected("unknown connection operation")),
         };
         let object = params
@@ -173,6 +232,64 @@ impl Shared {
                         "connection enrollment shape is unsupported",
                     ));
                 }
+                // Each shape refuses the other's credential field:
+                // a token paste is never reinterpreted as SMTP
+                // material, and SMTP fields never ride a token shape.
+                if shape == platform::smtp::ENROLLMENT_SHAPE {
+                    if params.get("token").is_some() {
+                        return Err(Error::rejected(
+                            "SMTP enrollment carries typed fields — no token",
+                        ));
+                    }
+                    let shapeliness = smtp_create_params(&provider, &account, params)?;
+                    let enrolled = self
+                        .enroll_inner(
+                            &shapeliness,
+                            false,
+                            None,
+                            Some(
+                                &descriptor
+                                    .capabilities
+                                    .iter()
+                                    .flat_map(|c| c.scopes.clone())
+                                    .collect::<Vec<_>>(),
+                            ),
+                            Some(&|record| self.connection_metadata_projection(record)),
+                        )
+                        .map_err(|error| {
+                            connection_error(
+                                error,
+                                params.get("secret").and_then(Value::as_str).unwrap_or(""),
+                            )
+                        })?;
+                    let _guard = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let record = self
+                        .store
+                        .connection_credential(
+                            enrolled["account"]["connection_id"]
+                                .as_str()
+                                .ok_or_else(|| Error::internal("missing connection identity"))?,
+                        )?
+                        .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
+                    return Ok(
+                        json!({"connection":self.connection_record(&provider,&account,Some(&record))?}),
+                    );
+                }
+                if params.get("secret").is_some()
+                    || params.get("host").is_some()
+                    || params.get("port").is_some()
+                    || params.get("tls_mode").is_some()
+                    || params.get("username").is_some()
+                    || params.get("sender").is_some()
+                    || params.get("sender_name").is_some()
+                {
+                    return Err(Error::rejected(
+                        "token enrollment carries a token — no SMTP fields",
+                    ));
+                }
                 let token = required_str(params, "token")?;
                 let enrolled=self.enroll_inner(&json!({"platform":provider,"account":account,"shape":shape,"token":token,"scopes":params.get("scopes").ok_or_else(||Error::rejected("scopes are required"))?,"accept_same_uid_risk":params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false))}),false,None,Some(&descriptor.capabilities.iter().flat_map(|c|c.scopes.clone()).collect::<Vec<_>>()),Some(&|record|self.connection_metadata_projection(record))).map_err(|error|connection_error(error,token))?;
                 let _guard = self
@@ -212,6 +329,52 @@ impl Shared {
                         "connection management shape is unsupported",
                     ));
                 }
+                // SMTP rotation always carries the fresh secret;
+                // transport/sender fields re-validate when present
+                // and inherit live custody otherwise.
+                if record.exchange == platform::smtp::ENROLLMENT_SHAPE {
+                    if params.get("token").is_some() {
+                        return Err(Error::rejected(
+                            "SMTP rotation carries the fresh secret — no token",
+                        ));
+                    }
+                    let mut mapped =
+                        smtp_rotate_params(&record, params, &self.smtp_projection(&record)?)?;
+                    mapped["platform"] = json!(record.platform);
+                    mapped["account"] = json!(record.account);
+                    mapped["shape"] = json!(record.exchange);
+                    let secret = params.get("secret").and_then(Value::as_str).unwrap_or("");
+                    self.enroll_inner(
+                        &mapped,
+                        true,
+                        Some(id),
+                        Some(
+                            &descriptor
+                                .capabilities
+                                .iter()
+                                .flat_map(|c| c.scopes.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        Some(&|record| self.connection_metadata_projection(record)),
+                    )
+                    .map_err(|error| connection_error(error, secret))?;
+                    let _guard = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let current = self
+                        .store
+                        .connection_credential(id)?
+                        .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
+                    return Ok(
+                        json!({"connection":self.connection_record(&current.platform,&current.account,Some(&current))?}),
+                    );
+                }
+                if params.get("secret").is_some() {
+                    return Err(Error::rejected(
+                        "token rotation carries a token — no SMTP secret",
+                    ));
+                }
                 let mut mapped = params.clone();
                 mapped.as_object_mut().unwrap().remove("connection_id");
                 mapped["platform"] = json!(record.platform);
@@ -247,6 +410,87 @@ impl Shared {
             _ => unreachable!(),
         }
     }
+}
+
+/// Forward exactly the typed shape-`smtp` grammar into the custody
+/// path. Every required field rides along; `sender_name` is
+/// optional. The grammar is validated eagerly so refusals name the
+/// field before custody is touched.
+fn smtp_create_params(provider: &str, account: &str, params: &Value) -> Result<Value> {
+    let mut out = json!({
+        "platform": provider,
+        "account": account,
+        "shape": platform::smtp::ENROLLMENT_SHAPE,
+        "scopes": params.get("scopes").ok_or_else(|| Error::rejected("scopes are required"))?,
+        "accept_same_uid_risk": params.get("accept_same_uid_risk").cloned().unwrap_or(json!(false)),
+    });
+    for field in ["host", "port", "tls_mode", "username", "secret", "sender"] {
+        out[field] = params
+            .get(field)
+            .cloned()
+            .ok_or_else(|| Error::rejected(format!("SMTP enrollment is missing '{field}'")))?;
+    }
+    if let Some(name) = params.get("sender_name") {
+        if !name.is_string() {
+            return Err(Error::rejected("SMTP field 'sender_name' must be a string"));
+        }
+        out["sender_name"] = name.clone();
+    }
+    platform::smtp::parse_enrollment(&out)?;
+    Ok(out)
+}
+
+/// Merge a rotate's partial re-spec onto live custody: absent
+/// transport/sender fields inherit, the fresh `secret` is required,
+/// and the merged grammar validates before any custody write. The
+/// caller's `connection_id` is stripped — the record writes it.
+fn smtp_rotate_params(
+    record: &CredentialRecord,
+    params: &Value,
+    current: &platform::smtp::SmtpProjection,
+) -> Result<Value> {
+    let _ = record;
+    let mut out = params.clone();
+    let object = out
+        .as_object_mut()
+        .ok_or_else(|| Error::rejected("connection parameters must be an object"))?;
+    object.remove("connection_id");
+    for (field, inherited) in [
+        ("host", current.host.clone()),
+        ("tls_mode", current.tls_mode.clone()),
+        ("username", current.username.clone()),
+        ("sender", current.sender.clone()),
+        ("sender_name", current.sender_name.clone()),
+    ] {
+        if object.get(field).is_none() {
+            object.insert(field.to_string(), json!(inherited));
+        }
+    }
+    if object.get("port").is_none() {
+        object.insert("port".to_string(), json!(current.port));
+    }
+    for field in [
+        "host",
+        "port",
+        "tls_mode",
+        "username",
+        "secret",
+        "sender",
+        "sender_name",
+    ] {
+        if let Some(value) = object.get(field) {
+            if field != "port" && !value.is_string() {
+                return Err(Error::rejected(format!(
+                    "SMTP field '{field}' must be a string"
+                )));
+            }
+        }
+    }
+    // Full-grammar validation of the merged document: `overlay`
+    // requires the fresh secret and re-checks every inherited byte.
+    let merged = Value::Object(object.clone());
+    platform::smtp::overlay_rotate(current, &merged)?;
+    Ok(Value::Object(object.clone()))
 }
 
 fn connection_error(error: Error, token: &str) -> Error {

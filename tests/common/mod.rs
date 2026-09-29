@@ -1094,6 +1094,9 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-140: no delivery gh — a daemon that shells `gh` in a
         // test does so only when the test injects one (LoopFixture).
         delivery_gh: None,
+        // CAD-785: no isolated-test SMTP CA unless the test pins
+        // one — production verifies against the platform roots.
+        smtp_test_ca_pem: None,
     }
 }
 

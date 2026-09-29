@@ -47,6 +47,10 @@ pub enum CapabilitySemantics {
     UpstreamApprovalHandoff,
     MetadataRead,
     PreviewOnly,
+    /// An authenticated encrypted mail-submission send (CAD-785).
+    /// Serializes as `email_send`; the `validate` grammar below
+    /// admits it exactly like the other reviewed semantics.
+    EmailSend,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct CapabilityDescriptor {
@@ -90,7 +94,14 @@ impl ProviderDescriptor {
             || self.provider != table.platform
             || self.revision.is_empty()
             || self.capabilities.is_empty()
-            || self.enrollment_shapes.iter().any(|s| s != "token")
+            // Enrollment shapes are an exact allowlist, not a prefix
+            // or pattern: `token` (operator-minted scoped tokens) and
+            // `smtp` (CAD-785 typed host/port/TLS/sender plus secret
+            // custody). Anything else refuses.
+            || self
+                .enrollment_shapes
+                .iter()
+                .any(|s| s != "token" && s != "smtp")
         {
             return Err(Error::rejected(
                 "provider connection descriptor is unavailable",

@@ -761,6 +761,15 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=29", [])?;
             tx.commit()?;
         }
+        if version < 30 {
+            // CAD-785: one host-custodied SMTP sender link per CRM
+            // installation/context. New table only; the secret itself
+            // lives in custody, never in this row.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::crm_smtp::SCHEMA)?;
+            tx.execute("UPDATE schema_version SET version=30", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

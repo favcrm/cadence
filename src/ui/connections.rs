@@ -50,13 +50,35 @@ impl Route<'_> {
         matches!(self, Self::Providers | Self::List | Self::Show(_))
     }
 }
+// CAD-785: the create/rotate bodies carry either the opaque token
+// shape or the typed SMTP shape (host, port, TLS mode, username,
+// secret, sender). Every field is optional at the peer: the body
+// forwards only present fields and the daemon's per-shape grammar
+// is the authority (a token shape with SMTP fields, or an SMTP
+// shape with a token, refuses there). `deny_unknown_fields` still
+// closes the schema here.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Create {
     provider: String,
     account: String,
     shape: String,
-    token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_name: Option<String>,
     scopes: Vec<String>,
     #[serde(
         default,
@@ -68,7 +90,22 @@ struct Create {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Rotate {
-    token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_name: Option<String>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -150,11 +187,13 @@ pub(super) fn handle(
     match client::rpc(state, method, params.clone()) {
         Ok(value) => {
             let output = value.to_string();
-            if output.len() > RESULT_CAP
-                || params["token"]
-                    .as_str()
-                    .is_some_and(|token| !token.trim().is_empty() && output.contains(token.trim()))
-            {
+            // Neither credential shape may echo in a receipt: the
+            // opaque token and the SMTP secret are both screened.
+            let leaks = [params["token"].as_str(), params["secret"].as_str()]
+                .into_iter()
+                .flatten()
+                .any(|secret| !secret.trim().is_empty() && output.contains(secret.trim()));
+            if output.len() > RESULT_CAP || leaks {
                 return err_response(502, "invalid connection management receipt");
             }
             let mut response = json_response(value);

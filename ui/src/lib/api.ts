@@ -552,8 +552,15 @@ export const api = {
   connectionCreate: (body: {
     provider: string;
     account: string;
-    shape: "token";
-    token: string;
+    shape: "token" | "smtp";
+    token?: string;
+    host?: string;
+    port?: number;
+    tls_mode?: string;
+    username?: string;
+    secret?: string;
+    sender?: string;
+    sender_name?: string;
     scopes: string[];
     accept_same_uid_risk?: boolean;
   }) => post<ConnectionPayload>("/api/connections", body),
@@ -564,7 +571,18 @@ export const api = {
    */
   connectionRotate: (
     id: string,
-    body: { token: string; scopes?: string[]; accept_same_uid_risk?: boolean },
+    body: {
+      token?: string;
+      secret?: string;
+      host?: string;
+      port?: number;
+      tls_mode?: string;
+      username?: string;
+      sender?: string;
+      sender_name?: string;
+      scopes?: string[];
+      accept_same_uid_risk?: boolean;
+    },
   ) => post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/rotate`, body),
   /** `POST /api/connections/<id>/revoke` — revoke it (operator-only). */
   connectionRevoke: (id: string) =>

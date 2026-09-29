@@ -1,14 +1,17 @@
 import { matchRoute, routePath } from "../src/lib/router";
 import type { Connection, ConnectionProvider } from "../src/lib/types";
 import {
+  acceptsSmtp,
   acceptsToken,
   canManage,
   capabilityWords,
   connectionCapabilities,
+  enrollmentShapes,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
+  smtpSummary,
 } from "../src/features/settings/connectionsView";
 import { connectionLabel, isLocalOutbox } from "../src/lib/connections";
 
@@ -152,6 +155,31 @@ equal(
 );
 equal(scopeHint(provider()), ["publish"], "scope hint dedupes");
 equal(scopeHint(provider({ descriptor: null })), [], "no descriptor, no hint");
+// SMTP sender enrollment (CAD-785): shape allowlist and projection words.
+equal(acceptsSmtp(provider()), false, "local takes no smtp");
+equal(
+  acceptsSmtp(provider({ descriptor: { ...provider().descriptor!, enrollment_shapes: ["smtp"] } })),
+  true,
+  "smtp enrollment",
+);
+equal(enrollmentShapes(provider()), [], "no smtp or token shape offered");
+equal(
+  enrollmentShapes(provider({ descriptor: { ...provider().descriptor!, enrollment_shapes: ["smtp"] } })),
+  ["smtp"],
+  "smtp shape listed",
+);
+equal(smtpSummary(row()), null, "no smtp projection, no summary");
+equal(
+  smtpSummary(
+    row({
+      provider: "smtp",
+      scopes: ["email:send"],
+      smtp: { host: "mail.example.com", port: 587, tls_mode: "starttls", username: "sender", sender: "news@example.com", sender_name: "CRM News" },
+    }),
+  ),
+  'mail.example.com:587 · STARTTLS · "CRM News" <news@example.com> · login sender',
+  "smtp summary names transport and verified sender",
+);
 equal(
   connectionCapabilities([provider()], "local"),
   "blog.publish, social.post",
