@@ -1,0 +1,10 @@
+[Unit]
+Description=Deploy green main builds to the cadence staging sandbox
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

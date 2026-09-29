@@ -1,0 +1,13 @@
+[Unit]
+Description=Cadence live staging deploy tick (favcrm/cadence main)
+# The deploy logic is always main's reviewed code: the working
+# directory is a dedicated clean clone that is detached onto
+# origin/main before every tick.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/cadence-staging/src
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/git fetch origin
+ExecStartPre=/usr/bin/git checkout --detach origin/main
+ExecStart=/usr/bin/python3 scripts/staging-deploy.py

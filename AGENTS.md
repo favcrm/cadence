@@ -116,6 +116,8 @@ this workflow exactly.
   `cadence rollout status` and CAD-236.
 - Boards and daemons you start use a temp state dir and a port in
   3110–3199.
+- Port 3020, tailnet :9460 and `~/.local/share/cadence-staging` belong
+  to the live-staging timer — do not reuse or touch them.
 - Never signal or kill a process you did not start.
 
 ### Shared scratch space
