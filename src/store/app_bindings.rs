@@ -225,7 +225,7 @@ impl Store {
                 let mut stmt = tx.prepare(
                     "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
                 )?;
-                stmt.query_map(params![app, install_id], |r| {
+                let mapped = stmt.query_map(params![app, install_id], |r| {
                     let raw: String = r.get(3)?;
                     Ok((
                         r.get(0)?,
@@ -233,9 +233,8 @@ impl Store {
                         r.get(2)?,
                         serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
                     ))
-                })?
-                .flatten()
-                .collect()
+                })?;
+                mapped.flatten().collect()
             };
             if rows.is_empty() {
                 continue;
@@ -249,13 +248,11 @@ impl Store {
                     let mut stmt = tx.prepare(
                         "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
                     )?;
-                    stmt.query_map(params![agent, plat, account], |r| {
+                    let mapped = stmt.query_map(params![agent, plat, account], |r| {
                         let raw: String = r.get(0)?;
                         Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
-                    })?
-                    .flatten()
-                    .flatten()
-                    .collect()
+                    })?;
+                    mapped.flatten().flatten().collect()
                 };
                 let existing: Option<String> = tx
                     .query_row(
@@ -312,11 +309,10 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
             )?;
-            stmt.query_map(params![platform_name, account], |r| {
+            let mapped = stmt.query_map(params![platform_name, account], |r| {
                 Ok((r.get(0)?, r.get(1)?))
-            })?
-            .flatten()
-            .collect()
+            })?;
+            mapped.flatten().collect()
         };
         if rows.is_empty() {
             return Ok(());

@@ -76,8 +76,9 @@ async function main() {
   assert(text().includes("Needs you"), "unapproved slot needs you");
   assert(text().includes("Approve the app's current version before running."), "reapproval action shown");
 
-  // Revoke closed the binding: the slot asks for a fresh save, never a silent gap.
-  await render({ installation, bindings: [{ ...binding, state: "revoked" }], connections, contextId: null });
+  // Revoke closed the binding, which withdrew approval: the slot asks for a
+  // fresh save and reapproval, never a silent gap.
+  await render({ installation: { ...installation, approved: false }, bindings: [{ ...binding, state: "revoked" }], connections, contextId: null });
   assert(text().includes("Choose a publication connection below and save it."), "revoke action shown");
   assert(!text().includes("approval in force"), "revoked binding carries no approval");
 
