@@ -10,7 +10,7 @@ export async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, si
   if (receipt.run_id !== run.id || receipt.slot !== "image"
     || receipt.binding_digest !== run.snapshot.capabilities?.image?.digest
     || receipt.result?.schema !== 1 || receipt.result.kind !== "media.generated.image"
-    || receipt.result.model !== "image-01" || receipt.result.aspect_ratio !== "1:1"
+    || receipt.result.model !== "openai/gpt-image-2.5" || receipt.result.aspect_ratio !== "1:1"
     || receipt.result.source_receipt_id !== (run.snapshot.source?.receipt_id ?? null)
     || receipt.result.source_post_id !== (run.snapshot.source?.post.id ?? null)
     || !meta || !imageTypes.has(meta.media_type) || meta.media_type !== receipt.result.asset_media_type
@@ -90,5 +90,11 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
       <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
     </figure>}
     {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}
+    {visibleReceipt?.result?.charge && <p className="wa-muted">
+      Billed USD {visibleReceipt.result.charge.amount} at the provider&rsquo;s actual charge
+      {Number(visibleReceipt.result.charge.amount) * 1_000_000 !== visibleReceipt.result.quoted_micros
+        && ` — approved rate was USD ${(visibleReceipt.result.quoted_micros / 1_000_000).toFixed(6)}`}
+      .
+    </p>}
   </section>;
 }

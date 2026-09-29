@@ -7,7 +7,7 @@ pub mod publish_sender;
 mod source;
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -19,24 +19,30 @@ use crate::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
 use crate::platform::{AppCapabilityAsset, AppCapabilityOutput, AppCapabilityQuote};
-#[cfg(test)]
-use image::BASE64_ENCODED_LIMIT;
-use image::{
-    download_image, image_agent, image_base64_bytes, image_prompt, image_url, BASE64_ASSET_LIMIT,
-};
-#[cfg(test)]
-use image::{image_mime, public_ip};
+use image::{image_mime, image_prompt, ASSET_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
-pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@1";
+pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@2";
 const POSTS_TOOL: &str = "scrapecreators.instagram.user.posts";
-const IMAGE_TOOL: &str = "minimax.image-gen.from_text";
+const IMAGE_TOOL: &str = "generate_image";
+/// The only model the image slot may run; the price read and every job must
+/// echo it back.
+const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
 const CALL_PATH: &str = "/v1/runtime/tools/call";
+const MEDIA_PRICE_PATH: &str = "/v1/runtime/media/price/image";
+const MEDIA_SUBMIT_PATH: &str = "/v1/runtime/media/image";
+const MEDIA_JOBS_PATH: &str = "/v1/runtime/media/jobs/";
+const MEDIA_ARTIFACTS_PATH: &str = "/v1/runtime/media/artifacts/";
 const RESPONSE_CAP: u64 = 1024 * 1024;
-
-pub(crate) fn valid_image_host(host: &str) -> bool {
-    image::valid_host(host)
-}
+/// Media job/price envelopes stay JSON-small.
+const MEDIA_BODY_CAP: u64 = 64 * 1024;
+/// The AgenticOS job read's own poll floor.
+const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Bounded well inside the 700s worker→daemon RPC frame timeout
+/// (`client::rpc`), so a stuck job answers the caller instead of hanging it.
+const MEDIA_POLL_DEADLINE: Duration = Duration::from_secs(120);
+const MEDIA_UNCERTAIN_SUBMIT: &str =
+    "AgenticOS image submit outcome is uncertain; retry reuses the same key";
 
 pub(crate) fn image_plan_preflight(
     inputs: &BTreeMap<String, String>,
@@ -47,10 +53,10 @@ pub(crate) fn image_plan_preflight(
 
 const TABLE_JSON: &str = r#"{
     "platform":"agenticos_external",
-    "manifest_version":"agenticos-external-provider-tools@1",
+    "manifest_version":"agenticos-external-provider-tools@2",
     "tools":[
         {"tool":"scrapecreators.instagram.user.posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
-        {"tool":"minimax.image-gen.from_text","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"}
+        {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"}
     ]
 }"#;
 
@@ -59,30 +65,17 @@ pub struct AgenticosExternalAdapter {
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
-    image_hosts: Vec<String>,
-    image_http: ureq::Agent,
     #[cfg(feature = "test-seam")]
-    test_cdn_url: Option<String>,
+    test_poll_interval: Option<Duration>,
+    #[cfg(feature = "test-seam")]
+    test_poll_deadline: Option<Duration>,
 }
 
 impl AgenticosExternalAdapter {
     /// The pin is an image-owner assertion about this exact deployed origin,
     /// never a claim made by an app, connection credential or HTTP response.
     pub fn with_deployment_pin(base: &str, deployment_pin: Option<&str>) -> Result<Self> {
-        Self::with_deployment(base, deployment_pin, &[])
-    }
-
-    fn with_deployment(
-        base: &str,
-        deployment_pin: Option<&str>,
-        image_hosts: &[String],
-    ) -> Result<Self> {
         let base = valid_base(base)?;
-        if image_hosts.len() > 4 || image_hosts.iter().any(|host| !image::valid_host(host)) {
-            return Err(Error::rejected(
-                "image CDN hosts must be exact public DNS names",
-            ));
-        }
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
@@ -95,10 +88,10 @@ impl AgenticosExternalAdapter {
             base,
             deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
-            image_hosts: image_hosts.to_vec(),
-            image_http: image_agent(),
             #[cfg(feature = "test-seam")]
-            test_cdn_url: None,
+            test_poll_interval: None,
+            #[cfg(feature = "test-seam")]
+            test_poll_deadline: None,
         };
         adapter
             .connection_descriptor()
@@ -107,31 +100,46 @@ impl AgenticosExternalAdapter {
         Ok(adapter)
     }
 
-    /// Local integration fixture: the provider still returns an exact approved
-    /// HTTPS host, while its CDN bytes come from a loopback-only fake transport.
-    /// Production registration never calls this constructor.
-    #[cfg(feature = "test-seam")]
-    pub fn with_test_cdn(
-        base: &str,
-        deployment_pin: Option<&str>,
-        image_hosts: &[String],
-        fake_cdn_url: &str,
-    ) -> Result<Self> {
-        let uri: ureq::http::Uri = fake_cdn_url
-            .parse()
-            .map_err(|_| Error::rejected("test CDN URL is malformed"))?;
-        if uri.scheme_str() != Some("http")
-            || uri.host() != Some("127.0.0.1")
-            || uri.port_u16().is_none()
-            || uri
-                .authority()
-                .is_none_or(|part| part.as_str().contains('@'))
-        {
-            return Err(Error::rejected("test CDN must be a loopback HTTP fixture"));
+    fn poll_interval(&self) -> Duration {
+        #[cfg(feature = "test-seam")]
+        if let Some(interval) = self.test_poll_interval {
+            return interval;
         }
-        let mut adapter = Self::with_deployment(base, deployment_pin, image_hosts)?;
-        adapter.test_cdn_url = Some(fake_cdn_url.to_owned());
-        Ok(adapter)
+        MEDIA_POLL_INTERVAL
+    }
+
+    fn poll_deadline(&self) -> Duration {
+        #[cfg(feature = "test-seam")]
+        if let Some(deadline) = self.test_poll_deadline {
+            return deadline;
+        }
+        MEDIA_POLL_DEADLINE
+    }
+
+    /// Bearer-authenticated media GET with the response capped and no
+    /// redirects. Transport, oversize and non-JSON failures all map to `err`.
+    fn get_media(
+        &self,
+        url: &str,
+        token: &str,
+        cap: u64,
+        err: &'static str,
+    ) -> std::result::Result<(u16, Value), String> {
+        let mut response = self
+            .http
+            .get(url)
+            .header("authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|_| err.to_owned())?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(cap)
+            .read_to_vec()
+            .map_err(|_| err.to_owned())?;
+        let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| err.to_owned())?;
+        Ok((status, envelope))
     }
 
     fn quote_fixed(
@@ -158,13 +166,6 @@ impl AgenticosExternalAdapter {
             (Some("social.read"), Some(1), Some("list_posts"), Some("read"), Some(POSTS_TOOL)) => {
                 POSTS_TOOL
             }
-            (
-                Some("media.generate"),
-                Some(1),
-                Some("generate_image"),
-                Some("draft"),
-                Some(IMAGE_TOOL),
-            ) => IMAGE_TOOL,
             _ => return Err("provider quote names an unreviewed action".into()),
         };
         let token = std::str::from_utf8(credential)
@@ -294,16 +295,101 @@ impl AgenticosExternalAdapter {
         Ok(normalized)
     }
 
-    /// CAD-734: the adapter fixes `response_format` from trusted deployment
-    /// metadata, never worker input. An approved CDN host selects URL mode;
-    /// without one the adapter quotes base64 mode, whose revision carries a
-    /// `base64:` prefix so a URL-mode run can never silently execute as
-    /// base64 under the same idempotency key (mode changes need a fresh
-    /// quote and operator approval).
-    fn image_base64_quote(&self) -> bool {
-        self.deployment_pin.as_deref() == Some(MANIFEST_PIN) && self.image_hosts.is_empty()
+    /// CAD-816: the image rate is the AgenticOS media price read, not the
+    /// provider-tool catalog. The quote carries the current rate; the
+    /// daemon re-quotes at execution and refuses a changed rate, so a price
+    /// move can never silently bill under an old approval.
+    fn quote_image(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+            return Err("image generation has not been approved by this deployment".into());
+        }
+        let config = &binding["config"];
+        let mapping = &config["mapping"];
+        if config["provider"] != PLATFORM
+            || config["account"].as_str().is_none_or(str::is_empty)
+            || config["connection_id"].as_str().is_none_or(str::is_empty)
+            || mapping["capability"] != "media.generate"
+            || mapping["version"] != 1
+            || mapping["action"] != "generate_image"
+            || mapping["resource_kind"] != "connection_account"
+            || mapping["effect"] != "draft"
+            || mapping["tool"] != IMAGE_TOOL
+        {
+            return Err("provider quote names an unreviewed action".into());
+        }
+        let token = bearer_token(credential)?;
+        let (status, envelope) = self
+            .get_media(
+                &format!("{}{MEDIA_PRICE_PATH}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS media price read could not reach the service",
+            )?;
+        match status {
+            200 if envelope["ok"] == true => {}
+            404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
+            403 if refused_code(&envelope) == "insufficient_scope" => {
+                return Err("AgenticOS connection credential lacks the runtime draft scope".into())
+            }
+            409 => {
+                return Err("AgenticOS image tool is unpriced or disabled".into());
+            }
+            _ => {
+                return Err(format!(
+                    "AgenticOS media price read refused: {}",
+                    refused_code(&envelope)
+                ))
+            }
+        }
+        let data = &envelope["data"];
+        let price = &data["price"];
+        if price["chargeMinor"].as_u64() == Some(0) {
+            return Err("AgenticOS image tool is unpriced or disabled".into());
+        }
+        let charge = price["chargeMinor"]
+            .as_u64()
+            .filter(|value| (1..=1_000_000_000).contains(value));
+        let version = price["version"]
+            .as_str()
+            .filter(|version| !version.is_empty() && version.len() <= 40);
+        let (charge, version) = match (charge, version) {
+            (Some(charge), Some(version)) => (charge, version),
+            _ => {
+                return Err(
+                    "AgenticOS media price view is malformed or outside the supported bound".into(),
+                )
+            }
+        };
+        if data["kind"] != "image"
+            || data["model"] != IMAGE_MODEL
+            || price["slug"] != IMAGE_TOOL
+            || price["currency"] != "USD"
+        {
+            return Err("AgenticOS media price view drifted from the reviewed image tool".into());
+        }
+        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge,"currency":"USD","version":version}});
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|_| "AgenticOS media price view cannot be serialized")?;
+        Ok(AppCapabilityQuote {
+            schema: 1,
+            currency: "USD".into(),
+            unit_price_micros: charge,
+            units: 1,
+            total_price_micros: charge,
+            price_revision: format!("media:sha256:{:x}", Sha256::digest(&bytes)),
+        })
     }
 
+    /// CAD-816 execution: submit → poll → artifact read over the funded
+    /// AgenticOS media door. The call_id is the idempotency key; it is never
+    /// transformed, and a second POST is never sent inside one call — a
+    /// retry under the same key replays the same upstream job. No price
+    /// ceiling is enforced here (pass-through pricing); the receipt records
+    /// the actual chargeMinor beside the approved rate.
     fn call_image(
         &self,
         credential: &[u8],
@@ -311,106 +397,262 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, String> {
-        let base64 = authority["quote"]["price_revision"]
-            .as_str()
-            .is_some_and(|revision| revision.starts_with("base64:"));
-        if base64 {
-            if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
-                return Err(
-                    "base64 image generation has not been approved by this deployment".into(),
-                );
-            }
-        } else if self.deployment_pin.as_deref() != Some(MANIFEST_PIN)
-            || self.image_hosts.is_empty()
-        {
-            return Err("image CDN host has not been approved by this deployment".into());
+        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+            return Err("image generation has not been approved by this deployment".into());
         }
         let prompt = image_prompt(authority, input)?;
-        let ceiling = frozen_charge_ceiling(authority)?;
-        let token = std::str::from_utf8(credential)
-            .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
-        if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_whitespace) {
-            return Err("AgenticOS provider credential has an invalid shape".into());
-        }
-        if idempotency_key.len() < 8
-            || idempotency_key.len() > 200
-            || !idempotency_key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-        {
+        // The frozen quote still proves shape (schema/currency/units); its
+        // amount is recorded, never enforced as a charge ceiling.
+        let quoted = frozen_charge_ceiling(authority)?;
+        let token = bearer_token(credential)?;
+        if !valid_caller_key(idempotency_key) {
             return Err("provider idempotency key is invalid".into());
         }
-        let response_format = if base64 { "base64" } else { "url" };
-        let mut response = self.http.post(format!("{}{CALL_PATH}", self.base))
+        let mut response = self
+            .http
+            .post(format!("{}{MEDIA_SUBMIT_PATH}", self.base))
             .header("authorization", &format!("Bearer {token}"))
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
-                "slug": IMAGE_TOOL,
-                "body": {"model":"image-01","prompt":prompt,"aspect_ratio":"1:1","response_format":response_format,"n":1,"prompt_optimizer":false},
-                "max_charge_minor": ceiling,
+                "model": IMAGE_MODEL,
+                "prompt": prompt,
+                "aspectRatio": "1:1",
             }))
-            .map_err(|_| "AgenticOS image request could not reach the provider")?;
+            .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
             .with_config()
             .limit(RESPONSE_CAP)
             .read_to_vec()
-            .map_err(|_| "AgenticOS image response exceeds the supported bound")?;
+            .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
         let envelope: Value =
-            serde_json::from_slice(&bytes).map_err(|_| "AgenticOS image response is not JSON")?;
-        if envelope["ok"] != true || status != 200 {
-            return Err("AgenticOS image call refused or has an uncertain outcome".into());
-        }
-        let data = &envelope["data"];
-        if data["slug"] != IMAGE_TOOL || !data["repeated"].is_boolean() {
-            return Err("AgenticOS image receipt changed tool or is malformed".into());
-        }
-        let charged = money_micros(&data["price"])
-            .ok_or("AgenticOS image settled receipt has invalid charge")?;
-        if charged > ceiling {
-            return Err("AgenticOS image charge exceeds the approved ceiling".into());
-        }
-        let asset = if base64 {
-            // Custody-checked inline bytes: the encoded string is dropped
-            // here and never stored as the reviewed asset.
-            let (bytes, media_type) = image_base64_bytes(&data["result"])?;
-            AppCapabilityAsset {
-                media_type: media_type.into(),
-                bytes,
+            serde_json::from_slice(&bytes).map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+        match status {
+            200 | 201 if envelope["ok"] == true => {}
+            404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
+            403 => {
+                return Err(match refused_code(&envelope).as_str() {
+                    "insufficient_scope" => {
+                        "AgenticOS connection credential lacks the runtime draft scope".into()
+                    }
+                    "credential_revoked" => {
+                        "AgenticOS connection credential is no longer authorized".into()
+                    }
+                    code => format!("AgenticOS image submit refused: {code}"),
+                })
             }
-        } else {
-            let url = image_url(&data["result"], &self.image_hosts)?;
-            #[cfg(feature = "test-seam")]
-            let asset = if let Some(local) = &self.test_cdn_url {
-                let config = ureq::Agent::config_builder()
-                    .timeout_global(Some(Duration::from_secs(20)))
-                    .http_status_as_error(false)
-                    .max_redirects(0)
-                    .proxy(None)
-                    .build();
-                download_image(&ureq::Agent::new_with_config(config), local)?
-            } else {
-                download_image(&self.image_http, url)?
+            402 if refused_code(&envelope) == "insufficient_funds" => {
+                return Err("AgenticOS workspace has insufficient credit".into());
+            }
+            409 => {
+                return Err(format!(
+                    "AgenticOS image submit refused: {}",
+                    refused_code(&envelope)
+                ))
+            }
+            s if s >= 500 => return Err(MEDIA_UNCERTAIN_SUBMIT.to_owned()),
+            _ => {
+                return Err(format!(
+                    "AgenticOS image submit refused: {}",
+                    refused_code(&envelope)
+                ))
+            }
+        }
+        let mut job = envelope["data"]["job"].clone();
+        checked_media_job(&job, None)?;
+        let deadline = Instant::now() + self.poll_deadline();
+        loop {
+            let id = job["id"].as_str().unwrap_or_default().to_owned();
+            match job["status"].as_str().unwrap_or("") {
+                "succeeded" => break,
+                "failed" | "released" => {
+                    return Err(format!("AgenticOS image job {id} ended without an image"))
+                }
+                "uncertain" => {
+                    return Err(format!("AgenticOS image job {id} needs reconciliation"))
+                }
+                "admitting" | "submitted" | "queued" | "running" => {}
+                _ => return Err("AgenticOS media job status is unknown".into()),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "AgenticOS image job {id} is still running; retry resumes the same job"
+                ));
+            }
+            std::thread::sleep(self.poll_interval());
+            let url = format!("{}{MEDIA_JOBS_PATH}{id}", self.base);
+            let (status, envelope) = match self.get_media(
+                &url,
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS image job read failed",
+            ) {
+                Ok(pair) => pair,
+                // A transient read failure keeps polling until the deadline.
+                Err(_) => continue,
             };
-            #[cfg(not(feature = "test-seam"))]
-            let asset = download_image(&self.image_http, url)?;
-            asset
-        };
-        let digest = format!("sha256:{:x}", Sha256::digest(&asset.bytes));
+            if status != 200 || envelope["ok"] != true {
+                if status >= 500 {
+                    continue;
+                }
+                return Err(format!(
+                    "AgenticOS image job read refused: {}",
+                    refused_code(&envelope)
+                ));
+            }
+            job = envelope["data"]["job"].clone();
+            checked_media_job(&job, Some(&id))?;
+        }
+        let id = job["id"].as_str().unwrap_or_default().to_owned();
+        let artifacts = job["artifacts"].as_array().cloned().unwrap_or_default();
+        if artifacts.is_empty() {
+            return Err(format!(
+                "AgenticOS image job {id} succeeded without an artifact"
+            ));
+        }
+        let artifact = &artifacts[0];
+        let artifact_ref = artifact["ref"].as_str().unwrap_or_default();
+        let artifact_digest = artifact["digest"].as_str().unwrap_or_default();
+        let artifact_bytes = artifact["bytes"].as_u64();
+        if !valid_media_ref(artifact_ref)
+            || artifact_ref
+                .split_once('.')
+                .map(|(job_id, digest)| job_id != id || digest != artifact_digest)
+                .unwrap_or(true)
+            || artifact_bytes.is_none()
+        {
+            return Err("AgenticOS media artifact descriptor is malformed".into());
+        }
+        let mut response = self
+            .http
+            .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base))
+            .header("authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|_| "AgenticOS media artifact read failed")?;
+        if response.status().as_u16() != 200 {
+            return Err("AgenticOS media artifact read was refused".into());
+        }
+        let header = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let asset_bytes = response
+            .body_mut()
+            .with_config()
+            .limit(ASSET_LIMIT as u64 + 1)
+            .read_to_vec()
+            .map_err(|_| "AgenticOS media artifact exceeds the custody bound")?;
+        if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
+            return Err("AgenticOS media artifact byte count differs from its receipt".into());
+        }
+        if format!("{:x}", Sha256::digest(&asset_bytes)) != artifact_digest {
+            return Err("AgenticOS media artifact digest differs from its receipt".into());
+        }
+        let media_type = image_mime(&asset_bytes, &header)?;
+        let digest = format!("sha256:{artifact_digest}");
+        let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
         let result = json!({
             "schema":1,"kind":"media.generated.image","provider":PLATFORM,
             "source_receipt_id":authority["source"]["receipt_id"],
             "source_post_id":authority["source"]["post"]["id"],
-            "model":"image-01","aspect_ratio":"1:1","n":1,"response_format":response_format,
-            "charge":data["price"],"repeated":data["repeated"],
-            "asset_sha256":digest,"asset_media_type":asset.media_type,
+            "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
+            "job_id":id,
+            "charge":{"currency":"USD","scale":6,"amount":format!("{}.{:06}", charge_minor / 1_000_000, charge_minor % 1_000_000)},
+            "price_version":job["price"]["version"],
+            "quoted_micros":quoted,
+            "repeated":job["repeated"],
+            "asset_sha256":digest,"asset_media_type":media_type,
         });
         Ok(AppCapabilityOutput {
             result,
-            asset: Some(asset),
+            asset: Some(AppCapabilityAsset {
+                media_type: media_type.into(),
+                bytes: asset_bytes,
+            }),
         })
     }
+}
+
+fn bearer_token(credential: &[u8]) -> std::result::Result<&str, String> {
+    let token = std::str::from_utf8(credential)
+        .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
+    if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_whitespace) {
+        return Err("AgenticOS provider credential has an invalid shape".into());
+    }
+    Ok(token)
+}
+
+fn refused_code(envelope: &Value) -> String {
+    envelope["error"]["code"]
+        .as_str()
+        .filter(|code| {
+            code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .unwrap_or("unavailable")
+        .to_owned()
+}
+
+/// The AgenticOS caller-key rule; daemon call ids already satisfy it and a
+/// foreign key is refused verbatim, never rewritten.
+fn valid_caller_key(key: &str) -> bool {
+    (8..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_media_job_id(id: &str) -> bool {
+    id.len() >= 4
+        && id.len() <= 84
+        && id.starts_with("med_")
+        && id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_media_ref(reference: &str) -> bool {
+    let Some((job, digest)) = reference.split_once('.') else {
+        return false;
+    };
+    valid_media_job_id(job)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Strict job validation, identical on submit and on every poll; a poll
+/// must echo the job the submit returned.
+fn checked_media_job(job: &Value, expected_id: Option<&str>) -> std::result::Result<(), String> {
+    let id = job["id"]
+        .as_str()
+        .ok_or("AgenticOS media job is malformed")?;
+    if !valid_media_job_id(id) || expected_id.is_some_and(|expected| expected != id) {
+        return Err("AgenticOS media job identity is invalid".into());
+    }
+    if job["kind"] != "image" || job["model"] != IMAGE_MODEL {
+        return Err("AgenticOS media job drifted from the reviewed image tool".into());
+    }
+    let price = &job["price"];
+    if price["slug"] != IMAGE_TOOL
+        || price["currency"] != "USD"
+        || !price["chargeMinor"].is_u64()
+        || price["version"]
+            .as_str()
+            .is_none_or(|version| version.is_empty() || version.len() > 40)
+    {
+        return Err("AgenticOS media job price receipt is malformed".into());
+    }
+    if !job["status"].is_string() || !job["repeated"].is_boolean() || !job["artifacts"].is_array() {
+        return Err("AgenticOS media job is malformed".into());
+    }
+    Ok(())
 }
 
 fn money_micros(value: &Value) -> Option<u64> {
@@ -572,14 +814,12 @@ fn register_with_deployment(
     opts: &mut crate::daemon::ServeOptions,
     base: &str,
     deployment_pin: Option<&str>,
-    image_hosts: &[String],
 ) -> Result<()> {
     opts.platforms.insert(
         PLATFORM.into(),
-        std::sync::Arc::new(AgenticosExternalAdapter::with_deployment(
+        std::sync::Arc::new(AgenticosExternalAdapter::with_deployment_pin(
             base,
             deployment_pin,
-            image_hosts,
         )?),
     );
     Ok(())
@@ -602,11 +842,7 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
     let pin = metadata
         .as_ref()
         .and_then(|value| value.pin(PLATFORM, &base));
-    let hosts = metadata
-        .as_ref()
-        .and_then(|value| value.image_hosts(PLATFORM, &base))
-        .unwrap_or(&[]);
-    register_with_deployment(opts, &base, pin, hosts)
+    register_with_deployment(opts, &base, pin)
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
@@ -616,30 +852,9 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
         if binding["config"]["mapping"]["capability"] == "media.generate" {
-            if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
-                return Err("image generation has not been approved by this deployment".into());
-            }
-            if self.image_hosts.is_empty() && binding["config"]["mapping"]["tool"] != IMAGE_TOOL {
-                return Err("provider quote names an unreviewed action".into());
-            }
+            return self.quote_image(credential, binding);
         }
-        let (total, mut revision) = self.quote_fixed(credential, binding)?;
-        if binding["config"]["mapping"]["capability"] == "media.generate" {
-            if self.image_base64_quote() {
-                let frozen = json!({"provider_quote":revision,"response_format":"base64","model":"image-01","aspect_ratio":"1:1","n":1,"base64_asset_limit_bytes":BASE64_ASSET_LIMIT});
-                revision = format!(
-                    "base64:sha256:{:x}",
-                    Sha256::digest(frozen.to_string().as_bytes())
-                );
-            } else {
-                if self.image_hosts.is_empty() {
-                    return Err("image CDN host has not been approved by this deployment".into());
-                }
-                let frozen =
-                    json!({"provider_quote":revision,"approved_image_hosts":self.image_hosts});
-                revision = format!("sha256:{:x}", Sha256::digest(frozen.to_string().as_bytes()));
-            }
-        }
+        let (total, revision) = self.quote_fixed(credential, binding)?;
         Ok(AppCapabilityQuote {
             schema: 1,
             currency: "USD".into(),
@@ -872,21 +1087,12 @@ mod tests {
         assert!(adapter
             .quote_app_capability(b"test-token", &binding)
             .is_err());
-        let unpinned = AgenticosExternalAdapter::with_deployment(
-            "https://api.example.test",
-            None,
-            &["cdn.minimax.io".into()],
-        )
-        .unwrap();
+        let unpinned =
+            AgenticosExternalAdapter::with_deployment_pin("https://api.example.test", None)
+                .unwrap();
         assert!(unpinned
             .quote_app_capability(b"test-token", &binding)
             .is_err());
-        assert!(AgenticosExternalAdapter::with_deployment(
-            "https://api.example.test",
-            Some(MANIFEST_PIN),
-            &["127.0.0.1".into()],
-        )
-        .is_err());
         // An image has no worker-controlled prompt, model, company or URL.
         let mut proof = authority();
         proof["slot"] = json!("image");
@@ -960,190 +1166,7 @@ mod tests {
         assert!(image_plan_preflight(&inputs, true).is_err());
     }
 
-    #[test]
-    fn image_result_and_cdn_boundary_fail_closed() {
-        use ::image::ImageEncoder as _;
-        let good = json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/generated.png"]}});
-        assert_eq!(
-            image_url(&good, &["images.example.test".into()]).unwrap(),
-            "https://images.example.test/generated.png"
-        );
-        for bad in [
-            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":[]}}),
-            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a","https://images.example.test/b"]}}),
-            json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a"]}}),
-            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["http://127.0.0.1/a"]}}),
-            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test.evil.test/a"]}}),
-            json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://user@images.example.test/a"]}}),
-        ] {
-            assert!(image_url(&bad, &["images.example.test".into()]).is_err());
-        }
-        for private in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.1.1",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "2001:db8::1",
-            "2002::1",
-        ] {
-            assert!(!public_ip(private.parse().unwrap()), "{private}");
-        }
-        assert!(public_ip("1.1.1.1".parse().unwrap()));
-        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
-        let mut png = Vec::new();
-        ::image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(&[0], 1, 1, ::image::ExtendedColorType::L8)
-            .unwrap();
-        assert_eq!(image_mime(&png, "image/png").unwrap(), "image/png");
-        assert!(image_mime(b"<svg/>", "image/png").is_err());
-        assert!(image_mime(&png[..8], "image/png").is_err());
-        assert!(image_mime(&png, "image/jpeg").is_err());
-    }
-
-    #[test]
-    fn image_call_uses_one_fixed_body_and_refuses_unapproved_cdn() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let worker = std::thread::spawn(move || {
-            for index in 0..2 {
-                let mut request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider request");
-                if index == 0 {
-                    assert_eq!(
-                        request.url(),
-                        "/v1/runtime/tools/minimax.image-gen.from_text"
-                    );
-                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                        "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
-                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
-                    }}).to_string())).unwrap();
-                } else {
-                    assert_eq!(request.url(), CALL_PATH);
-                    assert_eq!(
-                        request
-                            .headers()
-                            .iter()
-                            .find(|header| header.field.equiv("idempotency-key"))
-                            .map(|header| header.value.as_str()),
-                        Some("app-call-image-test")
-                    );
-                    let mut body = String::new();
-                    request.as_reader().read_to_string(&mut body).unwrap();
-                    let body: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(body["slug"], IMAGE_TOOL);
-                    assert_eq!(body["max_charge_minor"], 31_500);
-                    assert_eq!(body["body"]["model"], "image-01");
-                    assert_eq!(body["body"]["aspect_ratio"], "1:1");
-                    assert_eq!(body["body"]["n"], 1);
-                    assert_eq!(body["body"]["response_format"], "url");
-                    assert!(body["body"]["prompt"]
-                        .as_str()
-                        .unwrap()
-                        .contains("JuicySuite CRM"));
-                    assert!(body["body"]["prompt"]
-                        .as_str()
-                        .unwrap()
-                        .contains("Use a calm editorial palette"));
-                    assert!(body.get("company").is_none());
-                    assert!(body.get("query").is_none());
-                    // The pilot credential never silently gains send authority:
-                    // no grant, media key, scope or approval-identity field
-                    // travels on a provider read/draft call (`publish.send`
-                    // is a separate runtime-audience credential in slice-1).
-                    for field in [
-                        "grant",
-                        "grantId",
-                        "mediaKey",
-                        "scope",
-                        "cadenceApprovalId",
-                        "cadenceRunId",
-                        "cadenceEffectId",
-                    ] {
-                        assert!(body.get(field).is_none(), "{field}");
-                        assert!(body["body"].get(field).is_none(), "{field}");
-                    }
-                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                        "slug":IMAGE_TOOL,"repeated":false,
-                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},
-                        "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_urls":["https://evil.example.test/image.png"]}}
-                    }}).to_string())).unwrap();
-                }
-            }
-        });
-        let mut adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        adapter.image_hosts = vec!["images.example.test".into()];
-        let mut proof = authority();
-        proof["slot"] = json!("image");
-        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
-        proof["source"] = Value::Null;
-        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear","image_prompt":"Use a calm editorial palette"});
-        let quote = adapter
-            .quote_app_capability(b"test-token", &proof["binding"])
-            .unwrap();
-        assert_eq!(quote.total_price_micros, 31_500);
-        proof["quote"] = serde_json::to_value(quote).unwrap();
-        assert!(adapter
-            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-test")
-            .is_err());
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn image_call_refuses_rate_limit_and_uncertain_provider_outcomes_with_stable_key() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let worker = std::thread::spawn(move || {
-            for status in [429, 502, 200] {
-                let request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider request");
-                assert_eq!(request.url(), CALL_PATH);
-                assert_eq!(
-                    request
-                        .headers()
-                        .iter()
-                        .find(|header| header.field.equiv("idempotency-key"))
-                        .map(|header| header.value.as_str()),
-                    Some("stable-image-request")
-                );
-                let body = if status == 200 {
-                    json!({"ok":true,"data":{"slug":IMAGE_TOOL,"repeated":true,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"0","failed_count":"1"},"data":{"image_urls":[]}}}})
-                } else {
-                    json!({"ok":false,"error":{"code":"provider_unavailable"}})
-                };
-                request
-                    .respond(
-                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
-                    )
-                    .unwrap();
-            }
-        });
-        let mut adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        adapter.image_hosts = vec!["images.example.test".into()];
-        let mut proof = authority();
-        proof["slot"] = json!("image");
-        proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
-        proof["source"] = json!({"receipt_id":"receipt-1","post":{"id":"post-1","caption":"JuicySuite CRM helps teams track customers","permalink":"https://www.instagram.com/p/ABC123/"},"post_digest":"sha256:source"});
-        proof["inputs"] = json!({"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear"});
-        proof["quote"] = json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"fixed-test-quote"});
-        for _ in 0..3 {
-            assert!(adapter
-                .execute_app_capability(b"test-token", &proof, &json!({}), "stable-image-request")
-                .is_err());
-        }
-        worker.join().unwrap();
-    }
-
-    fn cad734_test_png() -> Vec<u8> {
+    fn test_png() -> Vec<u8> {
         use ::image::ImageEncoder as _;
         let mut bytes = Vec::new();
         ::image::codecs::png::PngEncoder::new(&mut bytes)
@@ -1152,7 +1175,7 @@ mod tests {
         bytes
     }
 
-    fn cad734_image_proof(quote: Value) -> Value {
+    fn image_proof(quote: Value) -> Value {
         let mut proof = authority();
         proof["slot"] = json!("image");
         proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
@@ -1162,285 +1185,554 @@ mod tests {
         proof
     }
 
-    #[test]
-    fn cad734_base64_quote_pins_mode_without_a_cdn_host() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let worker = std::thread::spawn(move || {
-            for _ in 0..3 {
-                let request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider quote");
-                assert_eq!(
-                    request.url(),
-                    "/v1/runtime/tools/minimax.image-gen.from_text"
-                );
-                request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                    "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
-                    "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
-                }}).to_string())).unwrap();
-            }
-        });
-        // No approved CDN host: the adapter fixes base64 mode from trusted
-        // deployment metadata, never from worker input.
-        let base64_adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        assert!(base64_adapter.image_hosts.is_empty());
-        let binding = cad734_image_proof(Value::Null)["binding"].clone();
-        let first = base64_adapter
-            .quote_app_capability(b"test-token", &binding)
-            .unwrap();
-        assert_eq!(first.total_price_micros, 31_500);
-        assert!(
-            first.price_revision.starts_with("base64:sha256:"),
-            "base64 runs carry a mode prefix URL runs never have"
-        );
-        let second = base64_adapter
-            .quote_app_capability(b"test-token", &binding)
-            .unwrap();
-        assert_eq!(first.price_revision, second.price_revision);
-        // An approved host selects URL mode with the legacy revision.
-        let mut url_adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        url_adapter.image_hosts = vec!["images.example.test".into()];
-        let url_quote = url_adapter
-            .quote_app_capability(b"test-token", &binding)
-            .unwrap();
-        assert!(!url_quote.price_revision.starts_with("base64:"));
-        assert_ne!(url_quote.price_revision, first.price_revision);
-        worker.join().unwrap();
+    fn media_quote() -> Value {
+        json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
     }
 
-    #[test]
-    fn cad734_base64_call_uses_fixed_body_and_retains_bytes_not_text() {
-        use base64::Engine as _;
-        let png = cad734_test_png();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
-        assert!(encoded.len() < BASE64_ENCODED_LIMIT);
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let fixture = encoded.clone();
-        let worker = std::thread::spawn(move || {
-            for index in 0..2 {
-                let mut request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider request");
-                if index == 0 {
-                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                        "slug":IMAGE_TOOL,"effect":"draft","chargePrecondition":"max_charge_minor@1",
-                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},"unitPrice":null
-                    }}).to_string())).unwrap();
-                } else {
-                    assert_eq!(request.url(), CALL_PATH);
-                    assert_eq!(
-                        request
-                            .headers()
-                            .iter()
-                            .find(|header| header.field.equiv("idempotency-key"))
-                            .map(|header| header.value.as_str()),
-                        Some("app-call-image-base64")
-                    );
-                    let mut body = String::new();
-                    request.as_reader().read_to_string(&mut body).unwrap();
-                    let body: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(body["slug"], IMAGE_TOOL);
-                    assert_eq!(body["max_charge_minor"], 31_500);
-                    assert_eq!(body["body"]["model"], "image-01");
-                    assert_eq!(body["body"]["aspect_ratio"], "1:1");
-                    assert_eq!(body["body"]["n"], 1);
-                    assert_eq!(body["body"]["response_format"], "base64");
-                    assert_eq!(body["body"]["prompt_optimizer"], false);
-                    assert!(body.get("company").is_none());
-                    assert!(body.get("query").is_none());
-                    // The pilot credential never silently gains send authority:
-                    // no grant, media key, scope or approval-identity field
-                    // travels on a provider read/draft call (`publish.send`
-                    // is a separate runtime-audience credential in slice-1).
-                    for field in [
-                        "grant",
-                        "grantId",
-                        "mediaKey",
-                        "scope",
-                        "cadenceApprovalId",
-                        "cadenceRunId",
-                        "cadenceEffectId",
-                    ] {
-                        assert!(body.get(field).is_none(), "{field}");
-                        assert!(body["body"].get(field).is_none(), "{field}");
-                    }
-                    request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                        "slug":IMAGE_TOOL,"repeated":false,
-                        "price":{"currency":"USD","scale":6,"amount":"0.031500"},
-                        "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_base64":[fixture]}}
-                    }}).to_string())).unwrap();
-                }
-            }
-        });
-        let adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        let binding = cad734_image_proof(Value::Null)["binding"].clone();
-        let quote = adapter
-            .quote_app_capability(b"test-token", &binding)
-            .unwrap();
-        let proof = cad734_image_proof(serde_json::to_value(quote).unwrap());
-        let output = adapter
-            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-base64")
-            .unwrap();
-        let asset = output.asset.expect("base64 run retains an asset");
-        assert_eq!(asset.bytes, png);
-        assert_eq!(asset.media_type, "image/png");
-        assert_eq!(output.result["response_format"], "base64");
-        assert_eq!(output.result["model"], "image-01");
-        assert_eq!(
-            output.result["asset_sha256"],
-            format!("sha256:{:x}", Sha256::digest(&png))
-        );
-        // The reviewed receipt carries digests only: no encoded image,
-        // temporary URL or worker assertion becomes the reviewed asset.
-        let serialized = output.result.to_string();
-        assert!(!serialized.contains(&encoded));
-        assert!(!serialized.contains("image_urls"));
-        assert!(!serialized.contains("image_base64"));
-        worker.join().unwrap();
+    #[derive(Clone, Debug)]
+    struct DoorRequest {
+        method: String,
+        url: String,
+        auth: Option<String>,
+        idem: Option<String>,
+        body: Value,
     }
 
-    #[test]
-    fn cad734_mode_never_changes_under_a_stable_idempotency_key() {
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(cad734_test_png());
+    fn json_response(status: u16, payload: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+        tiny_http::Response::from_string(payload.to_string()).with_status_code(status)
+    }
+
+    /// Loopback AgenticOS media door. It answers exactly `expected` requests
+    /// and the test joins the worker, so a call that issues one extra
+    /// request (a forbidden re-POST) fails instead of passing silently.
+    fn media_door(
+        answer: impl Fn(&DoorRequest) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<DoorRequest>>>,
+        std::thread::JoinHandle<()>,
+    ) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_worker = seen.clone();
         let worker = std::thread::spawn(move || {
-            for (index, payload) in [
-                // Each authority receives the other mode's payload: neither
-                // retry may silently change mode under its stable key.
-                json!({"image_base64":[encoded]}),
-                json!({"image_urls":["https://images.example.test/a.png"]}),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider request");
-                assert_eq!(request.url(), CALL_PATH);
-                let key = if index == 0 {
-                    "stable-url-run"
+            let mut first = true;
+            loop {
+                // The first request gets a generous window; afterwards the
+                // door closes shortly after the caller goes quiet, so a test
+                // finishes fast instead of idling for the full timeout.
+                let window = if first {
+                    Duration::from_secs(10)
                 } else {
-                    "stable-base64-run"
+                    Duration::from_millis(500)
                 };
-                assert_eq!(
-                    request
+                first = false;
+                let mut request = match server.recv_timeout(window).unwrap() {
+                    Some(request) => request,
+                    None => break,
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let record = DoorRequest {
+                    method: request.method().to_string(),
+                    url: request.url().to_string(),
+                    auth: request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("authorization"))
+                        .map(|header| header.value.as_str().to_owned()),
+                    idem: request
                         .headers()
                         .iter()
                         .find(|header| header.field.equiv("idempotency-key"))
-                        .map(|header| header.value.as_str()),
-                    Some(key)
-                );
-                request.respond(tiny_http::Response::from_string(json!({"ok":true,"data":{
-                    "slug":IMAGE_TOOL,"repeated":false,
-                    "price":{"currency":"USD","scale":6,"amount":"0.031500"},
-                    "result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":payload}
-                }}).to_string())).unwrap();
+                        .map(|header| header.value.as_str().to_owned()),
+                    body: serde_json::from_str(&text).unwrap_or(Value::Null),
+                };
+                let reply = answer(&record);
+                seen_worker.lock().unwrap().push(record);
+                request.respond(reply).unwrap();
             }
         });
-        let ceiling = json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500});
-        let mut url_adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        url_adapter.image_hosts = vec!["images.example.test".into()];
-        // A URL-mode authority that receives a base64 payload refuses: the
-        // retry cannot silently become a base64 run under the same key.
-        let mut url_quote = ceiling.clone();
-        url_quote["price_revision"] = json!("sha256:legacy-url-quote");
-        let url_proof = cad734_image_proof(url_quote);
-        assert!(url_adapter
-            .execute_app_capability(b"test-token", &url_proof, &json!({}), "stable-url-run")
-            .is_err());
-        // A base64-mode authority that receives a URL payload refuses too.
-        let adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        let mut base64_quote = ceiling.clone();
-        base64_quote["price_revision"] = json!("base64:sha256:test-quote");
-        let base64_proof = cad734_image_proof(base64_quote);
+        (base, seen, worker)
+    }
+
+    fn price_view(charge_minor: u64, version: &str) -> Value {
+        json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
+    }
+
+    fn job_view(id: &str, status: &str, artifacts: Value, repeated: bool, charge: u64) -> Value {
+        json!({"id":id,"kind":"image","status":status,"model":IMAGE_MODEL,"provider":"upstream-fixture",
+            "providerTaskId":null,"artifacts":artifacts,"artifactError":null,
+            "usage":{"providerCredits":null},
+            "price":{"slug":IMAGE_TOOL,"chargeMinor":charge,"currency":"USD","version":"2026-09-29T00:00:00.000Z"},
+            "repeated":repeated,"cached":false,"stale":false})
+    }
+
+    fn artifact_entry(job_id: &str, bytes: &[u8]) -> Value {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        json!({"ref":format!("{job_id}.{digest}"),"digest":digest,"bytes":bytes.len(),"mime":"image/png"})
+    }
+
+    fn artifact_response(bytes: &[u8]) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+        tiny_http::Response::from_data(bytes.to_vec())
+            .with_header(tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap())
+    }
+
+    fn image_adapter(base: &str) -> AgenticosExternalAdapter {
+        AgenticosExternalAdapter::with_deployment_pin(base, Some(MANIFEST_PIN)).unwrap()
+    }
+
+    fn image_binding() -> Value {
+        image_proof(Value::Null)["binding"].clone()
+    }
+
+    #[test]
+    fn cad816_image_quote_reads_the_media_price_view() {
+        let (base, seen, worker) = media_door(|request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.url, MEDIA_PRICE_PATH);
+            assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
+            json_response(200, price_view(31_500, "2026-09-29T00:00:00.000Z"))
+        });
+        let adapter = image_adapter(&base);
+        let quote = adapter
+            .quote_app_capability(b"test-token", &image_binding())
+            .unwrap();
+        assert_eq!(quote.schema, 1);
+        assert_eq!(quote.currency, "USD");
+        assert_eq!(quote.unit_price_micros, 31_500);
+        assert_eq!(quote.units, 1);
+        assert_eq!(quote.total_price_micros, 31_500);
+        assert!(quote.price_revision.starts_with("media:sha256:"));
+        worker.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cad816_image_quote_refuses_closed_unscoped_unpriced_and_drift() {
+        let mut drifted_slug = price_view(31_500, "v1");
+        drifted_slug["data"]["price"]["slug"] = json!("minimax.image-gen.from_text");
+        let mut drifted_model = price_view(31_500, "v1");
+        drifted_model["data"]["model"] = json!("image-01");
+        for (status, payload, needle) in [
+            (
+                404u16,
+                json!({"ok":false,"error":{"code":"not_found","message":"Unknown route."}}),
+                "media serving is not enabled",
+            ),
+            (
+                403,
+                json!({"ok":false,"error":{"code":"insufficient_scope"}}),
+                "runtime draft scope",
+            ),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"unpriced"}}),
+                "unpriced or disabled",
+            ),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"disabled"}}),
+                "unpriced or disabled",
+            ),
+            (200, price_view(0, "v1"), "unpriced or disabled"),
+            (200, drifted_slug, "drifted"),
+            (200, drifted_model, "drifted"),
+        ] {
+            let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let adapter = image_adapter(&base);
+            let error = adapter
+                .quote_app_capability(b"test-token", &image_binding())
+                .unwrap_err();
+            assert!(error.contains(needle), "{error} lacks {needle}");
+            worker.join().unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+        // An unpinned adapter or a stale manifest pin never reads a price.
+        for pin in [None, Some("agenticos-external-provider-tools@1")] {
+            let adapter =
+                AgenticosExternalAdapter::with_deployment_pin("https://api.example.test", pin)
+                    .unwrap();
+            assert!(adapter
+                .quote_app_capability(b"test-token", &image_binding())
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn cad816_image_quote_and_call_refuse_the_old_minimax_binding() {
+        let adapter = image_adapter("https://api.example.test");
+        let mut binding = image_binding();
+        binding["config"]["mapping"]["tool"] = json!("minimax.image-gen.from_text");
+        assert_eq!(
+            adapter
+                .quote_app_capability(b"test-token", &binding)
+                .unwrap_err(),
+            "provider quote names an unreviewed action"
+        );
+        let mut proof = image_proof(media_quote());
+        proof["binding"]["config"]["mapping"]["tool"] = json!("minimax.image-gen.from_text");
         assert!(adapter
-            .execute_app_capability(
-                b"test-token",
-                &base64_proof,
-                &json!({}),
-                "stable-base64-run"
-            )
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-1")
             .is_err());
-        // A base64 authority on an unapproved deployment, and a URL
-        // authority after its host approval lapses, both fail closed.
-        let unpinned = AgenticosExternalAdapter::with_deployment_pin(&base, None).unwrap();
+        // An unpinned or stale-pinned deployment never executes images.
+        let unpinned = AgenticosExternalAdapter::with_deployment_pin(
+            "https://api.example.test",
+            Some("agenticos-external-provider-tools@1"),
+        )
+        .unwrap();
         assert!(unpinned
             .execute_app_capability(
                 b"test-token",
-                &base64_proof,
+                &image_proof(media_quote()),
                 &json!({}),
-                "stable-base64-run"
+                "app-call-1"
             )
             .is_err());
-        let lapsed =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        assert!(lapsed
-            .execute_app_capability(b"test-token", &url_proof, &json!({}), "stable-url-run")
-            .is_err());
-        worker.join().unwrap();
     }
 
     #[test]
-    fn cad734_base64_refuses_uncertain_outcomes_without_a_second_call() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let worker = std::thread::spawn(move || {
-            for status in [429, 200] {
-                let request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("provider request");
-                assert_eq!(request.url(), CALL_PATH);
-                assert_eq!(
-                    request
-                        .headers()
-                        .iter()
-                        .find(|header| header.field.equiv("idempotency-key"))
-                        .map(|header| header.value.as_str()),
-                    Some("stable-base64-uncertain")
-                );
-                let body = if status == 200 {
-                    json!({"ok":true,"data":{"slug":IMAGE_TOOL,"repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"0","failed_count":"1"},"data":{"image_base64":[]}}}})
-                } else {
-                    json!({"ok":false,"error":{"code":"provider_unavailable"}})
-                };
-                request
-                    .respond(
-                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+    fn cad816_image_replay_and_over_quote_charge_succeed_without_a_poll() {
+        let png = test_png();
+        let artifact = artifact_entry("med_job1", &png);
+        let artifact_bytes = png.clone();
+        let (base, seen, worker) = media_door(move |request| {
+            match (request.method.as_str(), request.url.as_str()) {
+                ("POST", "/v1/runtime/media/image") => {
+                    assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
+                    assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
+                    assert_eq!(request.body["model"], json!("openai/gpt-image-2.5"));
+                    assert_eq!(request.body["aspectRatio"], json!("1:1"));
+                    assert_eq!(request.body.as_object().unwrap().len(), 3);
+                    assert!(request.body["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("JuicySuite CRM"));
+                    json_response(
+                        200,
+                        json!({"ok":true,"data":{"job":job_view("med_job1","succeeded",json!([artifact.clone()]),true,40_000)}}),
                     )
-                    .unwrap();
+                }
+                ("GET", _) => artifact_response(&artifact_bytes),
+                _ => panic!(
+                    "unexpected media request {} {}",
+                    request.method, request.url
+                ),
             }
         });
-        let adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&base, Some(MANIFEST_PIN)).unwrap();
-        let proof = cad734_image_proof(
-            json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"base64:sha256:test-quote"}),
+        let adapter = image_adapter(&base);
+        let proof = image_proof(media_quote());
+        let output = adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+            .unwrap();
+        let asset = output.asset.expect("image asset");
+        assert_eq!(asset.bytes, png);
+        assert_eq!(asset.media_type, "image/png");
+        let result = &output.result;
+        assert_eq!(result["kind"], "media.generated.image");
+        assert_eq!(result["model"], "openai/gpt-image-2.5");
+        assert_eq!(result["job_id"], "med_job1");
+        assert_eq!(result["charge"]["amount"], "0.040000");
+        assert_eq!(result["charge"]["currency"], "USD");
+        assert_eq!(result["charge"]["scale"], 6);
+        // Pass-through: the actual charge exceeds the approved rate; both
+        // are recorded and nothing is refused.
+        assert_eq!(result["quoted_micros"], 31_500);
+        assert_eq!(result["price_version"], "2026-09-29T00:00:00.000Z");
+        assert_eq!(result["repeated"], true);
+        assert_eq!(
+            result["asset_sha256"],
+            format!("sha256:{:x}", Sha256::digest(&png))
         );
-        // Exactly one provider call per execute: failures stay visible and
-        // retry only with the same key, never as an automatic second call.
-        for _ in 0..2 {
-            assert!(adapter
-                .execute_app_capability(
-                    b"test-token",
-                    &proof,
-                    &json!({}),
-                    "stable-base64-uncertain"
-                )
-                .is_err());
-        }
+        assert_eq!(result["asset_media_type"], "image/png");
+        assert_eq!(result["source_receipt_id"], "receipt-1");
+        assert_eq!(result["source_post_id"], "post-1");
         worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "submit plus artifact read; no poll");
+        assert_eq!(seen.iter().filter(|r| r.method == "POST").count(), 1);
+    }
+
+    #[test]
+    fn cad816_image_refusal_variants_never_repost() {
+        for (status, payload, needle) in [
+            (
+                404u16,
+                json!({"ok":false,"error":{"code":"not_found","message":"Unknown route."}}),
+                "media serving is not enabled",
+            ),
+            (
+                403,
+                json!({"ok":false,"error":{"code":"insufficient_scope"}}),
+                "runtime draft scope",
+            ),
+            (
+                403,
+                json!({"ok":false,"error":{"code":"credential_revoked"}}),
+                "no longer authorized",
+            ),
+            (
+                402,
+                json!({"ok":false,"error":{"code":"insufficient_funds"}}),
+                "insufficient credit",
+            ),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"key_conflict"}}),
+                "key_conflict",
+            ),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"uncertain"}}),
+                "uncertain",
+            ),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"idempotency_in_progress"}}),
+                "idempotency_in_progress",
+            ),
+            (
+                500,
+                json!({"ok":false,"error":{"code":"upstream"}}),
+                "outcome is uncertain",
+            ),
+            (
+                400,
+                json!({"ok":false,"error":{"code":"invalid_request"}}),
+                "invalid_request",
+            ),
+        ] {
+            let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let adapter = image_adapter(&base);
+            let proof = image_proof(media_quote());
+            let error = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .unwrap();
+            assert!(error.contains(needle), "{error} lacks {needle}");
+            worker.join().unwrap();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "exactly one POST for status {status}");
+            assert_eq!(seen[0].method, "POST");
+        }
+        // Transport failure: unreachable host is uncertain, still no retry.
+        let dead = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.server_addr().to_ip().unwrap());
+        drop(dead);
+        let adapter = image_adapter(&base);
+        let proof = image_proof(media_quote());
+        let error = adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+            .err()
+            .unwrap();
+        assert!(error.contains("outcome is uncertain"), "{error}");
+        // A caller key outside the AgenticOS shape is refused before any POST.
+        let adapter = image_adapter("https://api.example.test");
+        let proof = image_proof(media_quote());
+        assert_eq!(
+            adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "bad.key.12345")
+                .err()
+                .unwrap(),
+            "provider idempotency key is invalid"
+        );
+    }
+
+    #[test]
+    fn cad816_image_terminal_failures_and_bad_artifacts_refuse() {
+        let png = test_png();
+        let artifact = artifact_entry("med_job1", &png);
+        for (status_name, artifacts) in [
+            ("failed", json!([])),
+            ("released", json!([])),
+            ("uncertain", json!([])),
+            ("succeeded", json!([])),
+        ] {
+            let (base, _seen, worker) = media_door(move |_| {
+                json_response(
+                    201,
+                    json!({"ok":true,"data":{"job":job_view("med_job1",status_name,artifacts.clone(),false,31_500)}}),
+                )
+            });
+            let adapter = image_adapter(&base);
+            let proof = image_proof(media_quote());
+            let error = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("med_job1") || status_name == "succeeded",
+                "{error}"
+            );
+            worker.join().unwrap();
+        }
+        // Artifact descriptor and bytes must agree exactly.
+        let wrong_digest = artifact_entry("med_job1", b"different");
+        let bad_ref = {
+            let mut entry = artifact_entry("med_job1", &png);
+            entry["ref"] =
+                json!("med_other.5c1480e7e57bb317cfc0431d6b0b2457815986cd9f55b8d07a1c6c9c24e1b697");
+            entry
+        };
+        // Past the custody bound the artifact read is refused at the cap.
+        let big = vec![0u8; image::ASSET_LIMIT + 1];
+        let oversized_entry = artifact_entry("med_job1", &big);
+        for (entry, bytes, needle) in [
+            (oversized_entry, big, "custody bound"),
+            (wrong_digest, png.clone(), "differs from its receipt"),
+            (bad_ref, png.clone(), "artifact descriptor"),
+            (artifact.clone(), b"different bytes".to_vec(), "differs"),
+            (
+                artifact_entry("med_job1", b"<svg>not an image</svg>"),
+                b"<svg>not an image</svg>".to_vec(),
+                "image",
+            ),
+        ] {
+            let (base, seen, worker) = media_door(move |request| {
+                if request.method == "POST" {
+                    json_response(
+                        201,
+                        json!({"ok":true,"data":{"job":job_view("med_job1","succeeded",json!([entry.clone()]),false,31_500)}}),
+                    )
+                } else {
+                    artifact_response(&bytes)
+                }
+            });
+            let adapter = image_adapter(&base);
+            let proof = image_proof(media_quote());
+            let error = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .unwrap();
+            assert!(error.contains(needle), "{error} lacks {needle}");
+            worker.join().unwrap();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.iter().filter(|r| r.method == "POST").count(), 1);
+        }
+    }
+
+    /// Poll, deadline and drift paths need the short test-seam clock.
+    #[cfg(feature = "test-seam")]
+    mod media_poll_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        fn fast_adapter(base: &str) -> AgenticosExternalAdapter {
+            let mut adapter = image_adapter(base);
+            adapter.test_poll_interval = Some(Duration::from_millis(5));
+            adapter.test_poll_deadline = Some(Duration::from_millis(500));
+            adapter
+        }
+
+        #[test]
+        fn cad816_image_call_polls_queued_running_then_succeeds() {
+            let png = test_png();
+            let artifact = artifact_entry("med_job1", &png);
+            let artifact_bytes = png.clone();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_worker = polls.clone();
+            let (base, seen, worker) = media_door(move |request| {
+                match (request.method.as_str(), request.url.as_str()) {
+                    ("POST", "/v1/runtime/media/image") => {
+                        assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
+                        assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
+                        assert_eq!(
+                            request.body,
+                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1"})
+                        );
+                        json_response(
+                            201,
+                            json!({"ok":true,"data":{"job":job_view("med_job1","queued",json!([]),false,31_500)}}),
+                        )
+                    }
+                    ("GET", "/v1/runtime/media/jobs/med_job1") => {
+                        let count = polls_worker.fetch_add(1, Ordering::SeqCst);
+                        let (status, artifacts) = if count == 0 {
+                            ("running", json!([]))
+                        } else {
+                            ("succeeded", json!([artifact.clone()]))
+                        };
+                        json_response(
+                            200,
+                            json!({"ok":true,"data":{"job":job_view("med_job1",status,artifacts,false,31_500)}}),
+                        )
+                    }
+                    ("GET", _) => artifact_response(&artifact_bytes),
+                    _ => panic!(
+                        "unexpected media request {} {}",
+                        request.method, request.url
+                    ),
+                }
+            });
+            let adapter = fast_adapter(&base);
+            let proof = image_proof(media_quote());
+            let output = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .unwrap();
+            assert_eq!(output.result["job_id"], "med_job1");
+            assert_eq!(output.asset.unwrap().bytes, png);
+            worker.join().unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 4);
+        }
+
+        #[test]
+        fn cad816_image_poll_id_drift_and_deadline_fail_closed() {
+            // A poll echoing another job id is refused.
+            let (base, _seen, worker) = media_door(move |request| {
+                if request.method == "POST" {
+                    json_response(
+                        201,
+                        json!({"ok":true,"data":{"job":job_view("med_job1","queued",json!([]),false,31_500)}}),
+                    )
+                } else {
+                    json_response(
+                        200,
+                        json!({"ok":true,"data":{"job":job_view("med_other","queued",json!([]),false,31_500)}}),
+                    )
+                }
+            });
+            let adapter = fast_adapter(&base);
+            let proof = image_proof(media_quote());
+            let error = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .unwrap();
+            assert!(error.contains("identity"), "{error}");
+            worker.join().unwrap();
+
+            // A job that stays running hits the bounded deadline.
+            let (base, seen, worker) = media_door(move |request| {
+                if request.method == "POST" {
+                    json_response(
+                        201,
+                        json!({"ok":true,"data":{"job":job_view("med_job1","running",json!([]),false,31_500)}}),
+                    )
+                } else {
+                    json_response(
+                        200,
+                        json!({"ok":true,"data":{"job":job_view("med_job1","running",json!([]),false,31_500)}}),
+                    )
+                }
+            });
+            let adapter = fast_adapter(&base);
+            let proof = image_proof(media_quote());
+            let error = adapter
+                .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .unwrap();
+            assert!(error.contains("still running"), "{error}");
+            assert!(error.contains("med_job1"), "{error}");
+            let polls = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "GET")
+                .count();
+            assert!(polls >= 1, "the job was polled before the deadline");
+            drop(worker);
+        }
     }
 
     #[test]

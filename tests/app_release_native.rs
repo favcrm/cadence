@@ -1176,7 +1176,7 @@ fn cad713_reviewed_run_asset_is_pinned_into_one_local_outbox_draft() {
 
 #[cfg(feature = "test-seam")]
 #[test]
-fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
+fn cad816_media_image_reaches_reviewed_local_draft_only_with_exact_asset() {
     use base64::Engine as _;
     use image::ImageEncoder as _;
     use sha2::{Digest as _, Sha256};
@@ -1187,8 +1187,7 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
     image::codecs::png::PngEncoder::new(&mut png)
         .write_image(&[0], 1, 1, image::ExtendedColorType::L8)
         .unwrap();
-    let cdn = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let cdn_url = format!("http://{}/image.png", cdn.server_addr().to_ip().unwrap());
+    // The first run's artifact is plausible PNG that fails the custody decode.
     let mut corrupt = png.clone();
     let payload = corrupt
         .windows(4)
@@ -1196,93 +1195,118 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
         .unwrap()
         + 4;
     corrupt[payload] ^= 0x40;
-    let cdn_png = png.clone();
-    let cdn_worker = std::thread::spawn(move || {
-        for bytes in [corrupt, cdn_png] {
-            let request = cdn
-                .recv_timeout(Duration::from_secs(30))
-                .unwrap()
-                .expect("fixture CDN GET");
-            assert_eq!(request.url(), "/image.png");
-            request
-                .respond(tiny_http::Response::from_data(bytes).with_header(
-                    tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
-                ))
-                .unwrap();
-        }
-    });
+    let artifact_entry = |job_id: &str, bytes: &[u8]| {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        json!({"ref":format!("{job_id}.{digest}"),"digest":digest,"bytes":bytes.len(),"mime":"image/png"})
+    };
+    let job_view = |id: &str, status: &str, artifacts: Value, repeated: bool| {
+        json!({"id":id,"kind":"image","status":status,"model":"openai/gpt-image-2.5","provider":"upstream-fixture",
+            "providerTaskId":null,"artifacts":artifacts,"artifactError":null,
+            "usage":{"providerCredits":null},
+            "price":{"slug":"generate_image","chargeMinor":31_500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"},
+            "repeated":repeated,"cached":false,"stale":false})
+    };
     let provider = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let provider_url = format!("http://{}", provider.server_addr().to_ip().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let image_calls = Arc::new(AtomicUsize::new(0));
     let stop_worker = stop.clone();
     let image_calls_worker = image_calls.clone();
+    let corrupt_worker = corrupt.clone();
+    let png_worker = png.clone();
+    let artifact_entry = std::sync::Arc::new(artifact_entry);
+    let job_view = std::sync::Arc::new(job_view);
     let provider_worker = std::thread::spawn(move || {
         while !stop_worker.load(Ordering::SeqCst) {
             let Some(mut request) = provider.recv_timeout(Duration::from_millis(100)).unwrap()
             else {
                 continue;
             };
-            let reply = if request.url() != "/v1/runtime/tools/call"
-                && request.url().starts_with("/v1/runtime/tools/")
-            {
-                let image = request.url().ends_with("minimax.image-gen.from_text");
-                if !image {
-                    assert_eq!(
-                        request.url(),
-                        "/v1/runtime/tools/scrapecreators.instagram.user.posts"
-                    );
-                }
-                let slug = if image {
-                    "minimax.image-gen.from_text"
-                } else {
-                    "scrapecreators.instagram.user.posts"
-                };
-                json!({"ok":true,"data":{"slug":slug,"effect":if image {"draft"} else {"read"},"chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":if image {"0.031500"} else {"0.002000"}},"unitPrice":null}})
-            } else {
-                assert_eq!(request.url(), "/v1/runtime/tools/call");
-                let mut body = String::new();
-                request.as_reader().read_to_string(&mut body).unwrap();
-                let body: Value = serde_json::from_str(&body).unwrap();
+            let url = request.url().to_string();
+            if url == "/v1/runtime/media/price/image" {
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":true,"data":{"kind":"image","model":"openai/gpt-image-2.5",
+                            "price":{"slug":"generate_image","chargeMinor":31_500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}})
+                        .to_string(),
+                    ))
+                    .unwrap();
+                continue;
+            }
+            if url == "/v1/runtime/media/image" && request.method().as_str() == "POST" {
+                let call = image_calls_worker.fetch_add(1, Ordering::SeqCst);
                 assert!(request
                     .headers()
                     .iter()
                     .find(|header| header.field.equiv("idempotency-key"))
                     .is_some_and(|header| header.value.as_str().starts_with("app-call-")));
-                match body["slug"].as_str().unwrap() {
-                    "scrapecreators.instagram.user.posts" => {
-                        assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
-                        json!({"ok":true,"data":{"slug":"scrapecreators.instagram.user.posts","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.002000"},"result":{"success":true,"status":"ok","user":{"username":"juicysuite_crm","is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","user":{"username":"juicysuite_crm","is_private":false},"caption":{"text":"JuicySuite CRM helps teams track customers"},"media_type":1}]}}})
-                    }
-                    "minimax.image-gen.from_text" => {
-                        image_calls_worker.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(body["max_charge_minor"], 31_500);
-                        assert_eq!(body["body"]["model"], "image-01");
-                        assert_eq!(body["body"]["aspect_ratio"], "1:1");
-                        assert_eq!(body["body"]["n"], 1);
-                        assert_eq!(body["body"]["response_format"], "url");
-                        assert!(body["body"]["prompt"]
-                            .as_str()
-                            .unwrap()
-                            .contains("JuicySuite CRM"));
-                        json!({"ok":true,"data":{"slug":"minimax.image-gen.from_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_urls":["https://images.example.test/generated.png"]}}}})
-                    }
-                    other => panic!("unexpected fixture tool: {other}"),
-                }
-            };
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["model"], "openai/gpt-image-2.5");
+                assert_eq!(body["aspectRatio"], "1:1");
+                assert!(body["prompt"].as_str().unwrap().contains("JuicySuite CRM"));
+                assert!(body.get("max_charge_minor").is_none());
+                let job_id = format!("med_job{call}");
+                let bytes = if call == 0 {
+                    &corrupt_worker
+                } else {
+                    &png_worker
+                };
+                let job = job_view(
+                    &job_id,
+                    "succeeded",
+                    json!([artifact_entry(&job_id, bytes)]),
+                    false,
+                );
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":true,"data":{"job":job}}).to_string(),
+                    ))
+                    .unwrap();
+                continue;
+            }
+            if let Some(reference) = url.strip_prefix("/v1/runtime/media/artifacts/") {
+                let bytes = if reference.starts_with("med_job0.") {
+                    corrupt_worker.clone()
+                } else {
+                    png_worker.clone()
+                };
+                request
+                    .respond(tiny_http::Response::from_data(bytes).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
+                    ))
+                    .unwrap();
+                continue;
+            }
+            if url.starts_with("/v1/runtime/tools/") && url != "/v1/runtime/tools/call" {
+                assert_eq!(url, "/v1/runtime/tools/scrapecreators.instagram.user.posts");
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":true,"data":{"slug":"scrapecreators.instagram.user.posts","effect":"read","chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":"0.002000"},"unitPrice":null}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+                continue;
+            }
+            assert_eq!(url, "/v1/runtime/tools/call");
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["slug"], "scrapecreators.instagram.user.posts");
+            assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
             request
-                .respond(tiny_http::Response::from_string(reply.to_string()))
+                .respond(tiny_http::Response::from_string(
+                    json!({"ok":true,"data":{"slug":"scrapecreators.instagram.user.posts","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.002000"},"result":{"success":true,"status":"ok","user":{"username":"juicysuite_crm","is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","user":{"username":"juicysuite_crm","is_private":false},"caption":{"text":"JuicySuite CRM helps teams track customers"},"media_type":1}]}}})
+                        .to_string(),
+                ))
                 .unwrap();
         }
     });
     let h = Release::with_social_image(move |opts, _| {
-        let adapter = AgenticosExternalAdapter::with_test_cdn(
-            &provider_url,
-            Some(MANIFEST_PIN),
-            &["images.example.test".into()],
-            &cdn_url,
-        )
-        .unwrap();
+        let adapter =
+            AgenticosExternalAdapter::with_deployment_pin(&provider_url, Some(MANIFEST_PIN))
+                .unwrap();
         opts.platforms
             .insert("agenticos_external".into(), Arc::new(adapter));
     });
@@ -1316,6 +1340,11 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
         )
         .unwrap();
     assert_eq!(quoted["quote"]["total_price_micros"], 31_500);
+    assert!(quoted["quote"]["price_revision"]
+        .as_str()
+        .unwrap()
+        .starts_with("media:sha256:"));
+    // A corrupt artifact fails closed with no receipt and no staging.
     let refused = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":{"subject":"Customer follow-up","brand_voice":"Warm and clear","writer":WRITER,"reviewer":REVIEWER},"source_receipt_id":source_receipt["id"],"selected_post_id":"post-1","request_id":"corrupt-image-run","owner_pm":OWNER})).unwrap();
     std::fs::write(
         h.daemon.state.join(format!(
@@ -1359,8 +1388,15 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
         .unwrap()["results"][0]
         .clone();
     assert_eq!(receipt["result"]["kind"], "media.generated.image");
-    assert_eq!(receipt["result"]["model"], "image-01");
+    assert_eq!(receipt["result"]["model"], "openai/gpt-image-2.5");
     assert_eq!(receipt["result"]["aspect_ratio"], "1:1");
+    assert_eq!(receipt["result"]["charge"]["amount"], "0.031500");
+    assert_eq!(
+        receipt["result"]["price_version"],
+        "2026-09-29T00:00:00.000Z"
+    );
+    assert_eq!(receipt["result"]["quoted_micros"], 31_500);
+    assert_eq!(receipt["result"]["job_id"], "med_job1");
     assert_eq!(receipt["asset"]["media_type"], "image/png");
     assert_eq!(receipt["asset"]["size"], png.len());
     assert_eq!(
@@ -1385,7 +1421,6 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
         completed["reviews"][0]["asset_digest"],
         receipt["asset"]["digest"]
     );
-    assert!(!receipt.to_string().contains("images.example.test"));
     assert_eq!(
         image_calls.load(Ordering::SeqCst),
         2,
@@ -1439,274 +1474,6 @@ fn cad731_fixed_image_reaches_reviewed_local_draft_only_with_exact_asset() {
         .join(staged["effect_id"].as_str().unwrap())
         .join("attachments/asset.bin");
     assert_eq!(std::fs::read(path).unwrap(), png);
-    stop.store(true, Ordering::SeqCst);
-    provider_worker.join().unwrap();
-    cdn_worker.join().unwrap();
-}
-
-#[cfg(feature = "test-seam")]
-#[test]
-fn cad734_base64_image_reaches_reviewed_local_draft_with_exact_bytes() {
-    use base64::Engine as _;
-    use image::ImageEncoder as _;
-    use sha2::{Digest as _, Sha256};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::Arc;
-
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&[0], 1, 1, image::ExtendedColorType::L8)
-        .unwrap();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
-    let provider = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let provider_url = format!("http://{}", provider.server_addr().to_ip().unwrap());
-    let stop = Arc::new(AtomicBool::new(false));
-    let image_calls = Arc::new(AtomicUsize::new(0));
-    let stop_worker = stop.clone();
-    let image_calls_worker = image_calls.clone();
-    let png_worker = png.clone();
-    let encoded_worker = encoded.clone();
-    let provider_worker = std::thread::spawn(move || {
-        while !stop_worker.load(Ordering::SeqCst) {
-            let Some(mut request) = provider.recv_timeout(Duration::from_millis(100)).unwrap()
-            else {
-                continue;
-            };
-            let reply = if request.url() != "/v1/runtime/tools/call"
-                && request.url().starts_with("/v1/runtime/tools/")
-            {
-                let image = request.url().ends_with("minimax.image-gen.from_text");
-                if !image {
-                    assert_eq!(
-                        request.url(),
-                        "/v1/runtime/tools/scrapecreators.instagram.user.posts"
-                    );
-                }
-                let slug = if image {
-                    "minimax.image-gen.from_text"
-                } else {
-                    "scrapecreators.instagram.user.posts"
-                };
-                json!({"ok":true,"data":{"slug":slug,"effect":if image {"draft"} else {"read"},"chargePrecondition":"max_charge_minor@1","price":{"currency":"USD","scale":6,"amount":if image {"0.031500"} else {"0.002000"}},"unitPrice":null}})
-            } else {
-                assert_eq!(request.url(), "/v1/runtime/tools/call");
-                let mut body = String::new();
-                request.as_reader().read_to_string(&mut body).unwrap();
-                let body: Value = serde_json::from_str(&body).unwrap();
-                assert!(request
-                    .headers()
-                    .iter()
-                    .find(|header| header.field.equiv("idempotency-key"))
-                    .is_some_and(|header| header.value.as_str().starts_with("app-call-")));
-                match body["slug"].as_str().unwrap() {
-                    "scrapecreators.instagram.user.posts" => {
-                        assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
-                        json!({"ok":true,"data":{"slug":"scrapecreators.instagram.user.posts","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.002000"},"result":{"success":true,"status":"ok","user":{"username":"juicysuite_crm","is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","user":{"username":"juicysuite_crm","is_private":false},"caption":{"text":"JuicySuite CRM helps teams track customers"},"media_type":1}]}}})
-                    }
-                    "minimax.image-gen.from_text" => {
-                        let call = image_calls_worker.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(body["max_charge_minor"], 31_500);
-                        assert_eq!(body["body"]["model"], "image-01");
-                        assert_eq!(body["body"]["aspect_ratio"], "1:1");
-                        assert_eq!(body["body"]["n"], 1);
-                        assert_eq!(body["body"]["response_format"], "base64");
-                        assert!(body["body"]["prompt"]
-                            .as_str()
-                            .unwrap()
-                            .contains("JuicySuite CRM"));
-                        // First call is malformed, second oversized, then good:
-                        // each uncertain outcome stays visible, no silent retry.
-                        let payload = match call {
-                            0 => json!(["!!!not-base64!!!"]),
-                            1 => json!(["A".repeat(700_001)]),
-                            _ => json!([encoded_worker]),
-                        };
-                        json!({"ok":true,"data":{"slug":"minimax.image-gen.from_text","repeated":false,"price":{"currency":"USD","scale":6,"amount":"0.031500"},"result":{"base_resp":{"status_code":0},"metadata":{"success_count":"1","failed_count":"0"},"data":{"image_base64":payload}}}})
-                    }
-                    other => panic!("unexpected fixture tool: {other}"),
-                }
-            };
-            request
-                .respond(tiny_http::Response::from_string(reply.to_string()))
-                .unwrap();
-        }
-    });
-    // No approved CDN host: the deployment pins base64 custody only.
-    let h = Release::with_social_image(move |opts, _| {
-        let adapter =
-            AgenticosExternalAdapter::with_deployment_pin(&provider_url, Some(MANIFEST_PIN))
-                .unwrap();
-        opts.platforms
-            .insert("agenticos_external".into(), Arc::new(adapter));
-    });
-    let external = h.daemon.operator_rpc("connection_create", json!({"provider":"agenticos_external","account":"ws_11111111-1111-4111-8111-111111111111","shape":"token","token":"AAAAAAAAAAAAAAAAAAAA","scopes":["provider.read","provider.draft"],"accept_same_uid_risk":true})).unwrap()["connection"]["id"].as_str().unwrap().to_string();
-    for slot in ["source", "image"] {
-        h.daemon.operator_rpc("app_binding_create", json!({"install_id":h.install["install_id"],"slot":slot,"connection_id":external.as_str(),"request_id":format!("bind-{slot}")})).unwrap();
-    }
-    h.daemon.operator_rpc("app_binding_create", json!({"install_id":h.install["install_id"],"slot":"publication","connection_id":h.connection,"request_id":"bind-publication"})).unwrap();
-    let source = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"source-instagram","inputs":{"profile_handle":"juicysuite_crm","writer":WRITER},"request_id":"source-run","owner_pm":OWNER})).unwrap();
-    std::fs::write(
-        h.daemon.state.join(format!(
-            "social-image-probe-{}.json",
-            source["id"].as_str().unwrap()
-        )),
-        json!({"slot":"source"}).to_string(),
-    )
-    .unwrap();
-    h.dispatch(&source);
-    let source = h.wait_state(source["id"].as_str().unwrap(), "succeeded");
-    let source_receipt = h
-        .daemon
-        .operator_rpc("app_run_capability_results", json!({"run_id":source["id"]}))
-        .unwrap()["results"][0]
-        .clone();
-    assert_eq!(source_receipt["result"]["posts"][0]["id"], "post-1");
-    let quoted = h
-        .daemon
-        .operator_rpc(
-            "app_binding_quote",
-            json!({"install_id":h.install["install_id"],"slot":"image"}),
-        )
-        .unwrap();
-    assert_eq!(quoted["quote"]["total_price_micros"], 31_500);
-    assert!(
-        quoted["quote"]["price_revision"]
-            .as_str()
-            .unwrap()
-            .starts_with("base64:sha256:"),
-        "base64 approval pins its response mode"
-    );
-    let image_inputs = json!({"subject":"Customer follow-up","brand_voice":"Warm and clear","writer":WRITER,"reviewer":REVIEWER});
-    // Malformed then oversized base64 both fail closed with no reviewable
-    // artifact and no onward staging.
-    for (request_id, probe) in [
-        ("corrupt-image-run", "malformed"),
-        ("oversized-image-run", "oversized"),
-    ] {
-        let refused = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":image_inputs,"source_receipt_id":source_receipt["id"],"selected_post_id":"post-1","request_id":request_id,"owner_pm":OWNER})).unwrap();
-        std::fs::write(
-            h.daemon.state.join(format!(
-                "social-image-probe-{}.json",
-                refused["id"].as_str().unwrap()
-            )),
-            json!({"slot":"image"}).to_string(),
-        )
-        .unwrap();
-        h.dispatch(&refused);
-        let refused = h.wait_state(refused["id"].as_str().unwrap(), "failed");
-        assert!(
-            refused["artifacts"].as_array().unwrap().is_empty(),
-            "{probe}"
-        );
-        assert!(refused["reviews"].as_array().unwrap().is_empty(), "{probe}");
-        let _ = probe;
-    }
-    assert!(h.daemon.operator_rpc("app_effect_stage", json!({"run_id":"no-such-run","artifact_id":"forged","slot":"publication","request_id":"base64-forged-release","title":"Never released"})).is_err());
-    assert!(h.items().as_array().unwrap().is_empty());
-    // The frozen selected public source yields one retained image receipt.
-    let run = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":image_inputs,"source_receipt_id":source_receipt["id"],"selected_post_id":"post-1","request_id":"image-run","owner_pm":OWNER})).unwrap();
-    assert_eq!(run["snapshot"]["quotes"]["image"], quoted["quote"]);
-    std::fs::write(
-        h.daemon.state.join(format!(
-            "social-image-probe-{}.json",
-            run["id"].as_str().unwrap()
-        )),
-        json!({"slot":"image"}).to_string(),
-    )
-    .unwrap();
-    h.dispatch(&run);
-    let completed = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
-    let receipt = h
-        .daemon
-        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
-        .unwrap()["results"][0]
-        .clone();
-    assert_eq!(receipt["result"]["kind"], "media.generated.image");
-    assert_eq!(receipt["result"]["model"], "image-01");
-    assert_eq!(receipt["result"]["aspect_ratio"], "1:1");
-    assert_eq!(receipt["result"]["response_format"], "base64");
-    assert_eq!(receipt["asset"]["media_type"], "image/png");
-    assert_eq!(receipt["asset"]["size"], png.len());
-    assert_eq!(
-        receipt["asset"]["digest"],
-        format!("sha256:{:x}", Sha256::digest(&png))
-    );
-    // The encoded transport text never becomes the reviewed asset.
-    assert!(!receipt.to_string().contains(&encoded));
-    let retained = h
-        .daemon
-        .operator_rpc(
-            "app_run_capability_asset",
-            json!({"receipt_id":receipt["id"]}),
-        )
-        .unwrap();
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(retained["base64"].as_str().unwrap())
-            .unwrap(),
-        png
-    );
-    // An independent reviewer fetches and pins the exact digests.
-    assert_eq!(completed["reviews"][0]["asset_receipt_id"], receipt["id"]);
-    assert_eq!(
-        completed["reviews"][0]["asset_digest"],
-        receipt["asset"]["digest"]
-    );
-    assert_eq!(
-        image_calls.load(Ordering::SeqCst),
-        3,
-        "each of three runs should make one provider call despite stable-key retry"
-    );
-    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
-    db.execute(
-        "UPDATE app_capability_results SET asset=NULL WHERE id=?",
-        [receipt["id"].as_str().unwrap()],
-    )
-    .unwrap();
-    assert!(h.daemon.operator_rpc("app_effect_stage", json!({"run_id":run["id"],"artifact_id":completed["artifacts"][0]["id"],"slot":"publication","request_id":"missing-asset","title":"Reviewed draft"})).is_err());
-    db.execute(
-        "UPDATE app_capability_results SET asset=? WHERE id=?",
-        rusqlite::params![&png, receipt["id"].as_str().unwrap()],
-    )
-    .unwrap();
-    let staged = h.stage(&completed, "image-release");
-    db.execute(
-        "UPDATE app_capability_results SET asset=x'00' WHERE id=?",
-        [receipt["id"].as_str().unwrap()],
-    )
-    .unwrap();
-    assert!(h
-        .daemon
-        .operator_rpc(
-            "app_effect_decide",
-            json!({"effect_id":staged["effect_id"],"digest":staged["digest"],"decision":"accept"})
-        )
-        .is_err());
-    db.execute(
-        "UPDATE app_capability_results SET asset=? WHERE id=?",
-        rusqlite::params![&png, receipt["id"].as_str().unwrap()],
-    )
-    .unwrap();
-    // Explicit operator acceptance writes one Local draft with identical bytes.
-    let done = h.decide(&staged);
-    assert_eq!(done["state"], "done");
-    let items = h.items();
-    assert_eq!(items.as_array().unwrap().len(), 1);
-    assert_eq!(
-        items[0]["attachments"][0]["sha256"],
-        receipt["asset"]["digest"]
-            .as_str()
-            .unwrap()
-            .trim_start_matches("sha256:")
-    );
-    let path = h
-        .root
-        .path()
-        .join("outbox/app-items")
-        .join(staged["effect_id"].as_str().unwrap())
-        .join("attachments/asset.bin");
-    assert_eq!(std::fs::read(path).unwrap(), png);
-    assert_eq!(png_worker, png);
     stop.store(true, Ordering::SeqCst);
     provider_worker.join().unwrap();
 }
