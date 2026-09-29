@@ -22,6 +22,9 @@ use cadence_agent::platform::agenticos::{publish_content_digest, AgenticosAdapte
 use cadence_agent::platform::PlatformAdapter;
 use serde_json::{json, Value};
 
+#[path = "common/port.rs"]
+mod port;
+
 #[derive(Clone, Copy)]
 enum Script {
     Pending,
@@ -966,9 +969,8 @@ fn agenticos_http_peer_has_no_tool_relay_even_with_forged_identity() {
     let (door, adapter) = start(Script::Posted);
     let d = CallDaemon::start(Arc::new(adapter));
     let _agent = Lane::spawn(&d, "aos-http-agent");
-    let port = (3110..3200)
-        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-        .expect("private board test port");
+    let lease = port::test_port();
+    let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
     let state = d.state.clone();
     let pm = d._dir.path().join("pm");

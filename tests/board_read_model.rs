@@ -10,7 +10,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,8 @@ use tempfile::TempDir;
 
 #[path = "support/operator.rs"]
 mod op;
+#[path = "common/port.rs"]
+mod port;
 
 const ISSUES: usize = 420;
 const AGENTS: usize = 12;
@@ -80,15 +82,6 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-fn free_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let start = NEXT.fetch_add(1, Ordering::Relaxed) + std::process::id() as usize;
-    (0..89)
-        .map(|offset| 3110 + ((start + offset) % 89) as u16)
-        .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
-        .expect("no isolated board port available")
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -231,21 +224,28 @@ impl Drop for Daemon {
 
 /// Stops the in-process board when dropped (CAD-471), closing its port
 /// instead of serving for the rest of the run.
-struct BoardStop(Arc<AtomicBool>);
+struct BoardStop {
+    stop: Arc<AtomicBool>,
+    _lease: Option<port::PortLease>,
+}
 
 impl Drop for BoardStop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
 fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
     let overall = Instant::now() + Duration::from_secs(30);
     loop {
-        let port = free_port();
+        let lease = port::test_port();
+        let port = lease.port;
         let (sd, pd) = (state.to_path_buf(), pm.to_path_buf());
-        let board = BoardStop(Default::default());
-        let stop = board.0.clone();
+        let board = BoardStop {
+            stop: Default::default(),
+            _lease: Some(lease),
+        };
+        let stop = board.stop.clone();
         thread::spawn(move || {
             let opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),

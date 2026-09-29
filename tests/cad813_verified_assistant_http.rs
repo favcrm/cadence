@@ -14,7 +14,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
+use common::{daemon_opts, plant_member_pane, test_port, LaneShell, PortLease, TestDaemon};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{
@@ -36,6 +36,7 @@ struct Board {
     pm_dir: PathBuf,
     daemon: TestDaemon,
     port: u16,
+    _port_lease: PortLease,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
     install: String,
@@ -82,15 +83,15 @@ impl Board {
             .unwrap()["context"]
             .clone();
         let context_id = context["id"].as_str().unwrap().to_owned();
-        let port = (3110..3200)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap();
+        let lease = test_port();
+        let port = lease.port;
         let stop = Arc::new(AtomicBool::new(false));
         let mut board = Self {
             root,
             pm_dir,
             daemon,
             port,
+            _port_lease: lease,
             stop,
             thread: None,
             install,
@@ -130,11 +131,8 @@ impl Board {
                     Ok(Err(error)) => eprintln!("content board startup contention: {error}"),
                     unexpected => panic!("content board bind failure returned {unexpected:?}"),
                 }
-                board.port = board
-                    .port
-                    .checked_add(1)
-                    .filter(|port| *port < 3200)
-                    .expect("content board startup exhausted permitted ports");
+                board._port_lease = test_port();
+                board.port = board._port_lease.port;
                 board.stop.store(false, Ordering::SeqCst);
             } else {
                 panic!("content board startup notification {notification:?}; worker {result:?}");

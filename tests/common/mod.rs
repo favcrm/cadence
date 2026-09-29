@@ -34,6 +34,11 @@ mod git;
 #[allow(unused_imports)]
 pub use git::{git_at, git_f_repo, git_ok, git_porcelain, git_repo, git_stdout};
 
+pub mod port;
+// Each integration binary uses a different subset of the shared API.
+#[allow(unused_imports)]
+pub use port::{test_port, PortLease};
+
 mod reports;
 // Each integration binary uses a different subset of the shared API.
 #[allow(unused_imports)]

@@ -9,7 +9,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
+use common::{daemon_opts, plant_member_pane, test_port, LaneShell, PortLease, TestDaemon};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -867,6 +867,7 @@ struct Board {
     pm_dir: PathBuf,
     daemon: TestDaemon,
     port: u16,
+    _port_lease: PortLease,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
     install: String,
@@ -901,15 +902,15 @@ impl Board {
             .unwrap()["context"]
             .clone();
         let context_id = context["id"].as_str().unwrap().to_owned();
-        let port = (3110..3200)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap();
+        let lease = test_port();
+        let port = lease.port;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let mut board = Self {
             root,
             pm_dir,
             daemon,
             port,
+            _port_lease: lease,
             stop,
             thread: None,
             install,
