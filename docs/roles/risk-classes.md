@@ -20,11 +20,12 @@ Only these exact paths are eligible for `auto`:
 - `scripts/measurements/board-live.mjs` — isolated loopback board diagnostics.
 - `scripts/test-dup-report` — read-only test duplication analysis.
 - `scripts/test-dup-report.txt` — historical duplication report, not a gate input.
+- `scripts/auto-stage.py` — staging-only candidate selector and receipt writer. Its candidate check is not what promotion relies on: the `promote` job re-verifies the artifact itself (`scripts/delivery-candidate.py prepare`) and runs only on manual `workflow_dispatch` behind the `production` environment's required reviewers. Changes to `scripts/delivery-candidate.py`, to the `promote` job, or to `.github/**` stay human.
 
 Each path must satisfy ALL four criteria:
 
 1. It cannot change who approves anything, what a required CI check verifies, or whether a required check passes.
-2. It cannot change what is built, attested, released, published or promoted, or verify artifacts or attestations that promotion relies on.
+2. It cannot change what is built, attested, released, published or promoted, or verify artifacts or attestations that promotion relies on. A check that promotion repeats independently does not count as one promotion relies on.
 3. It cannot touch production, the installed binary, the tracker, secrets or credentials, or install software on a host.
 4. Any effect is behind a human-class control downstream: diagnostics do not authorize delivery, and changes to gates, releases or production still require operator approval.
 

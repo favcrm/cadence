@@ -33,7 +33,8 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   `ui/**`.
 - **Operator approval** when any `human` trigger in
   `docs/roles/risk-classes.md` applies. That includes, but is not
-  limited to, every change to `.github/**`, `scripts/**` (except the allowlist in `docs/roles/risk-classes.md`), `Cargo.toml`,
+  limited to, every change to `.github/**`, `scripts/**` (except the
+  allowlist in `docs/roles/risk-classes.md`), `Cargo.toml`,
   `Cargo.lock`, `ui/package.json`, `cadence-review.toml`,
   `src/review.rs`, `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`
   and this file. Most gates on a PR run from the PR's
