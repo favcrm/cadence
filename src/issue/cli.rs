@@ -349,9 +349,9 @@ pub enum IssueAction {
         /// Sweep-only: rejected with a single-ID finish.
         #[arg(long, requires = "merged", conflicts_with = "id")]
         dry_run: bool,
-        /// Emit the sweep rows as JSON.
-        /// Sweep-only: rejected with a single-ID finish.
-        #[arg(long, requires = "merged", conflicts_with = "id")]
+        /// Emit the sweep rows as JSON. Single-ID output is already
+        /// JSON, so this is accepted everywhere as a no-op there.
+        #[arg(long)]
         json: bool,
     },
     /// Show one issue — frontmatter, body, links both ways, comments,
@@ -1260,10 +1260,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             // ID is present (the installed build silently ignored the flag
             // and ran a real finish). Sweep-only flags are parser-rejected
             // via `conflicts_with = "id"` above; this guard covers any
-            // parser bypass (argument order, `--json`, future flags).
-            if *dry_run || *json || project.is_some() {
+            // parser bypass (argument order, future flags). `--json` is
+            // deliberately NOT guarded: single-ID output is always JSON,
+            // so it is an accepted no-op there (see
+            // `finish_guard_per_worktree`).
+            if *dry_run || project.is_some() {
                 return Err(Error::rejected(
-                    "issue finish --dry-run, --json and --project need --merged — a single-ID finish has no preview; omit them or use `issue finish --merged --dry-run` to preview the sweep",
+                    "issue finish --dry-run and --project need --merged — a single-ID finish has no preview; omit them or use `issue finish --merged --dry-run` to preview the sweep",
                 ));
             }
             let args = finish::FinishArgs {

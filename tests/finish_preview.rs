@@ -485,11 +485,13 @@ fn finish_preview_classifies_missing_worktrees_without_finishing_them() {
 ///
 /// The installed build accepted `finish <ID> --dry-run --json` and ran
 /// a real finish (`finished: true`, worktree removed, branch deleted).
-/// The CLI now rejects sweep-only flags with a single ID at parse time
-/// (`conflicts_with = "id"`, unit-tested in `src/cli/tests.rs`) and
-/// fails closed at dispatch time. This test uses a disposable merged
-/// idle lane to prove the tree and refs survive the sweep preview
-/// (the only supported preview), then a normal finish still succeeds.
+/// The CLI now rejects `--dry-run`/`--project` with a single ID at
+/// parse time (`conflicts_with = "id"`, unit-tested in
+/// `src/cli/tests.rs`) and fails closed at dispatch time (`--json`
+/// stays an accepted no-op: single-ID output is already JSON). This
+/// test uses a disposable merged idle lane to prove the tree and refs
+/// survive the sweep preview (the only supported preview), then a
+/// normal finish still succeeds.
 #[test]
 fn cad800_single_id_dry_run_rejected_without_mutation() {
     let tmp = TempDir::new().unwrap();
@@ -537,7 +539,7 @@ fn cad800_single_id_dry_run_rejected_without_mutation() {
     let issue_before = std::fs::read(pm_dir.join("demo").join("P-9").join("issue.md")).unwrap();
 
     // 1. The sweep preview is side-effect-free and classifies the lane.
-    //    (Single-ID + `--dry-run`/`--json`/`--project` parser rejection is
+    //    (Single-ID + `--dry-run`/`--project` parser rejection is
     //    unit-tested in `src/cli/tests.rs::cad800_single_id_sweep_flags_rejected`:
     //    the rejected parse never reaches `finish::run` — that is the
     //    regression, the old binary ignored the flag and finished.)

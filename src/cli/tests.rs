@@ -1284,17 +1284,16 @@ fn cad103_review_flakes_query_and_existing_pr_syntax() {
 /// CAD-800: sweep-only flags must not parse with a single ID — the
 /// installed build accepted `finish <ID> --dry-run` and ran a real
 /// finish. `requires = "merged"` alone does not reject when the
-/// positional ID is present, so the flags also conflict with `id`
-/// and the dispatch fails closed (see `src/issue/cli.rs`).
+/// positional ID is present, so `--dry-run` and `--project` also
+/// conflict with `id` and the dispatch fails closed (see
+/// `src/issue/cli.rs`). `--json` is the deliberate exception: single-ID
+/// output is already JSON, so it stays an accepted no-op there
+/// (`finish_guard_per_worktree` depends on it) — and it can never
+/// smuggle a preview past the guard because `dry_run` itself rejects.
 #[test]
 fn cad800_single_id_sweep_flags_rejected() {
-    // Every sweep-only flag, every position: a single ID must reject.
-    for extra in [
-        vec!["--dry-run"],
-        vec!["--json"],
-        vec!["--project", "demo"],
-        vec!["--dry-run", "--json"],
-    ] {
+    // Every mutating sweep-only flag, every position: reject with ID.
+    for extra in [vec!["--dry-run"], vec!["--project", "demo"]] {
         let mut with_id_first = vec!["cadence", "issue", "finish", "CAD-1"];
         with_id_first.extend(extra.iter().copied());
         assert!(
@@ -1309,9 +1308,16 @@ fn cad800_single_id_sweep_flags_rejected() {
             "single-ID finish must reject {extra:?} after the ID too"
         );
     }
-    // A bare `--dry-run`/`--json`/`--project` still needs `--merged`.
+    // `--dry-run` cannot ride along with `--json` either — the dry-run
+    // flag itself conflicts, so there is no `--json` bypass.
+    assert!(
+        Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1", "--dry-run", "--json"])
+            .is_err()
+    );
+    // `--json` alone stays accepted with a single ID (accepted no-op).
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1", "--json"]).is_ok());
+    // A bare `--dry-run`/`--project` still needs `--merged`.
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--dry-run"]).is_err());
-    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--json"]).is_err());
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--project", "demo"]).is_err());
     // The sweep preview itself still parses, with and without `--json`.
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--merged", "--dry-run"]).is_ok());
