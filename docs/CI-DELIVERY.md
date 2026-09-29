@@ -130,7 +130,7 @@ Each `test-shard` job selects the scope from the base policy, proves
 Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
 SPA, executes its assigned tests and uploads assignment/cost artifacts.
 The required `test` aggregate verifies complete, disjoint coverage from the
-eight assignment receipts. Default-feature refusal proofs and doctests
+assignment receipts (eight automatically; four or eight on a manual benchmark). Default-feature refusal proofs and doctests
 remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
 
 ## Why shards compile themselves (CAD-869)
@@ -154,6 +154,69 @@ assignment receipts and zero retries, enforced by `scripts/ci-shard-check.py`
 in the `test` aggregate. Revisit build-once distribution only with a
 producer that is not serial on the critical path and a measured win over a
 cache-hit shard.
+
+## CI throughput benchmark (CAD-840)
+
+Automatic PR, merge-group, main and tag CI stays eight-way. A manual
+`ci.yml` dispatch can run the **same full suite** four-way or eight-way:
+
+```sh
+# Use one reviewed, frozen branch/ref for both dispatches.
+gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref> -f test_shards=4
+gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref> -f test_shards=8
+```
+
+The matrix, partition denominator and assignment aggregate use the same
+width. Each width must prove its complete inventory union, with no missing,
+duplicate or out-of-range shard. Default-feature refusal proofs, doctests,
+fmt, both clippy shapes, build, UI and cross-build checks remain. Manual
+runs do not publish a release or reuse a main push's queue evidence.
+Benchmark dispatches have their own concurrency groups, so they cannot
+hold up an unrelated run sharing the main ref.
+
+Do not dispatch both trials simultaneously merely to compare them: they
+would compete with each other. Alternate widths across multiple trials,
+with similar background PR load and cache/toolchain state. Dispatching a
+benchmark consumes a full CI run; no scheduled extra runs are added here.
+The workflow must be available on the default branch before GitHub accepts
+manual dispatches. Freeze the ref, then verify the returned runs have the
+same `head_sha`; a moving main is not a controlled comparison.
+
+Read timing evidence (requires read-only Actions access via `gh`):
+
+```sh
+python3 scripts/ci-throughput.py --run-id <run-id>
+python3 scripts/ci-throughput.py --run-id <four-run-id> \
+  --compare-run-id <eight-run-id> --json > throughput-comparison.json
+```
+
+The report separates **dispatch-to-start delay** from job execution.
+Dispatch-to-start includes dependency wait and scheduling; it is not pure
+runner queue time. Job `created_at` can change on reruns, so subtracting
+it from `started_at` may produce a negative, false queue duration.
+Workflow elapsed uses the run's completion observation (`updated_at`);
+gates elapsed ends at the latest required gate. Summed runner-minutes are
+executed job wall time, not CPU time or GitHub billed minutes. Skipped jobs
+add no time. Inventory/build and test step times expose repeated compilation.
+
+Single-run reports can describe failed/incomplete evidence, clearly marked
+as partial. Comparisons refuse incomplete/red runs, missing or duplicate
+gates, malformed timing, unknown shard layouts, reruns, different SHAs,
+non-manual runs or a same-width pair. The reporter uses the exact attempt's
+paginated job inventory; it never mixes attempts, posts statuses or changes
+runner/repository settings. It is observational evidence, not merge approval
+or an independent replacement for the assignment coverage gate.
+
+For offline review, provide raw API responses with `--run run.json --jobs
+jobs.json`; compare a second pair using `--compare-run other-run.json
+--compare-jobs other-jobs.json`. The jobs file has the shape
+`{"jobs": [...]}`. Keep the raw responses with the report.
+
+Choose a default only after repeated same-SHA trials show better gate
+latency **and** acceptable runner-minutes under realistic load. Do not
+claim a saving from one noisy run. Build-once nextest distribution and a
+separate merge-queue runner pool remain follow-ups; neither is deployed
+by this benchmark increment.
 
 ## Remaining delivery work
 
