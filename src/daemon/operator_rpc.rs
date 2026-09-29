@@ -171,18 +171,18 @@ impl Shared {
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
-    /// `operator_session_open_device {sub, org, origin, user_agent?}` —
-    /// the board's device-grant sign-in exchange (CAD-777). The board
-    /// has already run the grant through the issuer (`device_login`
-    /// request/poll/verify for the exact workspace); `sub` is the
-    /// verified subject, `org` the workspace it was verified for. The
-    /// grant's approver is owner by issuer rule, so the minted session
-    /// is operator-mapped with the shorter remote lifetimes.
+    /// `operator_session_open_device {token, origin, user_agent?}` —
+    /// the board's device-grant sign-in exchange (CAD-777). `token` is
+    /// the issuer-approved `agc_` grant, verified LIVE against the
+    /// daemon-owned trust pin (`operator/device-login.json`, written
+    /// by `ui run`/`ui start` resolve) before anything is minted: the
+    /// subject and workspace come out of that verification, never out
+    /// of request fields, so a socket caller cannot forge them. The
+    /// grant's approver is owner by issuer rule, hence the minted
+    /// session is operator-mapped with the shorter remote lifetimes.
     ///
-    /// A connection that derives an agent is refused before anything
-    /// is minted — a browser session is never minted for a pane.
-    /// Neither field grants authority: `sub`/`org` name the verified
-    /// subject, they do not choose scopes or roles.
+    /// A connection that derives an agent is refused before any issuer
+    /// contact — a browser session is never minted for a pane.
     pub(super) fn rpc_operator_session_open_device(
         &self,
         params: &Value,
@@ -195,18 +195,24 @@ impl Shared {
                 who.lane()
             )));
         }
-        let sub = required_str(params, "sub")?;
-        let org = required_str(params, "org")?;
-        crate::device_login::validate_subject(sub)?;
-        crate::device_login::validate_subject(org)?;
+        let token = required_str(params, "token")?;
         let origin = origin_param(params)?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        // The pin is the only issuer/org authority: an absent file (or
+        // one failing strict modes) fails closed with no session.
+        let pin = crate::device_login::read_pin(&self.state_dir)?;
+        let config = crate::device_login::DeviceConfig::new(&pin.issuer, &pin.org)?;
+        let verified = crate::device_login::verify_session(
+            &crate::device_login::UreqTransport::new(),
+            &config,
+            token,
+        )?;
         let user = auth::BoardUser {
-            sub: sub.to_string(),
+            sub: verified.subject_id.clone(),
             email: String::new(),
             name: String::new(),
             role: "operator".to_string(),
-            handle: sub.to_string(),
+            handle: verified.subject_id,
         };
         let now = self.operator_now();
         let opened = self
@@ -215,7 +221,7 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_session_opened",
-            json!({"session": opened.session.id, "origin": origin.as_str(), "org": org}),
+            json!({"session": opened.session.id, "origin": origin.as_str(), "org": verified.org}),
         );
         Ok(json!({"token": opened.token, "key": opened.key, "session": opened.session}))
     }

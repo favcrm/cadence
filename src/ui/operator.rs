@@ -1505,25 +1505,27 @@ pub(super) fn device_poll(
         Ok(crate::device_login::Poll::Denied) => super::json_response(json!({"status": "denied"})),
         Ok(crate::device_login::Poll::Gone) => super::json_response(json!({"status": "expired"})),
         Ok(crate::device_login::Poll::Approved { token, .. }) => {
-            let verified =
-                match crate::device_login::verify_session(&*login.transport, &login.config, &token)
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return coded_response(
-                            502,
-                            "issuer_unavailable",
-                            "the issuer rejected the approved credential",
-                            None,
-                        );
-                    }
-                };
+            // Fail fast on a bad grant before the daemon call; the
+            // daemon re-verifies against its own pinned trust root
+            // and is the only authority that mints.
+            if crate::device_login::verify_session(&*login.transport, &login.config, &token)
+                .is_err()
+            {
+                return coded_response(
+                    502,
+                    "issuer_unavailable",
+                    "the issuer rejected the approved credential",
+                    None,
+                );
+            }
             let opened = client::rpc(
                 state_dir,
                 "operator_session_open_device",
                 json!({
-                    "sub": verified.subject_id,
-                    "org": verified.org,
+                    // The daemon verifies this bearer live against its
+                    // pinned trust root and derives subject/workspace
+                    // itself — no identity field crosses this call.
+                    "token": token,
                     "origin": origin.as_str(),
                     "user_agent": user_agent,
                 }),

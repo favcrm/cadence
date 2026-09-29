@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -38,6 +39,62 @@ const LOGIN_SCOPE: &str = "read draft";
 
 fn rejected(message: &str) -> Error {
     Error::rejected(message)
+}
+
+/// The daemon-side trust pin for device sign-in (CAD-777, fix of the
+/// reviewer finding on #541): the operator-configured issuer + exact
+/// workspace, written by `ui run`/`ui start` resolve and read by the
+/// daemon at mint time. The daemon verifies the presented `agc_`
+/// against THIS pin — never against caller-supplied issuer/org — so a
+/// socket caller cannot mint a session for a forged subject.
+/// Lives at `<state>/operator/device-login.json`, `0600` in the
+/// `0700` operator directory, under the same hygiene as the secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicePin {
+    pub issuer: String,
+    pub org: String,
+}
+
+const PIN_FILE: &str = "device-login.json";
+
+/// Record the pin. Overwrites atomically (tmp + rename); a partial
+/// write never replaces a good one.
+pub fn write_pin(state_dir: &std::path::Path, pin: &DevicePin) -> Result<()> {
+    // Validate before persisting: a bad pair fails the board at boot,
+    // never at first sign-in.
+    DeviceConfig::new(&pin.issuer, &pin.org)?;
+    crate::operator_auth::write_private(
+        state_dir,
+        PIN_FILE,
+        &serde_json::to_vec_pretty(pin).map_err(|e| Error::internal(e.to_string()))?,
+    )
+}
+
+/// Remove the pin (operator disabled device login): mint fails closed
+/// afterwards. Missing file is fine.
+pub fn clear_pin(state_dir: &std::path::Path) -> Result<()> {
+    let path = crate::operator_auth::dir(state_dir).join(PIN_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::internal(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// The configured pin — `Err` (`capability_unavailable`) when device
+/// login is not provisioned or the file fails strict modes.
+pub fn read_pin(state_dir: &std::path::Path) -> Result<DevicePin> {
+    let bytes = crate::operator_auth::read_private(state_dir, PIN_FILE)?;
+    let pin: DevicePin = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::invalid(
+            "capability_unavailable",
+            format!("device login pin is invalid: {e}"),
+        )
+    })?;
+    // Re-validate on read: a hand-edited file cannot widen the grant.
+    DeviceConfig::new(&pin.issuer, &pin.org)?;
+    Ok(pin)
 }
 
 /// An issuer origin plus the exact workspace the sign-in is for.
@@ -119,20 +176,6 @@ fn validate_token(token: &str) -> Result<()> {
         return Err(rejected(
             "Credential must be one bounded ASCII token without whitespace",
         ));
-    }
-    Ok(())
-}
-
-/// Subjects the daemon accepts from a verified device grant: the same
-/// workspace-ID grammar the issuer uses for companies and principals.
-pub fn validate_subject(raw: &str) -> Result<()> {
-    if raw.is_empty()
-        || raw.len() > 200
-        || !raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    {
-        return Err(rejected("Subject must be a workspace-style ID"));
     }
     Ok(())
 }
@@ -702,5 +745,50 @@ mod tests {
         let fake = Fake::new(vec![(200, json!({"surprise": "SECRET-BODY-X1"}))]);
         let err = request_code(&fake, &config()).unwrap_err().to_string();
         assert!(!err.contains("SECRET-BODY-X1"));
+    }
+
+    fn pin_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    /// The pin round-trips through the operator directory with secret
+    /// hygiene (0700 dir, 0600 file); absent or malformed pins fail
+    /// closed, and an invalid pair never persists.
+    #[test]
+    fn device_pin_round_trips_under_strict_modes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = pin_dir();
+        assert!(read_pin(dir.path()).is_err());
+        let pin = DevicePin {
+            issuer: "https://issuer.example".to_string(),
+            org: "ws_company".to_string(),
+        };
+        write_pin(dir.path(), &pin).unwrap();
+        assert_eq!(read_pin(dir.path()).unwrap(), pin);
+        let md = std::fs::symlink_metadata(dir.path().join("operator")).unwrap();
+        assert_eq!(md.mode() & 0o777, 0o700);
+        let md = std::fs::symlink_metadata(dir.path().join("operator").join("device-login.json"))
+            .unwrap();
+        assert!(md.is_file());
+        assert_eq!(md.mode() & 0o777, 0o600);
+        // Malformed content and invalid pairs fail closed.
+        std::fs::write(
+            dir.path().join("operator").join("device-login.json"),
+            b"{not json",
+        )
+        .unwrap();
+        assert!(read_pin(dir.path()).is_err());
+        assert!(write_pin(
+            dir.path(),
+            &DevicePin {
+                issuer: "http://evil.example".to_string(),
+                org: "ws_company".to_string(),
+            }
+        )
+        .is_err());
+        // Clearing removes mint authority; clearing twice is fine.
+        clear_pin(dir.path()).unwrap();
+        clear_pin(dir.path()).unwrap();
+        assert!(read_pin(dir.path()).is_err());
     }
 }

@@ -570,7 +570,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "operator_session_open_device",
-        Rule::Handler("device-verified subject bearer; agent callers refused pre-mint (CAD-777)"),
+        Rule::Handler("issuer bearer, verified live against the daemon-owned device pin; agent callers refused pre-mint (CAD-777)"),
     ),
     ("operator_session_check", Rule::Bearer),
     ("operator_session_logout", Rule::Bearer),

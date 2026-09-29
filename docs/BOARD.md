@@ -1031,11 +1031,15 @@ answers the user code + verification link plus a pending id; `POST
 with the same cookie shape as `/api/session`. The issuer device code
 lives only in the board's pending map (bounded, TTL-pruned) and the
 `agc_` credential is verified and dropped — neither ever reaches the
-browser. Sessions minted this way live 12 h idle, 24 h at most, one
-per verified subject, owner-mapped; agent peers are refused without
-side effects. Unconfigured boards answer both routes 404. The login
-audience (`read draft`) never enrolls a provider connection; issuing
-the grant still needs the issuer's device flag and an owner approver.
+browser. The daemon verifies the presented grant live against its own
+pinned trust root (`<state>/operator/device-login.json`, written at
+board start, removed when the flow is unconfigured) and derives the
+subject itself — request fields cannot forge it. Sessions minted this
+way live 12 h idle, 24 h at most, one per verified subject,
+owner-mapped; agent peers are refused without side effects.
+Unconfigured boards answer both routes 404. The login audience
+(`read draft`) never enrolls a provider connection; issuing the grant
+still needs the issuer's device flag and an owner approver.
 
 ## Remote access — `ui tailscale`
 

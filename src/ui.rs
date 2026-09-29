@@ -4078,6 +4078,23 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             },
         )?;
     }
+    // CAD-777: same handoff for the device trust pin — the daemon
+    // verifies the presented grant against this file at mint time, so
+    // a socket caller can never choose the issuer or workspace. When
+    // device login is not configured, any stale pin is removed so an
+    // old file cannot mint after the operator turned the flow off.
+    if let Some(login) = opts
+        .device_login
+        .as_ref()
+        .map(|login| crate::device_login::DevicePin {
+            issuer: login.config.issuer().to_string(),
+            org: login.config.org().to_string(),
+        })
+    {
+        crate::device_login::write_pin(state_dir, &login)?;
+    } else {
+        crate::device_login::clear_pin(state_dir)?;
+    }
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();

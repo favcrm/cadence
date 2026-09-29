@@ -976,6 +976,12 @@ fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
             };
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
+            let bearer = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Authorization"))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
             let (status, doc) = match (req.method(), req.url()) {
                 (tiny_http::Method::Post, "/v1/device/code") => (
                     200,
@@ -1023,17 +1029,23 @@ fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
                         }
                     }
                 }
-                (tiny_http::Method::Get, "/v1/runtime/session") => (
-                    200,
-                    json!({
-                        "ok": true,
-                        "data": {
-                            "workspace": {"id": "ws_company"},
-                            "subject": {"anonymous": false, "id": "op_9"},
-                            "scopes": ["read", "draft"]
-                        }
-                    }),
-                ),
+                (tiny_http::Method::Get, "/v1/runtime/session") => {
+                    if bearer == "Bearer agc_t" {
+                        (
+                            200,
+                            json!({
+                                "ok": true,
+                                "data": {
+                                    "workspace": {"id": "ws_company"},
+                                    "subject": {"anonymous": false, "id": "op_9"},
+                                    "scopes": ["read", "draft"]
+                                }
+                            }),
+                        )
+                    } else {
+                        (401, json!({"ok": false, "error": "unauthorized"}))
+                    }
+                }
                 _ => (404, json!({"ok": false})),
             };
             let _ = req.respond(
@@ -1357,4 +1369,62 @@ fn device_grant_for_another_workspace_settles_without_a_session() {
     assert_eq!(code, 200, "{body}");
     assert_eq!(status_of(&body), "expired", "{body}");
     assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+}
+
+/// The reviewer's exploit, closed: the daemon RPC mints nothing for a
+/// forged bearer, and nothing at all without its pinned trust root.
+/// The only key that opens a session is an issuer-minted grant the
+/// live issuer verifies — verified here against the stub.
+#[test]
+fn device_daemon_rpc_needs_an_issuer_verified_bearer_and_a_pin() {
+    use cadence_agent::device_login::{write_pin, DevicePin};
+    // No pin file anywhere: fail closed before any issuer contact.
+    let lonely = TempDir::new().unwrap();
+    let _alone = UiDaemon::start_on(lonely.path().to_path_buf());
+    let err = _alone
+        .rpc_opt(
+            "operator_session_open_device",
+            json!({"token": "agc_t", "origin": "loopback"}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("capability_unavailable"),
+        "unpinned daemon minted or misreported: {err}"
+    );
+
+    // Pinned daemon, forged bearer: the stub answers 401, no session.
+    let state = TempDir::new().unwrap();
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    write_pin(
+        state.path(),
+        &DevicePin {
+            issuer: issuer.clone(),
+            org: "ws_company".to_string(),
+        },
+    )
+    .unwrap();
+    let err = _d
+        .rpc_opt(
+            "operator_session_open_device",
+            json!({"token": "agc_forged", "origin": "loopback"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("rejected") || err.contains("Issuer rejected"),
+        "forged bearer minted or misreported: {err}"
+    );
+    // Positive control: the stub-verified grant mints (the test
+    // process is no agent). Proves the gate is bearer possession +
+    // live issuer verification, not field assertion.
+    let opened = _d
+        .rpc_opt(
+            "operator_session_open_device",
+            json!({"token": "agc_t", "origin": "loopback"}),
+        )
+        .unwrap();
+    assert_eq!(opened["session"]["origin"], json!("loopback"));
+    assert!(opened["token"].as_str().is_some_and(|t| t.len() == 64));
 }
