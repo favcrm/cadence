@@ -4292,6 +4292,16 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                 "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
             ));
         }
+        // CAD-777: the device trust pin is written once at board
+        // start; a live board serves its in-memory pair. Refuse any
+        // change (enable, disable, re-point) while running so the pin
+        // file, the saved options and the live routes cannot drift
+        // apart — stop the UI, then start it with the new pair.
+        if eff.device_login != recorded.device_login {
+            return Err(Error::rejected(
+                "device login configuration cannot change while the UI is running — stop the UI, then start it with the new configuration",
+            ));
+        }
         if eff.board_public_only {
             if eff.board != recorded.board || eff.host != recorded.host || eff.port != recorded.port
             {

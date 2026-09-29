@@ -1336,6 +1336,68 @@ fn device_poll_from_a_pane_is_refused_without_side_effects() {
     assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
 }
 
+/// Disabling device login while the board runs is refused — the live
+/// routes, the pin file and the saved options cannot drift apart.
+/// A restart without the pair clears the pin and the routes go 404.
+#[test]
+fn device_login_change_refused_while_running_cleared_on_restart() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    let (port, board) = start_device_board(pm.path(), state.path(), issuer.clone());
+    let host = op::board_host(port);
+    let pin = state.path().join("operator").join("device-login.json");
+    assert!(pin.is_file(), "serve writes the pin");
+    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 200);
+
+    // A reset while running is refused; nothing changes. The fixture
+    // board never persists ui.json, so record what a real `ui start`
+    // would have saved (pair + port).
+    std::fs::write(
+        state.path().join("ui.json"),
+        serde_json::to_vec_pretty(&ui::UiOpts {
+            port: Some(port),
+            device_login: Some(ui::DeviceLoginOpts {
+                issuer: issuer.clone(),
+                org: "ws_company".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+    let reset = ui::UiFlags::default();
+    let err = ui::run_cli(
+        state.path(),
+        &ui::UiAction::Start {
+            flags: reset,
+            reset: true,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("device login configuration cannot change"),
+        "{err}"
+    );
+    assert!(pin.is_file(), "refused reset keeps the pin");
+    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 200, "live routes untouched by the refused reset");
+    std::fs::remove_file(state.path().join("ui.pid")).unwrap();
+    drop(board);
+
+    // Restarted without the pair: pin gone, routes dead.
+    let (port2, _board2) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    assert!(!pin.exists(), "restart without the pair clears the pin");
+    let host2 = op::board_host(port2);
+    let (code, _, _) = device_post(port2, &host2, "/api/session/device/code", "{}");
+    assert_eq!(code, 404);
+}
+
 /// An approval for another workspace settles with no session.
 #[test]
 fn device_grant_for_another_workspace_settles_without_a_session() {
