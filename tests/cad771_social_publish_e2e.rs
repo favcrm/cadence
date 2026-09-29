@@ -377,6 +377,11 @@ const NOW: i64 = 1_750_000_000;
 struct HttpSender {
     base: String,
     behaviors: Mutex<HashMap<String, FakeProviderBehavior>>,
+    /// Test-only forged status outcomes keyed by stable key. When present
+    /// for a key, status() returns the forgery without touching the wire —
+    /// a second, sender-side injection point beside the door hook.
+    status_forgeries:
+        Mutex<HashMap<String, cadence_agent::platform::agenticos_external::publish::LedgerOutcome>>,
 }
 
 impl HttpSender {
@@ -384,7 +389,19 @@ impl HttpSender {
         Self {
             base,
             behaviors: Mutex::new(HashMap::new()),
+            status_forgeries: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn forge_status(
+        &self,
+        key: &str,
+        outcome: cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
+    ) {
+        self.status_forgeries
+            .lock()
+            .unwrap()
+            .insert(key.into(), outcome);
     }
 
     fn set_behavior(&self, key: &str, behavior: FakeProviderBehavior) {
@@ -512,6 +529,9 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
         cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
         cadence_agent::platform::agenticos_external::publish::Refusal,
     > {
+        if let Some(forged) = self.status_forgeries.lock().unwrap().get(key) {
+            return Ok(forged.clone());
+        }
         let verdict = self.post("/v1/device/publish/status", &json!({"key": key}));
         let empty = SendBinding {
             key: key.into(),
@@ -1655,6 +1675,82 @@ fn cad771_e2e_hostile_status_binding_fails_closed_at_reconcile() {
     let raw = door.post("/v1/device/publish/status", &json!({"key": key}));
     assert_eq!(raw["destination_id"], "222222222222222");
     // Daemon reconcile refuses to persist them.
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_reconcile",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match the frozen intent"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc(
+            "social_publish_show",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(shown["state"], "processing");
+    assert_eq!(shown["upstream"]["destination_id"], DEST_FB);
+    assert_eq!(door.ledger.provider_calls(), 1);
+}
+
+#[test]
+fn cad771_e2e_sender_forged_status_fails_closed_at_reconcile() {
+    // Second injection point beside the door hook: the sender itself
+    // returns a foreign binding for A's key. The HTTP peer still shows
+    // honest bytes while the daemon refuses to persist the forgery —
+    // processing retained, honest evidence intact, nothing recorded.
+    use cadence_agent::platform::agenticos_external::publish::{LedgerOutcome, PublishState};
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "senderforge");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-senderforge",
+                "cad_fx_senderforge_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let key = intent["request"].as_str().unwrap().to_owned();
+    let claimed = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck_for(&intent)}),
+        )
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    sender.forge_status(
+        &key,
+        LedgerOutcome {
+            state: PublishState::Posted,
+            permalink: Some("https://www.instagram.com/p/SENDERFORGED/".into()),
+            destination_id: "333333333333333".into(),
+            caption_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
+            image_digest: None,
+            provider_payload: Some("{\"id\":\"sender-forged\"}".into()),
+            provider_ids: vec!["provider-post-9".into()],
+            repeated: false,
+        },
+    );
+    // HTTP peer shows honest bytes; only the sender-observed path is hostile.
+    let raw = door.post("/v1/device/publish/status", &json!({"key": key}));
+    assert_eq!(raw["destination_id"], DEST_FB);
+    // Daemon reconcile refuses the forgery.
     let err = h
         .daemon
         .operator_rpc(
