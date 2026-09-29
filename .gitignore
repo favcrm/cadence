@@ -29,6 +29,7 @@ docs/guides/*
 !docs/AUDIT.md
 !docs/BOARD.md
 !docs/CHARTER.md
+!docs/EXTERNAL-TEST-RECIPE.md
 !docs/START-HERE.md
 !docs/INSTALL-AGENT.md
 !docs/RELEASING.md

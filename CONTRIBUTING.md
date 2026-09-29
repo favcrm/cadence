@@ -60,7 +60,10 @@ Use an authenticated `cadence build-slot run test -- <command>` when your native
 endpoint can hold a slot. Callers without a pane use an authorized project
 recipe through `cadence build-slot launch <RECIPE> --project cadence --worktree <LANE>`.
 Check `cadence build-slot --help` and the project's configured recipes; recipe
-names are project configuration, not universal commands. If identity or recipe
+names are project configuration, not universal commands. The admitted focused
+test recipe for external reviewers — exact `build.recipes` proposal, fixed
+invocation and runbook — is documented in
+docs/EXTERNAL-TEST-RECIPE.md. If identity or recipe
 configuration refuses admission, report that blocker to the operator rather
 than running an unadmitted build. A suite lock is separate from build admission.
 
