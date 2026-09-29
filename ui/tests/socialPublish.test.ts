@@ -13,7 +13,7 @@ const intents: any[] = [{
   caption_digest: "c-digest", image_digest: "i-digest", destination_digest: "d-digest",
   idempotency_key: "key-a", due_epoch: 1790601000, timezone: "Asia/Hong_Kong",
   grant_id: "grant-a", approval_id: "op-a", writer: "writer-a", reviewer: "reviewer-a",
-  permalink: null, receipt: null, refusal: null,
+  permalink: null, receipt: null, refusal: null, reconcile: null,
 }];
 (globalThis as any).fetch = async (input: unknown, init?: { method?: string; body?: string }) => {
   const url = String(input);
@@ -56,8 +56,14 @@ async function main() {
     && store.publishStateTone("held") === "warn"
     && store.publishStateTone("queued") === "muted" && store.publishStateTone("processing") === "muted", "State tones match the approved language");
   assert(store.publishStateText("held").includes("human") && !store.publishStateText("held").includes("reconnect"), "Held names the human, not a reconnect state");
-  assert(store.reconcileReading("processing")?.includes("uncertain") && store.reconcileReading("held")?.includes("human")
-    && store.reconcileReading("posted") === null && store.reconcileReading("queued") === null, "Uncertain reads as processing-or-held only");
+  assert(store.reconcileReading("held")?.includes("human")
+    && store.reconcileReading("posted") === null && store.reconcileReading("processing") === null && store.reconcileReading("queued") === null, "Only held carries standing reconcile guidance");
+  const base = { ...intents[0] };
+  assert(store.showsUncertainReading({ ...base, state: "processing", reconcile: { lost_response: true, checked_epoch: 1 } }), "Processing plus lost-response evidence shows the uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "processing", reconcile: null }), "Processing without evidence shows no uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "processing", reconcile: { lost_response: false, checked_epoch: 1 } }), "Negative evidence shows no uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "held", reconcile: { lost_response: true, checked_epoch: 1 } }), "Held never shows the uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "posted", reconcile: { lost_response: true, checked_epoch: 1 } }), "Terminal states never show the uncertain display");
   const vocabulary = ["bad_key", "bad_connection", "bad_destination", "bad_caption_digest", "bad_image_digest", "bad_run", "bad_effect", "bad_grant", "bad_intent", "bad_revision", "bad_timezone", "cancel_closed", "cross_workspace", "grant_mismatch", "binding_mismatch", "grant_revoked", "grant_exhausted", "grant_window", "grant_approval", "grant_bounds", "image_required", "key_conflict", "not_publishable", "wrong_connection", "wrong_destination", "wrong_toolkit", "unknown_key", "send_disabled"];
   assert(vocabulary.length === 28, "Refusal vocabulary is exactly the 28-code list");
   for (const code of vocabulary) {

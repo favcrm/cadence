@@ -93,13 +93,16 @@ async function main() {
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },
     { ...intents[0], intent_id: "i-refused", state: "refused", refusal: { code: "grant_exhausted", message: "raw" } },
-    { ...intents[0], intent_id: "i-processing", state: "processing" },
+    { ...intents[0], intent_id: "i-processing", state: "processing", reconcile: null },
+    { ...intents[0], intent_id: "i-unconfirmed", state: "processing", reconcile: { lost_response: true, checked_epoch: 1790602000 } },
     { ...intents[0], intent_id: "i-held", state: "held", refusal: { code: "grant_window", message: "" } },
   ];
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
   assert(text().includes("fixture000") && text().includes("never counts"), "Posted shows the verified receipt, never a bare string");
   assert(text().includes("no uses left"), "Refused names the grant cause");
-  assert(text().includes("read this as uncertain") && text().includes("Never duplicate"), "Processing carries the uncertain reading with reconcile-before-retry");
+  const uncertainCount = text().split("Reads as uncertain").length - 1;
+  assert(text().includes("in flight") && uncertainCount === 1, "Only the evidence-backed card shows the uncertain display");
+  assert(text().includes("Reads as uncertain") && text().includes("Never duplicate"), "Processing plus lost-response evidence shows the uncertain display with reconcile-before-retry");
   assert(text().includes("validity window") && text().includes("Needs a human decision") && text().includes("reconnect_needed is a separate layer"), "Held names the cause and the human; ledger reconnect_needed stays separate");
   assert(text().includes("Processing"), "Processing state renders");
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "x".repeat(121) });

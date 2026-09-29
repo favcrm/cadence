@@ -63,6 +63,10 @@ export interface PublishIntent {
   permalink: string | null;
   receipt: unknown | null;
   refusal: PublishRefusal | null;
+  /** Relay-provided reconcile evidence, set when the status query found a
+   *  lost response after accept for this processing intent. Absent means
+   *  no uncertain display. Never a stored state. */
+  reconcile: { lost_response: boolean; checked_epoch: number } | null;
 }
 
 /** Artifact-freeze schedule body: digests derive server-side from the
@@ -160,14 +164,22 @@ export function publishStateTone(
   return "muted";
 }
 
-/** Uncertain reading for the two states it can mean. Processing is
- *  unconfirmed: a lost response after accept reads as uncertain, so the
- *  operator reconciles the upstream ledger before any retry. Held needs
- *  a human decision (intent held vs provider reconnect_needed are
+/** Derived display flag: uncertain shows ONLY for a processing intent
+ *  with lost-response evidence from the status query. The persisted
+ *  intent remains processing — no stored enum is invented. Every other
+ *  combination (no evidence, or any non-processing state) shows no
+ *  uncertain display. */
+export function showsUncertainReading(intent: PublishIntent): boolean {
+  return (
+    intent.state === "processing" &&
+    intent.reconcile?.lost_response === true
+  );
+}
+
+/** Guidance for the two states the uncertain question can mean. Held
+ *  needs a human decision (intent held vs provider reconnect_needed are
  *  different layers — the intent never auto-resumes). */
 export function reconcileReading(state: PublishState): string | null {
-  if (state === "processing")
-    return "Unconfirmed: if the response was lost after accept, read this as uncertain — reconcile the upstream ledger before any retry. Never duplicate a provider post.";
   if (state === "held")
     return "Needs a human decision: the intent is held after a recheck mismatch (provider reconnect_needed is a separate layer). Reconnect, then re-approve — never auto-resume.";
   return null;

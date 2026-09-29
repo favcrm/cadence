@@ -12,6 +12,7 @@ import {
   publishStateTone,
   reconcileReading,
   refusalCopy,
+  showsUncertainReading,
   socialPublish,
   type PublishIntent,
   type PublishState,
@@ -151,6 +152,7 @@ export default function PublishPanel({
 
   const card = (intent: PublishIntent) => {
     const reading = reconcileReading(intent.state);
+    const unconfirmed = showsUncertainReading(intent);
     return (
     <article key={intent.intent_id} className="wa-panel wa-stack">
       <div className="wa-row">
@@ -187,6 +189,19 @@ export default function PublishPanel({
         intent.refusal && (
           <p className="wa-alert">{refusalCopy(intent.refusal)}</p>
         )}
+      {intent.state === "processing" && !unconfirmed && (
+        <p className="wa-muted">
+          Provider call in flight — outcomes reconcile through the status
+          query before any retry.
+        </p>
+      )}
+      {unconfirmed && (
+        <p className="wa-muted">
+          Reads as uncertain: the status query found a lost response after
+          accept while state stays processing. Reconcile the upstream
+          ledger before any retry. Never duplicate a provider post.
+        </p>
+      )}
       {reading && <p className="wa-muted">{reading}</p>}
       {canCancel(intent.state) && (
         <div className="wa-row">
