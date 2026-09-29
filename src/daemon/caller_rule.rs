@@ -418,6 +418,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_list", Rule::Handler("operator_connection (CAD-753)")),
     ("app_record_show", Rule::Handler("operator_connection (CAD-753)")),
     ("app_record_update", Rule::Handler("operator_connection (CAD-753)")),
+    ("app_record_csv_preview", Rule::Handler("operator_connection (CAD-779)")),
+    ("app_record_csv_import", Rule::Handler("operator_connection (CAD-779)")),
     ("app_workspace_install", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_upgrade", Rule::Handler("operator_connection (CAD-743)")),
     ("app_workspace_upgrade_check", Rule::Handler("operator_connection (CAD-743)")),

@@ -15,6 +15,9 @@ use std::path::Path;
 use tiny_http::{Header, Request};
 
 const BODY_CAP: u64 = 48 * 1024;
+// CSV preview/import carry bounded CSV text (daemon bound 256KiB)
+// plus a small JSON envelope; reads stay on the small cap.
+const CSV_BODY_CAP: u64 = 320 * 1024;
 // A context holds at most 100 records of at most 16KiB each.
 const RESULT_CAP: usize = 4 * 1024 * 1024;
 
@@ -23,6 +26,10 @@ pub(super) enum Route<'a> {
     List(&'a str, &'a str),
     Show(&'a str, &'a str, &'a str),
     Update(&'a str, &'a str, &'a str),
+    /// POST-only CSV preview: a read with a body, so it rides the
+    /// write transport while the daemon itself writes nothing.
+    CsvPreview(&'a str, &'a str),
+    CsvImport(&'a str, &'a str),
 }
 
 fn segment(id: &str) -> bool {
@@ -49,6 +56,20 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     };
     if record.is_empty() {
         return None;
+    }
+    // Reserved bulk verbs precede record IDs: the ids `csv-preview`
+    // and `csv-import` are unaddressable over HTTP (RPC still serves
+    // them) so a bulk POST can never create or read a record, and
+    // suffixed paths under them never resolve.
+    if matches!(record, "csv-preview" | "csv-import") {
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(if record == "csv-preview" {
+            Route::CsvPreview(install, context)
+        } else {
+            Route::CsvImport(install, context)
+        });
     }
     if !segment(record) {
         return None;
@@ -81,8 +102,40 @@ struct Update {
     profile: Value,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CsvPreview {
+    csv_text: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CsvDecision {
+    row: u64,
+    action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CsvImport {
+    csv_text: String,
+    preview_token: String,
+    request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decisions: Option<Vec<CsvDecision>>,
+}
+
 fn typed<T: serde::de::DeserializeOwned>(request: &mut Request) -> Result<T, HttpResp> {
-    let bytes = read_body(request, BODY_CAP)?;
+    typed_cap(request, BODY_CAP)
+}
+
+fn typed_cap<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+    cap: u64,
+) -> Result<T, HttpResp> {
+    let bytes = read_body(request, cap)?;
     serde_json::from_slice(&bytes)
         .map_err(|_| err_response(400, "invalid app record request schema"))
 }
@@ -137,6 +190,48 @@ pub(super) fn handle(
             params["profile"] = body.profile;
             ("app_record_update", params)
         }
+        Route::CsvPreview(install, context) => {
+            let body: CsvPreview = match typed_cap(request, CSV_BODY_CAP) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            (
+                "app_record_csv_preview",
+                json!({"install_id": install, "context_id": context, "csv_text": body.csv_text}),
+            )
+        }
+        Route::CsvImport(install, context) => {
+            let body: CsvImport = match typed_cap(request, CSV_BODY_CAP) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let mut params = json!({
+                "install_id": install,
+                "context_id": context,
+                "csv_text": body.csv_text,
+                "preview_token": body.preview_token,
+                "request_id": body.request_id,
+            });
+            if let Some(decisions) = body.decisions {
+                let mut list = Vec::with_capacity(decisions.len());
+                for item in &decisions {
+                    let revision: Option<i64> = match item.expected_revision {
+                        None => None,
+                        Some(revision) => match i64::try_from(revision) {
+                            Ok(revision) if revision > 0 => Some(revision),
+                            _ => return err_response(400, "invalid app record request schema"),
+                        },
+                    };
+                    let mut entry = json!({"row": item.row, "action": item.action});
+                    if let Some(revision) = revision {
+                        entry["expected_revision"] = revision.into();
+                    }
+                    list.push(entry);
+                }
+                params["decisions"] = Value::Array(list);
+            }
+            ("app_record_csv_import", params)
+        }
     };
     match client::rpc(state, method, params) {
         Ok(value) if value.to_string().len() <= RESULT_CAP => {
@@ -178,12 +273,33 @@ mod tests {
             route("/api/app-installations/install-a/contexts/context-b/records/customer-1/update"),
             Some(Route::Update("install-a", "context-b", "customer-1"))
         ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/context-b/records/csv-preview"),
+            Some(Route::CsvPreview("install-a", "context-b"))
+        ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/context-b/records/csv-import"),
+            Some(Route::CsvImport("install-a", "context-b"))
+        ));
+        // The bulk verbs are POST-only transport: never reads.
+        assert!(
+            !route("/api/app-installations/i/contexts/c/records/csv-preview")
+                .unwrap()
+                .is_read()
+        );
+        assert!(
+            !route("/api/app-installations/i/contexts/c/records/csv-import")
+                .unwrap()
+                .is_read()
+        );
         for path in [
             "/api/app-installations/install-a/records",
             "/api/app-installations/install-a/contexts/",
             "/api/app-installations/install-a/contexts/context-b/records/",
             "/api/app-installations/install-a/contexts/context-b/records/customer-1/update/extra",
             "/api/app-installations/install-a/contexts/context-b/records/customer-1/archive",
+            "/api/app-installations/install-a/contexts/context-b/records/csv-preview/extra",
+            "/api/app-installations/install-a/contexts/context-b/records/csv-import/extra",
             "/api/app-installations/../contexts",
             "/api/app-records",
         ] {
@@ -217,6 +333,42 @@ mod tests {
                 assert!(
                     serde_json::from_str::<Create>(body).is_err(),
                     "create admitted {body}"
+                );
+            }
+        }
+        // CSV transport bodies carry no identity: URL segments are the
+        // authority, and every extra field refuses at the transport.
+        assert!(serde_json::from_str::<CsvPreview>(r#"{"csv_text":"a,b"}"#).is_ok());
+        for body in [
+            r#"{"csv_text":"a,b","install_id":"other"}"#,
+            r#"{"csv_text":"a,b","context_id":"other"}"#,
+            r#"{"csv_text":"a,b","by":"operator"}"#,
+            r#"{"csv_text":"a,b","project":"client"}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CsvPreview>(body).is_err(),
+                "csv preview admitted {body}"
+            );
+        }
+        assert!(serde_json::from_str::<CsvImport>(
+            r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","decisions":[{"row":1,"action":"update","expected_revision":2}]}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","install_id":"other"}"#,
+            r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","actor":"operator"}"#,
+            r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","decisions":[{"row":1,"action":"merge"}]}"#,
+            r#"{"csv_text":"a","preview_token":"sha256:x"}"#,
+        ] {
+            // Unknown actions pass the transport grammar (the daemon
+            // names the allowed set); unknown fields never do.
+            if body.contains("merge") {
+                assert!(serde_json::from_str::<CsvImport>(body).is_ok());
+            } else {
+                assert!(
+                    serde_json::from_str::<CsvImport>(body).is_err(),
+                    "csv import admitted {body}"
                 );
             }
         }
