@@ -66,7 +66,7 @@ export default function PublishPreview({ readonly = false }) {
     );
   }
   function resolveAs(outcome) {
-    if (outcome === "uncertain") {
+    if (outcome === "lost-response") {
       // Uncertain reads as processing: state stays processing, the reading
       // orders reconcile-before-retry with no second send.
       setDispatch("processing");
@@ -236,7 +236,7 @@ export default function PublishPreview({ readonly = false }) {
                 onClick={() => {
                   setHeld(true);
                   setNotice(
-                    "Simulated authority change at dispatch — held for a new human decision. Never silently published. " +
+                    "Simulated authority change at dispatch — held for a new human decision. Never silently published, never auto-resumed. " +
                       flowNote,
                   );
                 }}
@@ -262,7 +262,8 @@ export default function PublishPreview({ readonly = false }) {
                 <>
                   <p className="error" role="alert">
                     Held: grant, binding, app or context changed at dispatch.
-                    Awaiting a new human decision.
+                    Awaiting a new human decision — reconnecting the provider
+                    alone never resumes the intent; re-approve after reconnect.
                   </p>
                   <div className="row">
                     <button
@@ -327,7 +328,7 @@ export default function PublishPreview({ readonly = false }) {
                         </button>
                         <button
                           className="btn"
-                          onClick={() => resolveAs("uncertain")}
+                          onClick={() => resolveAs("lost-response")}
                         >
                           Simulate lost response
                         </button>
