@@ -512,7 +512,7 @@ fn cad779_csv_two_installations_and_two_contexts_isolate() {
     let csv = "record_id,display_name,email\ncustomer-9,Boris Feld,boris@example.com\n";
     let preview = w.preview(a, &ctx_a, csv);
     assert_eq!(row(&preview, 1)["decision"], "create");
-    assert!(row(&preview, 1).get("duplicate_of").is_none());
+    assert!(row(&preview, 1)["duplicate_of"].is_null());
 
     // An import naming another installation's context is refused by the
     // live-context proof before any file is touched.
