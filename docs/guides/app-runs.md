@@ -163,6 +163,16 @@ still establishes the caller and turn; JSON fields cannot impersonate a
 producer or reviewer. Extra keys and conflicting duplicate results are
 refused.
 
+The kickoff asks for exactly one bare envelope, but the result handoff
+recovers deterministically when Pi wraps that single envelope in harmless
+prose, either bare or inside one standalone `json` fence. The final text is
+bounded before either parse path; exactly one complete envelope is accepted
+and missing, truncated, oversized, conflicting, or multiple candidates fail
+closed without material success. The decoded envelope still passes the same
+run, active-turn, assignment, artifact, and review checks as a bare
+envelope, and the already failed run stays historical: broker-retained
+receipts remain independent of the app turn result and are never replayed.
+
 Inspect runs with `cadence app run ls [--install-id <installation-id>]`.
 Use `cadence app run cancel <run-id>` to prevent further execution, or
 `cadence app catalog revoke <installation-id> --digest <installed-digest>`

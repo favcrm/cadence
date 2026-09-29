@@ -165,6 +165,12 @@ def run_prompt(prompt):
                 time.sleep(0.02)
     journal(receipt)
     text = json.dumps(result, sort_keys=True)
+    if (STATE / "app-run-fenced-result").exists():
+        text = (
+            "The source capability call succeeded. The broker receipt remains the source of truth.\n\n"
+            "```json\n" + text + "\n```\n\n"
+            "## Scope compliance\nNo outward action was taken."
+        )
     pi.emit(
         {
             "type": "message_update",

@@ -965,7 +965,7 @@ impl Store {
                 "source":run["snapshot"]["source"],
                 "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
                 "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                "result_contract":"Return a JSON envelope in text with schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
             let body = envelope.to_string();
             if body.len() > super::ENQUEUE_BYTES {
                 return Err(Error::rejected(
@@ -1134,13 +1134,13 @@ impl Store {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TextArtifact {
+pub(super) struct TextArtifact {
     media_type: String,
     text: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
-enum LocalResult {
+pub(super) enum LocalResult {
     #[serde(rename = "produce_text")]
     Produce {
         schema: u32,
@@ -1167,6 +1167,109 @@ enum LocalResult {
         rationale: String,
     },
 }
+
+/// Bound applied before either parse path below. A max-size artifact can
+/// expand when JSON-escaped, so the raw final text may legitimately exceed
+/// `ARTIFACT_BYTES` by several times; anything beyond this still fails closed.
+pub(super) const MAX_RESULT_TEXT_BYTES: usize = ARTIFACT_BYTES * 6 + 64 * 1024;
+
+/// Locate exactly one top-level balanced-brace object in `text`, honouring
+/// JSON string escapes. Returns `None` for zero, multiple, or unbalanced
+/// brace spans, or when a fence marker is present anywhere outside the span.
+fn extract_single_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    spans.push((start.take().expect("brace span start"), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_string || depth != 0 || spans.len() != 1 {
+        return None;
+    }
+    let (start, end) = spans[0];
+    if text[..start].contains("```") || text[end..].contains("```") {
+        return None;
+    }
+    Some(&text[start..end])
+}
+
+/// Pi sometimes surrounds its final material envelope with explanatory
+/// prose, either bare or inside one standalone `json` fence. Accept exactly
+/// one complete, bounded envelope in either form amid brace-free prose;
+/// never search prose for the first of several parseable objects. Multiple,
+/// conflicting, malformed, oversized, or extra-fence candidates fail closed.
+/// The decoded result still passes the active-turn, pinned-run, artifact and
+/// review checks below; unknown fields and forged identity are refused by
+/// the strict `LocalResult` deserialization.
+pub(super) fn parse_local_result_text(text: &str) -> Option<LocalResult> {
+    if text.len() > MAX_RESULT_TEXT_BYTES {
+        return None;
+    }
+    if text.contains("```") {
+        let mut opening = None;
+        let mut closing = None;
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let marker = line.trim_end_matches(['\r', '\n']);
+            match marker {
+                "```json" if opening.is_none() && closing.is_none() => {
+                    opening = Some((offset, offset + line.len()));
+                }
+                "```" if opening.is_some() && closing.is_none() => {
+                    closing = Some((offset, offset + line.len()));
+                }
+                _ => {}
+            }
+            offset += line.len();
+        }
+        let ((open_start, body_start), (body_end, close_end)) = (opening?, closing?);
+        let before = &text[..open_start];
+        let after = &text[close_end..];
+        if [before, after]
+            .iter()
+            .any(|part| part.contains("```") || part.contains('{') || part.contains('}'))
+        {
+            return None;
+        }
+        return serde_json::from_str::<LocalResult>(&text[body_start..body_end]).ok();
+    }
+    if let Ok(result) = serde_json::from_str::<LocalResult>(text) {
+        return Some(result);
+    }
+    serde_json::from_str::<LocalResult>(extract_single_json_object(text)?).ok()
+}
+
 impl Store {
     /// Material transitions occur only on the actual active app kickoff. This
     /// transaction records durable eligibility; it never acquires the PM lock.
@@ -1282,11 +1385,11 @@ impl Store {
                 .map(|_| true);
         };
         let decoded = if let Some(text) = result.get("text").and_then(Value::as_str) {
-            serde_json::from_str::<LocalResult>(text)
+            parse_local_result_text(text)
         } else {
-            serde_json::from_value::<LocalResult>(result.clone())
+            serde_json::from_value::<LocalResult>(result.clone()).ok()
         };
-        let Ok(decoded) = decoded else {
+        let Some(decoded) = decoded else {
             return self
                 .app_step_failed_in(
                     tx,
