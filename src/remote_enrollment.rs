@@ -1485,6 +1485,7 @@ mod tests {
         let dir = root.path().join("enroll");
         let enrolled = record(u64::MAX);
         trust(&dir, &enrolled.issuer);
+        access_file(&dir, &enrolled.issuer);
         save(&dir, &enrolled).unwrap();
         let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
         let command = ResultCommand::parse_json(
@@ -2505,6 +2506,35 @@ mod tests {
     }
 
     #[test]
+    fn access_ingress_challenge_cannot_create_or_save_a_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, _) =
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
+            write!(socket, "HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: 7\r\nconnection: close\r\n\r\ndenied!").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        access_file(&dir, &issuer);
+        let error = enroll_browser(
+            &issuer,
+            "ws_real",
+            "https://real.board.example.test",
+            "worker",
+            &dir,
+            |_, _| panic!("Access challenge returned a device code"),
+        )
+        .unwrap_err();
+        assert!(!format!("{error}").contains("test-secret"));
+        assert!(!dir.join(RECORD).exists());
+        assert!(server.join().unwrap().accept().is_err());
+    }
+
+    #[test]
     fn browser_public_request_ignores_ambient_proxy() {
         if std::env::var_os("CAD729_PROXY_PROOF_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
@@ -2532,11 +2562,28 @@ mod tests {
             let (mut socket, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
             assert_eq!(body["organization_id"], "ws_real");
             respond(&mut socket, &browser_code(60));
+            let (mut socket, body) =
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
+            assert_eq!(body["organization_id"], "ws_real");
+            respond(&mut socket, &browser_code(60));
         });
         let (status, _) = post_public(
             &issuer,
             "/v1/hosted-cadence/device/code",
             json!({"organization_id":"ws_real"}),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let access = AccessIngress {
+            issuer: issuer.clone(),
+            client_id: "test-id.access".into(),
+            client_secret: "test-secret".into(),
+        };
+        let (status, _) = post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/device/code",
+            json!({"organization_id":"ws_real"}),
+            Some(&access),
         )
         .unwrap();
         server.join().unwrap();
