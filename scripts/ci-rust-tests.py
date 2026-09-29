@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -60,6 +61,8 @@ def load_weights(path):
             raise ValueError(f"{path}: weight key must be '<binary-id> <name>': {key!r}")
         if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
             raise ValueError(f"{path}: non-numeric weight for {key!r}")
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"{path}: weight must be finite and >= 0 for {key!r}")
         out[key] = float(seconds)
     return out
 
@@ -69,8 +72,13 @@ def assign(tests, weights, n):
 
     `tests` is a list of (binary_id, name) pairs. Missing weights get
     the 0.1s default — weights only affect balance, never coverage.
+    A non-finite or negative weight poisons the least-loaded scan, so
+    it is refused here too, not only in `load_weights`.
     Returns n lists of ids, each sorted.
     """
+    for key, seconds in weights.items():
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"weight must be finite and >= 0 for {key!r}")
     by_weight = sorted(
         tests,
         key=lambda t: (-weights.get(f"{t[0]} {t[1]}", 0.1), f"{t[0]} {t[1]}"),
@@ -82,10 +90,6 @@ def assign(tests, weights, n):
         shards[lightest].append(f"{binary_id} {name}")
         loads[lightest] += weights.get(f"{binary_id} {name}", 0.1)
     return [sorted(shard) for shard in shards]
-
-
-def _quoted(text):
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def filterset(ids):
