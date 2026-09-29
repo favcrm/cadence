@@ -1280,3 +1280,50 @@ fn cad103_review_flakes_query_and_existing_pr_syntax() {
     assert!(Cli::try_parse_from(["cadence", "review", "42", "--test", "x"]).is_err());
     assert!(Cli::try_parse_from(["cadence", "review", "flakes", "--no-full"]).is_err());
 }
+
+/// CAD-800: sweep-only flags must not parse with a single ID — the
+/// installed build accepted `finish <ID> --dry-run` and ran a real
+/// finish. `requires = "merged"` alone does not reject when the
+/// positional ID is present, so the flags also conflict with `id`
+/// and the dispatch fails closed (see `src/issue/cli.rs`).
+#[test]
+fn cad800_single_id_sweep_flags_rejected() {
+    // Every sweep-only flag, every position: a single ID must reject.
+    for extra in [
+        vec!["--dry-run"],
+        vec!["--json"],
+        vec!["--project", "demo"],
+        vec!["--dry-run", "--json"],
+    ] {
+        let mut with_id_first = vec!["cadence", "issue", "finish", "CAD-1"];
+        with_id_first.extend(extra.iter().copied());
+        assert!(
+            Cli::try_parse_from(with_id_first).is_err(),
+            "single-ID finish must reject {extra:?}"
+        );
+        let mut with_id_last = vec!["cadence", "issue", "finish"];
+        with_id_last.extend(extra.iter().copied());
+        with_id_last.push("CAD-1");
+        assert!(
+            Cli::try_parse_from(with_id_last).is_err(),
+            "single-ID finish must reject {extra:?} after the ID too"
+        );
+    }
+    // A bare `--dry-run`/`--json`/`--project` still needs `--merged`.
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--json"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--project", "demo"]).is_err());
+    // The sweep preview itself still parses, with and without `--json`.
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "--merged", "--dry-run"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "issue",
+        "finish",
+        "--merged",
+        "--dry-run",
+        "--json"
+    ])
+    .is_ok());
+    // A plain single-ID finish still parses.
+    assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1"]).is_ok());
+}

@@ -480,3 +480,96 @@ fn finish_preview_classifies_missing_worktrees_without_finishing_them() {
 
     drop(held);
 }
+
+/// CAD-800: a single-ID `--dry-run` must never mutate the lane.
+///
+/// The installed build accepted `finish <ID> --dry-run --json` and ran
+/// a real finish (`finished: true`, worktree removed, branch deleted).
+/// The CLI now rejects sweep-only flags with a single ID at parse time
+/// (`conflicts_with = "id"`, unit-tested in `src/cli/tests.rs`) and
+/// fails closed at dispatch time. This test uses a disposable merged
+/// idle lane to prove the tree and refs survive the sweep preview
+/// (the only supported preview), then a normal finish still succeeds.
+#[test]
+fn cad800_single_id_dry_run_rejected_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let repo_dir = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let pm = Pm::init(&pm_dir).unwrap();
+    git(&repo_dir, &["init", "-b", "main"]);
+    git(&repo_dir, &["config", "user.email", "t@t"]);
+    git(&repo_dir, &["config", "user.name", "t"]);
+    std::fs::write(repo_dir.join("f"), "one").unwrap();
+    git(&repo_dir, &["add", "f"]);
+    git(&repo_dir, &["commit", "-qm", "init"]);
+    let repo = repo_dir.canonicalize().unwrap();
+
+    let lane = repo.join(".cadence").join("wt").join("p-dry");
+    let branch = "cadence/p-dry".to_string();
+    add_lane(&repo, &lane, &branch, "dry.txt", true);
+    // Idle past the 30-minute active window so a normal finish passes.
+    idle(&lane);
+    idle(&repo);
+
+    std::fs::create_dir_all(pm_dir.join("demo")).unwrap();
+    std::fs::write(
+        pm_dir.join("demo").join("project.yaml"),
+        "key: demo\nprefix: P\n",
+    )
+    .unwrap();
+    write_issue(&pm_dir, "P-9", "Dry", &lane, &branch);
+
+    let rev = |dir: &Path| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let pm_head = rev(&pm_dir);
+    let repo_head = rev(&repo);
+    let issue_before = std::fs::read(pm_dir.join("demo").join("P-9").join("issue.md")).unwrap();
+
+    // 1. The sweep preview is side-effect-free and classifies the lane.
+    //    (Single-ID + `--dry-run`/`--json`/`--project` parser rejection is
+    //    unit-tested in `src/cli/tests.rs::cad800_single_id_sweep_flags_rejected`:
+    //    the rejected parse never reaches `finish::run` — that is the
+    //    regression, the old binary ignored the flag and finished.)
+    let plan = finish::sweep(&pm, Some("demo"), false, true, "", &state).unwrap();
+    assert_eq!(plan["dry_run"], true, "{plan}");
+    let ours = row(&plan, "P-9");
+    assert_eq!(ours["outcome"], "would-finish", "{ours}");
+    assert!(lane.is_dir(), "preview removed the worktree");
+    assert!(branch_exists(&repo, &branch), "preview deleted the branch");
+    assert_eq!(rev(&pm_dir), pm_head, "preview committed the tracker");
+    assert_eq!(rev(&repo), repo_head, "preview moved the repo");
+    assert_eq!(
+        std::fs::read(pm_dir.join("demo").join("P-9").join("issue.md")).unwrap(),
+        issue_before,
+        "preview touched the issue"
+    );
+
+    // 2. No direct finish ran: the lane, branch and refs are untouched.
+    assert!(lane.is_dir());
+    assert!(branch_exists(&repo, &branch));
+    assert_eq!(rev(&pm_dir), pm_head);
+    assert_eq!(rev(&repo), repo_head);
+
+    // 3. A normal finish still succeeds afterwards (real sweep finishes
+    //    the same merged idle lane a single-ID `finish` would).
+    let applied = finish::sweep(&pm, Some("demo"), false, false, "", &state).unwrap();
+    assert_eq!(applied["dry_run"], false, "{applied}");
+    let finished = row(&applied, "P-9");
+    assert_eq!(finished["outcome"], "finished", "{finished}");
+    assert!(!lane.exists(), "normal finish kept the worktree");
+    assert!(
+        !branch_exists(&repo, &branch),
+        "normal finish kept the branch"
+    );
+}
