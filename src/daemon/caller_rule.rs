@@ -568,6 +568,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "operator_session_open",
         Rule::Handler("nonce bearer; a connection that derives an agent spends it and is refused (CAD-313)"),
     ),
+    (
+        "operator_session_open_device",
+        Rule::Handler("device-verified subject bearer; agent callers refused pre-mint (CAD-777)"),
+    ),
     ("operator_session_check", Rule::Bearer),
     ("operator_session_logout", Rule::Bearer),
     ("operator_session_stolen", Rule::Bearer),

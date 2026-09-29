@@ -124,6 +124,18 @@ pub struct UiFlags {
     /// `{issuer}/v2/board/authorize`.
     #[arg(long)]
     pub board_authorize_url: Option<String>,
+    /// CAD-777: allow remote operator sign-in through the AgenticOS
+    /// device grant — the issuer origin that mints the grant.
+    /// Requires `--device-login-org` (and env `CADENCE_DEVICE_LOGIN_ORG`
+    /// as fallback); the pair persists in ui.json. Default: off — the
+    /// device routes answer 404 unless both resolve.
+    #[arg(long)]
+    pub device_login_issuer: Option<String>,
+    /// CAD-777: the exact workspace the device sign-in is for.
+    /// Requires `--device-login-issuer` (env
+    /// `CADENCE_DEVICE_LOGIN_ISSUER` as fallback).
+    #[arg(long)]
+    pub device_login_org: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -304,6 +316,55 @@ pub struct PublicBoard {
     pub authorize_url: String,
 }
 
+/// Remote operator sign-in through the AgenticOS device grant
+/// (CAD-777): the issuer origin plus the exact workspace. Both or
+/// neither — a half pair never resolves.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLoginOpts {
+    pub issuer: String,
+    pub org: String,
+}
+
+/// A device grant the board is waiting on: the server-side code plus
+/// its expiry. The browser holds only the pending id. Opaque outside
+/// this module tree: fields stay private, so only `ui` and its
+/// children construct or read rows.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DevicePending {
+    device_code: String,
+    expires_at: i64,
+}
+
+/// The resolved device-login configuration (CAD-777): the validated
+/// issuer + workspace pair plus the live pending map. `None` in
+/// `ServeOpts` is off.
+#[derive(Clone)]
+pub struct DeviceLogin {
+    pub config: crate::device_login::DeviceConfig,
+    pub pending: std::sync::Arc<std::sync::Mutex<HashMap<String, DevicePending>>>,
+    /// The issuer transport — live ureq unless a test injects a fake.
+    pub transport: std::sync::Arc<dyn crate::device_login::IssuerTransport>,
+}
+
+/// Live device grants awaiting approval are bounded: past this many,
+/// `/api/session/device/code` refuses with 429 until one settles.
+const DEVICE_PENDING_CAP: usize = 16;
+
+impl DeviceLogin {
+    /// A live configuration: validated issuer pair, empty pending map,
+    /// live issuer transport. Tests point `config` at a loopback stub;
+    /// production uses an HTTPS issuer origin.
+    pub fn with_issuer(config: crate::device_login::DeviceConfig) -> Self {
+        Self {
+            config,
+            pending: Default::default(),
+            transport: std::sync::Arc::new(crate::device_login::UreqTransport::new()),
+        }
+    }
+}
+
 /// The effective options `ui start` persists — a later plain start
 /// reuses them, `ui status` prints them, `--reset` forgets them.
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -319,6 +380,9 @@ pub struct UiOpts {
     pub tailscale: Option<TailscaleOpts>,
     /// The AgenticOS board-identity configuration (CAD-526).
     pub board: Option<PublicBoard>,
+    /// Remote operator sign-in through the AgenticOS device grant
+    /// (CAD-777): issuer + workspace, or neither. Default off.
+    pub device_login: Option<DeviceLoginOpts>,
 }
 
 /// Everything the running server needs, resolved.
@@ -371,6 +435,11 @@ pub struct ServeOpts {
     /// `__platform/*` routes and `__Host-aos-board-session` reads —
     /// never the local login flow.
     pub public: Option<PublicBoard>,
+    /// CAD-777: remote operator sign-in through the AgenticOS device
+    /// grant, when the issuer + workspace pair resolved. `None` is
+    /// off — the device routes answer 404. Never set from the command
+    /// line — tests inject a fake issuer transport beside it.
+    pub device_login: Option<DeviceLogin>,
     /// CAD-482: arm the test-only caller seam — the board honors
     /// `X-Cadence-Test-As`/`X-Cadence-Test-Token` request headers and
     /// its daemon calls carry the asserted identity. Honored only in
@@ -494,6 +563,10 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
         // is all-or-nothing — any field present with another missing is
         // an operator error, never a partial trust root.
         board: resolve_board(flags, persisted)?,
+        // CAD-777: same shape — flag → env → persisted, both or
+        // neither. Validation (fail closed at boot) happens in
+        // `serve_opts` so `ui status` can show the raw pair.
+        device_login: resolve_device_login(flags, persisted)?,
     };
     if eff.board_public_only && eff.board.is_none() {
         return Err(Error::rejected(
@@ -521,6 +594,40 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
     }
     let serve = serve_opts(&eff)?;
     Ok((eff, serve))
+}
+
+/// CAD-777: merge the device-login pair — flags win, then
+/// `CADENCE_DEVICE_LOGIN_*` env, then the persisted block. Both or
+/// neither; a half pair is an operator error, never a silent half
+/// trust root. Values are validated when `serve_opts` builds the
+/// runtime config, so a bad pair fails the board at boot.
+fn resolve_device_login(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<DeviceLoginOpts>> {
+    let field = |flag: Option<&String>, env: &str, saved: Option<&String>| {
+        flag.cloned()
+            .or_else(|| std::env::var(env).ok())
+            .or_else(|| saved.cloned())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let saved = persisted.device_login.as_ref();
+    let issuer = field(
+        flags.device_login_issuer.as_ref(),
+        "CADENCE_DEVICE_LOGIN_ISSUER",
+        saved.map(|d| &d.issuer),
+    );
+    let org = field(
+        flags.device_login_org.as_ref(),
+        "CADENCE_DEVICE_LOGIN_ORG",
+        saved.map(|d| &d.org),
+    );
+    match (issuer, org) {
+        (None, None) => Ok(None),
+        (Some(issuer), Some(org)) => Ok(Some(DeviceLoginOpts { issuer, org })),
+        _ => Err(Error::rejected(
+            "device login needs both --device-login-issuer and --device-login-org \
+             (or CADENCE_DEVICE_LOGIN_ISSUER / CADENCE_DEVICE_LOGIN_ORG)",
+        )),
+    }
 }
 
 /// CAD-526: merge the board-identity configuration — flags win, then
@@ -667,6 +774,20 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         stop: None,
         startup: None,
         public: eff.board.clone(),
+        // CAD-777: the pair validates here so a bad issuer/org fails
+        // the board at boot, never at first sign-in. The pending map
+        // starts empty; tests replace the whole `DeviceLogin`.
+        device_login: eff
+            .device_login
+            .as_ref()
+            .map(|pair| -> Result<DeviceLogin> {
+                Ok(DeviceLogin {
+                    config: crate::device_login::DeviceConfig::new(&pair.issuer, &pair.org)?,
+                    pending: Default::default(),
+                    transport: std::sync::Arc::new(crate::device_login::UreqTransport::new()),
+                })
+            })
+            .transpose()?,
         // CAD-482: `ui run`/`ui start`'s fixture child arms from its
         // environment; in-process fixtures set the field directly.
         test_seam: crate::test_seam::env_armed(),
@@ -2006,6 +2127,22 @@ fn write_route(
             operator::open(&mut request, state_dir, opts)
         } else {
             operator::logout(&request, state_dir, opts)
+        };
+        send(request, resp);
+        return;
+    }
+    // CAD-777: device-grant sign-in — same login class as `/api/session`.
+    // Unconfigured boards answer 404 inside the handlers, like an
+    // unknown shape.
+    if path == "/api/session/device/code" || path == "/api/session/device/poll" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = if path == "/api/session/device/code" {
+            operator::device_code(&mut request, state_dir, opts)
+        } else {
+            operator::device_poll(&mut request, state_dir, opts)
         };
         send(request, resp);
         return;
@@ -4735,7 +4872,8 @@ fn qr_term(text: &str) -> Option<String> {
 mod tests {
     use super::{
         agents_payload_from, content_type, context_query, health_supports_model_defaults,
-        proxied_actor, running_json, static_answer_for, static_file, StaticAnswer,
+        proxied_actor, resolve_device_login, running_json, static_answer_for, static_file,
+        DeviceLoginOpts, StaticAnswer, UiFlags, UiOpts,
     };
     use serde_json::{json, Value};
     use tiny_http::{Header, Response};
@@ -5146,5 +5284,76 @@ mod tests {
         assert!(proxied_actor(Some("")).is_err());
         assert!(proxied_actor(Some("   ")).is_err());
         assert!(proxied_actor(Some("bad\u{1}login")).is_err());
+    }
+
+    /// CAD-777: the device-login pair resolves flag → env → persisted,
+    /// both or neither. Env is restored after each case so parallel
+    /// runners sharing the process see no leak.
+    #[test]
+    fn device_login_pair_resolves_all_or_nothing() {
+        fn persisted(pair: Option<(&str, &str)>) -> UiOpts {
+            UiOpts {
+                device_login: pair.map(|(issuer, org)| DeviceLoginOpts {
+                    issuer: issuer.to_string(),
+                    org: org.to_string(),
+                }),
+                ..Default::default()
+            }
+        }
+        fn flags(issuer: Option<&str>, org: Option<&str>) -> UiFlags {
+            UiFlags {
+                device_login_issuer: issuer.map(str::to_string),
+                device_login_org: org.map(str::to_string),
+                ..Default::default()
+            }
+        }
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("CADENCE_DEVICE_LOGIN_ISSUER");
+                std::env::remove_var("CADENCE_DEVICE_LOGIN_ORG");
+            }
+        }
+        let _guard = EnvGuard;
+        // Nothing anywhere: off.
+        assert!(resolve_device_login(&flags(None, None), &persisted(None))
+            .unwrap()
+            .is_none());
+        // Flags win and persist shape round-trips.
+        let pair = resolve_device_login(
+            &flags(Some("https://issuer.example"), Some("ws_co")),
+            &persisted(None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pair.issuer, "https://issuer.example");
+        // Half pairs refuse, wherever the half comes from.
+        assert!(resolve_device_login(
+            &flags(Some("https://issuer.example"), None),
+            &persisted(None)
+        )
+        .is_err());
+        assert!(resolve_device_login(
+            &flags(None, Some("ws_co")),
+            &persisted(Some(("https://issuer.example", "ws_co")))
+        )
+        .unwrap()
+        .is_some());
+        // Env fills the gaps; whitespace-only counts as absent.
+        std::env::set_var("CADENCE_DEVICE_LOGIN_ISSUER", "https://env.example");
+        std::env::set_var("CADENCE_DEVICE_LOGIN_ORG", "ws_env");
+        let pair = resolve_device_login(&flags(None, None), &persisted(None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.org, "ws_env");
+        // Persisted values survive when nothing overrides them.
+        std::env::remove_var("CADENCE_DEVICE_LOGIN_ISSUER");
+        std::env::remove_var("CADENCE_DEVICE_LOGIN_ORG");
+        assert!(resolve_device_login(
+            &flags(None, None),
+            &persisted(Some(("https://saved.example", "ws_saved")))
+        )
+        .unwrap()
+        .is_some());
     }
 }

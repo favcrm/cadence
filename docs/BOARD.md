@@ -983,7 +983,9 @@ a later plain `ui start` reuses it, `--reset` forgets it, and
 `--allow-host <name>` / `--allow-origin <origin>` (repeatable — extend
 the Host/Origin allowlists), `--read-only` (every write answers `403`,
 the SPA hides its edit controls; `--no-read-only` clears a persisted
-one).
+one), `--device-login-issuer <origin> --device-login-org <ws-id>`
+(remote operator sign-in through the AgenticOS device grant, CAD-777 —
+both or neither; default off).
 
 **Signing in (CAD-313, ADR 0004).** Board writes need the operator's
 session. `cadence ui login`, run from your own shell, prints a link —
@@ -1020,6 +1022,20 @@ random bits, and a shared failure budget would let an agent lock the
 operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
+
+**Remote sign-in without SSH (CAD-777).** With `--device-login-issuer`
+and `--device-login-org` resolved, `POST /api/session/device/code`
+requests an AgenticOS device grant for exactly that workspace and
+answers the user code + verification link plus a pending id; `POST
+/api/session/device/poll` exchanges the owner's approval for a session
+with the same cookie shape as `/api/session`. The issuer device code
+lives only in the board's pending map (bounded, TTL-pruned) and the
+`agc_` credential is verified and dropped — neither ever reaches the
+browser. Sessions minted this way live 12 h idle, 24 h at most, one
+per verified subject, owner-mapped; agent peers are refused without
+side effects. Unconfigured boards answer both routes 404. The login
+audience (`read draft`) never enrolls a provider connection; issuing
+the grant still needs the issuer's device flag and an owner approver.
 
 ## Remote access — `ui tailscale`
 

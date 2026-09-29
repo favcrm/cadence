@@ -7,6 +7,7 @@
 mod board_common;
 use board_common::*;
 
+use cadence_agent::device_login::DeviceConfig;
 use cadence_agent::ui;
 use serde_json::json;
 use serde_json::Value;
@@ -948,4 +949,412 @@ fn a_member_session_never_decides() {
     );
     assert_eq!(code, 403, "{body}");
     assert!(body.contains("member_role"), "{body}");
+}
+
+// ---------- CAD-777: device-grant sign-in ----------
+
+/// A scripted AgenticOS device issuer: device code, token poll and
+/// session check. `mode` is `approve`, `deny` or `wrongorg`; the first
+/// token poll is always pending so the board proves it waits.
+struct DeviceStub {
+    mode: std::sync::Mutex<String>,
+    polls: std::sync::atomic::AtomicUsize,
+}
+
+fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
+    let port = free_port();
+    let stub = std::sync::Arc::new(DeviceStub {
+        mode: std::sync::Mutex::new(mode.to_string()),
+        polls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let serve = stub.clone();
+    thread::spawn(move || {
+        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).unwrap();
+        loop {
+            let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            let mut body = String::new();
+            let _ = req.as_reader().read_to_string(&mut body);
+            let (status, doc) = match (req.method(), req.url()) {
+                (tiny_http::Method::Post, "/v1/device/code") => (
+                    200,
+                    json!({
+                        "device_code": "agd_t",
+                        "user_code": "ABCD-1234",
+                        "verification_uri": format!("http://127.0.0.1:{port}/approve"),
+                        "verification_uri_complete": format!("http://127.0.0.1:{port}/approve?code=ABCD-1234"),
+                        "expires_in": 600,
+                        "interval": 1
+                    }),
+                ),
+                (tiny_http::Method::Post, "/v1/device/token") => {
+                    if !body.contains("agd_t") {
+                        (400, json!({"error": "invalid_grant"}))
+                    } else if serve
+                        .polls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0
+                    {
+                        (400, json!({"error": "authorization_pending"}))
+                    } else {
+                        match serve.mode.lock().unwrap().as_str() {
+                            "deny" => (400, json!({"error": "access_denied"})),
+                            "wrongorg" => (
+                                200,
+                                json!({
+                                    "access_token": "agc_t",
+                                    "token_type": "bearer",
+                                    "expires_in": 999,
+                                    "scope": "read draft",
+                                    "workspace_id": "ws_other"
+                                }),
+                            ),
+                            _ => (
+                                200,
+                                json!({
+                                    "access_token": "agc_t",
+                                    "token_type": "bearer",
+                                    "expires_in": 999,
+                                    "scope": "read draft",
+                                    "workspace_id": "ws_company"
+                                }),
+                            ),
+                        }
+                    }
+                }
+                (tiny_http::Method::Get, "/v1/runtime/session") => (
+                    200,
+                    json!({
+                        "ok": true,
+                        "data": {
+                            "workspace": {"id": "ws_company"},
+                            "subject": {"anonymous": false, "id": "op_9"},
+                            "scopes": ["read", "draft"]
+                        }
+                    }),
+                ),
+                _ => (404, json!({"ok": false})),
+            };
+            let _ = req.respond(
+                tiny_http::Response::from_string(doc.to_string()).with_status_code(status),
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), stub)
+}
+
+/// A board with device login armed for `ws_company` against the stub.
+fn start_device_board(pm: &Path, state: &Path, issuer: String) -> (u16, BoardStop) {
+    start_ui_opts(pm.to_path_buf(), state.to_path_buf(), move |opts| {
+        opts.device_login = Some(ui::DeviceLogin::with_issuer(
+            DeviceConfig::new(&issuer, "ws_company").unwrap(),
+        ));
+    })
+}
+
+/// POST to a device route on the board's own name with write guards.
+fn device_post(port: u16, host: &str, path: &str, body: &str) -> (u16, String, String) {
+    op::raw(
+        port,
+        &op::request(
+            "POST",
+            path,
+            host,
+            Some(&format!("http://{host}")),
+            None,
+            body,
+        ),
+    )
+}
+
+/// The `status` of a poll answer body.
+fn status_of(body: &str) -> String {
+    serde_json::from_str::<Value>(body).unwrap()["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Unconfigured boards answer the device routes like unknown shapes.
+#[test]
+fn device_routes_are_dead_without_configuration() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = op::board_host(port);
+    for path in ["/api/session/device/code", "/api/session/device/poll"] {
+        let (code, _, body) = device_post(port, &host, path, "{}");
+        assert_eq!(code, 404, "{path}: {body}");
+    }
+    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 404);
+}
+
+/// The full loop: code, one pending poll, approval, session cookie +
+/// key — and the cookie opens a live operator session. Issuer secrets
+/// never appear in any board response.
+#[test]
+fn device_grant_opens_a_remote_session() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+
+    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 200, "{body}");
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    let pending = doc["pending_id"].as_str().unwrap().to_string();
+    assert_eq!(pending.len(), 64, "{body}");
+    assert_eq!(doc["user_code"], json!("ABCD-1234"));
+    assert!(!body.contains("agd_t"), "device code leaked: {body}");
+
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "pending", "{body}");
+
+    let (code, head, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains("agc_t"), "credential leaked: {body}");
+    let key = serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(key.len(), 64, "{body}");
+    let set = op::set_cookie(&head).unwrap();
+    assert!(
+        set.starts_with(&format!("cadence_operator_{port}=")),
+        "{set}"
+    );
+    let cookie = set.split(';').next().unwrap().to_string();
+
+    // The session is live: ending it answers 204.
+    let (code, _, _) = op::raw(
+        port,
+        &op::request(
+            "POST",
+            "/api/session/logout",
+            &host,
+            Some(&format!("http://{host}")),
+            Some(&cookie),
+            "{}",
+        ),
+    );
+    assert_eq!(code, 204);
+
+    // The grant is spent: polling again finds nothing.
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "expired", "{body}");
+}
+
+/// Denial, wrong-org approval and unknown pendings all settle without
+/// a session; malformed bodies and methods refuse loudly.
+#[test]
+fn device_grant_terminal_states_settle_without_a_session() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("deny");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+    let pending = |port: u16| -> String {
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // Denied on second poll (first is pending), then expired.
+    let id = pending(port);
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{id}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "pending", "{body}");
+    let (code, head, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{id}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "denied", "{body}");
+    assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{id}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "expired", "{body}");
+
+    // Unknown and malformed pendings.
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{}"}}"#, "0".repeat(64)),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "expired", "{body}");
+    let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "{}");
+    assert_eq!(code, 400);
+    let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "not json");
+    assert_eq!(code, 400);
+    // Like `/api/session` itself, the device exchange has no GET shape.
+    let (code, _, _) = op::raw(
+        port,
+        &op::request(
+            "GET",
+            "/api/session/device/code",
+            &host,
+            Some(&format!("http://{host}")),
+            None,
+            "",
+        ),
+    );
+    assert_eq!(code, 404);
+}
+
+/// A poll from a pane child is refused and spends nothing: the pending
+/// grant survives for the operator's own poll, which still approves.
+#[test]
+fn device_poll_from_a_pane_is_refused_without_side_effects() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 200, "{body}");
+    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Past pending: the stub answers pending once, then approves.
+    let (code, _, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(status_of(&body), "pending", "{code} {body}");
+
+    // The same poll from inside a pane: refused as an agent caller.
+    let req = op::request(
+        "POST",
+        "/api/session/device/poll",
+        &host,
+        Some(&format!("http://{host}")),
+        None,
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    let mut pane = std::process::Command::new("bash")
+        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+        .env(
+            "CLIENT",
+            format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port}; printf '%s' \"$REQ\" >&3; timeout 10 cat <&3"
+            ),
+        )
+        .env("REQ", req)
+        .env_remove("CADENCE_ALIAS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "w-device", pane.id());
+    use std::io::Write as _;
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut out = String::new();
+    use std::io::Read as _;
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(out.contains("403"), "{out}");
+    assert!(out.contains("session_from_agent"), "{out}");
+
+    // The pending survived: the operator's poll still approves.
+    let (code, head, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+            .as_str()
+            .is_some(),
+        "{body}"
+    );
+    assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+}
+
+/// An approval for another workspace settles with no session.
+#[test]
+fn device_grant_for_another_workspace_settles_without_a_session() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("wrongorg");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+    assert_eq!(code, 200, "{body}");
+    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // First poll is pending; the wrong-org approval then settles expired.
+    let (code, _, _) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200);
+    let (code, head, body) = device_post(
+        port,
+        &host,
+        "/api/session/device/poll",
+        &format!(r#"{{"pending_id":"{pending}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(status_of(&body), "expired", "{body}");
+    assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
 }

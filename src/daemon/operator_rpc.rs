@@ -171,6 +171,55 @@ impl Shared {
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
+    /// `operator_session_open_device {sub, org, origin, user_agent?}` —
+    /// the board's device-grant sign-in exchange (CAD-777). The board
+    /// has already run the grant through the issuer (`device_login`
+    /// request/poll/verify for the exact workspace); `sub` is the
+    /// verified subject, `org` the workspace it was verified for. The
+    /// grant's approver is owner by issuer rule, so the minted session
+    /// is operator-mapped with the shorter remote lifetimes.
+    ///
+    /// A connection that derives an agent is refused before anything
+    /// is minted — a browser session is never minted for a pane.
+    /// Neither field grants authority: `sub`/`org` name the verified
+    /// subject, they do not choose scopes or roles.
+    pub(super) fn rpc_operator_session_open_device(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            return Err(Error::rejected(format!(
+                "operator_session_open_device is the device sign-in exchange — this connection \
+                 is agent '{}'; a browser session is never minted for a pane",
+                who.lane()
+            )));
+        }
+        let sub = required_str(params, "sub")?;
+        let org = required_str(params, "org")?;
+        crate::device_login::validate_subject(sub)?;
+        crate::device_login::validate_subject(org)?;
+        let origin = origin_param(params)?;
+        let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        let user = auth::BoardUser {
+            sub: sub.to_string(),
+            email: String::new(),
+            name: String::new(),
+            role: "operator".to_string(),
+            handle: sub.to_string(),
+        };
+        let now = self.operator_now();
+        let opened = self
+            .operator_auth()
+            .open_device(user, origin, user_agent, now)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "operator_device_session_opened",
+            json!({"session": opened.session.id, "origin": origin.as_str(), "org": org}),
+        );
+        Ok(json!({"token": opened.token, "key": opened.key, "session": opened.session}))
+    }
+
     /// `board_session_open {assertion, user_agent?}` — the board's
     /// `POST /__platform/session` (CAD-526, contract §4/§9). The
     /// assertion is the credential: structure, Ed25519 signature

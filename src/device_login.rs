@@ -75,12 +75,15 @@ fn issuer_origin(input: &str) -> Result<String> {
         .authority()
         .ok_or_else(|| rejected("Issuer must be an HTTPS origin"))?;
     let secure = uri.scheme_str() == Some("https");
-    // Test-only escape hatch, mirroring remote_auth: unit tests may
-    // point at a loopback fake issuer. Never a CLI plaintext option.
-    let test_loopback = cfg!(test)
-        && uri.scheme_str() == Some("http")
+    // Loopback issuers (local fixtures, staging on this host) are
+    // allowed over plain HTTP in every build: the issuer is
+    // operator-configured (flag/env/persisted), never caller input, so
+    // nothing the network says chooses it, and bodies stay on-host.
+    // This mirrors the board-identity issuer, which already accepts
+    // local http:// origins (CAD-526).
+    let loopback = uri.scheme_str() == Some("http")
         && matches!(uri.host(), Some("127.0.0.1") | Some("localhost"));
-    if (!secure && !test_loopback)
+    if (!secure && !loopback)
         || authority.as_str().contains('@')
         || input.contains('#')
         || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
@@ -116,6 +119,20 @@ fn validate_token(token: &str) -> Result<()> {
         return Err(rejected(
             "Credential must be one bounded ASCII token without whitespace",
         ));
+    }
+    Ok(())
+}
+
+/// Subjects the daemon accepts from a verified device grant: the same
+/// workspace-ID grammar the issuer uses for companies and principals.
+pub fn validate_subject(raw: &str) -> Result<()> {
+    if raw.is_empty()
+        || raw.len() > 200
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Err(rejected("Subject must be a workspace-style ID"));
     }
     Ok(())
 }
@@ -161,7 +178,8 @@ pub struct Verified {
 
 /// The HTTP this module needs. The live impl speaks ureq like
 /// `remote_auth` (no redirects, bounded bodies); tests script a fake.
-pub trait IssuerTransport {
+/// Object-safe and shareable: the board keeps one behind `Arc`.
+pub trait IssuerTransport: Send + Sync {
     fn post(&self, url: &str, body: Value) -> Result<(u16, Value)>;
     fn get(&self, url: &str, bearer: &str) -> Result<(u16, Value)>;
 }
@@ -277,10 +295,11 @@ fn valid_https_url(raw: &str) -> bool {
         return false;
     };
     let secure = uri.scheme_str() == Some("https");
-    let test_loopback = cfg!(test)
-        && uri.scheme_str() == Some("http")
+    // Same loopback allowance as `issuer_origin`: operator-configured
+    // fixtures only, never caller input.
+    let loopback = uri.scheme_str() == Some("http")
         && matches!(uri.host(), Some("127.0.0.1") | Some("localhost"));
-    if !secure && !test_loopback {
+    if !secure && !loopback {
         return false;
     }
     let Some(authority) = uri.authority() else {
@@ -350,9 +369,7 @@ pub fn poll_token(
             .map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_default();
         if !scopes.iter().any(|s| s == "read") {
-            return Err(rejected(
-                "Issuer granted no read scope — start over",
-            ));
+            return Err(rejected("Issuer granted no read scope — start over"));
         }
         return Ok(Poll::Approved {
             token: token.to_string(),
@@ -379,10 +396,7 @@ pub fn verify_session(
     token: &str,
 ) -> Result<Verified> {
     validate_token(token)?;
-    let (status, value) = transport.get(
-        &format!("{}/v1/runtime/session", config.issuer),
-        token,
-    )?;
+    let (status, value) = transport.get(&format!("{}/v1/runtime/session", config.issuer), token)?;
     if status != 200 {
         return Err(rejected(
             "Issuer rejected the credential; check expiry, revocation and read scope",
@@ -506,10 +520,13 @@ mod tests {
 
     #[test]
     fn config_rejects_bad_issuer_and_org() {
+        // Plain HTTP to a non-loopback host is refused in every build;
+        // loopback fixtures are the documented operator exception.
         assert!(DeviceConfig::new("http://example.com", "ws_company").is_err());
         assert!(DeviceConfig::new("https://issuer.example/x", "ws_company").is_err());
         assert!(DeviceConfig::new("https://issuer.example", "not a workspace!").is_err());
         assert!(DeviceConfig::new("https://issuer.example", "").is_err());
+        assert!(DeviceConfig::new("http://127.0.0.1:9", "ws_company").is_ok());
     }
 
     #[test]
@@ -557,11 +574,20 @@ mod tests {
     #[test]
     fn poll_maps_every_terminal_state() {
         let pending = Fake::new(vec![(400, json!({"error": "authorization_pending"}))]);
-        assert_eq!(poll_token(&pending, &config(), "agd_x").unwrap(), Poll::Pending);
+        assert_eq!(
+            poll_token(&pending, &config(), "agd_x").unwrap(),
+            Poll::Pending
+        );
         let slow = Fake::new(vec![(400, json!({"error": "slow_down"}))]);
-        assert_eq!(poll_token(&slow, &config(), "agd_x").unwrap(), Poll::SlowDown);
+        assert_eq!(
+            poll_token(&slow, &config(), "agd_x").unwrap(),
+            Poll::SlowDown
+        );
         let denied = Fake::new(vec![(400, json!({"error": "access_denied"}))]);
-        assert_eq!(poll_token(&denied, &config(), "agd_x").unwrap(), Poll::Denied);
+        assert_eq!(
+            poll_token(&denied, &config(), "agd_x").unwrap(),
+            Poll::Denied
+        );
         for error in ["expired_token", "invalid_grant"] {
             let gone = Fake::new(vec![(400, json!({"error": error}))]);
             assert_eq!(poll_token(&gone, &config(), "agd_x").unwrap(), Poll::Gone);
@@ -582,8 +608,11 @@ mod tests {
                 "workspace_id": "ws_company"
             }),
         )]);
-        let Poll::Approved { token, workspace_id, .. } =
-            poll_token(&approved, &config(), "agd_x").unwrap()
+        let Poll::Approved {
+            token,
+            workspace_id,
+            ..
+        } = poll_token(&approved, &config(), "agd_x").unwrap()
         else {
             panic!("expected approval");
         };
@@ -626,26 +655,41 @@ mod tests {
         // Non-200, anonymous, wrong org, missing read, bad scope, dupes.
         let bad = vec![
             (401, json!({"ok": false})),
-            (200, json!({"ok": true, "data": {
+            (
+                200,
+                json!({"ok": true, "data": {
                 "workspace": {"id": "ws_company"},
                 "subject": {"anonymous": true, "id": "op_1"},
-                "scopes": ["read"]}})),
-            (200, json!({"ok": true, "data": {
+                "scopes": ["read"]}}),
+            ),
+            (
+                200,
+                json!({"ok": true, "data": {
                 "workspace": {"id": "ws_other"},
                 "subject": {"anonymous": false, "id": "op_1"},
-                "scopes": ["read"]}})),
-            (200, json!({"ok": true, "data": {
+                "scopes": ["read"]}}),
+            ),
+            (
+                200,
+                json!({"ok": true, "data": {
                 "workspace": {"id": "ws_company"},
                 "subject": {"anonymous": false, "id": "op_1"},
-                "scopes": ["draft"]}})),
-            (200, json!({"ok": true, "data": {
+                "scopes": ["draft"]}}),
+            ),
+            (
+                200,
+                json!({"ok": true, "data": {
                 "workspace": {"id": "ws_company"},
                 "subject": {"anonymous": false, "id": "op_1"},
-                "scopes": ["read", "admin"]}})),
-            (200, json!({"ok": true, "data": {
+                "scopes": ["read", "admin"]}}),
+            ),
+            (
+                200,
+                json!({"ok": true, "data": {
                 "workspace": {"id": "ws_company"},
                 "subject": {"anonymous": false, "id": "op_1"},
-                "scopes": ["read", "read"]}})),
+                "scopes": ["read", "read"]}}),
+            ),
         ];
         for answer in bad {
             let fake = Fake::new(vec![answer]);

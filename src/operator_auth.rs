@@ -778,8 +778,7 @@ impl Auth {
             ));
         }
         self.sessions.retain(|r| {
-            !(r.origin != Origin::Public
-                && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
+            !(r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
         });
         let token = random_credential()?;
         let key = random_credential()?;
@@ -1506,7 +1505,8 @@ mod tests {
                 "expires_at": T0 + ABSOLUTE_SECS,
                 "user_agent": "ua",
                 "user": null
-            }]}).to_string(),
+            }]})
+            .to_string(),
         )
         .unwrap();
         chmod(&file, 0o600);
