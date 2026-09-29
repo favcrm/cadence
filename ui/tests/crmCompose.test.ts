@@ -5,6 +5,8 @@ import {
 } from "../src/features/app-shell/contentClient";
 import { ApiError } from "../src/lib/api";
 
+declare function require(name: string): any;
+
 export {};
 /** CAD-782: content paths bind the URL scope and bodies stay grammatical. */
 
@@ -126,8 +128,135 @@ async function main() {
   } finally {
     (globalThis as any).fetch = realFetch;
   }
+  // Every POST carries the board write guard header alongside
+  // Content-Type, and the tab session header still passes through.
+  const seen: { path: string; init: RequestInit }[] = [];
+  (globalThis as any).fetch = (input: unknown, init?: RequestInit) => {
+    seen.push({ path: String(input), init: init ?? {} });
+    return Promise.resolve({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          render: { html: "<h1>H</h1>", text: "H", revision: 1, preview_only: true },
+        }),
+    });
+  };
+  try {
+    await contentClient.render(scope, "launch-1", { sampleFirstName: "Ada" });
+    await contentClient.proposalDiscard(scope, "prop-1");
+    assert(seen.length === 2, "two guarded posts reached the wire");
+    for (const call of seen) {
+      const headers = call.init.headers as Record<string, string>;
+      equal(headers["Content-Type"], "application/json", "post keeps its content type");
+      equal(headers["X-Cadence-Board"], "1", "post carries the board write guard");
+    }
+    // A signed-in tab keeps its session header next to the guard.
+    (globalThis as any).sessionStorage = {
+      getItem: () => "tab-key",
+      setItem: () => {},
+      removeItem: () => {},
+    };
+    await contentClient.render(scope, "launch-1", {});
+    const guarded = seen[2].init.headers as Record<string, string>;
+    equal(guarded["X-Cadence-Board"], "1", "guard survives alongside a session");
+    equal(guarded["X-Cadence-Session"], "tab-key", "session header still passes through");
+    delete (globalThis as any).sessionStorage;
+  } finally {
+    (globalThis as any).fetch = realFetch;
+  }
+  // Preview stores both render forms: switching the HTML/Text tab
+  // after Preview re-selects at display instead of showing stale
+  // bytes from the tab that was active during the fetch.
+  await composeTabSwitch();
 }
 
 // The tests directory runs each compiled file directly; mirror the
 // sibling suites' shape.
 void main();
+
+async function composeTabSwitch(): Promise<void> {
+  const { Window } = require("happy-dom");
+  const win = new Window({ url: "http://localhost/" });
+  for (const name of [
+    "window",
+    "document",
+    "Node",
+    "Element",
+    "HTMLElement",
+    "HTMLInputElement",
+    "HTMLTextAreaElement",
+    "SVGElement",
+    "navigator",
+    "MutationObserver",
+    "Event",
+    "MouseEvent",
+    "KeyboardEvent",
+    "location",
+    "history",
+    "sessionStorage",
+  ]) {
+    Object.defineProperty(globalThis, name, {
+      value: name === "window" ? win : (win as any)[name],
+      configurable: true,
+      writable: true,
+    });
+  }
+  Object.defineProperty(globalThis, "crypto", {
+    value: require("crypto").webcrypto,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+  (globalThis as any).fetch = () =>
+    Promise.resolve({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          render: {
+            html: "<h1>HTML form</h1>",
+            text: "TEXT form",
+            revision: 1,
+            preview_only: true,
+          },
+        }),
+    });
+  const React = require("react") as typeof import("react");
+  const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+  const CrmCompose = require("../src/features/app-shell/CrmCompose").default as typeof import("../src/features/app-shell/CrmCompose").default;
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const flush = () =>
+    React.act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  await React.act(async () => {
+    root.render(
+      React.createElement(CrmCompose, {
+        scope: { installId: "install-a", contextId: "ctx-b" },
+        campaignId: "launch-1",
+      }),
+    );
+  });
+  await flush();
+  const button = (label: string) =>
+    Array.from(host.querySelectorAll("button")).find((el) => el.textContent === label);
+  const shown = () => host.querySelector("pre[data-preview]")?.textContent ?? "";
+  await React.act(async () => {
+    button("Preview")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  assert(shown().includes("HTML form"), "preview shows the active html form");
+  await React.act(async () => {
+    button("Text")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  assert(shown().includes("TEXT form"), "switching tab after preview shows the text form");
+  await React.act(async () => {
+    button("HTML")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  assert(shown().includes("HTML form"), "switching back shows the html form");
+  await React.act(async () => {
+    root.unmount();
+  });
+}

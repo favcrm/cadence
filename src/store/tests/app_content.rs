@@ -924,3 +924,40 @@ fn cad782_block_parse_is_exact() {
     )
     .is_ok());
 }
+
+#[test]
+fn cad782_nonempty_proposal_list_releases_the_record_lock() {
+    // Regression: proposal_list held the record-file mutex while
+    // re-entering proposal_show (which locks it again), so any
+    // nonempty list deadlocked. Run the list on a worker thread with
+    // a bounded wait: without the fix this times out instead of
+    // hanging the suite forever.
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    store
+        .app_content_propose(
+            "ctx-1",
+            "launch-1",
+            "prop-1",
+            &draft("Listed", blocks_basic()),
+        )
+        .unwrap();
+    let store = std::sync::Arc::new(store);
+    let probe = std::sync::Arc::clone(&store);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = probe.app_content_proposal_list("ctx-1", None).map(|value| {
+            value["proposals"]
+                .as_array()
+                .map(std::vec::Vec::len)
+                .unwrap_or(usize::MAX)
+        });
+        let _ = done_tx.send(out);
+    });
+    let listed = done_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("nonempty proposal list hung holding the record lock");
+    let count = listed.expect("nonempty proposal list refused");
+    assert_eq!(count, 1, "nonempty proposal list dropped its row");
+}

@@ -37,7 +37,7 @@ export default function CrmCompose({
   const [sampleName, setSampleName] = useState("");
   const [bindingId, setBindingId] = useState("");
   const [previewTab, setPreviewTab] = useState<"html" | "text">("html");
-  const [preview, setPreview] = useState("");
+  const [preview, setPreview] = useState<{ html: string; text: string }>({ html: "", text: "" });
   const [previewOnly, setPreviewOnly] = useState(true);
   const [proposal, setProposal] = useState<null | {
     proposal_id: string;
@@ -114,9 +114,10 @@ export default function CrmCompose({
                     ...(bindingId ? { bindingId } : {}),
                   }),
                 (value) => {
-                  setPreview(
-                    previewTab === "html" ? value.render.html : value.render.text,
-                  );
+                  setPreview({
+                    html: value.render.html as string,
+                    text: value.render.text as string,
+                  });
                   setRevision(value.render.revision as number);
                   setPreviewOnly(value.render.preview_only as boolean);
                 },
@@ -166,7 +167,7 @@ export default function CrmCompose({
             Text
           </button>
         </div>
-        <pre data-preview={previewTab}>{preview}</pre>
+        <pre data-preview={previewTab}>{previewTab === "html" ? preview.html : preview.text}</pre>
       </section>
 
       {proposal && (

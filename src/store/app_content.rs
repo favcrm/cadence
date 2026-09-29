@@ -1426,6 +1426,7 @@ impl RecordStore {
             }
         }
         drop(stmt);
+        drop(conn);
         let mut proposals = Vec::with_capacity(ids.len());
         for id in &ids {
             proposals.push(self.app_content_proposal_show(context, id)?["proposal"].clone());

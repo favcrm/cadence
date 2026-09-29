@@ -217,6 +217,8 @@ impl Shared {
                 | "app_content_render"
                 | "app_content_proposal_show"
                 | "app_content_proposal_list"
+                | "app_sender_binding_show"
+                | "app_sender_binding_list"
         );
         workspace::with_runtime_snapshot(&pm, install, |_, _| {
             let _release = self

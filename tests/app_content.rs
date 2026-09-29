@@ -847,3 +847,28 @@ fn cad782_content_handler_is_source_pinned_to_operator_connection() {
         "content handler grew a second gate or a bypass"
     );
 }
+
+#[test]
+fn cad782_binding_reads_are_classified_reads_not_writes() {
+    // Regression: sender binding show/list were omitted from the
+    // read-classification match, so read calls audited and woke the
+    // daemon as if they were writes. Pin the classification in
+    // source: both methods must sit in the `!matches!` read arm.
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/app_content_rpc.rs"),
+    )
+    .unwrap();
+    let arm = source
+        .split_once("let write = !matches!(")
+        .expect("write/read classification moved")
+        .1
+        .split_once(");")
+        .expect("write/read classification unclosed")
+        .0;
+    for method in ["app_sender_binding_show", "app_sender_binding_list"] {
+        assert!(
+            arm.contains(&format!("\"{method}\"")),
+            "read classification omits {method}: reads would audit/wake"
+        );
+    }
+}

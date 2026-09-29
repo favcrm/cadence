@@ -130,7 +130,7 @@ export const contentPaths = {
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const resp = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...sessionHeaders() },
+    headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
     body: JSON.stringify(body),
   });
   if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
