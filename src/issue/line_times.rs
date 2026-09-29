@@ -426,6 +426,8 @@ mod tests {
         front.claim = Some(Claim {
             by: "pm".into(),
             at: "1970-01-01T00:33:20Z".into(),
+            session: None,
+            last_seen: None,
             note: None,
             stale: None,
         });

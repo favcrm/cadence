@@ -228,7 +228,8 @@ pub fn take_over_record(by: &str, t: &TakeOver) -> (String, String) {
 pub fn json(front: &Front, now: i64) -> Value {
     match &front.claim {
         Some(c) => json!({
-            "by": c.by, "at": c.at, "note": c.note, "stale": c.stale,
+            "by": c.by, "at": c.at, "session": c.session,
+            "last_seen": c.last_seen, "note": c.note, "stale": c.stale,
             "age_secs": time::parse_iso(&c.at).map(|t| (now - t).max(0)),
         }),
         None => Value::Null,
@@ -240,6 +241,8 @@ pub fn new_claim(by: &str, note: Option<String>) -> Claim {
     Claim {
         by: by.to_string(),
         at: time::iso(time::now_epoch()),
+        session: None,
+        last_seen: None,
         note,
         stale: None,
     }
@@ -480,7 +483,7 @@ pub fn release(
 pub fn liveness_sweep(
     pm: &Pm,
     dead: &HashMap<String, (i64, String)>,
-    live: &HashSet<String>,
+    live: &HashMap<String, Option<String>>,
     grace: Duration,
     now: i64,
     actor: &str,
@@ -492,30 +495,55 @@ pub fn liveness_sweep(
         .map(|i| i.front.id.clone())
         .collect();
     if claimed.is_empty() {
-        return Ok(json!({"marked": [], "healed": []}));
+        return Ok(json!({"marked": [], "healed": [], "refreshed": []}));
     }
     let _lock = pm.lock()?;
-    let (stale, fresh): (Vec<write::Staged>, Vec<write::Staged>) =
-        write::stage(pm, &claimed, |_project, front| {
-            let Some(c) = front.claim.as_mut() else {
-                return Ok(false);
-            };
-            if let Some((since, why)) = dead.get(c.by.as_str()) {
-                if c.stale.is_none() && now - *since >= grace.as_secs() as i64 {
-                    c.stale = Some(format!("{why} since {}", time::iso(*since)));
-                    return Ok(true);
+    let mut healed_ids = HashSet::new();
+    let staged = write::stage(pm, &claimed, |_project, front| {
+        let Some(c) = front.claim.as_mut() else {
+            return Ok(false);
+        };
+        if let Some((since, why)) = dead.get(c.by.as_str()) {
+            if c.stale.is_none() && now - *since >= grace.as_secs() as i64 {
+                c.stale = Some(format!("{why} since {}", time::iso(*since)));
+                return Ok(true);
+            }
+        } else if let Some(session) = live.get(c.by.as_str()) {
+            // Bound tracker writes during a frequent checkup, while
+            // retaining fresh persisted evidence across restarts.
+            let due = c
+                .last_seen
+                .as_deref()
+                .and_then(time::parse_iso)
+                .is_none_or(|seen| now - seen >= 300);
+            if due || c.stale.is_some() || c.session != *session {
+                if c.stale.is_some() {
+                    healed_ids.insert(front.id.clone());
                 }
-            } else if c.stale.is_some() && live.contains(c.by.as_str()) {
+                c.last_seen = Some(time::iso(now));
+                c.session = session.clone();
                 c.stale = None;
                 return Ok(true);
             }
-            Ok(false)
-        })?
-        .into_iter()
-        .partition(|s| s.front.claim.as_ref().is_some_and(|c| c.stale.is_some()));
+        }
+        Ok(false)
+    })?;
+    let mut stale = Vec::new();
+    let mut healed = Vec::new();
+    let mut refreshed = Vec::new();
+    for s in staged {
+        if s.front.claim.as_ref().is_some_and(|c| c.stale.is_some()) {
+            stale.push(s);
+        } else if healed_ids.contains(&s.id) {
+            healed.push(s);
+        } else {
+            refreshed.push(s);
+        }
+    }
     let (marked, _) = write::commit_staged(pm, &stale, "claims marked stale", actor)?;
-    let (healed, _) = write::commit_staged(pm, &fresh, "claims live again", actor)?;
-    Ok(json!({"marked": marked, "healed": healed}))
+    let (healed, _) = write::commit_staged(pm, &healed, "claims live again", actor)?;
+    let (refreshed, _) = write::commit_staged(pm, &refreshed, "claims checked live", actor)?;
+    Ok(json!({"marked": marked, "healed": healed, "refreshed": refreshed}))
 }
 
 #[cfg(test)]
@@ -529,6 +557,8 @@ mod tests {
         f.claim = claim_by.map(|b| Claim {
             by: b.to_string(),
             at: "2026-09-23T00:00:00Z".to_string(),
+            session: None,
+            last_seen: None,
             note: None,
             stale: None,
         });
@@ -701,7 +731,7 @@ mod tests {
             ("w2".to_string(), (now - 60, "offline".to_string())),
         ]);
         // w2 is dead but inside the grace window — untouched.
-        let out = liveness_sweep(&pm, &dead, &HashSet::new(), STALE_GRACE, now, "daemon").unwrap();
+        let out = liveness_sweep(&pm, &dead, &HashMap::new(), STALE_GRACE, now, "daemon").unwrap();
         assert_eq!(out["marked"], json!([dead_id.clone()]));
         let stale = front_of(&pm, &dead_id).claim.unwrap().stale.unwrap();
         assert!(stale.contains("stopped"), "{stale}");
@@ -712,7 +742,7 @@ mod tests {
         assert_eq!(front_of(&pm, &dead_id).owner.as_deref(), Some("w1-lane"));
 
         // w1 resumes → its marker clears; the operator claim is unmoved.
-        let live = HashSet::from(["w1".to_string()]);
+        let live = HashMap::from([("w1".to_string(), None)]);
         let out = liveness_sweep(&pm, &dead, &live, STALE_GRACE, now, "daemon").unwrap();
         // w1 is in both maps this pass — dead wins, nothing heals while
         // the registry still says stopped.
@@ -720,6 +750,59 @@ mod tests {
         let out = liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
         assert_eq!(out["healed"], json!([dead_id.clone()]));
         assert!(front_of(&pm, &dead_id).claim.unwrap().stale.is_none());
+    }
+
+    #[test]
+    fn live_check_persists_claim_session_and_last_seen() {
+        let (tmp, pm) = tracker();
+        let id = issue(&pm, tmp.path(), "live evidence", None);
+        claim(&pm, &id, Some("w1"), None, None, "t").unwrap();
+        let now = time::now_epoch();
+        let live = HashMap::from([("w1".to_string(), Some("session-1".to_string()))]);
+        liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
+        let persisted = front_of(&pm, &id);
+        assert_eq!(json(&persisted, now)["last_seen"], json!(time::iso(now)));
+        assert_eq!(json(&persisted, now)["session"], json!("session-1"));
+        assert!(persisted.claim.unwrap().stale.is_none());
+
+        // A same-session check inside the write interval makes no new
+        // evidence commit; crossing it refreshes the persisted time.
+        let out =
+            liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now + 60, "daemon").unwrap();
+        assert_eq!(out["healed"], json!([]));
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 60)["last_seen"],
+            json!(time::iso(now))
+        );
+        liveness_sweep(
+            &pm,
+            &HashMap::new(),
+            &live,
+            STALE_GRACE,
+            now + 301,
+            "daemon",
+        )
+        .unwrap();
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 301)["last_seen"],
+            json!(time::iso(now + 301))
+        );
+
+        // A replacement session is recorded even before the interval.
+        let replacement = HashMap::from([("w1".to_string(), Some("session-2".to_string()))]);
+        liveness_sweep(
+            &pm,
+            &HashMap::new(),
+            &replacement,
+            STALE_GRACE,
+            now + 302,
+            "daemon",
+        )
+        .unwrap();
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 302)["session"],
+            json!("session-2")
+        );
     }
 
     /// CAD-755: the whole check chain — a stale-claimed doing issue is
@@ -734,7 +817,7 @@ mod tests {
         assert!(claim(&pm, &id, Some("pm-b"), None, None, "t").is_err());
         let now = time::now_epoch();
         let dead = HashMap::from([("pm-a".to_string(), (now - 3600, "stopped".to_string()))]);
-        liveness_sweep(&pm, &dead, &HashSet::new(), STALE_GRACE, now, "daemon").unwrap();
+        liveness_sweep(&pm, &dead, &HashMap::new(), STALE_GRACE, now, "daemon").unwrap();
         let out = claim(&pm, &id, Some("pm-b"), None, None, "t").unwrap();
         assert_eq!(out["take_over"]["from"].as_str().unwrap(), "pm-a", "{out}");
         assert!(out["take_over"]["reason"]

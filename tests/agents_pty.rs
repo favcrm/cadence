@@ -1922,6 +1922,19 @@ fn agent_list_scopes_to_callers_group() {
     // Worker inside a pane: sees its group — root + itself.
     let v = list(Some("w1"), &[]);
     assert_eq!(aliases(&v), vec!["pm1", "w1"], "{v}");
+    let visible_live = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| {
+            a["dead"] != true
+                && !matches!(
+                    a["state"].as_str(),
+                    Some("stopping" | "stopped" | "attention" | "offline")
+                )
+        })
+        .count();
+    assert_eq!(v["live"], visible_live, "scoped count must match rows: {v}");
     let root = v["agents"]
         .as_array()
         .unwrap()

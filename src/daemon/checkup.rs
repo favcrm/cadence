@@ -27,7 +27,7 @@
 //! action ([`super::next_action`]): a fix turn, a review routing, one
 //! safe ready-ticket dispatch, or a Needs-you row.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -408,7 +408,7 @@ impl Shared {
             return Ok(());
         }
         let mut dead: HashMap<String, (i64, String)> = HashMap::new();
-        let mut live: HashSet<String> = HashSet::new();
+        let mut live: HashMap<String, Option<String>> = HashMap::new();
         for a in agents {
             let gone = matches!(
                 a.state.as_str(),
@@ -423,7 +423,7 @@ impl Shared {
                 };
                 dead.insert(a.alias.clone(), (a.updated as i64, why));
             } else {
-                live.insert(a.alias.clone());
+                live.insert(a.alias.clone(), a.session_id.clone());
             }
         }
         let pm = issue::Pm::at(pm_dir)?;

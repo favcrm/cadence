@@ -80,6 +80,14 @@ pub struct Claim {
     pub by: String,
     /// RFC 3339 UTC — the claim age is measured from here.
     pub at: String,
+    /// The current agent session observed by the daemon, when the
+    /// claimant is a registered agent. Human claims leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Last persisted agent-liveness observation. This is separate from
+    /// `at`, so renewing a claim never hides how long work has been held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// CAD-755: daemon-written staleness marker — why the holder's agent
