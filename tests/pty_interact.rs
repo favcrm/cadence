@@ -2568,13 +2568,23 @@ fn pty_devin_render_miss_records_reprobe_evidence() {
 /// The wedge here is a tmux mode: the gate probe refuses on
 /// `pane_in_mode` while the screen sample still reads idle — exactly
 /// the split verdict that makes a queued-on-idle wait undetectable
-/// without the watchdog.
+/// without the watchdog. The queue-age comparison reads the stall
+/// clock: the 600s budget is crossed by an offset jump on a 50ms tick
+/// instead of a wall wait — an under-budget jump first proves elapsed
+/// clock alone still gates.
 #[test]
 fn pty_delivery_stalled_fires_once_and_clears() {
-    let d = TestDaemon::start();
+    let offset = stall_clock_offset();
+    let mut opts = daemon_opts();
+    opts.stall_clock_offset = std::sync::Arc::clone(&offset);
+    opts.stall_tick = Some(Duration::from_millis(50));
+    let d = TestDaemon::start_opts(opts);
     let mock = d.mock_devin();
     stall_sample(1);
-    d.register_devin_opts("dv", json!({"delivery_watch_secs": 2}));
+    d.register_devin_opts(
+        "dv",
+        json!({"delivery_watch_secs": 600, "stall_secs": 0, "silent_end_secs": 0}),
+    );
     d.wait_agent("dv", "idle", 20);
     atomic_write(d.pane_file(&mock, "dv", "mode"), "1");
     d.rpc(
@@ -2590,9 +2600,24 @@ fn pty_delivery_stalled_fires_once_and_clears() {
             .contains("tmux mode"),
         "{wait}"
     );
-    let ev = d.wait_event("dv", "delivery_stalled", 30);
+    let captures = d.pane_file(&mock, "dv", "captures");
+    // Time alone must not fire: half the budget across two observed
+    // captures still yields zero delivery_stalled events.
+    offset.store(300, std::sync::atomic::Ordering::SeqCst);
+    let from = std::fs::read_to_string(&captures).unwrap_or_default().len();
+    wait_capture_advance(&captures, from, 2, 15);
+    assert!(
+        d.events("dv")
+            .iter()
+            .all(|e| e["kind"] != "delivery_stalled"),
+        "fired under budget: {:?}",
+        d.events("dv")
+    );
+    // Past the budget the edge fires on hot ticks, no wall wait.
+    offset.store(1200, std::sync::atomic::Ordering::SeqCst);
+    let ev = d.wait_event("dv", "delivery_stalled", 10);
     assert_eq!(ev["payload"]["message"], "m1", "{ev}");
-    assert_eq!(ev["payload"]["bound_secs"], 2, "{ev}");
+    assert_eq!(ev["payload"]["bound_secs"], 600, "{ev}");
     assert_eq!(ev["payload"]["probe"]["idle"], true, "{ev}");
     let agent = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
     assert_eq!(agent["delivery_stalled"]["message"], "m1", "{agent}");
@@ -2612,9 +2637,10 @@ fn pty_delivery_stalled_fires_once_and_clears() {
         title.contains("dv") && title.contains("m1") && title.contains("idle"),
         "{row}"
     );
-    // Once per head: three more observed idle samples re-fire nothing.
-    // Bound to ticker iterations, not wall time.
-    let captures = d.pane_file(&mock, "dv", "captures");
+    // Once per head: an hour more on the clock and three more observed
+    // idle samples re-fire nothing. Bound to ticker iterations, not
+    // wall time.
+    offset.store(1200 + 3600, std::sync::atomic::Ordering::SeqCst);
     let from = std::fs::read_to_string(&captures).unwrap_or_default().len();
     wait_capture_advance(&captures, from, 3, 15);
     assert_eq!(
