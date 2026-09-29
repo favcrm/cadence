@@ -89,6 +89,8 @@ test("publish preview gates post-now/schedule on exact approval and covers all d
     assert.match(host.textContent, /binding digest/);
     assert.match(host.textContent, /idempotency key/);
     assert.match(host.textContent, /HK\$12/);
+    assert.match(host.textContent, /1–10 uses/);
+    assert.match(host.textContent, /refusal code, not a state/);
     assert.match(host.textContent, /Fixtures only/);
     // No live-send affordance: every enabled send-flavoured button is a
     // simulation; disabled gallery buttons are labelled fixture-only.

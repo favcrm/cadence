@@ -159,6 +159,11 @@ export default function PublishPreview({ readonly = false }) {
               ]}
             />
             <p className="muted">{publishCost.authorityNote}</p>
+            <p className="muted">
+              Landed contract: send grants allow 1–10 uses · dispatch stays
+              closed (send_disabled is a refusal code, not a state) · binding
+              pins digest-form, caption re-resolves at dispatch.
+            </p>
           </div>
 
           <div className="card pad">
