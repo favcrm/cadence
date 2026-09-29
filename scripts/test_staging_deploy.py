@@ -35,6 +35,7 @@ class FakeRunner:
         # Substring of the cadence binary path whose `sandbox up` fails.
         self.fail_up_for = None
         self.seed_rc = 0
+        self.reset_rc = 0
         self.pm_dir = self.base / "sandbox" / "staging" / "pm"
         self.state_dir = self.base / "sandbox" / "staging" / "state"
 
@@ -64,6 +65,8 @@ class FakeRunner:
             }))
             return 0, "{}", ""
         if "sandbox reset" in joined:
+            if self.reset_rc:
+                return self.reset_rc, "", "reset: marker unreadable"
             return 0, "{}", ""
         if "sandbox down" in joined:
             return 0, "{}", ""
@@ -266,6 +269,18 @@ class TickTest(unittest.TestCase):
         self.assertIn("staging sandbox reset", status["last_error"])
         self.assertEqual(status["failed_release"], REL_A)
         self.assertIsNone(status["deployed_sha"])
+
+    def test_seed_failure_reset_failure_needs_manual_repair(self):
+        r = FakeRunner(self.base)
+        r.seed_rc = 1
+        r.reset_rc = 2
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 1)
+        self.assertTrue(r.argvs("sandbox reset staging"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertIn("sandbox reset ALSO failed (2)", status["last_error"])
+        self.assertIn("manual repair needed", status["last_error"])
+        self.assertEqual(status["failed_release"], REL_A)
 
     def test_no_reset_once_seeded(self):
         (self.base / "seeded").touch()

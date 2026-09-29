@@ -362,7 +362,15 @@ def _tick_locked(run, http_get, base, run_id):
             # A partial seed leaves projects in the tracker and the seed
             # then refuses every retry — reset the sandbox (never when
             # the seeded marker exists) so the next tick starts clean.
-            run([cadence, "sandbox", "reset", NAME], env=child_env())
+            # A failed reset means the tracker is in an unknown state.
+            rc, _, reset_err = run(
+                [cadence, "sandbox", "reset", NAME], env=child_env()
+            )
+            if rc != 0:
+                raise Refused(
+                    f"seed failed ({e}); sandbox reset ALSO failed ({rc}): "
+                    f"{reset_err.strip()[:300]} — manual repair needed"
+                )
             raise Refused(f"seed failed ({e}); staging sandbox reset")
         tailnet_state = tailnet(run, cadence, sandbox_env(run, cadence))
         # Non-fatal reachability probe through the tailnet URL itself.
