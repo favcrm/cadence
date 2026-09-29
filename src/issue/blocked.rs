@@ -23,8 +23,10 @@
 //! response JSON — never silent either way.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::client;
 use crate::error::{Error, Result};
@@ -42,6 +44,10 @@ pub const PARK_TAG: &str = "blocked-park";
 /// before it parks itself — the claim age is the renewal clock; a lane
 /// that keeps re-claiming keeps its seat.
 pub const PARK_GRACE_SECS: i64 = 24 * 3600;
+
+/// A sweep may attempt both holder and owner notices while it holds one
+/// issue's PM lock. Bound either send well below the writer's 15s wait.
+const NOTICE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Statuses a blocker must reach to count as closed — the same pair
 /// readiness and the dispatch path use.
@@ -85,11 +91,21 @@ pub fn check_ready(pm_dir: &Path, front: &Front) -> Result<()> {
 /// One control-free needs-you line to an agent alias — best-effort, the
 /// outcome is returned as data. `key` is the `agent_send` idempotency
 /// key: deterministic per edge so a retried sweep never double-sends.
+fn notice_id(key: &str, to: &str) -> String {
+    // Message IDs are global, not scoped to a recipient. Hash the edge
+    // and alias to keep retries stable and stay under the 64-char limit
+    // even when a blocker set contains many issue IDs.
+    let hash = format!("{:x}", Sha256::digest(format!("{key}\n{to}")));
+    format!("issue-notice-{}", &hash[..40])
+}
+
 fn send_to(state_dir: &Path, to: &str, text: &str, key: &str) -> Value {
-    match client::rpc(
+    let id = notice_id(key, to);
+    match client::rpc_timeout(
         state_dir,
         "agent_send",
-        json!({"alias": to, "text": text, "message": key}),
+        json!({"alias": to, "text": text, "message": id}),
+        NOTICE_RPC_TIMEOUT,
     ) {
         Ok(r) => json!({"to": to, "sent": true, "duplicate": r["duplicate"].as_bool()}),
         Err(e) => json!({"to": to, "sent": false, "error": e.to_string()}),
@@ -150,7 +166,9 @@ fn claim_age_secs(front: &Front, now: i64) -> Option<i64> {
         .map(|at| now - at)
 }
 
-/// One parked/unblocked write: mutate the front, then
+/// One parked/unblocked write. The caller holds the PM lock across the
+/// fresh per-issue snapshot and its transition, so the eligibility decision
+/// cannot go stale between reading and committing. Mutate the front, then
 /// [`commit_front_with_comment`] makes the transition a comment-bearing
 /// commit (and rolls both back when the commit refuses).
 #[allow(clippy::too_many_arguments)]
@@ -167,7 +185,6 @@ fn write_transition(
     if dry_run {
         return Ok(());
     }
-    let _lock = pm.lock()?;
     let (_project, dir) = issue_dir(pm, id)?;
     let (mut front, body) = load_front(&dir)?;
     let prev = front.clone();
@@ -194,13 +211,57 @@ pub fn sweep(
     state_dir: Option<&Path>,
     actor: &str,
 ) -> Result<Value> {
+    sweep_with_hooks(
+        pm,
+        grace_secs,
+        dry_run,
+        state_dir,
+        actor,
+        (None, || {}, || {}),
+    )
+}
+
+fn sweep_with_hooks(
+    pm: &Pm,
+    grace_secs: i64,
+    dry_run: bool,
+    state_dir: Option<&Path>,
+    actor: &str,
+    test_seam: (Option<board::JobOutcomes>, impl FnOnce(), impl FnMut()),
+) -> Result<Value> {
+    let (jobs_override, before_locked_snapshot, mut after_locked_snapshot) = test_seam;
+    // Candidate enumeration is advisory. Every candidate is reloaded
+    // and rechecked while its own PM lock is held, immediately before
+    // the transition. A new candidate can wait for the next sweep.
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
+    let jobs = jobs_override
+        .unwrap_or_else(|| state_dir.map(board::fetch_job_outcomes).unwrap_or_default());
     let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let candidates: Vec<String> = views
+        .iter()
+        .filter(|v| {
+            v.issue.front.tags.iter().any(|t| t == PARK_TAG)
+                || (v.blocked && matches!(v.status.as_str(), "doing" | "review") && !v.container)
+        })
+        .map(|v| v.issue.front.id.clone())
+        .collect();
+    // Test seam: a competing writer can change a candidate after the
+    // advisory snapshot but before its locked eligibility check.
+    before_locked_snapshot();
     let now = time::now_epoch();
     let mut parked: Vec<Value> = Vec::new();
     let mut unblocked: Vec<Value> = Vec::new();
-    for v in &views {
+    for id in candidates {
+        let _lock = pm.lock()?;
+        let current = board::views_with_jobs(
+            &pm.config.notes_dir(),
+            board::load_all(&pm.dir, None)?,
+            &jobs,
+        );
+        let Some(v) = current.into_iter().find(|v| v.issue.front.id == id) else {
+            continue;
+        };
+        after_locked_snapshot();
         let front = &v.issue.front;
         if front.tags.iter().any(|t| t == PARK_TAG) && !v.blocked {
             // Last blocker closed — tell the last claimer it can resume,
@@ -268,6 +329,11 @@ pub fn sweep(
             continue;
         }
         let open = open_blockers(&pm.dir, front);
+        if open.is_empty() {
+            // `View::blocked` also includes a blocked job outcome; only
+            // open `blocked_by` edges justify parking this issue.
+            continue;
+        }
         write_transition(
             pm,
             &front.id,
@@ -308,6 +374,38 @@ mod tests {
     use super::*;
     use crate::issue::model::Claim;
     use crate::issue::write::{load_front, new_issue, project_add, save_front, set_fields};
+
+    #[test]
+    fn notice_ids_are_unique_per_recipient_and_bounded() {
+        let key = format!("blocked-CAD-757-{}", "CAD-1000-".repeat(20));
+        let holder = notice_id(&key, "holder");
+        let owner = notice_id(&key, "owner");
+        assert_ne!(holder, owner, "the message store has a global ID namespace");
+        assert_eq!(holder, notice_id(&key, "holder"), "retry must dedupe");
+        assert!(holder.len() <= 64);
+        assert!(crate::proto::identifier(&holder, "message").is_ok());
+    }
+
+    #[test]
+    fn notice_to_unresponsive_daemon_times_out_before_pm_lock_wait() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("cadence.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let start = Instant::now();
+        let out = send_to(dir.path(), "holder", "needs you", "blocked-CAD-757-CAD-758");
+        assert_eq!(out["sent"], false, "{out}");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "notice RPC held the lock too long: {out}"
+        );
+        server.join().unwrap();
+    }
 
     fn tracker() -> (tempfile::TempDir, Pm) {
         let dir = tempfile::tempdir().unwrap();
@@ -496,6 +594,148 @@ mod tests {
             f.claim = Some(claim_at("w1", 3600));
         });
         let out = sweep(&pm, PARK_GRACE_SECS, false, None, "t").unwrap();
+        assert!(out["parked"].as_array().unwrap().is_empty(), "{out}");
+        assert_eq!(status(&pm, &a), "doing");
+    }
+
+    #[test]
+    fn sweep_respects_claim_renewal_racing_its_snapshot() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        edit(&pm, &a, |f| {
+            f.status = "doing".to_string();
+            f.blocked_by = vec![b];
+            f.claim = Some(claim_at("w1", 48 * 3600));
+        });
+        let out = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let writer_pm = &pm;
+            let writer_id = &a;
+            let writer = scope.spawn(move || {
+                rx.recv().unwrap();
+                let _writer = writer_pm.lock().unwrap();
+                edit(writer_pm, writer_id, |f| f.claim = Some(claim_at("w1", 0)));
+            });
+            sweep_with_hooks(
+                &pm,
+                PARK_GRACE_SECS,
+                false,
+                None,
+                "t",
+                (
+                    None,
+                    || {
+                        tx.send(()).unwrap();
+                        writer.join().unwrap();
+                    },
+                    || {},
+                ),
+            )
+            .unwrap()
+        });
+        assert!(out["parked"].as_array().unwrap().is_empty(), "{out}");
+        assert_eq!(status(&pm, &a), "doing");
+    }
+
+    #[test]
+    fn sweep_respects_reopened_blocker_racing_its_snapshot() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        edit(&pm, &a, |f| {
+            f.status = "backlog".to_string();
+            f.blocked_by = vec![b.clone()];
+            f.tags = vec![PARK_TAG.to_string()];
+            f.claim = Some(claim_at("w1", 48 * 3600));
+        });
+        edit(&pm, &b, |f| f.status = "done".to_string());
+        let out = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let writer_pm = &pm;
+            let writer_id = &b;
+            let writer = scope.spawn(move || {
+                rx.recv().unwrap();
+                let _writer = writer_pm.lock().unwrap();
+                edit(writer_pm, writer_id, |f| f.status = "backlog".to_string());
+            });
+            sweep_with_hooks(
+                &pm,
+                PARK_GRACE_SECS,
+                false,
+                None,
+                "t",
+                (
+                    None,
+                    || {
+                        tx.send(()).unwrap();
+                        writer.join().unwrap();
+                    },
+                    || {},
+                ),
+            )
+            .unwrap()
+        });
+        assert!(out["unblocked"].as_array().unwrap().is_empty(), "{out}");
+        let (_p, dir) = issue_dir(&pm, &a).unwrap();
+        assert!(load_front(&dir)
+            .unwrap()
+            .0
+            .tags
+            .iter()
+            .any(|t| t == PARK_TAG));
+    }
+
+    #[test]
+    fn sweep_holds_pm_lock_at_eligibility_snapshot() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        edit(&pm, &a, |f| {
+            f.status = "doing".to_string();
+            f.blocked_by = vec![b];
+            f.claim = Some(claim_at("w1", 48 * 3600));
+        });
+        sweep_with_hooks(
+            &pm,
+            PARK_GRACE_SECS,
+            true,
+            None,
+            "t",
+            (
+                None,
+                || {},
+                || {
+                    assert!(
+                        pm.try_lock().unwrap().is_none(),
+                        "snapshot must be protected by the same lock as transitions"
+                    );
+                },
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sweep_does_not_park_a_job_blocked_issue_without_dependencies() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        edit(&pm, &a, |f| {
+            f.status = "doing".to_string();
+            f.claim = Some(claim_at("w1", 48 * 3600));
+        });
+        let jobs = [(a.clone(), board::JobOutcome::Blocked)]
+            .into_iter()
+            .collect();
+        let out = sweep_with_hooks(
+            &pm,
+            PARK_GRACE_SECS,
+            false,
+            None,
+            "t",
+            (Some(jobs), || {}, || {}),
+        )
+        .unwrap();
         assert!(out["parked"].as_array().unwrap().is_empty(), "{out}");
         assert_eq!(status(&pm, &a), "doing");
     }
