@@ -797,6 +797,7 @@ fn cad771_browser_board_serves_social_content_app_surface() {
         .unwrap()
         .port();
     let (state, pm) = (h.daemon.state.clone(), h.root.path().join("pm"));
+    let serve_dist = dist.clone();
     thread::spawn(move || {
         let _ = cadence_agent::ui::serve(
             &state,
@@ -804,7 +805,7 @@ fn cad771_browser_board_serves_social_content_app_surface() {
             &cadence_agent::ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
-                dist: Some(dist),
+                dist: Some(serve_dist),
                 ..Default::default()
             },
         );
@@ -829,8 +830,26 @@ fn cad771_browser_board_serves_social_content_app_surface() {
         body.contains("<!doctype html>") || body.contains("<html"),
         "board serves the SPA shell"
     );
-    // Client-side app routes serve the same shell (deep links work).
+    // The served bundle is the real build and carries the workspace-app
+    // surface the Social Content install renders through: the
+    // `/app-installations/` route marker is a network contract the
+    // minifier cannot rename.
+    let bundle = std::fs::read_dir(dist.join("assets"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        bundle.contains("/app-installations/"),
+        "built bundle carries the workspace-app routes"
+    );
+    // Client-side app routes serve the same shell (deep links work),
+    // including the workspace-app screen for this exact install.
     let (status, _) = common::board_get(port, "/apps");
+    assert_eq!(status, 200);
+    let (status, _) = common::board_get(port, &format!("/app-installations/{install_id}"));
     assert_eq!(status, 200);
     // The data the Apps screen renders is present: the approved
     // Social Content installation with its publication workflows.
@@ -855,6 +874,74 @@ fn cad771_browser_board_serves_social_content_app_surface() {
         workflows.contains(&"instagram") && workflows.contains(&"facebook"),
         "{workflows:?}"
     );
+    // Real-browser proof where a browser exists (CI runners ship one):
+    // the bundle executes against this board and renders client-side
+    // chrome ("Sign in" appears only after JS runs — the static shell
+    // carries no text). Where no browser exists the HTTP proofs above
+    // stand; nothing is asserted from a placeholder.
+    if let Some(chrome) = find_chrome() {
+        use std::os::unix::process::CommandExt;
+        let dom_path = h.root.path().join("cad771-browser-dom.html");
+        let error_path = h.root.path().join("cad771-browser-stderr.txt");
+        let mut browser = std::process::Command::new(chrome)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--timeout=20000",
+                "--dump-dom",
+                &format!("http://127.0.0.1:{port}/"),
+            ])
+            .stdout(std::fs::File::create(&dom_path).unwrap())
+            .stderr(std::fs::File::create(&error_path).unwrap())
+            .process_group(0)
+            .spawn()
+            .expect("headless browser failed to start");
+        let browser_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = browser.try_wait().expect("headless browser wait failed") {
+                break status;
+            }
+            if std::time::Instant::now() >= browser_deadline {
+                // The browser's children inherit this dedicated process group.
+                // Reap the whole tree before failing, so one hung render cannot
+                // strand the test worker or a later run.
+                unsafe { libc::killpg(browser.id() as i32, libc::SIGKILL) };
+                let _ = browser.wait();
+                panic!("headless browser timed out after 30 seconds");
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            status.success(),
+            "headless browser exited {status}: {}",
+            std::fs::read_to_string(&error_path).unwrap_or_default()
+        );
+        let dom = std::fs::read_to_string(&dom_path).expect("headless browser DOM missing");
+        // Client-rendered board chrome: nav labels and the read-only
+        // session chip appear only after the bundle executes against
+        // this board (the static shell carries no text).
+        for marker in ["Projects", "Agents", "Read-only"] {
+            assert!(
+                dom.contains(marker),
+                "real browser renders the board chrome"
+            );
+        }
+    }
+}
+
+/// A real browser binary when one is installed; none is ever synthesized.
+fn find_chrome() -> Option<String> {
+    ["google-chrome", "chromium", "chromium-browser"]
+        .into_iter()
+        .find(|binary| {
+            std::process::Command::new(binary)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .map(str::to_owned)
 }
 
 #[test]

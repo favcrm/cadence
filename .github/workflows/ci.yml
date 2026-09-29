@@ -301,6 +301,13 @@ jobs:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
         run: scripts/cadence-nextest --test test_seam --locked
+      # CAD-771: board-surface Rust tests serve the real SPA build
+      # through `ui/dist`. The ui job cannot hand files to this job
+      # without artifact transfer, so build here before nextest (non-docs).
+      - name: Build SPA for board-surface Rust tests
+        if: steps.scope.outputs.mode != 'docs'
+        run: pnpm build
+        working-directory: ui
       - name: Run recorded Rust scope with pinned nextest
         if: steps.scope.outputs.mode != 'docs'
         id: nextest
