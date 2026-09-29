@@ -129,6 +129,94 @@ async function contentGrammar() {
   } catch (error) {
     assert(error instanceof ApiError, "bad campaign id refuses typed");
   }
+
+  // CAD-813: the mint path — request receipt parsing, identifier-safe
+  // request ids, and the scoped-message picker that decides what
+  // `message_id` may be named.
+  const stamped = grammar.parseProposalRequest({
+    request: {
+      request_id: "req-1", install_id: "install-crm", context_id: "ctx-a",
+      campaign_id: "launch-1", source_revision: 3, message_id: "chat-9",
+      state: "open", used_by: null, created: 1759286400, decided: null,
+    },
+  });
+  equal(stamped.campaignId, "launch-1", "mint receipt carries the stamped campaign");
+  equal(stamped.sourceRevision, 3, "mint receipt carries the stamped source revision");
+  equal(stamped.state, "open", "mint receipt carries its state");
+  let refusedReceipt = false;
+  try {
+    grammar.parseProposalRequest({ request: { request_id: "req-1" } });
+  } catch (error) {
+    assert(error instanceof ApiError, "a malformed request receipt refuses typed");
+    refusedReceipt = true;
+  }
+  assert(refusedReceipt, "a malformed request receipt reached the model");
+  const reqId = grammar.newRequestId();
+  assert(/^req-[0-9a-f]{24}$/.test(reqId), `request id is identifier-safe: ${reqId}`);
+  assert(grammar.newRequestId() !== reqId, "request ids are fresh");
+
+  // The mint body over the wire is exactly {campaign_id, message_id,
+  // request_id}: a forged field on the input refuses client-side.
+  const wireBodies: any[] = [];
+  const realFetch2 = (globalThis as any).fetch;
+  (globalThis as any).fetch = async (_input: unknown, init?: RequestInit) => {
+    wireBodies.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ request: {
+      request_id: "req-w", install_id: "install-crm", context_id: "ctx-a",
+      campaign_id: "launch-1", source_revision: 1, message_id: "chat-9",
+      state: "open", used_by: null, created: 1, decided: null,
+    } }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    await contentClient.proposalRequest(scope, {
+      campaignId: "launch-1", messageId: "chat-9", requestId: "req-w",
+    });
+    equal(
+      Object.keys(wireBodies[0]).sort(),
+      ["campaign_id", "message_id", "request_id"],
+      "the mint body is exactly the three ids — no token/receipt/turn/source_revision",
+    );
+    let forged = false;
+    try {
+      await (contentClient as any).proposalRequest(scope, {
+        campaignId: "launch-1", messageId: "chat-9", requestId: "req-w2",
+        source_revision: 7, token: "t", assistant_receipt: {}, turn_id: "t",
+      });
+    } catch (error) {
+      assert(error instanceof ApiError, "a forged mint field refuses typed");
+      forged = true;
+    }
+    assert(forged, "a forged mint field reached the network");
+    assert(wireBodies.length === 1, "the forged mint never reached fetch");
+  } finally {
+    (globalThis as any).fetch = realFetch2;
+  }
+
+  // The proposal render rule: verified badge needs actor==assistant
+  // AND a parsed receipt; anything else is operator-submitted.
+  const receipted = grammar.parseProposal({ proposal: {
+    proposal_id: "prop-a", campaign_id: "launch-1", source_revision: 1,
+    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    assistant_receipt: {
+      message_id: "m-scoped", agent: "crm-writer", request_id: "req-1",
+      install_id: "install-crm", context_id: "ctx-a", campaign_id: "launch-1",
+      source_revision: 1,
+    },
+  } });
+  equal(receipted.assistantReceipt?.agent, "crm-writer", "receipt parses its agent");
+  equal(receipted.assistantReceipt?.requestId, "req-1", "receipt parses its request id");
+  const noReceipt = grammar.parseProposal({ proposal: {
+    proposal_id: "prop-o", campaign_id: "launch-1", source_revision: 1,
+    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    assistant_receipt: null,
+  } });
+  equal(noReceipt.assistantReceipt, null, "a null receipt stays null — never assistant-badged");
+  const malformedReceipt = grammar.parseProposal({ proposal: {
+    proposal_id: "prop-m", campaign_id: "launch-1", source_revision: 1,
+    subject: "S", state: "pending", actor: "assistant", origin: "assistant-receipt",
+    assistant_receipt: { agent: "crm-writer" },
+  } });
+  equal(malformedReceipt.assistantReceipt, null, "a malformed receipt drops to no-provenance");
 }
 
 async function mountedFlow() {
@@ -158,6 +246,54 @@ async function mountedFlow() {
     if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
     return originalRequire.apply(this, arguments);
   };
+
+  // CAD-813: `latestScopedChatMessage` picks only the newest operator
+  // entry whose daemon stamp names exactly this scope — pending sends,
+  // foreign scopes and unverified payloads never qualify.
+  {
+    const { latestScopedChatMessage } = require("../src/features/app-shell/AppShell") as typeof import(
+      "../src/features/app-shell/AppShell"
+    );
+    const verifiedPayload = {
+      app: { install_id: "install-crm", context_id: "ctx-a", verified: true, context_revision: 1, context_digest: "ca" },
+    };
+    const foreignPayload = {
+      app: { install_id: "install-crm", context_id: "other-ctx", verified: true, context_revision: 1, context_digest: "x" },
+    };
+    const entries = [
+      { seq: 1, role: "operator", kind: "message", text: "a", message: "m-plain", payload: null },
+      { seq: 2, role: "operator", kind: "message", text: "b", message: "m-foreign", payload: foreignPayload },
+      { seq: 3, role: "operator", kind: "message", text: "c", message: "m-scoped", payload: verifiedPayload },
+      { seq: 4, role: "agent", kind: "turn_result", text: "d", message: "m-agent", payload: verifiedPayload },
+    ];
+    equal(
+      latestScopedChatMessage({ entries }, { installId: "install-crm", contextId: "ctx-a" }),
+      "m-scoped",
+      "the newest verified-scoped operator message is picked",
+    );
+    equal(
+      latestScopedChatMessage({ entries }, { installId: "install-crm", contextId: "other-ctx" }),
+      "m-foreign",
+      "a message scoped to another context mints there, not here",
+    );
+    equal(
+      latestScopedChatMessage({ entries }, { installId: "install-crm", contextId: "missing" }),
+      null,
+      "no scoped message means no mintable id",
+    );
+    equal(
+      latestScopedChatMessage({ entries }, { installId: "install-crm", contextId: "" }),
+      null,
+      "an empty context never mints",
+    );
+    const unverified = [{ seq: 1, role: "operator", kind: "message", text: "x", message: "m-un", payload: { app: { install_id: "install-crm", context_id: "ctx-a", verified: false } } }];
+    equal(
+      latestScopedChatMessage({ entries: unverified }, { installId: "install-crm", contextId: "ctx-a" }),
+      null,
+      "an unverified app stamp never mints",
+    );
+  }
+
   const React = require("react") as typeof import("react");
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
   const AppShell = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
@@ -176,8 +312,58 @@ async function mountedFlow() {
     },
   };
   const proposals: Record<string, any> = {};
+  const proposalRequests: Record<string, any> = {};
+  const mintBodies: any[] = [];
+  const applyBodies: any[] = [];
+  const sendBodies: any[] = [];
   let propSeq = 0;
+  // The assistant's turn lands later than the mint: `redeem` plays the
+  // daemon-side redemption (the socket-only verb a browser can never
+  // reach) so the list starts answering with a receipted proposal.
+  const redeem = (requestId: string) => {
+    const request = proposalRequests[requestId];
+    assert(request && request.state === "open", `redeem needs an open request: ${requestId}`);
+    propSeq += 1;
+    const id = `prop-asst-${propSeq}`;
+    proposals[id] = {
+      proposal_id: id, install_id: "install-crm", context_id: "ctx-a",
+      campaign_id: request.campaign_id, source_revision: request.source_revision,
+      subject: "Assistant draft subject", preheader: "From the chat turn",
+      blocks: [{ type: "paragraph", text: "Assistant copy {{first_name|Friend}}" }],
+      content_digest: `proposal-digest-asst-${propSeq}`, actor: "assistant",
+      origin: "assistant-receipt",
+      assistant_receipt: {
+        message_id: request.message_id, agent: "crm-writer", request_id: request.request_id,
+        install_id: "install-crm", context_id: "ctx-a",
+        campaign_id: request.campaign_id, source_revision: request.source_revision,
+      },
+      state: "pending", created: 1759286400, decided: null,
+    };
+    request.state = "used";
+    request.used_by = id;
+    return proposals[id];
+  };
   const suppressions: { kind: string; key: string; reason: string }[] = [];
+  const threadEntries: any[] = [];
+  let threadSeq = 0;
+  // What the daemon would append for an accepted scoped thread_send:
+  // the verified App stamp is host-derived, the browser's `app` body
+  // value is only the hint it proves against the store.
+  const stampEntry = (body: any) => {
+    threadSeq += 1;
+    const entry = {
+      seq: threadSeq, role: "operator", kind: "message", text: body.text,
+      message: body.message, created: "2026-09-29T00:00:00Z",
+      payload: body.app
+        ? { app: {
+            install_id: body.app.install_id, context_id: body.app.context_id,
+            verified: true, context_revision: 1, context_digest: "ca",
+          } }
+        : null,
+    };
+    threadEntries.push(entry);
+    return entry;
+  };
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   const refused = (message: string, status = 409) => json({ error: message }, status);
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
@@ -243,6 +429,33 @@ async function mountedFlow() {
         payload_digest: "payload-digest-1",
       } });
     }
+    // CAD-813: the one-time proposal-request mint — the body names
+    // only campaign/message/request ids; the host stamps the source
+    // revision and binds the chat message's verified scope.
+    if (method === "POST" && url.pathname.endsWith("/content/proposal-requests")) {
+      const body = JSON.parse(String(init!.body));
+      mintBodies.push(body);
+      const entry = threadEntries.find((row) => row.message === body.message_id);
+      const bound = entry?.payload?.app;
+      if (!entry || bound?.install_id !== "install-crm" || bound?.context_id !== "ctx-a") {
+        return refused("proposal request scope does not match its verified chat message", 409);
+      }
+      const request = proposalRequests[body.request_id];
+      if (request) {
+        if (request.campaign_id === body.campaign_id && request.message_id === body.message_id) {
+          return json({ request });
+        }
+        return refused("email proposal request ID is already used", 409);
+      }
+      proposalRequests[body.request_id] = {
+        request_id: body.request_id, install_id: "install-crm", context_id: "ctx-a",
+        campaign_id: body.campaign_id,
+        source_revision: contents[body.campaign_id]?.revision ?? 0,
+        message_id: body.message_id, state: "open", used_by: null,
+        created: 1759286400, decided: null,
+      };
+      return json({ request: proposalRequests[body.request_id] });
+    }
     if (method === "POST" && url.pathname.endsWith("/content/proposals")) {
       const body = JSON.parse(String(init!.body));
       propSeq += 1;
@@ -261,6 +474,7 @@ async function mountedFlow() {
       const row = proposals[id];
       if (!row || row.state !== "pending") return refused("email proposal is already decided");
       const body = String(init!.body ?? "");
+      applyBodies.push(body === "" ? {} : JSON.parse(body));
       const expected = body === "" ? undefined : (JSON.parse(body).expected_revision as number | undefined);
       const doc = contents[row.campaign_id];
       if (expected !== undefined && doc && expected !== doc.revision) {
@@ -311,7 +525,17 @@ async function mountedFlow() {
     if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [
       { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
     ] });
-    if (path.startsWith("/api/threads/master")) return json({ entries: [], more_before: false });
+    // The shared master thread: sends append a verified-scope entry
+    // exactly as the daemon stamps them, and page reads replay it.
+    if (method === "POST" && url.pathname === "/api/threads/master/messages") {
+      const body = JSON.parse(String(init!.body));
+      sendBodies.push(body);
+      const entry = stampEntry(body);
+      return json({ message: entry.message, state: "queued", duplicate: false });
+    }
+    if (path.startsWith("/api/threads/master")) {
+      return json({ entries: threadEntries, more_before: false });
+    }
     if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });
     if (url.pathname.endsWith("/exclusions/list")) return json({ exclusions: [] });
     if (url.pathname.endsWith("/suppressions/list")) return json({ suppressions });
@@ -338,13 +562,17 @@ async function mountedFlow() {
   const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
   const text = () => host.textContent ?? "";
-  async function settle(check: () => void) {
-    for (let i = 0; i < 80; i++) {
+  async function settle(check: () => void, budgetMs = 8000) {
+    const deadline = Date.now() + budgetMs;
+    let last: unknown;
+    for (;;) {
       await flush();
-      try { check(); return; } catch { /* keep polling */ }
+      try { check(); return; } catch (e) { last = e; }
+      if (Date.now() >= deadline) break;
+      await sleep(120);
     }
     await flush();
-    check();
+    try { check(); } catch { throw last; }
   }
   async function click(element: Element | undefined | null) {
     assert(element, "click target exists");
@@ -445,24 +673,116 @@ async function mountedFlow() {
   // invalidated) or Discard (non-mutating) with honest attribution.
   await click(byText("button", "Approve r1 (content-only)"));
   await settle(() => assert(text().includes("Approved r1"), "approval lands content-only"));
-  await click(byText("button", "Submit editor as proposal"));
+  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
   await settle(() => assert(text().includes("operator-direct"), "proposal shows honest attribution"));
+  assert(text().includes("Operator-submitted"), "an operator proposal is never labelled assistant");
+  assert(!text().includes("Verified assistant draft"), "no assistant badge without a receipt");
   await click(byText("button", "Apply (new revision)"));
   await settle(() => assert(text().includes("approval invalidated"), "apply bumps the revision and invalidates approval"));
+  assert(applyBodies.at(-1)?.expected_revision === 1, "Apply sends the current draft revision as expected_revision");
   assert(!text().includes("Approved r2"), "no approval survives a content change");
-  await click(byText("button", "Submit editor as proposal"));
+  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
   await settle(() => assert(byText("button", "Discard"), "second proposal pends"));
+  const openDoc = () => contents[(host.querySelector("#cmp-id") as HTMLInputElement | null)?.value ?? ""]
+    ?? Object.values(contents).find((row) => row.subject === "Launch" || row.subject === "Launch v3")
+    ?? Object.values(contents).at(-1);
+  const digestBeforeDiscard = openDoc().content_digest;
   await click(byText("button", "Discard"));
   await settle(() => assert(text().includes("draft unchanged at r2"), "discard is non-mutating"));
+  assert(openDoc().content_digest === digestBeforeDiscard, "discard left the draft digest untouched");
   // A proposal whose source drifted behind the draft refuses as stale:
-  // submit at r2, save r3, then Apply must not silently merge.
-  await click(byText("button", "Submit editor as proposal"));
+  // submit at r2, save r3, then Apply must not silently merge — and the
+  // UI itself renders it stale with Apply disabled.
+  await click(byText("button", "Submit editor as proposal (operator-submitted)"));
   await settle(() => assert(byText("button", "Discard"), "drifted proposal pends"));
   await fillInput("#cmp-subject", "Launch v3");
   await click(byText("button", "Save as r3"));
   await settle(() => assert(text().includes("Saved revision 3"), "draft moves to r3"));
-  await click(byText("button", "Apply (new revision)"));
-  await settle(() => assert(text().includes("stale"), "stale apply refuses instead of merging"));
+  await settle(() => assert(text().includes("Needs review (stale)"), "drifted proposal renders stale"));
+  const staleApply = Array.from(host.querySelectorAll('[data-proposal]'))
+    .map((li) => li.querySelector("button"))
+    .find((b) => (b?.textContent ?? "").includes("Apply"));
+  assert(staleApply && (staleApply as HTMLButtonElement).disabled, "stale proposal's Apply is disabled");
+
+  // ---- CAD-813: the verified assistant draft seam ----
+  // No scoped chat message yet: the mint control stays disabled with
+  // its explanation, and no request body ever leaves the browser.
+  const mintButton = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
+  assert(mintButton(), "the assistant-draft mint control renders");
+  assert(mintButton()!.disabled, "mint is disabled without a scoped chat message");
+  assert(
+    text().includes("Send the assistant a message in the left chat first"),
+    "the disabled mint explains what to do",
+  );
+  assert(mintBodies.length === 0, "no proposal request left the browser yet");
+
+  // Send the assistant a scoped chat message through the left pane —
+  // the daemon stamps the verified App binding on the stored entry,
+  // which the stream then lands in the shared thread store.
+  await fillArea("#app-shell-chat-box", "Draft the launch email for this campaign");
+  await click(byText("button", "Send"));
+  assert(sendBodies.length === 1, "the left chat sent one message");
+  equal(
+    sendBodies[0].app,
+    { install_id: "install-crm", context_id: "ctx-a" },
+    "the chat send carried the shell's scope",
+  );
+  // The stored entry lands via the thread stream; in this fixture the
+  // fake SSE is silent, so revalidate the shared store the way the
+  // stream's arrival would.
+  await React.act(async () => {
+    const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
+    await resources.masterThread.refresh();
+  });
+  await settle(() => assert(!mintButton()!.disabled, "the mint enables once a scoped message exists"));
+
+  // Mint: the body is exactly {campaign_id, message_id, request_id} —
+  // no token, receipt, turn or source_revision ever travels.
+  await click(mintButton());
+  await settle(() => assert(mintBodies.length === 1, "one proposal request minted"));
+  equal(
+    Object.keys(mintBodies[0]).sort(),
+    ["campaign_id", "message_id", "request_id"],
+    "the mint body carries exactly the three ids",
+  );
+  const openCampaignId = openDoc().campaign_id as string;
+  assert(mintBodies[0].campaign_id === openCampaignId, "mint names the open campaign");
+  assert(mintBodies[0].message_id === sendBodies[0].message, "mint names the scoped chat message");
+  assert(/^req-[0-9a-f]{24}$/.test(mintBodies[0].request_id), "request id is identifier-safe");
+  await settle(() =>
+    assert(
+      text().includes("stamped source r3") && text().includes("draft r3"),
+      "the minted request's host stamp renders beside the draft revision",
+    ),
+  );
+  await settle(() => assert(text().includes("Watching for the assistant's draft"), "the bounded watch starts"));
+
+  // The assistant's live turn redeems the request (daemon socket —
+  // this fixture's `redeem` plays the store-side part the browser
+  // can never reach): the next poll lands the verified proposal.
+  const mintedId = mintBodies[0].request_id as string;
+  redeem(mintedId);
+  await settle(() => assert(text().includes("Verified assistant draft"), "the verified badge renders on the receipted proposal"), 30000);
+  assert(text().includes("crm-writer"), "the badge names the receipt's agent");
+  assert(text().includes(`request ${mintedId}`), "the badge names the receipt's request");
+  assert(text().includes(`Verified assistant draft landed for request ${mintedId}`), "the poll stop note reports the match");
+
+  // Apply the verified draft: expected_revision = current draft, the
+  // revision moves, approval invalidates and the stale row clears.
+  const revisionBefore = openDoc().revision as number;
+  const verifiedLi = host.querySelector('[data-proposal^="prop-asst-"]');
+  assert(verifiedLi, "the verified proposal row exists");
+  await click(Array.from(verifiedLi!.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Apply")));
+  await settle(() => assert(text().includes("Applied as revision"), "verified apply reports the new revision"));
+  assert(applyBodies.at(-1)?.expected_revision === revisionBefore, "verified apply sent the current revision");
+  assert(text().includes("approval invalidated"), "apply invalidated approval visibly");
+  await settle(() =>
+    assert(
+      !text().includes(`request ${mintedId}`) || !text().includes("Verified assistant draft"),
+      "the decided proposal leaves the pending list",
+    ),
+  );
+
 
   // Test-send is a distinct prepared-only affordance.
   await fillInput("#cmp-test-email", "qa@example.com");

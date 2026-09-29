@@ -75,6 +75,7 @@ export function crmSectionHref(href: string, section: CrmSection): string {
  */
 export default function CrmOutlet({
   scope,
+  scopedChatMessage,
   installationTitle,
   appKind,
   view,
@@ -86,6 +87,10 @@ export default function CrmOutlet({
   onRecordCreated,
 }: {
   scope: HostScope;
+  /** CAD-813: the operator's newest left-chat message daemon-stamped
+   *  with this scope — the mint's message_id. `null` until one
+   *  exists; generic Apps ignore it. */
+  scopedChatMessage?: string | null;
   installationTitle: string;
   /** CRM names its records; every other App stays neutral. */
   appKind: "crm" | "generic";
@@ -120,6 +125,7 @@ export default function CrmOutlet({
         />
         <CrmShell
           scope={scope}
+          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           view={view}
           recordId={recordId}

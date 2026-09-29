@@ -35,6 +35,7 @@ import { hostActions, type HostRecord, type HostScope } from "./hostActions";
  */
 export default function CrmShell({
   scope,
+  scopedChatMessage,
   viewer,
   view,
   recordId,
@@ -44,6 +45,9 @@ export default function CrmShell({
   onRecordCreated,
 }: {
   scope: HostScope;
+  /** CAD-813: the operator's newest chat message daemon-stamped with
+   *  this scope — passed through to Campaigns untouched. */
+  scopedChatMessage?: string | null;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
@@ -72,6 +76,7 @@ export default function CrmShell({
       {section === "campaigns" && (
         <CrmCampaigns
           scope={scope}
+          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           view={view}
           recordId={recordId}

@@ -15,16 +15,19 @@ import {
   checkContent,
   friendlyCampaignError,
   isBlockType,
+  newRequestId,
   parseContentDoc,
   parseContentList,
   parseProposal,
   parseProposalList,
+  parseProposalRequest,
   parseRender,
   withToken,
   type CampaignBlock,
   type ContentDoc,
   type ContentRender,
   type ProposalDoc,
+  type ProposalRequestDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
@@ -49,14 +52,19 @@ import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
  * - Sender and unsubscribe material is host-locked preview-only
  *   bytes; final-send preparation refuses until CAD-785/786 supply
  *   verified authority. The Send control stays disabled and labelled.
- * - Proposals submitted here are operator-attributed
- *   (`operator-direct`, no assistant receipt): the receipt-backed
- *   assistant seam does not exist yet, so left-chat suggestions only
- *   land through an explicit Save or Submit press — never silently.
+ * - Assistant proposals ride the CAD-813 seam: the operator mints a
+ *   one-time proposal request against their newest scope-stamped
+ *   left-chat message, the assistant's turn redeems it once, and the
+ *   proposal arrives with a durable host receipt. The "verified
+ *   assistant draft" badge renders only from `actor: "assistant"`
+ *   plus a non-null receipt — anything else is operator-submitted.
+ *   The manual Submit stays for operator copy and is labelled as
+ *   such; it never claims assistant provenance.
  */
 
 export default function CrmCampaigns({
   scope,
+  scopedChatMessage,
   viewer,
   view,
   recordId,
@@ -65,6 +73,10 @@ export default function CrmCampaigns({
   onRecordCreated,
 }: {
   scope: AudienceScope;
+  /** CAD-813: the operator's newest left-chat message daemon-stamped
+   *  with this exact install/context — the mint's `message_id`.
+   *  Threaded down from the shell, never read from a global. */
+  scopedChatMessage?: string | null;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
@@ -94,6 +106,7 @@ export default function CrmCampaigns({
       {recordId !== null ? (
         <CampaignDetail
           scope={scope}
+          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           campaignId={recordId}
           onBack={() => onSelect(null)}
@@ -108,6 +121,7 @@ export default function CrmCampaigns({
       ) : (
         <CampaignNew
           scope={scope}
+          scopedChatMessage={scopedChatMessage ?? null}
           viewer={viewer}
           onCreated={(id) => {
             if (onRecordCreated) onRecordCreated(id);
@@ -767,12 +781,14 @@ function parseTestPrepare(value: unknown): TestReceipt {
 
 function CampaignWorkspace({
   scope,
+  scopedChatMessage,
   viewer,
   campaignId,
   doc,
   onDoc,
 }: {
   scope: AudienceScope;
+  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   doc: ContentDoc | null;
@@ -803,6 +819,12 @@ function CampaignWorkspace({
   const [proposalPending, setProposalPending] = useState(false);
   const [proposalError, setProposalError] = useState<string | null>(null);
   const [proposalNote, setProposalNote] = useState<string | null>(null);
+  // CAD-813: the minted request's host stamp, plus the bounded poll
+  // that watches for the assistant's turn to redeem it.
+  const [minted, setMinted] = useState<ProposalRequestDoc | null>(null);
+  const [mintPending, setMintPending] = useState(false);
+  const [mintWatching, setMintWatching] = useState(false);
+  const mintPoll = useRef<{ deadline: number; requestId: string } | null>(null);
 
   // The doc is the saved truth: editor follows a newly saved revision
   // (create, Apply) but never clobbers typing mid-draft.
@@ -838,6 +860,70 @@ function CampaignWorkspace({
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [proposalsKey]);
+
+  // Bounded post-mint watch: after a proposal request lands, poll the
+  // list every 3s until the assistant's receipt names it, the request
+  // is spent, or two minutes pass — then stop. No busy loop, and the
+  // watch dies with the workspace.
+  useEffect(() => {
+    if (!mintWatching || minted === null) return;
+    const timer = setInterval(() => {
+      const watch = mintPoll.current;
+      if (watch === null || watch.requestId !== minted.requestId || Date.now() >= watch.deadline) {
+        setMintWatching(false);
+        return;
+      }
+      contentClient
+        .proposalList(scope)
+        .then((value) => {
+          const matched = parseProposalList(value).some(
+            (row) =>
+              row.campaignId === campaignId &&
+              row.assistantReceipt?.requestId === watch.requestId,
+          );
+          if (matched) {
+            mintPoll.current = null;
+            setMintWatching(false);
+            setProposalToken((count) => count + 1);
+            setProposalNote(
+              `Verified assistant draft landed for request ${watch.requestId} — review and Apply or Discard below.`,
+            );
+            return;
+          }
+          setProposalToken((count) => count + 1);
+        })
+        .catch(() => {
+          /* a transient read failure retries on the next tick */
+        });
+    }, 3000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mintWatching, minted?.requestId]);
+
+  const mintRequest = () => {
+    if (scopedChatMessage === null || doc === null) return;
+    setMintPending(true);
+    setProposalError(null);
+    setProposalNote(null);
+    const requestId = newRequestId();
+    void contentClient
+      .proposalRequest(scope, {
+        campaignId,
+        messageId: scopedChatMessage,
+        requestId,
+      })
+      .then((value) => {
+        const request = parseProposalRequest(value);
+        setMinted(request);
+        mintPoll.current = { deadline: Date.now() + 120_000, requestId: request.requestId };
+        setMintWatching(true);
+        setProposalNote(
+          `Request ${request.requestId} minted against chat message ${request.messageId} — the assistant's next turn can attach one draft to it.`,
+        );
+      })
+      .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
+      .finally(() => setMintPending(false));
+  };
 
   const grammarBlocks = (): CampaignBlock[] => blocksToGrammar(blocks);
 
@@ -1321,9 +1407,10 @@ function CampaignWorkspace({
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
-            The left chat can suggest copy, but suggestions only land through an explicit Submit
-            here, and only Apply changes the draft revision (approval invalidates). Discard is
-            non-mutating. Nothing proposes, edits or sends silently.
+            The left chat assistant drafts copy when the operator asks it to: mint one proposal
+            request below, then its live turn answers with a host-verified draft. Only Apply
+            changes the draft revision (approval invalidates); Discard is non-mutating. Nothing
+            proposes, edits or sends silently.
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
@@ -1344,11 +1431,50 @@ function CampaignWorkspace({
             </p>
           )}
           {canWrite && (
+            <div className="grid gap-2" data-assistant-mint>
+              <div className="crm-toolbar">
+                <Button
+                  size="sm"
+                  variant="primary"
+                  loading={mintPending}
+                  disabled={mintPending || scopedChatMessage === null}
+                  title={
+                    scopedChatMessage === null
+                      ? "Send the assistant a message in the left chat first"
+                      : `Mint a one-time proposal request on chat message ${scopedChatMessage}`
+                  }
+                  onClick={mintRequest}
+                >
+                  Ask assistant to draft
+                </Button>
+                {scopedChatMessage === null && (
+                  <span className="text-label text-ink-500" data-mint-hint>
+                    Send the assistant a message in the left chat first
+                  </span>
+                )}
+                {mintWatching && (
+                  <span className="text-label text-ink-400" role="status" data-mint-watching>
+                    Watching for the assistant's draft…
+                  </span>
+                )}
+              </div>
+              {minted !== null && (
+                <p className="num text-micro text-ink-500" data-minted-request>
+                  Request {minted.requestId} · campaign {minted.campaignId} · stamped source r
+                  {minted.sourceRevision} · draft r{doc.revision} ·{" "}
+                  {minted.state === "open" ? "awaiting the assistant's turn" : minted.state}
+                  {minted.usedBy !== null ? ` by ${minted.usedBy}` : ""}
+                </p>
+              )}
+            </div>
+          )}
+          {canWrite && (
             <div>
               <Button
                 size="sm"
                 loading={proposalPending}
                 disabled={proposalPending}
+                title="Submit the editor's copy as an operator-submitted proposal (not assistant-authored)"
                 onClick={() => {
                   setProposalError(null);
                   setProposalNote(null);
@@ -1373,14 +1499,14 @@ function CampaignWorkspace({
                       const created = parseProposal(value);
                       setProposalToken((count) => count + 1);
                       setProposalNote(
-                        `Proposal ${created.proposalId} submitted against r${created.sourceRevision} — still inert until Apply.`,
+                        `Operator-submitted proposal ${created.proposalId} recorded against r${created.sourceRevision} — still inert until Apply.`,
                       );
                     })
                     .catch((err: unknown) => setProposalError(friendlyCampaignError(err)))
                     .finally(() => setProposalPending(false));
                 }}
               >
-                Submit editor as proposal
+                Submit editor as proposal (operator-submitted)
               </Button>
             </div>
           )}
@@ -1402,13 +1528,17 @@ function CampaignWorkspace({
                     onApplied={(next) => {
                       onDoc(next);
                       setProposalToken((count) => count + 1);
+                      setRender(null);
+                      setTestReceipt(null);
                       setProposalNote(
-                        `Applied as revision ${next.revision} — content approval invalidated.`,
+                        `Applied as revision ${next.revision} — content approval invalidated; re-approve before any send preparation.`,
                       );
                     }}
                     onDiscarded={(id) => {
                       setProposalToken((count) => count + 1);
-                      setProposalNote(`Proposal ${id} discarded — draft unchanged at r${doc.revision}.`);
+                      setProposalNote(
+                        `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
+                      );
                     }}
                     onError={setProposalError}
                   />
@@ -1421,6 +1551,15 @@ function CampaignWorkspace({
   );
 }
 
+/**
+ * One pending proposal. The CAD-813 render rule is strict: only
+ * `actor == "assistant"` AND a non-null `assistant_receipt` earns the
+ * verified badge — an operator submission (or a receipt-less row) is
+ * always labelled operator-submitted, never assistant, whatever its
+ * text looks like. A pending row whose stamped source drifted behind
+ * the current draft renders "Needs review (stale)" with Apply
+ * disabled — the operator re-reviews instead of merging late output.
+ */
 function ProposalRow({
   scope,
   proposal,
@@ -1439,22 +1578,60 @@ function ProposalRow({
   onError: (message: string | null) => void;
 }) {
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
+  const verified = proposal.actor === "assistant" && proposal.assistantReceipt !== null;
+  const stale = proposal.sourceRevision !== expectedRevision;
+  const receipt = proposal.assistantReceipt;
   return (
-    <li className="card px-3 py-3">
+    <li className="card px-3 py-3" data-proposal={proposal.proposalId}>
       <p className="text-label text-ink-200">
         <span className="num">{proposal.proposalId}</span> · {proposal.subject}
       </p>
-      <p className="num text-micro text-ink-500 mt-1">
-        actor {proposal.actor} · origin {proposal.origin} · source r{proposal.sourceRevision} ·
-        assistant receipt {proposal.assistantReceipt === null ? "none (operator-submitted)" : "present"}
-      </p>
+      {verified && receipt !== null ? (
+        <p className="mt-1">
+          <span
+            className="chip"
+            data-badge="verified-assistant"
+            title="Host-verified: the daemon stamped this draft's agent, request, campaign and source revision — the browser's copy is never the authority"
+          >
+            Verified assistant draft
+          </span>{" "}
+          <span className="num text-micro text-ink-500">
+            agent {receipt.agent} · request {receipt.requestId} · campaign {receipt.campaignId} ·
+            source r{receipt.sourceRevision}
+          </span>
+        </p>
+      ) : (
+        <p className="mt-1">
+          <span
+            className="chip"
+            data-badge="operator-submitted"
+            title="Submitted through the operator proposal route — no assistant provenance"
+          >
+            Operator-submitted
+          </span>{" "}
+          <span className="num text-micro text-ink-500">
+            actor {proposal.actor} · origin {proposal.origin} · source r{proposal.sourceRevision}
+          </span>
+        </p>
+      )}
+      {stale && proposal.state === "pending" && (
+        <p className="text-label text-warn mt-1" data-state="stale">
+          Needs review (stale) — stamped against source r{proposal.sourceRevision}, the draft is
+          now r{expectedRevision}. Re-review its text before re-minting a request.
+        </p>
+      )}
       {canWrite && (
         <div className="crm-toolbar mt-2">
           <Button
             size="sm"
             variant="primary"
             loading={pending === "apply"}
-            disabled={pending !== null}
+            disabled={pending !== null || stale}
+            title={
+              stale
+                ? "Apply is disabled: the proposal's stamped source revision is behind the current draft"
+                : `Apply as a new revision (expects the draft at r${expectedRevision})`
+            }
             onClick={() => {
               onError(null);
               setPending("apply");
@@ -1537,11 +1714,13 @@ function SenderPanel({ render }: { render: ContentRender }) {
 
 function CampaignNew({
   scope,
+  scopedChatMessage,
   viewer,
   onCreated,
   onCancel,
 }: {
   scope: AudienceScope;
+  scopedChatMessage: string | null;
   viewer: Viewer;
   onCreated: (campaignId: string) => void;
   onCancel: () => void;
@@ -1701,6 +1880,7 @@ function CampaignNew({
           />
           <CampaignWorkspace
             scope={scope}
+            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}
@@ -1722,11 +1902,13 @@ function CampaignNew({
 
 function CampaignDetail({
   scope,
+  scopedChatMessage,
   viewer,
   campaignId,
   onBack,
 }: {
   scope: AudienceScope;
+  scopedChatMessage: string | null;
   viewer: Viewer;
   campaignId: string;
   onBack: () => void;
@@ -1841,6 +2023,7 @@ function CampaignDetail({
         <>
           <CampaignWorkspace
             scope={scope}
+            scopedChatMessage={scopedChatMessage}
             viewer={viewer}
             campaignId={campaignId}
             doc={doc}

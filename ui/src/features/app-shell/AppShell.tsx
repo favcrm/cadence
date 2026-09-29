@@ -329,6 +329,13 @@ export default function AppShell({
     activeIds,
   });
   const scope: HostScope = { installId, contextId };
+  // CAD-813: the Campaigns page mints assistant proposal requests
+  // against the operator's most recent chat message stamped by the
+  // daemon with exactly this scope. The id travels as ordinary
+  // shell state — read back from the shared master-thread store,
+  // never a global — so a message bound to another install or
+  // context can never mint here.
+  const scopedChatMessage = useScopedChatMessage(scope);
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
 
@@ -447,6 +454,7 @@ export default function AppShell({
                 <CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}
+                  scopedChatMessage={scopedChatMessage}
                   installationTitle={title}
                   appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
@@ -523,6 +531,45 @@ export function entryApp(payload: unknown): {
     return null;
   }
   return { install_id: row.install_id, context_id: row.context_id };
+}
+
+/**
+ * CAD-813: the most recent operator chat message the daemon stamped
+ * with exactly `scope`'s verified App binding — the only
+ * `message_id` a proposal-request mint may name. Entries read back
+ * from the shared master-thread store are the source: a pending send
+ * or a foreign-scope message never qualifies. `null` when the
+ * operator has not sent a scoped message in this App yet.
+ */
+export function latestScopedChatMessage(
+  state: { entries?: { role?: string; message?: string | null; payload?: unknown }[] } | null,
+  scope: HostScope,
+): string | null {
+  if (scope.contextId === "") return null;
+  const entries = state?.entries ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.role !== "operator" || typeof entry.message !== "string") continue;
+    const bound = entryApp(entry.payload);
+    if (bound?.install_id === scope.installId && bound.context_id === scope.contextId) {
+      return entry.message;
+    }
+  }
+  return null;
+}
+
+/** Live view of [`latestScopedChatMessage`] over the shared store. */
+function useScopedChatMessage(scope: HostScope): string | null {
+  const thread = useQuery(resources.masterThread);
+  const [found, setFound] = useState<string | null>(() =>
+    latestScopedChatMessage(thread.data, scope),
+  );
+  const key = `${scope.installId}:${scope.contextId}`;
+  useEffect(() => {
+    setFound(latestScopedChatMessage(thread.data, scope));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, thread.data]);
+  return found;
 }
 
 /**

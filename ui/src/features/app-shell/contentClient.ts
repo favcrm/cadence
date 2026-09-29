@@ -59,6 +59,12 @@ const PROPOSE_KEYS = [
   "blocks",
 ] as const;
 const APPLY_KEYS = ["expected_revision"] as const;
+// CAD-813: the operator's one-time proposal-request mint names only
+// the campaign and the chat message the assistant's turn should
+// answer. Campaign scope and the source revision are host-stamped by
+// the daemon — the body can never carry a token, receipt, turn or
+// source_revision claim.
+const PROPOSAL_REQUEST_KEYS = ["campaign_id", "message_id", "request_id"] as const;
 
 /** Authority-claiming fields that must never travel from the browser. */
 const ALWAYS_FORBIDDEN = [
@@ -114,6 +120,7 @@ export const contentPaths = {
   sendPreparePath: (scope: ContentScope, campaignId: string) =>
     `${scopePath(scope)}/campaigns/${campaignId}/send-prepare`,
   proposePath: (scope: ContentScope) => `${scopePath(scope)}/proposals`,
+  proposalRequestPath: (scope: ContentScope) => `${scopePath(scope)}/proposal-requests`,
   proposalListPath: (scope: ContentScope) => `${scopePath(scope)}/proposals/list`,
   proposalPath: (scope: ContentScope, proposalId: string) =>
     `${scopePath(scope)}/proposals/${proposalId}`,
@@ -293,6 +300,31 @@ export const contentClient = {
     };
     assertClean(body, PROPOSE_KEYS, "propose");
     return post(contentPaths.proposePath(scope), body);
+  },
+  /**
+   * CAD-813: mint a one-time, host-stamped proposal request. The body
+   * is exactly `{campaign_id, message_id, request_id}` — the daemon
+   * re-proves the message's verified App binding and stamps campaign
+   * and live source revision itself. The browser never sends token,
+   * receipt, turn or source_revision fields; the transport's
+   * `deny_unknown_fields` would refuse them anyway.
+   */
+  proposalRequest(
+    scope: ContentScope,
+    input: { campaignId: string; messageId: string; requestId: string },
+  ): Promise<unknown> {
+    assertInputClean(
+      input as unknown as Record<string, unknown>,
+      ["campaignId", "messageId", "requestId"],
+      "proposal-request",
+    );
+    const body: Record<string, unknown> = {
+      campaign_id: input.campaignId,
+      message_id: input.messageId,
+      request_id: input.requestId,
+    };
+    assertClean(body, PROPOSAL_REQUEST_KEYS, "proposal-request");
+    return post(contentPaths.proposalRequestPath(scope), body);
   },
   proposalList(scope: ContentScope): Promise<unknown> {
     return get(contentPaths.proposalListPath(scope));

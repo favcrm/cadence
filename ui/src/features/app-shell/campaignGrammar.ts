@@ -242,6 +242,44 @@ export function parseRender(value: unknown): ContentRender {
   };
 }
 
+/** CAD-813: the host-stamped assistant provenance on a proposal.
+ *  Every field is server-typed from the durable receipt — the
+ *  assistant's claim is never the authority. */
+export interface AssistantReceipt {
+  messageId: string;
+  agent: string;
+  requestId: string;
+  installId: string;
+  contextId: string;
+  campaignId: string;
+  sourceRevision: number;
+}
+
+export function parseAssistantReceipt(value: unknown): AssistantReceipt | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  if (
+    typeof row.message_id !== "string" ||
+    typeof row.agent !== "string" ||
+    typeof row.request_id !== "string" ||
+    typeof row.install_id !== "string" ||
+    typeof row.context_id !== "string" ||
+    typeof row.campaign_id !== "string" ||
+    typeof row.source_revision !== "number"
+  ) {
+    return null;
+  }
+  return {
+    messageId: row.message_id,
+    agent: row.agent,
+    requestId: row.request_id,
+    installId: row.install_id,
+    contextId: row.context_id,
+    campaignId: row.campaign_id,
+    sourceRevision: row.source_revision,
+  };
+}
+
 export interface ProposalDoc {
   proposalId: string;
   campaignId: string;
@@ -250,7 +288,8 @@ export interface ProposalDoc {
   state: string;
   actor: string;
   origin: string;
-  assistantReceipt: unknown;
+  /** Non-null only on host-verified assistant proposals (CAD-813). */
+  assistantReceipt: AssistantReceipt | null;
 }
 
 export function parseProposal(value: unknown): ProposalDoc {
@@ -276,8 +315,56 @@ export function parseProposal(value: unknown): ProposalDoc {
     state: row.state,
     actor: typeof row.actor === "string" ? row.actor : "operator",
     origin: typeof row.origin === "string" ? row.origin : "operator-direct",
-    assistantReceipt: row.assistant_receipt ?? null,
+    assistantReceipt: parseAssistantReceipt(row.assistant_receipt),
   };
+}
+
+/** CAD-813: the minted request's host stamp — campaign and source
+ *  revision are read back exactly as the daemon recorded them. */
+export interface ProposalRequestDoc {
+  requestId: string;
+  campaignId: string;
+  sourceRevision: number;
+  messageId: string;
+  state: string;
+  usedBy: string | null;
+}
+
+export function parseProposalRequest(value: unknown): ProposalRequestDoc {
+  const doc = (value as { request?: unknown } | null)?.request;
+  if (!doc || typeof doc !== "object") {
+    throw new ApiError("The server returned an invalid proposal request receipt", 502);
+  }
+  const row = doc as Record<string, unknown>;
+  if (
+    typeof row.request_id !== "string" ||
+    typeof row.campaign_id !== "string" ||
+    typeof row.source_revision !== "number" ||
+    typeof row.message_id !== "string" ||
+    typeof row.state !== "string"
+  ) {
+    throw new ApiError("The server returned an invalid proposal request receipt", 502);
+  }
+  return {
+    requestId: row.request_id,
+    campaignId: row.campaign_id,
+    sourceRevision: row.source_revision,
+    messageId: row.message_id,
+    state: row.state,
+    usedBy: typeof row.used_by === "string" ? row.used_by : null,
+  };
+}
+
+/** A fresh client-chosen request id — identifier-safe, never a
+ *  provenance claim (the daemon stamps scope and revision). */
+export function newRequestId(): string {
+  try {
+    return `req-${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+  } catch {
+    // No crypto.getRandomValues fallback needed beyond this — a
+    // request id only needs collision-freedom, not entropy claims.
+    return `req-${Date.now().toString(36)}${Math.floor(Math.random() * 36 ** 8).toString(36)}`;
+  }
 }
 
 export function parseProposalList(value: unknown): ProposalDoc[] {
