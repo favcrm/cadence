@@ -368,7 +368,14 @@ mod tests {
         let a = mk(&pm, tmp.path(), "a");
         let b = mk(&pm, tmp.path(), "b");
         edit(&pm, &a, |f| f.blocked_by = vec![b.clone()]);
-        let e = set_fields(&pm, std::slice::from_ref(&a), &["status=ready".to_string()], "t").unwrap_err();
+        let e = set_fields(
+            &pm,
+            std::slice::from_ref(&a),
+            &["status=ready".to_string()],
+            "t",
+            None,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains(&b), "{e}");
         assert_eq!(status(&pm, &a), "backlog");
     }
@@ -380,7 +387,14 @@ mod tests {
         let b = mk(&pm, tmp.path(), "b");
         edit(&pm, &a, |f| f.blocked_by = vec![b.clone()]);
         edit(&pm, &b, |f| f.status = "done".to_string());
-        set_fields(&pm, std::slice::from_ref(&a), &["status=ready".to_string()], "t").unwrap();
+        set_fields(
+            &pm,
+            std::slice::from_ref(&a),
+            &["status=ready".to_string()],
+            "t",
+            None,
+        )
+        .unwrap();
         assert_eq!(status(&pm, &a), "ready");
     }
 

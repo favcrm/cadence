@@ -288,8 +288,9 @@ fn ui_write_path() {
         "status_derived"
     );
 
-    // ready while still blocked → succeeds, warns. CAD-3 waits on CAD-2
-    // (seeded link); move CAD-3 to ready and expect the warning.
+    // ready while still blocked → refused. CAD-3 waits on CAD-2
+    // (seeded link); moving CAD-3 to ready fails naming the blocker,
+    // and the card keeps its old status.
     assert!(
         cli(
             pm.path(),
@@ -305,14 +306,15 @@ fn ui_write_path() {
         &host,
         r#"{"status":"ready"}"#,
     );
+    assert_eq!(code, 400);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let err = v["error"].as_str().unwrap();
+    assert!(err.contains("CAD-3"), "{err}");
+    assert!(err.contains("blocked_by CAD-2"), "{err}");
+    let (code, body) = http(port, "GET", "/api/issues/CAD-3", &host);
     assert_eq!(code, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["card"]["status"], "ready");
-    assert!(v["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w.as_str().unwrap().contains("CAD-2")));
+    assert_ne!(v["status"], "ready");
 
     // links: add relates + delete it; self-link rejected.
     let (code, _, body) = write_json(
@@ -557,10 +559,11 @@ fn ui_write_path() {
     let (code, _, _) = write_json(port, "PATCH", "/api/issues/CAD-2", &host, "{");
     assert_eq!(code, 400);
 
-    // One commit per successful write: 9 HTTP writes + the 1 CLI link.
+    // One commit per successful write: 8 HTTP writes (the blocked-ready
+    // PATCH is refused, not warned) + the 1 CLI link.
     assert_eq!(
         commits(pm.path()),
-        before + 10,
+        before + 9,
         "each write is exactly one commit"
     );
 }
