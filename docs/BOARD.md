@@ -400,6 +400,13 @@ cadence issue lint                          # schema, links, depth, sizes, symli
                                             #   (e.g. ready/doing/review with an
                                             #   open blocked_by) never fail it
 cadence issue sync [--no-push] [--dry-run] [--resolve ours|theirs]
+cadence issue groom [--dry-run] [--grace SECS]
+                                            # CAD-812: advisory backlog freshness
+                                            #   — the `issue sweep` sibling for
+                                            #   dormant backlog|ready leaves. Flags
+                                            #   `needs-triage` + a comment +
+                                            #   `last_groomed_at` on stale/superseded
+                                            #   verdicts; never moves status.
 cadence issue set CAD-16 owner=             # empty value clears the field
 ```
 
@@ -1484,6 +1491,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | team | the issue owner | `gh pr view <n> --repo <slug>` |
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
 | 80 | `blocked_ready` — every `blocked_by` target is `done` | team | the issue owner | `cadence issue set <id> status=ready` |
+| 82 | `backlog_stale` — a `backlog`/`ready` leaf the groom pass flagged `needs-triage` (its `paths:` moved under it, a covering ticket closed in its window, or its `blocked_by` closed but it never advanced) | team | the issue owner | `cadence issue show <id>` |
 | 85 | `intake` — an untriaged `cadence report` | team | the issue owner | `cadence report show <id>` |
 | 86 | `intake_relay` — a report the intake consumer could not publish or hand to the PM (quota, stopped PM, retry, still queued) | team | the configured relay PM alias | `cadence intake status <project>` |
 | 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | team | none | `gh run view <run> --repo <slug>` |

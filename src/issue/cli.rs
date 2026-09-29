@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    blocked, board, claim, doctor, finish, history, hooks, lint, model, project, reconcile, retro,
-    sprint, start, sync, work, write, Pm,
+    blocked, board, claim, doctor, finish, groom, history, hooks, lint, model, project, reconcile,
+    retro, sprint, start, sync, work, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -486,6 +486,33 @@ pub enum IssueAction {
         /// fetched remote's.
         #[arg(long, value_parser = ["ours", "theirs"])]
         resolve: Option<String>,
+    },
+    /// Backlog freshness (CAD-812): an advisory groom pass over open
+    /// `backlog`/`ready` leaves — the `sweep` sibling for dormant work.
+    /// Each dormant ticket is re-judged against the tree and the
+    /// tracker: `paths:` that moved since `created`, closed siblings on
+    /// the same paths, satisfied blockers never advanced. A `stale` or
+    /// `superseded` verdict lands `needs-triage` + a comment +
+    /// `last_groomed_at`; `valid` only stamps `last_groomed_at`. Never
+    /// changes `status` — the operator decides drop or re-scope. The
+    /// daemon checkup runs the same pass; this verb is the manual and
+    /// dry-run path.
+    Groom {
+        /// Report what would be flagged — nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit the pass to one project (all projects when omitted).
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Emit the verdicts as JSON (the verb already prints JSON — the
+        /// flag is accepted for consistency with `issue ls --json`).
+        #[arg(long)]
+        json: bool,
+        /// Seconds a `backlog`/`ready` leaf may sit before the pass
+        /// judges it — inside the window the ticket is its own evidence
+        /// [default: 1209600 (14d)].
+        #[arg(long, value_name = "SECS")]
+        grace: Option<i64>,
     },
     /// Blocked-work hygiene (CAD-757): park `doing`/`review` leaves
     /// whose blockers are still open and whose claim is older than
@@ -1738,6 +1765,23 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 grace.unwrap_or(blocked::PARK_GRACE_SECS),
                 *dry_run,
                 Some(state_dir),
+                "",
+            )?;
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Groom {
+            dry_run,
+            project,
+            json: _,
+            grace,
+        } => {
+            let pm = open_pm()?;
+            let out = groom::groom(
+                &pm,
+                project.as_deref(),
+                grace.unwrap_or(groom::GROOM_GRACE_SECS),
+                *dry_run,
                 "",
             )?;
             print_json(&out);

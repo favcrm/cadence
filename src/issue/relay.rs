@@ -1793,6 +1793,7 @@ mod tests {
                 stage_at: None,
                 milestone: None,
                 size: None,
+                last_groomed_at: None,
                 parent: None,
                 blocked_by: vec![],
                 relates: vec![],

@@ -163,6 +163,13 @@ pub struct Front {
     /// unsized counts as M (docs/design/WORK-MODEL.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// CAD-812: when the advisory groom pass last re-derived this
+    /// ticket's freshness (RFC 3339 UTC). `issue groom` stamps it on
+    /// every verdict — `valid` and `stale` alike — so an untouched
+    /// ticket is not re-reviewed every pass. Absent means never
+    /// groomed; an older binary rewriting the file drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_groomed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -196,6 +203,7 @@ impl Front {
             stage_at: None,
             milestone: None,
             size: None,
+            last_groomed_at: None,
             parent: None,
             blocked_by: vec![],
             relates: vec![],
