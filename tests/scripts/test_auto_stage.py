@@ -1,6 +1,7 @@
 """Bounded automatic staging selector: eligibility, baseline, dedup and receipts."""
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -147,6 +148,81 @@ class ClassifyTests(unittest.TestCase):
         mod.check_digest_pin({"sha256": "d" * 64}, "d" * 64)
 
 
+class StagingStateTests(unittest.TestCase):
+    """Only staging-triggering events count as in-flight or receipt-bearing:
+    pull_request rehearsal runs never stage and must not coalesce the train."""
+
+    def staging_run(self, run_id, event="schedule", status="in_progress"):
+        run = {"id": run_id, "path": ".github/workflows/staging.yml",
+               "status": status, "conclusion": None}
+        if event is not None:
+            run["event"] = event
+        return run
+
+    def fetch(self, runs):
+        calls = []
+
+        def fake_api(*args):
+            calls.append(args[0])
+            if args[0].endswith("/artifacts"):
+                return json.dumps({"artifacts": []}).encode()
+            return json.dumps({"workflow_runs": runs}).encode()
+
+        original = mod.gh_api
+        mod.gh_api = fake_api
+        try:
+            state = mod.fetch_staging_state("favcrm/cadence", 10, 5, 999)
+        finally:
+            mod.gh_api = original
+        return state, calls
+
+    def test_pull_request_rehearsal_run_is_not_inflight(self):
+        state, _ = self.fetch([self.staging_run(11, event="pull_request")])
+        self.assertEqual(state["inflight"], [])
+        decision, reason, _, deferred = mod.classify(
+            {"ci_run_id": 42, "ci_run_attempt": 1}, baseline(), state, 999)
+        self.assertEqual(decision, "stage")
+        self.assertIsNone(deferred)
+
+    def test_staging_events_are_inflight(self):
+        state, _ = self.fetch([
+            self.staging_run(11, event="schedule"),
+            self.staging_run(12, event="workflow_run"),
+            self.staging_run(13, event="workflow_dispatch"),
+        ])
+        self.assertEqual(sorted(state["inflight"]), [11, 12, 13])
+
+    def test_unknown_or_missing_event_is_ignored(self):
+        state, calls = self.fetch([
+            self.staging_run(11, event=None),
+            self.staging_run(12, event="pull_request_review"),
+            self.staging_run(13, event="dynamic", status="queued"),
+            self.staging_run(14, event="pull_request", status="completed"),
+        ])
+        self.assertEqual(state["inflight"], [])
+        # Non-staging events never reach the artifact fetch either.
+        self.assertEqual(len(calls), 1)
+
+
+class WorkflowTriggerTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (Path(__file__).resolve().parents[2]
+                         / ".github/workflows/staging.yml").read_text()
+
+    def test_workflow_run_trigger_on_completed_main_ci(self):
+        trigger = self.workflow.split("  workflow_run:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("workflows: [ci]", trigger)
+        self.assertIn("types: [completed]", trigger)
+        self.assertIn("branches: [main]", trigger)
+
+    def test_promote_stays_manual_dispatch_only(self):
+        promote = self.workflow.split("  promote:\n", 1)[1]
+        gate = re.search(r"if: .*", promote)[0]
+        self.assertIn("workflow_dispatch", gate)
+        self.assertNotIn("schedule", gate)
+        self.assertNotIn("workflow_run", gate)
+
+
 class ReceiptTests(unittest.TestCase):
     def test_failing_gate_blocks_staging_with_reason(self):
         receipt = mod.staging_receipt(
@@ -177,13 +253,40 @@ class ReceiptTests(unittest.TestCase):
             argv = ["staging-receipt", "--trigger", "schedule", "--staging-run-id", "10",
                     "--staging-run-attempt", "1", "--candidate-json", str(candidate),
                     "--baseline-json", str(root / "absent.json"),
-                    "--mvp", "pass", "--rehearsal", "skip", "--digest-recheck", "pass",
+                    "--mvp", "success", "--rehearsal", "skipped", "--digest-recheck", "success",
                     "--expected-digest", "d" * 64, "--out", str(out)]
             mod.main(argv)
             receipt = json.loads(out.read_text())
             self.assertEqual(receipt["decision"], "failed")
             self.assertIn("migration_rehearsal", receipt["reason"])
             self.assertTrue(receipt["baseline"]["unverified"])
+            self.assertEqual(receipt["gates"], {"mvp_journey": "pass",
+                                                 "migration_rehearsal": "skip",
+                                                 "digest_recheck": "pass"})
+
+    def test_staging_receipt_cli_accepts_success_and_fails_closed_on_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.json"
+            candidate.write_text(json.dumps({"ci_run_id": 42, "ci_run_attempt": 1,
+                                             "source_sha": GOOD_SHA, "sha256": "d" * 64}))
+            baseline_file = root / "baseline.json"
+            baseline_file.write_text(json.dumps(baseline()))
+            out = root / "receipt.json"
+            argv = ["staging-receipt", "--trigger", "workflow_dispatch",
+                    "--staging-run-id", "10", "--staging-run-attempt", "1",
+                    "--candidate-json", str(candidate), "--baseline-json", str(baseline_file),
+                    "--mvp", "success", "--rehearsal", "success",
+                    "--digest-recheck", "success", "--out", str(out)]
+            mod.main(argv)
+            receipt = json.loads(out.read_text())
+            self.assertEqual(receipt["decision"], "staged")
+            self.assertEqual(set(receipt["gates"].values()), {"pass"})
+            argv[argv.index("--rehearsal") + 1] = "cancelled"
+            mod.main(argv)
+            receipt = json.loads(out.read_text())
+            self.assertEqual(receipt["decision"], "failed")
+            self.assertIn("unknown gate outcome", receipt["reason"])
 
     def test_staging_receipt_cli_rejects_digest_swap(self):
         with tempfile.TemporaryDirectory() as directory:

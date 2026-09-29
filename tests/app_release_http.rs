@@ -3,7 +3,7 @@
 mod common;
 use common::{
     app_release::{Release, A, OWNER, REVIEWER, WRITER},
-    plant_member_pane, LaneShell,
+    plant_member_pane, test_port, LaneShell, PortLease,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 struct Board {
     release: Release,
     port: u16,
+    _port_lease: PortLease,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
 }
@@ -22,13 +23,13 @@ impl Board {
         Self::from_release(Release::new())
     }
     fn from_release(release: Release) -> Self {
-        let port = (3110..3200)
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap();
+        let lease = test_port();
+        let port = lease.port;
         let stop = Arc::new(AtomicBool::new(false));
         let mut board = Self {
             release,
             port,
+            _port_lease: lease,
             stop,
             thread: None,
         };

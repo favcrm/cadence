@@ -110,6 +110,101 @@ fn msg(err: impl ToString) -> String {
     err.to_string()
 }
 
+/// A configured confined Devin worker is refused before issue start,
+/// including racing requests. Existing caller-proof tests below cover
+/// agent, detached-child and forged-field attempts at this same RPC.
+#[test]
+fn confined_devin_kickoff_leaves_issue_and_lane_unchanged() {
+    let lab = Lab::new();
+    let (ok, _, err) = lab.cli(&["issue", "new", "Safe", "--project", "demo"]);
+    assert!(ok, "{err}");
+    lab.accept("D-1");
+    let pm_yaml = lab.pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("\nhost:\n  confine_pi_workers: true\npi:\n  models:\n    allow: [\"devin/swe-2-high\"]\n    default: {worker: \"devin/swe-2-high\"}\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let before = std::fs::read_to_string(lab.pm_dir.join("demo/D-1/issue.md")).unwrap();
+    let unsafe_request = json!({
+        "issue": "D-1", "group": "pm", "provider": "pi", "alias": "unsafe-worker"
+    });
+
+    // The same unsafe configuration cannot be reached through an
+    // agent pane, a detached child, or a forged operator field.
+    let mut worker = ManagedWorker::start(&lab.d, "caller");
+    for how in ["self", "detached"] {
+        let frame = worker.rpc(how, "issue_kickoff", unsafe_request.clone());
+        assert_eq!(frame["ok"], false, "{how}: {frame}");
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("operator action"),
+            "{frame}"
+        );
+    }
+    for field in ["by", "actor", "operator"] {
+        let mut forged = unsafe_request.clone();
+        forged[field] = json!("operator");
+        assert!(
+            msg(lab.d.operator_rpc("issue_kickoff", forged).unwrap_err()).contains("request field")
+        );
+    }
+
+    // The board relays the identical gate: an authorized request
+    // receives the model refusal, while agent/detached callers and
+    // forged identity fields are refused before it.
+    let port = start_board(&lab.pm_dir, &lab.d.state);
+    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &lab.d.state, port);
+    let path = "/api/issues/D-1/kickoff";
+    let body = r#"{"group":"pm","provider":"pi","alias":"http-unsafe"}"#;
+    let (status, _, response) = op::raw(port, &session.request("POST", path, body));
+    assert_eq!(status, 400, "{response}");
+    assert!(response.contains("Choose a non-Devin model"), "{response}");
+    let forged = session.request(
+        "POST",
+        path,
+        r#"{"group":"pm","provider":"pi","by":"operator"}"#,
+    );
+    let (status, _, response) = op::raw(port, &forged);
+    assert_eq!(status, 400, "{response}");
+    // Test identity headers exist only with test-seam; without that
+    // feature this request would carry the valid operator cookie alone.
+    #[cfg(feature = "test-seam")]
+    for who in ["agent:caller", "unproven"] {
+        let request = session.request_as("POST", path, body, &op::seam_headers(&lab.d.state, who));
+        let (status, _, response) = op::raw(port, &request);
+        assert_eq!(status, 403, "{who}: {response}");
+    }
+
+    thread::scope(|s| {
+        for alias in ["unsafe-a", "unsafe-b"] {
+            let d = &lab.d;
+            s.spawn(move || {
+                let err = d
+                    .operator_rpc(
+                        "issue_kickoff",
+                        json!({
+                            "issue": "D-1", "group": "pm", "provider": "pi", "alias": alias
+                        }),
+                    )
+                    .unwrap_err();
+                assert!(msg(err).contains("Choose a non-Devin model"));
+            });
+        }
+    });
+    assert!(lab.lanes().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(lab.pm_dir.join("demo/D-1/issue.md")).unwrap(),
+        before
+    );
+    for alias in ["unsafe-a", "unsafe-b"] {
+        assert!(lab
+            .d
+            .operator_rpc("agent_show", json!({"alias": alias}))
+            .is_err());
+    }
+}
+
 /// Agent, detached child, and forged identity fields never open a lane.
 #[test]
 fn cad606_kickoff_refuses_agent_detached_and_forged_fields() {

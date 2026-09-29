@@ -19,7 +19,7 @@ const run = { id: "run-manual", snapshot: { source: null, capabilities: { image:
 const receipt: ImageReceipt = {
   id: "receipt-image", run_id: "run-manual", slot: "image", digest: "sha256:receipt", binding_digest: "binding-image",
   asset: { media_type: "image/png", digest, size: bytes.length },
-  result: { schema: 1, kind: "media.generated.image", provider: "agenticos_external", model: "image-01", aspect_ratio: "1:1", asset_sha256: digest, asset_media_type: "image/png", source_receipt_id: null, source_post_id: null },
+  result: { schema: 1, kind: "media.generated.image", provider: "agenticos_external", model: "openai/gpt-image-2.5", aspect_ratio: "1:1", job_id: "med_job1", charge: { currency: "USD", scale: 6, amount: "0.031500" }, price_version: "v1", quoted_micros: 31500, repeated: false, asset_sha256: digest, asset_media_type: "image/png", source_receipt_id: null, source_post_id: null },
 };
 globalThis.fetch = async input => {
   if (String(input) !== "/api/app-capability-results/receipt-image/asset") throw new Error(`Unexpected read ${input}`);

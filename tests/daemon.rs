@@ -3836,9 +3836,9 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
     .unwrap();
 
     let r = lead.rpc(&d.state, "task_reopen", json!({"task": "j1-t"}));
-    assert_refused(&r, "job task reopen", "not job 'j1''s PM", "pane reopen");
+    assert_refused(&r, "task reopen", "is not job 'j1's PM", "pane reopen");
     let r = wk.rpc("self", "task_reopen", json!({"task": "j1-t"}));
-    assert_refused(&r, "job task reopen", "not job 'j1''s PM", "managed reopen");
+    assert_refused(&r, "task reopen", "is not job 'j1's PM", "managed reopen");
     let calls = [
         ("monitor_stop", "monitor stop", json!({"monitor": "m1"})),
         (

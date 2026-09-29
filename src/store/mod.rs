@@ -61,6 +61,10 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+pub mod app_audiences;
+pub use app_audiences::{AudienceBase, Predicate};
+pub mod app_content;
+pub use app_content::{Block, Draft};
 pub mod app_bindings;
 pub mod app_capabilities;
 pub mod app_contexts;
@@ -68,6 +72,7 @@ pub mod app_effects;
 pub mod app_records;
 pub mod app_runs;
 mod plans;
+pub mod social_publish;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;

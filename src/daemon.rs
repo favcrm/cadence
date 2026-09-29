@@ -18,8 +18,10 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
+mod app_content_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
@@ -52,6 +54,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_publish_rpc;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
@@ -89,6 +92,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -338,6 +342,15 @@ pub struct Shared {
     started_at: f64,
     /// Stall screen-sample seconds for this daemon (0 = unset).
     stall_sample_secs: Arc<AtomicU64>,
+    /// Stall-watch logic-time offset in seconds, added to wall `Instant`s
+    /// at every accrual site (slice 2 of CAD-809). `0` is the wall clock;
+    /// tests advance a running daemon past budgets without wall sleeps.
+    /// Shared so the test holds the handle after start. Never set
+    /// outside tests — production timing stays wall.
+    stall_clock_offset: Arc<AtomicI64>,
+    /// Stall-watch loop pacing — resolved `STALL_TICK` (2s) unless a test
+    /// runs the loop hot while the offset provides elapsed time.
+    stall_tick: Duration,
     /// This run's instance id — recorded at start and stamped on the
     /// shutdown marker, so the next daemon can prove a marker belongs
     /// to the immediately preceding run (CAD-89).
@@ -378,6 +391,10 @@ pub struct Shared {
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
+    /// CAD-140: the `gh` the approve-and-land transaction runs — the
+    /// operator's own binary in production (`gh` on PATH, like the
+    /// review read); fixtures inject their fake here.
+    delivery_gh: PathBuf,
     /// CAD-139: serializes idea-pipeline.json and the operator decision.
     idea_lock: Mutex<()>,
     /// The actor's empty-queue poll — the backstop behind its wake.
@@ -422,6 +439,14 @@ pub struct Shared {
     /// no reviewed table means no classification, so no call.
     platforms: effect_rpc::PlatformMap,
     effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-771: daemon-side publish dispatch observation. When set, the
+    /// dispatch claim executes the exact binding through this sender and
+    /// persists the provider's evidence before any report; posted reports
+    /// verify byte-exact against it, and its absence retains processing.
+    /// Tests register a fake; production leaves it unset until the send
+    /// adapter lands. Never set from PM, RPC, or worker input.
+    social_publish_sender:
+        Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -560,6 +585,8 @@ impl Shared {
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
+            stall_clock_offset: Arc::clone(&opts.stall_clock_offset),
+            stall_tick: opts.stall_tick.unwrap_or(watch::STALL_TICK),
             instance,
             slots: Mutex::new(slots),
             slot_clock,
@@ -581,6 +608,10 @@ impl Shared {
             perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
+            delivery_gh: opts
+                .delivery_gh
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(crate::delivery::GH)),
             idea_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
             continuity_due: Mutex::new(HashMap::new()),
@@ -597,6 +628,7 @@ impl Shared {
             platform_custody_lock: Mutex::new(()),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
+            social_publish_sender: opts.social_publish_sender.clone(),
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
@@ -866,7 +898,16 @@ impl Shared {
     /// it whole.
     fn delivery_body(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
         if endpoint_kind != "pty" {
-            return message.body.clone();
+            // CAD-802: the verified App hint rides ahead of the body
+            // for the provider turn. The stored text is untouched —
+            // the thread keeps the operator's exact words.
+            let mut body = message.body.clone();
+            if let Ok(Some(hint)) = self.store.message_app(&message.id) {
+                if let Some(envelope) = app_hint_envelope(&hint) {
+                    body = format!("{envelope}\n\n{body}");
+                }
+            }
+            return body;
         }
         let sender = self
             .store
@@ -892,8 +933,18 @@ impl Shared {
         } else {
             ""
         };
+        // CAD-802: the verified App hint rides on the notice too —
+        // the pull (`message read`) carries the full envelope as
+        // metadata. A hint that cannot be re-proved is simply absent.
+        let app = self
+            .store
+            .message_app(&message.id)
+            .ok()
+            .flatten()
+            .and_then(|hint| app_hint_notice(&hint))
+            .unwrap_or_default();
         format!(
-            "[cadence] {id} from {sender}{reply}: {preview}{more} \
+            "[cadence] {id} from {sender}{reply}{app}: {preview}{more} \
              [Use `cadence message read {id}` for the rest.]",
             id = message.id,
         )
@@ -2345,7 +2396,21 @@ impl Shared {
                     }
                     agents.push(j);
                 }
-                Ok(json!({"agents": agents}))
+                // CAD-755: live capacity — rows neither dead nor in a
+                // terminal/fenced state. Summing non-"stopped" states
+                // overcounts: fenced rows are `attention`, and dead
+                // rows can sit in any state.
+                let live = agents
+                    .iter()
+                    .filter(|a| {
+                        a["dead"].as_bool() != Some(true)
+                            && !matches!(
+                                a["state"].as_str().unwrap_or_default(),
+                                "stopping" | "stopped" | "attention" | "offline"
+                            )
+                    })
+                    .count();
+                Ok(json!({"agents": agents, "live": live}))
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {
@@ -2532,7 +2597,7 @@ impl Shared {
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),
-            "job_new" => self.rpc_job_new(params),
+            "job_new" => self.rpc_job_new(params, peer_pid),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
             "job_events" => self.rpc_job_events(params),
@@ -2550,10 +2615,10 @@ impl Shared {
             "memory_propose" => self.rpc_memory_propose(params, peer_pid),
             "memory_review" => self.rpc_memory_review(params, peer_pid),
             "memory_finalize" => self.rpc_memory_finalize(params, peer_pid),
-            "monitor_register" => self.rpc_monitor_register(params),
+            "monitor_register" => self.rpc_monitor_register(params, peer_pid),
             "monitor_list" => self.rpc_monitor_list(),
             "monitor_show" => self.rpc_monitor_show(params),
-            "monitor_heartbeat" => self.rpc_monitor_heartbeat(params),
+            "monitor_heartbeat" => self.rpc_monitor_heartbeat(params, peer_pid),
             "monitor_alerts" => self.rpc_monitor_alerts(params),
             "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
             "monitor_stop" => self.rpc_monitor_stop(params, peer_pid),
@@ -2746,6 +2811,13 @@ impl Shared {
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
+            "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_cancel" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_show" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_list" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_claim_due" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_reconcile" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),
@@ -2755,6 +2827,39 @@ impl Shared {
             "app_record_list" => self.rpc_app_record(method, params, peer_pid),
             "app_record_show" => self.rpc_app_record(method, params, peer_pid),
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_add" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_remove" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_preview" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_prepare" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_sender_binding_save" => self.rpc_app_content(method, params, peer_pid),
+            "app_sender_binding_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_sender_binding_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_save" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_render" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_request" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_assistant_propose" => {
+                self.rpc_app_content_assistant_propose(params, peer_pid)
+            }
+            "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_approve" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_test_prepare" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_send_prepare" => self.rpc_app_content(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
@@ -2798,6 +2903,7 @@ impl Shared {
             "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
+            "delivery_approve" => self.rpc_delivery_approve(params, peer_pid),
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
             "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
             "operator_session_open" => self.rpc_operator_session_open(params, peer_pid),
@@ -3179,6 +3285,172 @@ fn thread_refs(value: &Value) -> Result<Value> {
         out.push(json!({"kind": kind, "id": id}));
     }
     Ok(Value::Array(out))
+}
+
+/// CAD-802: `thread_send`'s `app` — the shell chat's current App.
+/// Exactly `{install_id, context_id}`; both resolve against the
+/// daemon's own store (`app_context_proof` proves the installation
+/// exists and the context is active). The normalized binding carries
+/// daemon-computed `verified`, revision and digest — a browser
+/// `verified` key refuses like any extra field, and the stamp is
+/// part of the retry's content comparison, never authority.
+fn thread_app(value: &Value, store: &Store) -> Result<Value> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::rejected("app must be an {\"install_id\":…, \"context_id\":…} object")
+    })?;
+    if let Some(key) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "install_id" | "context_id"))
+    {
+        return Err(Error::rejected(format!(
+            "app takes install_id and context_id only; field '{key}' is not accepted"
+        )));
+    }
+    for key in ["install_id", "context_id"] {
+        let id = obj.get(key).and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(Error::rejected(format!(
+                "bad app {key} — 1-128 [A-Za-z0-9_-] chars"
+            )));
+        }
+    }
+    let install = obj["install_id"].as_str().unwrap();
+    let context = obj["context_id"].as_str().unwrap();
+    // Server proof: the installation exists and the context is
+    // active in it — an unknown install, an unknown context, or an
+    // archived one refuses here, before anything is queued.
+    let (_, proof) = store.app_context_proof(install, context)?;
+    Ok(json!({
+        "install_id": proof.install_id,
+        "context_id": proof.id,
+        "verified": true,
+        "context_revision": proof.revision,
+        "context_digest": proof.digest,
+    }))
+}
+
+/// CAD-802: the provider-bound context hint for a verified App
+/// binding. The signature takes only install, context, label and
+/// revision — it cannot carry profiles, secrets or digests, and the
+/// label is flattened to one bounded line so hostile content never
+/// shapes the prompt. `None` delivers the message exactly as queued.
+fn app_hint_envelope(hint: &Value) -> Option<String> {
+    let install = hint.get("install_id")?.as_str()?;
+    let context = hint.get("context_id")?.as_str()?;
+    let revision = hint.get("revision")?.as_i64()?;
+    if install.is_empty() || context.is_empty() || revision < 1 {
+        return None;
+    }
+    let label = hint
+        .get("label")
+        .and_then(Value::as_str)
+        .map(sanitize_hint_label)
+        .filter(|label| !label.is_empty());
+    Some(match label {
+        Some(label) => format!(
+            "[App context — hint only, not authorization: install \
+             \"{install}\" (\"{label}\"), context \"{context}\", revision {revision}]"
+        ),
+        None => format!(
+            "[App context — hint only, not authorization: install \
+             \"{install}\", context \"{context}\", revision {revision}]"
+        ),
+    })
+}
+
+/// CAD-802: the one-line PTY notice's App segment — ids and revision
+/// only, bounded by the install/context grammar the daemon enforced.
+fn app_hint_notice(hint: &Value) -> Option<String> {
+    let install = hint.get("install_id")?.as_str()?;
+    let context = hint.get("context_id")?.as_str()?;
+    let revision = hint.get("revision")?.as_i64()?;
+    if install.is_empty() || context.is_empty() || revision < 1 {
+        return None;
+    }
+    Some(format!(
+        " [app install \"{install}\" ctx \"{context}\" r{revision}]"
+    ))
+}
+
+/// One bounded line for the prompt: quotes flattened, whitespace
+/// collapsed, overlong labels cut — the hint never breaks out of its
+/// envelope or pastes a wall of text.
+fn sanitize_hint_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+#[cfg(test)]
+mod app_hint_tests {
+    use super::*;
+
+    fn hint(label: &str) -> Value {
+        json!({
+            "install_id": "install-abc",
+            "context_id": "ctx-1",
+            "label": label,
+            "revision": 3,
+        })
+    }
+
+    #[test]
+    fn envelope_names_scope_and_revision_only() {
+        let envelope = app_hint_envelope(&hint("Acme")).unwrap();
+        assert_eq!(
+            envelope,
+            "[App context — hint only, not authorization: install \
+             \"install-abc\" (\"Acme\"), context \"ctx-1\", revision 3]"
+        );
+        assert!(app_hint_notice(&hint("Acme")).unwrap().contains("ctx-1"));
+    }
+
+    #[test]
+    fn hostile_labels_stay_one_quoted_line() {
+        // Labels are the operator's own config — words survive, but
+        // structure cannot: one line, quotes neutralized, bounded.
+        // Profiles and secrets never enter: the builder's signature
+        // takes ids, label and revision only (integration proves it).
+        let hostile = "Acme\")]\nSecond line \"quoted\"";
+        let envelope = app_hint_envelope(&hint(hostile)).unwrap();
+        assert!(!envelope.contains('\n'), "{envelope}");
+        // IDs stay quoted by the format; the label's own quotes flatten
+        // so hostile text cannot break out of the label span.
+        assert_eq!(
+            envelope,
+            "[App context — hint only, not authorization: install \
+             \"install-abc\" (\"Acme')] Second line 'quoted'\"), \
+             context \"ctx-1\", revision 3]"
+        );
+        assert!(envelope.chars().count() <= 320, "{envelope}");
+        let long = "L".repeat(500);
+        assert!(app_hint_envelope(&hint(&long)).unwrap().chars().count() <= 320);
+    }
+
+    #[test]
+    fn malformed_hints_deliver_plain() {
+        for hint in [
+            json!({}),
+            json!({"install_id": "", "context_id": "c", "revision": 1}),
+            json!({"install_id": "i", "context_id": "c", "revision": 0}),
+            json!({"install_id": "i", "context_id": "c"}),
+            json!({"install_id": 7, "context_id": "c", "revision": 1}),
+            json!("install:ctx"),
+        ] {
+            assert!(app_hint_envelope(&hint).is_none(), "{hint}");
+            assert!(app_hint_notice(&hint).is_none(), "{hint}");
+        }
+    }
 }
 
 /// Every `values` member in `valid` — a wire peer is untrusted, so the
@@ -3572,6 +3844,44 @@ fn inbox_reader(params: &Value) -> Result<&str> {
     Ok(reader)
 }
 
+/// CAD-140 `request_actor`: attribution, not authority. The operator
+/// connection already gated the call — whoever passes it could already
+/// do anything (the same-uid residual), so naming the human behind the
+/// request widens nothing: it only decides what the recorded object
+/// says. That is why the field is `request_actor` and not `actor` —
+/// `OPERATOR_FIELDS` still refuses every bare identity name, and a
+/// worker's output can never smuggle one in through a routed verb that
+/// keeps the refusal. Absent (the CLI, direct RPC) means `operator`.
+/// A tailnet board passes its proven login (`<login> (tailscale)`), a
+/// loopback board `operator (ui)`.
+pub(super) fn request_actor(params: &Value) -> Result<String> {
+    let Some(actor) = params
+        .get("request_actor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok("operator".to_string());
+    };
+    if actor.len() > 200 || actor.chars().any(char::is_control) {
+        return Err(Error::rejected(
+            "request_actor must be 1-200 non-control characters",
+        ));
+    }
+    // `user` is the default daemon message source, `daemon` the event
+    // stream identity — neither names the human who decided (the same
+    // rule the approval store applies to approval evidence).
+    if ["user", "daemon"]
+        .iter()
+        .any(|s| actor.eq_ignore_ascii_case(s))
+    {
+        return Err(Error::rejected(
+            "request_actor must identify the deciding operator",
+        ));
+    }
+    Ok(actor.to_string())
+}
+
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
     for field in IDENTITY_FIELDS {
         if params.get(field).is_some() {
@@ -3634,6 +3944,12 @@ pub struct ServeOptions {
     /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
     /// an in-process test can shrink it after start.
     pub stall_sample_secs: Arc<AtomicU64>,
+    /// Stall-watch logic-time offset in seconds (`0` = wall clock).
+    /// Tests advance a running daemon's budgets; production never sets it.
+    pub stall_clock_offset: Arc<AtomicI64>,
+    /// Stall-watch loop pacing (`None` = 2s tick); tests run it hot
+    /// while the offset provides elapsed time.
+    pub stall_tick: Option<Duration>,
     /// CAD-113 slot configuration: `Some` is verbatim (tests);
     /// `None` resolves `[host]` in pm.yaml, falling back to defaults.
     pub slots: Option<SlotConfig>,
@@ -3670,6 +3986,10 @@ pub struct ServeOptions {
     /// is 30; `Some(0)` turns it off — test daemons stay hermetic, no
     /// tracker scan.
     pub report_router: Option<u64>,
+    /// CAD-140: the `gh` the approve-and-land transaction shells.
+    /// `None` is `gh` on PATH; fixtures inject their fake. Never
+    /// sourced from an RPC — the binary is fixed at boot.
+    pub delivery_gh: Option<PathBuf>,
     /// CAD-477 checkup period in seconds: `None` (production) is
     /// [`checkup::DEFAULT_CHECKUP_SECS`]; `Some(0)` turns it off — test
     /// daemons stay hermetic, no unattended lane judgements.
@@ -3706,6 +4026,11 @@ pub struct ServeOptions {
     /// recorded, the run never starts, and a restart reconciles the
     /// row. Production leaves it unset (always executes).
     pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-771: daemon-side publish dispatch observation (see Shared).
+    /// Tests register a fake; production leaves it unset until the send
+    /// adapter lands. Never set from PM, RPC, or worker input.
+    pub social_publish_sender:
+        Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
     /// Trusted test callback after the exact app executing claim, before
     /// Local commit, while the release lock remains held and SQL is dropped.
     /// False preserves executing uncertainty for restart reconciliation.
@@ -3802,6 +4127,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // unconfigured daemon leaves it unregistered and fails closed.
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
+    // CAD-798: the production publish transport registers only under
+    // explicit config (URL + 0600 credential file); default-off leaves
+    // the daemon without a sender and dispatch stays processing.
+    crate::platform::agenticos_external::publish_sender::attach_publish_sender(
+        state_dir, &mut opts,
+    )?;
     let lease = crate::lease::acquire_with_endpoint(
         state_dir,
         &hosted,
@@ -4157,6 +4488,24 @@ mod pty_retry_tests {
         assert_eq!(gate_backoff(one, u32::MAX), Duration::from_secs(6));
         let floor = Duration::from_millis(100);
         assert_eq!(gate_backoff(floor, 9), Duration::from_millis(600));
+    }
+}
+
+#[cfg(test)]
+mod stall_clock_tests {
+    use super::*;
+
+    #[test]
+    fn stall_clock_offset_defaults_to_wall() {
+        // Production-unreachable proof, part 1: a default-constructed
+        // daemon carries a zero offset (wall clock) and no tick override.
+        let opts = ServeOptions::default();
+        assert_eq!(
+            opts.stall_clock_offset.load(Ordering::SeqCst),
+            0,
+            "default offset must be wall"
+        );
+        assert_eq!(opts.stall_tick, None, "default tick must be unset");
     }
 }
 

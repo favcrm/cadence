@@ -10,7 +10,7 @@ export async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, si
   if (receipt.run_id !== run.id || receipt.slot !== "image"
     || receipt.binding_digest !== run.snapshot.capabilities?.image?.digest
     || receipt.result?.schema !== 1 || receipt.result.kind !== "media.generated.image"
-    || receipt.result.model !== "image-01" || receipt.result.aspect_ratio !== "1:1"
+    || receipt.result.model !== "openai/gpt-image-2.5" || receipt.result.aspect_ratio !== "1:1"
     || receipt.result.source_receipt_id !== (run.snapshot.source?.receipt_id ?? null)
     || receipt.result.source_post_id !== (run.snapshot.source?.post.id ?? null)
     || !meta || !imageTypes.has(meta.media_type) || meta.media_type !== receipt.result.asset_media_type
@@ -31,6 +31,13 @@ export async function retainedImage(receipt: ImageReceipt, run: WorkspaceRun, si
     .map(value => value.toString(16).padStart(2, "0")).join("");
   if (`sha256:${hash}` !== meta.digest) throw new Error("The retained image digest changed.");
   return `data:${meta.media_type};base64,${asset.base64}`;
+}
+
+/** Exact integer micros in a fixed-scale `d.dddddd` minor-unit amount;
+  * comparing floats would call equal charges different. */
+function amountMicros(amount: string): number | null {
+  const match = /^([0-9]+)\.([0-9]{6})$/.exec(amount);
+  return match ? Number(match[1]) * 1_000_000 + Number(match[2]) : null;
 }
 
 export function imageSubject(run: WorkspaceRun) {
@@ -90,5 +97,11 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
       <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
     </figure>}
     {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}
+    {visibleReceipt?.result?.charge && <p className="wa-muted">
+      Billed USD {visibleReceipt.result.charge.amount} at the provider&rsquo;s actual charge
+      {amountMicros(visibleReceipt.result.charge.amount) !== visibleReceipt.result.quoted_micros
+        && ` — approved rate was USD ${(visibleReceipt.result.quoted_micros / 1_000_000).toFixed(6)}`}
+      .
+    </p>}
   </section>;
 }

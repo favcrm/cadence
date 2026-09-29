@@ -23,6 +23,7 @@ const MAX_RESPONSE: u64 = 64 * 1024;
 const MAX_SERVICE_TOKEN: usize = 128;
 const RECORD: &str = "enrollment.json";
 const TRUSTED_ISSUER: &str = "trusted-issuer";
+const ACCESS_INGRESS: &str = "access-issuer.json";
 const DEVICE_VERSION: &str = "hosted-cadence-device.v1";
 const CONTINUITY_VERSION: &str = "hosted-cadence-continuity.v1";
 const CONTINUITY_RECORD: &str = "continuity.json";
@@ -37,7 +38,7 @@ enum EnrollmentSource {
 #[derive(Clone, Copy)]
 enum ChildSource<'a> {
     Service(&'a str),
-    Browser,
+    Browser(Option<&'a AccessIngress>),
 }
 fn is_service_source(source: &EnrollmentSource) -> bool {
     *source == EnrollmentSource::Service
@@ -621,6 +622,69 @@ fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Optional ingress credential. This is a Cloudflare Access pass for the
+/// pinned issuer only, never an AgenticOS identity or a board credential.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessIngress {
+    issuer: String,
+    client_id: String,
+    client_secret: String,
+}
+
+fn access_header(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn read_access_ingress(dir: &Path, issuer: &str) -> Result<Option<AccessIngress>> {
+    private_dir(dir, false)?;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(ACCESS_INGRESS))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(reject("Hosted Access ingress configuration cannot be read")),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject(
+            "Hosted Access ingress configuration must be a private owned file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(2049).read_to_end(&mut bytes)?;
+    if bytes.len() > 2048 {
+        return Err(reject("Hosted Access ingress configuration is too large"));
+    }
+    let access: AccessIngress = serde_json::from_slice(&bytes)
+        .map_err(|_| reject("Invalid hosted Access ingress configuration"))?;
+    if origin(&access.issuer, cfg!(test))?.as_str() != issuer
+        || !access_header(&access.client_id)
+        || !access_header(&access.client_secret)
+    {
+        return Err(reject(
+            "Hosted Access ingress configuration differs from pinned issuer",
+        ));
+    }
+    Ok(Some(access))
+}
+
+fn confirm_access_ingress(
+    dir: &Path,
+    issuer: &str,
+    expected: &Option<AccessIngress>,
+) -> Result<()> {
+    require_trusted_issuer(dir, issuer)?;
+    if &read_access_ingress(dir, issuer)? != expected {
+        return Err(reject(
+            "Hosted Access ingress configuration changed during enrollment",
+        ));
+    }
+    Ok(())
+}
 fn lock(dir: &Path, exclusive: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -763,15 +827,40 @@ fn save(dir: &Path, record: &Enrollment) -> Result<()> {
 }
 
 fn post(issuer: &str, path: &str, bearer: &str, body: Value) -> Result<Value> {
+    post_with_access(issuer, path, bearer, body, None)
+}
+
+fn post_with_access(
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    access: Option<&AccessIngress>,
+) -> Result<Value> {
+    if access.is_some() && path != "/v1/hosted-cadence/enroll" {
+        return Err(reject("Hosted Access ingress path refused"));
+    }
+    if access.is_some() {
+        origin(issuer, cfg!(test))?;
+    }
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None)
         .build();
-    let response = ureq::Agent::new_with_config(config)
+    let mut request = ureq::Agent::new_with_config(config)
         .post(format!("{issuer}{path}"))
-        .header("Authorization", format!("Bearer {bearer}"))
+        .header("Authorization", format!("Bearer {bearer}"));
+    if let Some(access) = access {
+        if access.issuer != issuer {
+            return Err(reject("Hosted Access ingress issuer changed"));
+        }
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    let response = request
         .send_json(body)
         .map_err(|_| reject("Issuer enrollment request failed"))?;
     if response.status() != 200 {
@@ -904,15 +993,44 @@ fn post_continuity(issuer: &str, path: &str, bearer: &str, body: Value) -> Resul
     serde_json::from_slice(&bytes).map_err(|_| ContinuityRefusal::Invalid.error())
 }
 
+#[cfg(test)]
 fn post_public(issuer: &str, path: &str, body: Value) -> Result<(u16, Value)> {
+    post_public_with_access(issuer, path, body, None)
+}
+
+fn post_public_with_access(
+    issuer: &str,
+    path: &str,
+    body: Value,
+    access: Option<&AccessIngress>,
+) -> Result<(u16, Value)> {
+    if access.is_some()
+        && !matches!(
+            path,
+            "/v1/hosted-cadence/device/code" | "/v1/hosted-cadence/device/token"
+        )
+    {
+        return Err(reject("Hosted Access ingress path refused"));
+    }
+    if access.is_some() {
+        origin(issuer, cfg!(test))?;
+    }
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None)
         .build();
-    let response = ureq::Agent::new_with_config(config)
-        .post(format!("{issuer}{path}"))
+    let mut request = ureq::Agent::new_with_config(config).post(format!("{issuer}{path}"));
+    if let Some(access) = access {
+        if access.issuer != issuer {
+            return Err(reject("Hosted Access ingress issuer changed"));
+        }
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    let response = request
         .send_json(body)
         .map_err(|_| reject("Hosted browser request failed"))?;
     let status = response.status().as_u16();
@@ -1028,17 +1146,20 @@ pub fn enroll_browser(
     private_dir(dir, false)?;
     let _guard = lock(dir, true)?;
     require_trusted_issuer(dir, &issuer)?;
+    let access = read_access_ingress(dir, &issuer)?;
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(|_| reject("Unable to create PKCE verifier"))?;
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
-    let (status, code) = post_public(
+    confirm_access_ingress(dir, &issuer, &access)?;
+    let (status, code) = post_public_with_access(
         &issuer,
         "/v1/hosted-cadence/device/code",
         json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
             "client_label":"Cadence local team","requested_capabilities":["bridge.enroll","results.submit"],
             "code_challenge":challenge}),
+        access.as_ref(),
     )?;
     if status != 200 {
         return Err(reject("Hosted issuer refused device authorization"));
@@ -1054,11 +1175,12 @@ pub fn enroll_browser(
         if Instant::now() >= deadline {
             return Err(reject("Hosted browser authorization expired; start again"));
         }
-        require_trusted_issuer(dir, &issuer)?;
-        let (status, response) = post_public(
+        confirm_access_ingress(dir, &issuer, &access)?;
+        let (status, response) = post_public_with_access(
             &issuer,
             "/v1/hosted-cadence/device/token",
             json!({"device_code":device,"code_verifier":verifier}),
+            access.as_ref(),
         )?;
         if Instant::now() >= deadline {
             return Err(reject("Hosted browser authorization expired; start again"));
@@ -1075,7 +1197,7 @@ pub fn enroll_browser(
         }
     };
     browser_grant(&grant, org, &audience)?;
-    require_trusted_issuer(dir, &issuer)?;
+    confirm_access_ingress(dir, &issuer, &access)?;
     enroll_child_locked(
         &issuer,
         org,
@@ -1083,7 +1205,7 @@ pub fn enroll_browser(
         client_agent,
         dir,
         &grant,
-        ChildSource::Browser,
+        ChildSource::Browser(access.as_ref()),
     )
 }
 
@@ -1168,16 +1290,21 @@ fn enroll_child_locked(
     let bridge = &grant["credential"];
     let path = match source {
         ChildSource::Service(_) => "/v1/hosted-cadence/service/enroll",
-        ChildSource::Browser => "/v1/hosted-cadence/enroll",
+        ChildSource::Browser(_) => "/v1/hosted-cadence/enroll",
     };
-    let enrollment = post(
+    let access = match source {
+        ChildSource::Service(_) => None,
+        ChildSource::Browser(access) => access,
+    };
+    let enrollment = post_with_access(
         issuer,
         path,
         field(bridge, "access_token")?,
         json!({"version":VERSION,"organization_id":org,"audience":audience,
             "client_label":"Cadence local team", "agents":[{
                 "client_agent_id":client_agent,"role":"implementer",
-                "requested_capabilities":["results.submit"]}]}),
+            "requested_capabilities":["results.submit"]}]}),
+        access,
     )?;
     let enrolled_at = now()?;
     let agents = enrollment["agents"]
@@ -1205,11 +1332,11 @@ fn enroll_child_locked(
         child_token: field(child_credential, "access_token")?.into(),
         source: match source {
             ChildSource::Service(_) => EnrollmentSource::Service,
-            ChildSource::Browser => EnrollmentSource::Browser,
+            ChildSource::Browser(_) => EnrollmentSource::Browser,
         },
         service_token: match source {
             ChildSource::Service(credential) => Some(credential.to_owned()),
-            ChildSource::Browser => None,
+            ChildSource::Browser(_) => None,
         },
     };
     if record.organization_id != org
@@ -1273,6 +1400,52 @@ mod tests {
         fs::write(dir.join(TRUSTED_ISSUER), format!("{issuer}\n")).unwrap();
         fs::set_permissions(dir.join(TRUSTED_ISSUER), fs::Permissions::from_mode(0o600)).unwrap();
     }
+    fn access_file(dir: &Path, issuer: &str) {
+        fs::write(
+            dir.join(ACCESS_INGRESS),
+            json!({"issuer":issuer,"client_id":"test-id.access","client_secret":"test-secret"})
+                .to_string(),
+        )
+        .unwrap();
+        fs::set_permissions(dir.join(ACCESS_INGRESS), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn access_ingress_file_is_opt_in_private_and_exactly_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        let issuer = "https://issuer.example.test";
+        trust(&dir, issuer);
+        assert!(read_access_ingress(&dir, issuer).unwrap().is_none());
+        access_file(&dir, issuer);
+        let pinned = read_access_ingress(&dir, issuer).unwrap();
+        assert!(pinned.is_some());
+        assert!(confirm_access_ingress(&dir, issuer, &pinned).is_ok());
+        fs::set_permissions(dir.join(ACCESS_INGRESS), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_access_ingress(&dir, issuer).is_err());
+        fs::set_permissions(dir.join(ACCESS_INGRESS), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(dir.join(ACCESS_INGRESS),
+            json!({"issuer":"https://other.example.test","client_id":"test-id.access","client_secret":"test-secret"}).to_string()).unwrap();
+        assert!(read_access_ingress(&dir, issuer).is_err());
+        access_file(&dir, issuer);
+        fs::write(
+            dir.join(ACCESS_INGRESS),
+            json!({"issuer":issuer,"client_id":"test-id.access","client_secret":"changed"})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(confirm_access_ingress(&dir, issuer, &pinned).is_err());
+        fs::write(
+            dir.join(ACCESS_INGRESS),
+            json!({"issuer":issuer,"client_id":"test-id.access","client_secret":"bad\nsecret"})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(read_access_ingress(&dir, issuer).is_err());
+        fs::remove_file(dir.join(ACCESS_INGRESS)).unwrap();
+        std::os::unix::fs::symlink("trusted-issuer", dir.join(ACCESS_INGRESS)).unwrap();
+        assert!(read_access_ingress(&dir, issuer).is_err());
+    }
     fn pin(board: &str) -> DestinationPin {
         DestinationPin::new("ws_real", board, "hsp_subject", "hca_agent").unwrap()
     }
@@ -1312,6 +1485,7 @@ mod tests {
         let dir = root.path().join("enroll");
         let enrolled = record(u64::MAX);
         trust(&dir, &enrolled.issuer);
+        access_file(&dir, &enrolled.issuer);
         save(&dir, &enrolled).unwrap();
         let outbox = ResultOutbox::open(&root.path().join("outbox")).unwrap();
         let command = ResultCommand::parse_json(
@@ -1514,6 +1688,15 @@ mod tests {
         bearer: &str,
         expected_audience: &str,
     ) -> std::net::TcpStream {
+        request_with_audience_access(listener, path, bearer, expected_audience, false)
+    }
+    fn request_with_audience_access(
+        listener: &TcpListener,
+        path: &str,
+        bearer: &str,
+        expected_audience: &str,
+        expect_access: bool,
+    ) -> std::net::TcpStream {
         let (socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1523,6 +1706,8 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), format!("POST {path} HTTP/1.1"));
         let mut authorization = String::new();
+        let mut access_id = None;
+        let mut access_secret = None;
         let mut length = 0;
         loop {
             line.clear();
@@ -1534,11 +1719,25 @@ mod tests {
             if key.eq_ignore_ascii_case("authorization") {
                 authorization = value.trim().into();
             }
+            if key.eq_ignore_ascii_case("cf-access-client-id") {
+                access_id = Some(value.trim().to_owned());
+            }
+            if key.eq_ignore_ascii_case("cf-access-client-secret") {
+                access_secret = Some(value.trim().to_owned());
+            }
             if key.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap();
             }
         }
         assert_eq!(authorization, format!("Bearer {bearer}"));
+        assert_eq!(
+            access_id.as_deref(),
+            expect_access.then_some("test-id.access")
+        );
+        assert_eq!(
+            access_secret.as_deref(),
+            expect_access.then_some("test-secret")
+        );
         let mut body = vec![0; length];
         reader.read_exact(&mut body).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -1547,6 +1746,13 @@ mod tests {
         socket
     }
     fn public_request(listener: &TcpListener, path: &str) -> (std::net::TcpStream, Value) {
+        public_request_access(listener, path, false)
+    }
+    fn public_request_access(
+        listener: &TcpListener,
+        path: &str,
+        expect_access: bool,
+    ) -> (std::net::TcpStream, Value) {
         let (socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1556,6 +1762,8 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), format!("POST {path} HTTP/1.1"));
         let mut length = 0;
+        let mut access_id = None;
+        let mut access_secret = None;
         loop {
             line.clear();
             reader.read_line(&mut line).unwrap();
@@ -1566,10 +1774,24 @@ mod tests {
             assert!(!key.eq_ignore_ascii_case("authorization"));
             assert!(!key.eq_ignore_ascii_case("cookie"));
             assert!(!key.eq_ignore_ascii_case("origin"));
+            if key.eq_ignore_ascii_case("cf-access-client-id") {
+                access_id = Some(value.trim().to_owned());
+            }
+            if key.eq_ignore_ascii_case("cf-access-client-secret") {
+                access_secret = Some(value.trim().to_owned());
+            }
             if key.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap();
             }
         }
+        assert_eq!(
+            access_id.as_deref(),
+            expect_access.then_some("test-id.access")
+        );
+        assert_eq!(
+            access_secret.as_deref(),
+            expect_access.then_some("test-secret")
+        );
         let mut body = vec![0; length];
         reader.read_exact(&mut body).unwrap();
         (socket, serde_json::from_slice(&body).unwrap())
@@ -2233,6 +2455,86 @@ mod tests {
     }
 
     #[test]
+    fn access_ingress_rejects_foreign_host_path_and_redirect_without_forwarding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker = TcpListener::bind("127.0.0.1:0").unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let access = AccessIngress {
+            issuer: issuer.clone(),
+            client_id: "test-id.access".into(),
+            client_secret: "test-secret".into(),
+        };
+        assert!(post_public_with_access(
+            "https://other.example.test",
+            "/v1/hosted-cadence/device/code",
+            json!({}),
+            Some(&access),
+        )
+        .is_err());
+        assert!(post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/service/exchange",
+            json!({}),
+            Some(&access),
+        )
+        .is_err());
+        assert!(post_with_access(
+            &issuer,
+            "/v1/hosted-cadence/service/enroll",
+            BRIDGE,
+            json!({}),
+            Some(&access),
+        )
+        .is_err());
+        let location = format!("http://{}/stolen", attacker.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, _) =
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
+            write!(socket, "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let error = post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/device/code",
+            json!({}),
+            Some(&access),
+        )
+        .unwrap_err();
+        assert!(!format!("{error}").contains("test-secret"));
+        server.join().unwrap();
+        assert!(attacker.accept().is_err());
+    }
+
+    #[test]
+    fn access_ingress_challenge_cannot_create_or_save_a_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, _) =
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
+            write!(socket, "HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: 7\r\nconnection: close\r\n\r\ndenied!").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        access_file(&dir, &issuer);
+        let error = enroll_browser(
+            &issuer,
+            "ws_real",
+            "https://real.board.example.test",
+            "worker",
+            &dir,
+            |_, _| panic!("Access challenge returned a device code"),
+        )
+        .unwrap_err();
+        assert!(!format!("{error}").contains("test-secret"));
+        assert!(!dir.join(RECORD).exists());
+        assert!(server.join().unwrap().accept().is_err());
+    }
+
+    #[test]
     fn browser_public_request_ignores_ambient_proxy() {
         if std::env::var_os("CAD729_PROXY_PROOF_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
@@ -2260,11 +2562,28 @@ mod tests {
             let (mut socket, body) = public_request(&listener, "/v1/hosted-cadence/device/code");
             assert_eq!(body["organization_id"], "ws_real");
             respond(&mut socket, &browser_code(60));
+            let (mut socket, body) =
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
+            assert_eq!(body["organization_id"], "ws_real");
+            respond(&mut socket, &browser_code(60));
         });
         let (status, _) = post_public(
             &issuer,
             "/v1/hosted-cadence/device/code",
             json!({"organization_id":"ws_real"}),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let access = AccessIngress {
+            issuer: issuer.clone(),
+            client_id: "test-id.access".into(),
+            client_secret: "test-secret".into(),
+        };
+        let (status, _) = post_public_with_access(
+            &issuer,
+            "/v1/hosted-cadence/device/code",
+            json!({"organization_id":"ws_real"}),
+            Some(&access),
         )
         .unwrap();
         server.join().unwrap();
@@ -2440,7 +2759,7 @@ mod tests {
         let at = now().unwrap();
         let server = thread::spawn(move || {
             let (mut code_socket, code_request) =
-                public_request(&listener, "/v1/hosted-cadence/device/code");
+                public_request_access(&listener, "/v1/hosted-cadence/device/code", true);
             assert_eq!(code_request["version"], DEVICE_VERSION);
             assert_eq!(code_request["organization_id"], "ws_real");
             assert_eq!(code_request["audience"], audience);
@@ -2458,7 +2777,7 @@ mod tests {
                 "expires_in":600,"interval":5}),
             );
             let (mut token_socket, token_request) =
-                public_request(&listener, "/v1/hosted-cadence/device/token");
+                public_request_access(&listener, "/v1/hosted-cadence/device/token", true);
             assert_eq!(
                 token_request["device_code"],
                 format!("hcd_{}", "A".repeat(43))
@@ -2478,8 +2797,13 @@ mod tests {
                 "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
                     "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}}),
             );
-            let mut child =
-                request_with_audience(&listener, "/v1/hosted-cadence/enroll", BRIDGE, audience);
+            let mut child = request_with_audience_access(
+                &listener,
+                "/v1/hosted-cadence/enroll",
+                BRIDGE,
+                audience,
+                true,
+            );
             respond(
                 &mut child,
                 &json!({"version":VERSION,"organization_id":"ws_real",
@@ -2494,6 +2818,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
         trust(&dir, &issuer);
+        access_file(&dir, &issuer);
         let info = enroll_browser(&issuer, "ws_real", audience, "worker", &dir, |url, code| {
             assert_eq!(
                 url,
@@ -2514,6 +2839,9 @@ mod tests {
         assert!(!fs::read_to_string(dir.join(RECORD))
             .unwrap()
             .contains(BRIDGE));
+        assert!(!fs::read_to_string(dir.join(RECORD))
+            .unwrap()
+            .contains("test-secret"));
         assert!(renew(&dir).is_err());
         assert_eq!(current(&dir).unwrap().agent_id(), "hca_agent");
         let mut restart = std::process::Command::new(std::env::current_exe().unwrap());

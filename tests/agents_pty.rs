@@ -1922,6 +1922,19 @@ fn agent_list_scopes_to_callers_group() {
     // Worker inside a pane: sees its group — root + itself.
     let v = list(Some("w1"), &[]);
     assert_eq!(aliases(&v), vec!["pm1", "w1"], "{v}");
+    let visible_live = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| {
+            a["dead"] != true
+                && !matches!(
+                    a["state"].as_str(),
+                    Some("stopping" | "stopped" | "attention" | "offline")
+                )
+        })
+        .count();
+    assert_eq!(v["live"], visible_live, "scoped count must match rows: {v}");
     let root = v["agents"]
         .as_array()
         .unwrap()
@@ -3129,8 +3142,10 @@ fn agent_set_rejects_non_allowlisted_params() {
 fn pty_unrendered_worker_result_requeues_then_parks() {
     // CAD-185: the retry waits (5s after each miss, 5s gate back-off) were
     // most of this test's ~41s and nothing here asserts their length — the
-    // count, flags, park and survival are the contract. 1s keeps them.
-    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
+    // count, flags, park and survival are the contract. 0.5s keeps them
+    // (gaps stay under the 4.0s `assert_retry_gaps_under` bound); the
+    // floor exists to keep a busy pane's gate from tight-looping.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "0.5");
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
@@ -3737,6 +3752,9 @@ fn pty_claude_forbidden_prefixes_reject_prewrite() {
 /// blocks sends until the worker resolves it.
 #[test]
 fn pty_claude_busy_and_approval_gate_sends() {
+    // Nothing here asserts gate-backoff length — the reasons, markers
+    // and menu answers are the contract (CAD-185 precedent).
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let d = TestDaemon::start();
     let mock = d.mock_claude_tui();
     d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
@@ -4714,13 +4732,24 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
 /// Claude session must never be dropped on a transient failure.
 #[test]
 fn pty_claude_resume_timeout_keeps_session() {
+    // The open deadline (30s production) is the behaviour's bound, not
+    // its value — nothing here asserts the length, only what a timeout
+    // proves: `timed out`, no `session_resume_failed`, session kept.
+    // Process env is shared across parallel tests, so the shrunken
+    // deadline rides in a child process (3s).
+    if !in_own_process(
+        "pty_claude_resume_timeout_keeps_session",
+        &[("CADENCE_PTY_OPEN_DEADLINE_SECS", "3")],
+    ) {
+        return;
+    }
     let d = TestDaemon::start();
     let mock = d.mock_claude_tui();
     // The pane stays alive but never publishes its session — the open
-    // wait runs to the claude profile's deadline.
+    // wait runs to the profile's deadline.
     mock_knob(&mock.dir, "MOCK_CLAUDE_NO_REGISTRY", Some("1"));
     d.register_claude_pty("cl", json!({"session": "claude-session-1"}));
-    let agent = d.wait_agent("cl", "attention", 60);
+    let agent = d.wait_agent("cl", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
     assert!(err.contains("timed out"), "{err}");
     assert!(
@@ -4814,6 +4843,9 @@ fn pty_cursor_forbidden_prefixes_reject_prewrite() {
 /// the worker resolves it.
 #[test]
 fn pty_cursor_busy_and_approval_gate_sends() {
+    // Nothing here asserts gate-backoff length — the reasons, markers
+    // and menu answers are the contract (CAD-185 precedent).
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let d = TestDaemon::start();
     let mock = d.mock_cursor_tui();
     d.register_cursor_pty("cu", json!({"auto_ready": "verified"}));
@@ -5400,15 +5432,14 @@ fn cadence_cli(state: &Path, args: &[&str], envs: &[(String, String)]) -> (bool,
 
 /// A turn that ends at the idle prompt without reporting is detected
 /// by the sampled probe: `turn_silent_end` fires once per message
-/// carrying the age and the admitting probe, the views flag it
-/// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
-/// needs-me row naming the `agent attach` remedy). The message itself is
-/// never auto-resolved. Since CAD-565 a nudge is bound to a live turn,
-/// so on an idle pane it gate-waits and dies with its bound turn — while
-/// a plain follow-up send queues behind the unreported turn until it is
-/// reported.
+/// carrying the age and the admitting probe. Timing is the behaviour
+/// (once per message over several sweeps), so this test keeps the
+/// production-shaped `silent_end_secs: 4` plus the sweep sleep and
+/// proves exactly-once. Views and recovery live in
+/// `pty_silent_end_views_and_recovery` below on a shrunken gate
+/// backoff, so this file pays the wall clock once, not per assertion.
 #[test]
-fn pty_silent_end_fires_once_and_recovers() {
+fn pty_silent_end_fires_once() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
     stall_sample(1);
@@ -5419,7 +5450,7 @@ fn pty_silent_end_fires_once_and_recovers() {
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
         .unwrap();
-    let token = pty_token(&d, "w1", "ms9");
+    let _token = pty_token(&d, "w1", "ms9");
 
     // The stub pane returns to `» stub ready` after the submission —
     // the message still runs but the probe reads idle.
@@ -5432,18 +5463,73 @@ fn pty_silent_end_fires_once_and_recovers() {
         "{e}"
     );
 
-    // Once per message: the pane stays idle but no second event fires.
-    // CAD-184 kept sleep: timing is the behaviour (once per message over
-    // several sweeps).
-    thread::sleep(Duration::from_secs(6));
+    // Once per message: three more observed sweeps fire nothing. The
+    // wait is bound to ticker iterations, not wall time (CAD-184 kept a
+    // sleep here; a stalled scheduler would pass a sleep vacuously).
+    let captures = d.stub_pane_file(&mock, "w1", "captures");
+    let from = std::fs::read_to_string(&captures).unwrap_or_default().len();
+    wait_capture_advance(&captures, from, 3, 15);
     assert_eq!(wait_event_count(&d, "w1", "turn_silent_end", 1, 2).len(), 1);
+    stall_sample(0);
+}
+
+/// The silent-end views and recovery path: the views flag a silent-ended
+/// turn (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
+/// needs-me row naming the `agent attach` remedy). The message itself is
+/// never auto-resolved. Since CAD-565 a nudge is bound to a live turn,
+/// so on an idle pane it gate-waits and dies with its bound turn — while
+/// a plain follow-up send queues behind the unreported turn until it is
+/// reported. Once-per-message timing is proven by `pty_silent_end_fires_once`
+/// above, so this test skips that sweep sleep; the silent budget elapses
+/// on the injected clock while hot ticks drive the scheduler; and nothing
+/// here asserts the gate-backoff length (CAD-185 precedent), so the retry
+/// base is shrunk to 0.5s (30s cap becomes 3s) and the cancelled-wait
+/// bound drops from 45s to 15s.
+#[test]
+fn pty_silent_end_views_and_recovery() {
+    // Shrink gate backoff before the daemon clones this test's provider
+    // env: base 0.5s caps at 3s, so the post-report cancelled wait below
+    // clears in seconds, not past the production 30s cap. The claim loop
+    // is actor-side wall machinery — outside the stall-clock slice.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "0.5");
+    let offset = stall_clock_offset();
+    let mut opts = daemon_opts();
+    opts.stall_clock_offset = std::sync::Arc::clone(&offset);
+    opts.stall_tick = Some(Duration::from_millis(50));
+    let d = TestDaemon::start_opts(opts);
+    let mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 3600, "stall_secs": 14400}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.send("w1", json!({"text": "do work", "message": "ms9"}))
+        .unwrap();
+    let token = pty_token(&d, "w1", "ms9");
+
+    // The stub pane returns to `» stub ready` after the submission —
+    // the message still runs but the probe reads idle. The budget
+    // elapses on the clock; the streak lands on hot ticks.
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let e = d.wait_event("w1", "turn_silent_end", 10);
+    assert_eq!(e["payload"]["message"], "ms9", "{e}");
+    assert!(
+        e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 3600,
+        "{e}"
+    );
+    assert_eq!(e["payload"]["probe"]["idle"], true, "{e}");
+    assert!(
+        e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
+        "{e}"
+    );
 
     // The views flag it: show/list carry silent_ended + ended_secs,
     // status renders `ended?:`, and the overview needs-me row names
     // the ready-gated recovery command.
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(show["silent_ended"], true, "{show}");
-    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 4, "{show}");
+    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 3600, "{show}");
     let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
         .as_array()
         .unwrap()
@@ -5517,8 +5603,9 @@ fn pty_silent_end_fires_once_and_recovers() {
     // ms9's report ends the turn the nudge is bound to: the next claim
     // skips it (`skipped_inactive` + `nudge_cancelled`) — it can never
     // land as stale input in the turn ms10 is about to start. The claim
-    // may sit out a gate backoff first, so wait past the 30s cap.
-    let n = d.wait_message("w1", &nudge_id, &["cancelled"], 45);
+    // may sit out a gate backoff first; with the 0.5s test retry base the
+    // cap is 3s, so a 15s bound (5x) replaces the production 45s wait.
+    let n = d.wait_message("w1", &nudge_id, &["cancelled"], 15);
     assert_eq!(n["result"]["via"], "skipped_inactive", "{n}");
     assert!(
         d.events("w1").iter().any(|e| {

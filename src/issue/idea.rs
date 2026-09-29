@@ -59,6 +59,9 @@ pub struct Proposed {
 }
 
 /// The operator's decision. This is the record — not a chat line.
+/// `actor` (CAD-140) names who decided — the board's `request_actor`
+/// (a proven tailnet login, `operator (ui)` on loopback) or
+/// `operator` for direct calls. `source` stays the authority class.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Decision {
     pub id: String,
@@ -67,6 +70,8 @@ pub struct Decision {
     pub action: String,
     pub source: String,
     pub recorded_via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +413,22 @@ pub fn set_status_tags(
     status: &str,
     extra_tag: Option<&str>,
     drop_tags: &[&str],
+    done_reason: Option<&str>,
+) -> Result<()> {
+    set_status_tags_if_rev(pm, id, status, extra_tag, drop_tags, done_reason, None)
+}
+
+/// [`set_status_tags`] bound to the revision shown (CAD-140): the
+/// revision check runs inside the tracker lock at the write, so a
+/// stale operator decision refuses instead of landing.
+pub fn set_status_tags_if_rev(
+    pm: &Pm,
+    id: &str,
+    status: &str,
+    extra_tag: Option<&str>,
+    drop_tags: &[&str],
+    done_reason: Option<&str>,
+    if_rev: Option<&str>,
 ) -> Result<()> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, _) = write::load_front(&dir)?;
@@ -425,7 +446,14 @@ pub fn set_status_tags(
         format!("status={status}"),
         format!("tags={}", tags.join(",")),
     ];
-    write::set_fields(pm, &[id.to_string()], &pairs, "daemon")?;
+    let out =
+        write::set_fields_if_rev(pm, &[id.to_string()], &pairs, "daemon", done_reason, if_rev)?;
+    if out.get("conflict").is_some() {
+        return Err(Error::invalid(
+            "stale_view",
+            format!("{id} changed since it was shown — re-read it before deciding"),
+        ));
+    }
     Ok(())
 }
 
@@ -444,6 +472,14 @@ fn valid_park_date(date: &str) -> bool {
 /// Record the operator's decision and, on approve, create exactly the
 /// proposed backlog children. A second approve or reject returns the
 /// existing object. A park can still be approved or rejected later.
+///
+/// CAD-140: `expect_rev` binds the decision to the issue shown and
+/// `actor` names who decided (the daemon caller threads the board's
+/// `request_actor`). The status/tags write carries the revision — the
+/// compare half of compare-and-swap, inside the tracker lock — and
+/// runs BEFORE any child is created, so a stale decision refuses
+/// with nothing written.
+#[allow(clippy::too_many_arguments)]
 pub fn decide(
     pm: &Pm,
     records: &mut BTreeMap<String, Record>,
@@ -451,6 +487,8 @@ pub fn decide(
     action: &str,
     reason: Option<&str>,
     park_until: Option<&str>,
+    expect_rev: &str,
+    actor: &str,
 ) -> Result<Value> {
     let (project, proposed, prior) = {
         let rec = records.get(issue).ok_or_else(|| {
@@ -516,25 +554,41 @@ pub fn decide(
         .as_ref()
         .map(|d| d.children.clone())
         .unwrap_or_default();
+    // The revision-bound write first: a stale view refuses here with
+    // nothing created and nothing recorded.
     if action == "approve" {
-        children = create_children(pm, issue, &project, &proposed, &children)?;
-        set_status_tags(
+        // CAD-756: the approval decision IS the done evidence — the
+        // children minted below are the work's continuation.
+        set_status_tags_if_rev(
             pm,
             issue,
             "done",
             Some("planned"),
             &["plan-ready", "parked", "idea-stale"],
+            Some("idea plan approved — children minted"),
+            Some(expect_rev),
         )?;
+        children = create_children(pm, issue, &project, &proposed, &children)?;
     } else if action == "reject" {
-        set_status_tags(
+        set_status_tags_if_rev(
             pm,
             issue,
             "dropped",
             None,
             &["plan-ready", "parked", "idea-stale"],
+            None,
+            Some(expect_rev),
         )?;
     } else {
-        set_status_tags(pm, issue, "review", Some("parked"), &["plan-ready"])?;
+        set_status_tags_if_rev(
+            pm,
+            issue,
+            "review",
+            Some("parked"),
+            &["plan-ready"],
+            None,
+            Some(expect_rev),
+        )?;
     }
     let decision = Decision {
         id: format!("idea-{}-{action}", issue.to_ascii_lowercase()),
@@ -543,6 +597,7 @@ pub fn decide(
         action: action.to_string(),
         source: "operator".to_string(),
         recorded_via: "operator_connection".to_string(),
+        actor: Some(actor.to_string()),
         reason: reason.map(str::to_string),
         park_until: park_until
             .map(|s| s.trim().to_string())

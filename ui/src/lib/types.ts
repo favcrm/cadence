@@ -1341,3 +1341,84 @@ export interface UpdateBanner {
   waiting: WaitingTurn[];
   count: number;
 }
+
+/**
+ * One reviewed provider capability (CAD-585/CAD-688): the exact tools,
+ * scopes and effect the provider's reviewed contract declares for a
+ * versioned capability id. Describes compatibility only — never
+ * execution authority.
+ */
+export interface ConnectionCapability {
+  id: string;
+  version: number;
+  tools: string[];
+  scopes: string[];
+  effect: string;
+  semantics: string;
+}
+
+/**
+ * One provider's reviewed connection descriptor (CAD-688): how it
+ * connects (`enrollment_shapes`), its built-in accounts and the
+ * capabilities it declares. `descriptor` is null when the provider
+ * has no reviewed metadata — then it stays unavailable.
+ */
+export interface ConnectionProviderDescriptor {
+  schema: number;
+  provider: string;
+  revision: string;
+  enrollment_shapes: string[];
+  builtin_accounts: string[];
+  capabilities: ConnectionCapability[];
+}
+
+/** `GET /api/connection-providers` row — one registered provider. */
+export interface ConnectionProvider {
+  provider: string;
+  descriptor: ConnectionProviderDescriptor | null;
+  descriptor_available: boolean;
+  manifest_status: string;
+  reviewed_pin: string | null;
+  reported_pin: string | null;
+  /** Always false: listing providers never checks the network. */
+  network_checked: boolean;
+  registration_digest: string | null;
+}
+
+export interface ConnectionProvidersPayload {
+  providers: ConnectionProvider[];
+}
+
+/**
+ * One connection row (CAD-688): an exact provider account in this
+ * workspace. `kind` is `builtin` (always present, e.g. Local outbox)
+ * or `enrolled` (an operator-enrolled credential). Carries metadata
+ * only — never secret bytes.
+ */
+export interface Connection {
+  id: string;
+  provider: string;
+  account: string;
+  kind: "builtin" | "enrolled";
+  revision: number | null;
+  registration_digest: string | null;
+  scopes: string[];
+  status: {
+    adapter_registered: boolean;
+    descriptor_available: boolean;
+    custody_available: boolean;
+    manifest_status: string;
+    reviewed_pin: string | null;
+    reported_pin: string | null;
+    execution_authority: boolean;
+    network_checked: boolean;
+  };
+}
+
+export interface ConnectionsPayload {
+  connections: Connection[];
+}
+
+export interface ConnectionPayload {
+  connection: Connection;
+}

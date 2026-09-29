@@ -2,7 +2,9 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, pi_policy_pm, plant_member_pane, LaneShell, TestDaemon};
+use common::{
+    daemon_opts, pi_policy_pm, plant_member_pane, test_port, LaneShell, PortLease, TestDaemon,
+};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,6 +16,9 @@ struct Board {
     root: tempfile::TempDir,
     daemon: TestDaemon,
     port: u16,
+    // The pick's fence: held while the board lives so no parallel test
+    // steals the port (a `forced_port` board shares its rival's lease).
+    _port_lease: Option<PortLease>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
 }
@@ -55,11 +60,8 @@ impl Board {
         after_probe: impl FnOnce(u16),
     ) -> Self {
         let BoardSetup { root, pm, daemon } = setup;
-        let port = forced_port.unwrap_or_else(|| {
-            (3110..3200)
-                .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-                .unwrap()
-        });
+        let lease = forced_port.is_none().then(test_port);
+        let port = forced_port.unwrap_or_else(|| lease.as_ref().unwrap().port);
         assert!((3110..3200).contains(&port));
         after_probe(port);
         let stop = Arc::new(AtomicBool::new(false));
@@ -67,6 +69,7 @@ impl Board {
             root,
             daemon,
             port,
+            _port_lease: lease,
             stop,
             thread: None,
         };
@@ -106,11 +109,8 @@ impl Board {
                     Ok(Err(error)) => eprintln!("board startup contention: {error}"),
                     unexpected => panic!("board bind failure returned {unexpected:?}"),
                 }
-                board.port = board
-                    .port
-                    .checked_add(1)
-                    .filter(|port| *port < 3200)
-                    .expect("board startup exhausted permitted ports");
+                board._port_lease = Some(test_port());
+                board.port = board._port_lease.as_ref().unwrap().port;
                 board.stop.store(false, Ordering::SeqCst);
             } else {
                 panic!("board startup notification {notification:?}; worker {result:?}");

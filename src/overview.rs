@@ -2477,6 +2477,7 @@ fn overview_from(
         let line_times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
         let mut clock = StatusClock::new(line_times.as_ref());
         let mut intake: Vec<Item> = Vec::new();
+        let mut backlog_stale: Vec<Item> = Vec::new();
         let escalations = crate::master::escalations(state_dir);
         // CAD-484: a next-action row hides only when its lane is
         // provably not at rest — the daemon answered and the lane is
@@ -2766,6 +2767,32 @@ fn overview_from(
                     .since(clock.since(v)),
                 );
             }
+            // CAD-812: a `backlog`/`ready` leaf the groom pass flagged
+            // `needs-triage` — the requirement may have drifted. Surfaces
+            // under `blocked_ready` (a flag, not a pick gate): oldest
+            // first, for the owner to re-confirm or re-scope. Collected
+            // and capped like intake so a pile of stale tickets cannot
+            // bury real work.
+            if matches!(v.status.as_str(), "backlog" | "ready")
+                && v.issue.front.tags.iter().any(|t| t == "needs-triage")
+            {
+                let since = v.issue.front.last_groomed_at.as_deref().and_then(parse_iso);
+                backlog_stale.push(
+                    item(
+                        82,
+                        "backlog_stale",
+                        &format!("{id} needs-triage — groom flagged drift"),
+                        age,
+                        project,
+                        None,
+                        &cmd_issue_show(id),
+                    )
+                    .about("issue", id)
+                    .for_agent(owner)
+                    .owned_by(Some(owner))
+                    .since(since),
+                );
+            }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
             // (notes-derived counts too) is what clears it.
@@ -2831,6 +2858,31 @@ fn overview_from(
                 .about("report", "intake-overflow"),
             );
         }
+        // Cap the stale-backlog block the same way — oldest first, one
+        // summary row past the cap.
+        backlog_stale.sort_by_key(|i| std::cmp::Reverse(i.age));
+        let stale_extra = backlog_stale
+            .len()
+            .checked_sub(report::NEEDS_ME_CAP)
+            .filter(|n| *n > 0);
+        if stale_extra.is_some() {
+            backlog_stale.truncate(report::NEEDS_ME_CAP);
+        }
+        if let Some(extra) = stale_extra {
+            backlog_stale.push(
+                item(
+                    82,
+                    "backlog_stale",
+                    &format!("… {extra} more stale backlog items"),
+                    0,
+                    "",
+                    None,
+                    "cadence issue ls --project <p>",
+                )
+                .about("issue", "backlog-stale-overflow"),
+            );
+        }
+        needs.extend(backlog_stale);
         needs.extend(intake);
         needs.extend(delivery_items(state_dir, now));
         if !clock.skipped.is_empty() {

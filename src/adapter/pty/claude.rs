@@ -30,7 +30,7 @@ use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::profile::{DraftView, TuiProfile};
+use super::profile::{open_deadline_override, DraftView, TuiProfile};
 use super::{descends_from, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Claude TUI to publish its session
@@ -816,7 +816,7 @@ impl TuiProfile for ClaudeProfile {
     }
 
     fn open_deadline(&self) -> Duration {
-        OPEN_DEADLINE
+        open_deadline_override().unwrap_or(OPEN_DEADLINE)
     }
 
     fn analyze(&self, screen: &str, cursor: Option<(u32, u32)>) -> Probe {

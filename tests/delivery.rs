@@ -1940,12 +1940,36 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
             json!({"issue": "D-2", "phase": "enqueued", "sha": b}),
         ),
         ("delivery_decline", json!({"issue": "D-2", "reason": "no"})),
+        // CAD-140: the approve transaction refuses agents the same
+        // way — and a forged identity field never names the decider.
+        ("delivery_approve", json!({"issue": "D-2", "sha": c})),
+        (
+            "delivery_approve",
+            json!({"issue": "D-2", "sha": c, "actor": "r1"}),
+        ),
+        (
+            "delivery_approve",
+            json!({"issue": "D-2", "sha": c, "by": "operator"}),
+        ),
+        (
+            "delivery_approve",
+            json!({"issue": "D-2", "sha": c, "request_actor": "daemon"}),
+        ),
+        (
+            "delivery_decline",
+            json!({"issue": "D-2", "reason": "no", "actor": "r1"}),
+        ),
     ] {
         for how in ["self", "detached", "detached-bare"] {
             let r = lf.r1.rpc(how, method, params.clone());
             assert_eq!(r["ok"], false, "{how} {method}: {r}");
             let msg = r["error"]["message"].as_str().unwrap_or_default();
-            assert!(msg.contains("operator"), "{how} {method}: {r}");
+            // The rule stops agents; a caller that reaches the handler
+            // meets the field refusal instead. Either way nothing writes.
+            assert!(
+                msg.contains("operator") || msg.contains("connection-bound"),
+                "{how} {method}: {r}"
+            );
         }
     }
     assert_eq!(lf.snapshot(), before, "an agent's merge wrote something");
@@ -2051,9 +2075,15 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(reply.contains("operator_session_required"), "{reply}");
     assert_eq!(lf.snapshot(), before, "a merge without a session wrote");
     let op = sign_in(&lf.f.d.state, port);
+    // CAD-140: the approval names its head — REQUIRED now.
     let (status, reply) = board_http(
         port,
-        &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), "{}"),
+        &cad328_post(
+            port,
+            "/api/delivery/D-2/merge",
+            &op_guards(&op),
+            &format!(r#"{{"sha":"{c}"}}"#),
+        ),
     );
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("enqueued"), "{reply}");
@@ -2065,6 +2095,118 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     for kind in ["merge_decision", "review_escalated", "auto_merge_on"] {
         assert!(lf.needs(kind).is_empty(), "{kind}");
     }
+}
+
+/// CAD-362: a diff over the oversized tier is flagged for splitting —
+/// the record parks `unstaffed`, the ticket and the record's note say
+/// why, and no reviewer ever gets the kickoff. A follow-up done report
+/// on a small head routes normally and its kickoff names the tier.
+#[test]
+fn an_oversized_diff_is_flagged_for_splitting_not_routed() {
+    let lf = LoopFixture::dispatched();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+
+    // The operator's observe pass has already sized head `a` — the
+    // record carries the stats the router's risk class reads.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": a, "pr_state": "OPEN",
+                   "additions": 2000, "deletions": 1500, "files": 50}),
+        )
+        .unwrap();
+    lf.done(&a);
+    let rec = lf.wait_rec("oversized held", |r| {
+        r["state"] == "unstaffed" && r["risk"] == "oversized"
+    });
+    assert!(rec["note"].as_str().unwrap().contains("split"), "{rec}");
+    assert!(rec["reviewer"].is_null(), "{rec}");
+    // No reviewer was asked.
+    for rev in ["r1", "r2"] {
+        assert!(
+            !lf.f
+                .messages_of(rev)
+                .iter()
+                .any(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-"))),
+            "{rev} got a kickoff for an oversized diff"
+        );
+    }
+    // The ticket carries the flag, and the event names it.
+    let comments = lf.f.pm_dir.join("demo/D-2/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            let t = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            t.contains("oversized") && t.contains("split")
+        }),
+        "no comment flags the diff for splitting"
+    );
+    assert!(
+        lf.daemon_events("review_oversized")
+            .iter()
+            .any(|e| e["payload"]["issue"] == "D-2"),
+        "{:#?}",
+        lf.daemon_events("review_oversized")
+    );
+
+    // The worker splits, files a new done report at `b` — already
+    // measured small — and the route proceeds, the kickoff naming
+    // the tier.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": b, "pr_state": "OPEN",
+                   "additions": 30, "deletions": 8, "files": 3}),
+        )
+        .unwrap();
+    lf.done(&b);
+    let rec = lf.wait_rec("small routed", |r| r["state"] == "reviewing");
+    assert_eq!(rec["risk"], "small", "{rec}");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    let kickoff =
+        lf.f.messages_of("r1")
+            .into_iter()
+            .find(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-")))
+            .expect("r1 got the review kickoff");
+    assert!(
+        kickoff["body"].as_str().unwrap().contains("Risk: small."),
+        "{}",
+        kickoff["body"]
+    );
+}
+
+/// CAD-362: every fixture agent is `claude` — the pick is the
+/// same-vendor fallback, and the record's note and the routed comment
+/// both say so; a fallback is never silent.
+#[test]
+fn a_same_vendor_pick_records_its_fallback_reason() {
+    let lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    assert!(
+        rec["note"]
+            .as_str()
+            .unwrap()
+            .contains("same-vendor fallback"),
+        "{rec}"
+    );
+    let comments = lf.f.pm_dir.join("demo/D-2/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .contains("[same-vendor fallback")
+        }),
+        "no routed comment carries the fallback reason"
+    );
+    assert!(
+        lf.daemon_events("review_routed")
+            .iter()
+            .any(|e| e["payload"]["reason"] == "same-vendor-fallback"),
+        "{:#?}",
+        lf.daemon_events("review_routed")
+    );
 }
 
 /// CAD-591: an agent caller cannot mint an independent reviewer — not
@@ -2801,7 +2943,14 @@ fn delivery_merged_marks_ticket_done_once() {
 
     // D-3 (it waited on D-2): two observations of its merge race; the
     // ticket is marked done once.
-    let (ok, out) = lf.f.cli(&["issue", "set", "D-2", "status=done"]);
+    let (ok, out) = lf.f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "re-close after merge-reopen probe",
+    ]);
     assert!(ok, "{out}");
     let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
     assert!(ok, "{sent}");
@@ -2899,7 +3048,14 @@ fn delivery_unreviewed_or_unmerged_never_marks_ticket_done() {
             .any(|r| r["title"].as_str().unwrap_or_default().starts_with("D-4:"))
     };
     assert!(row(&lf), "{:#?}", lf.f.needs_me());
-    let (ok, out) = lf.f.cli(&["issue", "set", "D-4", "status=done"]);
+    let (ok, out) = lf.f.cli(&[
+        "issue",
+        "set",
+        "D-4",
+        "status=done",
+        "--force",
+        "operator hand-settles unmerged ticket",
+    ]);
     assert!(ok, "{out}");
     lf.wait_of("D-4", "settled by hand", |r| {
         r["ticket_done"]["outcome"] == "kept"
@@ -3702,7 +3858,15 @@ fn master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence() {
     // D-2 is done (the operator's tracker write, not through the
     // daemon): the router wakes the master for D-3. D-4's wake meets the
     // planted row and is refused loudly — never counted as sent.
-    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=done"]);
+    // CAD-756: the operator write records the override.
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "wake probe close",
+    ]);
     assert!(ok, "{out}");
     let wake = f.wait_thread("[wake] D-3 is ready to dispatch", 10);
     assert_eq!(wake["role"], "system", "{wake}");
@@ -3731,7 +3895,14 @@ fn master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence() {
     let (ok, out) = f.cli(&["issue", "set", "D-2", "status=doing"]);
     assert!(ok, "{out}");
     thread::sleep(Duration::from_millis(2_500));
-    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=done"]);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "new-epoch wake probe",
+    ]);
     assert!(ok, "{out}");
     f.wait_thread("[wake] D-4 is ready to dispatch", 10);
     let d4_again = cadence_agent::master::wake_id("blocker_done", "D-4/D-2@2");
@@ -4038,4 +4209,739 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
         rec["excluded"].as_array().unwrap().contains(&json!("r2")),
         "{rec}"
     );
+}
+
+// ==== CAD-776: wake the live master when reviewed delivery CI readiness changes ====
+
+/// This test's merge-ready wakes: master `sys-wake-…` messages naming a
+/// delivery ready to merge.
+fn ready_wakes(f: &PlanFixture) -> Vec<Value> {
+    master_wakes(f)
+        .into_iter()
+        .filter(|m| {
+            m["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("is ready to merge"))
+        })
+        .collect()
+}
+
+fn ready_woken_events(lf: &LoopFixture) -> Vec<Value> {
+    lf.daemon_events("master_woken")
+        .into_iter()
+        .filter(|e| e["payload"]["event"] == "merge_ready")
+        .collect()
+}
+
+/// CAD-776 acceptance 1+2: an operator-authenticated observation that
+/// makes a reviewed, open, exact-head delivery merge-ready queues one
+/// durable wake naming the issue, PR, reviewed head and operator
+/// action; a replay queues no second wake; a regression then recovery
+/// wakes again under a new key; a moved head never presents the old
+/// review as ready.
+#[test]
+fn cad776_observe_queues_one_merge_ready_wake_per_readiness_streak() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    assert_eq!(lf.rec()["merge_ready"], false);
+
+    // Green CI on the open, reviewed head: one durable wake.
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    let wake = lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    assert_eq!(wake["role"], "system", "{wake}");
+    let text = wake["text"].as_str().unwrap();
+    assert!(text.contains("D-2"), "{text}");
+    assert!(text.contains("acme/app#7"), "{text}");
+    assert!(text.contains(&a), "{text}");
+    assert!(text.contains("delivery_observe"), "{text}");
+    assert!(text.contains("grants nothing"), "{text}");
+    let first = cadence_agent::master::wake_id("merge_ready", &format!("D-2/{a}@1"));
+    assert_eq!(
+        ready_wakes(&lf.f)
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(first)],
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+
+    // A replay of the same observation (and a second sync) queues no
+    // second wake: the message id dedupes it.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": a.clone(), "pr_state": "OPEN", "ci_green": true}),
+        )
+        .unwrap();
+    let (ok, _) = lf.operator(&["delivery", "sync", "D-2"]);
+    assert!(ok);
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+
+    // A readiness regression (CI red) wakes nobody; the recovery wakes
+    // again under a new epoch key.
+    lf.set_gh(&a, "OPEN", false, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], false, "{row}");
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ready_wakes(&lf.f).len() == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:#?}", ready_wakes(&lf.f));
+        thread::sleep(Duration::from_millis(100));
+    }
+    let second = cadence_agent::master::wake_id("merge_ready", &format!("D-2/{a}@2"));
+    assert!(
+        ready_wakes(&lf.f)
+            .iter()
+            .any(|m| m["id"] == second.as_str()),
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+    assert_eq!(ready_woken_events(&lf).len(), 2);
+
+    // A moved head never presents the old review as ready: no new wake,
+    // and no wake names the moved head.
+    let b = "b".repeat(40);
+    let out =
+        lf.f.d
+            .operator_rpc(
+                "delivery_observe",
+                json!({"issue": "D-2", "head": b.clone(), "pr_state": "OPEN", "ci_green": true}),
+            )
+            .unwrap();
+    assert_eq!(out["merge_ready"], false, "{out}");
+    assert_eq!(lf.rec()["state"], "reviewing", "{}", lf.rec());
+    thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(ready_wakes(&lf.f).len(), 2, "{:#?}", ready_wakes(&lf.f));
+    assert!(
+        !ready_wakes(&lf.f)
+            .iter()
+            .any(|m| m["body"].as_str().unwrap_or_default().contains(&b)),
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+}
+
+/// CAD-776 acceptance 3 (gate): agent callers, detached children and
+/// forged fields cannot cause a wake — the existing operator-only
+/// observation gate refuses them before any wake logic runs.
+#[test]
+fn cad776_agent_detached_and_forged_observe_cannot_wake() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    let obs = json!({"issue": "D-2", "head": a, "pr_state": "OPEN", "ci_green": true});
+    let before = lf.snapshot();
+
+    // An agent caller, its child, its detached setsid grandchild and a
+    // bare one with no alias: all refused as non-operator.
+    for who in [&mut lf.w1, &mut lf.r1] {
+        for how in ["self", "child", "detached", "detached-bare"] {
+            let r = who.rpc(how, "delivery_observe", obs.clone());
+            assert_eq!(r["ok"], false, "{how}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator"),
+                "{how}: {r}"
+            );
+        }
+    }
+    // Forged identity/authority fields on the operator's own connection
+    // are refused, never read.
+    for (field, value) in [
+        ("alias", json!("w1")),
+        ("operator", json!(true)),
+        ("actor", json!("operator")),
+        ("by", json!("operator")),
+        ("attribution", json!("operator")),
+    ] {
+        let mut forged = obs.clone();
+        forged[field] = value;
+        let r = lf.f.d.operator_rpc("delivery_observe", forged);
+        assert!(r.is_err(), "{field}: {r:?}");
+        assert!(
+            r.unwrap_err().to_string().contains("connection-bound"),
+            "{field}"
+        );
+    }
+    // Nothing was written and nobody was woken.
+    assert_eq!(lf.snapshot(), before, "a refused observation wrote");
+    assert_eq!(lf.rec()["merge_ready"], false);
+    assert!(ready_wakes(&lf.f).is_empty(), "{:#?}", ready_wakes(&lf.f));
+    assert!(ready_woken_events(&lf).is_empty());
+}
+
+/// CAD-776 acceptance 3 (concurrency): concurrent observations of the
+/// same ready-making read preserve one outcome per transition — the
+/// delivery lock serializes them and exactly one wake fires.
+#[test]
+fn cad776_concurrent_observe_wakes_once() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    let obs = json!({"issue": "D-2", "head": a, "pr_state": "OPEN", "ci_green": true});
+    thread::scope(|scope| {
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    lf.f.d
+                        .operator_rpc("delivery_observe", obs.clone())
+                        .unwrap()
+                })
+            })
+            .collect();
+        for c in calls {
+            let out = c.join().unwrap();
+            assert_eq!(out["merge_ready"], true, "{out}");
+        }
+    });
+    lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    thread::sleep(Duration::from_millis(2_000));
+    // One wake, and under the first-epoch key: the lock serializes the
+    // observers, so the second is steady on the record-persisted
+    // epoch — never one key each.
+    assert_eq!(
+        ready_wakes(&lf.f)
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(cadence_agent::master::wake_id(
+            "merge_ready",
+            &format!("D-2/{a}@1")
+        ))],
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
+    assert_eq!(ready_woken_events(&lf).len(), 1);
+}
+
+/// CAD-776 acceptance 4: the wake grants no merge authority. The
+/// operator-only, independent-review and head-pinned merge checks are
+/// untouched: agents still cannot merge after the wake, a wrong pin is
+/// still refused, and a regressed delivery still refuses the check.
+#[test]
+fn cad776_merge_ready_wake_grants_no_merge_authority() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.set_gh(&a, "OPEN", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], true, "{row}");
+    lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
+    let eligible = lf.rec();
+
+    // Agents cannot merge on the back of the wake.
+    for how in ["self", "detached", "detached-bare"] {
+        for phase in ["authorize", "check"] {
+            let r = lf.w1.rpc(
+                how,
+                "delivery_merge",
+                json!({"issue": "D-2", "phase": phase, "sha": a.clone()}),
+            );
+            assert_eq!(r["ok"], false, "{how} {phase}: {r}");
+            assert!(
+                r["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator"),
+                "{how} {phase}: {r}"
+            );
+        }
+    }
+    // The head pin is still enforced for the operator.
+    let r = lf.f.d.operator_rpc(
+        "delivery_merge",
+        json!({"issue": "D-2", "phase": "enqueued", "sha": "b".repeat(40)}),
+    );
+    assert!(r.is_err(), "{r:?}");
+    assert!(r.unwrap_err().to_string().contains("pinned"));
+    // The wake changed nothing about eligibility: same state, same
+    // verdict, same head and PR.
+    for field in ["state", "verdict", "head", "pr"] {
+        assert_eq!(lf.rec()[field], eligible[field], "{field}");
+    }
+    // After a regression the check refuses again — the wake stuck
+    // nothing open.
+    lf.set_gh(&a, "OPEN", false, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["merge_ready"], false, "{row}");
+    let r =
+        lf.f.d
+            .operator_rpc("delivery_merge", json!({"issue": "D-2", "phase": "check"}));
+    assert!(r.is_err(), "{r:?}");
+    assert!(r.unwrap_err().to_string().contains("not ready to merge"));
+}
+
+/// CAD-140: the board's Merge is the daemon's approve-and-land
+/// transaction — the board shells no `gh` itself. The approval names
+/// its head (REQUIRED) and voids on a moved one; the recorded object
+/// carries the head SHA and the deciding actor.
+#[test]
+fn board_merge_approves_and_lands_without_board_gh() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    assert_eq!(
+        lf.needs("merge_decision").len(),
+        1,
+        "{:#?}",
+        lf.f.needs_me()
+    );
+
+    // The board's `gh` refuses every call: a merge that shells it
+    // fails loudly instead of passing silently.
+    let refuse_dir = lf.f.tmp.path().join("board-gh");
+    std::fs::create_dir_all(&refuse_dir).unwrap();
+    let refuse_log = refuse_dir.join("gh.log");
+    std::fs::write(&refuse_log, "").unwrap();
+    std::fs::write(
+        refuse_dir.join("gh"),
+        format!(
+            "#!/bin/sh\necho \"BOARD-GH: $*\" >> {log}\nexit 64\n",
+            log = refuse_log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            refuse_dir.join("gh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(refuse_dir.join("gh")),
+    );
+    let op = sign_in(&lf.f.d.state, port);
+    let merge = |body: &str| {
+        board_http(
+            port,
+            &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), body),
+        )
+    };
+    let board_calls = || std::fs::read_to_string(&refuse_log).unwrap();
+    // No head named: the approval cannot bind — 400, nothing written.
+    let before = lf.snapshot();
+    let (status, reply) = merge("{}");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("sha_required"), "{reply}");
+    assert_eq!(lf.snapshot(), before, "a refused approval wrote something");
+    // The head moved since the card was shown: 409 `head_moved`
+    // before anything is recorded — no approval, no enqueue.
+    let wrong = "0".repeat(40);
+    let (status, reply) = merge(&format!(r#"{{"sha":"{wrong}"}}"#));
+    assert_eq!(status, 409, "{reply}");
+    assert!(reply.contains("head_moved"), "{reply}");
+    assert_eq!(lf.snapshot(), before, "a refused approval wrote something");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    // A moved head persists no approval object for either head.
+    assert!(
+        recorded_approvals(&lf.f.d.state).is_empty(),
+        "a refused approval recorded"
+    );
+    // The shown head: the approval object records it with the
+    // deciding actor, and the daemon lands it pinned to itself.
+    let (status, reply) = merge(&format!(r#"{{"sha":"{a}"}}"#));
+    assert_eq!(status, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["state"], "enqueued", "{v}");
+    assert_eq!(v["approval_id"], format!("merge-pr7-{}", &a[..12]), "{v}");
+    assert_eq!(v["approved_by"], "operator (ui)", "{v}");
+    assert_eq!(v["head"], a, "the receipt names the approved head");
+    // The persisted approval object — head SHA plus the deciding
+    // actor — read back from the store, not the response echo.
+    let approvals = recorded_approvals(&lf.f.d.state);
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["approval_id"], v["approval_id"],
+        "{approvals:?}"
+    );
+    assert_eq!(approvals[0]["head_sha"], a, "{approvals:?}");
+    assert_eq!(approvals[0]["source"], "operator (ui)", "{approvals:?}");
+    assert!(
+        lf.gh_log().contains(&format!(
+            "pr merge 7 -R acme/app --auto --squash --match-head-commit {a}"
+        )),
+        "the daemon landed it pinned: {}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["state"], "enqueued", "{}", lf.rec());
+    assert!(
+        board_calls().is_empty(),
+        "the board shelled gh: {}",
+        board_calls()
+    );
+}
+
+/// CAD-140: the board's Decline states its reason — without one the
+/// call refuses, with one the loop stands down as declined.
+#[test]
+fn board_decline_states_its_reason() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(lf.gh_dir.join("gh")),
+    );
+    let op = sign_in(&lf.f.d.state, port);
+    let decline = |body: &str| {
+        board_http(
+            port,
+            &cad328_post(port, "/api/delivery/D-2/decline", &op_guards(&op), body),
+        )
+    };
+    let (status, reply) = decline("{}");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("reason_required"), "{reply}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let (status, reply) = decline(r#"{"reason":"not this sprint"}"#);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(lf.rec()["state"], "declined", "{}", lf.rec());
+    assert!(
+        lf.needs("merge_decision").is_empty(),
+        "{:#?}",
+        lf.f.needs_me()
+    );
+}
+
+/// Read back every persisted approval object — the store rows the
+/// approve transaction wrote, not a response echo.
+fn recorded_approvals(state: &std::path::Path) -> Vec<Value> {
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT payload FROM events WHERE alias='audit:approvals' AND kind='approval_recorded' ORDER BY seq")
+        .unwrap();
+    stmt.query_map([], |row| {
+        let raw: String = row.get(0)?;
+        Ok(raw)
+    })
+    .unwrap()
+    .map(|r| serde_json::from_str::<Value>(&r.unwrap()).unwrap())
+    .collect()
+}
+
+/// CAD-140 gate work for `delivery_approve` (AGENTS.md: adversarial
+/// first): an agent caller, a detached setsid child, forged identity
+/// fields, and concurrent approves. Every refusal writes nothing; the
+/// race records exactly one approval and enqueues exactly once.
+#[test]
+fn delivery_approve_gate_forgeries_race_and_attribution() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let before = lf.snapshot();
+
+    // Forged identity fields are refused even over the operator's own
+    // connection — authority is connection-bound, never requested.
+    // (Names no verb reads, like `as`, are ignored, not honored.)
+    for (field, value) in [
+        ("actor", "r1"),
+        ("by", "operator"),
+        ("attribution", "r1"),
+        ("recorded_via", "operator_connection"),
+    ] {
+        let mut params = serde_json::Map::new();
+        params.insert("issue".to_string(), "D-2".into());
+        params.insert("sha".to_string(), a.clone().into());
+        params.insert(field.to_string(), value.into());
+        let err =
+            lf.f.d
+                .operator_rpc("delivery_approve", Value::Object(params))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains(field) && err.contains("connection-bound"),
+            "{field}: {err}"
+        );
+    }
+    // `request_actor` is the sanctioned attribution channel, with
+    // rules: the daemon's own identities never name a human.
+    for bad in ["user", "daemon", "op\u{1}x"] {
+        let err =
+            lf.f.d
+                .operator_rpc(
+                    "delivery_approve",
+                    json!({"issue": "D-2", "sha": a, "request_actor": bad}),
+                )
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("request_actor"), "{bad:?}: {err}");
+    }
+    // The head is REQUIRED and shaped: missing or malformed refuses
+    // before anything is read or written.
+    for (name, params) in [
+        ("missing", json!({"issue": "D-2"})),
+        ("blank", json!({"issue": "D-2", "sha": "  "})),
+        ("short", json!({"issue": "D-2", "sha": "abc"})),
+        ("upper", json!({"issue": "D-2", "sha": "A".repeat(40)})),
+    ] {
+        let err =
+            lf.f.d
+                .operator_rpc("delivery_approve", params)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("sha") || err.contains("SHA") || err.contains("head"),
+            "{name}: {err}"
+        );
+    }
+    assert_eq!(lf.snapshot(), before, "refused approvals wrote something");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    assert!(recorded_approvals(&lf.f.d.state).is_empty());
+
+    // Two concurrent approves: exactly one records the approval and
+    // enqueues; the other sees no standing PASS.
+    let mut oks = 0;
+    let mut errs = Vec::new();
+    std::thread::scope(|s| {
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            joins.push(s.spawn(|| {
+                lf.f.d
+                    .operator_rpc("delivery_approve", json!({"issue": "D-2", "sha": a}))
+            }));
+        }
+        for join in joins {
+            match join.join().unwrap() {
+                Ok(out) => {
+                    oks += 1;
+                    assert_eq!(out["state"], "enqueued", "{out}");
+                    assert_eq!(
+                        out["approval_id"],
+                        format!("merge-pr7-{}", &a[..12]),
+                        "{out}"
+                    );
+                }
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+    });
+    assert_eq!(oks, 1, "one approval wins: {errs:?}");
+    assert!(
+        errs.iter().all(|e| e.contains("no standing PASS")),
+        "{errs:?}"
+    );
+    assert_eq!(
+        lf.gh_log()
+            .lines()
+            .filter(|l| l.starts_with("pr merge 7 -R"))
+            .count(),
+        1,
+        "exactly one enqueue: {}",
+        lf.gh_log()
+    );
+    // The persisted object — head SHA plus the deciding actor — read
+    // back from the store, not the response echo.
+    let approvals = recorded_approvals(&lf.f.d.state);
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["approval_id"],
+        format!("merge-pr7-{}", &a[..12]),
+        "{approvals:?}"
+    );
+    assert_eq!(approvals[0]["head_sha"], a, "{approvals:?}");
+    assert_eq!(approvals[0]["source"], "operator", "{approvals:?}");
+    assert_eq!(approvals[0]["action"], "merge", "{approvals:?}");
+    assert_eq!(lf.rec()["state"], "enqueued", "{}", lf.rec());
+}
+
+/// CAD-140: decline carries the same gate — agents and forgeries are
+/// refused, and concurrent declines decide exactly once.
+#[test]
+fn delivery_decline_gate_forgeries_and_races() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let before = lf.snapshot();
+
+    // Agents (and their detached setsid children) cannot decline —
+    // and a forged identity field is refused by name before any
+    // authority check runs.
+    for how in ["self", "detached", "detached-bare"] {
+        let r = lf.r1.rpc(
+            how,
+            "delivery_decline",
+            json!({"issue": "D-2", "reason": "no"}),
+        );
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator"),
+            "{how}: {r}"
+        );
+        let r = lf.r1.rpc(
+            how,
+            "delivery_decline",
+            json!({"issue": "D-2", "reason": "no", "actor": "r1"}),
+        );
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        // The rule stops agents; a caller that reaches the handler
+        // meets the field refusal instead. Either way nothing writes.
+        assert!(
+            msg.contains("'actor'") || msg.contains("operator"),
+            "{how}: {r}"
+        );
+    }
+    // Forged identity over the operator's connection is refused by
+    // field; the sanctioned channel keeps its rules.
+    for (field, value) in [("actor", "r1"), ("by", "operator")] {
+        let mut params = serde_json::Map::new();
+        params.insert("issue".to_string(), "D-2".into());
+        params.insert("reason".to_string(), "no".into());
+        params.insert(field.to_string(), value.into());
+        let err =
+            lf.f.d
+                .operator_rpc("delivery_decline", Value::Object(params))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains(field) && err.contains("connection-bound"),
+            "{field}: {err}"
+        );
+    }
+    assert_eq!(lf.snapshot(), before, "refused declines wrote something");
+
+    // Two concurrent declines: one records, the other is already done.
+    // Both name a tailnet decider, so whichever wins persists it.
+    let mut oks = 0;
+    let mut errs = Vec::new();
+    std::thread::scope(|s| {
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            joins.push(s.spawn(|| {
+                lf.f.d.operator_rpc(
+                    "delivery_decline",
+                    json!({
+                        "issue": "D-2",
+                        "reason": "not now",
+                        "request_actor": "fable@example.com (tailscale)",
+                    }),
+                )
+            }));
+        }
+        for join in joins {
+            match join.join().unwrap() {
+                Ok(out) => {
+                    oks += 1;
+                    assert_eq!(out["state"], "declined", "{out}");
+                }
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+    });
+    assert_eq!(oks, 1, "one decline wins: {errs:?}");
+    assert!(errs.iter().all(|e| e.contains("already")), "{errs:?}");
+    assert_eq!(lf.rec()["state"], "declined", "{}", lf.rec());
+    assert_eq!(
+        lf.rec()["declined_by"],
+        "fable@example.com (tailscale)",
+        "{}",
+        lf.rec()
+    );
+    let declined = lf.f.daemon_events("merge_declined");
+    assert_eq!(declined.len(), 1, "{declined:?}");
+    assert_eq!(
+        declined[0]["actor"], "fable@example.com (tailscale)",
+        "{declined:?}"
+    );
+    // The tracker comment names the decider too.
+    let mut comments = String::new();
+    for entry in std::fs::read_dir(lf.f.pm_dir.join("demo/D-2/comments"))
+        .unwrap()
+        .flatten()
+    {
+        comments.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+    }
+    assert!(
+        comments.contains("Merge declined by fable@example.com (tailscale): not now"),
+        "{comments}"
+    );
+}
+
+/// CAD-140: the approval records who decided — a tailnet-shaped
+/// `request_actor` persists verbatim on the approval object the
+/// transaction writes (the board forwards its proven login the same
+/// field; authority stays with this connection).
+#[test]
+fn delivery_approve_records_tailscale_actor() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let out =
+        lf.f.d
+            .operator_rpc(
+                "delivery_approve",
+                json!({"issue": "D-2", "sha": a, "request_actor": "fable@example.com (tailscale)"}),
+            )
+            .unwrap();
+    assert_eq!(out["state"], "enqueued", "{out}");
+    let approvals = recorded_approvals(&lf.f.d.state);
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(approvals[0]["head_sha"], a, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["source"], "fable@example.com (tailscale)",
+        "{approvals:?}"
+    );
+    assert_eq!(out["approved_by"], "fable@example.com (tailscale)", "{out}");
 }

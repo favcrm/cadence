@@ -8,6 +8,9 @@ import type {
   AppOutputsPayload,
   AppRunsPayload,
   AppsPayload,
+  ConnectionPayload,
+  ConnectionProvidersPayload,
+  ConnectionsPayload,
   Health,
   IssueCard,
   IssueDetail,
@@ -269,6 +272,8 @@ export const api = {
     tags?: string[];
     parent?: string;
     blocked_by?: string[];
+    /** CAD-140: the report/idea description, filed with the issue. */
+    body?: string;
   }) => write("POST", "/api/issues", req),
 
   patch: (
@@ -356,11 +361,25 @@ export const api = {
   },
   /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent.
    *  `refs` are the needs-me subjects the message cites (CAD-574 "Ask
-   *  master"): they land on the entry's payload, never in the text. */
-  threadSend: (alias: string, text: string, message: string, refs?: ThreadRef[]) =>
+   *  master"): they land on the entry's payload, never in the text.
+   *  `app` is the shell chat's current installation/context (CAD-802):
+   *  never authority — the daemon proves both against its store and
+   *  stamps the verified binding on the entry, refusing anything else. */
+  threadSend: (
+    alias: string,
+    text: string,
+    message: string,
+    refs?: ThreadRef[],
+    app?: { install_id: string; context_id: string },
+  ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      refs && refs.length > 0 ? { text, message, refs } : { text, message },
+      {
+        text,
+        message,
+        ...(refs && refs.length > 0 ? { refs } : {}),
+        ...(app ? { app } : {}),
+      },
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
@@ -410,6 +429,40 @@ export const api = {
   /** `POST /api/issues/<id>/answers` — the operator's answer report. */
   answer: (issue: string, question: string, text: string) =>
     write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
+  /**
+   * `POST /api/reports` (CAD-140) — file a question, feedback, idea
+   * or bug through the canonical intake path. `project` is the board
+   * filed from: ideas land there, every other kind routes to the
+   * `cadence` project server-side. Answers a `WriteResp`.
+   */
+  report: (req: {
+    kind: "question" | "feedback" | "idea" | "bug";
+    project: string;
+    title: string;
+    priority?: string;
+    body?: string;
+  }) => write("POST", "/api/reports", req),
+  /**
+   * `POST /api/ideas/<id>/decide` (CAD-140) — the operator's idea
+   * decision: `approve` takes nothing, `reject` needs a reason, `park`
+   * needs a `park_until` date. `expect_rev` binds the call to the
+   * issue shown — a moved issue refuses with 409 `stale_view`.
+   * Attribution is the board's proven connection, never a body field.
+   */
+  ideaDecide: (
+    issue: string,
+    action: "approve" | "reject" | "park",
+    opts: { reason?: string; park_until?: string; expect_rev: string },
+  ) =>
+    post<Record<string, unknown>>(
+      `/api/ideas/${encodeURIComponent(issue)}/decide`,
+      {
+        action,
+        ...(opts?.reason ? { reason: opts.reason } : {}),
+        ...(opts?.park_until ? { park_until: opts.park_until } : {}),
+        ...(opts?.expect_rev ? { expect_rev: opts.expect_rev } : {}),
+      },
+    ),
   /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
   workflows: (project: string) =>
     get<WorkflowsPayload>(`/api/projects/${encodeURIComponent(project)}/workflows`),
@@ -479,6 +532,54 @@ export const api = {
   outboxItem: (effectId: string) =>
     get<OutboxDetail>(`/api/outbox?effect_id=${encodeURIComponent(effectId)}`),
   /**
+   * `GET /api/connection-providers` — every registered provider with
+   * its reviewed descriptor (CAD-688). Operator-only: the Settings
+   * Connections page fetches it only when the board proves the
+   * operator, so a viewer without the read never sees a 403.
+   */
+  connectionProviders: () => get<ConnectionProvidersPayload>("/api/connection-providers"),
+  /** `GET /api/connections` — every exact provider account (operator-only). */
+  connections: () => get<ConnectionsPayload>("/api/connections"),
+  /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */
+  connection: (id: string) =>
+    get<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}`),
+  /**
+   * `POST /api/connections` — enroll a scoped token for a supported
+   * provider (CAD-688). Operator-only. The token crosses this one
+   * request into daemon custody; the caller clears it immediately and
+   * never stores it.
+   */
+  connectionCreate: (body: {
+    provider: string;
+    account: string;
+    shape: "token";
+    token: string;
+    scopes: string[];
+    accept_same_uid_risk?: boolean;
+  }) => post<ConnectionPayload>("/api/connections", body),
+  /**
+   * `POST /api/connections/<id>/rotate` — replace the credential,
+   * preserving the connection's identity (operator-only). Omitting
+   * `scopes` keeps the current scopes.
+   */
+  connectionRotate: (
+    id: string,
+    body: { token: string; scopes?: string[]; accept_same_uid_risk?: boolean },
+  ) => post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/rotate`, body),
+  /** `POST /api/connections/<id>/revoke` — revoke it (operator-only). */
+  connectionRevoke: (id: string) =>
+    post<{ connection_id: string; revoked: boolean }>(
+      `/api/connections/${encodeURIComponent(id)}/revoke`,
+      {},
+    ),
+  /**
+   * `POST /api/connections/<id>/status` — the local configuration
+   * check (operator-only). It inspects local configuration only: it
+   * sends no provider effect and proves no upstream connectivity.
+   */
+  connectionCheck: (id: string) =>
+    post<ConnectionPayload>(`/api/connections/${encodeURIComponent(id)}/status`, {}),
+  /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query
    * is built by hand (encodeURIComponent, not URLSearchParams) because
@@ -508,11 +609,20 @@ export const api = {
       `/api/epics/${encodeURIComponent(epic)}/stage`,
       note && note.trim() ? { stage, note: note.trim() } : { stage },
     ),
-  /** `POST /api/delivery/<id>/merge` — the operator's merge decision
-   *  (CAD-431): the board's own `gh` enqueues the PR pinned to the
-   *  reviewed head. */
-  mergeDelivery: (issue: string) =>
-    post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/merge`, {}),
+  /** `POST /api/delivery/<id>/merge` — the operator's merge approval
+   *  (CAD-431, CAD-140): the daemon records the approval object and
+   *  lands pinned to the reviewed head. `sha` is REQUIRED — the head
+   *  the card showed; a moved head refuses with 409 `head_moved` and
+   *  nothing is recorded. */
+  mergeDelivery: (issue: string, sha: string) =>
+    post<Record<string, unknown>>(
+      `/api/delivery/${encodeURIComponent(issue)}/merge`,
+      sha ? { sha } : {},
+    ),
+  /** `POST /api/delivery/<id>/decline` — the operator declines with a
+   *  reason (CAD-140); the worker loop stands down. */
+  declineDelivery: (issue: string, reason: string) =>
+    post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),

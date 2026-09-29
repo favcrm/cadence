@@ -22,7 +22,10 @@ struct ProviderDeployment {
     provider: String,
     origin: String,
     manifest_pin: String,
+    /// CAD-816: accepted for older metadata files; media artifacts now come
+    /// from the AgenticOS door itself, so the CDN allowlist is ignored.
     #[serde(default)]
+    #[allow(dead_code)]
     image_hosts: Vec<String>,
 }
 
@@ -82,17 +85,6 @@ impl DeploymentMetadata {
                 || entry.manifest_pin.is_empty()
                 || entry.manifest_pin.len() > 256
                 || entry.manifest_pin.chars().any(char::is_control)
-                || entry.image_hosts.len() > 4
-                || entry.image_hosts.iter().any(|host| {
-                    !crate::platform::agenticos_external::valid_image_host(host)
-                        || host.to_ascii_lowercase() != *host
-                })
-                || entry
-                    .image_hosts
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != entry.image_hosts.len()
             {
                 return Err(refused());
             }
@@ -105,14 +97,6 @@ impl DeploymentMetadata {
             .iter()
             .find(|entry| entry.provider == provider && entry.origin == origin)
             .map(|entry| entry.manifest_pin.as_str())
-    }
-
-    /// Image custody policy belongs to the same exact-origin deployment pin.
-    pub fn image_hosts(&self, provider: &str, origin: &str) -> Option<&[String]> {
-        self.providers
-            .iter()
-            .find(|entry| entry.provider == provider && entry.origin == origin)
-            .map(|entry| entry.image_hosts.as_slice())
     }
 }
 

@@ -9,7 +9,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
-use common::{daemon_opts, plant_member_pane, LaneShell, TestDaemon};
+use common::{daemon_opts, plant_member_pane, test_port, LaneShell, TestDaemon};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -471,7 +471,7 @@ fn cad753_record_profile_validation_refuses_without_mutation_or_leak() {
 }
 
 #[test]
-fn cad753_records_stay_out_of_git_and_have_no_http_route() {
+fn cad753_records_stay_out_of_git_with_http_peer() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -535,11 +535,10 @@ fn cad753_records_stay_out_of_git_and_have_no_http_route() {
         .unwrap();
     assert!(tracked.stdout.is_empty(), "record body reached Git history");
 
-    // No HTTP route exposes records in this slice; the board peer is a
-    // named follow-up, so record-shaped paths must 404 for the operator.
-    let port = (3110..3200)
-        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .unwrap();
+    // CAD-768: the board peer serves the installation/context record
+    // routes with the same operator proof as RPC; unscoped shapes 404.
+    let lease = test_port();
+    let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
     let opts = cadence_agent::ui::ServeOpts {
         host: "127.0.0.1".into(),
@@ -568,6 +567,21 @@ fn cad753_records_stay_out_of_git_and_have_no_http_route() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    // Scoped routes serve the same receipt as daemon RPC.
+    let (code, _, list_body) = common::op::raw(
+        port,
+        &session.request(
+            "GET",
+            &format!("/api/app-installations/{install}/contexts/{context_id}/records"),
+            "",
+        ),
+    );
+    assert_eq!(code, 200, "record list HTTP: {list_body}");
+    let listed: Value = serde_json::from_str(&list_body).unwrap();
+    assert_eq!(listed["records"].as_array().unwrap().len(), 1);
+    let via_rpc = w.show(install, context_id, "customer-1");
+    assert_eq!(listed["records"][0], via_rpc["record"]);
+    // Unscoped record-shaped paths still 404 for the operator.
     for (method, path, body) in [
         (
             "GET",
@@ -578,11 +592,6 @@ fn cad753_records_stay_out_of_git_and_have_no_http_route() {
             "POST",
             format!("/api/app-installations/{install}/records"),
             "{}".to_string(),
-        ),
-        (
-            "GET",
-            format!("/api/app-installations/{install}/contexts/{context_id}/records"),
-            String::new(),
         ),
         ("GET", "/api/app-records".to_string(), String::new()),
     ] {

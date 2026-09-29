@@ -331,6 +331,7 @@ fn message_entry<'a>(
     body: &'a str,
     id: &'a str,
     refs: Option<&Value>,
+    app: Option<&Value>,
 ) -> NewEntry<'a> {
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
@@ -339,6 +340,11 @@ fn message_entry<'a>(
     };
     if let Some(refs) = refs {
         payload["refs"] = refs.clone();
+    }
+    // CAD-802: the daemon-stamped App binding — verified server-side
+    // at send time, read back by the board and the master turn.
+    if let Some(app) = app {
+        payload["app"] = app.clone();
     }
     NewEntry {
         role,
@@ -568,6 +574,7 @@ impl Store {
     }
 
     /// The operator/system entry for a freshly queued message.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn thread_note_enqueued(
         tx: &Connection,
         alias: &str,
@@ -576,18 +583,94 @@ impl Store {
         body: &str,
         id: &str,
         refs: Option<&Value>,
+        app: Option<&Value>,
     ) -> Result<()> {
         if *sender == Sender::OperatorChat {
             Self::ensure_thread_in(tx, alias)?;
         }
-        Self::thread_append_in(tx, alias, message_entry(sender, source, body, id, refs))?;
+        Self::thread_append_in(
+            tx,
+            alias,
+            message_entry(sender, source, body, id, refs, app),
+        )?;
         Ok(())
+    }
+
+    /// The verified App binding the enqueue note for `id` recorded
+    /// (CAD-802), `None` when its payload carries none — the stored
+    /// side of the retry's content comparison.
+    pub(super) fn entry_app_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "app")
+    }
+
+    /// The delivery-time App hint for `id` (CAD-802): the send-time
+    /// stamp re-proved against the live store. An archived context, a
+    /// revised or re-digested one, or any malformed stamp drops the
+    /// hint — fail closed on the hint, never on the message, which
+    /// delivers exactly as queued. Returns install, context, label
+    /// and revision for the provider envelope; never profiles,
+    /// secrets or digests.
+    pub fn message_app(&self, message_id: &str) -> Result<Option<Value>> {
+        // The store holds one mutex-guarded connection: scope the
+        // guard so the re-proof below (which locks again) cannot
+        // self-deadlock and wedge the daemon.
+        let stamped = {
+            let conn = self.conn();
+            Self::entry_app_in(&conn, message_id)?
+        };
+        let Some(stamped) = stamped else {
+            return Ok(None);
+        };
+        let obj = match stamped.as_object() {
+            Some(obj) => obj,
+            None => return Ok(None),
+        };
+        if obj.get("verified") != Some(&Value::Bool(true)) {
+            return Ok(None);
+        }
+        let install = obj
+            .get("install_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let context = obj
+            .get("context_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let stamp_revision = obj.get("context_revision").and_then(Value::as_i64);
+        let stamp_digest = obj.get("context_digest").and_then(Value::as_str);
+        if install.is_empty()
+            || context.is_empty()
+            || stamp_revision.is_none()
+            || stamp_digest.is_none()
+        {
+            return Ok(None);
+        }
+        let (config, proof) = match self.app_context_proof(install, context) {
+            Ok(proven) => proven,
+            Err(_) => return Ok(None),
+        };
+        if proof.revision != stamp_revision.unwrap() || proof.digest != stamp_digest.unwrap() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "install_id": proof.install_id,
+            "context_id": proof.id,
+            "label": config.label,
+            "revision": proof.revision,
+        })))
     }
 
     /// The refs the enqueue note for `id` recorded (CAD-574), `None`
     /// when its payload carries none — the stored side of the retry's
     /// content comparison.
     pub(super) fn entry_refs_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "refs")
+    }
+
+    /// One named field of the enqueue note's payload for `id`, `None`
+    /// when the payload carries none — the stored side of the retry's
+    /// content comparison.
+    fn entry_payload_field_in(tx: &Connection, id: &str, field: &str) -> Result<Option<Value>> {
         let first: Option<Option<String>> = tx
             .query_row(
                 "SELECT payload FROM thread_entries WHERE message_id=? \
@@ -599,7 +682,7 @@ impl Store {
         Ok(first
             .flatten()
             .and_then(|p| serde_json::from_str::<Value>(&p).ok())
-            .and_then(|v| v.get("refs").filter(|r| !r.is_null()).cloned()))
+            .and_then(|v| v.get(field).filter(|r| !r.is_null()).cloned()))
     }
 
     /// The `turn_result` entry for a finished message. The payload is
@@ -1465,5 +1548,89 @@ mod tests {
         let cleaned = clean_text(&long, TEXT_CAP);
         assert!(cleaned.len() <= TEXT_CAP, "{}", cleaned.len());
         assert!(cleaned.ends_with("…[truncated]"));
+    }
+
+    /// CAD-802: `message_app` returns the delivery hint only while the
+    /// send-time stamp still matches the live proof. Revised or
+    /// archived contexts — and unbound messages — yield no hint, so a
+    /// stale scope can never ride a later turn. Fast and deterministic:
+    /// no daemon, no provider, no waiting.
+    #[test]
+    fn cad802_message_app_hint_reproves_before_delivery() {
+        use crate::store::app_contexts::ContextConfig;
+        use crate::store::Steer;
+        use std::collections::BTreeMap;
+        let (dir, s) = store();
+        reg(&s, "lead", dir.path());
+        let config = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+        let created = s.app_context_create("install-1", &config, "req-1").unwrap();
+        let id = created["context"]["id"].as_str().unwrap().to_string();
+        let (_, proof) = s.app_context_proof("install-1", &id).unwrap();
+        let stamp = json!({
+            "install_id": "install-1",
+            "context_id": id,
+            "verified": true,
+            "context_revision": proof.revision,
+            "context_digest": proof.digest,
+        });
+        s.enqueue_steered(
+            "lead",
+            "q",
+            None,
+            "m-1",
+            "user",
+            None,
+            None,
+            None,
+            &Sender::OperatorChat,
+            &Steer::NONE,
+            None,
+            Some(&stamp),
+        )
+        .unwrap();
+        let hint = s.message_app("m-1").unwrap().expect("fresh hint");
+        assert_eq!(hint["install_id"], json!("install-1"));
+        assert_eq!(hint["context_id"], json!(id));
+        assert_eq!(hint["label"], json!("Client"));
+        assert_eq!(hint["revision"], json!(proof.revision));
+        assert!(hint.get("profile").is_none(), "{hint}");
+        assert!(hint.get("digest").is_none(), "{hint}");
+        assert!(hint.get("verified").is_none(), "{hint}");
+        // Unbound messages carry no hint.
+        s.enqueue_steered(
+            "lead",
+            "q2",
+            None,
+            "m-2",
+            "user",
+            None,
+            None,
+            None,
+            &Sender::OperatorChat,
+            &Steer::NONE,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.message_app("m-2").unwrap(), None);
+        assert_eq!(s.message_app("no-such-message").unwrap(), None);
+        // A revised context invalidates the old stamp.
+        let renamed = ContextConfig::new("Renamed", BTreeMap::new()).unwrap();
+        s.app_context_update("install-1", &id, proof.revision, &renamed)
+            .unwrap();
+        assert_eq!(
+            s.message_app("m-1").unwrap(),
+            None,
+            "revised hint must drop"
+        );
+        // So does an archived one.
+        let (_, proof2) = s.app_context_proof("install-1", &id).unwrap();
+        s.app_context_archive("install-1", &id, proof2.revision)
+            .unwrap();
+        assert_eq!(
+            s.message_app("m-1").unwrap(),
+            None,
+            "archived hint must drop"
+        );
     }
 }

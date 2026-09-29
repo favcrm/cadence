@@ -62,6 +62,28 @@ fn config_digest(install: &str, context: Option<&str>, slot: &str, config: &Valu
         "context_id":context,"slot":slot,"config":config}))
 }
 
+/// CAD-796: the binding fields covered by installation approval. A rebind
+/// that changes any of these withdraws the installation's prior approval;
+/// anything else (receipt formatting the daemon re-derives) never churns it.
+fn binding_material_same(old: &Value, new: &Value) -> bool {
+    const FIELDS: &[&str] = &[
+        "install_id",
+        "context",
+        "bundle_digest",
+        "workspace_id",
+        "connection_id",
+        "connection_kind",
+        "connection_revision",
+        "provider",
+        "account",
+        "registration_digest",
+        "descriptor_revision",
+        "mapping",
+        "declaration",
+    ];
+    FIELDS.iter().all(|field| old[field] == new[field])
+}
+
 fn binding_in(conn: &Connection, install: &str, id: &str) -> Result<Value> {
     let row = conn.query_row(
         "SELECT context_id,slot,revision,state,config,digest FROM app_bindings WHERE install_id=? AND id=?",
@@ -136,6 +158,192 @@ pub(crate) fn binding_current_in(
         _ => current = false,
     }
     Ok(current)
+}
+
+impl Store {
+    /// CAD-796: withdraw one installation's capability approval after a
+    /// material binding change. The row moves to `revoked` with a fresh
+    /// epoch, mirroring an explicit operator revoke, so new runs refuse
+    /// with "approval is absent or stale" until the operator re-approves
+    /// the changed binding. The current digest's epoch rows move with it,
+    /// like a re-approval supersede; other digests keep their exact
+    /// historical authority.
+    /// Answers whether an approval was withdrawn (absent stays absent).
+    pub(super) fn app_binding_approval_withdraw_in(
+        tx: &Connection,
+        install: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let current: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT digest, epoch FROM app_install_capabilities WHERE install_id=? AND state='approved'",
+                [install],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((digest, epoch)) = current else {
+            return Ok(false);
+        };
+        let next = epoch + 1;
+        tx.execute(
+            "UPDATE app_install_capabilities SET state='revoked', epoch=?, created=? WHERE install_id=?",
+            params![next, now(), install],
+        )?;
+        tx.execute(
+            "UPDATE app_capability_epochs SET state='revoked' WHERE install_id=? AND digest=?",
+            params![install, digest],
+        )?;
+        tx.execute(
+            "INSERT INTO app_capability_epochs(install_id,epoch,digest,state,created) VALUES(?,?,?,?,?)",
+            params![install, next, digest, "revoked", now()],
+        )?;
+        Self::event(
+            tx,
+            Self::DAEMON_STREAM,
+            "app_install_capability_revoked",
+            json!({"install_id": install, "digest": digest, "epoch": next,
+                   "actor": "operator", "reason": reason}),
+        )?;
+        Ok(true)
+    }
+
+    /// CAD-796: drop every derived-grant row recorded for one
+    /// installation. A scope survives only while some remaining
+    /// derivation (any app, any install) still covers it, so a rebind
+    /// never cuts another install's grant and never keeps this one's.
+    pub(super) fn app_install_grants_drop_in(
+        tx: &Connection,
+        install_id: &str,
+        by: &str,
+    ) -> Result<()> {
+        let apps: Vec<String> = tx
+            .prepare("SELECT DISTINCT app FROM app_grants WHERE install_id=?")?
+            .query_map([install_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for app in apps {
+            let rows: Vec<(String, String, String, Vec<String>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT agent, platform, account, scopes FROM app_grants WHERE app=? AND install_id=?",
+                )?;
+                let mapped = stmt.query_map(params![app, install_id], |r| {
+                    let raw: String = r.get(3)?;
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, raw))
+                })?;
+                let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
+                for row in mapped {
+                    let (agent, plat, account, raw): (String, String, String, String) = row?;
+                    let scopes: Vec<String> = serde_json::from_str(&raw)
+                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
+                    rows.push((agent, plat, account, scopes));
+                }
+                rows
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM app_grants WHERE app=? AND install_id=?",
+                params![app, install_id],
+            )?;
+            for (agent, plat, account, derived) in &rows {
+                let still: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
+                    )?;
+                    let mapped =
+                        stmt.query_map(params![agent, plat, account], |r| r.get::<_, String>(0))?;
+                    let mut still: Vec<String> = Vec::new();
+                    for row in mapped {
+                        let raw: String = row?;
+                        still
+                            .extend(serde_json::from_str::<Vec<String>>(&raw).map_err(|_| {
+                                Error::internal("derived grant receipt is corrupt")
+                            })?);
+                    }
+                    still
+                };
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT scopes FROM platform_grants WHERE agent=? AND platform=? AND account=?",
+                        params![agent, plat, account],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(raw) = existing else {
+                    continue;
+                };
+                let held: Vec<String> = serde_json::from_str(&raw)
+                    .map_err(|_| Error::internal("platform grant receipt is corrupt"))?;
+                let kept: Vec<String> = held
+                    .iter()
+                    .filter(|s| !derived.contains(s) || still.contains(s))
+                    .cloned()
+                    .collect();
+                if kept == held {
+                    continue;
+                }
+                if kept.is_empty() {
+                    tx.execute(
+                        "DELETE FROM platform_grants WHERE agent=? AND platform=? AND account=?",
+                        params![agent, plat, account],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE platform_grants SET scopes=? WHERE agent=? AND platform=? AND account=?",
+                        params![serde_json::to_string(&kept)?, agent, plat, account],
+                    )?;
+                }
+            }
+            Self::event(
+                tx,
+                platform::PLATFORM_STREAM,
+                platform::APP_GRANTS_REVOKED_EVENT,
+                json!({"install_id": install_id, "app": app,
+                       "reason": "connection_binding_changed", "by": by}),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// CAD-796: close every configured binding on one credential and
+    /// withdraw each affected installation's approval. Called inside the
+    /// credential revoke/rotate transaction, so the record change and
+    /// the approval withdrawal land together.
+    pub(super) fn app_binding_approvals_withdraw_for_credential_in(
+        tx: &Connection,
+        platform_name: &str,
+        account: &str,
+    ) -> Result<()> {
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
+            )?;
+            let mapped = stmt.query_map(params![platform_name, account], |r| {
+                let install: String = r.get(0)?;
+                let binding: String = r.get(1)?;
+                Ok((install, binding))
+            })?;
+            let mut rows: Vec<(String, String)> = Vec::new();
+            for row in mapped {
+                rows.push(row?);
+            }
+            rows
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (install, binding) in &rows {
+            Self::app_effect_invalidate_in(tx, install, None, Some(binding), None)?;
+        }
+        let mut installs: Vec<String> = rows.into_iter().map(|(install, _)| install).collect();
+        installs.sort();
+        installs.dedup();
+        for install in installs {
+            Self::app_binding_approval_withdraw_in(tx, &install, "connection_credential_changed")?;
+            Self::app_install_grants_drop_in(tx, &install, "operator")?;
+        }
+        Ok(())
+    }
 }
 
 impl Store {
@@ -352,6 +560,14 @@ impl Store {
                 "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
             ));
         }
+        // CAD-796: an unchanged re-save is a complete no-op — same
+        // revision, open effects, standing approval. Only a material
+        // rebind (CAD-692) bumps the incarnation and closes the waiting
+        // effects pinned to the old one.
+        if row["config"] == *config {
+            return Ok(json!({"binding": row}));
+        }
+        let material_changed = !binding_material_same(&row["config"], config);
         let slot = row["slot"]
             .as_str()
             .ok_or_else(|| Error::internal("invalid binding slot"))?;
@@ -361,6 +577,10 @@ impl Store {
             return Err(Error::rejected("binding update lost its revision claim"));
         }
         Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+        if material_changed {
+            Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
+            Self::app_install_grants_drop_in(&tx, install, "operator")?;
+        }
         Self::event(
             &tx,
             "app_bindings",
@@ -390,6 +610,8 @@ impl Store {
             return Err(Error::rejected("binding revoke lost its revision claim"));
         }
         Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+        Self::app_binding_approval_withdraw_in(&tx, install, "connection_binding_changed")?;
+        Self::app_install_grants_drop_in(&tx, install, "operator")?;
         Self::event(
             &tx,
             "app_bindings",

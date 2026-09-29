@@ -400,7 +400,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
         let (text, subject) = claim::take_over_record(&requester, t);
         write::commit_front_with_comment(
-            pm, &dir, &front, &taken, &body, &requester, &text, &subject, actor,
+            pm, &dir, &front, &taken, &body, &requester, "claim", &text, &subject, actor,
         )?;
         front = taken;
     }

@@ -180,7 +180,7 @@ export function NewPost({
         {imageSupported && (!imageBindingDigest
           ? <p className="wa-alert">To add an image, choose a ready image generation connection in Cadence Settings.</p>
           : imageQuote
-            ? <p className="wa-alert">Current charge for one generated image: <strong>USD {(imageQuote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong>. The frozen plan requires a separate cost approval before dispatch.</p>
+            ? <p className="wa-alert">Current rate for one generated image: <strong>USD {(imageQuote.quote.total_price_micros / 1_000_000).toFixed(6)}</strong> — billed at the provider's actual charge. The frozen plan requires a separate cost approval before dispatch.</p>
             : imageQuoteError
               ? <p className="wa-alert" data-tone="fail" role="alert">{imageQuoteError}</p>
               : <p className="wa-muted" role="status">Checking one-image provider price…</p>)}

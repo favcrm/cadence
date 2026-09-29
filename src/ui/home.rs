@@ -10,12 +10,14 @@
 //!   authored `operator`, then hand it to the daemon's `answer_route`
 //!   (CAD-447) so the question's author is told; the reply's `route`
 //!   says whether it was.
-//! - `POST /api/delivery/<ID>/merge` `{}` and
+//! - `POST /api/delivery/<ID>/merge` `{"sha"}` and
 //!   `POST /api/delivery/<ID>/decline` `{"reason"}` — the worker loop's
-//!   merge decision (CAD-431). Merge runs [`crate::delivery::merge`] in
-//!   this board process — the operator's own `gh` enqueues the PR pinned
-//!   to the reviewed head; the daemon never runs `gh`. Decline relays the
-//!   daemon's operator-only `delivery_decline`.
+//!   merge decision (CAD-431). Merge relays the daemon's
+//!   approve-and-land transaction (CAD-140): the shown head is
+//!   REQUIRED, the approval object is recorded with the deciding
+//!   actor, and the daemon enqueues pinned to it — the board shells
+//!   no `gh` itself. Decline relays the daemon's operator-only
+//!   `delivery_decline`.
 //! - `GET /api/master/summary?since=<epoch secs>` — relay the daemon's
 //!   `master_summary` (CAD-339) without posting it; a daemon without the
 //!   method answers 501 so the UI shows "not available".
@@ -75,13 +77,16 @@ struct DecideReq {
 }
 
 /// `POST /api/ideas/<id>/decide`. Unknown fields are refused here so a
-/// forged `by` never reaches the daemon.
+/// forged `by` never reaches the daemon. `expect_rev` binds the
+/// decision to the issue the operator was shown: when present, the
+/// relay refuses (409 `stale_view`) if issue.md moved since.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdeaDecideReq {
     action: String,
     reason: Option<String>,
     park_until: Option<String>,
+    expect_rev: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,9 +337,15 @@ pub(super) fn decide_plan(
 
 /// `POST /api/ideas/<id>/decide` (CAD-139). The board relays
 /// `idea_decide`; the daemon's operator connection is the gate.
+/// CAD-140: `expect_rev` binds the call to the plan the operator was
+/// shown — a decision made against a moved issue is refused before
+/// the daemon is asked, so a stale card can neither approve nor
+/// reject.
 pub(super) fn decide_idea(
     request: &mut Request,
     state_dir: &std::path::Path,
+    pm_dir: &std::path::Path,
+    actor: &str,
     id: &str,
 ) -> HttpResp {
     let Ok(id) = model::check_id(id) else {
@@ -352,7 +363,44 @@ pub(super) fn decide_idea(
     if !matches!(action, "approve" | "reject" | "park") {
         return err_response(400, "action must be approve, reject, or park");
     }
-    let mut params = json!({ "issue": id, "action": action });
+    // CAD-140: the decision binds the issue shown — REQUIRED, so a
+    // stale card can neither approve nor reject. The daemon enforces
+    // it again at the write; this fast-fails before the relay.
+    let Some(shown) = req
+        .expect_rev
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    else {
+        return coded_response(
+            400,
+            "rev_required",
+            "a decision names the issue revision it was made against — re-read it and retry",
+            None,
+        );
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    let dir = match crate::issue::write::issue_dir(&pm, id.as_str()) {
+        Ok((_, dir)) => dir,
+        Err(e) => return super::write_err(&e),
+    };
+    let cur = match crate::issue::write::issue_rev(&dir) {
+        Ok(rev) => rev,
+        Err(e) => return err_response(500, &e.to_string()),
+    };
+    if shown != cur {
+        return coded_response(
+            409,
+            "stale_view",
+            &format!("{id} changed since it was shown — re-read it before deciding"),
+            None,
+        );
+    }
+    let mut params =
+        json!({ "issue": id, "action": action, "request_actor": actor, "expect_rev": shown });
     if let Some(reason) = req
         .reason
         .as_deref()
@@ -371,6 +419,11 @@ pub(super) fn decide_idea(
     }
     match client::rpc(state_dir, "idea_decide", params) {
         Ok(out) => json_response(out),
+        // CAD-140: the issue moved between the board's check and the
+        // daemon's write — 409, so the card says "re-read".
+        Err(e) if e.code() == Some("stale_view") => {
+            coded_response(409, "stale_view", &e.to_string(), None)
+        }
         Err(e) => rpc_err(&e, "idea_decide"),
     }
 }
@@ -384,10 +437,22 @@ pub(super) fn delivery_route(path: &str) -> Option<(&str, &str)> {
 
 /// `POST /api/delivery/<id>/merge|decline` (CAD-431) — the same
 /// operator rule as the plan decision (`operator::admit`).
+/// CAD-140: a merge carries the head it was approved against
+/// (`{"sha"}`, REQUIRED); the board relays the daemon's
+/// approve-and-land transaction and shells no `gh` itself. When the
+/// live head no longer matches, the approval is refused (409
+/// `head_moved`) before anything is recorded.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeReq {
+    reason: Option<String>,
+    sha: Option<String>,
+}
+
 pub(super) fn decide_delivery(
     request: &mut Request,
     state_dir: &std::path::Path,
-    opts: &ServeOpts,
+    actor: &str,
     id: &str,
     verb: &str,
 ) -> HttpResp {
@@ -403,7 +468,7 @@ pub(super) fn decide_delivery(
         Ok(bytes) => bytes,
         Err(resp) => return resp,
     };
-    let req: DecideReq = match parse_json(&bytes) {
+    let req: MergeReq = match parse_json(&bytes) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
@@ -412,20 +477,33 @@ pub(super) fn decide_delivery(
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty());
+    // The deciding actor rides along for the approval object —
+    // attribution, never authority (the daemon gates the connection).
+    // The caller passes it: `admit` derived it before this handler ran.
     let (out, method) = if merge {
         if reason.is_some() {
             return err_response(400, "a merge takes no reason");
         }
-        let gh = opts
-            .gh
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| crate::delivery::GH.to_string());
+        let Some(sha) = req.sha.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return coded_response(
+                400,
+                "sha_required",
+                "a merge names the head it approves — re-read the row and retry",
+                None,
+            );
+        };
         (
-            crate::delivery::merge(state_dir, &id, &gh),
-            "delivery_merge",
+            client::rpc(
+                state_dir,
+                "delivery_approve",
+                json!({"issue": id, "sha": sha, "request_actor": actor}),
+            ),
+            "delivery_approve",
         )
     } else {
+        if req.sha.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return err_response(400, "a decline takes a reason, not a head");
+        }
         let Some(reason) = reason else {
             return coded_response(400, "reason_required", "a decline needs a reason", None);
         };
@@ -433,13 +511,18 @@ pub(super) fn decide_delivery(
             client::rpc(
                 state_dir,
                 "delivery_decline",
-                json!({"issue": id, "reason": reason}),
+                json!({"issue": id, "reason": reason, "request_actor": actor}),
             ),
             "delivery_decline",
         )
     };
     match out {
         Ok(out) => json_response(out),
+        // CAD-140: the head moved since the operator was shown it —
+        // 409, not the check's 400, so the card can say "re-review".
+        Err(e) if e.code() == Some("head_moved") => {
+            coded_response(409, "head_moved", &e.to_string(), None)
+        }
         Err(e) => rpc_err(&e, method),
     }
 }

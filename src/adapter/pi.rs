@@ -59,9 +59,10 @@
 //!   policy grants its worktree, the repo's shared git dir, the
 //!   effective/shared target dirs, the declared cargo + sccache
 //!   caches, the PM tracker and its own dir under the state dir —
-//!   reads the toolchain and system trees, and denies `$HOME` secrets
-//!   (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
-//!   `credentials.toml`), every other agent's dir and the daemon store
+//!   reads the toolchain and system trees, and denies every `$HOME`
+//!   secret (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
+//!   cargo `credentials.toml`, `~/.local/share` itself, and Devin
+//!   credentials) — every other agent's dir and the daemon store
 //!   by omission. `TMPDIR` is redirected into the worker dir (a shared
 //!   `/tmp` grant would expose every lane, and a denied one makes
 //!   rustc retry for ~1s) and `GIT_CONFIG_GLOBAL` at the worker's own
@@ -752,9 +753,11 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   push` over ssh + agent works while the keys themselves stay
 ///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
 ///   an unreadable config (proven), and this file carries the
-///   rustc-wrapper/source-mirror settings builds need. `credentials.
-///   toml` is never in the policy — it is the token file; the pinned
-///   `[pi].providers` package dirs the `-e` argv loads (CAD-559).
+///   rustc-wrapper/source-mirror settings builds need. Cargo's
+///   `credentials.toml` (registry tokens) and the Devin CLI login
+///   (`~/.local/share/devin/credentials.toml`) are never granted.
+///   The pinned `[pi].providers`
+///   package dirs the `-e` argv loads (CAD-559).
 /// - **denied** by omission: `$HOME` itself and everything under it
 ///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
 ///   agents' dirs under the state dir (`<state>/agents/<alias>` is the
@@ -764,6 +767,41 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///
 /// `GIT_CONFIG_GLOBAL` is redirected to the worker's own file by
 /// `open` (git fatals on an unreadable `~/.gitconfig` — proven).
+///
+/// A confined managed Pi worker cannot use the Devin provider: pi-devin
+/// reads the operator's login file on every turn, and granting that file
+/// to a worker would let its tools copy or transmit the credential.
+/// Call this before persisting a registration, changing a launch model,
+/// dispatching work, and opening an existing row.
+pub fn refuse_confined_devin(alias: &str, confined: bool, model: &str) -> Result<()> {
+    if confined && model.starts_with("devin/") {
+        return Err(Error::rejected(format!(
+            "pi worker '{alias}' cannot use model '{model}' while confined: \
+             pi-devin requires the operator's Devin credential, which a confined \
+             worker cannot safely read. Choose a non-Devin model or have the \
+             operator register an unconfined worker (CAD-751)"
+        )));
+    }
+    Ok(())
+}
+
+pub fn refuse_confined_devin_agent(agent: &Agent) -> Result<()> {
+    if agent.provider == "pi"
+        && agent.endpoint_kind == "managed"
+        && !crate::master::is_master(&agent.alias)
+    {
+        let params = agent.params.as_ref().unwrap_or(&Value::Null);
+        refuse_confined_devin(
+            &agent.alias,
+            params.get("confine").and_then(Value::as_bool) == Some(true),
+            params
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )?;
+    }
+    Ok(())
+}
 pub fn pi_worker_confinement(
     env: &ProviderEnv,
     state_dir: &Path,
@@ -889,6 +927,7 @@ pub fn pi_worker_confinement(
         read.push(home.join(".config/sccache"));
         read.push(home.join(".ssh/config"));
         read.push(home.join(".ssh/known_hosts"));
+        // Devin login remains outside every worker's filesystem policy.
     }
     // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
     // named explicitly so the write set shows it — it is inside the
@@ -1916,6 +1955,7 @@ impl ProviderAdapter for PiAdapter {
     /// `set_thinking_level` and is verified against `get_state`, since
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
+        refuse_confined_devin_agent(agent)?;
         let master = crate::master::is_master(&agent.alias);
         let params = agent.params.clone().unwrap_or(Value::Null);
         // CAD-559: pi launches only on an explicit model the operator

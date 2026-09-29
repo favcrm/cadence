@@ -18,6 +18,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import Button from "../../ui/Button";
 import PermissionCard from "./PermissionCard";
 import PlanCard from "./PlanCard";
+import IdeaCard from "./IdeaCard";
 import Link from "../../ui/Link";
 
 /** One row of a rail's inline menu (the `…` overflow and the Unfence
@@ -27,6 +28,7 @@ const MENU_ITEM =
 
 const KIND_CHIP: Record<string, string> = {
   plan: "bg-warn/10 text-warn",
+  idea_plan: "bg-warn/10 text-warn",
   question: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
   master_permission: "bg-warn/10 text-warn",
@@ -121,7 +123,12 @@ function AnswerForm({
   );
 }
 
-/** The merge decision (CAD-431): what passed, then one Merge button. */
+/**
+ * The merge decision (CAD-431, CAD-140): what passed, then Merge
+ * pinned to the shown head — or Decline with a reason. The merge
+ * carries the head it was approved against; a moved head refuses
+ * with 409 `head_moved` before any `gh` merge runs.
+ */
 function MergeForm({
   need,
   readOnly,
@@ -132,19 +139,45 @@ function MergeForm({
   onDone: (text: string) => void;
 }) {
   const { issue, pr, sha, reviewer, verdict } = need.action;
-  const [busy, setBusy] = useState(false);
+  // CAD-140: the approval names its head — REQUIRED. A row that
+  // predates the field cannot merge until it is re-read.
+  const shown = sha && sha.trim() ? sha : null;
+  const [busy, setBusy] = useState<null | "merge" | "decline">(null);
+  const [declining, setDeclining] = useState(false);
+  const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
   const merge = () => {
-    setBusy(true);
+    setBusy("merge");
     setError(null);
+    if (!shown) {
+      setError("Re-read the row — it names no head to approve.");
+      return;
+    }
     api
-      .mergeDelivery(issue)
+      .mergeDelivery(issue, shown)
       .then((out) => {
         void resources.overview.invalidate();
         onDone(`merge ${String((out as { state?: unknown }).state ?? "sent")}`);
       })
       .catch((e: ApiError) => setError(e.message ?? String(e)))
-      .finally(() => setBusy(false));
+      .finally(() => setBusy(null));
+  };
+  const decline = () => {
+    const why = reason.trim();
+    if (!why) {
+      setError("Say why — the reason goes to the worker loop.");
+      return;
+    }
+    setBusy("decline");
+    setError(null);
+    api
+      .declineDelivery(issue, why)
+      .then((out) => {
+        void resources.overview.invalidate();
+        onDone(`declined: ${String((out as { state?: unknown }).state ?? "sent")}`);
+      })
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(null));
   };
   return (
     <div className="mt-2 space-y-2">
@@ -157,9 +190,51 @@ function MergeForm({
       {readOnly ? (
         <p className="text-micro text-ink-500">Board is read-only — merge with `cadence delivery merge {issue}`.</p>
       ) : (
-        <Button variant="primary" size="sm" disabled={busy} loading={busy} onClick={merge}>
-          {busy ? "Merging…" : "Merge"}
-        </Button>
+        <>
+          {declining && (
+            <label className="block">
+              <span className="slabel">reason (required)</span>
+              <textarea
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                rows={2}
+                className="field w-full mt-1 text-secondary"
+                placeholder="What should change before this can merge?"
+                aria-label="decline reason"
+              />
+            </label>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {!declining && shown && (
+              <Button variant="primary" size="sm" disabled={busy !== null} loading={busy === "merge"} onClick={merge}>
+                {busy === "merge" ? "Merging…" : "Merge"}
+              </Button>
+            )}
+            {!declining && !shown && (
+              <p className="text-micro text-ink-500">Re-read the row — it names no head to approve.</p>
+            )}
+            {declining ? (
+              <>
+                <Button
+                  variant="danger"
+                  size="sm"
+                  disabled={busy !== null}
+                  loading={busy === "decline"}
+                  onClick={decline}
+                >
+                  {busy === "decline" ? "Declining…" : "Decline"}
+                </Button>
+                <Button size="sm" onClick={() => { setDeclining(false); setError(null); }}>
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => setDeclining(true)}>
+                Decline…
+              </Button>
+            )}
+          </div>
+        </>
       )}
       {error && (
         <p className="text-micro text-fail break-words" role="alert">
@@ -318,11 +393,13 @@ function NeedItem({
   const expandLabel =
     action.type === "plan"
       ? "Review plan"
-      : action.type === "answer"
-        ? "Answer"
-        : action.type === "permission"
-          ? "Decide"
-          : "Review merge";
+      : action.type === "idea"
+        ? "Decide"
+        : action.type === "answer"
+          ? "Answer"
+          : action.type === "permission"
+            ? "Decide"
+            : "Review merge";
   return (
     <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
       <div className="flex items-center gap-2 min-w-0">
@@ -353,6 +430,7 @@ function NeedItem({
             Ask master
           </button>
           {(action.type === "plan" ||
+            action.type === "idea" ||
             action.type === "answer" ||
             action.type === "merge" ||
             action.type === "permission") && (
@@ -456,6 +534,16 @@ function NeedItem({
       {open && action.type === "plan" && (
         <div className="mt-2">
           <PlanCard epic={action.epic} readOnly={readOnly} onOpenIssue={onOpenIssue} />
+        </div>
+      )}
+      {open && action.type === "idea" && !done && (
+        <div className="mt-2">
+          <IdeaCard
+            issue={action.issue}
+            readOnly={readOnly}
+            onOpenIssue={onOpenIssue}
+            onDecided={(id, decided) => setDone(`${id} ${decided}`)}
+          />
         </div>
       )}
       {open && action.type === "merge" && !done && (

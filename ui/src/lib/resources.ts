@@ -16,6 +16,8 @@ import type {
   AppOutputsPayload,
   AppRow,
   AppRun,
+  Connection,
+  ConnectionProvider,
   IssueCard,
   IssueDetail,
   MasterState,
@@ -142,4 +144,22 @@ export const resources = {
   outbox: cache.resource<OutboxItem[]>("outbox", () => api.outbox().then((r) => r.items), {
     isEmpty: (rows) => rows.length === 0,
   }),
+  /**
+   * `GET /api/connection-providers` — every registered provider with
+   * its reviewed descriptor (CAD-585). Operator-only: the Settings
+   * Connections page fetches it only when the board proves the
+   * operator.
+   */
+  connectionProviders: cache.resource<ConnectionProvider[]>(
+    "connectionProviders",
+    () => api.connectionProviders().then((r) => r.providers),
+    { isEmpty: (rows) => rows.length === 0 },
+  ),
+  /**
+   * `GET /api/connections` — every exact provider account, metadata
+   * only (CAD-585). Operator-only, like the providers read.
+   */
+  connections: cache.resource<Connection[]>("connections", () =>
+    api.connections().then((r) => r.connections),
+  ),
 };

@@ -85,7 +85,7 @@ impl Shared {
     /// only that live, verified direct child session, never a further
     /// `setsid` below the shell or an arbitrary detached program. The
     /// message/turn, binding, quote and one-result checks remain in the RPC.
-    fn pi_bash_tool_session(
+    pub(super) fn pi_bash_tool_session(
         &self,
         alias: &str,
         proof: &crate::slots::StrictCaller,

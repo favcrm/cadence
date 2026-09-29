@@ -51,7 +51,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,6 +59,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+#[path = "common/port.rs"]
+mod port;
 
 /// The whole journey's budget (the acceptance: under 10 minutes).
 const BUDGET: Duration = Duration::from_secs(600);
@@ -82,18 +84,25 @@ const PORTS: std::ops::RangeInclusive<u16> = 3110..=3199;
 /// Setup attempts on a new port when the one picked was taken meanwhile.
 const PORT_ATTEMPTS: usize = 8;
 
-/// A port in [`PORTS`] that binds right now, not in `tried`. The scan
-/// starts at a pid-derived offset, so concurrent journeys (and the other
-/// lanes' boards in the same range) rarely race for one port; the race
-/// that remains between this probe and `setup` binding is retried by
-/// [`Journey::setup`].
-fn free_port(tried: &[u16]) -> u16 {
-    let n = PORTS.len() as u64;
-    let start = (u64::from(std::process::id()) * 7919 + tried.len() as u64 * 13) % n;
-    (0..n)
-        .map(|i| *PORTS.start() + ((start + i) % n) as u16)
-        .find(|p| !tried.contains(p) && TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("no free port in 3110-3199")
+/// A fenced lease on a [`PORTS`] port, not in `tried`. The pick honours
+/// the suite's `/tmp/cadence-test-ports` flock dir, so a parallel
+/// journey (or a sandbox's `down` window) can never take a leased port;
+/// the race that remains between the pick and `setup` binding is
+/// retried by [`Journey::setup`].
+fn free_port(tried: &[u16], kept: &mut Vec<port::PortLease>) -> u16 {
+    for _ in 0..PORTS.len() {
+        let lease = port::test_port();
+        if tried.contains(&lease.port) {
+            // Keep the lease: dropped, it frees the port and the next
+            // pick from the same offset returns it again.
+            kept.push(lease);
+            continue;
+        }
+        let port = lease.port;
+        kept.push(lease);
+        return port;
+    }
+    panic!("no free port in 3110-3199")
 }
 
 /// A program's absolute path on this process's own PATH — the board
@@ -119,6 +128,8 @@ struct Case {
 struct Journey {
     root: TempDir,
     port: u16,
+    /// Every lease the journey has taken — held for its whole life.
+    leases: Vec<port::PortLease>,
     artifacts: PathBuf,
     started: Instant,
     /// The operator's browser, spawned on the first board step.
@@ -140,14 +151,15 @@ impl Journey {
         }
         let artifacts = PathBuf::from(required_env("CADENCE_E2E_ARTIFACTS"));
         fs::create_dir_all(&artifacts).unwrap();
-        let j = Journey {
+        let mut j = Journey {
             // CADENCE_E2E_PORT pins the first attempt (debugging, and
             // proving the taken-port retry); the default probes the range.
             port: std::env::var("CADENCE_E2E_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .filter(|p| PORTS.contains(p))
-                .unwrap_or_else(|| free_port(&[])),
+                .unwrap_or(0),
+            leases: Vec::new(),
             root,
             artifacts,
             started: Instant::now(),
@@ -155,6 +167,10 @@ impl Journey {
             cases: Vec::new(),
             steps: Vec::new(),
         };
+        if j.port == 0 {
+            // No CADENCE_E2E_PORT pin: take the first fenced pick.
+            j.port = free_port(&[], &mut j.leases);
+        }
         // The socket path must fit sun_path (107 bytes).
         let sock = j.state_dir().join("cadence.sock");
         assert!(sock.as_os_str().len() <= 107, "{}", sock.display());
@@ -394,7 +410,7 @@ impl Journey {
                 "port {} was taken meanwhile — setup again on another",
                 self.port
             );
-            self.port = free_port(&tried);
+            self.port = free_port(&tried, &mut self.leases);
         }
         panic!("setup found no free board port in {PORT_ATTEMPTS} attempts:\n{all}");
     }
@@ -984,6 +1000,30 @@ fn mvp_journey_end_to_end() {
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "passed");
+    // CAD-140: a researched idea waits beside the merge — both
+    // decision rows must fit a 390px phone viewport first.
+    let filed = j.ok(&[
+        "report",
+        "--kind",
+        "idea",
+        "--project",
+        "demo",
+        "-m",
+        "Phone-width idea\nEvery control reachable at 390px.",
+    ]);
+    let idea = filed["id"].as_str().unwrap().to_string();
+    j.ok(&[
+        "issue",
+        "set",
+        &idea,
+        "status=review",
+        "tags=intake,idea,plan-ready",
+    ]);
+    j.board("decisions390", json!({"idea": idea, "issue": "DEM-2"}));
+    j.pass(
+        7,
+        "the idea and merge decision rows fit 390px with every control inside the viewport",
+    );
     j.board(
         "merge",
         json!({"issue": "DEM-2", "reviewer": "r1", "sha": sha, "pr": "acme/demo#1",
@@ -993,7 +1033,7 @@ fn mvp_journey_end_to_end() {
         j.gh_log().contains(&format!(
             "pr merge 1 -R acme/demo --auto --squash --match-head-commit {sha}"
         )),
-        "the board's Merge ran the operator's gh pinned to the reviewed head:\n{}",
+        "the board's Merge landed pinned to the reviewed head (daemon-side gh):\n{}",
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "enqueued");

@@ -80,8 +80,23 @@ pub struct Claim {
     pub by: String,
     /// RFC 3339 UTC — the claim age is measured from here.
     pub at: String,
+    /// The current agent session observed by the daemon, when the
+    /// claimant is a registered agent. Human claims leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Last persisted agent-liveness observation. This is separate from
+    /// `at`, so renewing a claim never hides how long work has been held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// CAD-755: daemon-written staleness marker — why the holder's agent
+    /// no longer counts as live ("stopped at …", "attention since …").
+    /// A set marker means the claim does not block take-over; a live
+    /// holder clears it on the next liveness pass. `owner` is untouched
+    /// either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says
@@ -148,6 +163,13 @@ pub struct Front {
     /// unsized counts as M (docs/design/WORK-MODEL.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// CAD-812: when the advisory groom pass last re-derived this
+    /// ticket's freshness (RFC 3339 UTC). `issue groom` stamps it on
+    /// every verdict — `valid` and `stale` alike — so an untouched
+    /// ticket is not re-reviewed every pass. Absent means never
+    /// groomed; an older binary rewriting the file drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_groomed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -181,6 +203,7 @@ impl Front {
             stage_at: None,
             milestone: None,
             size: None,
+            last_groomed_at: None,
             parent: None,
             blocked_by: vec![],
             relates: vec![],

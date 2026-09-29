@@ -19,7 +19,16 @@
 //! (`claim take-over by …` in `issue log`). In `backlog`/`ready` an owner
 //! is an assignment or the project's `default_owner`, not work in
 //! flight, so it only warns.
+//!
+//! **Liveness** (CAD-755): the daemon's checkup maps the agent registry
+//! to `claim.stale` — a holder stopped, fenced (`attention`), offline or
+//! endpoint-dead past [`STALE_GRACE`] gets the marker; a live holder
+//! clears it. A stale claim needs no `--take-over`: the marker is the
+//! recorded reason the claim no longer stands. Holders outside the
+//! registry (operators, foreign PMs) are never marked — `issue claim`
+//! refreshes their claim by hand. `owner` is untouched either way.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,6 +47,11 @@ const NOTE_MAX: usize = 500;
 
 /// Per-issue bound on the git fallback that dates an owner-only claim.
 const OWNER_CLOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// CAD-755: how long a holder's agent may be dead before its claim is
+/// marked stale — long enough to cover a restart, short enough that a
+/// fenced lane does not hold a ticket hostage.
+pub const STALE_GRACE: Duration = Duration::from_secs(30 * 60);
 
 /// What [`check`] found for a request that may proceed.
 #[derive(Debug, Default, Clone)]
@@ -169,25 +183,37 @@ pub fn check(
             take_over: None,
         });
     }
-    let Some(reason) = take_over else {
-        return Err(Error::invalid(
-            "claimed",
-            format!(
-                "{id} is {status} and held by {holder} — {verb} by {asking} refused so a \
-                 second lane does not start on it. Ask {} (`cadence issue show {id}`), or \
-                 pass --take-over \"<reason>\" to take it over (recorded on the issue)",
-                held[0]
-            ),
-        ));
-    };
-    Ok(Check {
-        warning: None,
-        take_over: Some(TakeOver {
-            from: held[0].to_string(),
-            holder,
-            reason: clean_text("--take-over", reason)?,
-        }),
-    })
+    if let Some(reason) = take_over {
+        return Ok(Check {
+            warning: None,
+            take_over: Some(TakeOver {
+                from: held[0].to_string(),
+                holder,
+                reason: clean_text("--take-over", reason)?,
+            }),
+        });
+    }
+    // CAD-755: the daemon's stale marker already carries the reason the
+    // claim no longer stands — taking it over needs no --take-over.
+    if let Some(c) = front.claim.as_ref().filter(|c| c.stale.is_some()) {
+        return Ok(Check {
+            warning: None,
+            take_over: Some(TakeOver {
+                from: held[0].to_string(),
+                holder,
+                reason: format!("stale claim: {}", c.stale.as_deref().unwrap_or_default()),
+            }),
+        });
+    }
+    Err(Error::invalid(
+        "claimed",
+        format!(
+            "{id} is {status} and held by {holder} — {verb} by {asking} refused so a \
+             second lane does not start on it. Ask {} (`cadence issue show {id}`), or \
+             pass --take-over \"<reason>\" to take it over (recorded on the issue)",
+            held[0]
+        ),
+    ))
 }
 
 /// The take-over comment and the `issue log` subject for it.
@@ -202,7 +228,8 @@ pub fn take_over_record(by: &str, t: &TakeOver) -> (String, String) {
 pub fn json(front: &Front, now: i64) -> Value {
     match &front.claim {
         Some(c) => json!({
-            "by": c.by, "at": c.at, "note": c.note,
+            "by": c.by, "at": c.at, "session": c.session,
+            "last_seen": c.last_seen, "note": c.note, "stale": c.stale,
             "age_secs": time::parse_iso(&c.at).map(|t| (now - t).max(0)),
         }),
         None => Value::Null,
@@ -214,7 +241,10 @@ pub fn new_claim(by: &str, note: Option<String>) -> Claim {
     Claim {
         by: by.to_string(),
         at: time::iso(time::now_epoch()),
+        session: None,
+        last_seen: None,
         note,
+        stale: None,
     }
 }
 
@@ -250,6 +280,7 @@ pub fn row(project: &str, front: &Front, since: Option<i64>, now: i64) -> Value 
         "by": front.claim.as_ref().map(|c| c.by.clone()).or_else(|| front.owner.clone()),
         "owner": front.owner,
         "note": front.claim.as_ref().and_then(|c| c.note.clone()),
+        "stale": front.claim.as_ref().and_then(|c| c.stale.clone()),
         "since": since.map(time::iso),
         "age_secs": since.map(|t| (now - t).max(0)),
     })
@@ -295,21 +326,31 @@ pub fn claim(
     // claimed it — that is a take-over too.
     if let Some(c) = front.claim.as_ref().filter(|c| c.by != by) {
         if !checked.foreign() {
-            let Some(reason) = take_over else {
-                return Err(Error::invalid(
-                    "claimed",
-                    format!(
-                        "{id} is claimed by {} and {by} is its owner — pass --take-over \
-                         \"<reason>\" to take the claim itself",
-                        c.by
-                    ),
-                ));
-            };
-            checked.take_over = Some(TakeOver {
-                from: c.by.clone(),
-                holder: describe(&front, time::parse_iso(&c.at), time::now_epoch()),
-                reason: clean_text("--take-over", reason)?,
-            });
+            // CAD-755: an owner reclaiming a stale claim needs no
+            // --take-over either — the marker carries the reason.
+            if c.stale.is_some() {
+                checked.take_over = Some(TakeOver {
+                    from: c.by.clone(),
+                    holder: describe(&front, time::parse_iso(&c.at), time::now_epoch()),
+                    reason: format!("stale claim: {}", c.stale.as_deref().unwrap_or_default()),
+                });
+            } else {
+                let Some(reason) = take_over else {
+                    return Err(Error::invalid(
+                        "claimed",
+                        format!(
+                            "{id} is claimed by {} and {by} is its owner — pass --take-over \
+                             \"<reason>\" to take the claim itself",
+                            c.by
+                        ),
+                    ));
+                };
+                checked.take_over = Some(TakeOver {
+                    from: c.by.clone(),
+                    holder: describe(&front, time::parse_iso(&c.at), time::now_epoch()),
+                    reason: clean_text("--take-over", reason)?,
+                });
+            }
         }
     }
     let mut next = front.clone();
@@ -345,7 +386,7 @@ pub fn claim(
         None => text,
     };
     let comment = write::commit_front_with_comment(
-        pm, &dir, &front, &next, &body, &by, &text, &subject, actor,
+        pm, &dir, &front, &next, &body, &by, "claim", &text, &subject, actor,
     )?;
     let now = time::now_epoch();
     Ok(json!({
@@ -412,6 +453,7 @@ pub fn release(
         &next,
         &body,
         &by,
+        "claim",
         &format!("Released by {by}{suffix}"),
         &format!("release by {by}"),
         actor,
@@ -426,6 +468,91 @@ pub fn release(
     }))
 }
 
+/// The daemon-side claim sweep (CAD-755). `dead` maps every registered
+/// agent that no longer counts as live — stopped, fenced (`attention`),
+/// offline, or whose endpoint `agent_liveness` reports dead — to when
+/// its registry row last changed and why. `live` names the rest of the
+/// registry. A claim whose holder is dead past `grace` gets
+/// `claim.stale` stamped with the reason; a claim held by a live agent
+/// clears the marker on the next pass. Claims whose holder is not a
+/// registered agent at all (an operator, a foreign PM) are never marked
+/// — `issue claim` is their manual refresh path. `owner` is never
+/// touched. Marks and heals commit separately, each one commit.
+///
+/// Returns the marked/healed id lists for the daemon's checkup log.
+pub fn liveness_sweep(
+    pm: &Pm,
+    dead: &HashMap<String, (i64, String)>,
+    live: &HashMap<String, Option<String>>,
+    grace: Duration,
+    now: i64,
+    actor: &str,
+) -> Result<Value> {
+    let issues = crate::issue::board::load_all(&pm.dir, None)?;
+    let claimed: Vec<String> = issues
+        .iter()
+        .filter(|i| {
+            i.front.claim.is_some() && !matches!(i.front.status.as_str(), "done" | "dropped")
+        })
+        .map(|i| i.front.id.clone())
+        .collect();
+    if claimed.is_empty() {
+        return Ok(json!({"marked": [], "healed": [], "refreshed": []}));
+    }
+    let _lock = pm.lock()?;
+    let mut healed_ids = HashSet::new();
+    let staged = write::stage(pm, &claimed, |_project, front| {
+        // Recheck under the PM lock: the initial board snapshot can race
+        // a human completing or dropping the issue.
+        if matches!(front.status.as_str(), "done" | "dropped") {
+            return Ok(false);
+        }
+        let Some(c) = front.claim.as_mut() else {
+            return Ok(false);
+        };
+        if let Some((since, why)) = dead.get(c.by.as_str()) {
+            if c.stale.is_none() && now - *since >= grace.as_secs() as i64 {
+                c.stale = Some(format!("{why} since {}", time::iso(*since)));
+                return Ok(true);
+            }
+        } else if let Some(session) = live.get(c.by.as_str()) {
+            // Bound tracker writes during a frequent checkup, while
+            // retaining fresh persisted evidence across restarts.
+            let due = c
+                .last_seen
+                .as_deref()
+                .and_then(time::parse_iso)
+                .is_none_or(|seen| now - seen >= 300);
+            if due || c.stale.is_some() || c.session != *session {
+                if c.stale.is_some() {
+                    healed_ids.insert(front.id.clone());
+                }
+                c.last_seen = Some(time::iso(now));
+                c.session = session.clone();
+                c.stale = None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })?;
+    let mut stale = Vec::new();
+    let mut healed = Vec::new();
+    let mut refreshed = Vec::new();
+    for s in staged {
+        if s.front.claim.as_ref().is_some_and(|c| c.stale.is_some()) {
+            stale.push(s);
+        } else if healed_ids.contains(&s.id) {
+            healed.push(s);
+        } else {
+            refreshed.push(s);
+        }
+    }
+    let (marked, _) = write::commit_staged(pm, &stale, "claims marked stale", actor)?;
+    let (healed, _) = write::commit_staged(pm, &healed, "claims live again", actor)?;
+    let (refreshed, _) = write::commit_staged(pm, &refreshed, "claims checked live", actor)?;
+    Ok(json!({"marked": marked, "healed": healed, "refreshed": refreshed}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +564,10 @@ mod tests {
         f.claim = claim_by.map(|b| Claim {
             by: b.to_string(),
             at: "2026-09-23T00:00:00Z".to_string(),
+            session: None,
+            last_seen: None,
             note: None,
+            stale: None,
         });
         f
     }
@@ -526,5 +656,206 @@ mod tests {
         );
         assert_eq!(holders(&front("doing", Some("pm"), Some("pm"))), ["pm"]);
         assert!(holders(&front("doing", None, None)).is_empty());
+    }
+
+    fn stale_front(status: &str, owner: Option<&str>, claim_by: &str) -> Front {
+        let mut f = front(status, owner, Some(claim_by));
+        f.claim.as_mut().unwrap().stale = Some("stopped since 2026-01-01T00:00:00Z".into());
+        f
+    }
+
+    /// CAD-755: a daemon-stale claim frees the issue — a foreign lane
+    /// takes over without --take-over, and the marker's reason stands in
+    /// for the operator's.
+    #[test]
+    fn stale_claim_takes_over_without_a_flag() {
+        let f = stale_front("doing", Some("w1"), "pm-a");
+        let c = run(&f, &["pm-b", "w3"], None).unwrap();
+        let t = c.take_over.unwrap();
+        assert_eq!(t.from, "pm-a");
+        assert!(t.reason.contains("stale claim"), "{}", t.reason);
+        // An explicit --take-over still speaks for itself.
+        let c = run(&f, &["pm-b"], Some("lane confirmed dead")).unwrap();
+        assert_eq!(c.take_over.unwrap().reason, "lane confirmed dead");
+        // And a stale claim on an unprotected status still only warns.
+        let f = stale_front("backlog", Some("w1"), "pm-a");
+        assert!(run(&f, &["pm-b"], None).unwrap().warning.is_some());
+        // A marker that never reached the front refuses as before.
+        let f = front("doing", Some("w1"), Some("pm-a"));
+        assert!(run(&f, &["pm-b", "w3"], None).is_err());
+    }
+
+    /// A tracker with project `cadence`; `issue` files tickets under it.
+    fn tracker() -> (tempfile::TempDir, Pm) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        (dir, pm)
+    }
+
+    fn issue(pm: &Pm, cwd: &Path, title: &str, owner: Option<&str>) -> String {
+        write::new_issue(
+            pm,
+            cwd,
+            Some("cadence"),
+            title,
+            None,
+            None,
+            &[],
+            owner,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn front_of(pm: &Pm, id: &str) -> Front {
+        let (_p, dir) = write::issue_dir(pm, id).unwrap();
+        write::load_front(&dir).unwrap().0
+    }
+
+    /// CAD-755: dead past grace → stale; live again → healed; a holder
+    /// the registry does not know (an operator) is never auto-marked;
+    /// a dead holder inside grace keeps its claim whole.
+    #[test]
+    fn liveness_sweep_marks_heals_and_skips_unregistered() {
+        let (tmp, pm) = tracker();
+        let dead_id = issue(&pm, tmp.path(), "dead lane", Some("w1-lane"));
+        let live_id = issue(&pm, tmp.path(), "live lane", None);
+        let op_id = issue(&pm, tmp.path(), "operator lane", None);
+        claim(&pm, &dead_id, Some("w1"), None, None, "t").unwrap();
+        claim(&pm, &live_id, Some("w2"), None, None, "t").unwrap();
+        claim(&pm, &op_id, Some("operator"), None, None, "t").unwrap();
+        let now = time::now_epoch();
+        let dead = HashMap::from([
+            ("w1".to_string(), (now - 3600, "stopped".to_string())),
+            ("w2".to_string(), (now - 60, "offline".to_string())),
+        ]);
+        // w2 is dead but inside the grace window — untouched.
+        let out = liveness_sweep(&pm, &dead, &HashMap::new(), STALE_GRACE, now, "daemon").unwrap();
+        assert_eq!(out["marked"], json!([dead_id.clone()]));
+        let stale = front_of(&pm, &dead_id).claim.unwrap().stale.unwrap();
+        assert!(stale.contains("stopped"), "{stale}");
+        assert!(front_of(&pm, &live_id).claim.unwrap().stale.is_none());
+        // `operator` is in no registry map — its claim stays whole.
+        assert!(front_of(&pm, &op_id).claim.unwrap().stale.is_none());
+        // owner is untouched by the mark.
+        assert_eq!(front_of(&pm, &dead_id).owner.as_deref(), Some("w1-lane"));
+
+        // w1 resumes → its marker clears; the operator claim is unmoved.
+        let live = HashMap::from([("w1".to_string(), None)]);
+        let out = liveness_sweep(&pm, &dead, &live, STALE_GRACE, now, "daemon").unwrap();
+        // w1 is in both maps this pass — dead wins, nothing heals while
+        // the registry still says stopped.
+        assert_eq!(out["healed"], json!([]));
+        let out = liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
+        assert_eq!(out["healed"], json!([dead_id.clone()]));
+        assert!(front_of(&pm, &dead_id).claim.unwrap().stale.is_none());
+    }
+
+    #[test]
+    fn live_check_persists_claim_session_and_last_seen() {
+        let (tmp, pm) = tracker();
+        let id = issue(&pm, tmp.path(), "live evidence", None);
+        claim(&pm, &id, Some("w1"), None, None, "t").unwrap();
+        let now = time::now_epoch();
+        let live = HashMap::from([("w1".to_string(), Some("session-1".to_string()))]);
+        liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
+        let persisted = front_of(&pm, &id);
+        assert_eq!(json(&persisted, now)["last_seen"], json!(time::iso(now)));
+        assert_eq!(json(&persisted, now)["session"], json!("session-1"));
+        assert!(persisted.claim.unwrap().stale.is_none());
+
+        // A same-session check inside the write interval makes no new
+        // evidence commit; crossing it refreshes the persisted time.
+        let out =
+            liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now + 60, "daemon").unwrap();
+        assert_eq!(out["healed"], json!([]));
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 60)["last_seen"],
+            json!(time::iso(now))
+        );
+        liveness_sweep(
+            &pm,
+            &HashMap::new(),
+            &live,
+            STALE_GRACE,
+            now + 301,
+            "daemon",
+        )
+        .unwrap();
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 301)["last_seen"],
+            json!(time::iso(now + 301))
+        );
+
+        // A replacement session is recorded even before the interval.
+        let replacement = HashMap::from([("w1".to_string(), Some("session-2".to_string()))]);
+        liveness_sweep(
+            &pm,
+            &HashMap::new(),
+            &replacement,
+            STALE_GRACE,
+            now + 302,
+            "daemon",
+        )
+        .unwrap();
+        assert_eq!(
+            json(&front_of(&pm, &id), now + 302)["session"],
+            json!("session-2")
+        );
+    }
+
+    #[test]
+    fn terminal_claims_are_not_rewritten_by_liveness_checks() {
+        let (tmp, pm) = tracker();
+        for status in ["done", "dropped"] {
+            let id = issue(&pm, tmp.path(), status, None);
+            claim(&pm, &id, Some("w1"), None, None, "t").unwrap();
+            write::set_fields(
+                &pm,
+                std::slice::from_ref(&id),
+                &[format!("status={status}")],
+                "t",
+                (status == "done").then_some("terminal fixture with no release evidence"),
+            )
+            .unwrap();
+            let before = front_of(&pm, &id).claim.unwrap();
+            let now = time::now_epoch();
+            let live = HashMap::from([("w1".to_string(), Some("session-1".to_string()))]);
+            let out =
+                liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
+            assert_eq!(out["refreshed"], json!([]), "{status}: {out}");
+            assert_eq!(front_of(&pm, &id).claim.unwrap(), before);
+        }
+    }
+
+    /// CAD-755: the whole check chain — a stale-claimed doing issue is
+    /// claimed by another lane with no --take-over, and the holder's
+    /// owner is never a magic backdoor either.
+    #[test]
+    fn stale_claim_frees_issue_claim_for_foreign_and_owner() {
+        let (tmp, pm) = tracker();
+        let id = issue(&pm, tmp.path(), "taken", None);
+        claim(&pm, &id, Some("pm-a"), None, None, "t").unwrap();
+        // Foreign lane on a live claim still refuses.
+        assert!(claim(&pm, &id, Some("pm-b"), None, None, "t").is_err());
+        let now = time::now_epoch();
+        let dead = HashMap::from([("pm-a".to_string(), (now - 3600, "stopped".to_string()))]);
+        liveness_sweep(&pm, &dead, &HashMap::new(), STALE_GRACE, now, "daemon").unwrap();
+        let out = claim(&pm, &id, Some("pm-b"), None, None, "t").unwrap();
+        assert_eq!(out["take_over"]["from"].as_str().unwrap(), "pm-a", "{out}");
+        assert!(out["take_over"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stale claim"));
+        // The take-over reclaims the claim under the new holder.
+        assert_eq!(front_of(&pm, &id).claim.unwrap().by, "pm-b");
     }
 }

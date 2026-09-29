@@ -155,23 +155,18 @@ fn issue_cli_end_to_end() {
     assert!(ok);
     assert_eq!(lint["ok"], true);
 
-    // status=ready while a blocker is open → warning, not an error.
-    assert!(
-        cli(
-            pm.path(),
-            state.path(),
-            &["issue", "set", "CAD-3", "status=ready"]
-        )
-        .0
+    // CAD-757: status=ready while a blocker is open → refused, not a
+    // warning. Nothing is written, so lint stays clean.
+    let (ok, err) = cli(
+        pm.path(),
+        state.path(),
+        &["issue", "set", "CAD-3", "status=ready"],
     );
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("CAD-2"));
     let (ok, lint) = cli(pm.path(), state.path(), &["issue", "lint"]);
     assert!(ok);
     assert_eq!(lint["ok"], true);
-    assert!(lint["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w.as_str().unwrap().contains("CAD-3")));
 }
 
 #[test]
@@ -1598,8 +1593,17 @@ fn tags_fixture() -> (TempDir, TempDir) {
         "core",
     ]);
     run(&["issue", "new", "loose", "--project", "x", "--tag", "infra"]);
+    // CAD-756: closing X-3 needs recorded evidence — the fixture performs
+    // no merge, so it records the designed override.
+    run(&[
+        "issue",
+        "set",
+        "X-3",
+        "status=done",
+        "--force",
+        "tags fixture close",
+    ]);
     for (id, status) in [
-        ("X-3", "done"),
         ("X-4", "doing"),
         ("X-6", "dropped"),
         ("X-7", "ready"),
@@ -1819,6 +1823,20 @@ fn issue_bulk_edits_are_one_atomic_commit() {
             .to_string()
     };
     let before = commits(pm);
+    // CAD-757: the ready gate composes with batch atomicity — X-5 waits
+    // on doing X-4, so a batch moving it to ready is refused whole,
+    // writing nothing.
+    let (ok, out) = cli(pm, state, &["issue", "set", "X-5", "X-7", "status=ready"]);
+    assert!(!ok, "{out}");
+    assert!(out.to_string().contains("X-4"), "{out}");
+    assert_eq!(commits(pm), before, "refused batch writes nothing");
+    assert!(tree_is_clean(pm));
+    assert_eq!(status_of("X-5"), "backlog");
+    // Unblock X-5; the atomic batch below then exercises the commit
+    // shape it was written for, not the gate.
+    let (ok, out) = cli(pm, state, &["issue", "unlink", "X-5", "blocked_by", "X-4"]);
+    assert!(ok, "{out}");
+    let before = commits(pm);
     let (ok, out) = cli(
         pm,
         state,
@@ -2035,8 +2053,23 @@ fn issue_ls_filters_and_epics_match_the_api() {
     );
     assert_eq!(b["blocked"], 0);
     assert_eq!(b["owners"], json!(["cy"]));
-    // Finishing the only live child completes epic B.
-    assert!(cli(pm, state, &["issue", "set", "X-7", "status=done"]).0);
+    // Finishing the only live child completes epic B. CAD-756: the
+    // fixture performed no merge, so the close records the override.
+    assert!(
+        cli(
+            pm,
+            state,
+            &[
+                "issue",
+                "set",
+                "X-7",
+                "status=done",
+                "--force",
+                "epic rollup probe close"
+            ]
+        )
+        .0
+    );
     let (_, out) = cli(pm, state, &["issue", "epic", "ls", "--json"]);
     assert_eq!(out["epics"][1]["done_ratio"], 1.0);
     assert_eq!(out["epics"][1]["status"], "done");

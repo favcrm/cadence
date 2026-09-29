@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::proc::run_bounded;
 use crate::store::Agent;
 
-use super::profile::TuiProfile;
+use super::profile::{open_deadline_override, TuiProfile};
 use super::{descends_from, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Cursor TUI to open its chat store —
@@ -962,7 +962,7 @@ impl TuiProfile for CursorProfile {
     }
 
     fn open_deadline(&self) -> Duration {
-        OPEN_DEADLINE
+        open_deadline_override().unwrap_or(OPEN_DEADLINE)
     }
 
     /// Cursor's idle placeholder is verified against live captures

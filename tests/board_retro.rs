@@ -167,7 +167,14 @@ fn retro_reports_rounds_defects_flakes_and_unknowns() {
         cli(
             pm.path(),
             state.path(),
-            &["issue", "set", "CAD-1", "status=done"]
+            &[
+                "issue",
+                "set",
+                "CAD-1",
+                "status=done",
+                "--force",
+                "retro timing probe close",
+            ]
         )
         .0
     );

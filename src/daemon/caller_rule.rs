@@ -39,6 +39,10 @@ pub(crate) enum Target {
     Alias,
     /// The recipient of the message named by the `message` param.
     Message,
+    /// The `job` param.
+    Job,
+    /// The job of the task named by the `task` param.
+    Task,
 }
 
 /// A method's caller rule.
@@ -55,6 +59,11 @@ pub(crate) enum Rule {
     /// Acts on an agent: [`may_mutate_agent`] decides with the target's
     /// own PM. Stamps `by` with the caller.
     OnAgent(Target, AgentMutation),
+    /// Acts on a job or one of its tasks: the operator, or the job's
+    /// PM bound to a registration that predates the job — a PM removed
+    /// and re-registered under the same alias inherits nothing
+    /// (CAD-422). Stamps `by` with the caller.
+    OnJob(Target),
     /// A write attributed to its caller in `field`: an agent is
     /// attributed to itself; the operator's own value is kept, else
     /// `default`.
@@ -67,9 +76,6 @@ pub(crate) enum Rule {
     /// restart` from its pane); in a sandbox, also a caller tied to none
     /// of its agents.
     Shutdown,
-    /// A mutation with no connection check yet — each names why and
-    /// its follow-up. The table test pins this list.
-    Unguarded(&'static str),
 }
 
 use AgentMutation::{Controlled, SelfService};
@@ -146,8 +152,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "request_open",
-        Rule::Unguarded(
-            "the agent's own approval broker opens it; binding it to the agent is a follow-up",
+        Rule::Handler(
+            "request_caller: the named agent alone opens its own requests \
+             (CAD-452; the stale Unguarded entry corrected, CAD-422)",
         ),
     ),
     ("request_wait", Rule::Bearer),
@@ -204,31 +211,31 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("message_cancel", Rule::OnAgent(Target::Message, Controlled)),
     (
         "job_new",
-        Rule::Unguarded("bookkeeping; the named PM is not yet bound to the caller"),
+        Rule::Handler(
+            "rpc_job_new: the operator, or the agent the job names as its PM \
+             creating its own job (CAD-422)",
+        ),
     ),
     ("job_list", Rule::Read),
     ("job_show", Rule::Read),
     ("job_events", Rule::Read),
-    ("job_cancel", BY_OPERATOR),
-    ("job_close", BY_OPERATOR),
-    (
-        "task_new",
-        Rule::Unguarded("bookkeeping on an open job; not yet bound to the job's PM"),
-    ),
+    ("job_cancel", Rule::OnJob(Target::Job)),
+    ("job_close", Rule::OnJob(Target::Job)),
+    ("task_new", Rule::OnJob(Target::Job)),
     ("task_show", Rule::Read),
-    ("task_dispatch", BY_OPERATOR),
+    ("task_dispatch", Rule::OnJob(Target::Task)),
     (
         "task_verdict",
         Rule::Handler("agent_caller: any agent but the assignee/author, or the operator (CAD-372)"),
     ),
-    ("task_accept", BY_OPERATOR),
-    ("task_sha", BY_OPERATOR),
-    ("task_fail", BY_OPERATOR),
+    ("task_accept", Rule::OnJob(Target::Task)),
+    ("task_sha", Rule::OnJob(Target::Task)),
+    ("task_fail", Rule::OnJob(Target::Task)),
     (
         "task_reopen",
-        Rule::Handler("agent_caller: the operator or the job's PM (CAD-373)"),
+        Rule::OnJob(Target::Task),
     ),
-    ("task_cancel", BY_OPERATOR),
+    ("task_cancel", Rule::OnJob(Target::Task)),
     (
         "memory_propose",
         Rule::Handler("memory_actor: caller_identity (CAD-381)"),
@@ -252,7 +259,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("monitor_show", Rule::Read),
     (
         "monitor_heartbeat",
-        Rule::Unguarded("liveness ping by the monitor's own loop; carries no caller"),
+        Rule::Handler(
+            "rpc_monitor_heartbeat: the operator, or the monitor's owner bound \
+             to a registration that predates the monitor (CAD-422)",
+        ),
     ),
     ("monitor_alerts", Rule::Read),
     ("monitor_alert_ack", BY_OPERATOR),
@@ -286,7 +296,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("slot_launch", Rule::Handler("launch_requester (CAD-230b)")),
     (
         "slot_runner",
-        Rule::Handler("slot_identity or proven_operator (CAD-230b)"),
+        Rule::Handler("connection_caller: a derived agent or the operator (CAD-230b/422)"),
     ),
     (
         "approval_record",
@@ -298,7 +308,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "plan_propose",
-        Rule::Handler("slot_identity or operator_evidence"),
+        Rule::Handler("connection_caller: a derived agent or the operator (CAD-422)"),
     ),
     ("plan_approve", Rule::Handler("operator_connection")),
     (
@@ -309,8 +319,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "epic_stage",
         Rule::Handler(
-            "slot_identity or operator_evidence; operator_connection into an operator stage \
-             or with operator_decision (CAD-432: every board-relayed move)",
+            "connection_caller: a derived agent or the operator (CAD-422); \
+             operator_connection into an operator stage or with operator_decision \
+             (CAD-432: every board-relayed move)",
         ),
     ),
     ("project_work_approve", Rule::Handler("operator_connection")),
@@ -398,6 +409,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_effect_list", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_decide", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_resolve", Rule::Handler("operator_connection (CAD-692)")),
+    ("social_publish_schedule", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_cancel", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_show", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_list", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_claim_due", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_reconcile", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_report", Rule::Handler("operator_connection (CAD-771)")),
     ("app_context_create", Rule::Handler("operator_connection (CAD-690)")),
     ("app_context_list", Rule::Handler("operator_connection (CAD-690)")),
     ("app_context_show", Rule::Handler("operator_connection (CAD-690)")),
@@ -407,6 +425,40 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_list", Rule::Handler("operator_connection (CAD-753)")),
     ("app_record_show", Rule::Handler("operator_connection (CAD-753)")),
     ("app_record_update", Rule::Handler("operator_connection (CAD-753)")),
+    ("app_record_csv_preview", Rule::Handler("operator_connection (CAD-779)")),
+    ("app_record_csv_import", Rule::Handler("operator_connection (CAD-779)")),
+    ("app_segment_save", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_segment_show", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_segment_list", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_exclusion_save", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_exclusion_show", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_exclusion_list", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_suppression_add", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_suppression_remove", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_suppression_list", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_audience_preview", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_audience_prepare", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_audience_show", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_sender_binding_save", Rule::Handler("operator_connection (CAD-782)"),
+    ),
+    ("app_sender_binding_show", Rule::Handler("operator_connection (CAD-782)"),
+    ),
+    ("app_sender_binding_list", Rule::Handler("operator_connection (CAD-782)"),
+    ),
+    ("app_content_save", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_show", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_list", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_render", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_propose", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_proposal_request", Rule::Handler("operator_connection (CAD-813)")),
+    ("app_content_assistant_propose", Rule::Handler("active assigned chat turn and verified App binding (CAD-813)")),
+    ("app_content_proposal_show", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_proposal_list", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_proposal_apply", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_proposal_discard", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_approve", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_test_prepare", Rule::Handler("operator_connection (CAD-782)")),
+    ("app_content_send_prepare", Rule::Handler("operator_connection (CAD-782)")),
     ("app_workspace_install", Rule::Handler("operator_connection (CAD-667)")),
     ("app_workspace_upgrade", Rule::Handler("operator_connection (CAD-743)")),
     ("app_workspace_upgrade_check", Rule::Handler("operator_connection (CAD-743)")),
@@ -537,6 +589,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "delivery_merge",
         Rule::Handler("operator_connection (CAD-431)"),
+    ),
+    (
+        "delivery_approve",
+        Rule::Handler("operator_connection (CAD-140)"),
     ),
     (
         "delivery_decline",
@@ -748,7 +804,7 @@ impl Rule {
     pub(crate) fn checks_connection(self) -> bool {
         matches!(
             self,
-            Rule::OnAgent(..) | Rule::Attributed { .. } | Rule::Shutdown
+            Rule::OnAgent(..) | Rule::OnJob(..) | Rule::Attributed { .. } | Rule::Shutdown
         )
     }
 }
@@ -759,6 +815,9 @@ impl Rule {
 pub(crate) struct Facts {
     /// [`Rule::OnAgent`]: the target agent and its own PM.
     pub(crate) target: Option<(String, Option<String>)>,
+    /// [`Rule::OnJob`]: `(job id, its stored pm_alias, the bound PM)` —
+    /// the PM row predating the job, or `None` when none does.
+    pub(crate) job: Option<(String, String, Option<String>)>,
     /// [`Rule::Shutdown`]: the live rollout lease holder, when it also
     /// holds a live operator grant (`rollout::granted_lease_holder`).
     pub(crate) lease_holder: Option<String>,
@@ -795,7 +854,7 @@ pub(crate) fn admit(
             if facts.sandbox_outsider {
                 match rule {
                     Rule::Shutdown => return Ok(None),
-                    Rule::OnAgent(..) => {
+                    Rule::OnAgent(..) | Rule::OnJob(..) => {
                         return Ok(Some(("by", json!("operator (sandbox)"))));
                     }
                     _ => {}
@@ -810,7 +869,9 @@ pub(crate) fn admit(
         }
         Who::Operator => {
             return Ok(match rule {
-                Rule::OnAgent(..) => Some(("by", keep_or(params, "by", Some("operator")))),
+                Rule::OnAgent(..) | Rule::OnJob(..) => {
+                    Some(("by", keep_or(params, "by", Some("operator"))))
+                }
                 Rule::Attributed { field, default } => {
                     Some((field, keep_or(params, field, default)))
                 }
@@ -870,6 +931,23 @@ pub(crate) fn admit(
             )?;
             Ok(Some(("by", json!(alias))))
         }
+        Rule::OnJob(_) => match &facts.job {
+            Some((_, _, Some(pm))) if pm == alias => Ok(Some(("by", json!(alias)))),
+            Some((job_id, stored, bound)) => {
+                let bound_note = match bound {
+                    Some(b) => format!("bound to '{b}'"),
+                    None => format!("'{stored}' names no registration predating the job"),
+                };
+                Err(format!(
+                    "{verb} refused: agent '{alias}' is not job '{job_id}'s PM \
+                     ({bound_note}) — the operator or that PM runs it (caller \
+                     rule, CAD-422)"
+                ))
+            }
+            None => Err(format!(
+                "{verb} refused: agent '{alias}' — the job or task is unknown"
+            )),
+        },
         Rule::Attributed { field, .. } => Ok(Some((field, json!(alias)))),
         _ => Ok(None),
     }
@@ -966,7 +1044,7 @@ mod tests {
             let det = admit(m, *rule, &detached(), &p, &facts);
             let op = admit(m, *rule, &Who::Operator, &p, &facts);
             match rule {
-                Rule::Read | Rule::Bearer | Rule::Handler(_) | Rule::Unguarded(_) => {
+                Rule::Read | Rule::Bearer | Rule::Handler(_) => {
                     for r in [&stranger, &own, &pm, &det, &op] {
                         assert_eq!(r, &Ok(None), "{m}: the gate never checks a {rule:?}");
                     }
@@ -1014,6 +1092,24 @@ mod tests {
                         "{m}"
                     );
                 }
+                Rule::OnJob(_) => {
+                    // `on_tgt` binds no job, so every agent is refused
+                    // with the unknown-job refusal; only the operator
+                    // passes, stamped `by`.
+                    for r in [&stranger, &own, &pm] {
+                        assert!(
+                            r.as_ref()
+                                .unwrap_err()
+                                .contains("the job or task is unknown"),
+                            "{m}: {r:?}"
+                        );
+                    }
+                    assert!(
+                        det.unwrap_err().contains("not provably the operator"),
+                        "{m}"
+                    );
+                    assert_eq!(op, Ok(Some(("by", json!("operator")))), "{m}");
+                }
                 Rule::Shutdown => {
                     for r in [&stranger, &own, &pm, &det] {
                         assert!(
@@ -1042,38 +1138,37 @@ mod tests {
             "message_reconcile",
             "agent_respond",
             "task_verdict",
-            "task_reopen",
             "monitor_stop",
             "monitor_dispatch",
+            "job_new",
+            "monitor_heartbeat",
+            "request_open",
         ] {
             assert!(matches!(rule_of(m), Some(Rule::Handler(_))), "{m}");
         }
+        // CAD-422: a job's PM alone runs its job and task verbs; a
+        // stranger agent is refused at the rule layer.
+        for m in ["job_cancel", "job_close", "task_new"] {
+            assert_eq!(rule_of(m), Some(Rule::OnJob(Target::Job)), "{m}");
+        }
         for m in [
-            "task_fail",
-            "task_cancel",
-            "job_cancel",
-            "job_close",
             "task_dispatch",
             "task_accept",
             "task_sha",
-            "monitor_alert_ack",
-            "monitor_register",
-            "agent_ready",
+            "task_fail",
+            "task_reopen",
+            "task_cancel",
         ] {
+            assert_eq!(rule_of(m), Some(Rule::OnJob(Target::Task)), "{m}");
+        }
+        for m in ["monitor_alert_ack", "monitor_register", "agent_ready"] {
             assert!(matches!(rule_of(m), Some(Rule::Attributed { .. })), "{m}");
         }
         assert_eq!(rule_of("shutdown"), Some(Rule::Shutdown));
-        // The known gaps are pinned: a new unguarded method is a
+        // CAD-422 closed the last `Unguarded` entries: the variant is
+        // gone, so a new method that needs no connection check can only
+        // be a `Read` or a `Handler` that names its own proof — both a
         // deliberate edit here, never a silent default.
-        let unguarded: Vec<&str> = RULES
-            .iter()
-            .filter(|(_, r)| matches!(r, Rule::Unguarded(_)))
-            .map(|(m, _)| *m)
-            .collect();
-        assert_eq!(
-            unguarded,
-            ["request_open", "job_new", "task_new", "monitor_heartbeat"]
-        );
     }
 
     /// Shutdown: the rollout lease holder's pane may stop the daemon; a

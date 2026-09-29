@@ -28,6 +28,12 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: RecordAction,
     },
+    /// Saved segments, exclusion lists, suppressions and frozen
+    /// audiences over customer records (CAD-780). No mail is sent.
+    Audience {
+        #[command(subcommand)]
+        action: AudienceAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -256,6 +262,171 @@ pub(crate) enum RecordAction {
         #[arg(long)]
         profile: PathBuf,
     },
+    /// Preview bounded CSV text as per-row create/update/skip/error
+    /// decisions without mutating anything; prints the preview token
+    /// that binds the exact bytes for `csv-import`.
+    CsvPreview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file (bounded to 256KiB, 500 rows).
+        #[arg(long)]
+        csv: PathBuf,
+    },
+    /// Explicitly import previewed CSV text at a request id: retries
+    /// with the same request id replay the stored receipt.
+    CsvImport {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file holding the exact previewed bytes.
+        #[arg(long)]
+        csv: PathBuf,
+        /// Preview token from `csv-preview` over the same bytes.
+        #[arg(long)]
+        preview_token: String,
+        /// Idempotency key; reuse with different bytes is refused.
+        #[arg(long)]
+        request_id: String,
+        /// Optional JSON array of `{row, action, expected_revision?}`
+        /// decisions overriding the preview plan.
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+    },
+}
+
+/// CAD-780 audience verbs. JSON files hold predicates (`[{field,
+/// op, value}]`), member ID arrays, suppression targets and base
+/// objects (`{mode, ...}`); the daemon's allowlisted grammar
+/// validates every value.
+#[derive(Subcommand)]
+pub(crate) enum AudienceAction {
+    /// Save a segment (create, or update at the observed revision).
+    SegmentSave {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+        #[arg(long)]
+        name: String,
+        /// JSON file holding the predicates array.
+        #[arg(long)]
+        predicates: PathBuf,
+        /// Observed revision; absent creates.
+        #[arg(long)]
+        expected_revision: Option<u64>,
+    },
+    /// Inspect one exact saved segment.
+    SegmentShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        segment_id: String,
+    },
+    /// Every saved segment in an exact installation context.
+    SegmentLs {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+    },
+    /// Save an exclusion list (create, or update at the observed
+    /// revision).
+    ExclusionSave {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        list_id: String,
+        #[arg(long)]
+        name: String,
+        /// JSON file holding the member ID array.
+        #[arg(long)]
+        members: PathBuf,
+        /// Observed revision; absent creates.
+        #[arg(long)]
+        expected_revision: Option<u64>,
+    },
+    /// Inspect one exact exclusion list.
+    ExclusionShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        list_id: String,
+    },
+    /// Every exclusion list in an exact installation context.
+    ExclusionLs {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+    },
+    /// Suppress one address or customer ID with a reason.
+    SuppressionAdd {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        customer_id: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Lift one suppression.
+    SuppressionRemove {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        customer_id: Option<String>,
+    },
+    /// Every suppression in an exact installation context.
+    SuppressionLs {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+    },
+    /// Exact inclusion/exclusion/final counts plus a bounded sample
+    /// for one base mode; writes nothing.
+    Preview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// JSON file holding the base object.
+        #[arg(long)]
+        base: PathBuf,
+        /// Saved exclusion list applied to any base.
+        #[arg(long)]
+        exclusion_list_id: Option<String>,
+    },
+    /// Freeze final membership, digest, scope and revision pins
+    /// under a recipient ceiling.
+    Prepare {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        freeze_id: String,
+        /// JSON file holding the base object.
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        exclusion_list_id: Option<String>,
+        #[arg(long)]
+        max_recipients: u64,
+    },
+    /// A frozen audience with its live validity.
+    FreezeShow {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        freeze_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +529,47 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
+fn read_record_csv(path: &Path) -> Result<String> {
+    use std::io::Read;
+    const MAX_CSV_BYTES: usize = 256 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open CSV: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_CSV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read CSV: {e}")))?;
+    if bytes.len() > MAX_CSV_BYTES {
+        return Err(Error::invalid("app_record_csv", "CSV exceeds 256KiB"));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::invalid("app_record_csv", "CSV must be UTF-8 text"))
+}
+
+fn read_csv_decisions(path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_DECISIONS_BYTES: usize = 64 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open decisions: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_DECISIONS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read decisions: {e}")))?;
+    if bytes.len() > MAX_DECISIONS_BYTES {
+        return Err(Error::invalid(
+            "app_record_csv",
+            "decisions JSON exceeds 64KiB",
+        ));
+    }
+    let decisions: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_record_csv", "decisions must be a JSON array"))?;
+    if !decisions.is_array() {
+        return Err(Error::invalid(
+            "app_record_csv",
+            "decisions must be a JSON array",
+        ));
+    }
+    Ok(decisions)
+}
+
 fn read_record_profile(path: &Path) -> Result<serde_json::Value> {
     use std::io::Read;
     const MAX_PROFILE_BYTES: usize = 16 * 1024;
@@ -419,6 +631,183 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
         } => (
             "app_record_update",
             json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?}),
+        ),
+        RecordAction::CsvPreview {
+            install_id,
+            context_id,
+            csv,
+        } => (
+            "app_record_csv_preview",
+            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?}),
+        ),
+        RecordAction::CsvImport {
+            install_id,
+            context_id,
+            csv,
+            preview_token,
+            request_id,
+            decisions,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id});
+            if let Some(path) = decisions {
+                params["decisions"] = read_csv_decisions(path)?;
+            }
+            ("app_record_csv_import", params)
+        }
+    })
+}
+
+fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_AUDIENCE_BYTES: usize = 64 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_audience", format!("cannot open {kind}: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_AUDIENCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_audience", format!("cannot read {kind}: {e}")))?;
+    if bytes.len() > MAX_AUDIENCE_BYTES {
+        return Err(Error::invalid(
+            "app_audience",
+            format!("{kind} JSON exceeds 64KiB"),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_audience", format!("{kind} must be JSON")))
+}
+
+fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        AudienceAction::SegmentSave {
+            install_id,
+            context_id,
+            segment_id,
+            name,
+            predicates,
+            expected_revision,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id, "name": name, "predicates": read_audience_json(predicates, "predicates")?});
+            if let Some(revision) = expected_revision {
+                params["expected_revision"] = json!(revision);
+            }
+            ("app_segment_save", params)
+        }
+        AudienceAction::SegmentShow {
+            install_id,
+            context_id,
+            segment_id,
+        } => (
+            "app_segment_show",
+            json!({"install_id": install_id, "context_id": context_id, "segment_id": segment_id}),
+        ),
+        AudienceAction::SegmentLs {
+            install_id,
+            context_id,
+        } => (
+            "app_segment_list",
+            json!({"install_id": install_id, "context_id": context_id}),
+        ),
+        AudienceAction::ExclusionSave {
+            install_id,
+            context_id,
+            list_id,
+            name,
+            members,
+            expected_revision,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "list_id": list_id, "name": name, "member_ids": read_audience_json(members, "members")?});
+            if let Some(revision) = expected_revision {
+                params["expected_revision"] = json!(revision);
+            }
+            ("app_exclusion_save", params)
+        }
+        AudienceAction::ExclusionShow {
+            install_id,
+            context_id,
+            list_id,
+        } => (
+            "app_exclusion_show",
+            json!({"install_id": install_id, "context_id": context_id, "list_id": list_id}),
+        ),
+        AudienceAction::ExclusionLs {
+            install_id,
+            context_id,
+        } => (
+            "app_exclusion_list",
+            json!({"install_id": install_id, "context_id": context_id}),
+        ),
+        AudienceAction::SuppressionAdd {
+            install_id,
+            context_id,
+            email,
+            customer_id,
+            reason,
+        } => {
+            let mut params =
+                json!({"install_id": install_id, "context_id": context_id, "reason": reason});
+            if let Some(address) = email {
+                params["email"] = json!(address);
+            }
+            if let Some(id) = customer_id {
+                params["customer_id"] = json!(id);
+            }
+            ("app_suppression_add", params)
+        }
+        AudienceAction::SuppressionRemove {
+            install_id,
+            context_id,
+            email,
+            customer_id,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id});
+            if let Some(address) = email {
+                params["email"] = json!(address);
+            }
+            if let Some(id) = customer_id {
+                params["customer_id"] = json!(id);
+            }
+            ("app_suppression_remove", params)
+        }
+        AudienceAction::SuppressionLs {
+            install_id,
+            context_id,
+        } => (
+            "app_suppression_list",
+            json!({"install_id": install_id, "context_id": context_id}),
+        ),
+        AudienceAction::Preview {
+            install_id,
+            context_id,
+            base,
+            exclusion_list_id,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "base": read_audience_json(base, "base")?});
+            if let Some(list) = exclusion_list_id {
+                params["exclusion_list_id"] = json!(list);
+            }
+            ("app_audience_preview", params)
+        }
+        AudienceAction::Prepare {
+            install_id,
+            context_id,
+            freeze_id,
+            base,
+            exclusion_list_id,
+            max_recipients,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "freeze_id": freeze_id, "base": read_audience_json(base, "base")?, "max_recipients": max_recipients});
+            if let Some(list) = exclusion_list_id {
+                params["exclusion_list_id"] = json!(list);
+            }
+            ("app_audience_prepare", params)
+        }
+        AudienceAction::FreezeShow {
+            install_id,
+            context_id,
+            freeze_id,
+        } => (
+            "app_audience_show",
+            json!({"install_id": install_id, "context_id": context_id, "freeze_id": freeze_id}),
         ),
     })
 }
@@ -982,6 +1371,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Record { action } => {
             let (method, params) = record_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Audience { action } => {
+            let (method, params) = audience_params(action)?;
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {

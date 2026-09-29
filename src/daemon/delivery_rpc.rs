@@ -28,7 +28,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{check_values, optional_str, optional_strs, required_str, Shared, DAEMON_ALIAS};
+use super::{
+    check_values, optional_str, optional_strs, request_actor, required_str, Shared,
+    APPROVAL_RECORDED_VIA, DAEMON_ALIAS,
+};
 use crate::delivery::{self, Candidate, Observed, Record, State, TicketDone, VerdictRec};
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
@@ -100,6 +103,10 @@ impl Shared {
             return Ok(0);
         }
         let pm = self.pm()?;
+        // CAD-362: pair-precision history, snapshot before the mutable
+        // pass — `pick_reviewer` reads every record for the pair.
+        let history: Vec<delivery::Record> = all.values().cloned().collect();
+        let hist: Vec<&delivery::Record> = history.iter().collect();
         // The PRs live records hold — one PR belongs to one ticket.
         let held: Vec<(String, String)> = all
             .values()
@@ -111,7 +118,7 @@ impl Shared {
             // One ticket's failure (a message the queue refuses, an
             // unreadable ticket) never holds up the others; it is
             // retried next pass.
-            match self.route_record(&pm, rec, &held) {
+            match self.route_record(&pm, rec, &held, &hist) {
                 Ok(true) => moved += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!("delivery router, {}: {e}", rec.issue),
@@ -130,6 +137,7 @@ impl Shared {
         pm: &Pm,
         rec: &mut Record,
         held: &[(String, String)],
+        hist: &[&Record],
     ) -> Result<bool> {
         if rec.state.terminal() || rec.state == State::Escalated {
             return Ok(false);
@@ -159,7 +167,7 @@ impl Shared {
         });
         let Some(latest) = fresh.last().cloned() else {
             if rec.state == State::Unstaffed {
-                self.start_review(pm, rec)?;
+                self.start_review(pm, rec, hist)?;
                 return Ok(rec.state != State::Unstaffed);
             }
             return Ok(false);
@@ -168,7 +176,7 @@ impl Shared {
         let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
             (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
                 None => {
-                    self.on_done(pm, rec, sha, pr)?;
+                    self.on_done(pm, rec, sha, pr, hist)?;
                     None
                 }
                 why => why,
@@ -233,7 +241,14 @@ impl Shared {
     }
 
     /// The worker reported `sha` done on `pr`.
-    fn on_done(self: &Arc<Self>, pm: &Pm, rec: &mut Record, sha: &str, pr: &str) -> Result<()> {
+    fn on_done(
+        self: &Arc<Self>,
+        pm: &Pm,
+        rec: &mut Record,
+        sha: &str,
+        pr: &str,
+        hist: &[&Record],
+    ) -> Result<()> {
         let same_head = rec.head.as_deref() == Some(sha) && rec.pr.as_deref() == Some(pr);
         if same_head
             && matches!(
@@ -251,51 +266,136 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.pr = Some(pr.to_string());
+        if rec.head.as_deref() != Some(sha) {
+            // A new head is a new diff — the risk tier is re-measured.
+            rec.risk = None;
+        }
         rec.head = Some(sha.to_string());
         rec.head_at = now();
-        self.start_review(pm, rec)
+        self.start_review(pm, rec, hist)
     }
 
     /// The head moved without a done report from the worker: whoever
     /// reviewed it may have pushed it, so that reviewer is barred from
     /// this ticket and the review goes to someone else.
-    fn review_moved_head(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
+    fn review_moved_head(
+        self: &Arc<Self>,
+        pm: &Pm,
+        rec: &mut Record,
+        hist: &[&Record],
+    ) -> Result<()> {
         if let Some(prev) = rec.reviewer.take() {
             if !rec.excluded.contains(&prev) {
                 rec.excluded.push(prev);
             }
         }
-        self.start_review(pm, rec)
+        // The head that was measured is gone — re-measure the new one.
+        rec.risk = None;
+        self.start_review(pm, rec, hist)
+    }
+
+    /// `(files, additions, deletions)` for the head under review —
+    /// the record's own observation when it names this head, else one
+    /// bounded `gh pr view`. `None` means the diff could not be sized
+    /// (offline, the head moved mid-read): the review proceeds without
+    /// a tier rather than blocking on a stat fetch.
+    fn review_stats(rec: &Record) -> Option<(u64, u64, u64)> {
+        let head = rec.head.as_deref()?;
+        if let Some(o) = &rec.observed {
+            if o.head == head {
+                return Some((o.files, o.additions, o.deletions));
+            }
+        }
+        let pr = rec.pr.as_deref()?;
+        let text = delivery::gh(
+            delivery::GH,
+            &[
+                "pr",
+                "view",
+                pr,
+                "--json",
+                "additions,deletions,changedFiles,headRefOid",
+            ],
+        )
+        .ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        // The PR tip moved since `head` was recorded — the size read
+        // belongs to a different diff; the observe path re-routes.
+        if v["headRefOid"].as_str()? != head {
+            return None;
+        }
+        Some((
+            v["changedFiles"].as_u64()?,
+            v["additions"].as_u64()?,
+            v["deletions"].as_u64()?,
+        ))
     }
 
     /// Route a review of `rec.head` to an independent reviewer, or mark
-    /// the record unstaffed when nobody qualifies.
-    fn start_review(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
+    /// the record unstaffed when nobody qualifies. CAD-362: an
+    /// oversized diff is flagged for splitting instead — no reviewer
+    /// reads a diff too big to verify.
+    fn start_review(self: &Arc<Self>, pm: &Pm, rec: &mut Record, hist: &[&Record]) -> Result<()> {
         let (Some(sha), Some(pr)) = (rec.head.clone(), rec.pr.clone()) else {
             return Ok(());
         };
+        // Risk is measured once per head — `on_done`/`review_moved_head`
+        // clear it when the head moves.
+        if rec.risk.is_none() {
+            rec.risk = Self::review_stats(rec)
+                .map(|(files, adds, dels)| delivery::risk_class(adds, dels, files).as_str())
+                .map(str::to_string);
+        }
+        if rec.risk.as_deref() == Some(delivery::Risk::Oversized.as_str()) {
+            let why = "the diff is oversized for a single review — split it into \
+                       reviewable pieces (smaller PRs), then file a new done report";
+            rec.note = Some(format!("{sha} held from review: {why}"));
+            // The flag is raised once — an Unstaffed record retries the
+            // route every pass and must not re-comment each time.
+            if rec.state != State::Unstaffed {
+                rec.enter(State::Unstaffed, now());
+                let _ = issue::write::add_comment(
+                    pm,
+                    &rec.issue,
+                    &format!("Held from review at {sha}: {why}."),
+                    Some(DAEMON_ALIAS),
+                    Some("review"),
+                    None,
+                    DAEMON_ALIAS,
+                );
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "review_oversized",
+                    json!({"issue": rec.issue, "sha": sha, "pr": pr}),
+                );
+            }
+            return Ok(());
+        }
         let agents = self.store.agents()?;
-        let worker_provider = agents
+        let worker_vendor = agents
             .iter()
             .find(|a| a.alias == rec.worker)
-            .map(|a| a.provider.clone());
+            .map(|a| delivery::vendor(&a.provider, a.model.as_deref()));
         let candidates: Vec<Candidate> = agents
             .iter()
             .map(|a| Candidate {
                 alias: a.alias.clone(),
                 provider: a.provider.clone(),
+                model: a.model.clone(),
                 state: a.state.clone(),
                 enabled: a.enabled,
                 upstream: super::agent_upstream(a).map(str::to_string),
                 role: a.role.clone(),
             })
             .collect();
-        let Some(reviewer) = delivery::pick_reviewer(
+        let Some(pick) = delivery::pick_reviewer(
             &rec.worker,
-            worker_provider.as_deref(),
+            worker_vendor.as_deref(),
             rec.reviewer.as_deref(),
             &rec.excluded,
             &candidates,
+            &pm.config.review,
+            hist,
         ) else {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
@@ -312,6 +412,7 @@ impl Shared {
             }
             return Ok(());
         };
+        let reviewer = pick.alias.clone();
         let agent = agents
             .iter()
             .find(|a| a.alias == reviewer)
@@ -326,6 +427,7 @@ impl Shared {
             &pr,
             &sha,
             &rec.worker,
+            rec.risk.as_deref(),
             listing.as_deref(),
             &ticket.dir.join("issue.md"),
             store::kickoff_ceiling(&agent.provider, &agent.endpoint_kind),
@@ -337,12 +439,23 @@ impl Shared {
         )?;
         rec.rounds = round;
         rec.reviewer = Some(reviewer.clone());
-        rec.note = None;
+        rec.note = if pick.reason.is_fallback() {
+            Some(format!("reviewer {reviewer}: {}", pick.reason.describe()))
+        } else {
+            None
+        };
         rec.enter(State::Reviewing, now());
+        let mut cmt = format!("Review round {round} routed to {reviewer}: {pr} at {sha}");
+        cmt.push_str(&format!(" [{}]", pick.reason.describe()));
+        if let Some(risk) = rec.risk.as_deref() {
+            cmt.push_str(&format!(" Risk: {risk}."));
+        } else {
+            cmt.push('.');
+        }
         let _ = issue::write::add_comment(
             pm,
             &rec.issue,
-            &format!("Review round {round} routed to {reviewer}: {pr} at {sha}."),
+            &cmt,
             Some(DAEMON_ALIAS),
             Some("review"),
             None,
@@ -352,7 +465,8 @@ impl Shared {
             DAEMON_ALIAS,
             "review_routed",
             json!({"issue": rec.issue, "reviewer": reviewer, "sha": sha, "pr": pr,
-                   "round": round, "message": mid}),
+                   "round": round, "message": mid,
+                   "reason": pick.reason.as_str(), "risk": rec.risk}),
         );
         Ok(())
     }
@@ -601,8 +715,15 @@ impl Shared {
         let pm = self.pm()?;
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
+        // CAD-362: pair-precision history for any re-route below.
+        let history: Vec<Record> = all.values().cloned().collect();
+        let hist: Vec<&Record> = history.iter().collect();
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
         let before = rec.state;
+        // CAD-776: readiness before this observation — the wake fires
+        // on the transition into merge-ready, never on merely being
+        // there.
+        let was_ready = rec.merge_ready();
         let mut moved = rec.head.as_deref() != Some(head.as_str());
         // CAD-564: an observation whose read began before the record's
         // last head change (the done report's `head_at`) saw the head
@@ -623,7 +744,7 @@ impl Shared {
                 {
                     rec.head = Some(head.clone());
                     rec.head_at = now();
-                    self.review_moved_head(&pm, rec)?;
+                    self.review_moved_head(&pm, rec, &hist)?;
                     let _ = issue::write::add_comment(
                         &pm,
                         id,
@@ -645,6 +766,11 @@ impl Shared {
         let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
         rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
+        // CAD-776: count the transition into merge-ready here, under
+        // `delivery_lock`, so the epoch persists atomically with the
+        // observation that caused it — every later wake attempt reads
+        // the same saved key.
+        rec.advance_ready_epoch(was_ready);
         let mut out = json!({
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
@@ -677,6 +803,14 @@ impl Shared {
             self.wake_on_delivery_end(&rec, wake_guard);
         } else {
             drop(wake_guard);
+        }
+        // CAD-776: the observation made the delivery merge-ready — one
+        // durable hint to the master per readiness streak. A loop that
+        // just ended is terminal, never merge-ready, so the two wakes
+        // cannot fire together. The key comes from the saved record
+        // alone, so concurrent observers converge on it.
+        if let Some(ready) = all.get(id).filter(|r| r.merge_ready()) {
+            self.wake_on_merge_ready(ready);
         }
         self.post_notices(&pm, notices);
         if rec_state_changed(&out, was_disable) {
@@ -1097,6 +1231,159 @@ impl Shared {
         }
     }
 
+    /// `delivery_approve` (CAD-140) — the operator's merge approval as
+    /// one single-writer transaction under `delivery_lock`: re-read the
+    /// PR, compare-and-swap the shown head against the live one,
+    /// record the approval object, and enqueue pinned to it. `sha` is
+    /// REQUIRED — the head the approval was made against; a moved head
+    /// voids the decision (`head_moved`) before anything is recorded.
+    /// The approval carries the deciding actor (`request_actor`,
+    /// attribution only — authority is this connection). Neither the
+    /// board nor the CLI shells `gh` for a merge anymore; the daemon
+    /// shells it only here, bound to the recorded approval. A refused
+    /// approval writes nothing: no record, no observation, no enqueue.
+    pub(super) fn rpc_delivery_approve(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("delivery approve", params, peer_pid)?;
+        let id = required_str(params, "issue")?;
+        let want = params
+            .get("sha")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::rejected("delivery approve names the approved head: {\"sha\"} is required")
+            })?;
+        if want.len() != 40
+            || !want
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::rejected(
+                "approved head must be the full 40-character lowercase hexadecimal SHA",
+            ));
+        }
+        let actor = request_actor(params)?;
+        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = delivery::load(&self.state_dir)?;
+        let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        if rec.state != State::Passed {
+            return Err(Error::rejected(format!(
+                "{id} has no standing PASS to approve (it is {})",
+                rec.state.as_str()
+            )));
+        }
+        let pr_url = rec.pr.clone().unwrap_or_default();
+        let (slug, number) = task_report::parse_pr_url(&pr_url)
+            .map_err(|e| Error::rejected(format!("{id} links no pull request ({e})")))?;
+        // The compare basis is read fresh, under the lock — whatever
+        // this call returns was true now, not at the last sync.
+        let read_at = now();
+        let gh_bin = self.delivery_gh.to_string_lossy().to_string();
+        let view = delivery::pr_view(&gh_bin, &slug, number).map_err(|e| {
+            Error::rejected(format!(
+                "{id}: reading the PR failed, nothing was approved — {e}"
+            ))
+        })?;
+        let rollup = view["statusCheckRollup"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let live = view["headRefOid"].as_str().unwrap_or_default().to_string();
+        if want != live {
+            return Err(Error::invalid(
+                "head_moved",
+                format!(
+                    "{id}: the PR head moved since it was shown (shown {}…, now {}…) — re-review before approving",
+                    &want[..12],
+                    live.chars().take(12).collect::<String>(),
+                ),
+            ));
+        }
+        rec.observed = Some(Observed {
+            head: live.clone(),
+            pr_state: view["state"].as_str().unwrap_or_default().to_string(),
+            ci_green: crate::overview::checks_green_pub(&rollup),
+            auto_merge: !view["autoMergeRequest"].is_null(),
+            additions: view["additions"].as_u64().unwrap_or(0),
+            deletions: view["deletions"].as_u64().unwrap_or(0),
+            files: view["changedFiles"].as_u64().unwrap_or(0),
+            at: now(),
+            read_at,
+        });
+        if !rec.merge_ready() {
+            let why = match &rec.observed {
+                None => "GitHub has not been read for it yet".to_string(),
+                Some(o) if o.pr_state != "OPEN" => format!("the PR is {}", o.pr_state),
+                Some(_) => "its CI is not green".to_string(),
+            };
+            return Err(Error::rejected(format!(
+                "{id} is not ready to merge: {why}"
+            )));
+        }
+        let sha = live;
+        // The approval object first: a failed enqueue retries cleanly
+        // (same evidence dedupes to the same id), and audit never sees
+        // a merge without its approval.
+        let (_, approval_id) = self.store.record_approval(
+            &store::NewApproval {
+                id: None,
+                source: &actor,
+                action: "merge",
+                head_sha: &sha,
+                repo: &slug,
+                pr: number,
+            },
+            APPROVAL_RECORDED_VIA,
+        )?;
+        if let Err(e) = delivery::gh(
+            &gh_bin,
+            &[
+                "pr",
+                "merge",
+                &number.to_string(),
+                "-R",
+                &slug,
+                "--auto",
+                "--squash",
+                "--match-head-commit",
+                &sha,
+            ],
+        ) {
+            return Err(Error::rejected(format!(
+                "{id}: the merge did not enqueue ({e}) — approval {approval_id} stands; retry the approval"
+            )));
+        }
+        rec.enter(State::Enqueued, now());
+        let mut out = rec.to_json();
+        out["approval_id"] = serde_json::json!(approval_id);
+        out["approved_by"] = serde_json::json!(actor);
+        delivery::save(&self.state_dir, &all)?;
+        if let Ok(pm) = self.pm() {
+            let _ = issue::write::add_comment(
+                &pm,
+                id,
+                &format!(
+                    "Merge approved by {actor} and enqueued: {pr_url}, pinned to {sha} (approval {approval_id})."
+                ),
+                Some("operator"),
+                Some("review"),
+                None,
+                "operator",
+            );
+        }
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "merge_enqueued",
+            serde_json::json!({"issue": id, "sha": sha, "pr": pr_url, "approval_id": approval_id}),
+        );
+        self.wake();
+        Ok(out)
+    }
+
     /// `delivery_decline` — the operator declines the merge decision
     /// (or an escalated or unstaffed review) with a reason.
     pub(super) fn rpc_delivery_decline(
@@ -1113,6 +1400,10 @@ impl Shared {
             )));
         }
         crate::secret::guard(&format!("{id}: decline"), reason)?;
+        // CAD-140: who declined — the record, the comment and the
+        // event carry the deciding actor (attribution only; authority
+        // is this connection, gated above).
+        let actor = request_actor(params)?;
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -1126,6 +1417,7 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.note = Some(reason.to_string());
+        rec.declined_by = Some(actor.clone());
         rec.enter(State::Declined, now());
         let out = rec.to_json();
         let ended = rec.clone();
@@ -1135,7 +1427,7 @@ impl Shared {
             let _ = issue::write::add_comment(
                 &pm,
                 id,
-                &format!("Merge declined by the operator: {reason}"),
+                &format!("Merge declined by {actor}: {reason}"),
                 Some("operator"),
                 Some("review"),
                 None,
@@ -1145,7 +1437,7 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "merge_declined",
-            json!({"issue": id, "reason": reason}),
+            json!({"issue": id, "reason": reason, "actor": actor}),
         );
         self.wake();
         Ok(out)

@@ -41,7 +41,8 @@ local surface.
 ```
 ~/pm/
 ├── pm.yaml                 # schema, statuses, link types, artifact cap, notes_dir,
-│                           #   [pi] model/provider-package allowlists (CAD-559)
+│                           #   [pi] model/provider-package allowlists (CAD-559),
+│                           #   [review] pair/never reviewer catalog (CAD-362)
 ├── README.md               # the rules, for agents and humans
 ├── cadence/
 │   ├── project.yaml        # key, prefix: CAD, repos, components, tags, default_owner
@@ -110,7 +111,7 @@ fail-closed on both:
 
 ```yaml
 pi:
-  providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
+  providers: ["pi-devin@0.2.1"]            # extension pkgs, name@version
   agentic_providers: []                   # additional model provider namespaces
   models:
     allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
@@ -129,7 +130,13 @@ pi:
   back to `allow`. A confined master cannot run `devin/*` — the
   pi-devin extension shells out to a Devin CLI the sandbox cannot
   credential — so the master's list is typically the openrouter/other
-  subset while workers keep `devin/*`. An absent `[pi]` (or an empty
+  subset. Confined managed Pi workers also refuse `devin/*` before
+  registration or dispatch: pi-devin needs the operator's Devin login,
+  and granting that file would let a worker's tools disclose it.
+  Choose a non-Devin model for a confined worker, or have the operator
+  explicitly start an unconfined worker to use `devin/*`. The example
+  worker default above therefore requires an unconfined worker.
+  An absent `[pi]` (or an empty
   applicable list) allows nothing — a pi registration, start, or
   relaunch refuses rather than fall back. `model_policy:
   provider_default` is refused outright for pi.
@@ -235,7 +242,7 @@ unvetted build.
 
 ### Which models to use
 
-- **devin** models are the worker/reviewer path — check
+- **devin** models are the unconfined worker/reviewer path — check
   `devin models list` for cost_tier: `swe-2-{high,medium,max}` are
   **Free**; `deepseek-v4-1-flash-*` is low cost, not free. Default:
   `devin/swe-2-high` + `--effort max` (SWE-2 Max); DeepSeek V4.1 Flash
@@ -393,6 +400,13 @@ cadence issue lint                          # schema, links, depth, sizes, symli
                                             #   (e.g. ready/doing/review with an
                                             #   open blocked_by) never fail it
 cadence issue sync [--no-push] [--dry-run] [--resolve ours|theirs]
+cadence issue groom [--dry-run] [--grace SECS]
+                                            # CAD-812: advisory backlog freshness
+                                            #   — the `issue sweep` sibling for
+                                            #   dormant backlog|ready leaves. Flags
+                                            #   `needs-triage` + a comment +
+                                            #   `last_groomed_at` on stale/superseded
+                                            #   verdicts; never moves status.
 cadence issue set CAD-16 owner=             # empty value clears the field
 ```
 
@@ -1247,7 +1261,9 @@ exactly one git commit whose subject carries the actor:
 |---|---|---|
 | `POST /api/session` | `{nonce}` — a `ui login` link's fragment; answers `{session_key}` for the page. Write guards apply, the Host must be this board's own name (or the proven tailnet) and `Origin` this request's own; the link must be for this origin. The peer is attributed first: an agent, or a peer the board cannot attribute (its socket already closed), spends the link and gets nothing (`session_from_agent` / `caller_identity`); so does a board whose own daemon connection is an agent's (the daemon checks) | `200 {session_key}` + `Set-Cookie`; `403 login_link` naming `already_used`, `expired`, `wrong_origin` or `unknown`; `403 session_origin` on any other Host |
 | `POST /api/session/logout` | `{}` | `204`, the presenting session ended and its cookie cleared |
-| `POST /api/issues` | `{project, title, priority?, owner?, component?, tags?, parent?, blocked_by?}` | `201` |
+| `POST /api/issues` | `{project, title, priority?, owner?, component?, tags?, parent?, blocked_by?, body?}` | `201` |
+| `POST /api/reports` | `{kind: question\|feedback\|idea\|bug, project, title, priority?, body?}` — file a report through the canonical intake path (CAD-140): ideas land on `project`, every other kind routes to the `cadence` project server-side; secret-shaped bodies refuse `400` | `201` with `{issue, card, report}` |
+| `POST /api/ideas/:id/decide` | `{action: approve\|reject\|park, reason?, park_until?, expect_rev}` (CAD-140) — the operator's idea decision, bound to the shown revision (REQUIRED; a moved issue is `409 stale_view`) and attributed to the deciding actor (`request_actor`) on the recorded object | `200` with the decision |
 | `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, tags?, title?, body?, if_rev?}` — `""` clears owner/component; `tags` replaces the list (`[]` clears) under the CLI's validation; `body` replaces the markdown only | `200` |
 | `POST /api/issues/:id/links` | `{type: blocked_by\|relates\|parent\|duplicate_of, target, if_rev?}` | `200` |
 | `DELETE /api/issues/:id/links` | same shape | `200` |
@@ -1258,7 +1274,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/memories/:project/:slug/reject` | `{}` — refused for the same missing native endpoint proof | `400` with an actionable refusal |
 | `POST /api/plans/:epic/approve` | `{}` — the operator approves a proposed plan (CAD-328) over the daemon's operator-only `plan_approve` (CAD-360): the plan's backlog tickets move to ready in one commit. Read-only, the write guards and caller attribution run first; a caller attributed to an agent gets `403 operator_only`. No identity field is read (`deny_unknown_fields`); and the board runs CAD-276's positive operator proof on its own TCP peer (`crate::peer::tcp_peer_operator_proof`: no pane or managed provider on its ancestry, not a descendant of the daemon process, no agent environment, session leader on its ancestry — a `tailscale serve` request proven by CAD-336 passes as its login), refusing `403 operator_proof` before anything is written; the daemon then checks the board's own connection again | `200` with the decision; `409` already decided; `404` unknown epic; `501` a daemon without plans |
 | `POST /api/plans/:epic/reject` | `{reason}` — same path and refusals; a missing or blank reason is `400 reason_required` before the daemon is asked | same |
-| `POST /api/delivery/:id/merge` | `{}` — the operator's merge decision on a ticket the worker loop PASSed (CAD-431): the same write path, `403 operator_only` for an agent and `403 operator_proof` without positive operator proof, before anything runs. The board process then runs `cadence delivery merge`'s steps with the operator's own `gh` (the daemon never runs it): re-read the PR, check the PASS stands on that head with green CI, `gh pr merge --auto --squash --match-head-commit <reviewed sha>`, record `enqueued` | `200` with the loop record; `400` not ready (no PASS, head moved, CI not green) |
+| `POST /api/delivery/:id/merge` | `{"sha"}` (REQUIRED) — the operator's merge approval on a ticket the worker loop PASSed (CAD-431, CAD-140): the same write path, `403 operator_only` for an agent and `403 operator_proof` without positive operator proof, before anything runs. The board relays the daemon's approve-and-land transaction and shells no `gh` itself: the daemon re-reads the PR, voids a moved head (`409 head_moved`, nothing recorded), records the approval object carrying the head SHA and the deciding actor (`request_actor` — the tailnet login, `operator (ui)` on loopback), and enqueues pinned to it. A missing head is `400 sha_required` | `200` with the loop record plus `approval_id`/`approved_by`; `409 head_moved`; `400` not ready (no PASS, CI not green, PR not open) |
 | `POST /api/delivery/:id/decline` | `{reason}` — same path and refusals; relays the daemon's operator-only `delivery_decline`; a blank reason is `400 reason_required` | `200` with the loop record |
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
@@ -1508,6 +1524,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | team | the issue owner | `gh pr view <n> --repo <slug>` |
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
 | 80 | `blocked_ready` — every `blocked_by` target is `done` | team | the issue owner | `cadence issue set <id> status=ready` |
+| 82 | `backlog_stale` — a `backlog`/`ready` leaf the groom pass flagged `needs-triage` (its `paths:` moved under it, a covering ticket closed in its window, or its `blocked_by` closed but it never advanced) | team | the issue owner | `cadence issue show <id>` |
 | 85 | `intake` — an untriaged `cadence report` | team | the issue owner | `cadence report show <id>` |
 | 86 | `intake_relay` — a report the intake consumer could not publish or hand to the PM (quota, stopped PM, retry, still queued) | team | the configured relay PM alias | `cadence intake status <project>` |
 | 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | team | none | `gh run view <run> --repo <slug>` |

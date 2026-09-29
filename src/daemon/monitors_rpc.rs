@@ -3,7 +3,11 @@
 use super::*;
 
 impl Shared {
-    pub(super) fn rpc_monitor_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_monitor_register(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let tasks = params
             .get("tasks")
             .and_then(Value::as_array)
@@ -26,6 +30,20 @@ impl Shared {
             .get("auto_dispatch_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // CAD-422: a registered monitor's auto-dispatch bypasses the
+        // operator-only `monitor_dispatch` gate, so arming either flag
+        // is the operator's act. An agent may still register coverage —
+        // its `owner` is already stamped by the caller rule — it just
+        // cannot arm dispatch.
+        if dispatch_enabled || auto_dispatch_enabled {
+            if let AgentCaller::Agent(alias) = self.agent_caller(peer_pid, "monitor register")? {
+                return Err(Error::rejected(format!(
+                    "monitor register refused: agent '{alias}' may not enable \
+                     dispatch flags — arming a monitor's dispatch is the \
+                     operator's act (caller rule, CAD-422)"
+                )));
+            }
+        }
         let (monitor, duplicate) = self.store.register_monitor(
             required_str(params, "monitor")?,
             required_str(params, "project")?,
@@ -58,8 +76,33 @@ impl Shared {
         Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
     }
 
-    pub(super) fn rpc_monitor_heartbeat(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// `monitor heartbeat` — the monitor's own liveness ping. The
+    /// operator, or the monitor's owner bound to a registration that
+    /// predates the monitor (a re-registered alias inherits nothing,
+    /// CAD-422).
+    pub(super) fn rpc_monitor_heartbeat(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_identity_fields(params, "monitor heartbeat")?;
         let id = required_str(params, "monitor")?;
+        if let AgentCaller::Agent(alias) = self.agent_caller(peer_pid, "monitor heartbeat")? {
+            let monitor = self.store.monitor(id)?;
+            let bound = self
+                .store
+                .agent_opt(&monitor.owner)?
+                .filter(|row| row.created <= monitor.created)
+                .map(|row| row.alias);
+            if bound.as_deref() != Some(alias.as_str()) {
+                return Err(Error::rejected(format!(
+                    "monitor heartbeat refused: agent '{alias}' is not monitor \
+                     '{id}'s owner ('{}') — the operator or that owner pings it \
+                     (caller rule, CAD-422)",
+                    monitor.owner
+                )));
+            }
+        }
         let monitor = self.store.monitor_heartbeat(id)?;
         let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
         self.wake();

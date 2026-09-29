@@ -520,6 +520,13 @@ pub fn run(
         .as_str()
         .unwrap_or_default()
         .to_string();
+    if provider == "pi" && endpoint_kind == "managed" {
+        crate::adapter::pi::refuse_confined_devin(
+            args.to.as_str(),
+            agent["params"]["confine"].as_bool() == Some(true),
+            agent["params"]["model"].as_str().unwrap_or_default(),
+        )?;
+    }
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
             || agent["params"]["upstream"].as_str() == Some(reply_to.as_str());

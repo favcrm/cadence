@@ -14,21 +14,16 @@ The hosted image composition may bake `/etc/cadence/provider-deployments.json`:
     {
       "provider": "agenticos_external",
       "origin": "https://api-v2.agenticos.hk",
-      "manifest_pin": "agenticos-external-provider-tools@1",
-      "image_hosts": ["cdn.example.invalid"]
+      "manifest_pin": "agenticos-external-provider-tools@2"
     }
   ]
 }
 ```
 
-The external entry is illustrative. Replace `cdn.example.invalid` only with
-the exact lowercase public DNS hostname independently verified for the image
-provider's returned URLs; it is not a live CDN assertion. Source reads may
-omit `image_hosts`. An absent or nonmatching image host keeps image acquisition
-closed, even when the manifest pin matches. At most four distinct hosts are
-allowed; each is a hostname, not a URL, wildcard or IP address. The image
-fetch refuses redirects and proxies, resolves once, and rejects private or
-non-public addresses before retaining bounded bytes.
+The external entry is illustrative. The `@2` manifest removes the CDN
+pinning mode entirely: generated images arrive as durable AgenticOS media
+artifacts fetched from the pinned origin itself, so an `image_hosts` key in
+an older file is accepted and ignored rather than rejected.
 
 This is an image-owned assertion about an independently reviewed deployed
 contract. It is not remote discovery, an account binding, consent, a credential,
@@ -54,7 +49,7 @@ grant, or outward release approval is bypassed.
 
 The separate `agenticos_external` pin identifies the exact deployed external
 provider-tools contract for priced Social Content reads and drafts. The app
-cannot supply or change its origin, manifest pin or image host allowlist.
+cannot supply or change its origin or manifest pin.
 An exact pin is necessary but does not grant a device credential, approve a
 quote, or authorize a paid call.
 

@@ -223,7 +223,7 @@ helpers = [
 ]
 
 [binaries.idea_pipeline]
-tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children"]
+tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children", "board_idea_decisions_bind_the_shown_issue_and_decide", "board_idea_decision_records_tailscale_actor"]
 
 [binaries.daemon]
 tests = [
@@ -446,7 +446,8 @@ tests = [
     "launch_leaves_cwd_repo_untouched",
     "failed_open_writes_nothing",
     "agents_md_opt_in_and_worktree_gitignore",
-    "pty_silent_end_fires_once_and_recovers",
+    "pty_silent_end_fires_once",
+    "pty_silent_end_views_and_recovery",
     "pty_unreported_turn_holds_queue_and_bounds_to_unknown",
     "agent_set_caller_rule_per_caller_kind",
     "agent_remove_and_gc_caller_rule_per_caller_kind",
@@ -535,6 +536,9 @@ tests = [
     "fake_silent_turn_stalls_and_brokered_wait_does_not",
     "stall_secs_zero_disables_and_live_set_rearms",
     "pty_stall_sampling_runs_while_the_pane_lives",
+    "stall_clock_alone_fires_nothing",
+    "stall_budget_gates_despite_clock",
+    "stall_absence_under_clock_zero_wall",
     "pty_approval_menu_blocks_pastes_and_answers",
     "pty_silent_end_sends_one_report_reminder",
     "pty_silent_end_reminder_is_not_resent_after_restart",
@@ -715,6 +719,9 @@ tests = [
     "cad574_needs_dismiss_gate_and_suppression",
     "cad574_needs_board_gate",
     "cad574_thread_send_refs",
+    "cad802_thread_send_app_binding_is_server_verified",
+    "cad802_thread_send_app_hint_reaches_provider_and_pull_paths",
+    "cad802_thread_send_app_hint_rides_pty_notice",
 ]
 helpers = [
     "start_operator_board",
@@ -896,6 +903,12 @@ tests = [
     "dispatch_warns_on_empty_acceptance",
     "dispatch_refuses_criteria_past_the_pty_ceiling",
     "dispatch_job_precheck_measures_the_issues_existing_lane",
+    "cad422_converged_verbs_use_the_one_verifier",
+    "cad422_concurrent_callers_get_their_own_answers",
+    "cad422_job_new_binds_the_calling_agent",
+    "cad422_job_task_verbs_bind_the_job_pm",
+    "cad422_monitor_dispatch_flags_and_heartbeat",
+    "cad422_reregistered_pm_inherits_nothing",
 ]
 helpers = [
     "seed_provider_quota",
@@ -1019,6 +1032,8 @@ tests = [
     "master_without_landlock_starts_only_on_the_operators_opt_in",
     "master_dispatch_races_dispatch_a_ticket_once",
     "delivery_loop_review_revise_pass_merge_end_to_end",
+    "an_oversized_diff_is_flagged_for_splitting_not_routed",
+    "a_same_vendor_pick_records_its_fallback_reason",
     "review_routing_refuses_agent_callers_implementers_and_foreign_groups",
     "delivery_loop_escalates_after_two_revise_rounds",
     "delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record",
@@ -1036,6 +1051,15 @@ tests = [
     "merged_delivery_marks_done_and_wakes_the_dependent_once",
     "master_wake_waits_queued_while_the_master_is_stopped",
     "delivery_observe_stale_read_never_rewinds_a_passed_review",
+    "cad776_observe_queues_one_merge_ready_wake_per_readiness_streak",
+    "cad776_agent_detached_and_forged_observe_cannot_wake",
+    "cad776_concurrent_observe_wakes_once",
+    "cad776_merge_ready_wake_grants_no_merge_authority",
+    "board_merge_approves_and_lands_without_board_gh",
+    "board_decline_states_its_reason",
+    "delivery_approve_gate_forgeries_race_and_attribution",
+    "delivery_decline_gate_forgeries_and_races",
+    "delivery_approve_records_tailscale_actor",
 ]
 helpers = [
     "daemon_methods",

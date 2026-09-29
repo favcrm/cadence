@@ -34,6 +34,11 @@ mod git;
 #[allow(unused_imports)]
 pub use git::{git_at, git_f_repo, git_ok, git_porcelain, git_repo, git_stdout};
 
+pub mod port;
+// Each integration binary uses a different subset of the shared API.
+#[allow(unused_imports)]
+pub use port::{test_port, PortLease};
+
 mod reports;
 // Each integration binary uses a different subset of the shared API.
 #[allow(unused_imports)]
@@ -1030,6 +1035,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
         stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
+        stall_clock_offset: Default::default(),
+        stall_tick: None,
         // Explicit defaults keep test daemons hermetic — a real pm.yaml
         // [host] table on the dev host must never leak into a test.
         slots: Some(cadence_agent::slots::SlotConfig::default()),
@@ -1064,6 +1071,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         platforms: Default::default(),
         provider_deployments: None,
         effect_execute_gate: None,
+        social_publish_sender: None,
         app_release_claim_gate: None,
         // CAD-546: no `local` outbox — a test that registers the
         // adapter pins its own root via `platform::local::register_at`.
@@ -1083,6 +1091,9 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // without `test-seam` sees `false` and the daemon refuses to
         // serve.
         test_seam: cfg!(feature = "test-seam"),
+        // CAD-140: no delivery gh — a daemon that shells `gh` in a
+        // test does so only when the test injects one (LoopFixture).
+        delivery_gh: None,
     }
 }
 
@@ -2613,7 +2624,45 @@ impl FakeGh {
     }
 }
 
+/// Fresh stall-watch logic-time offset in seconds (starts at wall `0`).
+/// Tests install it in `ServeOptions` before start and advance the
+/// RUNNING daemon past budgets — no wall sleeps. Owned per test (a
+/// fresh `Arc`, not thread-local), so nothing leaks across tests.
+pub fn stall_clock_offset() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+    Default::default()
+}
+
 // ---------- CAD-52: stall detection ----------
+
+/// Wait until the mock pane's screen has been captured `want_more` times
+/// past `from` (one `captures` row per ticker sample), then return.
+/// Absence proofs (`turn_silent_end` fires once, no second reminder)
+/// wait on observed sweeps this way instead of a fixed sleep: the proof
+/// is bound to scheduler iterations, so a stalled scheduler cannot pass
+/// it vacuously, and the happy path pays exactly the sweeps observed,
+/// not a conservative sleep. `secs` bounds failure only.
+pub fn wait_capture_advance(
+    captures_file: &std::path::PathBuf,
+    from: usize,
+    want_more: usize,
+    secs: u64,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let len = std::fs::read_to_string(captures_file)
+            .unwrap_or_default()
+            .len();
+        if len >= from + want_more {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "captures advanced {} of {want_more} in {secs}s",
+            len.saturating_sub(from)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
 
 /// Poll until `alias` has at least `want` events of `kind`.
 pub fn wait_event_count(
@@ -4382,8 +4431,8 @@ pub const LOOP_PR: &str = "https://github.com/acme/app/pull/7";
 /// The loop's fixture: a routed tracker + daemon, the master, a managed
 /// worker `w1`, managed reviewers `r1` and `r2` (launch role `reviewer`;
 /// `r1` wins by alias, and `r2` takes the ticket when `r1` is excluded),
-/// and a fake `gh` only the
-/// operator's process has on its PATH.
+/// and a fake `gh` the daemon takes at boot plus the operator's
+/// processes have on PATH.
 pub struct LoopFixture {
     pub f: PlanFixture,
     pub m: ManagedWorker,
@@ -4391,6 +4440,7 @@ pub struct LoopFixture {
     pub r1: ManagedWorker,
     pub r2: ManagedWorker,
     pub gh_dir: PathBuf,
+    _gh_tmp: TempDir,
 }
 
 impl LoopFixture {
@@ -4411,7 +4461,18 @@ impl LoopFixture {
         )
     }
 
-    pub fn dispatched_plan_with(plan_md: &str, opts: daemon::ServeOptions) -> LoopFixture {
+    pub fn dispatched_plan_with(plan_md: &str, mut opts: daemon::ServeOptions) -> LoopFixture {
+        // CAD-140: the fake `gh` exists before the daemon spawns — the
+        // daemon's approve-and-land transaction shells it, so the
+        // daemon takes it at boot, not off a shared PATH.
+        let gh_tmp = TempDir::new().unwrap();
+        let gh_dir = gh_tmp.path().join("ghbin");
+        std::fs::create_dir_all(&gh_dir).unwrap();
+        let gh = gh_dir.join("gh");
+        std::fs::write(&gh, FAKE_GH_PY).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        opts.delivery_gh = Some(gh);
         let f = PlanFixture::start_with(opts);
         let yaml = f.pm_dir.join("demo/project.yaml");
         let text = std::fs::read_to_string(&yaml).unwrap();
@@ -4444,12 +4505,6 @@ impl LoopFixture {
             .unwrap();
         let (ok, sent) = f.as_master(&mut m, "master dispatch D-2");
         assert!(ok, "{sent}");
-        let gh_dir = f.tmp.path().join("ghbin");
-        std::fs::create_dir_all(&gh_dir).unwrap();
-        let gh = gh_dir.join("gh");
-        std::fs::write(&gh, FAKE_GH_PY).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let lf = LoopFixture {
             f,
             m,
@@ -4457,6 +4512,7 @@ impl LoopFixture {
             r1,
             r2,
             gh_dir,
+            _gh_tmp: gh_tmp,
         };
         lf.set_gh(&"0".repeat(40), "OPEN", false, false);
         assert_eq!(lf.rec()["state"], "working", "{}", lf.rec());

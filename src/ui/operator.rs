@@ -132,6 +132,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/contexts/*/archive",
         RouteClass::OperatorOnly,
     ),
+    route(
+        "POST",
+        "/api/app-installations/*/contexts/*/records",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-installations/*/contexts/*/records/*/update",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/connections", RouteClass::OperatorOnly),
     route(
         "POST",
@@ -152,6 +162,12 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/app-runs/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/cancel", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/dispatch", RouteClass::OperatorOnly),
+    route("POST", "/api/social-publishes", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/social-publishes/*/cancel",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/*/approve",
@@ -179,6 +195,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
+    // CAD-140: filing a report or idea is creating a tracker issue —
+    // the same class as `POST /api/issues`, through `report::file`.
+    route("POST", "/api/reports", RouteClass::AgentAllowed),
     route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
     route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),
     route("DELETE", "/api/issues/*/links", RouteClass::AgentAllowed),
@@ -1960,6 +1979,11 @@ mod tests {
             RouteClass::AgentAllowed
         );
         assert_eq!(route_class("POST", "/api/issues"), RouteClass::AgentAllowed);
+        // CAD-140: filing a report is creating an issue, same class.
+        assert_eq!(
+            route_class("POST", "/api/reports"),
+            RouteClass::AgentAllowed
+        );
         assert_eq!(route_class("POST", "/api/session"), RouteClass::Session);
         // CAD-777: the device exchange is a login credential like the link.
         assert_eq!(

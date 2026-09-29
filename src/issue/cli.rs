@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, claim, doctor, finish, history, hooks, lint, model, project, retro, start, sync, work,
-    write, Pm,
+    blocked, board, claim, doctor, finish, groom, history, hooks, lint, model, project, reconcile,
+    retro, sprint, start, sync, work, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -130,6 +130,10 @@ pub enum IssueAction {
         /// Only computed-ready leaves.
         #[arg(long)]
         ready: bool,
+        /// Only issues with at least one open `blocked_by` target
+        /// (CAD-757) — blocked work in active states is one query away.
+        #[arg(long)]
+        blocked: bool,
         /// Board state at a git revision — exports the tree at `<rev>`
         /// and lists it read-only; cards report `status_source: file`.
         #[arg(long)]
@@ -253,7 +257,8 @@ pub enum IssueAction {
     /// note), backlog|ready → doing, and a comment; owner (the lane) is
     /// left alone except on a take-over.
     /// Re-claiming your own claim refreshes its time. Someone else's
-    /// doing/review issue refuses unless --take-over.
+    /// doing/review issue refuses unless --take-over — or unless the
+    /// daemon marked the claim stale, which needs no flag (CAD-755).
     Claim {
         id: String,
         /// Claimant [default: CADENCE_ALIAS, else operator].
@@ -337,13 +342,16 @@ pub enum IssueAction {
         #[arg(long, conflicts_with = "id")]
         merged: bool,
         /// Limit the sweep to one project (all projects when omitted).
-        #[arg(long, requires = "merged")]
+        /// Sweep-only: rejected with a single-ID finish.
+        #[arg(long, requires = "merged", conflicts_with = "id")]
         project: Option<String>,
         /// Print the sweep plan without changing anything.
-        #[arg(long, requires = "merged")]
+        /// Sweep-only: rejected with a single-ID finish.
+        #[arg(long, requires = "merged", conflicts_with = "id")]
         dry_run: bool,
-        /// Emit the sweep rows as JSON.
-        #[arg(long, requires = "merged")]
+        /// Emit the sweep rows as JSON. Single-ID output is already
+        /// JSON, so this is accepted everywhere as a no-op there.
+        #[arg(long)]
         json: bool,
     },
     /// Show one issue — frontmatter, body, links both ways, comments,
@@ -372,6 +380,10 @@ pub enum IssueAction {
         /// owner/component/tags, `tags=a,b` replaces the tag list.
         #[arg(required = true)]
         args: Vec<String>,
+        /// Override the `status=done` evidence gate (CAD-756) — the
+        /// reason is recorded on the commit, never silent.
+        #[arg(long, value_name = "REASON")]
+        force: Option<String>,
     },
     /// Add or remove tags: `issue tag <ID>… add|rm <tag>…`. Bulk like
     /// `set`: one commit, all-or-nothing.
@@ -434,6 +446,29 @@ pub enum IssueAction {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Reconcile tracker status with merge reality (CAD-754): classify
+    /// every `doing`/`review` leaf issue against its recorded branch,
+    /// worktree and `pr:` refs, and mark `done` the ones whose work
+    /// provably merged — one commit per issue naming the evidence.
+    /// `held`/`stalled` rows are reported, never moved: an open PR or
+    /// a claim newer than the merge blocks the flip. Merged worktree
+    /// refs are swept with the same guard `finish --merged` uses.
+    /// `issue sync` runs this sweep after a successful push.
+    Reconcile {
+        /// Limit the sweep to one project (all projects when omitted).
+        #[arg(long)]
+        project: Option<String>,
+        /// Print the classification without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Classify at most this many issues (0 = no limit — the daemon
+        /// tick uses a bound so the rest drain over later ticks).
+        #[arg(long, default_value = "0")]
+        limit: usize,
+        /// Emit the sweep rows as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Bring the tracker level with `origin`: fetch, rebase the local
     /// commits on top, lint the result, push. A conflict or lint
     /// failure aborts and leaves the tree exactly as found; the report
@@ -451,6 +486,89 @@ pub enum IssueAction {
         /// fetched remote's.
         #[arg(long, value_parser = ["ours", "theirs"])]
         resolve: Option<String>,
+    },
+    /// Backlog freshness (CAD-812): an advisory groom pass over open
+    /// `backlog`/`ready` leaves — the `sweep` sibling for dormant work.
+    /// Each dormant ticket is re-judged against the tree and the
+    /// tracker: `paths:` that moved since `created`, closed siblings on
+    /// the same paths, satisfied blockers never advanced. A `stale` or
+    /// `superseded` verdict lands `needs-triage` + a comment +
+    /// `last_groomed_at`; `valid` only stamps `last_groomed_at`. Never
+    /// changes `status` — the operator decides drop or re-scope. The
+    /// daemon checkup runs the same pass; this verb is the manual and
+    /// dry-run path.
+    Groom {
+        /// Report what would be flagged — nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit the pass to one project (all projects when omitted).
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Emit the verdicts as JSON (the verb already prints JSON — the
+        /// flag is accepted for consistency with `issue ls --json`).
+        #[arg(long)]
+        json: bool,
+        /// Seconds a `backlog`/`ready` leaf may sit before the pass
+        /// judges it — inside the window the ticket is its own evidence
+        /// [default: 1209600 (14d)].
+        #[arg(long, value_name = "SECS")]
+        grace: Option<i64>,
+    },
+    /// Blocked-work hygiene (CAD-757): park `doing`/`review` leaves
+    /// whose blockers are still open and whose claim is older than
+    /// `--grace` — tagged `blocked-park`, comment-bearing commit,
+    /// reversible — and for a tagged item whose blockers all closed,
+    /// notify its last claimer and drop the tag. The daemon checkup
+    /// runs the same sweep; this verb is the manual and dry-run path.
+    Sweep {
+        /// Report what would change — nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds a blocked active item may hold an unchanged claim
+        /// before it parks [default: 86400].
+        #[arg(long, value_name = "SECS")]
+        grace: Option<i64>,
+    },
+    /// Sprint pick-batch verbs (CAD-758): `close` ends a batch tag
+    /// with a velocity report and moves survivors in one commit;
+    /// `open` refills the next batch from ready in priority order.
+    /// Any tag scheme works — `sprint-*`, `batch-*`, project-local.
+    Sprint {
+        #[command(subcommand)]
+        action: SprintAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SprintAction {
+    /// Close a batch: report each tagged item (done / in-flight /
+    /// untouched / blocked stragglers), strip the tag from finished
+    /// work, and move every survivor — `--next <tag>` re-tags them
+    /// into the next batch, `--drop` returns them to plain status.
+    Close {
+        /// The pick-batch tag being closed (e.g. sprint-2026w40).
+        tag: String,
+        /// Re-tag every survivor to this tag in the same commit.
+        #[arg(long, value_name = "TAG", conflicts_with = "drop")]
+        next: Option<String>,
+        /// Drop the tag from survivors — they keep their status.
+        #[arg(long)]
+        drop: bool,
+        /// Report without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Open a batch: tag the first `--cap` computed-ready leaves in
+    /// priority order; blocked items are skipped and named.
+    Open {
+        /// The pick-batch tag to populate.
+        tag: String,
+        /// Batch size cap [default: 10].
+        #[arg(long, default_value_t = 10)]
+        cap: usize,
+        /// Report without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -794,6 +912,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             until,
             open,
             ready,
+            blocked,
             at,
             sort,
             limit,
@@ -911,6 +1030,9 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             if *ready {
                 views.retain(|v| v.ready);
+            }
+            if *blocked {
+                views.retain(|v| v.blocked);
             }
             // Stage/health filters run on the work block — one ctx.
             let by_id: std::collections::HashMap<String, &board::View> =
@@ -1201,6 +1323,20 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "issue finish needs an id — or --merged to sweep",
                 ));
             };
+            // CAD-800: fail closed — clap's `requires = "merged"` alone
+            // does not reject `finish <ID> --dry-run` when the positional
+            // ID is present (the installed build silently ignored the flag
+            // and ran a real finish). Sweep-only flags are parser-rejected
+            // via `conflicts_with = "id"` above; this guard covers any
+            // parser bypass (argument order, future flags). `--json` is
+            // deliberately NOT guarded: single-ID output is always JSON,
+            // so it is an accepted no-op there (see
+            // `finish_guard_per_worktree`).
+            if *dry_run || project.is_some() {
+                return Err(Error::rejected(
+                    "issue finish --dry-run and --project need --merged — a single-ID finish has no preview; omit them or use `issue finish --merged --dry-run` to preview the sweep",
+                ));
+            }
             let args = finish::FinishArgs {
                 force: *force,
                 keep_branch: *keep_branch,
@@ -1256,7 +1392,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             print_json(&write::set_acceptance(&pm, id, from, "")?);
             Ok(0)
         }
-        IssueAction::Set { args } => {
+        IssueAction::Set { args, force } => {
             // Ids never contain `=`, pairs always do.
             let split = args
                 .iter()
@@ -1270,7 +1406,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )));
             }
             let pm = open_pm()?;
-            let out = write::set_fields(&pm, ids, pairs, "")?;
+            let out = write::set_fields(&pm, ids, pairs, "", force.as_deref())?;
             print_json(&out);
             // The post-merge reminder: a done issue with an open
             // worktree ref still holds the tree — finish it (or sweep
@@ -1554,6 +1690,40 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 Ok(1)
             }
         }
+        IssueAction::Reconcile {
+            project,
+            dry_run,
+            limit,
+            json,
+        } => {
+            let pm = open_pm()?;
+            let out = reconcile::run(&pm, project.as_deref(), *dry_run, "", state_dir, *limit)?;
+            if *json {
+                print_json(&out);
+            } else {
+                for row in out["rows"].as_array().into_iter().flatten() {
+                    let mut line = format!(
+                        "{}: {}",
+                        row["issue"].as_str().unwrap_or("?"),
+                        row["outcome"].as_str().unwrap_or("?")
+                    );
+                    if let Some(r) = row["reason"].as_str() {
+                        line.push_str(&format!("({})", r.lines().next().unwrap_or(r)));
+                    }
+                    if let Some(e) = row["evidence"].as_str() {
+                        line.push_str(&format!(" — {e}"));
+                    }
+                    println!("{line}");
+                }
+            }
+            // A reconcile whose own writes failed still answers — the
+            // row says why. `errors` counts unwritable closes.
+            Ok(if out["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+                1
+            } else {
+                0
+            })
+        }
         IssueAction::Sync {
             no_push,
             dry_run,
@@ -1565,16 +1735,81 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 _ => sync::Resolve::Theirs,
             });
             let report = sync::run(&pm, !no_push, *dry_run, side)?;
-            if report["ok"].as_bool() == Some(true) {
-                print_json(&report);
-                Ok(0)
-            } else {
+            if report["ok"].as_bool() != Some(true) {
                 eprintln!(
                     "{}",
                     serde_json::to_string_pretty(&report).unwrap_or_default()
                 );
-                Ok(1)
+                return Ok(1);
             }
+            print_json(&report);
+            // CAD-754: a fresh upstream is the right time to sweep —
+            // status catches up with merges the push just published.
+            // Failure never fails the sync that succeeded.
+            if !*dry_run {
+                match reconcile::run(&pm, None, false, "", state_dir, 0) {
+                    Ok(rec) => {
+                        let done = rec["done"].as_array().map(|d| d.len()).unwrap_or(0);
+                        let held = rec["held"].as_array().map(|h| h.len()).unwrap_or(0);
+                        eprintln!("reconcile: {done} closed, {held} held");
+                    }
+                    Err(e) => eprintln!("reconcile: {e}"),
+                }
+            }
+            Ok(0)
+        }
+        IssueAction::Sweep { dry_run, grace } => {
+            let pm = open_pm()?;
+            let out = blocked::sweep(
+                &pm,
+                grace.unwrap_or(blocked::PARK_GRACE_SECS),
+                *dry_run,
+                Some(state_dir),
+                "",
+            )?;
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Groom {
+            dry_run,
+            project,
+            json: _,
+            grace,
+        } => {
+            let pm = open_pm()?;
+            let out = groom::groom(
+                &pm,
+                project.as_deref(),
+                grace.unwrap_or(groom::GROOM_GRACE_SECS),
+                *dry_run,
+                "",
+            )?;
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Sprint { action } => {
+            let pm = open_pm()?;
+            let out = match action {
+                SprintAction::Close {
+                    tag,
+                    next,
+                    drop,
+                    dry_run,
+                } => sprint::close(
+                    &pm,
+                    tag,
+                    next.as_deref(),
+                    *drop,
+                    *dry_run,
+                    Some(state_dir),
+                    "",
+                )?,
+                SprintAction::Open { tag, cap, dry_run } => {
+                    sprint::open(&pm, tag, *cap, *dry_run, Some(state_dir), "")?
+                }
+            };
+            print_json(&out);
+            Ok(0)
         }
     }
 }
@@ -1654,9 +1889,19 @@ fn print_ls_table(views: &[&board::View]) {
         eprintln!("no issues — `cadence issue new \"title\"` creates one");
         return;
     }
-    let mut rows = vec![["ID", "STATUS", "PRI", "FLAGS", "OWNER", "TAGS", "TITLE"]
-        .map(str::to_string)
-        .to_vec()];
+    let mut rows = vec![[
+        "ID",
+        "STATUS",
+        "PRI",
+        "FLAGS",
+        "OWNER",
+        "CLAIM AGE",
+        "TAGS",
+        "TITLE",
+    ]
+    .map(str::to_string)
+    .to_vec()];
+    let now = crate::issue::time::now_epoch();
     for v in views {
         let f = &v.issue.front;
         let mut flags = String::new();
@@ -1669,19 +1914,29 @@ fn print_ls_table(views: &[&board::View]) {
         if v.container {
             flags.push('C');
         }
+        // CAD-755: S — the daemon marked this claim stale (holder's
+        // agent dead past grace); it no longer blocks take-over.
+        if f.claim.as_ref().is_some_and(|c| c.stale.is_some()) {
+            flags.push('S');
+        }
         rows.push(vec![
             f.id.clone(),
             v.status.clone(),
             f.priority.clone(),
             flags,
             f.owner.clone().unwrap_or_default(),
+            f.claim
+                .as_ref()
+                .and_then(|c| crate::issue::time::parse_iso(&c.at))
+                .map(|at| crate::inbox::fmt_age((now - at).max(0) as u64))
+                .unwrap_or_default(),
             f.tags.join(","),
             f.title.clone(),
         ]);
     }
     print_table(&rows);
     eprintln!(
-        "{} issues · B=blocked ~=derived-status C=container",
+        "{} issues · B=blocked ~=derived-status C=container S=stale-claim",
         views.len()
     );
 }

@@ -370,6 +370,7 @@ fn send_steered(
         &Sender::Unattributed,
         steer,
         None,
+        None,
     )
 }
 
@@ -610,6 +611,9 @@ fn cad688_duplicate_connection_id_cannot_replace_another_credential() {
     );
 }
 
+mod app_audiences;
 mod app_bindings;
+mod app_content;
 mod app_effects;
 mod app_records;
+mod social_publish;

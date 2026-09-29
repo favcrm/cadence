@@ -9,12 +9,14 @@ import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
 import MailSend01Icon from "@hugeicons/core-free-icons/MailSend01Icon";
 import ContrastIcon from "@hugeicons/core-free-icons/ContrastIcon";
 import SecondaryViews from "./SecondaryViews.jsx";
+import PublishPreview from "./PublishPreview.jsx";
 
 const sections = [
   "Home",
   "Library",
   "Runs",
   "Needs you",
+  "Publish",
   "Automations",
   "Workflows",
   "Settings",
@@ -1446,6 +1448,7 @@ export default function SocialContent() {
                 {["Automations", "Workflows", "Settings"].includes(view) && (
                   <SecondaryViews view={view.toLowerCase()} context={context} />
                 )}
+                {view === "Publish" && <PublishPreview readonly={readonly} />}
               </>
             )}
           </main>

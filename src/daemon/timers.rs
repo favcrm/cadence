@@ -614,7 +614,36 @@ impl Shared {
 // failed auto-resume keeps the agent stopped and the message waits;
 // the failure raises a needs-me row instead of passing silently.
 
+/// CAD-754: issues classified per reconcile tick.
+const RECONCILE_BATCH: usize = 25;
+
 impl Shared {
+    /// CAD-754: one bounded batch of the tracker reconcile — close
+    /// `doing`/`review` issues whose recorded work merged. Runs on the
+    /// stall-watch thread at most hourly; the finish sweep stays a CLI
+    /// verb because its liveness probes go through `client::rpc`,
+    /// which the daemon must not issue to itself. A tracker write
+    /// failure is logged, never escalated: the next tick retries.
+    pub(super) fn reconcile_tick(&self) {
+        let pm = match self.pm() {
+            Ok(pm) => pm,
+            Err(e) => {
+                eprintln!("issue reconcile: {e}");
+                return;
+            }
+        };
+        match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH) {
+            Ok(out) => {
+                let done = out["done"].as_array().map(|d| d.len()).unwrap_or(0);
+                let held = out["held"].as_array().map(|h| h.len()).unwrap_or(0);
+                if done > 0 || held > 0 {
+                    eprintln!("issue reconcile: {done} closed, {held} held");
+                }
+            }
+            Err(e) => eprintln!("issue reconcile: {e}"),
+        }
+    }
+
     /// Resume every auto-stopped agent with work queued. Runs on the
     /// stall-watch thread each tick: one grouped queue read, then a
     /// marker read only for the stopped agents that have work waiting.

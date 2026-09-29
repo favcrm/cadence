@@ -158,16 +158,30 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component clippy
+      # Rust build cache (pinned): dependency artifacts keyed on
+      # toolchain + lockfile; final binaries always rebuild from sources.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --locked -- -D warnings
       # CAD-482: the test seam's gated code is dead to a default clippy
       # run — lint the feature-on shape too so it cannot rot.
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
 
-  test:
+  # The suite runs partitioned across shards for wall time (CAD-809):
+  # each shard compiles everything (warm rust-cache) and runs 1/N of
+  # the tests via nextest hash partitioning. `test` below aggregates
+  # under the stable required-check name, so branch protection and
+  # downstream `needs.test` gates need no changes.
+  test-shard:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # A shard failure must never hide the others' signal (or their
+      # cost evidence): every shard runs to its own verdict.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -192,6 +206,13 @@ jobs:
             if ! git show "$BASE_SHA:scripts/ci-rust-tests.py" > "$runner"; then
               cp scripts/ci-rust-tests.py "$runner"
             fi
+            # Shard partitioning needs runner support: a base predating
+            # --partition gets the head runner (plans stay schema-1,
+            # which the runner validates — a mismatch fails loud, never
+            # silently runs the wrong scope).
+            if ! grep -q -- "\-\-partition" "$runner"; then
+              cp scripts/ci-rust-tests.py "$runner"
+            fi
           else
             cp scripts/ci-rust-tests.py "$runner"
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
@@ -199,7 +220,11 @@ jobs:
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
       - name: Test scope selection and execution contracts
         run: python3 tests/scripts/test_ci_test_plan.py
+      - name: Test suite-shard partition contracts
+        run: python3 tests/scripts/test_ci_rust_tests.py
       - run: rustup toolchain install stable --profile minimal
+        if: steps.scope.outputs.mode != 'docs'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.scope.outputs.mode != 'docs'
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
@@ -270,7 +295,7 @@ jobs:
             cat "$RUNNER_TEMP/ci-test-plan.json"
             printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
             printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
-            echo 'profile=test (dev settings in Cargo.toml); no Rust cache action configured; actual warm/cold/cache hits not measured'
+            echo 'profile=test (dev settings in Cargo.toml); Rust cache via pinned Swatinem/rust-cache; actual warm/cold/cache hits not measured'
             sha256sum Cargo.toml Cargo.lock .config/nextest.toml
             echo 'Integration targets importing common (each unit also includes its own tests and link):'
             git grep -l '^mod common;' -- 'tests/*.rs'
@@ -282,7 +307,7 @@ jobs:
         if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: compiler-timings-${{ github.run_id }}-${{ github.run_attempt }}-inventory
+          name: compiler-timings-${{ github.run_id }}-${{ github.run_attempt }}-inventory-shard-${{ matrix.shard }}
           path: |
             ${{ steps.inventory.outputs.timings_available == 'true' && format('{0}/inventory-timings/inventory.html', runner.temp) || '' }}
             ${{ runner.temp }}/inventory-timings/context.txt
@@ -293,21 +318,20 @@ jobs:
       # for (tests/split_map_inventory.rs is the suite-side twin check).
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
-      # The feature-on suite cannot compile cfg(not(test-seam)) proofs.
-      # Run only that identity contract in the production feature shape.
-      - name: Run default-feature test-seam refusal proofs
+      # CAD-771: board-surface Rust tests serve the real SPA build
+      # through `ui/dist`. The ui job cannot hand files to this job
+      # without artifact transfer, so build here before nextest (non-docs).
+      - name: Build SPA for board-surface Rust tests
         if: steps.scope.outputs.mode != 'docs'
-        env:
-          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-          CARGO_BUILD_JOBS: 4
-        run: scripts/cadence-nextest --test test_seam --locked
+        run: pnpm build
+        working-directory: ui
       - name: Run recorded Rust scope with pinned nextest
         if: steps.scope.outputs.mode != 'docs'
         id: nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/8"
       # Observational timings come from the same run, including failed tests.
       # The recorded scope artifact distinguishes selected from full timings.
       - name: Summarize Rust test costs
@@ -325,7 +349,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: nextest-costs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nextest-costs-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
           path: |
             ${{ runner.temp }}/ci-test-plan.json
             ${{ runner.temp }}/nextest-costs.json
@@ -335,11 +359,55 @@ jobs:
       # cargo-nextest intentionally does not execute Rust doctests. Keep
       # doctests visible as a separate locked Cargo step rather than silently
       # dropping that coverage from cargo test --all-targets semantics.
+      # One shard runs them: they are unpartitioned by construction.
       - name: Run Rust doctests with locked Cargo
-        if: steps.scope.outputs.mode != 'docs'
+        if: steps.scope.outputs.mode != 'docs' && matrix.shard == 1
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
+
+  # The feature-on suite cannot compile cfg(not(test-seam)) proofs, so
+  # the refusal proofs run in the production feature shape. One job runs
+  # them once, in parallel with the shards instead of inside each —
+  # the second compile leaves every shard's critical path (CAD-809).
+  test-seam-refusal:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned cargo-nextest (PR93 dependency)
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      - name: Run default-feature test-seam refusal proofs
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+        run: scripts/cadence-nextest --test test_seam --locked
+
+  # Stable required-check name over the shards and the refusal job
+  # above: branch protection requires `test`, and downstream gates read
+  # `needs.test.result`. Skipped (not failed) when either fails, so red
+  # stays red.
+  test:
+    needs: [queue-evidence, test-shard, test-seam-refusal]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate test-shard results
+        run: |
+          echo "test shards: ${{ needs.test-shard.result }}"
+          echo "test-seam refusal: ${{ needs.test-seam-refusal.result }}"
+          [ "${{ needs.test-shard.result }}" = success ]
+          [ "${{ needs.test-seam-refusal.result }}" = success ]
 
   build:
     needs: [queue-evidence]
@@ -349,11 +417,19 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --release --locked
       - name: Rehearse offline hosted migration with the built CLI
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/release/cadence
         run: python3 scripts/test-hosted-migration.py -v
+      # CAD-778: the release binary parses with production features (no
+      # dev-deps), so only it proves frozen snapshot digests survive the
+      # store round trip — in-lane test binaries mask the default parser
+      # via dev-only jsonschema unification. Minimal port of the closed
+      # #463 release check; staging-rehearsal/MVP paths deliberately out.
+      - name: Verify frozen snapshot digests with the release CLI
+        run: python3 tests/e2e/app_snapshot_digest_778.py --binary target/release/cadence
       # CAD-482: the test seam must never reach a release binary —
       # the canary exists only under the feature, so this grep on the
       # shipped default-feature binary proves its bytes carry none of
@@ -409,6 +485,7 @@ jobs:
       - name: Verify app development isolation and HMR
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
 
@@ -460,6 +537,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
@@ -668,6 +746,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
@@ -863,6 +942,7 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked
       - run: target/debug/cadence --version
 

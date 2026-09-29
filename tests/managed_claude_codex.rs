@@ -1152,6 +1152,17 @@ fn ws_handshake_stall_is_bounded_and_cleans_child() {
     // The reviewer's probe: TCP accepts but never upgrades. The bounded
     // handshake must fail startup and kill the owned child — before the
     // fix, connect blocked past the deadline and the child leaked.
+    // The deadline values are production tuning, not the contract, so
+    // this runs at 3s/1s in a child process (process env is shared).
+    if !in_own_process(
+        "ws_handshake_stall_is_bounded_and_cleans_child",
+        &[
+            ("CADENCE_WS_CONNECT_SECS", "3"),
+            ("CADENCE_WS_HANDSHAKE_SECS", "1"),
+        ],
+    ) {
+        return;
+    }
     let d = TestDaemon::start();
     let mock = d.mock_codex_ws("no-upgrade");
     d.register_codex_ws("w1");
@@ -1288,6 +1299,16 @@ fn ws_external_approval_resolution_drops_pending() {
 fn ws_drip_handshake_is_bounded() {
     // The reviewer's drip probe: a peer feeding one header byte/second
     // defeats per-read timeouts; only the absolute deadline bounds it.
+    // Deadline values are production tuning — run at 3s/1s in a child.
+    if !in_own_process(
+        "ws_drip_handshake_is_bounded",
+        &[
+            ("CADENCE_WS_CONNECT_SECS", "3"),
+            ("CADENCE_WS_HANDSHAKE_SECS", "1"),
+        ],
+    ) {
+        return;
+    }
     let d = TestDaemon::start();
     let mock = d.mock_codex_ws("drip");
     d.register_codex_ws("w1");
@@ -1303,6 +1324,16 @@ fn ws_drip_handshake_is_bounded() {
 #[test]
 fn ws_refused_upgrade_is_bounded() {
     // A 200-instead-of-101 response must fail startup, not hang.
+    // Deadline values are production tuning — run at 3s/1s in a child.
+    if !in_own_process(
+        "ws_refused_upgrade_is_bounded",
+        &[
+            ("CADENCE_WS_CONNECT_SECS", "3"),
+            ("CADENCE_WS_HANDSHAKE_SECS", "1"),
+        ],
+    ) {
+        return;
+    }
     let d = TestDaemon::start();
     let mock = d.mock_codex_ws("bad-upgrade");
     d.register_codex_ws("w1");

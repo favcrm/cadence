@@ -320,6 +320,60 @@ const steps = {
     return {};
   },
 
+  // CAD-140: the operator's decision rows at phone width — a needs-me
+  // idea row and the merge approval row, expanded, with every control
+  // reachable without horizontal scroll.
+  async decisions390({ page }, { idea, issue }) {
+    await page.setViewportSize({ width: 390, height: 800 });
+    await page.goto(base);
+    // Under ~1100px the rail is a drawer behind the floating button.
+    const rail = page.locator("button.needbtn");
+    await rail.waitFor({ timeout: TIMEOUT });
+    await rail.click();
+    const panel = page.locator('section[aria-label="agent updates"]:visible');
+    await panel.waitFor({ timeout: TIMEOUT });
+    const decisions = panel.getByRole("group", { name: "Team activity" })
+      .getByRole("button", { name: /^Decisions\b/ });
+    if ((await decisions.getAttribute("aria-pressed")) !== "true") await decisions.click();
+    // The idea card: approve, reject-with-reason, park-with-date.
+    const ideaRow = panel.locator('li[data-need="idea_plan"]', { hasText: idea });
+    await ideaRow.first().waitFor({ timeout: TIMEOUT });
+    await ideaRow.first().getByRole("button", { name: /^Decide/ }).click();
+    const card = panel.locator(`[data-idea-card="${idea}"]`);
+    await card.waitFor({ timeout: TIMEOUT });
+    await expectText(card, idea, "the idea card shows its ticket");
+    // The merge card: the pinned head, Merge, Decline with a reason.
+    const prs = panel.locator('section[data-need-group="prs"]');
+    await prs.first().waitFor({ timeout: TIMEOUT });
+    const prsToggle = prs.first().locator('button[aria-expanded]').first();
+    if ((await prsToggle.getAttribute("aria-expanded")) === "false") await prsToggle.click();
+    const mergeRow = panel.locator('li[data-need="merge_decision"]', { hasText: issue });
+    await mergeRow.first().waitFor({ timeout: TIMEOUT });
+    await mergeRow.first().getByRole("button", { name: /^Review merge/ }).click();
+    await expectText(mergeRow.first(), issue, "the merge card shows its ticket");
+    // No horizontal scroll at 390px…
+    const overflow = await page.evaluate(
+      () =>
+        document.documentElement.scrollWidth > document.documentElement.clientWidth ||
+        document.body.scrollWidth > document.documentElement.clientWidth,
+    );
+    if (overflow) throw new Error("the decision rows overflow a 390px viewport");
+    // …and every decision control sits inside the viewport.
+    for (const name of ["Approve idea", "Reject…", "Park…", "Merge", "Decline…"]) {
+      const control = page.getByRole("button", { name, exact: true });
+      await control.first().waitFor({ timeout: TIMEOUT });
+      if (!(await control.first().isVisible())) {
+        throw new Error(`${name} is not visible at 390px`);
+      }
+      const box = await control.first().boundingBox();
+      if (!box || box.x < 0 || box.x + box.width > 390) {
+        throw new Error(`${name} escapes the 390px viewport: ${JSON.stringify(box)}`);
+      }
+    }
+    await page.setViewportSize({ width: 1400, height: 1000 });
+    return {};
+  },
+
   // Use case 7: the merge decision names the reviewer and the pinned
   // head; Merge enqueues it.
   async merge({ page }, { issue, reviewer, sha, pr, verdict }) {

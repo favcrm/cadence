@@ -188,8 +188,10 @@ fn fixture_repo(root: &Path) -> Repo {
 /// Write: worktree, shared git dir, worker dir, pm dir, cargo caches,
 /// sccache. Read: toolchain + the two non-secret ssh files. Never:
 /// `$HOME` itself, `~/.ssh` keys, `~/.gitconfig`, `~/.pi`/`~/.claude`,
-/// `credentials.toml`, other agents' dirs, the master dir, the daemon
-/// store root. A mutation widening any of those fails here.
+/// cargo `credentials.toml`, the Devin provider-auth file for every
+/// worker model, `~/.local/share` itself or any sibling of the
+/// Devin file, other agents' dirs, the master dir, the daemon store
+/// root. A mutation widening any of those fails here.
 #[test]
 fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
     let dir = tempfile::tempdir().unwrap();
@@ -219,6 +221,20 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
     std::fs::write(
         home.join(".cargo/credentials.toml"),
         "[registry]\ntoken = \"x\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".local/share/devin")).unwrap();
+    // CAD-751: the pinned pi-devin provider derives its OAuth auth
+    // from this single file. The value is test-only and never real —
+    // this test emits a policy, it never logs the file's contents.
+    std::fs::write(
+        home.join(".local/share/devin/credentials.toml"),
+        "windsurf_api_key = \"CAD751-TEST-ONLY-NOT-A-SECRET\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".local/share/devin/sibling.txt"),
+        "not the credential\n",
     )
     .unwrap();
 
@@ -281,6 +297,17 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
     ] {
         assert!(covers(&policy.read, &want), "read lacks {}", want.display());
     }
+    // The fixture file exists so this asserts policy denial, not mere absence.
+    assert!(
+        !covers(
+            &policy.read,
+            &home.join(".local/share/devin/credentials.toml")
+        ) && !covers(
+            &policy.write,
+            &home.join(".local/share/devin/credentials.toml")
+        ),
+        "non-Devin worker policy reaches the devin provider-auth file"
+    );
     // The deny surface — asserted as ABSENCE, so a widening mutation
     // (e.g. `write.push(home)`) trips the test, not a runtime probe.
     // Inside $HOME the check is airtight: EVERY granted path under it
@@ -315,6 +342,11 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
         home.join(".pi"),
         home.join(".claude"),
         home.join(".cargo/credentials.toml"),
+        // Devin's credentials and their parent directories stay denied.
+        home.join(".local"),
+        home.join(".local/share"),
+        home.join(".local/share/devin"),
+        home.join(".local/share/devin/sibling.txt"),
         repo.sibling.clone(),
         state.join("agents").join("other"),
         state.join("master"),
@@ -339,6 +371,90 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
     assert!(
         !covers(&policy.write, &home.join(".cargo")),
         "cargo root — only named caches"
+    );
+}
+
+/// No confined worker can read the operator's Devin login, regardless
+/// of its configured model.
+#[test]
+fn devin_model_workers_do_not_get_the_credential_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = root.join("state");
+    let home = root.join("home");
+    let pm = root.join("pm");
+    let cwd = root.join("work");
+    for d in [
+        home.join(".local/share/devin"),
+        pm.as_path().to_path_buf(),
+        cwd.as_path().to_path_buf(),
+    ] {
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    // Present so the assertions pin policy denial/grant, not absence.
+    std::fs::write(
+        home.join(".local/share/devin/credentials.toml"),
+        "windsurf_api_key = \"CAD751-TEST-ONLY-NOT-A-SECRET\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".local/share/devin/sibling.txt"),
+        "not the credential\n",
+    )
+    .unwrap();
+
+    let env = ProviderEnv::default();
+    env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
+    env.set("HOME", home.to_string_lossy().to_string());
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
+    env.set(
+        "CARGO_HOME",
+        home.join(".cargo").to_string_lossy().to_string(),
+    );
+    env.set(
+        "RUSTUP_HOME",
+        home.join(".rustup").to_string_lossy().to_string(),
+    );
+    env.set(
+        "SCCACHE_DIR",
+        home.join(".cache/sccache").to_string_lossy().to_string(),
+    );
+    let creds = home.join(".local/share/devin/credentials.toml");
+
+    // Even a `devin/<id>` model receives no secret grant.
+    let devin = worker(
+        "wd",
+        &cwd,
+        json!({"confine": true, "model": "devin/swe-2-high"}),
+    );
+    let (_exe, policy) = cadence_agent::adapter::pi::pi_worker_confinement(&env, &state, &devin);
+    assert!(
+        !covers(&policy.read, &creds),
+        "confined worker can read Devin credentials"
+    );
+    assert!(
+        !covers(&policy.write, &creds),
+        "the devin file must never be writable"
+    );
+    for denied in [
+        home.join(".local"),
+        home.join(".local/share"),
+        home.join(".local/share/devin"),
+        home.join(".local/share/devin/sibling.txt"),
+    ] {
+        assert!(
+            !covers(&policy.write, &denied) && !covers(&policy.read, &denied),
+            "devin worker policy reaches {}",
+            denied.display()
+        );
+    }
+
+    // A bare id names no provider namespace: no grant (fail closed).
+    let bare = worker("wb", &cwd, json!({"confine": true, "model": "swe-2-high"}));
+    let (_exe, policy) = cadence_agent::adapter::pi::pi_worker_confinement(&env, &state, &bare);
+    assert!(
+        !covers(&policy.read, &creds) && !covers(&policy.write, &creds),
+        "bare-id worker policy reaches the devin file"
     );
 }
 
@@ -735,6 +851,132 @@ fn pm_config_defaults_confinement_and_explicit_params_win() {
     test_env().remove("CADENCE_PM_DIR");
 }
 
+#[test]
+fn confined_devin_is_refused_before_registration_or_model_switch() {
+    let pm_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        pm_dir.path().join("pm.yaml"),
+        "schema: 1\nhost:\n  confine_pi_workers: true\npi:\n  models:\n    allow: [\"fake/model-1\", \"devin/swe-2-high\"]\n    default: {worker: \"devin/swe-2-high\"}\n",
+    )
+    .unwrap();
+    test_env().set(
+        "CADENCE_PM_DIR",
+        pm_dir.path().to_string_lossy().to_string(),
+    );
+    let _env = confine_env();
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    let cwd = d.dir.path().to_str().unwrap();
+    let err = d
+        .fixture_rpc(
+            "agent_register",
+            json!({
+                "alias": "denied", "provider": "pi", "endpoint_kind": "managed",
+                "cwd": cwd, "params": "{}"
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    assert!(d.rpc("agent_show", json!({"alias": "denied"})).is_err());
+
+    // An explicit opt-out remains usable, while an ordinary confined
+    // worker cannot switch to Devin for its next launch.
+    d.register_pi("unconfined", json!({"confine": false}));
+    d.wait_agent("unconfined", "idle", 20);
+    let show = d.rpc("agent_show", json!({"alias": "unconfined"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "devin/swe-2-high");
+    d.register_pi("safe", json!({"model": "fake/model-1"}));
+    let err = d
+        .fixture_rpc(
+            "agent_set",
+            json!({
+                "alias": "safe", "patch": {"model": "devin/swe-2-high"}, "next_launch": true
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "safe"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "fake/model-1");
+    test_env().remove("CADENCE_PM_DIR");
+}
+
+/// pi-devin@0.2.1 reads the operator's Devin login for
+/// `devin/swe-2-high` on every turn. Simulate a persisted row from
+/// before CAD-751: direct task dispatch must refuse it before a task
+/// revision or kickoff message is written. An unconfined worker on
+/// the same pinned model can receive and complete a turn.
+#[test]
+fn persisted_confined_devin_row_cannot_receive_a_dispatched_turn() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    d.register_inbox("pm-in");
+    d.register_pi(
+        "stale",
+        json!({"confine": false, "model": "devin/swe-2-high", "upstream": "pm-in"}),
+    );
+    d.register_pi(
+        "unconfined",
+        json!({"confine": false, "model": "devin/swe-2-high", "upstream": "pm-in"}),
+    );
+    d.wait_agent("stale", "idle", 20);
+    d.wait_agent("unconfined", "idle", 20);
+
+    // Direct store write creates the old unsafe row; the public
+    // register/set routes now refuse this combination.
+    let store = cadence_agent::store::Store::open_side(&d.state.join("cadence.sqlite3")).unwrap();
+    store
+        .set_params("stale", &json!({"confine": true}))
+        .unwrap();
+    drop(store);
+
+    let messages_before =
+        d.rpc("agent_show", json!({"alias": "stale"})).unwrap()["messages"].clone();
+    let err = d
+        .operator_rpc(
+            "agent_send",
+            json!({
+                "alias": "stale", "text": "unsafe direct turn"
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    let messages_after =
+        d.rpc("agent_show", json!({"alias": "stale"})).unwrap()["messages"].clone();
+    assert_eq!(messages_after, messages_before, "direct send queued a turn");
+
+    let (spec, sha) = d.spec_file("cad751-dispatch.md", "test a pi-devin dispatched turn");
+    d.job_new("pm-in", "j751", &spec, &sha);
+    d.task_new_ac("j751", "j751-stale", "stale", "report completion")
+        .unwrap();
+    d.task_new_ac("j751", "j751-control", "unconfined", "report completion")
+        .unwrap();
+
+    let before = d.rpc("task_show", json!({"task": "j751-stale"})).unwrap()["task"].clone();
+    let err = d.job_dispatch("j751-stale", json!({})).unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    let after = d.rpc("task_show", json!({"task": "j751-stale"})).unwrap()["task"].clone();
+    assert_eq!(after["state"], "draft", "{after}");
+    assert_eq!(after["revision"], before["revision"], "{after}");
+    assert!(after["dispatch_message"].is_null(), "{after}");
+
+    let control = d.job_dispatch("j751-control", json!({})).unwrap();
+    let message = control["message"].as_str().unwrap();
+    assert_eq!(control["task"]["dispatch_message"], message);
+    d.wait_message("unconfined", message, &["completed"], 20);
+}
+
 /// `agent set` cannot shed the boundary: `confine` is a posture param
 /// — an agent caller gets refused; only operator/PM may change it, and
 /// only for the next launch.
@@ -841,4 +1083,354 @@ fn join_pi_confine_end_to_end() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("confine"), "{err}");
     }
+}
+
+/// Asserts the ordinary test path leaks no `canary` into any text
+/// file under `state` (log, record, session file, cache). This guards
+/// Cadence's own handling only — a model with a granted credential
+/// read could still exfiltrate through its own writes (accepted
+/// residual risk, see the CAD-751 grant comment in `src/adapter/pi.rs`).
+fn assert_state_has_no_canary(state: &Path, canary: &str) {
+    let mut hits = Vec::new();
+    let mut stack = vec![state.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains(canary) {
+                    hits.push(path);
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "credential bytes leaked into {hits:?}");
+}
+
+/// Even if an old row carries the unsafe model, its emitted policy
+/// never exposes the Devin credential.
+#[test]
+fn confined_devin_provider_auth_is_denied() {
+    if cadence_agent::confine::available().is_err() {
+        eprintln!("no Landlock on this host — confined leg skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = root.join("state");
+    let home = root.join("home");
+    let pm = root.join("pm");
+    let cwd = root.join("work");
+    for d in [
+        home.join(".local/share/devin"),
+        home.join(".local/share/other"),
+        home.join(".cargo"),
+        home.join(".pi/agent"),
+        pm.as_path().to_path_buf(),
+        cwd.as_path().to_path_buf(),
+    ] {
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    // Test-only bytes, never a real credential — the probe reports
+    // booleans, and the assertions below prove the bytes reach no
+    // harness-visible output.
+    let canary = "CAD751-TEST-ONLY-NOT-A-SECRET";
+    std::fs::write(
+        home.join(".local/share/devin/credentials.toml"),
+        format!("windsurf_api_key = \"{canary}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(home.join(".local/share/devin/sibling.txt"), "sibling\n").unwrap();
+    std::fs::write(home.join(".local/share/other/note.txt"), "other\n").unwrap();
+    std::fs::write(home.join(".cargo/credentials.toml"), "token = \"nope\"\n").unwrap();
+    std::fs::write(home.join(".pi/agent/auth.json"), "{}\n").unwrap();
+
+    let env = ProviderEnv::default();
+    env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
+    env.set("HOME", home.to_string_lossy().to_string());
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
+    env.set(
+        "CADENCE_CONFINE_COMMAND",
+        env!("CARGO_BIN_EXE_cadence").to_string(),
+    );
+    env.set(
+        "CARGO_HOME",
+        home.join(".cargo").to_string_lossy().to_string(),
+    );
+    env.set(
+        "RUSTUP_HOME",
+        home.join(".rustup").to_string_lossy().to_string(),
+    );
+    env.set(
+        "SCCACHE_DIR",
+        home.join(".cache/sccache").to_string_lossy().to_string(),
+    );
+    let agent = worker(
+        "w751",
+        &cwd,
+        json!({"confine": true, "model": "devin/swe-2-high"}),
+    );
+    let (confine, policy) = cadence_agent::adapter::pi::pi_worker_confinement(&env, &state, &agent);
+
+    // The emitted policy never names the credential path.
+    let args = policy.to_args().join(" ");
+    assert!(
+        !args.contains(".local/share/devin/credentials.toml"),
+        "{args}"
+    );
+    assert!(
+        !args.contains(canary),
+        "policy argv carries credential bytes"
+    );
+
+    let creds = home.join(".local/share/devin/credentials.toml");
+    let spec = json!({
+        "read_ok": [],
+        "write_ok": [cwd.join("probe-ok.txt")],
+        "read_deny": [
+            creds,
+            home.join(".local/share/devin/sibling.txt"),
+            home.join(".local/share/other/note.txt"),
+            home.join(".cargo/credentials.toml"),
+            home.join(".pi/agent/auth.json"),
+        ],
+        "write_deny": [creds, home.join(".local/share/devin/evil.txt")],
+        "list_deny": [home.join(".local"), home.join(".local/share"), home.join(".local/share/devin")],
+    });
+    let out = std::process::Command::new(&confine)
+        .arg("confine")
+        .args(policy.to_args())
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(PROBE751)
+        .arg(spec.to_string())
+        .env("HOME", &home)
+        .env("TMPDIR", &cwd)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(canary) && !stderr.contains(canary),
+        "probe output carries credential bytes"
+    );
+    let report: Value = serde_json::from_str(stdout.trim().lines().last().unwrap_or("{}"))
+        .unwrap_or_else(|e| panic!("probe output not json: {e}\nstdout={stdout}\nstderr={stderr}"));
+    assert!(
+        out.status.success() && report["ok"] == true,
+        "confined devin-auth probes: {}\nstderr: {stderr}",
+        serde_json::to_string_pretty(&report).unwrap(),
+    );
+}
+
+/// CAD-751 negative live leg: a confined worker on a NON-Devin model
+/// cannot read the Devin provider-auth file — the emitted policy names
+/// no grant, and under the applied policy the read fails while the
+/// write-ok control proves the probe itself ran inside the policy.
+/// (Before scoping, this same probe read the file: the grant leaked to
+/// every confined worker.)
+#[test]
+fn confined_non_devin_worker_cannot_read_devin_auth() {
+    if cadence_agent::confine::available().is_err() {
+        eprintln!("no Landlock on this host — confined leg skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let state = root.join("state");
+    let home = root.join("home");
+    let pm = root.join("pm");
+    let cwd = root.join("work");
+    for d in [
+        home.join(".local/share/devin"),
+        pm.as_path().to_path_buf(),
+        cwd.as_path().to_path_buf(),
+    ] {
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    let canary = "CAD751-TEST-ONLY-NOT-A-SECRET";
+    std::fs::write(
+        home.join(".local/share/devin/credentials.toml"),
+        format!("windsurf_api_key = \"{canary}\"\n"),
+    )
+    .unwrap();
+
+    let env = ProviderEnv::default();
+    env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
+    env.set("HOME", home.to_string_lossy().to_string());
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
+    env.set(
+        "CADENCE_CONFINE_COMMAND",
+        env!("CARGO_BIN_EXE_cadence").to_string(),
+    );
+    env.set(
+        "CARGO_HOME",
+        home.join(".cargo").to_string_lossy().to_string(),
+    );
+    env.set(
+        "RUSTUP_HOME",
+        home.join(".rustup").to_string_lossy().to_string(),
+    );
+    env.set(
+        "SCCACHE_DIR",
+        home.join(".cache/sccache").to_string_lossy().to_string(),
+    );
+    // Non-Devin model: the `worker` helper's `fake/model-1` default.
+    let agent = worker("wn", &cwd, json!({"confine": true}));
+    let (confine, policy) = cadence_agent::adapter::pi::pi_worker_confinement(&env, &state, &agent);
+
+    let args = policy.to_args().join(" ");
+    assert!(
+        !args.contains("devin/credentials.toml"),
+        "non-Devin worker policy names the devin file: {args}"
+    );
+
+    let creds = home.join(".local/share/devin/credentials.toml");
+    let spec = json!({
+        "read_ok": [],
+        "write_ok": [cwd.join("probe-ok.txt")],
+        "read_deny": [creds],
+        "write_deny": [],
+        "list_deny": [],
+    });
+    let out = std::process::Command::new(&confine)
+        .arg("confine")
+        .args(policy.to_args())
+        .arg("--")
+        .arg("python3")
+        .arg("-c")
+        .arg(PROBE751)
+        .arg(spec.to_string())
+        .env("HOME", &home)
+        .env("TMPDIR", &cwd)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(canary) && !stderr.contains(canary),
+        "probe output carries credential bytes"
+    );
+    let report: Value = serde_json::from_str(stdout.trim().lines().last().unwrap_or("{}"))
+        .unwrap_or_else(|e| panic!("probe output not json: {e}\nstdout={stdout}\nstderr={stderr}"));
+    assert!(
+        out.status.success() && report["ok"] == true,
+        "non-devin confined probes: {}\nstderr: {stderr}",
+        serde_json::to_string_pretty(&report).unwrap(),
+    );
+}
+
+/// The probe the CAD-751 test runs: [`PROBE`]'s read/write legs plus a
+/// `list_deny` leg — listing a directory needs a grant on the dir
+/// itself, so the credential file's ungranted parents must refuse.
+/// Every check reports booleans into the JSON on stdout — file
+/// contents never cross it, so credential bytes cannot leak through
+/// the harness-visible report.
+const PROBE751: &str = r#"
+import json, os, sys
+spec = json.loads(sys.argv[1])
+checks = []
+def rec(name, ok, detail=""):
+    checks.append({"check": name, "ok": bool(ok), "detail": str(detail)[:200]})
+def can_read(p):
+    try:
+        open(p).read(1)
+        return True
+    except OSError as e:
+        return e
+def can_write(p):
+    try:
+        open(p, "w").write("x")
+        return True
+    except OSError as e:
+        return e
+def can_list(p):
+    try:
+        os.listdir(p)
+        return True
+    except OSError as e:
+        return e
+for p in spec["read_ok"]:
+    r = can_read(p); rec("read:" + p, r is True, r)
+for p in spec["write_ok"]:
+    r = can_write(p); rec("write:" + p, r is True, r)
+for p in spec["read_deny"]:
+    r = can_read(p); rec("deny-read:" + p, r is not True, "LEAKED" if r is True else r)
+for p in spec["write_deny"]:
+    r = can_write(p); rec("deny-write:" + p, r is not True, "LEAKED" if r is True else r)
+for p in spec.get("list_deny", []):
+    r = can_list(p); rec("deny-list:" + p, r is not True, "LEAKED" if r is True else r)
+ok = all(c["ok"] for c in checks)
+print(json.dumps({"ok": ok, "fail": [c for c in checks if not c["ok"]]}))
+"#;
+
+/// An existing unsafe row is refused before Pi is launched or any
+/// dispatched turn can run.
+#[test]
+fn confined_devin_model_refuses_before_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let cwd = dir.path().join("work");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(home.join(".local/share/devin")).unwrap();
+    // Test-only bytes, never a real credential. The launch must refuse
+    // before Pi can read this file or copy its bytes into state.
+    let canary = "CAD751-TEST-ONLY-NOT-A-SECRET";
+    std::fs::write(
+        home.join(".local/share/devin/credentials.toml"),
+        format!("windsurf_api_key = \"{canary}\"\n"),
+    )
+    .unwrap();
+    let e2e = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e");
+    let ad = adapter(
+        "normal",
+        &state,
+        &[
+            ("HOME", home.to_string_lossy().to_string()),
+            // The toolchain vars are read from the daemon env first —
+            // pin them at the fixture home so the emitted policy is
+            // deterministic (the real process env's would win).
+            (
+                "CARGO_HOME",
+                home.join(".cargo").to_string_lossy().to_string(),
+            ),
+            (
+                "RUSTUP_HOME",
+                home.join(".rustup").to_string_lossy().to_string(),
+            ),
+            (
+                "SCCACHE_DIR",
+                home.join(".cache/sccache").to_string_lossy().to_string(),
+            ),
+            (
+                "CADENCE_CONFINE_COMMAND",
+                env!("CARGO_BIN_EXE_cadence").to_string(),
+            ),
+            (
+                cadence_agent::adapter::pi::CONFINE_WORKER_EXTRA_READ_ENV,
+                e2e.to_string_lossy().to_string(),
+            ),
+        ],
+    );
+    // The pinned provider model from the ticket — the suite `[pi]`
+    // policy the `adapter` helper writes already allowlists it.
+    let agent = worker(
+        "w751",
+        &cwd,
+        json!({"confine": true, "model": "devin/swe-2-high"}),
+    );
+    let error = match ad.open(&agent) {
+        Ok(_) => panic!("confined Devin worker launched"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("cannot use model") && error.contains("Choose a non-Devin model"),
+        "{error}"
+    );
+    assert!(!state.join("agents/w751/pi-record.json").exists());
+    assert_state_has_no_canary(&state, canary);
 }

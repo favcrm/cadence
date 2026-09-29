@@ -614,6 +614,13 @@ impl Store {
         let mut payload = record.to_json();
         if rotated {
             payload["rotated"] = json!(true);
+            // CAD-796: the revision bump stales every binding on this
+            // credential — withdraw affected approvals with the record.
+            Self::app_binding_approvals_withdraw_for_credential_in(
+                &tx,
+                &record.platform,
+                &record.account,
+            )?;
         }
         if let Some(risk) = risk {
             payload["custody_risk_accepted"] = json!(risk);
@@ -675,6 +682,10 @@ impl Store {
             "DELETE FROM platform_defaults WHERE platform=?1 AND account=?2",
             params![platform, account],
         )?;
+        // CAD-796: every configured binding on this credential goes stale
+        // with the record — withdraw each affected installation's approval
+        // and close its waiting effects in the same transaction.
+        Self::app_binding_approvals_withdraw_for_credential_in(&tx, platform, account)?;
         for grant in &grants {
             let mut payload = grant.to_json();
             payload["reason"] = json!(reason.unwrap_or("credential revoked"));

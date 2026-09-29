@@ -8,6 +8,7 @@
 pub mod app;
 pub mod app_catalog;
 pub mod areas;
+pub mod blocked;
 pub mod board;
 pub mod claim;
 pub mod cli;
@@ -15,6 +16,7 @@ pub mod context;
 pub mod dispatch;
 pub mod doctor;
 pub mod finish;
+pub mod groom;
 pub mod history;
 pub mod hooks;
 pub mod idea;
@@ -26,9 +28,11 @@ pub mod parse;
 pub mod plan;
 pub mod project;
 pub mod project_new;
+pub mod reconcile;
 pub mod relay;
 pub mod report;
 pub mod retro;
+pub mod sprint;
 pub mod start;
 pub mod summary;
 pub mod sync;
@@ -38,7 +42,7 @@ pub mod work;
 pub mod workflow;
 pub mod write;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -77,6 +81,10 @@ pub struct PmConfig {
     /// file over it before the blob lands).
     #[serde(default)]
     pub wiki: WikiConfig,
+    /// CAD-362: the operator's reviewer-pairing catalog — `pair` pins
+    /// an author's reviews to one reviewer, `never` bars a pair.
+    #[serde(default)]
+    pub review: crate::delivery::ReviewRules,
 }
 
 /// `pm.yaml`'s `wiki:` section.
@@ -121,6 +129,7 @@ impl Default for PmConfig {
             artifact_max_bytes: default_artifact_cap(),
             notes_dir: default_notes_dir(),
             wiki: WikiConfig::default(),
+            review: crate::delivery::ReviewRules::default(),
         }
     }
 }
@@ -529,17 +538,75 @@ fn foreign_out(mut foreign: Vec<String>, extra: usize) -> Vec<String> {
 }
 
 /// One stderr line per write that saw foreign files — the immediate
-/// signal for the operator watching the CLI or the daemon's log.
+/// signal for the operator watching the CLI or the daemon's log. A
+/// path already named within `FOREIGN_WARN_QUIET` folds into the
+/// "(already reported)" count instead of printing again — one stuck
+/// file must not train operators to skip every warning (CAD-759).
 fn warn_foreign(dir: &Path, foreign: &[String], extra: usize) {
     if foreign.is_empty() && extra == 0 {
         return;
     }
+    let fresh = foreign_fresh(dir, foreign, time::now_epoch());
+    let suppressed = foreign.len() - fresh.len();
+    if fresh.is_empty() && extra == 0 {
+        return;
+    }
+    let quiet = if suppressed > 0 {
+        format!(" ({suppressed} already reported within 24h)")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "warning: {} foreign path(s) under {} left uncommitted: {}",
-        foreign.len() + extra,
+        "warning: {} foreign path(s) under {} left uncommitted: {}{}",
+        fresh.len() + extra,
         dir.display(),
-        foreign_listed(foreign, extra)
+        foreign_listed(&fresh, extra),
+        quiet
     );
+}
+
+/// How long a warned-about foreign path stays quiet — the CAD-584
+/// artifact warned on every write for days; one notice per path per
+/// day keeps the signal readable.
+const FOREIGN_WARN_QUIET: i64 = 24 * 3600;
+
+/// `.index/foreign-seen` — `path<TAB>epoch` for each foreign path the
+/// warning already named. Gitignored tracker scratch like `.write.lock`.
+fn load_foreign_seen(dir: &Path) -> HashMap<String, i64> {
+    std::fs::read_to_string(dir.join(".index").join("foreign-seen"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (p, t) = l.rsplit_once('\t')?;
+            Some((p.to_string(), t.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// Foreign paths not warned about within the quiet window — and stamps
+/// *those* paths seen at `now`. A suppressed path keeps its last-warned
+/// stamp, so a file that stays dirty re-warns a day after the last
+/// warning instead of sliding quiet forever. Best effort both ways: a
+/// state file that cannot be read or written degrades to
+/// warn-everything, never to silence.
+fn foreign_fresh(dir: &Path, foreign: &[String], now: i64) -> Vec<String> {
+    let mut seen = load_foreign_seen(dir);
+    let fresh: Vec<String> = foreign
+        .iter()
+        .filter(|p| seen.get(*p).is_none_or(|t| now - *t >= FOREIGN_WARN_QUIET))
+        .cloned()
+        .collect();
+    for p in &fresh {
+        seen.insert(p.clone(), now);
+    }
+    // Anything older than two quiet windows cannot decide a verdict
+    // again — the file stays bounded no matter the history.
+    seen.retain(|_, t| now - *t < 2 * FOREIGN_WARN_QUIET);
+    let body: String = seen.iter().map(|(p, t)| format!("{p}\t{t}\n")).collect();
+    let index = dir.join(".index");
+    let _ = std::fs::create_dir_all(&index)
+        .and_then(|_| std::fs::write(index.join("foreign-seen"), body));
+    fresh
 }
 
 /// The foreign-path list as one line — capped so a planted tree cannot
@@ -701,5 +768,30 @@ mod tests {
         assert!(pm.flush_pending("test").is_err());
         let staged = git(&pm_dir, &["diff", "--cached", "--name-only"]).unwrap();
         assert_eq!(staged, "", "the refused write staged: {staged}");
+    }
+
+    /// CAD-759: a foreign path warns once per quiet window — repeated
+    /// writes against the same stuck file say so instead of repeating
+    /// the whole list, and a second stuck path still names itself.
+    #[test]
+    fn foreign_warning_dedupes_per_path_per_day() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pm_dir = dir.path().join("pm");
+        let _pm = Pm::init(&pm_dir).unwrap();
+        let f = vec!["cadence/CAD-1/artifacts/review.md".to_string()];
+        assert_eq!(foreign_fresh(&pm_dir, &f, 1_000_000), f);
+        // Inside the window the path stays quiet while a second one
+        // still names itself.
+        let both = vec![f[0].clone(), "other/x.md".to_string()];
+        assert_eq!(foreign_fresh(&pm_dir, &both, 1_000_100), ["other/x.md"]);
+        // Past the window the stuck path warns again.
+        assert_eq!(
+            foreign_fresh(&pm_dir, &f, 1_000_000 + FOREIGN_WARN_QUIET),
+            f
+        );
+        // The state file lives under gitignored .index/ — the foreign
+        // scan itself can never warn on the dedup record.
+        let seen = std::fs::read_to_string(pm_dir.join(".index/foreign-seen")).unwrap();
+        assert!(seen.contains("cadence/CAD-1/artifacts/review.md"), "{seen}");
     }
 }

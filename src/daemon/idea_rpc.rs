@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{optional_str, required_str, Shared, DAEMON_ALIAS};
-use crate::error::Result;
+use super::{optional_str, request_actor, required_str, Shared, DAEMON_ALIAS};
+use crate::error::{Error, Result};
 use crate::issue::{self, board, idea, project};
 use crate::store;
 
@@ -351,7 +351,7 @@ impl Shared {
         match idea::parse_plan(&text) {
             Ok(plan) => {
                 idea::comment_once(pm, id, author, "plan", &text)?;
-                idea::set_status_tags(pm, id, "review", Some("plan-ready"), &[])?;
+                idea::set_status_tags(pm, id, "review", Some("plan-ready"), &[], None)?;
                 if let Some(rec) = records.get_mut(id) {
                     rec.state = "plan_ready".into();
                     rec.plan_ready_at = Some(now);
@@ -402,7 +402,7 @@ impl Shared {
             "stale",
             &format!("{id} has had no operator decision for 14 days; the plan is stale."),
         )?;
-        idea::set_status_tags(pm, id, "review", Some("idea-stale"), &[])?;
+        idea::set_status_tags(pm, id, "review", Some("idea-stale"), &[], None)?;
         if let Some(rec) = records.get_mut(id) {
             rec.stale = true;
         }
@@ -426,7 +426,7 @@ impl Shared {
         if idea::ymd(now) < until {
             return Ok(false);
         }
-        idea::set_status_tags(pm, id, "review", Some("plan-ready"), &["parked"])?;
+        idea::set_status_tags(pm, id, "review", Some("plan-ready"), &["parked"], None)?;
         if let Some(rec) = records.get_mut(id) {
             rec.state = "plan_ready".into();
             rec.plan_ready_at = Some(now);
@@ -475,13 +475,24 @@ impl Shared {
     }
 
     /// `idea_decide` — operator only. The decision is an object on the
-    /// pipeline record and a daemon event, not a comment.
+    /// pipeline record and a daemon event, not a comment. CAD-140:
+    /// `expect_rev` is REQUIRED — the revision the decision was made
+    /// against, enforced at the write — and `request_actor` names who
+    /// decided on the recorded object (attribution only; authority is
+    /// this connection).
     pub(super) fn rpc_idea_decide(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("idea decide", params, peer_pid)?;
         let _g = self.idea_lock.lock().unwrap_or_else(|e| e.into_inner());
         let issue = required_str(params, "issue")?;
         issue::model::check_id(issue)?;
         let action = required_str(params, "action")?;
+        let expect_rev = required_str(params, "expect_rev")?;
+        if expect_rev.trim().is_empty() {
+            return Err(Error::rejected(
+                "idea decide names the issue revision it was made against: {\"expect_rev\"} is required",
+            ));
+        }
+        let actor = request_actor(params)?;
         let pm = self.pm()?;
         let mut records = idea::load(&self.state_dir)?;
         let out = idea::decide(
@@ -491,6 +502,8 @@ impl Shared {
             action,
             optional_str(params, "reason"),
             optional_str(params, "park_until"),
+            expect_rev,
+            &actor,
         )?;
         idea::save(&self.state_dir, &records)?;
         let _ = self

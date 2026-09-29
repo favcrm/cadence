@@ -2078,7 +2078,14 @@ fn board_app_runs_are_the_apps_plans() {
     // progress and the row follow the tracker.
     f.d.operator_rpc("plan_approve", json!({"epic": epic}))
         .unwrap();
-    let (ok, out) = f.cli(&["issue", "set", &tickets[0], "status=done"]);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        &tickets[0],
+        "status=done",
+        "--force",
+        "app-plans probe close",
+    ]);
     assert!(ok, "{out}");
     let (status, body) = board_get(port, "/api/apps/demo/studio/runs");
     assert_eq!(status, 200, "{body}");
@@ -2362,7 +2369,18 @@ fn cad432_epic(f: &PlanFixture) {
         let (ok, out) = f.cli(&["issue", "new", title, "--project", "demo", "--epic", "D-1"]);
         assert!(ok, "{out}");
     }
-    assert!(f.cli(&["issue", "set", "D-2", "size=L", "status=done"]).0);
+    assert!(
+        f.cli(&[
+            "issue",
+            "set",
+            "D-2",
+            "size=L",
+            "status=done",
+            "--force",
+            "epic shape probe close"
+        ])
+        .0
+    );
     assert!(f.cli(&["issue", "set", "D-3", "size=S"]).0);
     let (ok, out) = f.cli(&["issue", "set", "D-1", "type=epic", "milestone=m1"]);
     assert!(ok, "{out}");

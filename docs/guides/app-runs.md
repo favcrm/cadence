@@ -107,6 +107,14 @@ the original run; a conflicting request is refused. Use the returned
 snapshot digest for run approval. An optional `--project-link` records
 only a discovery link.
 
+The frozen snapshot embeds agent identity timestamps as JSON floats, so
+approval rehashes the stored snapshot text and compares it to the frozen
+digest. The build enables exact float round-tripping (`float_roundtrip`)
+so a reread parses back the identical doubles; without it, epoch-scale
+timestamps can decode one ULP off and approval refuses the run with
+`immutable app run snapshot receipt is corrupt`. A mismatched digest is
+never bypassed: forged digests and tampered snapshots stay refused.
+
 Workers receive the supported result contract in their real kickoff.
 Production returns a bounded text or Markdown artifact through an
 authenticated result. Review receives an artifact reference and reads it

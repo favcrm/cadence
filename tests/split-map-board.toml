@@ -165,6 +165,7 @@ helpers = [
 
 [binaries.board_http]
 tests = [
+    "board_reports_file_through_canonical_intake_routing",
     "ui_routes_and_rejections",
     "ui_write_path",
     "ui_pm_absent_is_honest",

@@ -19,6 +19,9 @@ import { SourceImport, type SourceImportValues } from "./SourceImport";
 import { SourcesPanel } from "./SourcesPanel";
 import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
+import { SlotBindings } from "./SlotBindings";
+import { ReadinessPanel } from "./ReadinessPanel";
+import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
   type Installation,
@@ -32,6 +35,7 @@ import {
   type UpgradeProposal,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
+import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
@@ -41,6 +45,7 @@ type Section =
   | "Library"
   | "Runs"
   | "Needs you"
+  | "Publish"
   | "Settings"
   | "Schedule"
   | "Sources";
@@ -107,9 +112,6 @@ export default function WorkspaceApp({
   const [contentPrompt, setContentPrompt] = useState("");
   const [imagePrompt, setImagePrompt] = useState("");
   const [editingContextId, setEditingContextId] = useState("");
-  const [connectionId, setConnectionId] = useState("");
-  const [sourceConnectionId, setSourceConnectionId] = useState("");
-  const [imageConnectionId, setImageConnectionId] = useState("");
   const [upgradeSource, setUpgradeSource] = useState("");
   const [upgradeProposal, setUpgradeProposal] = useState<{ source: string; receipt: UpgradeProposal } | null>(null);
   const [outbox, setOutbox] = useState<WorkspaceOutbox | null>(null);
@@ -123,8 +125,7 @@ export default function WorkspaceApp({
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     forgetContext(installId);
-    setContextId(""); setConnectionId("");
-    setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
+    setContextId(""); setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
@@ -185,8 +186,8 @@ export default function WorkspaceApp({
   useEffect(() => {
     setData(null);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
-    setContentPrompt(""); setImagePrompt(""); setEditingContextId(""); setConnectionId("");
-    setSourceConnectionId(""); setImageConnectionId(""); setImporting(false); setSelectedSource(null);
+    setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
+    setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
     setContextId(rememberedContext(installId) ?? "");
     setSelectedRun(null);
@@ -211,6 +212,11 @@ export default function WorkspaceApp({
     const selected = initialContext(installId, data.contexts.filter(value => value.state === "active").map(value => value.id));
     if (selected !== contextId) setContextId(selected);
   }, [data, contextId, installId]);
+  // Candidates re-check on every Settings visit — including the return
+  // from Settings → Connections — on top of the background poll below.
+  useEffect(() => {
+    if (section === "Settings") void refresh();
+  }, [section, refresh]);
   const mutate = async (work: () => Promise<void>) => {
     if (!canWrite || mutationLock.current) return;
     mutationLock.current = true;
@@ -308,6 +314,20 @@ export default function WorkspaceApp({
     ...(data?.installation.files?.includes("workflows/image-manual.md") ? [{ value: "image-manual", label: "Caption and image from pasted facts" }] : []),
   ];
   const isImageRun = (value: WorkspaceRun) => !!value.snapshot.capabilities?.image;
+  const publishCandidates: PublishCandidate[] = postRuns
+    .filter((value) => value.approved_digest && value.artifacts.length > 0)
+    .map((value) => ({
+      run_id: value.id,
+      effect_id: data?.effects.find((effect) => effect.authority.run_id === value.id)?.effect_id ?? "",
+      artifact_id: value.artifacts[0].id,
+      bundle_digest: data?.installation.digest ?? "",
+      title: plainTitle(value.snapshot.inputs, value.snapshot.workflow.title),
+      caption: plainTitle(value.snapshot.inputs, value.snapshot.workflow.title),
+      image_digest: (value.snapshot.capabilities?.image?.digest as string | undefined) ?? null,
+      writer: String(value.snapshot.inputs.writer ?? ""),
+      reviewer: String(value.snapshot.inputs.reviewer ?? ""),
+    }))
+    .filter((value) => value.effect_id.length > 0);
   useEffect(() => {
     setArtifact(null);
     setArtifactError(null);
@@ -577,9 +597,6 @@ export default function WorkspaceApp({
                   setEditingContextId("");
                   setBrandName(""); setBrandVoice(""); setProtectedTerms("");
                   setContentPrompt(""); setImagePrompt("");
-                  setConnectionId("");
-                  setSourceConnectionId("");
-                  setImageConnectionId("");
                   setSelectedSource(null);
                   setSelectedRun(null);
                   setSelectedArtifact("");
@@ -652,6 +669,7 @@ export default function WorkspaceApp({
                 ...(sourceEnabled ? ["Sources"] : []),
                 "Runs",
                 "Needs you",
+                "Publish",
                 "Schedule",
                 "Settings",
               ] as Section[]
@@ -712,6 +730,16 @@ export default function WorkspaceApp({
                   </div>
                 )}
               </div>
+            )}
+            {section === "Publish" && (
+              <PublishPanel
+                installId={installId}
+                contextId={contextId || null}
+                candidates={publishCandidates}
+                grantId=""
+                approvalId=""
+                canWrite={canWrite && !busy}
+              />
             )}
             {section === "Schedule" && (
               <section className="wa-panel wa-stack">
@@ -785,141 +813,28 @@ export default function WorkspaceApp({
                       })}>Apply checked update</Button>
                   </div>}
                 </section>
-                <section className="wa-panel wa-stack">
-                  <h2>Local destination</h2>
-                  <p className="wa-muted">
-                    Save the actual destination for{" "}
-                    {contextId
-                      ? contexts.find((value) => value.id === contextId)?.config
-                          .label
-                      : "posts without a brand context"}
-                    . This configures future plans; it doesn’t release a post.
-                  </p>
-                  {binding && (
-                    <p className="wa-kicker">
-                      Configured · revision {binding.revision} ·{" "}
-                      {binding.config.account}
-                    </p>
-                  )}
-                  <div className="wa-row">
-                    <div className="wa-context">
-                      <Select
-                        value={
-                          connectionId || binding?.config.connection_id || ""
-                        }
-                        onChange={setConnectionId}
-                        options={data.connections
-                          .filter((value) => value.provider === "local")
-                          .map((value) => ({
-                            value: value.id,
-                            label: value.account || "Local",
-                            hint: value.id,
-                          }))}
-                        placeholder="Choose a Local connection"
-                        aria-label="Local destination"
-                        disabled={!canWrite || busy}
-                        full
-                      />
-                    </div>
-                    <Button
-                      disabled={
-                        !canWrite ||
-                        !(connectionId || binding?.config.connection_id) ||
-                        (binding !== undefined &&
-                          (connectionId || binding.config.connection_id) ===
-                            binding.config.connection_id)
-                      }
-                      loading={busy}
-                      onClick={() =>
-                        void mutate(async () => {
-                          const selected =
-                            connectionId || binding?.config.connection_id || "";
-                          if (binding)
-                            await workspaceApps.updateBinding(
-                              installId,
-                              binding.id,
-                              {
-                                expected_revision: binding.revision,
-                                connection_id: selected,
-                              },
-                            );
-                          else
-                            await workspaceApps.createBinding(installId, {
-                              slot: "publication",
-                              connection_id: selected,
-                              request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "publication", selected])),
-                              ...(contextId ? { context_id: contextId } : {}),
-                            });
-                        })
-                      }
-                    >
-                      Save destination
-                    </Button>
-                  </div>
-                  {!data.connections.some(
-                    (value) => value.provider === "local",
-                  ) && (
-                    <p className="wa-alert">
-                      No Local connection is registered. Configure a Local
-                      destination before creating a post.
-                    </p>
-                  )}
-                </section>
-                {sourceEnabled && <section className="wa-panel wa-stack">
-                  <h2>Instagram source</h2>
-                  <p className="wa-muted">Choose the company connection Cadence uses to read public Instagram posts. Every source plan freezes this choice and shows its exact price before a read starts.</p>
-                  {sourceBinding && <p className="wa-kicker">Configured · revision {sourceBinding.revision} · {sourceBinding.config.account}</p>}
-                  <div className="wa-row">
-                    <div className="wa-context">
-                      <Select
-                        value={sourceConnectionId || sourceBinding?.config.connection_id || ""}
-                        onChange={setSourceConnectionId}
-                        options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "social.read" && mapping.action === "list_posts" && mapping.effect === "read") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
-                        placeholder="Choose source connection"
-                        aria-label="Instagram source connection"
-                        disabled={!canWrite || busy}
-                        full
-                      />
-                    </div>
-                    <Button
-                      disabled={!canWrite || busy || !(sourceConnectionId || sourceBinding?.config.connection_id) || (sourceBinding !== undefined && (sourceConnectionId || sourceBinding.config.connection_id) === sourceBinding.config.connection_id)}
-                      loading={busy}
-                      onClick={() => void mutate(async () => {
-                        const selected = sourceConnectionId || sourceBinding?.config.connection_id || "";
-                        if (sourceBinding) await workspaceApps.updateBinding(installId, sourceBinding.id, { expected_revision: sourceBinding.revision, connection_id: selected });
-                        else await workspaceApps.createBinding(installId, { slot: "source", connection_id: selected, request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "source", selected])), ...(contextId ? { context_id: contextId } : {}) });
-                      })}
-                    >Save source connection</Button>
-                  </div>
-                  {!data.connections.some(value => value.provider === "agenticos_external") && <p className="wa-alert">No company source connection is available yet. Set up provider access for this Cadence app before reading Instagram posts.</p>}
-                </section>}
-                {imageEnabled && <section className="wa-panel wa-stack">
-                  <h2>Image generation</h2>
-                  <p className="wa-muted">Choose the company connection Cadence uses for one draft image. Cadence checks the provider price and retains the image for review before any Local release. If the image provider is not ready, image planning stays unavailable.</p>
-                  {imageBinding && <p className="wa-kicker">Configured · revision {imageBinding.revision} · {imageBinding.config.account}</p>}
-                  <div className="wa-row">
-                    <div className="wa-context">
-                      <Select
-                        value={imageConnectionId || imageBinding?.config.connection_id || ""}
-                        onChange={setImageConnectionId}
-                        options={data.connections.filter(value => value.provider === "agenticos_external" && value.descriptor?.action_mappings?.some(mapping => mapping.capability === "media.generate" && mapping.action === "generate_image" && mapping.effect === "draft") && value.status?.manifest_status === "matched" && value.status.custody_available).map(value => ({ value: value.id, label: value.account, hint: value.id }))}
-                        placeholder="Choose image connection"
-                        aria-label="Generated image connection"
-                        disabled={!canWrite || busy}
-                        full
-                      />
-                    </div>
-                    <Button
-                      disabled={!canWrite || busy || !(imageConnectionId || imageBinding?.config.connection_id) || (imageBinding !== undefined && (imageConnectionId || imageBinding.config.connection_id) === imageBinding.config.connection_id)}
-                      loading={busy}
-                      onClick={() => void mutate(async () => {
-                        const selected = imageConnectionId || imageBinding?.config.connection_id || "";
-                        if (imageBinding) await workspaceApps.updateBinding(installId, imageBinding.id, { expected_revision: imageBinding.revision, connection_id: selected });
-                        else await workspaceApps.createBinding(installId, { slot: "image", connection_id: selected, request_id: retainedRequest(JSON.stringify([installId, contextId, data.installation.digest, "image", selected])), ...(contextId ? { context_id: contextId } : {}) });
-                      })}
-                    >Save image connection</Button>
-                  </div>
-                </section>}
+                <ReadinessPanel
+                  installation={data.installation}
+                  bindings={data.bindings}
+                  connections={data.connections}
+                  contextId={contextId || null}
+                />
+                <SlotBindings
+                  installId={installId}
+                  digest={data.installation.digest}
+                  contextId={contextId || null}
+                  contextLabel={
+                    contextId
+                      ? (contexts.find((value) => value.id === contextId)?.config.label ?? null)
+                      : null
+                  }
+                  slots={declaredSlots(data.installation)}
+                  bindings={data.bindings}
+                  connections={data.connections}
+                  canWrite={canWrite}
+                  busy={busy}
+                  mutate={mutate}
+                />
                 <section className="wa-panel wa-stack">
                   <h2>Brand contexts</h2>
                   <p className="wa-muted">
@@ -975,9 +890,6 @@ export default function WorkspaceApp({
                           setProtectedTerms("");
                           setContentPrompt("");
                           setImagePrompt("");
-                          setConnectionId("");
-                          setSourceConnectionId("");
-                          setImageConnectionId("");
                         }
                       });
                     }}
@@ -1149,7 +1061,7 @@ export default function WorkspaceApp({
             </div>
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
-              ? <p className="wa-alert">Frozen one-image charge: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong>. This covers one `image-01` square draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed price or binding stops dispatch.</p>
+              ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>
               : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
             <section className="wa-stack">
               <h3>Frozen plan</h3>
@@ -1200,7 +1112,7 @@ export default function WorkspaceApp({
                     })
                   }
                 >
-                  {isImageRun(run) && imagePlanPriced ? `Approve one image for USD ${(run.snapshot.quotes!.image.total_price_micros / 1_000_000).toFixed(6)} and this plan` : "Approve this plan"}
+                  {isImageRun(run) && imagePlanPriced ? `Approve one image (current rate USD ${(run.snapshot.quotes!.image.total_price_micros / 1_000_000).toFixed(6)})` : "Approve this plan"}
                 </Button>
               )}
               {run.state === "approved" && (
