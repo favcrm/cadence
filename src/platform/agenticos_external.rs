@@ -2,6 +2,7 @@
 //! Only app-run capability authority may execute these fixed, reviewed tools.
 //! A token stays in custody; the upstream door derives its company from it.
 mod image;
+pub mod publish;
 mod source;
 
 use std::collections::BTreeMap;
