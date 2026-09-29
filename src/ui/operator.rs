@@ -161,6 +161,12 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/app-runs/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/cancel", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/dispatch", RouteClass::OperatorOnly),
+    route("POST", "/api/social-publishes", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/social-publishes/*/cancel",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/*/approve",
