@@ -141,6 +141,19 @@ class TestOnceJob(unittest.TestCase):
     def test_shard_body_has_no_refusal_compile(self):
         self.assertNotIn("--test test_seam", self.shard)
 
+    def test_runner_step_is_unconditional_docs_writes_assignment(self):
+        # Docs PRs never reach cargo, but the runner still must write
+        # its assignment — an `if:` here starves the upload and the
+        # coverage check (CAD-809 slice5b).
+        step = self.shard.split("- name: Run recorded Rust scope", 1)[1]
+        step = re.split(r"\n      - (?:name|uses):", step, maxsplit=1)[0]
+        self.assertNotIn("if:", step)
+        self.assertNotIn("steps.scope", step)
+        upload = self.shard.split("- name: Keep the shard's test assignment", 1)[1]
+        upload = re.split(r"\n      - (?:name|uses):", upload, maxsplit=1)[0]
+        self.assertIn("!cancelled()", upload)
+        self.assertIn("if-no-files-found: error", upload)
+
     def test_shard_body_runs_no_doctests(self):
         self.assertNotIn("cargo test --doc", self.shard)
 
@@ -157,8 +170,17 @@ class TestOnceJob(unittest.TestCase):
         self.assertIn("test-shard", needs)
         self.assertIn("test-once", needs)
 
+    def test_aggregate_verifies_shard_assignments(self):
+        self.assertIn("download-artifact@", self.aggregate)
+        self.assertIn("shard-assignment-", self.aggregate)
+        self.assertIn("ci-shard-check.py", self.aggregate)
+
     def test_aggregate_fails_unless_both_succeed(self):
-        script = textwrap.dedent(self.aggregate.split("        run: |\n", 1)[1])
+        tail = self.aggregate.split("        run: |\n", 1)[1]
+        # The run block alone: stop at the first line dedented past it
+        # (the assignment download/check steps that follow).
+        block = re.split(r"\n {0,8}\S", tail, maxsplit=1)[0]
+        script = textwrap.dedent(block)
         results = ["success", "failure", "cancelled", "skipped", ""]
         for shard in results:
             for refusal in results:
