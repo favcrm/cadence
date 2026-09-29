@@ -669,6 +669,18 @@ fn job_event_parks_on_unrendered_pty_pm() {
     // CAD-185: three 5s retry waits were ~15s of this test and nothing
     // here asserts their length; the four render misses keep the real
     // RENDER_DEADLINE, since that timeout path is what the park proves.
+    // Render bound shrunk to 2s via the deadline seam (same rationale —
+    // count/flags/park are the contract); process env rides a child
+    // process since it is shared across parallel tests.
+    if !in_own_process(
+        "job_event_parks_on_unrendered_pty_pm",
+        &[
+            ("CADENCE_PTY_RETRY_SECS", "1"),
+            ("CADENCE_PTY_RENDER_DEADLINE_SECS", "2"),
+        ],
+    ) {
+        return;
+    }
     test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let state_dir = TempDir::new().unwrap();
     let mock_dir = TempDir::new().unwrap();
