@@ -1273,6 +1273,60 @@ fn cad779_csv_concurrent_imports_conflict_on_email_without_second_row() {
 }
 
 #[test]
+fn cad779_concurrent_creates_refuse_same_normalized_email_at_write_boundary() {
+    let w = Records::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Write boundary", "ctx-email-write-race");
+    let context_id = context["id"].as_str().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let (left, right) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            w.daemon.operator_rpc(
+                "app_record_create",
+                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-a", "profile": {"schema": 1, "display_name": "First", "email": "RACE@example.com", "consent": {"email": "unknown"}}}),
+            )
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            w.daemon.operator_rpc(
+                "app_record_create",
+                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-b", "profile": {"schema": 1, "display_name": "Second", "email": "race@example.com", "consent": {"email": "unknown"}}}),
+            )
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let outcomes = [&left, &right];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "two IDs acquired the same normalized email: {outcomes:?}"
+    );
+    let refusal = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .unwrap()
+        .to_string();
+    assert!(
+        refusal.contains("another record"),
+        "loser was not refused for the held email: {refusal}"
+    );
+    let listed = w
+        .daemon
+        .operator_rpc(
+            "app_record_list",
+            json!({"install_id": install, "context_id": context_id}),
+        )
+        .unwrap();
+    assert_eq!(
+        listed["records"].as_array().unwrap().len(),
+        1,
+        "two live rows survived the write race: {listed}"
+    );
+}
+
+#[test]
 fn cad779_csv_blank_record_id_is_a_row_error() {
     let w = Records::new();
     let installed = w.install();
