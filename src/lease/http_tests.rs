@@ -17,6 +17,13 @@ struct Peer {
 
 impl Peer {
     fn new(responses: Vec<String>, delay: Duration) -> Self {
+        Self::staggered(responses.into_iter().map(|body| (body, delay)).collect())
+    }
+
+    /// One `(response, hold-before-responding)` pair per accepted POST —
+    /// lets a test admit fast, stall exactly one renewal past its
+    /// two-second attempt budget, then heal, without slowing the rest.
+    fn staggered(schedule: Vec<(String, Duration)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/renew", listener.local_addr().unwrap());
@@ -24,7 +31,7 @@ impl Peer {
         let halted = Arc::clone(&stop);
         let (tx, requests) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let mut replies = responses.into_iter();
+            let mut replies = schedule.into_iter();
             while !halted.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
@@ -41,12 +48,23 @@ impl Peer {
                             assert!(request.len() < 8192);
                         }
                         let _ = tx.send(String::from_utf8(request).unwrap());
-                        let deadline = Instant::now() + delay;
-                        while Instant::now() < deadline && !halted.load(Ordering::SeqCst) {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        if let Some(response) = replies.next() {
-                            let _ = socket.write_all(response.as_bytes());
+                        // A real host answers concurrently: a stalled
+                        // reply must not head-of-line-block the next
+                        // renewal behind it, or a heal would always
+                        // arrive "late". Replies stay assigned in
+                        // accept order; only the wait-and-respond runs
+                        // per connection. Detached: a sleeper whose
+                        // client already timed out writes to a closed
+                        // socket and exits.
+                        if let Some((response, delay)) = replies.next() {
+                            let halted = Arc::clone(&halted);
+                            thread::spawn(move || {
+                                let deadline = Instant::now() + delay;
+                                while Instant::now() < deadline && !halted.load(Ordering::SeqCst) {
+                                    thread::sleep(Duration::from_millis(5));
+                                }
+                                let _ = socket.write_all(response.as_bytes());
+                            });
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -280,7 +298,7 @@ fn cad673_host_generation_absent_and_shared_writes_fenced() {
     std::fs::write(state.join("lease-epoch"), "41\n").unwrap();
     let ctl = start_lease(
         &state,
-        Box::new(peer.provider()),
+        Arc::new(peer.provider()),
         HOST_RENEW_URL.into(),
         Duration::from_secs(2),
         Duration::from_secs(10),
@@ -383,4 +401,179 @@ fn cad673_host_ttl_cannot_exceed_bridge_policy() {
         .to_string()
         .contains("6s"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// CAD-702: a 500 inside the six-second local deadline is a blip, not
+/// loss. The renewal surfaces but does not fence; health says
+/// retrying; a later 204 heals and clears the retry state.
+#[test]
+fn cad702_blip_then_204_heals_without_fencing() {
+    let peer = Peer::new(
+        vec![
+            reply(204, "", ""),
+            reply(500, "", "overloaded"),
+            reply(204, "", ""),
+        ],
+        Duration::ZERO,
+    );
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let ctl = start_lease(
+        &state,
+        Arc::new(peer.provider()),
+        HOST_RENEW_URL.into(),
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    // The blip surfaces — the 500 is reported, not swallowed...
+    let err = ctl.renew().unwrap_err();
+    assert!(err.to_string().contains("500"), "{err}");
+    // ...but fences nothing: the deadline from the last 204 is open.
+    assert!(!ctl.fence().tripped(), "a single 500 fenced the daemon");
+    assert!(ctl.fence().check().is_none());
+    // Health tells the truth: unfenced yet retrying, with the cause.
+    let health = ctl.status_json();
+    assert!(health["fenced"].is_null(), "{health}");
+    assert_eq!(health["retrying"], true, "{health}");
+    assert!(
+        health["last_renew_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("500"),
+        "{health}"
+    );
+    // A 204 inside the deadline heals: renewal succeeds, the retry
+    // state clears, and the fence never tripped in between.
+    ctl.renew().unwrap();
+    assert!(!ctl.fence().tripped());
+    let health = ctl.status_json();
+    assert_eq!(health["retrying"], false, "{health}");
+    assert!(health["last_renew_error"].is_null(), "{health}");
+    // Three POSTs: admission, blip, heal — the blip never fenced the
+    // provider, so the heal was attempted, not refused.
+    peer.request();
+    peer.request();
+    peer.request();
+}
+
+/// CAD-702: 409 is definite loss even with the whole six-second
+/// deadline still open — it latches at once, trips the fence, and the
+/// provider never contacts the host again.
+#[test]
+fn cad702_409_fences_immediately_with_open_deadline() {
+    let peer = Peer::new(
+        vec![
+            reply(204, "", ""),
+            reply(409, "", "{\"error\":\"lease_lost\"}"),
+            reply(204, "", ""),
+        ],
+        Duration::ZERO,
+    );
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let ctl = start_lease(
+        &state,
+        Arc::new(peer.provider()),
+        HOST_RENEW_URL.into(),
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let err = ctl.renew().unwrap_err();
+    assert!(err.to_string().contains("409"), "{err}");
+    assert!(ctl.fence().tripped(), "a 409 did not fence the daemon");
+    let health = ctl.status_json();
+    assert!(health["fenced"].is_string(), "{health}");
+    assert_eq!(health["retrying"], false, "{health}");
+    // Latched: further renewals refuse without host contact, so the
+    // forged third 204 is never even attempted.
+    assert!(ctl.renew().is_err());
+    peer.request();
+    peer.request();
+    assert!(
+        peer.requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "fenced provider contacted host again"
+    );
+}
+
+/// CAD-702: blips only buy time until the deadline. Six seconds with
+/// no 204 fences permanently — and the fence arrives without another
+/// host attempt once the deadline has passed.
+#[test]
+fn cad702_deadline_without_204_fences() {
+    let peer = Peer::new(
+        vec![reply(204, "", ""), reply(500, "", "overloaded")],
+        Duration::ZERO,
+    );
+    let ttl = Duration::from_millis(400);
+    let provider = HttpProvider::new(peer.url.clone(), ttl);
+    let admitted = provider.acquire("h", 0).unwrap();
+    // Inside the deadline the 500 is a blip, not a fence.
+    assert!(provider.renew(&admitted).is_err());
+    // Past the deadline with no 204: permanent loss, fenced without
+    // spending another host attempt on a lease already lapsed.
+    thread::sleep(ttl + Duration::from_millis(200));
+    let err = provider.renew(&admitted).unwrap_err();
+    assert!(
+        err.to_string().contains("deadline expired"),
+        "blips past the deadline must fence: {err}"
+    );
+    assert!(provider.renew(&admitted).is_err());
+    peer.request();
+    peer.request();
+    assert!(
+        peer.requests
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "deadline-fenced provider contacted host again"
+    );
+}
+
+/// CAD-702: a renewal that stalls past its attempt budget fails that
+/// attempt only — bounded at two seconds, retryable while the
+/// deadline is open, healable by the next 204.
+#[test]
+fn cad702_stalled_renewal_retries_within_budget() {
+    let peer = Peer::staggered(vec![
+        (reply(204, "", ""), Duration::ZERO),
+        (reply(204, "", ""), Duration::from_secs(4)),
+        (reply(204, "", ""), Duration::ZERO),
+    ]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let ctl = start_lease(
+        &state,
+        Arc::new(peer.provider()),
+        HOST_RENEW_URL.into(),
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let err = ctl.renew().unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "renewal attempt was not bounded at two seconds: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        err.to_string().contains("timed out") || err.to_string().contains("transport"),
+        "stalled attempt misreported: {err}"
+    );
+    assert!(
+        !ctl.fence().tripped(),
+        "a stalled attempt fenced the daemon"
+    );
+    assert_eq!(ctl.status_json()["retrying"], true);
+    // The stalled attempt's 204 arrives far too late to count — but
+    // the next renewal heals, proving the stall never latched.
+    ctl.renew().unwrap();
+    assert!(!ctl.fence().tripped());
+    assert_eq!(ctl.status_json()["retrying"], false);
 }

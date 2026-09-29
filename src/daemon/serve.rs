@@ -16,24 +16,33 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 impl Shared {
-    /// CAD-538: the hosted-lease heartbeat — renew every `renew_every`
-    /// until the daemon begins closing, in 100ms sub-steps so a stop
-    /// lands at once. The first failed or expired renewal is lease
-    /// loss: [`Self::trip_lease`] drops the write fence before the
-    /// next store or tracker write can begin, and this daemon never
-    /// writes again.
+    /// CAD-538 heartbeat under CAD-702 renewal policy: renew every
+    /// `renew_every` until `lease_heartbeat_stop` — which serve sets
+    /// only after the shutdown flush completes, so the WAL checkpoint
+    /// and tracker flush (and a deliberately slow test flush) always
+    /// run under exactly one renewal poster. A permanent failure trips
+    /// the fence and ends the loop; a transient blip — marked by the
+    /// HTTP provider while the local deadline stays open — is logged
+    /// and retried on the next beat without fencing.
     pub(super) fn run_lease_heartbeat(self: &Arc<Self>, lease: &Arc<crate::lease::LeaseCtl>) {
-        while !self.closing.load(Ordering::SeqCst) {
+        while !self.lease_heartbeat_stop.load(Ordering::SeqCst) {
             let deadline = Instant::now() + lease.renew_every;
-            while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+            while !self.lease_heartbeat_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if self.closing.load(Ordering::SeqCst) {
+            if self.lease_heartbeat_stop.load(Ordering::SeqCst) {
                 break;
             }
-            if let Err(e) = lease.renew() {
-                self.trip_lease(format!("lease renewal failed: {e}"));
-                return;
+            match lease.renew() {
+                Ok(()) => {}
+                Err(error) if crate::lease::is_transient_lease_error(&error) => {
+                    eprintln!("cadence: hosted lease renewal blip — retrying: {error}");
+                    tracing::warn!("hosted lease renewal blip — retrying: {error}");
+                }
+                Err(error) => {
+                    self.trip_lease(format!("lease renewal failed: {error}"));
+                    return;
+                }
             }
         }
     }
@@ -349,11 +358,16 @@ pub(super) fn flush_budget(
 /// operator's own `~/pm`, which a routine stop must never commit into.
 /// A fenced daemon's tracker half refuses like every write; the WAL
 /// fold is the flush of what it committed while it still held the lease.
-pub(super) fn lease_flush(shared: &Arc<Shared>, budget: Duration) {
+/// `slow` is a test-only dwell (CAD-702) at the flush's start, proving
+/// renewal spans a slow flush; production passes zero.
+pub(super) fn lease_flush(shared: &Arc<Shared>, budget: Duration, slow: Duration) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let leased = shared.lease.is_some();
     let shared = Arc::clone(shared);
     thread::spawn(move || {
+        if !slow.is_zero() {
+            thread::sleep(slow);
+        }
         match shared.store.checkpoint() {
             Ok(true) => {}
             Ok(false) => {

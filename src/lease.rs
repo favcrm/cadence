@@ -87,11 +87,19 @@ pub trait Provider: Send + Sync {
     fn acquire(&self, holder: &str, epoch_hint: u64) -> Result<Lease>;
     /// Extend `lease`'s expiry. Must fail when the lease was lost or
     /// expired — the heartbeat turns that failure into the write fence.
+    /// A failure [`is_transient_lease_error`] reports is a blip, not
+    /// loss: the caller must surface it without fencing.
     fn renew(&self, lease: &Lease) -> Result<Lease>;
     /// Give the lease up early; a crash is covered by expiry anyway.
     fn release(&self, lease: &Lease) -> Result<()>;
     /// One line for logs and `health`.
     fn describe(&self) -> String;
+    /// Extra `status_json` fields — `{}` unless the provider has
+    /// retry state worth reporting (the HTTP provider's `retrying` /
+    /// `last_renew_error`). Never overrides the base keys.
+    fn status_extra(&self) -> Value {
+        json!({})
+    }
 }
 
 // ---------- the fence ----------
@@ -221,7 +229,7 @@ impl PmLease {
 /// The daemon's lease and its knobs: what to renew, when the fence is
 /// shared, and the epoch outbound writes carry.
 pub struct LeaseCtl {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     spec: String,
     current: Mutex<Lease>,
     fence: Arc<Fence>,
@@ -234,15 +242,23 @@ pub struct LeaseCtl {
 
 impl LeaseCtl {
     /// Extend the hold one heartbeat. An expired, stolen or vanished
-    /// lease surfaces as `Err` — the caller trips the fence.
+    /// lease surfaces as `Err` — the caller trips the fence — unless
+    /// the failure [`is_transient_lease_error`] reports: a renewal blip
+    /// inside the local deadline, which surfaces without fencing so a
+    /// later `204` can still heal.
     pub fn renew(&self) -> Result<()> {
         if let Some(reason) = self.fence.check() {
             return Err(Error::rejected(format!("lease renewal refused: {reason}")));
         }
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        let next = self.provider.renew(&current).inspect_err(|error| {
-            self.fence.trip(format!("lease renewal failed: {error}"));
-        })?;
+        let next = match self.provider.renew(&current) {
+            Ok(next) => next,
+            Err(error) if is_transient_lease_error(&error) => return Err(error),
+            Err(error) => {
+                self.fence.trip(format!("lease renewal failed: {error}"));
+                return Err(error);
+            }
+        };
         match (&self.epoch, next.epoch) {
             (Some(epoch), Some(value)) => epoch.store(value, Ordering::SeqCst),
             (None, None) => {}
@@ -287,9 +303,14 @@ impl LeaseCtl {
     }
 
     /// `health`/`daemon_info` surface: provider, epoch, expiry, fence.
+    /// An HTTP provider in its retry window adds `retrying: true` with
+    /// `last_renew_error`; once fenced, `retrying` reads false — the
+    /// heartbeat has stopped, so nothing is still retrying.
     pub fn status_json(&self) -> Value {
         let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        json!({
+        let fenced = self.fence.check();
+        let is_fenced = fenced.is_some();
+        let mut status = json!({
             "provider": self.spec,
             "holder": current.holder,
             "epoch": current.epoch,
@@ -297,8 +318,21 @@ impl LeaseCtl {
             "expiry_authority": if current.expires_monotonic.is_some() { "local_renewal_deadline" } else { "provider" },
             "expires_unix": current.expires_unix,
             "renew_secs": self.renew_every.as_secs_f64(),
-            "fenced": self.fence.check(),
-        })
+            "fenced": fenced,
+        });
+        if let Value::Object(extra) = self.provider.status_extra() {
+            if let Some(map) = status.as_object_mut() {
+                map.extend(extra);
+            }
+        }
+        if is_fenced {
+            if let Some(map) = status.as_object_mut() {
+                if map.contains_key("retrying") {
+                    map.insert("retrying".to_string(), Value::Bool(false));
+                }
+            }
+        }
+        status
     }
 }
 
@@ -388,6 +422,21 @@ fn save_epoch(state_dir: &Path, epoch: u64) {
 /// — nothing in the daemon changes. Any lease configured but not
 /// granted is `Err`: a hosted daemon never starts unleased.
 pub fn acquire(state_dir: &Path, hosted: &Hosted) -> Result<Option<Arc<LeaseCtl>>> {
+    acquire_with_endpoint(state_dir, hosted, None)
+}
+
+/// [`acquire`] with a test-only HTTP endpoint override (CAD-702): when
+/// the configured spec is HTTP and `endpoint_override` is `Some`, the
+/// renewal transport dials it instead of `lease.internal` — a loopback
+/// stub in tests. The configured spec is still parsed first, so the
+/// endpoint restrictions hold on what operators configure; only
+/// in-process `ServeOptions` ever sets the override, never pm.yaml,
+/// the RPC surface, or the environment.
+pub(crate) fn acquire_with_endpoint(
+    state_dir: &Path,
+    hosted: &Hosted,
+    endpoint_override: Option<&str>,
+) -> Result<Option<Arc<LeaseCtl>>> {
     let Some(raw) = hosted.lease.as_deref().map(str::trim) else {
         return Ok(None);
     };
@@ -429,20 +478,23 @@ pub fn acquire(state_dir: &Path, hosted: &Hosted) -> Result<Option<Arc<LeaseCtl>
             .unwrap_or(DEFAULT_FLUSH_SECS)
             .max(1),
     );
-    let (provider, spec_name): (Box<dyn Provider>, String) = match spec {
+    let (provider, spec_name): (Arc<dyn Provider>, String) = match spec {
         Spec::Off => return Ok(None),
-        Spec::File(path) => (Box::new(FileProvider::new(path, ttl)), raw.to_string()),
-        Spec::Http(url) => (
-            Box::new(HttpProvider::new(url, ttl)),
-            HOST_RENEW_URL.to_string(),
-        ),
+        Spec::File(path) => (Arc::new(FileProvider::new(path, ttl)), raw.to_string()),
+        Spec::Http(url) => {
+            let url = endpoint_override.unwrap_or(url.as_str()).to_string();
+            (
+                Arc::new(HttpProvider::new(url, ttl)),
+                HOST_RENEW_URL.to_string(),
+            )
+        }
     };
     start_lease(state_dir, provider, spec_name, renew_every, flush_timeout).map(Some)
 }
 
 fn start_lease(
     state_dir: &Path,
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     spec_name: String,
     renew_every: Duration,
     flush_timeout: Duration,
@@ -720,6 +772,13 @@ impl Provider for FileProvider {
 /// Admission/renewal only: the host has already claimed this container.
 /// Host routing supplies company and instance; request fields cannot claim
 /// another identity. This adapter never revokes that host claim on release.
+///
+/// Renewal policy (CAD-702): `409` is definite loss and latches at once.
+/// Any other failure — a 5xx, a timeout, a transport blip — retries while
+/// the six-second local deadline from the last `204` stays open: the
+/// failure surfaces (marked [`TRANSIENT_PREFIX`]) without fencing, and a
+/// later `204` heals. Only a deadline with no `204` fences. Each attempt
+/// keeps a budget of at most two seconds.
 struct HttpProvider {
     url: String,
     ttl: Duration,
@@ -731,6 +790,34 @@ struct HttpProvider {
 struct HttpState {
     deadline: Option<Instant>,
     lost: Option<String>,
+    /// The latest blip inside the open deadline — cleared by a `204`,
+    /// so health can tell retrying apart from loss.
+    last_error: Option<String>,
+}
+
+/// A renewal attempt's verdict: admitted, definitely lost (`409` or past
+/// the local deadline — latch `lost`), or a blip to retry while the
+/// deadline from the last `204` stays open.
+enum RenewAttempt {
+    Admitted(Lease),
+    Lost(String),
+    Blip(String),
+}
+
+/// Prefix marking a renewal failure as a blip, not loss. [`LeaseCtl`]
+/// and the heartbeat consult [`is_transient_lease_error`] instead of
+/// fencing on it; the file provider never emits it, so its
+/// first-failure fence is unchanged.
+pub(crate) const TRANSIENT_PREFIX: &str = "host lease transient: ";
+
+fn transient_lease_error(message: impl Into<String>) -> Error {
+    Error::rejected(format!("{TRANSIENT_PREFIX}{}", message.into()))
+}
+
+/// Whether a renewal failure is a retryable blip inside the local
+/// deadline rather than lease loss.
+pub(crate) fn is_transient_lease_error(error: &Error) -> bool {
+    matches!(error, Error::Rejected(message) if message.starts_with(TRANSIENT_PREFIX))
 }
 
 impl HttpProvider {
@@ -752,57 +839,97 @@ impl HttpProvider {
         }
     }
 
+    /// Admission fails closed on any non-204, as before: with no prior
+    /// `204` there is no deadline to retry inside, so the first failure
+    /// latches and the daemon refuses to start unleased.
     fn admission(&self, holder: &str, state: &mut HttpState) -> Result<Lease> {
         if let Some(reason) = &state.lost {
             return Err(Error::rejected(format!(
                 "host lease permanently fenced: {reason}"
             )));
         }
-        let result = self.post_renew(holder, state.deadline);
-        match result {
-            Ok(lease) => {
+        match self.post_renew(holder, state.deadline) {
+            RenewAttempt::Admitted(lease) => {
                 state.deadline = lease.expires_monotonic;
+                state.last_error = None;
                 Ok(lease)
             }
-            Err(error) => {
-                // All uncertain outcomes fail closed, matching the daemon's
-                // existing first-renewal-failure policy. A later 204 cannot
-                // revive this provider, especially after a definite stale 409.
-                state.lost = Some(error.to_string());
-                Err(error)
+            RenewAttempt::Lost(message) | RenewAttempt::Blip(message) => {
+                state.lost = Some(message.clone());
+                Err(Error::rejected(message))
             }
         }
     }
 
-    fn post_renew(&self, holder: &str, previous: Option<Instant>) -> Result<Lease> {
+    /// Renewal inside the local deadline: `409` latches at once; any
+    /// other failure is a blip while the deadline stays open (surfaced
+    /// without fencing, healable by a later `204`); a deadline with no
+    /// `204` latches without spending another host attempt.
+    fn readmission(&self, holder: &str, state: &mut HttpState) -> Result<Lease> {
+        if let Some(reason) = &state.lost {
+            return Err(Error::rejected(format!(
+                "host lease permanently fenced: {reason}"
+            )));
+        }
+        match self.post_renew(holder, state.deadline) {
+            RenewAttempt::Admitted(lease) => {
+                state.deadline = lease.expires_monotonic;
+                state.last_error = None;
+                Ok(lease)
+            }
+            RenewAttempt::Lost(message) => {
+                state.lost = Some(message.clone());
+                Err(Error::rejected(message))
+            }
+            RenewAttempt::Blip(message) => {
+                if state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    let message = "host lease renewal deadline expired".to_string();
+                    state.lost = Some(message.clone());
+                    return Err(Error::rejected(message));
+                }
+                state.last_error = Some(message.clone());
+                Err(transient_lease_error(message))
+            }
+        }
+    }
+
+    fn post_renew(&self, holder: &str, previous: Option<Instant>) -> RenewAttempt {
         let started = Instant::now();
         let remaining = previous
             .map(|deadline| deadline.saturating_duration_since(started))
             .unwrap_or(self.ttl);
         if remaining.is_zero() {
-            return Err(Error::rejected("host lease renewal deadline expired"));
+            return RenewAttempt::Lost("host lease renewal deadline expired".into());
         }
         let budget = HTTP_TIMEOUT.min(remaining);
-        let response = self
+        let response = match self
             .agent
             .post(&self.url)
             .config()
             .timeout_global(Some(budget))
             .build()
             .send_empty()
-            .map_err(|_| Error::rejected("host lease renewal transport failed or timed out"))?;
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return RenewAttempt::Blip(
+                    "host lease renewal transport failed or timed out".into(),
+                );
+            }
+        };
         let completed = Instant::now();
         if completed.duration_since(started) >= budget
             || previous.is_some_and(|deadline| completed >= deadline)
         {
-            return Err(Error::rejected(
-                "host lease renewal arrived after its deadline",
-            ));
+            return RenewAttempt::Lost("host lease renewal arrived after its deadline".into());
         }
         match response.status().as_u16() {
             204 => {
                 let deadline = started + self.ttl;
-                Ok(Lease {
+                RenewAttempt::Admitted(Lease {
                     holder: holder.to_string(),
                     epoch: None,
                     expires_unix: now_unix()
@@ -810,10 +937,10 @@ impl HttpProvider {
                     expires_monotonic: Some(deadline),
                 })
             }
-            409 => Err(Error::rejected("host lease lost (HTTP 409)")),
-            status => Err(Error::rejected(format!(
+            409 => RenewAttempt::Lost("host lease lost (HTTP 409)".into()),
+            status => RenewAttempt::Blip(format!(
                 "host lease renewal refused (HTTP {status}; only 204 admits)"
-            ))),
+            )),
         }
     }
 }
@@ -831,7 +958,7 @@ impl Provider for HttpProvider {
         }
         // Supplied identity/generation/expiry fields never affect host routing
         // or the deadline. The provider's admitted deadline is authoritative.
-        self.admission(&lease.holder, &mut state)
+        self.readmission(&lease.holder, &mut state)
     }
 
     fn release(&self, _lease: &Lease) -> Result<()> {
@@ -840,6 +967,14 @@ impl Provider for HttpProvider {
 
     fn describe(&self) -> String {
         self.url.clone()
+    }
+
+    fn status_extra(&self) -> Value {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        json!({
+            "retrying": state.lost.is_none() && state.last_error.is_some(),
+            "last_renew_error": state.last_error.clone(),
+        })
     }
 }
 

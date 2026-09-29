@@ -434,6 +434,10 @@ pub struct Shared {
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
     lease: Option<Arc<crate::lease::LeaseCtl>>,
+    /// CAD-702: stops the hosted-lease heartbeat. Set only after the
+    /// shutdown flush completes, so exactly one renewal poster covers
+    /// the WAL checkpoint and tracker flush — never zero, never two.
+    lease_heartbeat_stop: AtomicBool,
     /// CAD-482: the test-only caller seam's armed credential — `Some`
     /// only when a fixture asked for it ([`ServeOptions::test_seam`])
     /// on a `test-seam` build. Request frames carrying `test_caller`
@@ -597,6 +601,7 @@ impl Shared {
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             lease,
+            lease_heartbeat_stop: AtomicBool::new(false),
             seam,
             #[cfg(feature = "test-seam")]
             after_done_write_failure: opts.after_done_write_failure.clone(),
@@ -3712,6 +3717,17 @@ pub struct ServeOptions {
     /// with `lease` unset is explicitly off, which is how tests pin
     /// it); `None` reads the tracker's `hosted:` table in pm.yaml.
     pub lease: Option<crate::lease::Hosted>,
+    /// CAD-702: test-only HTTP lease endpoint override — when the
+    /// configured spec is HTTP, the renewal transport dials this URL
+    /// (a loopback stub) instead of `lease.internal`. The configured
+    /// spec is still parsed, so endpoint restrictions hold; only
+    /// in-process fixtures set this, never pm.yaml, RPC, or env.
+    /// Production leaves it unset.
+    pub lease_http_endpoint_override: Option<String>,
+    /// CAD-702: test-only extra dwell inside the shutdown flush, so a
+    /// test can prove renewal spans a slow flush. In-process fixtures
+    /// only; production leaves it unset.
+    pub flush_delay_for_test: Option<Duration>,
     /// CAD-482: arm the test-only caller seam. Honored only in
     /// `test-seam` builds; a daemon asked for it on any other build
     /// refuses to start rather than fall back to ambient identity.
@@ -3783,7 +3799,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // unconfigured daemon leaves it unregistered and fails closed.
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
-    let lease = crate::lease::acquire(state_dir, &hosted)?;
+    let lease = crate::lease::acquire_with_endpoint(
+        state_dir,
+        &hosted,
+        opts.lease_http_endpoint_override.as_deref(),
+    )?;
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
     // CAD-313: the operator secret exists from the first start, so an
@@ -3902,8 +3922,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // stays the correctness fallback. Joined at shutdown so a rebuild
     // never outlives the daemon.
     let wiki_index_worker = shared.wiki_index.spawn();
-    // CAD-538: the hosted lease heartbeat — joined in the shutdown
-    // tail so no renew can race the flush and release.
+    // CAD-538 heartbeat under CAD-702 shutdown order: the single renewal
+    // poster from now until after the shutdown flush — stopped and
+    // joined only once the flush has completed, then the lease releases.
     let lease_heartbeat = shared.lease.clone().map(|lease| {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_lease_heartbeat(&lease))
@@ -3948,12 +3969,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
     let _ = test_watch.join();
-    // CAD-538: the heartbeat must be quiet before the flush and the
-    // release — a late renew would rewrite the lease file a release
-    // just removed, and a renewal's writes are post-marker state.
-    if let Some(heartbeat) = lease_heartbeat {
-        let _ = heartbeat.join();
-    }
+    // CAD-702: the heartbeat is NOT joined here — it stays the single
+    // renewal poster through the flush below. Joining it before the
+    // flush would leave the final WAL checkpoint and tracker commit
+    // uncovered; joining it only after guarantees never zero posters.
     // CAD-719: stop the refresh worker, then join it — a rebuild already
     // mid-flight finishes against the same committed tree it started on;
     // the query-time fallback still covers a daemon that restarts stale.
@@ -3963,7 +3982,19 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // CAD-538: flush before exit — WAL fold + the tracker's staged
     // index — then release the lease LAST: a successor may start the
     // moment it is gone, and this process must have no writes left.
-    lease_flush(&shared, flush_budget(&hosted, shared.lease.as_deref()));
+    // CAD-702: the heartbeat renewed through all of the above; only
+    // now is it stopped and joined, so there is never a window with
+    // zero posters (heartbeat dead, flush still running) or two (a
+    // late renew racing the release and rewriting a removed lease).
+    lease_flush(
+        &shared,
+        flush_budget(&hosted, shared.lease.as_deref()),
+        opts.flush_delay_for_test.unwrap_or_default(),
+    );
+    shared.lease_heartbeat_stop.store(true, Ordering::SeqCst);
+    if let Some(heartbeat) = lease_heartbeat {
+        let _ = heartbeat.join();
+    }
     if let Some(lease) = &shared.lease {
         if let Err(e) = lease.release() {
             eprintln!("cadence: lease release failed (expiry covers it): {e}");
