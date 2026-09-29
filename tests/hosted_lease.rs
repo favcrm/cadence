@@ -12,13 +12,14 @@ use common::*;
 use cadence_agent::daemon;
 use cadence_agent::issue::Pm;
 use cadence_agent::lease::Hosted;
+use cadence_agent::platform::deployments::DeploymentMetadata;
 use serde_json::json;
 use serde_json::Value;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -350,22 +351,27 @@ fn cad538_sigterm_flushes_store_and_tracker() {
     assert_eq!(h2["lease"]["epoch"], 2, "{h2}");
 }
 
-/// The second tripwire: a shutdown tail that outlives the lease's
-/// residual TTL. The heartbeat stops at `closing`, so nothing renews
-/// while the tail runs — the snapshot gate parks it past expiry, and
-/// the tracker flush must then refuse: a successor may already hold
-/// the lease. No renewal failure, no trip — expiry alone fences it.
+/// CAD-702 changed the premise: the heartbeat no longer dies at
+/// `closing` — it renews through the flush — so a parked tail cannot
+/// outrun the TTL by waiting anymore. Lease loss mid-shutdown is now a
+/// stolen lease: the still-live heartbeat's next renewal sees holder
+/// and epoch differ and trips the fence, and the tracker flush refuses
+/// exactly as before — a successor may already hold the lease. (Renamed
+/// from `cad538_expired_lease_refuses_the_shutdown_flush`, whose
+/// wait-past-the-TTL shape the new ordering deliberately closes.)
 #[test]
-fn cad538_expired_lease_refuses_the_shutdown_flush() {
+fn cad538_stolen_lease_refuses_the_shutdown_flush() {
     let dir = TempDir::new().unwrap();
     let pm_dir = dir.path().join("pm");
     Pm::init(&pm_dir).unwrap();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(Barrier::new(2));
-    let mut opts = leased_opts(dir.path(), 2); // ttl 2s, renew 1s
+    let mut opts = leased_opts(dir.path(), 30);
     opts.stop = Some(stop.clone());
     opts.release_shutdown_snapshot = Some(gate.clone());
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
     let d = TestDaemon::start_opts(opts);
     d.register("w1");
 
@@ -373,18 +379,42 @@ fn cad538_expired_lease_refuses_the_shutdown_flush() {
     std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
     git(&pm_dir, &["add", "pending.md"]);
 
-    // Stop; the tail parks at the gate while the TTL runs out —
-    // heartbeats are already dead, so nothing renews it back.
-    stop.store(true, Ordering::SeqCst);
-    thread::sleep(Duration::from_secs(4)); // > the ≤2s residual TTL
-    gate.wait();
+    // A foreign holder steals the file while the daemon runs — the
+    // live heartbeat's next renewal sees holder and epoch differ and
+    // trips the fence. This poll must happen BEFORE the stop below:
+    // once `closing` is set serve stops accepting connections, so any
+    // RPC issued while the tail is parked at the gate would hang on
+    // the 700s client timeout and deadlock the rendezvous.
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    let stolen = json!({"holder": "intruder",
+                        "epoch": body["epoch"].as_u64().unwrap() + 5,
+                        "expires_unix": now_unix() + 600.0});
+    std::fs::write(lease_file(dir.path()), stolen.to_string()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let h = d.rpc("health", json!({})).unwrap();
+        if h["lease"]["fenced"].is_string() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never fenced: {h}");
+        thread::sleep(Duration::from_millis(100));
+    }
 
-    // Clean exit — but no commit landed past the lease's expiry.
+    // Stop; the fenced tail parks at the gate, the test releases it,
+    // and the tracker flush must refuse: a successor may already hold
+    // the lease.
+    stop.store(true, Ordering::SeqCst);
+    let mut guard = GateGuard::armed(&gate);
+    gate.wait();
+    guard.disarm();
+
+    // Clean exit — but no commit landed past the lease's loss.
     drop(d);
     let log = git(&pm_dir, &["log", "--format=%B", "-3"]);
     assert!(
         !log.contains("cadence flush on stop"),
-        "flush committed after the lease expired: {log}"
+        "flush committed after the lease was stolen: {log}"
     );
     // The staged file was never claimed — still staged for the
     // successor's operator to judge, not swept into our epoch.
@@ -497,4 +527,172 @@ fn cad538_hosted_config_off_by_default() {
     opts.lease = None;
     let err = daemon::serve_with(state.path(), opts).unwrap_err();
     assert!(err.to_string().contains("bogouscheme"), "{err}");
+}
+
+/// Releases the shutdown gate if the test unwinds after asking serve
+/// to stop but before reaching the gate itself — otherwise serve parks
+/// at the gate forever and the shutdown join hangs. Armed only after
+/// `stop` is set (serve then always reaches the gate); disarmed once
+/// the test rendezvoused normally.
+struct GateGuard {
+    gate: Option<Arc<Barrier>>,
+}
+
+impl GateGuard {
+    fn armed(gate: &Arc<Barrier>) -> Self {
+        Self {
+            gate: Some(Arc::clone(gate)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.gate.take();
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.wait();
+        }
+    }
+}
+
+/// An always-204 stub host that records every renewal POST's arrival
+/// time — the witness for CAD-702's shutdown ordering.
+struct StubHost {
+    url: String,
+    times: Arc<Mutex<Vec<Instant>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StubHost {
+    fn new() -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/renew", listener.local_addr().unwrap());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&times);
+        let stop = Arc::new(AtomicBool::new(false));
+        let halted = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !halted.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut byte = [0];
+                        while socket.read(&mut byte).unwrap_or(0) == 1 {
+                            request.push(byte[0]);
+                            if request.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                            assert!(request.len() < 8192);
+                        }
+                        let text = String::from_utf8(request).unwrap();
+                        assert!(text.starts_with("POST /renew HTTP/1.1\r\n"), "{text}");
+                        seen.lock().unwrap().push(Instant::now());
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("stub accept: {e}"),
+                }
+            }
+        });
+        Self {
+            url,
+            times,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn posts(&self) -> usize {
+        self.times.lock().unwrap().len()
+    }
+
+    fn times(&self) -> Vec<Instant> {
+        self.times.lock().unwrap().clone()
+    }
+}
+
+impl Drop for StubHost {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// CAD-702: `daemon stop` keeps exactly one renewal poster through the
+/// WAL checkpoint and tracker flush — renewal stops only after the
+/// flush completes. The stub records POST times across a deliberately
+/// slow flush: renewals must span the whole shutdown window, then go
+/// silent once the daemon is gone (no zero-poster gap, no second
+/// poster, no afterlife).
+#[test]
+fn cad702_http_renewal_continues_through_slow_flush() {
+    let stub = StubHost::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = daemon_opts();
+    opts.lease = Some(Hosted {
+        lease: Some("http://lease.internal".into()),
+        lease_ttl_secs: Some(6),
+        lease_renew_secs: Some(1),
+        flush_timeout_secs: Some(20),
+    });
+    // Test-only, in-process: the configured endpoint stays
+    // `lease.internal` (restrictions enforced); only the transport
+    // dials the loopback stub.
+    opts.lease_http_endpoint_override = Some(stub.url.clone());
+    // A deliberately slow flush: three seconds at a one-second
+    // heartbeat must contain renewals iff the poster outlives `closing`.
+    opts.flush_delay_for_test = Some(Duration::from_secs(3));
+    opts.stop = Some(stop.clone());
+    // Hermetic AgenticOS attach: a hosted lease triggers the deployment
+    // lookup, which must not depend on the image file here — an empty
+    // composition parses and leaves the adapter gated; we never publish.
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    // Admission plus at least one heartbeat renewal before shutdown —
+    // so every POST after `stop` is proof of renewal during shutdown.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while stub.posts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "heartbeat never renewed before stop"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        d.rpc("health", json!({})).unwrap()["lease"]["fenced"].is_null(),
+        "daemon fenced before shutdown"
+    );
+    let stopping_at = Instant::now();
+    stop.store(true, Ordering::SeqCst);
+    drop(d); // serve returns only after flush, heartbeat stop, release
+    let during = stub
+        .times()
+        .into_iter()
+        .filter(|t| *t >= stopping_at)
+        .count();
+    assert!(
+        during >= 2,
+        "renewal did not continue through the slow flush: {during} POSTs after stop"
+    );
+    // And the poster stopped with the daemon: silence afterwards.
+    let total = stub.posts();
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(stub.posts(), total, "renewal poster outlived the flush");
 }

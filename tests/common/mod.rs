@@ -1071,6 +1071,10 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-538: hosted leasing stays off unless a test pins a spec —
         // a real `hosted:` table on the dev host must never leak in.
         lease: Some(cadence_agent::lease::Hosted::default()),
+        // CAD-702: no endpoint override or flush dwell unless a test
+        // pins them — production never sets either.
+        lease_http_endpoint_override: None,
+        flush_delay_for_test: None,
         agent_uid: None,
         shared_socket: None,
         // CAD-482: when the test build carries the seam, fixture
