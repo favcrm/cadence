@@ -995,7 +995,7 @@ impl RecordStore {
         let mut email_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for (at, raw) in raws.iter().enumerate() {
-            if raw.errors.iter().any(|code| *code == "record id") {
+            if raw.errors.contains(&"record id") {
                 continue;
             }
             if profiles[at].is_some() {
@@ -1043,18 +1043,16 @@ impl RecordStore {
         for (at, raw) in raws.iter().enumerate() {
             let mut errors = raw.errors.clone();
             let mut duplicate_of: Option<String> = None;
-            if errors.is_empty() {
-                if profiles[at].is_none() {
-                    errors.push(classify_profile_cells(
-                        &raw.display,
-                        &raw.email,
-                        &raw.phone,
-                        &raw.tags,
-                        &raw.source,
-                        &raw.consent_email,
-                        &raw.consent_sms,
-                    ));
-                }
+            if errors.is_empty() && profiles[at].is_none() {
+                errors.push(classify_profile_cells(
+                    &raw.display,
+                    &raw.email,
+                    &raw.phone,
+                    &raw.tags,
+                    &raw.source,
+                    &raw.consent_email,
+                    &raw.consent_sms,
+                ));
             }
             if errors.is_empty()
                 && id_counts
@@ -1318,7 +1316,8 @@ impl RecordStore {
                     ("skipped", Some(*why))
                 }
                 Apply::Create(profile) => {
-                    match self.app_record_create(context, &row.record_id, profile) {
+                    let stored = self.app_record_create(context, &row.record_id, profile);
+                    match stored {
                         Ok(_) => {
                             applied += 1;
                             ("created", None)
@@ -1330,7 +1329,9 @@ impl RecordStore {
                     }
                 }
                 Apply::Update(profile, revision) => {
-                    match self.app_record_update(context, &row.record_id, *revision, profile) {
+                    let stored =
+                        self.app_record_update(context, &row.record_id, *revision, profile);
+                    match stored {
                         Ok(_) => {
                             applied += 1;
                             ("updated", None)

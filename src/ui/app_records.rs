@@ -61,17 +61,15 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     // and `csv-import` are unaddressable over HTTP (RPC still serves
     // them) so a bulk POST can never create or read a record, and
     // suffixed paths under them never resolve.
-    match record {
-        "csv-preview" | "csv-import" => {
-            if parts.next().is_some() {
-                return None;
-            }
-            return match record {
-                "csv-preview" => Some(Route::CsvPreview(install, context)),
-                _ => Some(Route::CsvImport(install, context)),
-            };
+    if matches!(record, "csv-preview" | "csv-import") {
+        if parts.next().is_some() {
+            return None;
         }
-        _ => {}
+        return Some(if record == "csv-preview" {
+            Route::CsvPreview(install, context)
+        } else {
+            Route::CsvImport(install, context)
+        });
     }
     if !segment(record) {
         return None;
