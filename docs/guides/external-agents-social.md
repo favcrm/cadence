@@ -9,7 +9,7 @@ pasted provider token) is not a shortcut.
 
 ## Prerequisites
 
-- A tip build with remote-capable sign-in reviewed (CAD-777) for V2;
+- A build that includes CAD-777 (device-grant board sign-in) for V2;
   V1 works on any recent build.
 - The daemon on its host, loopback-bound, with an enrolled
   `agenticos_external` connection (`provider.read`/`provider.draft`)
@@ -101,12 +101,36 @@ Fail-open attribution — anything attributed to `operator` that is
 not the operator, or any operator-only success — stops the
 onboarding. That is a security finding, not a docs gap.
 
-## V2: device-grant sign-in (pending CAD-777 + AOS-97)
+## V2: device-grant sign-in (issuer side pending AOS-97)
 
-When the device-login routes land, the human operator signs into the
-board without SSH (`--device-login-issuer/org`, owner-approved
-grant, 12 h/24 h session); agent access stays CLI-shaped. Unchanged:
-alias-carried actions, per-run teams, human-approved sends.
+The human operator signs into the board without SSH. Agent access
+stays CLI-shaped. Unchanged: alias-carried actions, per-run teams,
+human-approved sends.
+
+Configure it once, from your own shell:
+
+```sh
+cadence ui start --device-login-issuer https://your-agenticos-api.example \
+  --device-login-org ws_company --device-login-subject <your-subject-id>
+```
+
+Supply issuer, org and at least one subject together, or none of them. You
+can also use env `CADENCE_DEVICE_LOGIN_ISSUER` / `_ORG` / `_SUBJECTS`
+(comma-separated). `--device-login-subject` repeats, once per operator
+who may sign in remotely. It is the operator's allowlist: any other
+verified workspace member is refused `device_subject_not_allowed`. Find
+your subject id with `cadence auth status` (`principal.subject_id`);
+a refused sign-in also names the subject it saw. Changing the
+configuration while the board runs is refused. Stop the UI, then start
+it again.
+
+On the board, open the header's **Sign in** menu and choose **Sign in
+with AgenticOS**. The board shows a user code and an approval link,
+then polls until the grant is approved, denied or expired. A remote
+session lasts 12 h idle and 24 h at most. Revoking the grant at the
+issuer does not end a live board session early; sign it out from
+`cadence ui sessions`. Issuing the grant still needs the issuer's
+device flag (AOS-97).
 
 Explicit non-goal of this guide: scoped API/MCP agent bearers for
 headless agents. That is a separate ticket with its own adversarial
