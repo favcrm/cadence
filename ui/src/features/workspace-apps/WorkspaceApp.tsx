@@ -35,6 +35,7 @@ import {
   type UpgradeProposal,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
+import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
@@ -44,6 +45,7 @@ type Section =
   | "Library"
   | "Runs"
   | "Needs you"
+  | "Publish"
   | "Settings"
   | "Schedule"
   | "Sources";
@@ -312,6 +314,20 @@ export default function WorkspaceApp({
     ...(data?.installation.files?.includes("workflows/image-manual.md") ? [{ value: "image-manual", label: "Caption and image from pasted facts" }] : []),
   ];
   const isImageRun = (value: WorkspaceRun) => !!value.snapshot.capabilities?.image;
+  const publishCandidates: PublishCandidate[] = postRuns
+    .filter((value) => value.approved_digest && value.artifacts.length > 0)
+    .map((value) => ({
+      run_id: value.id,
+      effect_id: data?.effects.find((effect) => effect.authority.run_id === value.id)?.effect_id ?? "",
+      artifact_id: value.artifacts[0].id,
+      bundle_digest: data?.installation.digest ?? "",
+      title: plainTitle(value.snapshot.inputs, value.snapshot.workflow.title),
+      caption: plainTitle(value.snapshot.inputs, value.snapshot.workflow.title),
+      image_digest: (value.snapshot.capabilities?.image?.digest as string | undefined) ?? null,
+      writer: String(value.snapshot.inputs.writer ?? ""),
+      reviewer: String(value.snapshot.inputs.reviewer ?? ""),
+    }))
+    .filter((value) => value.effect_id.length > 0);
   useEffect(() => {
     setArtifact(null);
     setArtifactError(null);
@@ -653,6 +669,7 @@ export default function WorkspaceApp({
                 ...(sourceEnabled ? ["Sources"] : []),
                 "Runs",
                 "Needs you",
+                "Publish",
                 "Schedule",
                 "Settings",
               ] as Section[]
@@ -713,6 +730,16 @@ export default function WorkspaceApp({
                   </div>
                 )}
               </div>
+            )}
+            {section === "Publish" && (
+              <PublishPanel
+                installId={installId}
+                contextId={contextId || null}
+                candidates={publishCandidates}
+                grantId=""
+                approvalId=""
+                canWrite={canWrite && !busy}
+              />
             )}
             {section === "Schedule" && (
               <section className="wa-panel wa-stack">
