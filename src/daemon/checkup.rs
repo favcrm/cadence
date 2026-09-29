@@ -27,6 +27,7 @@
 //! action ([`super::next_action`]): a fix turn, a review routing, one
 //! safe ready-ticket dispatch, or a Needs-you row.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,6 +108,11 @@ impl Shared {
                 return;
             }
         };
+        // CAD-755: stale-claim pass — registry state says which holders
+        // are still live before any claim check trusts them.
+        if let Err(e) = self.claim_liveness(&agents) {
+            tracing::warn!(event = "claim_liveness_failed", error = e.to_string());
+        }
         for agent in &agents {
             // A mailbox's unread is its function, not a turn —
             // inbox_unread / inbox_stale already row it.
@@ -374,6 +380,67 @@ impl Shared {
             return Ok(next_action::DoneMap::new());
         };
         self.checkup_reports_in(&pm_dir)
+    }
+
+    /// CAD-755: registry-driven claim staleness. Every registered agent
+    /// that no longer counts as live — `stopping`/`stopped`/`offline`,
+    /// fenced (`attention`), or an endpoint `agent_liveness` reports
+    /// dead — maps to when its row last changed; the rest of the
+    /// registry is live. `issue::claim::liveness_sweep` stamps or clears
+    /// `claim.stale` from that; claim holders that are not registered
+    /// agents at all are never auto-marked.
+    fn claim_liveness(self: &Arc<Self>, agents: &[Agent]) -> Result<()> {
+        let Ok(pm_dir) = self.pm_dir() else {
+            return Ok(());
+        };
+        self.claim_liveness_in(&pm_dir, agents, issue::claim::STALE_GRACE)
+    }
+
+    /// The scan over one tracker dir — split from [`Self::pm_dir`]
+    /// resolution so a test can point it at its own pm and grace.
+    pub(super) fn claim_liveness_in(
+        self: &Arc<Self>,
+        pm_dir: &std::path::Path,
+        agents: &[Agent],
+        grace: Duration,
+    ) -> Result<()> {
+        if !pm_dir.join("pm.yaml").is_file() {
+            return Ok(());
+        }
+        let mut dead: HashMap<String, (i64, String)> = HashMap::new();
+        let mut live: HashMap<String, Option<String>> = HashMap::new();
+        for a in agents {
+            let gone = matches!(
+                a.state.as_str(),
+                "stopping" | "stopped" | "attention" | "offline"
+            );
+            let (dead_end, _) = self.agent_liveness(a);
+            if gone || dead_end {
+                let why = if gone {
+                    a.state.clone()
+                } else {
+                    "endpoint dead".to_string()
+                };
+                dead.insert(a.alias.clone(), (a.updated as i64, why));
+            } else {
+                live.insert(a.alias.clone(), a.session_id.clone());
+            }
+        }
+        let pm = issue::Pm::at(pm_dir)?;
+        let out = issue::claim::liveness_sweep(
+            &pm,
+            &dead,
+            &live,
+            grace,
+            issue::time::now_epoch(),
+            DAEMON_ALIAS,
+        )?;
+        let marked = out["marked"].as_array().map(Vec::len).unwrap_or(0);
+        let healed = out["healed"].as_array().map(Vec::len).unwrap_or(0);
+        if marked + healed > 0 {
+            tracing::info!(event = "claim_liveness", marked, healed);
+        }
+        Ok(())
     }
 
     /// The scan over one tracker dir — split from [`Self::pm_dir`]
@@ -994,5 +1061,69 @@ mod tests {
         assert_eq!(s.store.agent("w-stop").unwrap().state, "stopped");
         assert!(s.lifecycle.lock().unwrap().agents.is_empty());
         assert_eq!(s.store.queued_count("w-stop").unwrap(), 1);
+    }
+
+    /// CAD-755: while the holder is registered and live a foreign claim
+    /// refuses; once its row goes `stopped` past the grace the sweep
+    /// stamps `claim.stale` and the same foreign claim proceeds with no
+    /// --take-over — the marker itself is the recorded reason.
+    #[test]
+    fn dead_holders_claim_goes_stale_and_frees_the_issue() {
+        let (_d, s) = shared();
+        worker(&s, "w1", "fake", None);
+        worker(&s, "w2", "fake", None);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm_dir = tmp.path().join("pm");
+        let pm = issue::Pm::init(&pm_dir).unwrap();
+        issue::write::project_add(&pm, "tst", "TST", &[], &[], &[], None).unwrap();
+        let v = issue::write::new_issue(
+            &pm,
+            tmp.path(),
+            Some("tst"),
+            "claimed",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        issue::claim::claim(&pm, &id, Some("w1"), None, None, "t").unwrap();
+        let (_p, dir) = issue::write::issue_dir(&pm, &id).unwrap();
+        let stale_of = || {
+            issue::write::load_front(&dir)
+                .unwrap()
+                .0
+                .claim
+                .and_then(|c| c.stale)
+        };
+
+        // Live holder: the sweep marks nothing and w2 stays refused.
+        let agents = s.store.agents().unwrap();
+        s.claim_liveness_in(&pm_dir, &agents, Duration::ZERO)
+            .unwrap();
+        assert!(stale_of().is_none());
+        assert!(issue::claim::claim(&pm, &id, Some("w2"), None, None, "t").is_err());
+
+        // w1 stopped: past grace (a zero-grace pass) the claim goes
+        // stale — and the stale marker, not a flag, frees the issue.
+        s.store.set_agent_state("w1", "stopped", None).unwrap();
+        let agents = s.store.agents().unwrap();
+        s.claim_liveness_in(&pm_dir, &agents, Duration::ZERO)
+            .unwrap();
+        assert!(
+            stale_of()
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stopped since"),
+            "{:?}",
+            stale_of()
+        );
+        issue::claim::claim(&pm, &id, Some("w2"), None, None, "t").unwrap();
     }
 }

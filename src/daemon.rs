@@ -2345,7 +2345,21 @@ impl Shared {
                     }
                     agents.push(j);
                 }
-                Ok(json!({"agents": agents}))
+                // CAD-755: live capacity — rows neither dead nor in a
+                // terminal/fenced state. Summing non-"stopped" states
+                // overcounts: fenced rows are `attention`, and dead
+                // rows can sit in any state.
+                let live = agents
+                    .iter()
+                    .filter(|a| {
+                        a["dead"].as_bool() != Some(true)
+                            && !matches!(
+                                a["state"].as_str().unwrap_or_default(),
+                                "stopping" | "stopped" | "attention" | "offline"
+                            )
+                    })
+                    .count();
+                Ok(json!({"agents": agents, "live": live}))
             }
             "agent_identity" => {
                 if !params.as_object().is_some_and(|fields| fields.is_empty()) {

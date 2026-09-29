@@ -407,6 +407,16 @@ pub fn run_with(
     // still open. File status is what lint audits — derivation is a
     // runtime concern.
     for (_, front, _) in fronts.values() {
+        // CAD-755: the daemon stamped the claim stale — the holder's
+        // agent is dead and the claim no longer counts as live work.
+        if let Some(c) = front.claim.as_ref().filter(|c| c.stale.is_some()) {
+            lint.warn(format!(
+                "{}: claim by {} is stale — {}",
+                front.id,
+                c.by,
+                c.stale.as_deref().unwrap_or_default()
+            ));
+        }
         if matches!(front.status.as_str(), "ready" | "doing" | "review") {
             let open: Vec<&str> = front
                 .blocked_by

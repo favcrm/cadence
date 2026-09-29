@@ -257,7 +257,8 @@ pub enum IssueAction {
     /// note), backlog|ready → doing, and a comment; owner (the lane) is
     /// left alone except on a take-over.
     /// Re-claiming your own claim refreshes its time. Someone else's
-    /// doing/review issue refuses unless --take-over.
+    /// doing/review issue refuses unless --take-over — or unless the
+    /// daemon marked the claim stale, which needs no flag (CAD-755).
     Claim {
         id: String,
         /// Claimant [default: CADENCE_ALIAS, else operator].
@@ -1762,9 +1763,19 @@ fn print_ls_table(views: &[&board::View]) {
         eprintln!("no issues — `cadence issue new \"title\"` creates one");
         return;
     }
-    let mut rows = vec![["ID", "STATUS", "PRI", "FLAGS", "OWNER", "TAGS", "TITLE"]
-        .map(str::to_string)
-        .to_vec()];
+    let mut rows = vec![[
+        "ID",
+        "STATUS",
+        "PRI",
+        "FLAGS",
+        "OWNER",
+        "CLAIM AGE",
+        "TAGS",
+        "TITLE",
+    ]
+    .map(str::to_string)
+    .to_vec()];
+    let now = crate::issue::time::now_epoch();
     for v in views {
         let f = &v.issue.front;
         let mut flags = String::new();
@@ -1777,19 +1788,29 @@ fn print_ls_table(views: &[&board::View]) {
         if v.container {
             flags.push('C');
         }
+        // CAD-755: S — the daemon marked this claim stale (holder's
+        // agent dead past grace); it no longer blocks take-over.
+        if f.claim.as_ref().is_some_and(|c| c.stale.is_some()) {
+            flags.push('S');
+        }
         rows.push(vec![
             f.id.clone(),
             v.status.clone(),
             f.priority.clone(),
             flags,
             f.owner.clone().unwrap_or_default(),
+            f.claim
+                .as_ref()
+                .and_then(|c| crate::issue::time::parse_iso(&c.at))
+                .map(|at| crate::inbox::fmt_age((now - at).max(0) as u64))
+                .unwrap_or_default(),
             f.tags.join(","),
             f.title.clone(),
         ]);
     }
     print_table(&rows);
     eprintln!(
-        "{} issues · B=blocked ~=derived-status C=container",
+        "{} issues · B=blocked ~=derived-status C=container S=stale-claim",
         views.len()
     );
 }

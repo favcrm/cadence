@@ -2,6 +2,16 @@
 use super::*;
 
 #[test]
+fn scoped_live_count_uses_only_visible_rows() {
+    let rows = json!({"agents": [
+        {"alias": "group-a", "state": "busy", "dead": false},
+        {"alias": "child-a", "state": "attention", "dead": false},
+        {"alias": "child-b", "state": "busy", "dead": true}
+    ], "live": 99});
+    assert_eq!(count_live_agents(&rows), 1);
+}
+
+#[test]
 fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
     let args = [
         "cadence",

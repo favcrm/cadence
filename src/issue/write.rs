@@ -963,10 +963,10 @@ fn apply_pairs(
 }
 
 /// One issue of a bulk edit, loaded and edited in memory.
-struct Staged {
-    id: String,
+pub(crate) struct Staged {
+    pub(crate) id: String,
     dir: PathBuf,
-    front: Front,
+    pub(crate) front: Front,
     body: String,
 }
 
@@ -975,7 +975,7 @@ struct Staged {
 /// issues drop out of the batch. Any unknown id or rejected edit fails
 /// the whole batch before a single file is written. Call under the PM
 /// lock.
-fn stage(
+pub(crate) fn stage(
     pm: &Pm,
     ids: &[String],
     mut edit: impl FnMut(&project::Project, &mut Front) -> Result<bool>,
@@ -1010,7 +1010,7 @@ fn stage(
 /// Only the staged issues' `issue.md` files reach the commit. Returns
 /// the committed ids plus the foreign paths the commit saw; a failed
 /// write or commit restores every file it touched (CAD-454).
-fn commit_staged(
+pub(crate) fn commit_staged(
     pm: &Pm,
     staged: &[Staged],
     summary: &str,

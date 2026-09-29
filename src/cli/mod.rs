@@ -2692,7 +2692,25 @@ pub(crate) fn list_agents(
             });
         }
     }
+    // The daemon counts before client-side group and project filters.
+    // Keep the advertised capacity in the same scope as the visible rows.
+    list["live"] = json!(count_live_agents(&list));
     Ok(list)
+}
+
+fn count_live_agents(list: &Value) -> usize {
+    list["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| {
+            a["dead"].as_bool() != Some(true)
+                && !matches!(
+                    a["state"].as_str().unwrap_or_default(),
+                    "stopping" | "stopped" | "attention" | "offline"
+                )
+        })
+        .count()
 }
 
 /// Stamp each agent row's `"project"` with the tracker project its cwd
