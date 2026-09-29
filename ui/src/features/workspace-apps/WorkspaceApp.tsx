@@ -20,7 +20,7 @@ import { SourcesPanel } from "./SourcesPanel";
 import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
-import { declaredSlots } from "./slotBindings";
+import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
   type Installation,

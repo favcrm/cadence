@@ -10,7 +10,7 @@ import {
   connectionLabel,
   plainRequirement,
   type DeclaredSlot,
-} from "./slotBindings";
+} from "./bindingChoices";
 import { workspaceApps, type AppBinding, type Connection } from "./workspaceApps";
 
 /**
@@ -59,12 +59,15 @@ export function SlotBindings({
   return (
     <>
       {slots.map((slot) => {
-        const binding = bindingForSlot(bindings, contextId, slot.slot);
+        const binding = bindingForSlot(bindings, contextId, slot.slot, digest);
         const health = bindingHealth(binding, digest, connections);
+        // The store refuses an update across bundle digests — a stale
+        // pin rebinds through create, with a fresh request identity.
+        const stale = health === "stale-bundle";
         const { offered, withheld } = candidatesFor(slot.declaration, connections);
         const selected = drafts[slot.slot] ?? binding?.config.connection_id ?? "";
         const unchanged =
-          binding !== undefined && selected === binding.config.connection_id;
+          binding !== undefined && !stale && selected === binding.config.connection_id;
         return (
           <section key={slot.slot} className="wa-panel wa-stack" aria-label={`${titleFor(slot.slot)} connection`}>
             <h2>{titleFor(slot.slot)}</h2>
@@ -118,7 +121,7 @@ export function SlotBindings({
                 loading={busy}
                 onClick={() =>
                   void mutate(async () => {
-                    if (binding)
+                    if (binding && !stale)
                       await workspaceApps.updateBinding(installId, binding.id, {
                         expected_revision: binding.revision,
                         connection_id: selected,

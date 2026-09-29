@@ -19,7 +19,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
-const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"] };
+const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"], capabilities: { publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" } }, connection_slots: [] };
 let simulatedInstallation: typeof installation | null = null;
 let loseUpgradeReply = false;
 const snapshot = { owner_pm: "pm-a", inputs: { subject: "Synthetic caption", source: "Synthetic source facts", writer: "writer-a", reviewer: "reviewer-a" }, workflow: { title: "Instagram caption: Synthetic caption", publication_slot: "publication", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Write" }, { id: "2", kind: "review_text", assignee: "reviewer-a", dependencies: ["1"], instruction: "Review" }] }, publication: { slot: "publication", binding: { id: "binding-a", revision: 1, digest: "binding-digest" } }, assignments: {} };
@@ -43,7 +43,7 @@ function read(path: string): Response {
   if (path === "/api/app-installations/install-a") return json(simulatedInstallation ?? installation);
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [{ id: "context-b", install_id: "install-a", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } }] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { bundle_digest: "bundle-digest", connection_id: "local-id", account: "default" } }] });
-  if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "default" }] });
+  if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "local", kind: "builtin", descriptor: { action_mappings: [{ capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" }] }, status: { manifest_status: "matched", custody_available: true, adapter_registered: true } }] });
   if (path === "/api/agents") return json({ agents: [{ alias: "pm-a", role: "pm", group: "pm-a", state: "idle" }, { alias: "writer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }, { alias: "reviewer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }] });
   if (path === "/api/app-runs?install_id=install-a") return json({ runs: rows });
   if (path === "/api/app-installations/install-a/effects") return json({ effects });
@@ -231,8 +231,8 @@ async function main() {
   assert(button("New post")?.disabled, "Read-only operator cannot create posts");
   await click(button("Settings"));
   assert(!host.querySelector("#wa-default-content-prompt") && !host.querySelector("#wa-default-image-prompt") && text().includes("needs an upgrade"), "Older installed bundles do not offer prompt defaults their workflow cannot save");
-  assert(button("Save destination")?.disabled && button("Add brand")?.disabled && button("Check update")?.disabled, "Read-only settings have no enabled mutation controls");
-  await click(button("Save destination")); await click(button("Add brand"));
+  assert(button("Save publication connection")?.disabled && button("Add brand")?.disabled && button("Check update")?.disabled, "Read-only settings have no enabled mutation controls");
+  await click(button("Save publication connection")); await click(button("Add brand"));
   assert(writes.length === 0, "Read-only attempted actions cause zero POSTs");
   await fresh(); await click(button("Settings"));
   assert(!button("Apply checked update"), "No package applies before a reviewed check");
@@ -267,14 +267,14 @@ async function main() {
   await click(host.querySelector('button[aria-label="Optional brand context"]'));
   await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("Brand B")));
   await click(button("Settings"));
-  await choosePage("Local destination", "local-id");
-  await click(button("Save destination"));
+  await choosePage("Publication connection", "Local outbox");
+  await click(button("Save publication connection"));
   const oldBindingId = writes.at(-1)?.body.request_id;
   assert(oldBindingId && writes.at(-1)?.body.slot === "publication", "Old package can bind a brand Local destination");
   simulatedInstallation = { ...installation, digest: "new-bundle-digest", catalog_generation: "generation-b" };
   await fresh(); await click(button("Settings"));
-  await choosePage("Local destination", "local-id");
-  await click(button("Save destination"));
+  await choosePage("Publication connection", "Local outbox");
+  await click(button("Save publication connection"));
   assert(writes.at(-1)?.body.request_id && writes.at(-1)?.body.request_id !== oldBindingId, "Same connection in a new bundle needs a new binding request identity");
   await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v04");
   await click(button("Check update")); await click(button("Apply checked update"));

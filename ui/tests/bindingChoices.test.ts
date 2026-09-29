@@ -6,7 +6,7 @@ import {
   declaredSlots,
   isLocalOutbox,
   plainRequirement,
-} from "../src/features/workspace-apps/slotBindings";
+} from "../src/features/workspace-apps/bindingChoices";
 import type {
   AppBinding,
   Connection,
@@ -191,3 +191,9 @@ equal(bindingForSlot([brand, binding()], null, "publication")?.id, "bind-a", "co
 equal(bindingForSlot([brand, binding()], "brand-a", "publication")?.id, "bind-brand", "brand");
 equal(bindingForSlot([brand], "brand-b", "publication"), undefined, "wrong context");
 equal(bindingForSlot([brand], null, "source"), undefined, "wrong slot");
+// After a rebind both pins exist: the current bundle's row wins regardless of order.
+const staleRow = binding({ id: "bind-old", config: { ...binding().config, bundle_digest: "sha256:old" } });
+const freshRow = binding({ id: "bind-new" });
+equal(bindingForSlot([staleRow, freshRow], null, "publication", "sha256:current")?.id, "bind-new", "current pin first");
+equal(bindingForSlot([freshRow, staleRow], null, "publication", "sha256:current")?.id, "bind-new", "current pin either order");
+equal(bindingForSlot([staleRow], null, "publication", "sha256:current")?.id, "bind-old", "stale still visible");

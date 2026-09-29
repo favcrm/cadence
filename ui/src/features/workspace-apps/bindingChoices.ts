@@ -10,7 +10,7 @@ import type {
  * an installation has, which connections are reviewed-compatible with
  * each, and whether a saved binding is still healthy. Kept pure so the
  * matching rules are unit-tested in plain node
- * (tests/slotBindings.test.ts).
+ * (tests/bindingChoices.test.ts).
  *
  * Compatibility mirrors the daemon's exact check
  * (`app_binding_config`): a candidate must map the declared
@@ -143,13 +143,19 @@ export function bindingHealth(
   return "ok";
 }
 
-/** The binding for one slot in this context, pinned to the current bundle. */
+/** The binding for one slot in this context, preferring the current bundle's pin. */
 export function bindingForSlot(
   bindings: AppBinding[],
   contextId: string | null,
   slot: string,
+  preferredDigest?: string,
 ): AppBinding | undefined {
-  return bindings.find(
+  const rows = bindings.filter(
     (value) => value.context_id === contextId && value.slot === slot,
   );
+  if (preferredDigest !== undefined) {
+    const current = rows.find((value) => value.config.bundle_digest === preferredDigest);
+    if (current) return current;
+  }
+  return rows[0];
 }
