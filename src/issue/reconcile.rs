@@ -679,7 +679,10 @@ mod tests {
             front.claim = Some(Claim {
                 by: "op".to_string(),
                 at: at.to_string(),
+                session: None,
+                last_seen: None,
                 note: None,
+                stale: None,
             });
         }
         front.refs.push(Ref {

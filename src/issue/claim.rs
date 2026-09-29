@@ -823,6 +823,7 @@ mod tests {
                 std::slice::from_ref(&id),
                 &[format!("status={status}")],
                 "t",
+                (status == "done").then_some("terminal fixture with no release evidence"),
             )
             .unwrap();
             let before = front_of(&pm, &id).claim.unwrap();
