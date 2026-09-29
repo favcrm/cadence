@@ -356,21 +356,13 @@ jobs:
             ${{ runner.temp }}/nextest-costs.md
           if-no-files-found: warn
           retention-days: 14
-      # cargo-nextest intentionally does not execute Rust doctests. Keep
-      # doctests visible as a separate locked Cargo step rather than silently
-      # dropping that coverage from cargo test --all-targets semantics.
-      # One shard runs them: they are unpartitioned by construction.
-      - name: Run Rust doctests with locked Cargo
-        if: steps.scope.outputs.mode != 'docs' && matrix.shard == 1
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: cargo test --doc --locked
-
-  # The feature-on suite cannot compile cfg(not(test-seam)) proofs, so
-  # the refusal proofs run in the production feature shape. One job runs
-  # them once, in parallel with the shards instead of inside each —
-  # the second compile leaves every shard's critical path (CAD-809).
-  test-seam-refusal:
+  # The proofs that run once, outside the shards: the feature-on suite
+  # cannot compile cfg(not(test-seam)) proofs, so the refusal proofs run
+  # in the production feature shape, and cargo-nextest intentionally
+  # does not execute Rust doctests. One job runs both once, in parallel
+  # with the shards instead of inside them — a second compile or a
+  # doctest pass leaves every shard's critical path (CAD-809).
+  test-once:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
@@ -391,13 +383,20 @@ jobs:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
         run: scripts/cadence-nextest --test test_seam --locked
+      # cargo-nextest intentionally does not execute Rust doctests. Keep
+      # doctests visible as a separate locked Cargo step rather than silently
+      # dropping that coverage from cargo test --all-targets semantics.
+      - name: Run Rust doctests with locked Cargo
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --doc --locked
 
-  # Stable required-check name over the shards and the refusal job
+  # Stable required-check name over the shards and the once-only job
   # above: branch protection requires `test`, and downstream gates read
   # `needs.test.result`. Skipped (not failed) when either fails, so red
   # stays red.
   test:
-    needs: [queue-evidence, test-shard, test-seam-refusal]
+    needs: [queue-evidence, test-shard, test-once]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -405,9 +404,9 @@ jobs:
       - name: Aggregate test-shard results
         run: |
           echo "test shards: ${{ needs.test-shard.result }}"
-          echo "test-seam refusal: ${{ needs.test-seam-refusal.result }}"
+          echo "test-once: ${{ needs.test-once.result }}"
           [ "${{ needs.test-shard.result }}" = success ]
-          [ "${{ needs.test-seam-refusal.result }}" = success ]
+          [ "${{ needs.test-once.result }}" = success ]
 
   build:
     needs: [queue-evidence]
