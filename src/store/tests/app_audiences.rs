@@ -309,7 +309,10 @@ fn cad780_cross_install_context_isolation() {
     );
     // Nothing saved under ctx-1 is addressable from ctx-2 either.
     assert!(a.app_segment_show("ctx-2", "seg-vip").is_err());
-    assert!(a.app_audience_preview("ctx-2", &base_all(), None).unwrap()["final_count"] == 0);
+    assert_eq!(
+        a.app_audience_preview("ctx-2", &base_all(), None).unwrap()["final_count"],
+        0
+    );
 }
 
 #[test]
