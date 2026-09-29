@@ -403,6 +403,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("social_publish_show", Rule::Handler("operator_connection (CAD-771)")),
     ("social_publish_list", Rule::Handler("operator_connection (CAD-771)")),
     ("social_publish_claim_due", Rule::Handler("operator_connection (CAD-771)")),
+    ("social_publish_reconcile", Rule::Handler("operator_connection (CAD-771)")),
     ("social_publish_report", Rule::Handler("operator_connection (CAD-771)")),
     ("app_context_create", Rule::Handler("operator_connection (CAD-690)")),
     ("app_context_list", Rule::Handler("operator_connection (CAD-690)")),

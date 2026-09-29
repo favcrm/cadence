@@ -423,6 +423,14 @@ pub struct Shared {
     /// no reviewed table means no classification, so no call.
     platforms: effect_rpc::PlatformMap,
     effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-771: daemon-side publish dispatch observation. When set, the
+    /// dispatch claim executes the exact binding through this sender and
+    /// persists the provider's evidence before any report; posted reports
+    /// verify byte-exact against it, and its absence retains processing.
+    /// Tests register a fake; production leaves it unset until the send
+    /// adapter lands. Never set from PM, RPC, or worker input.
+    social_publish_sender:
+        Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -598,6 +606,7 @@ impl Shared {
             platform_custody_lock: Mutex::new(()),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
+            social_publish_sender: opts.social_publish_sender.clone(),
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
@@ -2752,6 +2761,7 @@ impl Shared {
             "social_publish_show" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_list" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_claim_due" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_reconcile" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
@@ -3710,6 +3720,11 @@ pub struct ServeOptions {
     /// recorded, the run never starts, and a restart reconciles the
     /// row. Production leaves it unset (always executes).
     pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-771: daemon-side publish dispatch observation (see Shared).
+    /// Tests register a fake; production leaves it unset until the send
+    /// adapter lands. Never set from PM, RPC, or worker input.
+    pub social_publish_sender:
+        Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
     /// Trusted test callback after the exact app executing claim, before
     /// Local commit, while the release lock remains held and SQL is dropped.
     /// False preserves executing uncertainty for restart reconciliation.

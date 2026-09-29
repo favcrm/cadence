@@ -264,7 +264,10 @@ fn cad771_same_key_with_changed_content_or_destination_fails() {
             FakeProviderBehavior::Post,
         )
         .unwrap_err();
-    assert!(matches!(err.code, "key_conflict" | "wrong_destination"));
+    assert!(matches!(
+        err.code.as_str(),
+        "key_conflict" | "wrong_destination"
+    ));
     assert_eq!(ledger.provider_calls(), 1);
 }
 
@@ -356,7 +359,7 @@ fn cad771_agent_caller_cannot_broaden_destination() {
         )
         .unwrap_err();
     assert!(matches!(
-        err.code,
+        err.code.as_str(),
         "grant_binding_mismatch" | "wrong_destination"
     ));
     assert_eq!(ledger.provider_calls(), 0);
@@ -571,7 +574,7 @@ fn cad771_cross_workspace_and_cross_account_blocked() {
         )
         .unwrap_err();
     assert!(matches!(
-        err.code,
+        err.code.as_str(),
         "wrong_connection" | "wrong_destination" | "wrong_toolkit"
     ));
     assert_eq!(ledger.provider_calls(), 0);

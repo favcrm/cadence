@@ -107,6 +107,11 @@ struct FakeDoor {
     grants: Arc<Mutex<GrantAuthority>>,
     ledger: Arc<FakePublishLedger>,
     calls: Arc<Mutex<u64>>,
+    /// Owner-authorized destination the fake discovery returns. The fake
+    /// trusts the enrolled connection namespace (operator-side) and
+    /// enforces destination-exactness against this value; unset means the
+    /// tests drive discovery echo for liveness-only paths.
+    expected_destination: Arc<Mutex<Option<String>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -118,10 +123,12 @@ impl FakeDoor {
         let grants = Arc::new(Mutex::new(GrantAuthority::default()));
         let ledger = Arc::new(FakePublishLedger::enabled());
         let calls = Arc::new(Mutex::new(0u64));
+        let expected_destination = Arc::new(Mutex::new(None));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
+        let worker_expected = Arc::clone(&expected_destination);
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             while !worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -132,7 +139,13 @@ impl FakeDoor {
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap_or(0);
                 let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                let reply = Self::route(&worker_grants, &worker_ledger, request.url(), &value);
+                let reply = Self::route(
+                    &worker_grants,
+                    &worker_ledger,
+                    &worker_expected,
+                    request.url(),
+                    &value,
+                );
                 let _ = request.respond(tiny_http::Response::from_string(reply.to_string()));
             }
         });
@@ -141,9 +154,14 @@ impl FakeDoor {
             grants,
             ledger,
             calls,
+            expected_destination,
             stop,
             worker: Some(worker),
         }
+    }
+
+    fn expect_destination(&self, destination_id: &str) {
+        *self.expected_destination.lock().unwrap() = Some(destination_id.into());
     }
 
     /// Native-vs-HTTP parity core: the HTTP door reaches exactly the verdicts
@@ -151,6 +169,7 @@ impl FakeDoor {
     fn route(
         grants: &Mutex<GrantAuthority>,
         ledger: &FakePublishLedger,
+        expected: &Mutex<Option<String>>,
         url: &str,
         value: &Value,
     ) -> Value {
@@ -167,7 +186,16 @@ impl FakeDoor {
             cadence_effect_id: value["cadence_effect_id"].as_str().unwrap_or("").into(),
             grant_id: value["grant_id"].as_str().unwrap_or("").into(),
         };
-        let dest = discovery(toolkit);
+        let mut dest = discovery(toolkit);
+        // The fake trusts the operator-enrolled connection namespace and
+        // enforces destination-exactness against owner-authorized
+        // discovery (explicit expectation) or echo (liveness-only paths).
+        dest.connection_id = binding.connection_id.clone();
+        if let Some(expected) = expected.lock().unwrap().clone() {
+            dest.destination_id = expected;
+        } else {
+            dest.destination_id = binding.destination_id.clone();
+        }
         let mut grant = SendGrant {
             id: binding.grant_id.clone(),
             workspace_id: "ws_harbour".into(),
@@ -208,6 +236,7 @@ impl FakeDoor {
                     grants.lock().unwrap().consume(&binding.grant_id);
                     json!({"verdict": "ok", "state": outcome.state.as_str(),
                         "permalink": outcome.permalink,
+                        "provider_ids": outcome.provider_ids,
                         "provider_payload": outcome.provider_payload,
                         "repeated": outcome.repeated})
                 }
@@ -218,7 +247,11 @@ impl FakeDoor {
             return match ledger.status(&binding.key) {
                 Ok(outcome) => json!({"verdict": "ok", "state": outcome.state.as_str(),
                     "permalink": outcome.permalink,
+                    "provider_ids": outcome.provider_ids,
                     "provider_payload": outcome.provider_payload,
+                    "destination_id": outcome.destination_id,
+                    "caption_digest": outcome.caption_digest,
+                    "image_digest": outcome.image_digest,
                     "repeated": outcome.repeated}),
                 Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
             };
@@ -251,6 +284,144 @@ impl Drop for FakeDoor {
 }
 
 const NOW: i64 = 1_750_000_000;
+
+/// Daemon-side test sender: speaks the fake door over loopback HTTP and
+/// maps its verdicts to ledger outcomes. Grant liveness, key folding and
+/// no-second-call semantics stay door-side; the daemon only observes.
+struct HttpSender {
+    base: String,
+    behaviors: Mutex<HashMap<String, FakeProviderBehavior>>,
+}
+
+impl HttpSender {
+    fn new(base: String) -> Self {
+        Self {
+            base,
+            behaviors: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn set_behavior(&self, key: &str, behavior: FakeProviderBehavior) {
+        self.behaviors.lock().unwrap().insert(key.into(), behavior);
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Value {
+        let agent = ureq::Agent::new_with_defaults();
+        let mut response = agent
+            .post(format!("{}{path}", self.base))
+            .send_json(body)
+            .unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn outcome_of(
+        binding: &SendBinding,
+        verdict: &Value,
+    ) -> Result<
+        cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
+        cadence_agent::platform::agenticos_external::publish::Refusal,
+    > {
+        use cadence_agent::platform::agenticos_external::publish::{
+            LedgerOutcome, PublishState, Refusal,
+        };
+        if verdict["verdict"] != "ok" {
+            return Err(Refusal::new(
+                Refusal::code_for(verdict["code"].as_str().unwrap_or("")),
+                "fake door refused dispatch",
+            ));
+        }
+        let field = |name: &str, fallback: &str| {
+            verdict[name]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| fallback.to_owned())
+        };
+        Ok(LedgerOutcome {
+            state: match verdict["state"].as_str().unwrap_or("") {
+                "posted" => PublishState::Posted,
+                "processing" => PublishState::Processing,
+                "refused" => PublishState::Refused,
+                _ => PublishState::ReconnectNeeded,
+            },
+            permalink: verdict["permalink"].as_str().map(str::to_owned),
+            destination_id: field("destination_id", &binding.destination_id),
+            caption_digest: field("caption_digest", &binding.caption_digest),
+            image_digest: verdict["image_digest"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| binding.image_digest.clone()),
+            provider_payload: verdict["provider_payload"].as_str().map(str::to_owned),
+            provider_ids: verdict["provider_ids"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            repeated: verdict["repeated"].as_bool().unwrap_or(false),
+        })
+    }
+}
+
+impl cadence_agent::platform::agenticos_external::publish::PublishSender for HttpSender {
+    fn execute(
+        &self,
+        binding: &SendBinding,
+    ) -> Result<
+        cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
+        cadence_agent::platform::agenticos_external::publish::Refusal,
+    > {
+        let behavior = self
+            .behaviors
+            .lock()
+            .unwrap()
+            .get(&binding.key)
+            .copied()
+            .unwrap_or(FakeProviderBehavior::Post);
+        let verdict = self.post(
+            "/v1/device/publish/exec",
+            &json!({"key": binding.key,
+            "connection_id": binding.connection_id,
+            "toolkit": binding.toolkit.as_str(),
+            "destination_id": binding.destination_id,
+            "caption_digest": binding.caption_digest,
+            "image_digest": binding.image_digest,
+            "cadence_run_id": binding.cadence_run_id,
+            "cadence_effect_id": binding.cadence_effect_id,
+            "grant_id": binding.grant_id,
+            "behavior": match behavior {
+                FakeProviderBehavior::Post => "post",
+                FakeProviderBehavior::Refuse => "refuse",
+                FakeProviderBehavior::LoseResponseAfterAccept => "lose",
+            }}),
+        );
+        Self::outcome_of(binding, &verdict)
+    }
+
+    fn status(
+        &self,
+        key: &str,
+    ) -> Result<
+        cadence_agent::platform::agenticos_external::publish::LedgerOutcome,
+        cadence_agent::platform::agenticos_external::publish::Refusal,
+    > {
+        let verdict = self.post("/v1/device/publish/status", &json!({"key": key}));
+        let empty = SendBinding {
+            key: key.into(),
+            connection_id: String::new(),
+            destination_id: String::new(),
+            toolkit: Toolkit::Facebook,
+            caption_digest: String::new(),
+            image_digest: None,
+            cadence_run_id: String::new(),
+            cadence_effect_id: String::new(),
+            grant_id: String::new(),
+        };
+        Self::outcome_of(&empty, &verdict)
+    }
+}
 
 fn door_binding(intent: &Value, behavior: &str) -> Value {
     let frozen = &intent["frozen"];
@@ -318,6 +489,18 @@ fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
     (context, run, bundle_digest, install_id)
 }
 
+/// A daemon with the fake dispatch sender registered: claims execute
+/// daemon-side and persist provider evidence, exactly the path posted
+/// reports verify against.
+fn e2e_release(door: &FakeDoor) -> (Release, Arc<HttpSender>) {
+    let sender = Arc::new(HttpSender::new(format!("http://{}", door.addr)));
+    let registered = Arc::clone(&sender);
+    let h = Release::with_options(move |opts, _| {
+        opts.social_publish_sender = Some(registered);
+    });
+    (h, sender)
+}
+
 fn freeze_params(
     context: &Value,
     run: &Value,
@@ -339,11 +522,11 @@ fn freeze_params(
 
 #[test]
 fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
-    let h = Release::new();
-    let (context, run, bundle_digest, install_id) = approved_run(&h, "now");
-    let _ = &context;
     let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "now");
+    let _ = &context;
 
     // Freeze from the genuinely approved run: digests are derived, and the
     // reviewed binding is re-proven current.
@@ -386,27 +569,20 @@ fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
         )
         .unwrap();
     assert_eq!(claimed["intent"]["state"], "processing");
-    let preflight = door.post(
-        "/v1/device/publish/preflight",
-        &door_binding(&claimed["intent"], "post"),
-    );
-    assert_eq!(preflight["verdict"], "ok");
-    let exec = door.post(
-        "/v1/device/publish/exec",
-        &door_binding(&claimed["intent"], "post"),
-    );
-    assert_eq!(exec["verdict"], "ok");
-    assert_eq!(exec["state"], "posted");
-    assert!(!exec["repeated"].as_bool().unwrap());
+    // The daemon executed the exact binding itself and persisted the
+    // provider's evidence; the report below must replay those bytes.
+    let evidence = &claimed["intent"]["upstream"];
+    assert_eq!(evidence["state"], "posted");
+    assert!(!evidence["permalink"].as_str().unwrap_or("").is_empty());
     let posted = h
         .daemon
         .operator_rpc(
             "social_publish_report",
             json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
-                "receipt": {"permalink": exec["permalink"],
+                "receipt": {"permalink": evidence["permalink"],
                     "destination_id": DEST_FB, "caption_digest": reviewed_hex, "image_digest": intent["frozen"]["image_digest"],
-                    "provider_ids": ["provider-post-1"],
-                    "provider_payload": exec["provider_payload"]}}),
+                    "provider_ids": evidence["provider_ids"],
+                    "provider_payload": evidence["provider_payload"]}}),
         )
         .unwrap()["intent"]
         .clone();
@@ -422,6 +598,95 @@ fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
         .unwrap();
     assert_eq!(idle["claimed"], false);
     assert_eq!(door.ledger.provider_calls(), 1);
+}
+
+#[test]
+fn cad771_e2e_forged_matching_receipt_fails_closed_without_trusted_evidence() {
+    // Field-equality is not trust: a receipt copying every frozen field
+    // but fabricating permalink and payload must not post. Only the exact
+    // daemon-observed evidence bytes satisfy a posted report; anything
+    // else retains processing (uncertain).
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "forged-receipt");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-forged-receipt",
+                "cad_fx_forged_receipt_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let recheck = recheck_for(&intent);
+    let claimed = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    // Every frozen field copied exactly; permalink and payload fabricated.
+    let forged = h
+        .daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": "https://www.instagram.com/p/FORGED/",
+                    "destination_id": intent["frozen"]["destination_id"],
+                    "caption_digest": intent["frozen"]["caption_digest"],
+                    "image_digest": intent["frozen"]["image_digest"],
+                    "provider_ids": ["provider-post-1"],
+                    "provider_payload": "{\"id\":\"forged\"}"}}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        forged.contains("does not match trusted upstream evidence"),
+        "{forged}"
+    );
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "social_publish_show",
+                json!({"intent_id": claimed["intent"]["intent_id"]}),
+            )
+            .unwrap()["intent"]["state"],
+        "processing"
+    );
+    assert_eq!(door.ledger.provider_calls(), 1);
+    // The true evidence bytes post.
+    let evidence = &claimed["intent"]["upstream"];
+    h.daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": evidence["permalink"],
+                    "destination_id": intent["frozen"]["destination_id"],
+                    "caption_digest": intent["frozen"]["caption_digest"],
+                    "image_digest": intent["frozen"]["image_digest"],
+                    "provider_ids": evidence["provider_ids"],
+                    "provider_payload": evidence["provider_payload"]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "social_publish_show",
+                json!({"intent_id": claimed["intent"]["intent_id"]}),
+            )
+            .unwrap()["intent"]["state"],
+        "posted"
+    );
 }
 
 #[test]
@@ -473,6 +738,7 @@ fn cad771_e2e_forged_freeze_inputs_fail_closed() {
         "social_publish_show",
         "social_publish_list",
         "social_publish_claim_due",
+        "social_publish_reconcile",
         "social_publish_report",
     ] {
         assert!(
@@ -488,10 +754,10 @@ fn cad771_e2e_forged_freeze_inputs_fail_closed() {
 
 #[test]
 fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
-    let h = Release::new();
-    let (context, run, bundle_digest, install_id) = approved_run(&h, "revoke");
     let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 1);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "revoke");
 
     // Revocation between schedule and dispatch: the door refuses liveness,
     // and a stale recheck claims-then-holds for a new human decision.
@@ -512,15 +778,41 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
         .unwrap()["intent"]
         .clone();
     door.grants.lock().unwrap().revoke(GRANT_FB);
-    let preflight = door.post(
-        "/v1/device/publish/preflight",
-        &door_binding(&intent, "post"),
-    );
-    assert_eq!(
-        preflight,
-        json!({"verdict": "refused", "code": "grant_revoked"})
-    );
-    let mut stale = recheck_for(&intent);
+    // Revocation between schedule and dispatch: the daemon-side exec hits
+    // the liveness gate and the intent auto-reports refused with the
+    // provider's verdict — no provider call, no human decision consumed.
+    let refused = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck_for(&intent)}),
+        )
+        .unwrap();
+    assert_eq!(refused["intent"]["state"], "refused");
+    assert!(refused["intent"]["receipt"]["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("grant_revoked"));
+    assert_eq!(door.ledger.provider_calls(), 0);
+    // A stale recheck (rotated destination) claims-then-holds for a new
+    // human decision instead of publishing: fresh intent, same flow.
+    let stale_intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-revoke-stale",
+                "cad_fx_revoke_stale_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let mut stale = recheck_for(&stale_intent);
     stale["destination_id"] = json!("999999999999999");
     let held = h
         .daemon
@@ -560,20 +852,17 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
         )
         .unwrap();
     assert_eq!(claimed2["intent"]["state"], "processing");
-    let exec2 = door.post(
-        "/v1/device/publish/exec",
-        &door_binding(&claimed2["intent"], "post"),
-    );
-    assert_eq!(exec2["verdict"], "ok");
+    let evidence2 = &claimed2["intent"]["upstream"];
+    assert_eq!(evidence2["state"], "posted");
     h.daemon
         .operator_rpc(
             "social_publish_report",
             json!({"intent_id": claimed2["intent"]["intent_id"], "decision": "posted",
-                "receipt": {"permalink": exec2["permalink"], "destination_id": DEST_FB,
+                "receipt": {"permalink": evidence2["permalink"], "destination_id": DEST_FB,
                     "caption_digest": intent2["frozen"]["caption_digest"],
                     "image_digest": intent2["frozen"]["image_digest"],
-                    "provider_ids": ["provider-post-1"],
-                    "provider_payload": exec2["provider_payload"]}}),
+                    "provider_ids": evidence2["provider_ids"],
+                    "provider_payload": evidence2["provider_payload"]}}),
         )
         .unwrap();
     let intent3 = h
@@ -592,20 +881,28 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
         )
         .unwrap()["intent"]
         .clone();
-    let exec3 = door.post("/v1/device/publish/exec", &door_binding(&intent3, "post"));
-    assert_eq!(
-        exec3,
-        json!({"verdict": "refused", "code": "grant_exhausted"})
-    );
+    let recheck3 = recheck_for(&intent3);
+    let refused3 = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck3}),
+        )
+        .unwrap();
+    assert_eq!(refused3["intent"]["state"], "refused");
+    assert!(refused3["intent"]["receipt"]["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("grant_exhausted"));
     assert_eq!(door.ledger.provider_calls(), 1);
 }
 
 #[test]
 fn cad771_e2e_lost_response_reconciles_without_second_send() {
-    let h = Release::new();
-    let (context, run, bundle_digest, install_id) = approved_run(&h, "lost");
     let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "lost");
     let intent = h
         .daemon
         .operator_rpc(
@@ -622,6 +919,12 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
         )
         .unwrap()["intent"]
         .clone();
+    // The provider will accept but the response will be lost: arm the
+    // lose behavior before the claim executes daemon-side at once.
+    sender.set_behavior(
+        intent["request"].as_str().unwrap(),
+        FakeProviderBehavior::LoseResponseAfterAccept,
+    );
     let recheck = recheck_for(&intent);
     let claimed = h
         .daemon
@@ -630,37 +933,36 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
             json!({"now_epoch": epoch_now() + 5, "recheck": recheck}),
         )
         .unwrap();
-    // Provider accepts but the response is lost: processing, no evidence.
-    let lost = door.post(
-        "/v1/device/publish/exec",
-        &door_binding(&claimed["intent"], "lose"),
-    );
-    assert_eq!(lost["verdict"], "ok");
-    assert_eq!(lost["state"], "processing");
-    // After restart, reconcile upstream status before any retry: the status
-    // query finalizes to posted with byte-exact evidence — no second call.
-    let status = door.post(
-        "/v1/device/publish/status",
-        &json!({"key": claimed["intent"]["request"]}),
-    );
-    assert_eq!(status["verdict"], "ok");
-    assert_eq!(status["state"], "posted");
-    assert!(status["permalink"].is_string());
+    assert_eq!(claimed["intent"]["state"], "processing");
+    assert_eq!(claimed["intent"]["upstream"]["state"], "processing");
+    assert!(claimed["intent"]["upstream"]["provider_payload"].is_null());
+    // After restart, reconcile upstream status before any retry.
+    let reconciled = h
+        .daemon
+        .operator_rpc(
+            "social_publish_reconcile",
+            json!({"intent_id": claimed["intent"]["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(reconciled["state"], "processing");
+    let evidence = &reconciled["upstream"];
+    assert_eq!(evidence["state"], "posted");
     // Byte-exact provider evidence: the payload travels as an opaque
     // string and parses to the recorded provider document — never a
     // re-serialized approximation, never a bare success string.
     let payload: Value =
-        serde_json::from_str(status["provider_payload"].as_str().unwrap()).unwrap();
+        serde_json::from_str(evidence["provider_payload"].as_str().unwrap()).unwrap();
     assert_eq!(payload["id"], "provider-post-1");
     h.daemon
         .operator_rpc(
             "social_publish_report",
             json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
-                "receipt": {"permalink": status["permalink"], "destination_id": DEST_FB,
+                "receipt": {"permalink": evidence["permalink"], "destination_id": DEST_FB,
                     "caption_digest": intent["frozen"]["caption_digest"],
                     "image_digest": intent["frozen"]["image_digest"],
-                    "provider_ids": ["provider-post-1"],
-                    "provider_payload": status["provider_payload"]}}),
+                    "provider_ids": evidence["provider_ids"],
+                    "provider_payload": evidence["provider_payload"]}}),
         )
         .unwrap();
     let shown = h
@@ -726,6 +1028,9 @@ fn cad771_e2e_schedule_cancel_and_native_http_parity() {
     // wrong-destination verdict is destination-exact, not toolkit luck.
     forged["toolkit"] = json!("instagram");
     forged["connection_id"] = json!(CONN_IG);
+    // Owner-authorized discovery returns the true destination: the forged
+    // binding mismatches it through the HTTP door exactly as natively.
+    door.expect_destination(DEST_IG);
     // Instagram shape needs an image digest before the destination gate;
     // the point under test is destination-exactness, so supply one.
     forged["image_digest"] =

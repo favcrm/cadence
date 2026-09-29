@@ -108,15 +108,51 @@ impl PublishState {
 /// Failing verdict for a gate refusal (never a second provider call).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    pub code: &'static str,
+    pub code: String,
     pub detail: String,
 }
 
 impl Refusal {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             detail: detail.into(),
+        }
+    }
+
+    /// The code vocabulary the landed contract refuses with. Unknown wire
+    /// codes fail closed to a generic refusal rather than inventing a code.
+    pub fn code_for(name: &str) -> &'static str {
+        match name {
+            "bad_key" => "bad_key",
+            "bad_connection" => "bad_connection",
+            "bad_destination" => "bad_destination",
+            "bad_caption_digest" => "bad_caption_digest",
+            "bad_image_digest" => "bad_image_digest",
+            "bad_run" => "bad_run",
+            "bad_effect" => "bad_effect",
+            "bad_grant" => "bad_grant",
+            "bad_intent" => "bad_intent",
+            "bad_revision" => "bad_revision",
+            "bad_timezone" => "bad_timezone",
+            "cancel_closed" => "cancel_closed",
+            "cross_workspace" => "cross_workspace",
+            "grant_approval" => "grant_approval",
+            "grant_binding_mismatch" => "grant_binding_mismatch",
+            "grant_bounds" => "grant_bounds",
+            "grant_exhausted" => "grant_exhausted",
+            "grant_mismatch" => "grant_mismatch",
+            "grant_revoked" => "grant_revoked",
+            "grant_window" => "grant_window",
+            "image_required" => "image_required",
+            "key_conflict" => "key_conflict",
+            "not_publishable" => "not_publishable",
+            "send_disabled" => "send_disabled",
+            "unknown_key" => "unknown_key",
+            "wrong_connection" => "wrong_connection",
+            "wrong_destination" => "wrong_destination",
+            "wrong_toolkit" => "wrong_toolkit",
+            _ => "refused",
         }
     }
 }
@@ -625,6 +661,35 @@ impl FakePublishLedger {
 impl Default for FakePublishLedger {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Daemon-side dispatch observation: the party that speaks to the provider
+/// door, so posted reports verify against evidence the daemon itself
+/// observed — never operator-supplied JSON alone. Production leaves the
+/// daemon without one until the send adapter lands; tests register a fake.
+/// A forged receipt with matching binding fields but fabricated evidence
+/// fails closed against the recorded bytes.
+pub trait PublishSender: Send + Sync {
+    /// Dispatch one exact binding against the provider door. The returned
+    /// outcome is daemon-observed evidence, persisted before any report.
+    fn execute(&self, binding: &SendBinding) -> Result<LedgerOutcome, Refusal>;
+    /// Reconcile one stable key against the provider door. Never a second
+    /// provider call for an already-accepted send.
+    fn status(&self, key: &str) -> Result<LedgerOutcome, Refusal>;
+}
+
+impl LedgerOutcome {
+    /// Evidence document as persisted on the intent row: the exact binding
+    /// the provider answered plus its byte-exact evidence.
+    pub fn evidence_json(&self) -> serde_json::Value {
+        serde_json::json!({"state": self.state.as_str(),
+            "permalink": self.permalink,
+            "provider_ids": self.provider_ids,
+            "provider_payload": self.provider_payload,
+            "destination_id": self.destination_id,
+            "caption_digest": self.caption_digest,
+            "image_digest": self.image_digest})
     }
 }
 

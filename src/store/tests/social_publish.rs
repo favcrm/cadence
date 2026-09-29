@@ -197,6 +197,20 @@ fn cad771_concurrent_claimants_have_exactly_one_winner() {
     assert_eq!(wins.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+fn note_matching_evidence(s: &Store, id: &str) {
+    s.social_publish_note_evidence(
+        id,
+        &json!({"state": "posted",
+            "permalink": "https://www.instagram.com/p/ABC/",
+            "provider_ids": ["provider-post-1"],
+            "provider_payload": "{\"id\":\"provider-post-1\"}",
+            "destination_id": "17841400008460056",
+            "caption_digest": digest(1),
+            "image_digest": img_digest()}),
+    )
+    .unwrap();
+}
+
 #[test]
 fn cad771_report_needs_verified_receipt_and_never_bare_success() {
     let (_dir, s) = store();
@@ -212,7 +226,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
                 "caption_digest": digest(1),
             "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
-                "provider_payload": {"id": "provider-post-1"}})
+                "provider_payload": "{\"id\":\"provider-post-1\"}"})
         )
         .is_err());
     s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
@@ -233,7 +247,27 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
     assert!(s
         .social_publish_report(&id, "maybe", &json!({"reason": "x"}))
         .is_err());
-    // The verified receipt closes the intent as posted.
+    // The verified receipt closes the intent as posted — but only with
+    // daemon-observed evidence on file.
+    assert!(s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/",
+                "destination_id": "17841400008460056",
+                "caption_digest": digest(1),
+            "image_digest": img_digest(),
+                "provider_ids": ["provider-post-1"],
+                "provider_payload": "{\"id\":\"provider-post-1\"}"}),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no trusted upstream evidence"));
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "processing"
+    );
+    note_matching_evidence(&s, &id);
     let posted = s
         .social_publish_report(
             &id,
@@ -243,7 +277,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
                 "caption_digest": digest(1),
             "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
-                "provider_payload": {"id": "provider-post-1"}}),
+                "provider_payload": "{\"id\":\"provider-post-1\"}"}),
         )
         .unwrap();
     assert_eq!(posted["intent"]["state"], "posted");
@@ -261,7 +295,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
                 "caption_digest": digest(1),
             "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
-                "provider_payload": {"id": "provider-post-1"}})
+                "provider_payload": "{\"id\":\"provider-post-1\"}"})
         )
         .is_err());
 }
@@ -322,6 +356,7 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
         .unwrap()
         .is_none());
     // Reconcile by explicit report, then the receipt is durable too.
+    note_matching_evidence(&s, &id);
     s.social_publish_report(
         &id,
         "posted",
@@ -330,7 +365,7 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
             "caption_digest": digest(1),
             "image_digest": img_digest(),
             "provider_ids": ["provider-post-1"],
-            "provider_payload": {"id": "provider-post-1"}}),
+            "provider_payload": "{\"id\":\"provider-post-1\"}"}),
     )
     .unwrap();
     drop(s);
@@ -422,7 +457,7 @@ fn cad771_posted_receipt_must_match_frozen_intent() {
         "caption_digest": frozen["caption_digest"],
         "image_digest": frozen["image_digest"],
         "provider_ids": ["provider-post-1"],
-        "provider_payload": {"id": "provider-post-1"}});
+        "provider_payload": "{\"id\":\"provider-post-1\"}"});
     // Forged destination, caption, and image digests each refuse.
     for (field, value) in [
         ("destination_id", json!("999999999999999")),
@@ -444,6 +479,21 @@ fn cad771_posted_receipt_must_match_frozen_intent() {
             "processing"
         );
     }
+    // Evidence on file, then: a receipt whose evidence the daemon never
+    // observed refuses, even with matching binding fields.
+    note_matching_evidence(&s, &id);
+    let mut fabricated = good.clone();
+    fabricated["provider_payload"] = json!("{\"id\":\"forged\"}");
+    fabricated["permalink"] = json!("https://www.instagram.com/p/FORGED/");
+    assert!(s
+        .social_publish_report(&id, "posted", &fabricated)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match trusted upstream evidence"));
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "processing"
+    );
     // The matching receipt posts.
     let posted = s.social_publish_report(&id, "posted", &good).unwrap();
     assert_eq!(posted["intent"]["state"], "posted");
