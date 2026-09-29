@@ -595,7 +595,11 @@ fn stall_budget_gates_despite_clock() {
     stall_sample(1);
     d.register_stub(
         "w1",
-        json!({"auto_ready": "verified", "stall_secs": 7200, "silent_end_secs": 3600}),
+        // Stall disabled (0): with one offset jump meeting every budget
+        // at once, the sample-free stall edge would otherwise win the
+        // race against the 3-sample silent edge. Isolate one edge per
+        // clock test; the stall path has its own tests.
+        json!({"auto_ready": "verified", "stall_secs": 0, "silent_end_secs": 3600}),
     );
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
@@ -632,7 +636,9 @@ fn stall_absence_under_clock_zero_wall() {
     stall_sample(1);
     d.register_stub(
         "w1",
-        json!({"auto_ready": "verified", "stall_secs": 7200, "silent_end_secs": 3600}),
+        // Stall disabled: one offset jump meets every budget at once,
+        // and the sample-free stall edge would race the silent streak.
+        json!({"auto_ready": "verified", "stall_secs": 0, "silent_end_secs": 3600}),
     );
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
@@ -897,8 +903,11 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
     // Clock-driven like its siblings: the silent budget elapses on the
     // offset (dedupe logic is threshold-agnostic), and the SAME offset
     // handle rides across the restart — a fresh zero clock would wait
-    // out the wall budget for the re-fire. The restart dance itself
-    // (shutdown/boot/adopt) stays wall and dominates the remainder.
+    // out the wall budget for the re-fire. Stall is disabled (0): one
+    // offset jump meets every budget at once, and the sample-free stall
+    // edge would win the race against the re-probed silent streak. The
+    // restart dance itself (shutdown/boot/adopt) stays wall and
+    // dominates the remainder.
     let offset = stall_clock_offset();
     let mut opts = daemon_opts();
     opts.stall_clock_offset = std::sync::Arc::clone(&offset);
@@ -908,7 +917,7 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
     stall_sample(1);
     d.register_stub(
         "w1",
-        json!({"auto_ready": "verified", "silent_end_secs": 3600, "stall_secs": 14400}),
+        json!({"auto_ready": "verified", "silent_end_secs": 3600, "stall_secs": 0}),
     );
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
