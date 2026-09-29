@@ -118,6 +118,69 @@ await React.act(async () => {
 });
 await settle(() => assert(text().includes("Seed Alpha"), "shell list paints server rows"));
 assert(text().includes("Customers"), "CRM section renders inside the real shell");
+
+// Pure section-link grammar: context (and any other host param)
+// survives, the record view and New form never follow a move, and
+// Customers is the bare default route.
+const { crmSectionHref } = require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet");
+assert(
+  crmSectionHref("/app-installations/install-crm?ctx=ctx-a", "segments") ===
+    "/app-installations/install-crm?ctx=ctx-a&crm=segments",
+  "segment href keeps the selected context",
+);
+assert(
+  crmSectionHref("/app-installations/install-crm?ctx=ctx-a&crm=segments&record=r1&appview=new", "customers") ===
+    "/app-installations/install-crm?ctx=ctx-a",
+  "customers href drops the section, record and form",
+);
+assert(
+  crmSectionHref("/app-installations/install-crm?ctx=ctx-a&crm=segments", "campaigns") ===
+    "/app-installations/install-crm?ctx=ctx-a&crm=campaigns",
+  "cross-section href swaps only the section",
+);
+assert(
+  crmSectionHref("/app-installations/install-crm", "customers") === "/app-installations/install-crm",
+  "bare default route stays bare",
+);
+
+// Host submenu: Apps → CRM → sections lives in the shared outlet
+// as real links (openable, copyable, keyboard-focusable) with the
+// current section marked — not buttons inside the CRM pane.
+const submenu = () => host.querySelector('nav[aria-label="CRM sections"]');
+assert(submenu(), "host-owned CRM submenu renders in the shell");
+const submenuLinks = Array.from(submenu()!.querySelectorAll("a"));
+assert(
+  submenuLinks.length === 3 && submenuLinks.every((el) => el.tagName === "A"),
+  "submenu offers three real links",
+);
+assert(
+  submenuLinks[1].getAttribute("href") === "/app-installations/install-crm?ctx=ctx-a&crm=segments",
+  "segment link keeps the selected context",
+);
+assert(
+  submenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Customers",
+  "submenu marks the current section",
+);
+submenuLinks[1].focus();
+assert(document.activeElement === submenuLinks[1], "submenu links take keyboard focus");
+// One chat node across section moves; a drawer never follows.
+const openSeed = Array.from(host.querySelectorAll("button.lnk")).find(
+  (el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Seed Alpha"),
+);
+await click(openSeed);
+await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens before the move"));
+const chatBefore = host.querySelector("[data-chat-pane]");
+assert(chatBefore, "chat pane mounts with the shell");
+await click(submenuLinks[1]);
+await settle(() => assert(location.search.includes("crm=segments"), "submenu link routes"));
+assert(!host.querySelector("[data-drawer]"), "no drawer follows a section move");
+assert(host.querySelector("[data-chat-pane]") === chatBefore, "section move keeps the single chat node mounted");
+assert(
+  submenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Segments",
+  "submenu follows the route",
+);
+await click(Array.from(submenu()!.querySelectorAll("a")).find((el) => (el.textContent ?? "").trim() === "Customers")!);
+await settle(() => assert(text().includes("Seed Alpha"), "customers link restores the list"));
 const wrap = host.querySelector(".crm-table-wrap");
 assert(wrap?.getAttribute("tabindex") === "0", "table wrap is keyboard-focusable for internal scroll");
 assert(wrap?.getAttribute("role") === "region", "table wrap is a labelled scroll region");
@@ -182,6 +245,19 @@ assert(/max-width:\s*100%/.test(block("\\.crm-table-wrap")), "wrap never exceeds
 assert(/overflow-wrap:\s*anywhere/.test(block("\\.crm-table th,\\s*\\.crm-table td")), "unbreakable tokens wrap in table cells");
 assert(/flex-wrap:\s*wrap/.test(block("\\.app-outlet-tabs")), "section tabs wrap at narrow widths");
 assert(/flex-wrap:\s*wrap/.test(block("\\.crm-pager")), "pager wraps at narrow widths");
+// The host submenu reuses the shared section-nav kit: it wraps
+// instead of overflowing at narrow widths and never forces a
+// minimum width on the shell grid.
+const stylesPath = path.join(proc.cwd(), "src/styles.css");
+assert(fs.existsSync(stylesPath), `shared styles present at ${stylesPath}`);
+const stylesCss: string = fs.readFileSync(stylesPath, "utf8");
+const stylesBlock = (selector: string): string => {
+  const match = stylesCss.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`));
+  assert(match, `CSS block exists: ${selector}`);
+  return match![1];
+};
+assert(/flex-wrap:\s*wrap/.test(stylesBlock(".section-nav")), "host submenu wraps at narrow widths");
+assert(/min-width:\s*0/.test(stylesBlock(".section-nav")), "host submenu can shrink inside the shell grid");
 // CAD-784: the campaign preview source scrolls inside its own box
 // instead of pushing the document past narrow viewports, and the
 // scriptless visual frame never exceeds its column.

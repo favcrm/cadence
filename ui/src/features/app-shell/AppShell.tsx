@@ -422,16 +422,9 @@ export default function AppShell({
                   viewer={viewer}
                   onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
                   onSelect={(id) => writeQuery({ record: id })}
-                  // Section switches clear the record view and drafts:
-                  // a customer drawer must never follow the operator
-                  // into Segments or Campaigns.
-                  onSection={(s) =>
-                    writeQuery({
-                      crm: s === "customers" ? null : s,
-                      appview: null,
-                      record: null,
-                    })
-                  }
+                  // Section moves ride real submenu links (CrmOutlet):
+                  // their hrefs already clear the record view and
+                  // drafts, so no callback is needed here.
                   // Created records land on list + details in ONE query
                   // write. Two sequential writes would each start from the
                   // stale render's href, so the second would re-apply the

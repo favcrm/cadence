@@ -41,7 +41,6 @@ export default function CrmShell({
   section,
   onView,
   onSelect,
-  onSection,
   onRecordCreated,
 }: {
   scope: HostScope;
@@ -51,33 +50,13 @@ export default function CrmShell({
   section: CrmSection;
   onView: (view: "list" | "new") => void;
   onSelect: (recordId: string | null) => void;
-  onSection: (section: CrmSection) => void;
   onRecordCreated?: (recordId: string) => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
+  // Section navigation lives in the host-owned outlet submenu
+  // (CrmOutlet): this pane only renders the active section body.
   return (
     <div className="app-outlet crm" data-outlet="crm">
-      <div className="app-outlet-tabs" role="tablist" aria-label="CRM sections">
-        {(
-          [
-            ["customers", "Customers"],
-            ["segments", "Segments"],
-            ["campaigns", "Campaigns"],
-          ] as [CrmSection, string][]
-        ).map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            role="tab"
-            aria-selected={section === key}
-            className="app-outlet-tab"
-            data-on={section === key || undefined}
-            onClick={() => onSection(key)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
 
       {section === "segments" && (
         <CrmSegments

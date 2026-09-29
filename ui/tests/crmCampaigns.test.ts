@@ -385,13 +385,25 @@ async function mountedFlow() {
   assert(!listSection!.querySelector("input, textarea"), "the list contains no inline builder fields");
   assert(!text().includes("Create campaign"), "the list contains no inline builder submit");
 
-  // Nested tabs move the `crm` route; Customers drops it entirely.
-  await click(byText("button", "Segments"));
-  await settle(() => assert(location.search.includes("crm=segments"), "segments tab routes"));
-  await click(byText("button", "Customers"));
+  // Host submenu links move the `crm` route; Customers drops it entirely.
+  // They are real anchors (openable, copyable), not pane buttons.
+  const submenu = () => host.querySelector('nav[aria-label="CRM sections"]');
+  assert(submenu(), "host-owned CRM submenu renders in the shell");
+  assert(byText("a", "Segments"), "submenu offers real links");
+  assert(
+    (byText("a", "Segments") as HTMLAnchorElement).getAttribute("href")?.includes("ctx=ctx-a"),
+    "submenu links keep the selected context",
+  );
+  assert(
+    host.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Campaigns",
+    "submenu marks the current section",
+  );
+  await click(byText("a", "Segments"));
+  await settle(() => assert(location.search.includes("crm=segments"), "segments link routes"));
+  await click(byText("a", "Customers"));
   await settle(() => assert(!location.search.includes("crm="), "customers is the default route"));
-  await click(byText("button", "Campaigns"));
-  await settle(() => assert(location.search.includes("crm=campaigns"), "campaigns tab routes back"));
+  await click(byText("a", "Campaigns"));
+  await settle(() => assert(location.search.includes("crm=campaigns"), "campaigns link routes back"));
   // Switching sections clears the record view: no drawer follows.
   assert(!host.querySelector("[data-drawer]"), "no drawer follows a section switch");
 

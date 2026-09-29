@@ -165,6 +165,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CrmOutlet = (require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet")).default;
+const { useHref } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 
 const posts: { path: string; body: any }[] = [];
 const recordStore: Record<string, any> = {
@@ -228,22 +229,23 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
 function Harness({ viewer }: { viewer: { operator: boolean; readOnly: boolean } }) {
   const [view, setView] = React.useState<"list" | "new">("list");
   const [recordId, setRecordId] = React.useState<string | null>(null);
-  // CAD-784: the nested CRM section is shell-routed state — the
-  // harness mirrors the shell by clearing the record view on moves.
-  const [section, setSection] = React.useState<"customers" | "segments" | "campaigns">("customers");
+  // CAD-784: the nested CRM section is route state — the harness
+  // reads it from the URL like the shell does, so submenu links
+  // drive section moves end to end (record view cleared by the
+  // link href itself).
+  const href = useHref();
+  const crm = new URLSearchParams(href.split("?")[1] ?? "").get("crm");
+  const section = crm === "segments" || crm === "campaigns" ? crm : "customers";
   React.useEffect(() => {
-    const params = new URLSearchParams();
+    const params = new URLSearchParams(href.split("?")[1] ?? "");
     if (recordId) params.set("record", recordId);
-    history.replaceState(null, "", `/app-installations/install-crm?ctx=ctx-a${params.toString() ? `&${params}` : ""}`);
+    else params.delete("record");
+    const s = params.toString();
+    history.replaceState(null, "", `/app-installations/install-crm${s ? `?${s}` : ""}`);
   }, [recordId]);
   return React.createElement(CrmOutlet, {
     scope, installationTitle: "CRM", appKind: "crm", view, recordId, section, viewer,
     onView: setView, onSelect: setRecordId,
-    onSection: (next: "customers" | "segments" | "campaigns") => {
-      setSection(next);
-      setView("list");
-      setRecordId(null);
-    },
   });
 }
 
@@ -295,13 +297,25 @@ await settle(() => assert(text().includes("Search Alpha One"), "clearing restore
 
 // CAD-784 sections render real server-driven screens: empty states off
 // empty server rows, and the list never contains an inline builder.
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Segments"));
+// Moves ride the host-owned submenu links (real anchors), not pane buttons.
+const sectionLink = (label: string) =>
+  Array.from(host.querySelectorAll('nav[aria-label="CRM sections"] a')).find(
+    (el) => (el.textContent ?? "").trim() === label,
+  );
+assert(sectionLink("Segments")?.tagName === "A", "submenu offers real links");
+assert(
+  (sectionLink("Segments") as HTMLAnchorElement).getAttribute("href")?.includes("ctx=ctx-a"),
+  "submenu links keep the selected context",
+);
+await click(sectionLink("Segments"));
 await settle(() => assert(text().includes("No segments yet in this context"), "segments empty state is server-driven"));
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Campaigns"));
+assert(location.search.includes("crm=segments"), "submenu move routes");
+await click(sectionLink("Campaigns"));
 await settle(() => assert(text().includes("No campaigns yet in this context"), "campaigns empty state is server-driven"));
 assert(!host.querySelector('section[aria-label="Campaigns list"] input'), "campaigns list holds no inline builder");
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Customers"));
-await settle(() => assert(text().includes("Search Alpha One"), "customers tab restores the list"));
+await click(sectionLink("Customers"));
+await settle(() => assert(text().includes("Search Alpha One"), "customers link restores the list"));
+assert(!location.search.includes("crm="), "customers is the default route");
 
 // Drawer: profile, consent trail, keyboard close with focus restoration.
 const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Beta"));
