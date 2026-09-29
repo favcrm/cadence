@@ -267,7 +267,7 @@ jobs:
     needs: stage
     # The skipped schedule-only selector is an ancestor of stage. Avoid the
     # implicit success() check on that ancestor after manual staging passes.
-    if: !cancelled() && github.event_name == 'workflow_dispatch' && needs.stage.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.stage.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: production
