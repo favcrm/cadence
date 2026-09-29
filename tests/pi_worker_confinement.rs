@@ -906,6 +906,77 @@ fn confined_devin_is_refused_before_registration_or_model_switch() {
     test_env().remove("CADENCE_PM_DIR");
 }
 
+/// pi-devin@0.2.1 reads the operator's Devin login for
+/// `devin/swe-2-high` on every turn. Simulate a persisted row from
+/// before CAD-751: direct task dispatch must refuse it before a task
+/// revision or kickoff message is written. An unconfined worker on
+/// the same pinned model can receive and complete a turn.
+#[test]
+fn persisted_confined_devin_row_cannot_receive_a_dispatched_turn() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    d.register_inbox("pm-in");
+    d.register_pi(
+        "stale",
+        json!({"confine": false, "model": "devin/swe-2-high"}),
+    );
+    d.register_pi(
+        "unconfined",
+        json!({"confine": false, "model": "devin/swe-2-high"}),
+    );
+    d.wait_agent("stale", "idle", 20);
+    d.wait_agent("unconfined", "idle", 20);
+
+    // Direct store write creates the old unsafe row; the public
+    // register/set routes now refuse this combination.
+    let store = cadence_agent::store::Store::open_side(&d.state.join("cadence.sqlite3")).unwrap();
+    store
+        .set_params("stale", &json!({"confine": true}))
+        .unwrap();
+    drop(store);
+
+    let messages_before =
+        d.rpc("agent_show", json!({"alias": "stale"})).unwrap()["messages"].clone();
+    let err = d
+        .operator_rpc(
+            "agent_send",
+            json!({
+                "alias": "stale", "text": "unsafe direct turn"
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    let messages_after =
+        d.rpc("agent_show", json!({"alias": "stale"})).unwrap()["messages"].clone();
+    assert_eq!(messages_after, messages_before, "direct send queued a turn");
+
+    let (spec, sha) = d.spec_file("cad751-dispatch.md", "test a pi-devin dispatched turn");
+    d.job_new("pm-in", "j751", &spec, &sha);
+    d.task_new_ac("j751", "j751-stale", "stale", "report completion")
+        .unwrap();
+    d.task_new_ac("j751", "j751-control", "unconfined", "report completion")
+        .unwrap();
+
+    let before = d.rpc("task_show", json!({"task": "j751-stale"})).unwrap()["task"].clone();
+    let err = d.job_dispatch("j751-stale", json!({})).unwrap_err();
+    assert!(
+        err.to_string().contains("Choose a non-Devin model"),
+        "{err}"
+    );
+    let after = d.rpc("task_show", json!({"task": "j751-stale"})).unwrap()["task"].clone();
+    assert_eq!(after["state"], "draft", "{after}");
+    assert_eq!(after["revision"], before["revision"], "{after}");
+    assert!(after["dispatch_message"].is_null(), "{after}");
+
+    let control = d.job_dispatch("j751-control", json!({})).unwrap();
+    let message = control["message"].as_str().unwrap();
+    assert_eq!(control["task"]["dispatch_message"], message);
+    d.wait_message("unconfined", message, &["completed"], 20);
+}
+
 /// `agent set` cannot shed the boundary: `confine` is a posture param
 /// — an agent caller gets refused; only operator/PM may change it, and
 /// only for the next launch.
@@ -1306,9 +1377,8 @@ fn confined_devin_model_refuses_before_bootstrap() {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(home.join(".local/share/devin")).unwrap();
-    // Test-only bytes, never a real credential — the sweep below
-    // proves they reach no state file on this ordinary path even
-    // though the policy grants the confined child this read.
+    // Test-only bytes, never a real credential. The launch must refuse
+    // before Pi can read this file or copy its bytes into state.
     let canary = "CAD751-TEST-ONLY-NOT-A-SECRET";
     std::fs::write(
         home.join(".local/share/devin/credentials.toml"),
