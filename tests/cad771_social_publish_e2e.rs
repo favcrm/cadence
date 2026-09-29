@@ -1772,3 +1772,76 @@ fn cad771_e2e_sender_forged_status_fails_closed_at_reconcile() {
     assert_eq!(shown["upstream"]["destination_id"], DEST_FB);
     assert_eq!(door.ledger.provider_calls(), 1);
 }
+
+#[test]
+fn cad771_e2e_hostile_reconcile_with_no_prior_evidence_stays_null() {
+    // Null-upstream variant: the claim itself records nothing (corrupt
+    // exec refused at note), then a forged status for the same key must
+    // still refuse at reconcile — processing retained, upstream null.
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "nullup");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-nullup",
+                "cad_fx_nullup_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let key = intent["request"].as_str().unwrap().to_owned();
+    // Corrupt exec: claim records nothing, processing with null upstream.
+    door.corrupt_binding_echo(true);
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck_for(&intent)}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match the frozen intent"), "{err}");
+    door.corrupt_binding_echo(false);
+    // Hostile status for the same key: reconcile refuses, null retained.
+    door.forge_status(
+        &key,
+        json!({"verdict": "ok", "state": "posted",
+            "permalink": "https://www.instagram.com/p/NULLUP/",
+            "provider_ids": ["provider-post-9"],
+            "provider_payload": "{\"id\":\"nullup\"}",
+            "destination_id": "444444444444444",
+            "caption_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "image_digest": null,
+            "repeated": false}),
+    );
+    let raw = door.post("/v1/device/publish/status", &json!({"key": key}));
+    assert_eq!(raw["destination_id"], "444444444444444");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_reconcile",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match the frozen intent"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc(
+            "social_publish_show",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(shown["state"], "processing");
+    assert!(shown["upstream"].is_null());
+}
