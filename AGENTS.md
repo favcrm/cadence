@@ -32,10 +32,11 @@ PR needs each of the following as a PASS on the exact head you enqueue:
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in
-  `docs/roles/risk-classes.md` applies. This covers every change to
-  `.github/**`, `scripts/**`, `Cargo.toml`, `Cargo.lock`,
-  `ui/package.json`, `cadence-review.toml`, `src/review.rs`,
-  `docs/roles/**` and this file. Most gates on a PR run from the PR's
+  `docs/roles/risk-classes.md` applies. That includes, but is not
+  limited to, every change to `.github/**`, `scripts/**`, `Cargo.toml`,
+  `Cargo.lock`, `ui/package.json`, `cadence-review.toml`,
+  `src/review.rs`, `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`
+  and this file. Most gates on a PR run from the PR's
   own workflow files, so review is the only control on a change to them.
   The operator decides. An agent the operator designates may prepare
   and relay the decision; the PR's author never does. Before enqueue,
@@ -47,16 +48,33 @@ PR needs each of the following as a PASS on the exact head you enqueue:
 Record the evidence so that every merge can be audited:
 - The PR title carries the issue id (`CAD-123: …`). A PR without a
   ticket does not merge.
-- Each review files one verdict note in the notes dir, in the form
-  `cadence audit` and the ticket view recognise:
-  - the file is named `<UTC>-<slug>-verdict.md`;
-  - the first line is `# Verdict: <ID> — pass` (or `— revise`);
-  - the next line is the blockquote header `> Issue: <ID>`. A bare
-    `Issue:` line, or one that follows body text, does not link the
-    note to the ticket;
-  - the body names the PR as `#<n>` and has a line `head <full-sha>`;
-  - it lists the gates run and what was read.
-  Link the note from the ticket.
+- Each review files one verdict note in the notes dir (`notes_dir` in
+  `pm.yaml`, default `/var/www/agent-notes`). Name it
+  `YYYYMMDD-HHMMSS-<slug>-verdict.md` (UTC), and use this shape so
+  `cadence audit` and the ticket view both read it:
+
+  ```markdown
+  # Verdict: CAD-123 Standards review — pass
+  > Issue: CAD-123
+  > From: <reviewer>
+
+  ## Verdict
+  pass — PR #456, head <full 40-hex sha>
+
+  Risk: auto
+
+  ## Gates
+  - <each gate run and its result; what was read>
+
+  ## Findings
+  - <blocking / should-fix / nits>
+  ```
+
+  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`.
+  The `>` header lines must follow the title directly. A bare `Issue:`
+  line does not link the note to the ticket. The audit takes the result
+  from the first line under `## Verdict`, not from the title. Link the
+  note from the ticket.
 - Before you enqueue, post one ticket comment for the head you enqueue.
   It lists every required verdict note, the green CI run and, for a
   `human`-class PR, the approval id.
