@@ -1463,8 +1463,10 @@ pub(crate) enum Commands {
     /// tracker and board port under `$CADENCE_SANDBOX_ROOT` (default
     /// `$XDG_STATE_HOME/cadence-sandbox`), run from this binary with
     /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
-    /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
-    /// watcher observe-only. Refuses production's dirs and port 3010.
+    /// into `$HOME`, refuses `ui tailscale` (and any host-global write)
+    /// unless the sandbox was started with `CADENCE_SANDBOX_ALLOW_GLOBAL=1`,
+    /// and keeps the provider WAL watcher observe-only. Refuses
+    /// production's dirs and port 3010.
     Sandbox {
         #[command(subcommand)]
         action: cadence_agent::sandbox::SandboxAction,

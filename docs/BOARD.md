@@ -1069,6 +1069,13 @@ leaves the mapping in place; `ui stop --tailscale-off` is the same
 removal without the restart semantics. `funnel` is never invoked —
 tailnet-only, no public exposure.
 
+Under a sandbox profile (`CADENCE_PROFILE=sandbox:<name>`) every path
+onto the tailnet — `ui tailscale start`, `ui start --tailscale`, and a
+persisted tailscale block in `ui.json` — is refused, unless the sandbox
+was started with the operator's explicit opt-in
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1` (`cadence sandbox down <name>` then
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up <name>`).
+
 Writers are attributed per request. `Tailscale-User-Login` resolves
 the actor to `<login> (tailscale)` — the tracker commit's `Actor:`
 trailer names the person who wrote — only for a request **proven** to

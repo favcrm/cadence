@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use cadence_agent::client;
@@ -47,7 +47,7 @@ impl Host {
         self.tmp.path().join("sandboxes")
     }
 
-    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+    fn cmd(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
         cmd.args(args)
             .env("HOME", self.home())
@@ -74,7 +74,11 @@ impl Host {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().unwrap()
+        cmd
+    }
+
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.cmd(args, env).output().unwrap()
     }
 
     fn up(&mut self, name: &str, extra: &[&str]) -> Value {
@@ -452,6 +456,276 @@ fn tailscale_and_port_3010_are_refused_under_a_sandbox_profile() {
         refused(&out, "port 3010 is the production board");
     }
     assert!(!state.join("ui.pid").exists(), "no board started");
+}
+
+// ---------- tailnet opt-in (`CADENCE_SANDBOX_ALLOW_GLOBAL`) ----------
+
+const SANDBOX_TS_DNS: &str = "node.tail1234.ts.net";
+
+/// A fake `tailscale` first on PATH (same shape as the one in
+/// tests/board_tailnet.rs): `status` answers `status.json`,
+/// `serve status` reports `serve.map` (`<dns>:<port>\t<target>`) in the
+/// real `Web` shape, `serve --bg` appends to it. Every argv lands in
+/// `calls.log`, so a refusal can prove the tailnet was never asked.
+fn fake_tailscale(parent: &Path) -> PathBuf {
+    let d = parent.join("tsbin");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("dns"), SANDBOX_TS_DNS).unwrap();
+    std::fs::write(d.join("calls.log"), "").unwrap();
+    std::fs::write(
+        d.join("status.json"),
+        format!(
+            r#"{{"BackendState":"Running","Self":{{"DNSName":"{SANDBOX_TS_DNS}."}},"CertDomains":["{SANDBOX_TS_DNS}"]}}"#
+        ),
+    )
+    .unwrap();
+    let script = r#"#!/usr/bin/env bash
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "$*" >> "$d/calls.log"
+case "${1:-}" in
+status)
+  cat "$d/status.json"
+  ;;
+serve)
+  case "${2:-}" in
+  status)
+    printf '{"Web":{'
+    first=1
+    if [ -f "$d/serve.map" ]; then
+      while IFS=$'\t' read -r key target; do
+        [ -n "$key" ] || continue
+        [ "$first" -eq 0 ] && printf ','
+        first=0
+        printf '"%s":{"Handlers":{"/":{"Proxy":"%s"}}}' "$key" "$target"
+      done < "$d/serve.map"
+    fi
+    printf '}}'
+    ;;
+  --bg)
+    port="${3#--https=}"
+    printf '%s:%s\t%s\n' "$(cat "$d/dns")" "$port" "$4" >> "$d/serve.map"
+    ;;
+  esac
+  ;;
+esac
+exit 0
+"#;
+    let path = d.join("tailscale");
+    std::fs::write(&path, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    d
+}
+
+/// Env pairs for one sandboxed `cadence` run with the fake `tailscale`
+/// first on PATH; `allow` is the opt-in value (None = unset).
+fn ts_sandbox_env<'a>(path: &'a str, allow: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+    let mut env = vec![("CADENCE_PROFILE", "sandbox:x"), ("PATH", path)];
+    if let Some(v) = allow {
+        env.push(("CADENCE_SANDBOX_ALLOW_GLOBAL", v));
+    }
+    env
+}
+
+fn ts_calls(fake: &Path) -> String {
+    std::fs::read_to_string(fake.join("calls.log")).unwrap()
+}
+
+/// Without the opt-in every route onto the tailnet refuses before
+/// `tailscale` is ever invoked — the two operator verbs AND a persisted
+/// tailscale block in `ui.json` (which the detached `ui run` would
+/// otherwise serve silently). Forged opt-in values — anything but
+/// exactly `1` — refuse the same way.
+#[test]
+fn sandbox_tailnet_writes_refused_without_the_opt_in() {
+    let host = Host::new();
+    let fake = fake_tailscale(host.tmp.path());
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let state = host.tmp.path().join("state");
+    let state_arg = state.to_str().unwrap();
+
+    for args in [
+        vec!["--state-dir", state_arg, "ui", "tailscale", "start"],
+        vec!["--state-dir", state_arg, "ui", "start", "--tailscale"],
+    ] {
+        let out = host.run(&args, &ts_sandbox_env(&path, None));
+        refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
+        assert!(text(&out).contains("opt-in"), "{}", text(&out));
+    }
+    assert_eq!(ts_calls(&fake), "", "tailscale must never run");
+
+    // A hand-written ui.json with a tailscale block: `ui start` must
+    // refuse rather than silently publishing the sandbox board.
+    let port = free_port();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("ui.json"),
+        json!({
+            "port": port,
+            "tailscale": {
+                "dns_name": SANDBOX_TS_DNS,
+                "https_port": 9450,
+                "target": format!("http://127.0.0.1:{port}"),
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = host.run(
+        &["--state-dir", state_arg, "ui", "start"],
+        &ts_sandbox_env(&path, None),
+    );
+    refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
+    assert!(
+        text(&out).contains("persisted tailscale sharing"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(ts_calls(&fake), "", "tailscale must never run");
+    assert!(!state.join("ui.pid").exists(), "no board started");
+
+    // The detached board process itself resolves the same persisted
+    // options: a bare `ui run` refuses rather than serve shared.
+    let mut child = host
+        .cmd(
+            &["--state-dir", state_arg, "ui", "run"],
+            &ts_sandbox_env(&path, None),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("ui run served instead of refusing the persisted tailscale block");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    refused(&out, "persisted tailscale sharing");
+    assert_eq!(ts_calls(&fake), "", "tailscale must never run");
+
+    // `ui tailscale stop` on the hand-written block: the serve write is
+    // gated too — the refusal is a warning (stop stays non-fatal) but
+    // tailscale is never invoked and the mapping is untouched.
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n"),
+    )
+    .unwrap();
+    let out = host.run(
+        &["--state-dir", state_arg, "ui", "tailscale", "stop"],
+        &ts_sandbox_env(&path, None),
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("refused under CADENCE_PROFILE=sandbox:x"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fake.join("serve.map")).unwrap(),
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n")
+    );
+    assert_eq!(ts_calls(&fake), "", "tailscale must never run");
+
+    // Forged opt-in values: only exactly "1" opens the gate.
+    for forged in ["true", "yes", " 1", ""] {
+        let out = host.run(
+            &["--state-dir", state_arg, "ui", "tailscale", "start"],
+            &ts_sandbox_env(&path, Some(forged)),
+        );
+        refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
+    }
+    assert_eq!(ts_calls(&fake), "", "tailscale must never run");
+}
+
+/// With `CADENCE_SANDBOX_ALLOW_GLOBAL=1` a sandbox may publish: an
+/// identical mapping is reused without `serve --bg`, and a port that
+/// already targets production's board is still a hard refusal with the
+/// mapping untouched — the opt-in never lets cadence overwrite another
+/// serve mapping.
+#[test]
+fn sandbox_tailnet_opt_in_reuses_and_refuses_a_foreign_mapping() {
+    let host = Host::new();
+    let fake = fake_tailscale(host.tmp.path());
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let state = host.tmp.path().join("state");
+    let state_arg = state.to_str().unwrap();
+    let pm = host.tmp.path().join("pm");
+    let mut env = ts_sandbox_env(&path, Some("1"));
+    env.push(("CADENCE_PM_DIR", pm.to_str().unwrap()));
+
+    let port = free_port();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("ui.json"), json!({"port": port}).to_string()).unwrap();
+    // The serve config already maps :9450 to this board — reused.
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n"),
+    )
+    .unwrap();
+    let out = host.run(&["issue", "init"], &env);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let out = host.run(
+        &["--state-dir", state_arg, "ui", "tailscale", "start"],
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "opt-in start must proceed: {}",
+        text(&out)
+    );
+    let out: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out["state"], "sharing", "{out}");
+    assert_eq!(out["mapping_created"], false, "{out}");
+    assert!(
+        !ts_calls(&fake).contains("serve --bg"),
+        "identical mapping reused, no serve --bg: {}",
+        ts_calls(&fake)
+    );
+    // Stop the board this start spawned.
+    let stop = host.run(&["--state-dir", state_arg, "ui", "stop"], &env);
+    assert!(stop.status.success(), "{}", text(&stop));
+
+    // A serve port that already targets production's board (:3010)
+    // refuses under the opt-in too — never overwritten.
+    let state2 = host.tmp.path().join("state2");
+    let state2_arg = state2.to_str().unwrap();
+    std::fs::create_dir_all(&state2).unwrap();
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:3010\n"),
+    )
+    .unwrap();
+    std::fs::write(state2.join("ui.json"), json!({"port": port}).to_string()).unwrap();
+    let out = host.run(
+        &["--state-dir", state2_arg, "ui", "tailscale", "start"],
+        &env,
+    );
+    refused(&out, "already targets http://127.0.0.1:3010");
+    assert_eq!(
+        std::fs::read_to_string(fake.join("serve.map")).unwrap(),
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:3010\n"),
+        "the foreign mapping is untouched"
+    );
+    assert!(!state2.join("ui.pid").exists(), "no board started");
 }
 
 /// A claude worker in a sandbox keeps the sandbox's tracker and

@@ -5,7 +5,8 @@
 //! tracker) and `sandbox.env`. `up` starts a daemon and a board from the
 //! invoking binary with `CADENCE_PROFILE=sandbox:<name>` exported, and
 //! that profile is the one switch the daemon and the UI read to gate
-//! global side effects: no skill sync into `$HOME`, no tailnet, an
+//! global side effects: no skill sync into `$HOME`, no tailnet unless
+//! the sandbox was started with `CADENCE_SANDBOX_ALLOW_GLOBAL=1`, an
 //! observe-only provider WAL watcher, no Cursor `cli-config.json` merge.
 //! Every verb first refuses a root that overlaps production's state
 //! dir (and so its socket) or tracker.

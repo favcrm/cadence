@@ -504,8 +504,16 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
             "board public-only mode requires a public board identity",
         ));
     }
+    // A persisted tailscale block goes live here for `ui start` and
+    // for the detached `ui run` alike — under a sandbox profile it
+    // needs the same opt-in as the explicit flag.
+    if eff.tailscale.is_some() {
+        crate::sandbox::refuse_global_unless_allowed(
+            "`ui start` with persisted tailscale sharing",
+        )?;
+    }
     if let Some(https_port) = flags.tailscale {
-        crate::sandbox::refuse_global("`ui start --tailscale`")?;
+        crate::sandbox::refuse_global_unless_allowed("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         if !is_loopback_host(&host) {
             return Err(Error::rejected(format!(
@@ -4561,8 +4569,9 @@ fn serve_map() -> Result<HashMap<u16, String>> {
 /// left alone (returns false), a different one on that port is a hard
 /// refusal — cadence never overwrites somebody else's serve config.
 fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
-    // The tailnet is host-wide: a sandbox board never goes on it.
-    crate::sandbox::refuse_global("`tailscale serve`")?;
+    // The tailnet is host-wide: a sandbox board goes on it only with
+    // the operator's explicit opt-in.
+    crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
     match serve_map()?.get(&port) {
         Some(existing) if existing == target => Ok(false),
         Some(other) => Err(Error::rejected(format!(
@@ -4585,6 +4594,8 @@ fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
 /// Remove the mapping only while it still targets what cadence
 /// recorded — a foreign or absent mapping returns false.
 fn remove_mapping(port: u16, expected: &str) -> Result<bool> {
+    // Same host-global write as `serve --bg`: sandbox needs the opt-in.
+    crate::sandbox::refuse_global_unless_allowed("`tailscale serve off`")?;
     match serve_map()?.get(&port) {
         Some(existing) if existing == expected => {
             let out = ts(&["serve", &format!("--https={port}"), "off"])?;
@@ -4624,7 +4635,7 @@ pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool)
 }
 
 fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
-    crate::sandbox::refuse_global("`ui tailscale start`")?;
+    crate::sandbox::refuse_global_unless_allowed("`ui tailscale start`")?;
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);
