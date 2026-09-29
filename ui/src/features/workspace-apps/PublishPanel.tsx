@@ -6,6 +6,7 @@ import {
   PUBLISH_TIMEZONE,
   canCancel,
   dueLabel,
+  isApprovalIdUsable,
   parseDueEpoch,
   publishStateText,
   publishStateTone,
@@ -69,7 +70,9 @@ export default function PublishPanel({
   const candidate =
     candidates.find((value) => value.run_id === candidateId) ?? null;
   const dueEpoch = parseDueEpoch(due);
-  const grantReady = grantId.trim().length > 0 && approvalId.trim().length > 0;
+  const approvalOversize = approvalId.length > 120;
+  const grantReady =
+    grantId.trim().length > 0 && isApprovalIdUsable(approvalId);
   const canDecide =
     canWrite && grantReady && candidate !== null && !busy && approved;
 
@@ -236,8 +239,15 @@ export default function PublishPanel({
         <p className="wa-kicker">
           Landed contract: send grants allow 1–10 uses · dispatch stays
           closed (send_disabled) until the operator enables it · scheduling
-          freezes the intent, never sends.
+          freezes the intent, never sends · binding pins digest-form, caption
+          re-resolves from the run at dispatch.
         </p>
+        {approvalOversize && (
+          <p className="wa-alert" data-tone="fail" role="alert">
+            The approval identity exceeds 120 characters — the contract
+            refuses it (grant_approval). Bind a shorter approval identity.
+          </p>
+        )}
         {!grantReady && (
           <p className="wa-alert">
             No publish grant is bound. Connect the destination and bind a send

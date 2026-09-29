@@ -100,6 +100,8 @@ async function main() {
   assert(text().includes("Never duplicate"), "Uncertain orders reconcile-before-retry");
   assert(text().includes("changed nothing"), "Disabled gate names validate-all/mutate-nothing");
   assert(text().includes("Processing"), "Processing state renders");
+  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "x".repeat(121) });
+  assert(text().includes("grant_approval") && button("Post now")?.disabled, "Oversize approval gates with its contract code");
   // Read-only and failure states.
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a", canWrite: false });
   assert(host.querySelector("fieldset[disabled]"), "Read-only disables the whole decision fieldset");

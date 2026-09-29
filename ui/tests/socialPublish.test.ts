@@ -55,10 +55,12 @@ async function main() {
   assert(store.publishStateTone("posted") === "ok" && store.publishStateTone("refused") === "fail"
     && store.publishStateTone("uncertain") === "warn" && store.publishStateTone("held") === "warn"
     && store.publishStateTone("queued") === "muted", "State tones match the approved language");
-  for (const code of ["send_disabled", "grant_bounds", "grant_exhausted", "grant_revoked", "destination_mismatch", "image_required", "digest_changed", "binding_changed", "future_code"]) {
-    const copy = store.refusalCopy({ code, message: "raw" }).toLowerCase();
-    assert(copy.includes("nothing was published") || copy.includes("new human decision") || copy.includes("no provider was called") || copy.includes("raw"), `Refusal ${code} stays explicit`);
+  for (const code of ["send_disabled", "grant_bounds", "grant_exhausted", "grant_revoked", "grant_mismatch", "grant_window", "grant_approval", "bad_caption_digest", "bad_image_digest", "bad_destination", "wrong_destination", "wrong_connection", "wrong_toolkit", "not_publishable", "bad_key", "bad_grant", "image_required"]) {
+    const copy = store.refusalCopy({ code, message: "" }).toLowerCase();
+    assert(copy.includes("nothing was published") || copy.includes("nothing was stored") || copy.includes("no provider was called"), `Refusal ${code} stays explicit`);
   }
+  assert(store.refusalCopy({ code: "future_code", message: "raw" }).includes("future_code") && store.refusalCopy({ code: "future_code", message: "raw" }).includes("raw"), "Unknown codes stay visible with raw message");
+  assert(store.isApprovalIdUsable("op-a") && !store.isApprovalIdUsable("") && !store.isApprovalIdUsable("x".repeat(121)) && store.isApprovalIdUsable("x".repeat(120)), "Approval bound is 1..=120 characters");
   assert(store.refusalCopy({ code: "send_disabled", message: "" }).includes("changed nothing"), "Disabled gate names validate-all/mutate-nothing");
   assert(store.canCancel("queued") && store.canCancel("processing") && !store.canCancel("posted") && !store.canCancel("cancelled"), "Only pre-dispatch intents cancel");
   const label = store.dueLabel(1790601000, "Asia/Hong_Kong");

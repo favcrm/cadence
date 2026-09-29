@@ -13,6 +13,18 @@
  * reach an external provider. No live post in any test: tests stub fetch.
  */
 
+/** Operator-facing dispatch states.
+ *
+ * Mapping to the backend (771 @ aa2c2ca8 vs landed AOS-94 3d6ced85):
+ * - Store rows: queued/cancelled/processing/posted/refused/held.
+ * - Device byte-exact enum: posted/processing/refused only.
+ * - `uncertain` is DERIVED, never stored: a processing intent whose
+ *   response was lost after accept. The operator reconciles via the
+ *   status query before any retry — never a second provider call.
+ * - `held` is stored at dispatch recheck when grant, binding, app/context
+ *   or digests mismatch (recheck-then-hold); the binding pins
+ *   digest-form and the raw caption re-resolves from the run at dispatch.
+ */
 export type PublishState =
   | "queued"
   | "processing"
@@ -149,8 +161,9 @@ export function publishStateTone(
   return "muted";
 }
 
-/** Operator copy for every refusal code the contract can return, including
- *  the landed default-off gate. Unknown codes stay visible, never silent. */
+/** Operator copy for the exact refusal codes the contract returns (mirror
+ *  `SendBinding::validate`, `SendGrant::authorize`, `check_destination`).
+ *  Unknown codes stay visible with their raw message, never silent. */
 export function refusalCopy(refusal: PublishRefusal): string {
   switch (refusal.code) {
     case "send_disabled":
@@ -161,17 +174,46 @@ export function refusalCopy(refusal: PublishRefusal): string {
       return "The send grant has no uses left. Nothing was published.";
     case "grant_revoked":
       return "The send grant was revoked. Nothing was published.";
-    case "destination_mismatch":
-      return "The destination does not match the owner-authorized binding. Nothing was published.";
+    case "grant_mismatch":
+      return "The grant id does not match this binding. Nothing was published.";
+    case "grant_window":
+      return "The send grant is outside its validity window. Nothing was published.";
+    case "grant_approval":
+      return "The grant names no usable operator approval (empty or over 120 characters). Nothing was published.";
+    case "bad_caption_digest":
+      return "The caption digest is not 64 lowercase hex. Nothing was published.";
+    case "bad_image_digest":
+      return "The image digest is not 64 lowercase hex. Nothing was published.";
+    case "bad_destination":
+    case "wrong_destination":
+      return "The destination does not match the discovered owner-authorized account. Nothing was published.";
+    case "wrong_connection":
+      return "The binding names a different connection than discovery. Nothing was published.";
+    case "wrong_toolkit":
+      return "The binding toolkit differs from the discovered destination. Nothing was published.";
+    case "not_publishable":
+      return "The destination is not active, linked and open. Nothing was published.";
+    case "bad_key":
+      return "The idempotency key shape is invalid. Nothing was stored.";
+    case "bad_connection":
+    case "bad_grant":
+    case "bad_run":
+    case "bad_effect":
+      return `An identity shape is invalid (${refusal.code}). Nothing was stored.`;
     case "image_required":
       return "Instagram needs a reviewed provider-accessible image. Nothing was published.";
-    case "digest_changed":
-      return "Caption, media or destination changed after approval. Held for a new human decision — never silently published.";
-    case "binding_changed":
-      return "Binding, app or context changed at dispatch. Held for a new human decision.";
     default:
-      return refusal.message || `Refused (${refusal.code}). Nothing was published.`;
+      return refusal.message
+        ? `${refusal.message} (${refusal.code}). Nothing was published.`
+        : `Refused (${refusal.code}). Nothing was published.`;
   }
+}
+
+/** Landed `cadenceApprovalId` bound: non-empty, max 120 characters.
+ *  The UI gates scheduling on it so the contract never sees an
+ *  oversize approval from this surface. */
+export function isApprovalIdUsable(approvalId: string): boolean {
+  return approvalId.length > 0 && approvalId.length <= 120;
 }
 
 export function canCancel(state: PublishState): boolean {
