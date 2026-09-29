@@ -26,6 +26,7 @@ pub mod parse;
 pub mod plan;
 pub mod project;
 pub mod project_new;
+pub mod reconcile;
 pub mod relay;
 pub mod report;
 pub mod retro;

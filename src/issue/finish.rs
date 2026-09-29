@@ -46,8 +46,9 @@ use crate::worktree::layout;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `git -C dir <args>`; non-zero exit is a rejected error carrying
-/// stderr, like `issue::git`.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+/// stderr, like `issue::git`. `pub(crate)`: `issue reconcile` runs
+/// the same bounded probes for its merge classification.
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = git_out(dir, args, &[])?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
@@ -75,7 +76,7 @@ fn git_out(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<Output> {
 
 /// The repo's default ref for merge checks: `origin/HEAD` when set,
 /// else the main checkout's current branch.
-fn default_ref(root: &Path) -> Option<String> {
+pub(crate) fn default_ref(root: &Path) -> Option<String> {
     if let Ok(origin_head) = git(
         root,
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
@@ -99,7 +100,12 @@ fn ancestor(root: &Path, branch: &str, into: &str) -> bool {
 /// the head branch name the `pr` arm filters on (a remote-tracking
 /// tip still names the local head it was pushed from). The first
 /// match wins and is reported as `merged_by`.
-fn merge_rule(root: &Path, pr_head: &str, tip: &str, into: &str) -> Option<&'static str> {
+pub(crate) fn merge_rule(
+    root: &Path,
+    pr_head: &str,
+    tip: &str,
+    into: &str,
+) -> Option<&'static str> {
     if ancestor(root, tip, into) {
         return Some("ancestry");
     }
@@ -737,7 +743,7 @@ struct Evidence {
 }
 
 /// The branch's tip once: `rev-parse refs/heads/<branch>`.
-fn branch_tip(root: &Path, branch: &str) -> Option<String> {
+pub(crate) fn branch_tip(root: &Path, branch: &str) -> Option<String> {
     if branch.is_empty() {
         return None;
     }
@@ -778,7 +784,7 @@ fn fork_point(root: &Path, branch: &str) -> Option<String> {
 /// against the fork point, not the default branch: a lane merged by
 /// fast-forward also has no commits beyond the default branch, yet it
 /// did start.
-fn not_started(root: &Path, branch: &str, tip: &str) -> bool {
+pub(crate) fn not_started(root: &Path, branch: &str, tip: &str) -> bool {
     let Some(fork) = fork_point(root, branch) else {
         return false;
     };
