@@ -1,123 +1,21 @@
-//! Fixed image-01 generation and custody of its short-lived URL result.
-//! The CDN location is transport input only; the run receipt contains bytes.
+//! Fixed image generation prompt composition and custody decode of the
+//! retained AgenticOS artifact bytes; the run receipt stores bytes, never
+//! a provider location.
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::net::IpAddr;
 
 use serde_json::Value;
-use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::DefaultConnector;
-
-use crate::platform::AppCapabilityAsset;
 
 use super::{IMAGE_TOOL, PLATFORM};
 
-const ASSET_LIMIT: usize = 2 * 1024 * 1024;
-/// CAD-734: base64 image custody keeps the existing 1 MiB AgenticOS JSON
-/// response cap end to end. A 512 KiB decoded asset needs at most 699,052
-/// base64 characters, which plus a bounded envelope fits the unchanged
-/// 1 MiB Cadence JSON cap and the 2 MiB upstream Treg body cap. Larger
-/// assets stay on the URL-mode path; raising this bound requires a
-/// coordinated storage/replay and failure-cost proof, never a lone buffer.
-pub(crate) const BASE64_ASSET_LIMIT: usize = 512 * 1024;
-/// Ceiling for the single encoded field, checked before any decode work.
-/// 699,052 characters carry 512 KiB; the slack covers padding only.
-pub(crate) const BASE64_ENCODED_LIMIT: usize = 700_000;
-// The fixed image-01 operation asks for one square image. Keep decode work
+/// Custody bound on the retained artifact; the AgenticOS backend ceiling is
+/// larger, but this is what the downstream release path accepts.
+pub(crate) const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+// The fixed image operation asks for one square image. Keep decode work
 // independent of the compressed byte count: a tiny file can expand enormously.
 const IMAGE_SIDE_LIMIT: u32 = 2048;
 const IMAGE_PIXEL_LIMIT: u64 = 2048 * 2048;
 const IMAGE_DECODE_ALLOC_LIMIT: u64 = 64 * 1024 * 1024;
-
-pub(crate) fn valid_host(host: &str) -> bool {
-    host.len() <= 253
-        && host.contains('.')
-        && host.parse::<IpAddr>().is_err()
-        && !host.ends_with(".local")
-        && !host.ends_with(".localhost")
-        && !host.ends_with(".internal")
-        && host != "localhost"
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.as_bytes()[0].is_ascii_alphanumeric()
-                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
-/// Resolve once, reject every non-public answer, then give those exact socket
-/// addresses to the connector. This closes the usual validate-then-re-resolve
-/// DNS rebinding gap. Proxies are disabled in `image_agent`.
-#[derive(Debug, Default)]
-struct PublicResolver;
-
-impl Resolver for PublicResolver {
-    fn resolve(
-        &self,
-        uri: &ureq::http::Uri,
-        config: &ureq::config::Config,
-        timeout: ureq::unversioned::transport::NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let addresses = DefaultResolver::default().resolve(uri, config, timeout)?;
-        checked_public_addresses(addresses)
-    }
-}
-
-fn checked_public_addresses(
-    addresses: ResolvedSocketAddrs,
-) -> Result<ResolvedSocketAddrs, ureq::Error> {
-    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
-        return Err(ureq::Error::HostNotFound);
-    }
-    Ok(addresses)
-}
-
-pub(super) fn public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let o = ip.octets();
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-                || o[0] == 0
-                || o[0] >= 224
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                || (o[0] == 198 && (18..=19).contains(&o[1])))
-        }
-        IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return public_ip(IpAddr::V4(mapped));
-            }
-            let segments = ip.segments();
-            !(ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-                || segments[0] & 0xe000 != 0x2000
-                || segments[0] == 0x2002
-                || (segments[0] == 0x2001 && (segments[1] == 0 || segments[1] == 0x0db8)))
-        }
-    }
-}
-
-pub(super) fn image_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(20)))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .proxy(None)
-        .build();
-    ureq::Agent::with_parts(config, DefaultConnector::default(), PublicResolver)
-}
 
 fn manual_source_starts_with_url(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
@@ -239,97 +137,6 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     compose_image_prompt(title, prompt_source, voice, guidance, legacy)
 }
 
-pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a str, String> {
-    if result["base_resp"]["status_code"] != 0
-        || !matches!(result["metadata"]["success_count"].as_str(), Some("1"))
-        || !matches!(result["metadata"]["failed_count"].as_str(), Some("0"))
-    {
-        return Err("image provider did not attest one successful image".into());
-    }
-    // A base64-mode payload must never be accepted as a URL-mode result;
-    // mode confusion would let one paid outcome satisfy the other run.
-    if let Some(entries) = result["data"].get("image_base64") {
-        let non_empty = entries
-            .as_array()
-            .map(|items| !items.is_empty())
-            .unwrap_or(true);
-        if non_empty {
-            return Err("image URL result carries an unexpected base64 payload".into());
-        }
-    }
-    let images = result["data"]["image_urls"]
-        .as_array()
-        .ok_or("image URL list is missing")?;
-    if images.len() != 1 {
-        return Err("image provider returned a different number of images".into());
-    }
-    let url = images[0].as_str().ok_or("image URL is malformed")?;
-    let uri: ureq::http::Uri = url.parse().map_err(|_| "image URL is malformed")?;
-    let host = uri
-        .host()
-        .ok_or("image URL has no host")?
-        .to_ascii_lowercase();
-    if url.len() > 2048
-        || uri.scheme_str() != Some("https")
-        || uri
-            .authority()
-            .is_none_or(|authority| authority.as_str().contains('@'))
-        || uri.port_u16().is_some_and(|port| port != 443)
-        || !valid_host(&host)
-        || !hosts.iter().any(|approved| approved == &host)
-    {
-        return Err("image URL is outside the approved HTTPS CDN host".into());
-    }
-    Ok(url)
-}
-
-/// CAD-734: accept exactly one successful `data.image_base64` value and
-/// return its custody-checked bytes plus sniffed media type. The encoded
-/// field is bounded before decoding, the decoded bytes are bounded to
-/// [`BASE64_ASSET_LIMIT`], and the bytes then pass the same full
-/// PNG/JPEG/WebP decode, square/dimension/pixel/allocation limits as
-/// CDN custody. The encoded string is never retained: callers keep only
-/// the decoded asset bytes behind an immutable run-scoped receipt.
-pub(super) fn image_base64_bytes(result: &Value) -> Result<(Vec<u8>, &'static str), String> {
-    if result["base_resp"]["status_code"] != 0
-        || !matches!(result["metadata"]["success_count"].as_str(), Some("1"))
-        || !matches!(result["metadata"]["failed_count"].as_str(), Some("0"))
-    {
-        return Err("image provider did not attest one successful image".into());
-    }
-    // URL-mode output must never satisfy a base64-mode run (and vice
-    // versa): a retry under the same idempotency key cannot change mode.
-    if let Some(urls) = result["data"].get("image_urls") {
-        let non_empty = urls
-            .as_array()
-            .map(|items| !items.is_empty())
-            .unwrap_or(true);
-        if non_empty {
-            return Err("image base64 result carries an unexpected URL payload".into());
-        }
-    }
-    let entries = result["data"]["image_base64"]
-        .as_array()
-        .ok_or("image base64 list is missing")?;
-    if entries.len() != 1 {
-        return Err("image provider returned a different number of images".into());
-    }
-    let encoded = entries[0]
-        .as_str()
-        .ok_or("image base64 value is malformed")?;
-    if encoded.is_empty() || encoded.len() > BASE64_ENCODED_LIMIT {
-        return Err("image base64 value exceeds the supported bound".into());
-    }
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| "image base64 value is malformed")?;
-    if bytes.is_empty() || bytes.len() > BASE64_ASSET_LIMIT {
-        return Err("image base64 payload exceeds the 512 KiB base64 asset bound".into());
-    }
-    let media_type = image_data_mime(&bytes)?;
-    Ok((bytes, media_type))
-}
 pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
     let sniffed = image_data_mime(bytes)?;
     if header.trim().to_ascii_lowercase() != sniffed {
@@ -394,36 +201,6 @@ fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
         return Err("downloaded image dimensions changed during decode".into());
     }
     Ok(sniffed)
-}
-
-pub(super) fn download_image(agent: &ureq::Agent, url: &str) -> Result<AppCapabilityAsset, String> {
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|_| "image CDN request failed")?;
-    if response.status().as_u16() != 200 {
-        return Err("image CDN did not return a direct success".into());
-    }
-    let header = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit((ASSET_LIMIT + 1) as u64)
-        .read_to_vec()
-        .map_err(|_| "image CDN response exceeds 2 MiB")?;
-    if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
-        return Err("image CDN response exceeds 2 MiB".into());
-    }
-    let media_type = image_mime(&bytes, &header)?;
-    Ok(AppCapabilityAsset {
-        media_type: media_type.into(),
-        bytes,
-    })
 }
 
 /// CAD-734 mapping onto the AOS-94 slice-1 device media-import shape
@@ -515,100 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn cad734_base64_custody_accepts_one_bounded_image_and_refuses_forgeries() {
-        use base64::Engine as _;
-        let engine = base64::engine::general_purpose::STANDARD;
-        let png = encoded_png(1, 1);
-        let good = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}});
-        let (bytes, mime) = image_base64_bytes(&good).unwrap();
-        assert_eq!(bytes, png);
-        assert_eq!(mime, "image/png");
-        let jpeg = encoded_jpeg(1, 1);
-        let (bytes, mime) = image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&jpeg)]}}))
-            .unwrap();
-        assert_eq!(bytes, jpeg);
-        assert_eq!(mime, "image/jpeg");
-        for (name, result) in [
-            (
-                "missing field",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{}}),
-            ),
-            (
-                "empty list",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[]}}),
-            ),
-            (
-                "two images",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png), engine.encode(&png)]}}),
-            ),
-            (
-                "not a string",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[42]}}),
-            ),
-            (
-                "empty string",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[""]}}),
-            ),
-            (
-                "malformed base64",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":["!!!not-base64!!!"]}}),
-            ),
-            (
-                "non-standard alphabet rejected",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("-{}", engine.encode(&png))]}}),
-            ),
-            (
-                "data-url prefix rejected",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("data:image/png;base64,{}", engine.encode(&png))]}}),
-            ),
-            (
-                "failed attestation",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"1","success_count":"0"},"data":{"image_base64":[engine.encode(&png)]}}),
-            ),
-            (
-                "bad status",
-                serde_json::json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}}),
-            ),
-            (
-                "url payload in base64 result",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)],"image_urls":["https://images.example.test/a.png"]}}),
-            ),
-            (
-                "not an image",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(b"<svg>not an image</svg>")]}}),
-            ),
-            (
-                "non-square",
-                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(encoded_png(2, 1))]}}),
-            ),
-        ] {
-            assert!(image_base64_bytes(&result).is_err(), "{name}");
-        }
-        // URL-mode results must refuse a smuggled base64 payload, and an
-        // oversized encoded field must fail before any decode work.
-        let smuggled = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a.png"],"image_base64":[engine.encode(&png)]}});
-        assert!(image_url(&smuggled, &["images.example.test".into()]).is_err());
-        let oversized = "A".repeat(BASE64_ENCODED_LIMIT + 1);
-        assert!(image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[oversized]}})).is_err());
-        // A 512 KiB asset fits; anything larger is refused even though the
-        // field bound would admit its encoding.
-        let big = vec![0u8; BASE64_ASSET_LIMIT + 1];
-        let big_result = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&big)]}});
-        assert!(image_base64_bytes(&big_result).is_err());
-        // Encoded-size proof: the largest supported asset plus a bounded
-        // envelope must fit the unchanged 1 MiB JSON response cap.
-        let max_encoded = BASE64_ASSET_LIMIT.div_ceil(3) * 4;
-        assert!(
-            max_encoded <= BASE64_ENCODED_LIMIT,
-            "encoded bound must admit 512 KiB"
-        );
-        assert!(
-            max_encoded + 2048 <= 1024 * 1024,
-            "base64 JSON must fit the 1 MiB cap"
-        );
-    }
-
-    #[test]
     fn cad734_publish_binding_digests_match_grant_gate_shapes() {
         // Slice-1 fixture digest is sha256("test"): the caption half must
         // reproduce the gate's exact content binding.
@@ -673,7 +356,6 @@ mod tests {
         );
         // Slice-1 cap admits every Cadence custody bound by construction.
         const {
-            assert!(BASE64_ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
             assert!(ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
         }
     }
@@ -727,81 +409,5 @@ mod tests {
         webp.extend(b"WEBPVP8 ");
         webp.extend([0; 8]);
         assert!(image_mime(&webp, "image/webp").is_err());
-    }
-
-    #[test]
-    fn resolver_rejects_private_target_even_with_an_approved_name() {
-        let mut rebound = PublicResolver.empty();
-        rebound.push("1.1.1.1:443".parse().unwrap());
-        rebound.push("10.0.0.8:443".parse().unwrap());
-        assert!(
-            checked_public_addresses(rebound).is_err(),
-            "one rebound private answer must poison the entire DNS set"
-        );
-        let mut public = PublicResolver.empty();
-        public.push("1.1.1.1:443".parse().unwrap());
-        assert!(checked_public_addresses(public).is_ok());
-        assert!(image_agent()
-            .get("http://127.0.0.1:3191/image")
-            .call()
-            .is_err());
-        for host in [
-            "127.0.0.1",
-            "localhost",
-            "internal.local",
-            "images.example.test.evil@host.test",
-            "cdn..example.test",
-        ] {
-            assert!(!valid_host(host), "{host}");
-        }
-        assert!(valid_host("images.example.test"));
-    }
-
-    #[test]
-    fn custody_rejects_redirect_corrupt_mime_and_oversize_before_receipt() {
-        let tiny_png = encoded_png(1, 1);
-        let expected = tiny_png.clone();
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
-        let worker = std::thread::spawn(move || {
-            for index in 0..4 {
-                let request = server
-                    .recv_timeout(std::time::Duration::from_secs(3))
-                    .unwrap()
-                    .expect("image request");
-                let response = match index {
-                    0 => tiny_http::Response::from_data(Vec::new())
-                        .with_status_code(302)
-                        .with_header(
-                            tiny_http::Header::from_bytes("Location", "http://127.0.0.1/private")
-                                .unwrap(),
-                        ),
-                    1 => tiny_http::Response::from_data(b"<svg>not an image</svg>".to_vec())
-                        .with_header(
-                            tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
-                        ),
-                    2 => tiny_http::Response::from_data(vec![b'x'; ASSET_LIMIT + 1]).with_header(
-                        tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
-                    ),
-                    _ => tiny_http::Response::from_data(tiny_png.clone()).with_header(
-                        tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
-                    ),
-                };
-                request.respond(response).unwrap();
-            }
-        });
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .proxy(None)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
-        for index in 0..3 {
-            assert!(download_image(&agent, &format!("{base}/{index}")).is_err());
-        }
-        let retained = download_image(&agent, &format!("{base}/3")).unwrap();
-        assert_eq!(retained.media_type, "image/png");
-        assert_eq!(retained.bytes, expected);
-        worker.join().unwrap();
     }
 }

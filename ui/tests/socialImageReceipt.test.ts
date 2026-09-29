@@ -24,7 +24,7 @@ const run = {
   snapshot: { workflow: { title: "Caption and image", steps: [] }, inputs: { source: "Selected source" }, owner_pm: "pm-a", capabilities: { image: { id: "binding-image", revision: 1, digest: "binding-digest" } }, source: { receipt_id: "source-receipt", post: { id: "post-a", caption: "Original" } }, assignments: {} },
   steps: [], artifacts: [], reviews: [{ step_id: "review", artifact_digest: "text-digest", reviewer: "reviewer-a", decision: "approve", rationale: "Checked", asset_receipt_id: "image-receipt", asset_digest: digest }],
 };
-const receipt = { id: "image-receipt", run_id: run.id, slot: "image", digest: "receipt-digest", binding_digest: "binding-digest", asset: { media_type: "image/png", digest, size: bytes.length }, result: { schema: 1, kind: "media.generated.image", provider: "agenticos_external", model: "image-01", aspect_ratio: "1:1", asset_sha256: digest, asset_media_type: "image/png", source_receipt_id: "source-receipt", source_post_id: "post-a" } };
+const receipt = { id: "image-receipt", run_id: run.id, slot: "image", digest: "receipt-digest", binding_digest: "binding-digest", asset: { media_type: "image/png", digest, size: bytes.length }, result: { schema: 1, kind: "media.generated.image", provider: "agenticos_external", model: "openai/gpt-image-2.5", aspect_ratio: "1:1", job_id: "med_job1", charge: { currency: "USD", scale: 6, amount: "0.031500" }, price_version: "v1", quoted_micros: 31500, repeated: false, asset_sha256: digest, asset_media_type: "image/png", source_receipt_id: "source-receipt", source_post_id: "post-a" } };
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
 let returnedReceipt: typeof receipt = receipt;
 let returnedBytes = png;
@@ -70,6 +70,14 @@ async function main() {
   assert(verified.at(-1)?.receiptId === receipt.id && verified.at(-1)?.digest === digest, "Exact retained digest can unlock release");
   assert(verified.at(-1)?.subject === imageSubject(run), "Release pin binds the selected run, image binding and source");
   assert(host.textContent?.includes("Independent review pinned these bytes"), "Board explains the reviewer pin");
+  assert(host.textContent?.includes("Billed USD 0.031500"), "Receipt shows the actual billed charge");
+  assert(!host.textContent?.includes("approved rate was"), "An equal approved rate is not restated");
+  returnedReceipt = { ...receipt, result: { ...receipt.result, charge: { ...receipt.result.charge, amount: "0.040000" } } };
+  await render({ ...run, state: "running" });
+  await settleUntil(() => !!host.textContent?.includes("approved rate was USD 0.031500"), "A billed charge above the approved rate must show the approved rate");
+  returnedReceipt = receipt;
+  await render(run);
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !host.textContent?.includes("approved rate was"), "Matching charge did not hide the approved-rate suffix");
   let releaseResults!: () => void;
   holdResults = new Promise(resolve => { releaseResults = resolve; });
   await render({ ...run, state: "failed" });

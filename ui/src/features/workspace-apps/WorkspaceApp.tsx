@@ -1061,7 +1061,7 @@ export default function WorkspaceApp({
             </div>
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
-              ? <p className="wa-alert">Frozen one-image charge: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong>. This covers one `image-01` square draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed price or binding stops dispatch.</p>
+              ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>
               : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
             <section className="wa-stack">
               <h3>Frozen plan</h3>
@@ -1112,7 +1112,7 @@ export default function WorkspaceApp({
                     })
                   }
                 >
-                  {isImageRun(run) && imagePlanPriced ? `Approve one image for USD ${(run.snapshot.quotes!.image.total_price_micros / 1_000_000).toFixed(6)} and this plan` : "Approve this plan"}
+                  {isImageRun(run) && imagePlanPriced ? `Approve one image (current rate USD ${(run.snapshot.quotes!.image.total_price_micros / 1_000_000).toFixed(6)})` : "Approve this plan"}
                 </Button>
               )}
               {run.state === "approved" && (
