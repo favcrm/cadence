@@ -1,3 +1,6 @@
+import { ApiError } from "../../lib/api";
+import { sessionHeaders } from "../../lib/sessionKey";
+
 /** CAD-787 product client for the publish decision surface.
  *
  * Binds the approved preview flow to the CAD-771/AOS-94 exact-destination
@@ -123,30 +126,50 @@ function sameOrigin(path: string): string {
   return path;
 }
 
-async function request<T>(path: string, body?: unknown): Promise<T> {
-  const response = await fetch(sameOrigin(path), {
-    method: body === undefined ? "GET" : "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(
-      `Publish request failed (${response.status})${detail ? `: ${detail.slice(0, 200)}` : ""}`,
-    );
+/** Body keys the relay accepts per operation (mirrors the hostActions
+guard pattern): anything else is forged and never serializes. Schedule
+carries the artifact-freeze grammar only — digests derive server-side.
+Cancel carries an empty body. */
+const SCHEDULE_KEYS = [
+  "request_id", "install_id", "context_id", "run_id", "effect_id",
+  "artifact_id", "bundle_digest", "slot", "destination_id", "toolkit",
+  "media_key", "grant_id", "approval_id", "due_epoch", "timezone",
+] as const;
+
+function assertCleanBody(body: Record<string, unknown>, allowed: readonly string[]): void {
+  for (const key of Object.keys(body)) {
+    if (!allowed.includes(key)) throw new ApiError(`refused publish field: ${key}`, 400);
   }
-  return (await response.json()) as T;
+}
+
+/** Reads are abortable and uncached so receipts never outlive an operator
+session; transport mirrors workspaceApps/hostActions (same-origin
+credentials, session headers, board marker on writes). */
+async function request<T>(path: string, signal?: AbortSignal, body?: Record<string, unknown>): Promise<T> {
+  if (body !== undefined) assertCleanBody(body, SCHEDULE_KEYS);
+  const response = await fetch(sameOrigin(path), {
+    method: body === undefined ? "GET" : "POST", signal,
+    credentials: "same-origin", cache: "no-store",
+    headers: body === undefined ? sessionHeaders() : {
+      "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+  if (value === null) throw new ApiError("The server returned an invalid publish receipt", 502);
+  return value as T;
 }
 
 export const socialPublish = {
-  list: (installId: string, contextId: string | null) =>
-    request<{ intents: PublishIntent[] }>(paths.list(installId, contextId)),
-  show: (intentId: string) =>
-    request<{ intent: PublishIntent }>(paths.show(intentId)),
+  list: (installId: string, contextId: string | null, signal?: AbortSignal) =>
+    request<{ intents: PublishIntent[] }>(paths.list(installId, contextId), signal),
+  show: (intentId: string, signal?: AbortSignal) =>
+    request<{ intent: PublishIntent }>(paths.show(intentId), signal),
   schedule: (body: SchedulePublishBody) =>
-    request<{ intent: PublishIntent }>(paths.schedule(), body),
+    request<{ intent: PublishIntent }>(paths.schedule(), undefined, body as unknown as Record<string, unknown>),
   cancel: (intentId: string) =>
-    request<{ intent: PublishIntent }>(paths.cancel(intentId), {}),
+    request<{ intent: PublishIntent }>(paths.cancel(intentId), undefined, {}),
 };
 
 export function publishStateText(state: PublishState): string {
@@ -197,6 +220,11 @@ export function reconcileReading(state: PublishState): string | null {
  *  revoked/exhausted/window/approval/bounds, image_required, key_conflict,
  *  not_publishable, wrong_connection/destination/toolkit, unknown_key,
  *  send_disabled. Unknown codes stay visible with their raw message.
+ *
+ *  Transport note (CAD-802): install/context identity always arrives via
+ *  props from the route-owned WorkspaceApp — never from a form field —
+ *  and the shell observes context selection for chat scope with zero
+ *  panel work. Body keys are allowlisted per operation like hostActions.
  *
  * Field mappings (771 binding): idempotency_key comes from the schedule
  * request; channel is the request toolkit; frozen_digest is the
