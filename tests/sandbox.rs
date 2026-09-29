@@ -1087,7 +1087,7 @@ fn sandbox_env_exports_the_recorded_opt_in() {
     )
     .unwrap();
     assert_eq!(marker["allow_global"], false, "{marker}");
-    host.up("gb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", " 1")]);
+    host.up_with("gb", &[], &[("CADENCE_SANDBOX_ALLOW_GLOBAL", " 1")]);
     let marker: Value = serde_json::from_str(
         &std::fs::read_to_string(host.base().join("gb").join(".cadence-sandbox")).unwrap(),
     )

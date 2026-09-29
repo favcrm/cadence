@@ -692,6 +692,12 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
         .env_remove("CADENCE_ALIAS")
         .env_remove("CADENCE_ROLLOUT_AS")
         .stdin(Stdio::null());
+    // Children get exactly the grant `up` records: `1` or nothing.
+    if std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1") {
+        cmd.env(ALLOW_GLOBAL_ENV, "1");
+    } else {
+        cmd.env_remove(ALLOW_GLOBAL_ENV);
+    }
     cmd
 }
 
