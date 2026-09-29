@@ -313,6 +313,17 @@ impl Shared {
             )
     }
 
+    /// Epoch-seconds twin of `stall_now`: wall epoch plus the test
+    /// offset (`0` in production) for gates that compare against
+    /// stored epoch stamps.
+    fn stall_epoch(&self) -> f64 {
+        epoch_secs()
+            + self
+                .stall_clock_offset
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .max(0) as f64
+    }
+
     /// Sample owned agents on a slow cadence until shutdown. The stall
     /// watch itself only ever emits events and notices — it never
     /// interrupts, re-dispatches or fences anything it observes. The
@@ -702,7 +713,7 @@ impl Shared {
                 if running.is_none() && !w.delivery_stalled_sent && probe.idle {
                     if let Some(m) = tracked.as_ref() {
                         let bound = self.delivery_watch_budget(&agent);
-                        let queued_secs = epoch_secs() - m.created;
+                        let queued_secs = self.stall_epoch() - m.created;
                         if bound > 0 && queued_secs >= bound as f64 {
                             w.delivery_stalled_sent = true;
                             delivery_fire = Some((m.id.clone(), queued_secs as u64, probe.clone()));
