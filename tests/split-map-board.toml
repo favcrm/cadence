@@ -357,6 +357,11 @@ tests = [
     "hosted_public_only_detached_child_probe",
     "hosted_public_only_cannot_be_persisted_over_a_running_open_board",
     "hosted_public_only_cannot_change_live_public_identity_without_restart",
+    "device_routes_are_dead_without_configuration",
+    "device_grant_opens_a_remote_session",
+    "device_grant_terminal_states_settle_without_a_session",
+    "device_poll_from_a_pane_is_refused_without_side_effects",
+    "device_grant_for_another_workspace_settles_without_a_session",
 ]
 helpers = [
     "jwks_stub",
