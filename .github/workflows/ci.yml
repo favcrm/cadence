@@ -318,14 +318,6 @@ jobs:
       # for (tests/split_map_inventory.rs is the suite-side twin check).
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
-      # The feature-on suite cannot compile cfg(not(test-seam)) proofs.
-      # Run only that identity contract in the production feature shape.
-      - name: Run default-feature test-seam refusal proofs
-        if: steps.scope.outputs.mode != 'docs'
-        env:
-          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
-          CARGO_BUILD_JOBS: 4
-        run: scripts/cadence-nextest --test test_seam --locked
       # CAD-771: board-surface Rust tests serve the real SPA build
       # through `ui/dist`. The ui job cannot hand files to this job
       # without artifact transfer, so build here before nextest (non-docs).
@@ -374,11 +366,38 @@ jobs:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
 
-  # Stable required-check name over the shards above: branch protection
-  # requires `test`, and downstream gates read `needs.test.result`.
-  # Skipped (not failed) when any shard fails, so red stays red.
+  # The feature-on suite cannot compile cfg(not(test-seam)) proofs, so
+  # the refusal proofs run in the production feature shape. One job runs
+  # them once, in parallel with the shards instead of inside each —
+  # the second compile leaves every shard's critical path (CAD-809).
+  test-seam-refusal:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned cargo-nextest (PR93 dependency)
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      - name: Run default-feature test-seam refusal proofs
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+        run: scripts/cadence-nextest --test test_seam --locked
+
+  # Stable required-check name over the shards and the refusal job
+  # above: branch protection requires `test`, and downstream gates read
+  # `needs.test.result`. Skipped (not failed) when either fails, so red
+  # stays red.
   test:
-    needs: [queue-evidence, test-shard]
+    needs: [queue-evidence, test-shard, test-seam-refusal]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -386,7 +405,9 @@ jobs:
       - name: Aggregate test-shard results
         run: |
           echo "test shards: ${{ needs.test-shard.result }}"
+          echo "test-seam refusal: ${{ needs.test-seam-refusal.result }}"
           [ "${{ needs.test-shard.result }}" = success ]
+          [ "${{ needs.test-seam-refusal.result }}" = success ]
 
   build:
     needs: [queue-evidence]

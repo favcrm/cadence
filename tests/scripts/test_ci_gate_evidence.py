@@ -121,5 +121,56 @@ sys.exit(1 if os.environ["FIXTURE_FAIL"] == "true" else status)
         self.assertLess(self.release.index("NEEDS_JSON:"), self.release.index("actions/checkout@"))
 
 
+def job_body(workflow, name):
+    """A job's lines, from its `  name:` header to the next job header."""
+    body = workflow.split(f"  {name}:\n", 1)[1]
+    return re.split(r"\n  \S[^:\n]*:\n", body, maxsplit=1)[0]
+
+
+class TestSeamRefusalJob(unittest.TestCase):
+    """CAD-809: the default-feature refusal proofs run once, in their own
+    job in parallel with the shards — never inside every shard."""
+
+    def setUp(self):
+        self.workflow = WORKFLOW.read_text()
+        self.shard = job_body(self.workflow, "test-shard")
+        self.refusal = job_body(self.workflow, "test-seam-refusal")
+        self.aggregate = job_body(self.workflow, "test")
+
+    def test_shard_body_has_no_refusal_compile(self):
+        self.assertNotIn("--test test_seam", self.shard)
+
+    def test_refusal_job_runs_one_locked_default_feature_invocation(self):
+        self.assertIn("run: scripts/cadence-nextest --test test_seam --locked", self.refusal)
+        self.assertNotIn("--features test-seam", self.refusal)
+        self.assertNotIn("steps.scope", self.refusal)
+
+    def test_aggregate_needs_shards_and_refusal(self):
+        needs = re.search(r"needs: \[([^\]]+)\]", self.aggregate)[1]
+        self.assertIn("test-shard", needs)
+        self.assertIn("test-seam-refusal", needs)
+
+    def test_aggregate_fails_unless_both_succeed(self):
+        script = textwrap.dedent(self.aggregate.split("        run: |\n", 1)[1])
+        results = ["success", "failure", "cancelled", "skipped", ""]
+        for shard in results:
+            for refusal in results:
+                with self.subTest(shard=shard, refusal=refusal):
+                    substituted = (
+                        script.replace("${{ needs.test-shard.result }}", shard)
+                        .replace("${{ needs.test-seam-refusal.result }}", refusal)
+                    )
+                    # Actions `run:` steps execute as `bash -eo pipefail`;
+                    # without -e a failed early check is masked by the last.
+                    run = subprocess.run(
+                        ["bash", "-eo", "pipefail", "-c", substituted],
+                        capture_output=True,
+                    )
+                    if shard == "success" and refusal == "success":
+                        self.assertEqual(run.returncode, 0)
+                    else:
+                        self.assertNotEqual(run.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
