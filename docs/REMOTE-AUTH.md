@@ -138,7 +138,24 @@ cadence remote enrollment browser \
 
 The same independently created `trusted-issuer` pin is required before the
 first request. `--no-open` prints the URL and code for another device. The CLI
-requests only `bridge.enroll` and `results.submit`, proves possession with a
+can opt in to a staging Cloudflare Access ingress pass by placing a separately
+provisioned `access-issuer.json` in the same private enrollment directory with
+mode 0600 and owner-only directory permissions:
+
+```json
+{"issuer":"https://your-agenticos-api.example","client_id":"<Access client ID>","client_secret":"<Access client secret>"}
+```
+
+The file's issuer must exactly match `trusted-issuer` and `--issuer`. The CLI
+reads it only for browser enrollment and sends the two `CF-Access-Client-*`
+headers only to that issuer's device code, device token and child enrollment
+paths. It refuses redirects, ambient proxies, changed config, Access challenge
+responses and malformed grants. Do not put this secret in argv or an environment
+variable. Access opens the API ingress only; AgenticOS still requires PKCE,
+owner consent, exact organization and audience, and its own `hct_` grant. The
+service enrollment and board result sender do not use this Access pass.
+
+The CLI requests only `bridge.enroll` and `results.submit`, proves possession with a
 fresh PKCE verifier, and accepts only the issuer's matching owner grant. It
 uses the one-time `hct_` bridge to enroll an implementer child through
 `/v1/hosted-cadence/enroll`. It does not use the unrelated `agc_` tools login or
