@@ -662,7 +662,15 @@ impl DeliveryPolicy {
             }
             match &rule.when {
                 None => {
-                    if rule.require.iter().any(|r| self.reviews[r].blocking()) {
+                    // The floor is a human-or-peer gate: only an agent
+                    // or operator review counts — a `check` is a bot
+                    // and never satisfies it, even `mode: required`
+                    // (which still blocks where a rule names it).
+                    if rule
+                        .require
+                        .iter()
+                        .any(|r| matches!(self.reviews[r], Review::Agent { .. } | Review::Operator))
+                    {
                         floor = true;
                     }
                 }
@@ -693,7 +701,8 @@ impl DeliveryPolicy {
         if !floor {
             return Err(err(
                 "risk must hold one unconditional rule (no `when`) whose require \
-                 includes a blocking review (agent, operator or a required check)",
+                 includes an agent or operator review — a bot check never \
+                 satisfies the floor",
             ));
         }
         if !(1..=10).contains(&self.max_revise) {
@@ -1019,6 +1028,20 @@ mod tests {
                            risk: [{when: {paths: [x]}, require: [d]}]}",
                 "unconditional rule",
             ),
+            // The floor needs an agent or operator review — a bot
+            // check never satisfies it, even `required`: alone
+            // unconditionally, or beside a conditional agent rule.
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, \
+                           risk: [{require: [c]}]}",
+                "a bot check never satisfies the floor",
+            ),
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                           r: {kind: agent, focus: general}}, \
+                           risk: [{require: [c]}, {when: {lines_over: 1}, require: [r]}]}",
+                "a bot check never satisfies the floor",
+            ),
             // 10: max_revise in 1..=10.
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 0}",
@@ -1064,11 +1087,13 @@ mod tests {
             assert!(e.contains(why), "{yaml} -> {e}");
             assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
         }
-        // …and the floor accepts an agent, an operator or a required
-        // check.
+        // …and the floor accepts an agent or an operator — a required
+        // check may join them, but never stands alone.
         for yaml in [
             "delivery: {reviews: {g: {kind: operator}}, risk: [{require: [g]}]}",
-            "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, risk: [{require: [c]}]}",
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}]}",
+            "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                        r: {kind: agent, focus: general}}, risk: [{require: [c, r]}]}",
             "delivery: {reviews: {r: {kind: agent, focus: general}}, \
                        risk: [{require: [r]}, {when: {paths: ['**', 'x/**/y']}, require: [r]}]}",
         ] {

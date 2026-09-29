@@ -494,8 +494,9 @@ segment, `\`, control character or `[`/`]`/`{`/`}`/`?` — `*` may
 appear inside a segment, `**` only as a whole segment like `ui/**` or
 `a/**/b`; slice 3 owns matching). `heavy` sits strictly
 under `oversized`. And the safety floor: at least one unconditional
-rule must require a blocking review (`agent`, `operator` or a
-`required` check), so a merge can never need no review at all.
+rule must require an `agent` or `operator` review — a `check` is a bot
+and never satisfies the floor, even `required` (it still blocks where
+a rule names it) — so a merge can never need no review at all.
 
 While the file's section is not the approved one, every reader falls
 back — to the approved policy, else the defaults — and reports the
