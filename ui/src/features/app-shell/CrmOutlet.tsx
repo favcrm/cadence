@@ -2,15 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import type { Viewer } from "../projects/work";
+import CrmShell from "./CrmCustomers";
 import type { HostScope } from "./hostActions";
 
 export type OutletView = "list" | "new";
 
 /**
- * The generic installed-App outlet (CAD-802). CAD-781 fills this frame
- * with the real CRM customer list/new/detail; until then it is a
- * truthful coming-soon surface with the same list/detail/new shape —
- * no fake customer records, ever.
+ * The installed-App outlet (CAD-802 shell, CAD-781 CRM Customers).
+ * CRM installations render the real customer list/new/detail drawer;
+ * every other App keeps the truthful coming-soon surface with the
+ * same list/detail/new shape — no fake records, ever.
  */
 export default function CrmOutlet({
   scope,
@@ -24,8 +25,50 @@ export default function CrmOutlet({
 }: {
   scope: HostScope;
   installationTitle: string;
-  /** CRM names its forthcoming records; every other App stays neutral. */
+  /** CRM names its records; every other App stays neutral. */
   appKind: "crm" | "generic";
+  view: OutletView;
+  recordId: string | null;
+  viewer: Viewer;
+  onView: (view: OutletView) => void;
+  onSelect: (recordId: string | null) => void;
+}) {
+  if (appKind === "crm") {
+    return (
+      <CrmShell
+        scope={scope}
+        viewer={viewer}
+        view={view}
+        recordId={recordId}
+        onView={onView}
+        onSelect={onSelect}
+      />
+    );
+  }
+  return (
+    <GenericOutlet
+      scope={scope}
+      installationTitle={installationTitle}
+      view={view}
+      recordId={recordId}
+      viewer={viewer}
+      onView={onView}
+      onSelect={onSelect}
+    />
+  );
+}
+
+function GenericOutlet({
+  scope,
+  installationTitle,
+  view,
+  recordId,
+  viewer,
+  onView,
+  onSelect,
+}: {
+  scope: HostScope;
+  installationTitle: string;
   view: OutletView;
   recordId: string | null;
   viewer: Viewer;
@@ -69,9 +112,7 @@ export default function CrmOutlet({
           <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="records" role="status">
             <p className="font-medium text-ink-200">No records yet in {installationTitle}</p>
             <p className="mt-1">
-              {appKind === "crm"
-                ? "Customer records arrive with CAD-781. This outlet stays empty until the server returns real rows — nothing here is sample data."
-                : "This App's record screens are not installed yet. This outlet stays empty until the server returns real rows — nothing here is sample data."}
+              This App's record screens are not installed yet. This outlet stays empty until the server returns real rows — nothing here is sample data.
             </p>
             <p className="num text-micro text-ink-500 mt-2">
               Installation {scope.installId} · Context {scope.contextId || "none"}
@@ -104,10 +145,10 @@ export default function CrmOutlet({
                 onChange={(e) => setDraft(e.target.value)}
                 maxLength={120}
                 autoComplete="off"
-                placeholder="Unsaved draft — CAD-781 wires this to the server"
+                placeholder="Unsaved draft — this App's form wires this to the server"
               />
               <p className="text-micro text-ink-500">
-                Saving is disabled until this App's form lands{appKind === "crm" ? " (CAD-781 provides the customer form)" : ""}. This draft never leaves the browser.
+                Saving is disabled until this App's form lands. This draft never leaves the browser.
               </p>
               <div>
                 <Button type="submit" variant="primary" disabled title="Record creation arrives with this App's screens">
@@ -133,7 +174,7 @@ export default function CrmOutlet({
             </Button>
           </div>
           <p className="text-secondary text-ink-400">
-            Record <span className="num">{recordId}</span> has no reader yet{appKind === "crm" ? " — CAD-781 provides the detail drawer" : ""}.
+            Record <span className="num">{recordId}</span> has no reader yet.
             The selection stays in the URL so a refresh or pasted link keeps it.
           </p>
           <p className="mt-2">

@@ -657,3 +657,109 @@ fn cad768_http_verb_path_matrix() {
         before["record"]
     );
 }
+
+/// CAD-781 list search and pagination through the actual HTTP peer.
+///
+/// Positive search/pagination over real transport matches RPC
+/// semantics; forged or out-of-bounds selectors refuse with a generic
+/// error that leaks no customer content, and query strings on
+/// non-list routes (including creates) refuse before any mutation.
+#[test]
+fn cad781_http_list_search_and_pagination_through_peer() {
+    let b = Board::new();
+    let base = b.base();
+    let seed = [
+        (
+            "customer-s1",
+            r#"{"schema":1,"display_name":"Search Alpha One","email":"alpha-one@example.com","tags":["alpha"],"consent":{"email":"granted"}}"#,
+        ),
+        (
+            "customer-s2",
+            r#"{"schema":1,"display_name":"Search Beta Two","email":"beta-two@example.com","tags":["beta"],"source":"import","consent":{"email":"denied"}}"#,
+        ),
+        (
+            "customer-s3",
+            r#"{"schema":1,"display_name":"Search Gamma Three","email":"gamma-three@example.com","tags":[],"consent":{"email":"unknown"}}"#,
+        ),
+    ];
+    for (id, profile) in seed {
+        b.value(
+            "POST",
+            &base,
+            json!({"record_id": id, "profile": Board::profile(profile)}),
+        );
+    }
+
+    let all = b.value("GET", &base, json!({}));
+    assert_eq!(all["records"].as_array().unwrap().len(), 3);
+    assert_eq!(all["truncated"], false);
+    assert!(all["next_cursor"].is_null());
+
+    // Server-side search narrows to the matching row only.
+    let found = b.value("GET", &format!("{base}?query=Beta"), json!({}));
+    let rows = found["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "customer-s2");
+
+    // Cursor pagination walks the ordered ids without overlap.
+    let first = b.value("GET", &format!("{base}?limit=2"), json!({}));
+    assert_eq!(first["records"].as_array().unwrap().len(), 2);
+    assert_eq!(first["truncated"], true);
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    assert_eq!(cursor, first["records"][1]["id"].as_str().unwrap());
+    let second = b.value("GET", &format!("{base}?limit=2&cursor={cursor}"), json!({}));
+    let tail = second["records"].as_array().unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(second["truncated"], false);
+    assert!(second["next_cursor"].is_null());
+    assert_ne!(tail[0]["id"], first["records"][0]["id"]);
+
+    // Forged and out-of-bounds selectors refuse without a leak.
+    for path in [
+        format!("{base}?install_id=other"),
+        format!("{base}?by=operator"),
+        format!("{base}?project=client"),
+        format!("{base}?query=Beta&query=Beta"),
+        format!("{base}?limit=0"),
+        format!("{base}?limit=101"),
+        format!("{base}?limit=many"),
+        format!("{base}?cursor=a/b"),
+        format!("{base}?query=%ZZ"),
+        format!("{}/customer-s1?query=Beta", base),
+        format!("{}/customer-s1/update?limit=2", base),
+    ] {
+        let method = if path.contains("/update?") {
+            "POST"
+        } else {
+            "GET"
+        };
+        let body = if method == "POST" {
+            json!({"expected_revision": 1, "profile": Board::profile(PROFILE_A)}).to_string()
+        } else {
+            String::new()
+        };
+        let (code, text) = b.operator(method, &path, &body);
+        assert!(
+            code == 400 || code == 405,
+            "list selector misuse admitted {path}: {code}"
+        );
+        assert!(
+            !text.contains("alpha-one@example.com") && !text.contains("Search Alpha"),
+            "selector refusal leaked customer content for {path}"
+        );
+    }
+    // A create behind a query string refuses before any row mutates.
+    let (code, _) = b.operator(
+        "POST",
+        &format!("{base}?query=Beta"),
+        &json!({"record_id": "customer-evil", "profile": Board::profile(PROFILE_A)}).to_string(),
+    );
+    assert_eq!(code, 400, "queried create admitted: {code}");
+    assert_eq!(
+        b.value("GET", &base, json!({}))["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
