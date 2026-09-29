@@ -5,13 +5,12 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
-  connectionLabel,
   isAvailable,
-  isLocalOutbox,
   pinWord,
   readinessText,
   scopeHint,
 } from "../src/features/settings/connectionsView";
+import { connectionLabel, isLocalOutbox } from "../src/lib/connections";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);

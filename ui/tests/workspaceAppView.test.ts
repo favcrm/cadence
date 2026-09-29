@@ -19,7 +19,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
-const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"], capabilities: { publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" } }, connection_slots: [] };
+const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"], capabilities: { publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" } }, connection_slots: ["cms"] };
 let simulatedInstallation: typeof installation | null = null;
 let loseUpgradeReply = false;
 const snapshot = { owner_pm: "pm-a", inputs: { subject: "Synthetic caption", source: "Synthetic source facts", writer: "writer-a", reviewer: "reviewer-a" }, workflow: { title: "Instagram caption: Synthetic caption", publication_slot: "publication", steps: [{ id: "1", kind: "produce_text", assignee: "writer-a", dependencies: [], instruction: "Write" }, { id: "2", kind: "review_text", assignee: "reviewer-a", dependencies: ["1"], instruction: "Review" }] }, publication: { slot: "publication", binding: { id: "binding-a", revision: 1, digest: "binding-digest" } }, assignments: {} };
@@ -43,7 +43,10 @@ function read(path: string): Response {
   if (path === "/api/app-installations/install-a") return json(simulatedInstallation ?? installation);
   if (path === "/api/app-installations/install-a/contexts") return json({ contexts: [{ id: "context-b", install_id: "install-a", revision: 1, state: "active", digest: "brand-digest", config: { schema: 1, label: "Brand B", input_defaults: {} } }] });
   if (path === "/api/app-installations/install-a/bindings") return json({ bindings: [{ id: "binding-a", install_id: "install-a", context_id: null, slot: "publication", revision: 1, state: "configured", digest: "binding-digest", config: { bundle_digest: "bundle-digest", connection_id: "local-id", account: "default" } }] });
-  if (path === "/api/connections") return json({ connections: [{ id: "local-id", provider: "local", account: "local", kind: "builtin", descriptor: { action_mappings: [{ capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" }] }, status: { manifest_status: "matched", custody_available: true, adapter_registered: true } }] });
+  if (path === "/api/connections") return json({ connections: [
+    { id: "local-id", provider: "local", account: "local", kind: "builtin", scopes: [], descriptor: { action_mappings: [{ capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send", scopes: [] }] }, status: { manifest_status: "matched", custody_available: true, adapter_registered: true } },
+    { id: "conn-extra", provider: "local", account: "extra", kind: "builtin", scopes: [], descriptor: { action_mappings: [{ capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send", scopes: [] }] }, status: { manifest_status: "matched", custody_available: true, adapter_registered: true } },
+  ] });
   if (path === "/api/agents") return json({ agents: [{ alias: "pm-a", role: "pm", group: "pm-a", state: "idle" }, { alias: "writer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }, { alias: "reviewer-a", role: "worker", group: "pm-a", provider: "codex", endpoint_kind: "managed", state: "idle" }] });
   if (path === "/api/app-runs?install_id=install-a") return json({ runs: rows });
   if (path === "/api/app-installations/install-a/effects") return json({ effects });
@@ -276,6 +279,15 @@ async function main() {
   await choosePage("Publication connection", "Local outbox");
   await click(button("Save publication connection"));
   assert(writes.at(-1)?.body.request_id && writes.at(-1)?.body.request_id !== oldBindingId, "Same connection in a new bundle needs a new binding request identity");
+  assert(text().includes("binds through"), "Legacy untyped slots name their app-set path instead of offering a board save");
+  // An unsaved Brand B choice must not leak into the context-free slot.
+  await choosePage("Publication connection", "local · extra");
+  await click(host.querySelector('button[aria-label="Optional brand context"]'));
+  await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("No brand context")));
+  assert(host.querySelector('button[aria-label="Publication connection"]')?.textContent?.includes("Local outbox"), "Switching brand keeps no unsaved choice");
+  await choosePage("Publication connection", "local · extra");
+  await click(button("Save publication connection"));
+  assert(writes.at(-1)?.body.slot === "publication" && writes.at(-1)?.body.connection_id === "conn-extra" && !Object.hasOwn(writes.at(-1)?.body ?? {}, "context_id"), "Context-free save uses its own draft, never the other brand's");
   await fill('input[placeholder="/absolute/path/to/app or https://github.com/owner/repo"]', "/tmp/social-v04");
   await click(button("Check update")); await click(button("Apply checked update"));
   assert(simulatedInstallation.digest === "bundle-digest" && simulatedInstallation.catalog_generation === "catalog-generation", "Return to the earlier bundle restores its prior content-derived catalog generation");

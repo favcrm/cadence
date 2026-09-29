@@ -1,4 +1,5 @@
 import type { Connection, ConnectionProvider } from "../../lib/types";
+import { isLocalOutbox } from "../../lib/connections";
 
 /**
  * The Settings Connections page's view of provider connections
@@ -10,17 +11,6 @@ import type { Connection, ConnectionProvider } from "../../lib/types";
  * Every helper reads metadata only: rows never carry secret bytes, and
  * nothing here stores a token.
  */
-
-/** Is this the built-in Local outbox — always present, provider local. */
-export function isLocalOutbox(row: Pick<Connection, "provider" | "account">): boolean {
-  return row.provider === "local" && row.account === "local";
-}
-
-/** The connection's plain name: "Local outbox", else `provider · account`. */
-export function connectionLabel(row: Pick<Connection, "provider" | "account">): string {
-  if (isLocalOutbox(row)) return "Local outbox";
-  return `${row.provider} · ${row.account}`;
-}
 
 /** Is this connection usable — registered, described and in custody? */
 export function isAvailable(row: Connection): boolean {

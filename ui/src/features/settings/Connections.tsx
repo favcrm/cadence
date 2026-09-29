@@ -11,12 +11,12 @@ import {
   canManage,
   capabilityWords,
   connectionCapabilities,
-  connectionLabel,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
 } from "./connectionsView";
+import { connectionLabel } from "../../lib/connections";
 
 /**
  * Settings → Connections (CAD-585): the operator's view of exact

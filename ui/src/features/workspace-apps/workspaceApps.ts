@@ -25,10 +25,12 @@ export interface AppContext {
 }
 export interface ActionMapping {
   capability: string; version: number; action: string; resource_kind: string;
-  effect: string; semantics: string; input_contract: string; output_contract: string;
+  effect: string; semantics: string; scopes: string[];
+  input_contract: string; output_contract: string;
 }
 export interface Connection {
   id: string; provider: string; account: string; kind: string;
+  scopes: string[];
   descriptor: { action_mappings: ActionMapping[] } | null;
   status: { manifest_status: string; custody_available: boolean; adapter_registered: boolean };
 }

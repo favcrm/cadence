@@ -2,9 +2,7 @@ import {
   bindingForSlot,
   bindingHealth,
   candidatesFor,
-  connectionLabel,
   declaredSlots,
-  isLocalOutbox,
   plainRequirement,
 } from "../src/features/workspace-apps/bindingChoices";
 import type {
@@ -49,7 +47,7 @@ function installation(): Installation {
 function connection(over: Partial<Connection> = {}): Connection {
   return {
     id: "conn-a", provider: "agenticos_external", account: "ws_acme",
-    kind: "enrolled",
+    kind: "enrolled", scopes: [],
     descriptor: { action_mappings: [] },
     status: { manifest_status: "matched", custody_available: true, adapter_registered: true },
     ...over,
@@ -63,7 +61,8 @@ function localConnection(): Connection {
       action_mappings: [{
         capability: "text.publish", version: 1, action: "publish",
         resource_kind: "connection_account", effect: "send",
-        semantics: "LocalMarkdownSink", input_contract: "in", output_contract: "out",
+        semantics: "LocalMarkdownSink", scopes: [],
+        input_contract: "in", output_contract: "out",
       }],
     },
   });
@@ -71,12 +70,13 @@ function localConnection(): Connection {
 
 function sourceConnection(): Connection {
   return connection({
-    id: "conn-source", account: "ws_source",
+    id: "conn-source", account: "ws_source", scopes: ["sources"],
     descriptor: {
       action_mappings: [{
         capability: "social.read", version: 1, action: "list_posts",
         resource_kind: "connection_account", effect: "read",
-        semantics: "MetadataRead", input_contract: "in", output_contract: "out",
+        semantics: "MetadataRead", scopes: ["sources"],
+        input_contract: "in", output_contract: "out",
       }],
     },
   });
@@ -91,7 +91,8 @@ function binding(over: Partial<AppBinding> = {}): AppBinding {
       provider: "local", account: "local", mapping: {
         capability: "text.publish", version: 1, action: "publish",
         resource_kind: "connection_account", effect: "send",
-        semantics: "LocalMarkdownSink", input_contract: "in", output_contract: "out",
+        semantics: "LocalMarkdownSink", scopes: ["publish"],
+        input_contract: "in", output_contract: "out",
       },
     },
     ...over,
@@ -142,19 +143,22 @@ const noCustody = sourceConnection();
 noCustody.id = "conn-cust";
 noCustody.status = { ...noCustody.status, custody_available: false };
 const noDescriptor = connection({ id: "conn-nodesc", descriptor: null });
-for (const bad of [wrongVersion, wrongEffect, stalePin, noCustody, noDescriptor]) {
+// An enrolled credential missing a reviewed action scope is withheld before Save.
+const narrowScopes = sourceConnection();
+narrowScopes.id = "conn-narrow";
+narrowScopes.scopes = ["sources"];
+narrowScopes.descriptor = {
+  action_mappings: [{
+    ...sourceConnection().descriptor!.action_mappings[0],
+    scopes: ["sources", "admin"],
+  }],
+};
+for (const bad of [wrongVersion, wrongEffect, stalePin, noCustody, noDescriptor, narrowScopes]) {
   const seen = candidatesFor(sourceRead(), [bad, sourceConnection()]);
   equal(seen.offered.map((c) => c.id), ["conn-source"], `withholds ${bad.id}`);
 }
 
 // Plain words, never a tool or scope.
-equal(isLocalOutbox(localConnection()), true, "local outbox");
-equal(connectionLabel(localConnection()), "Local outbox", "outbox label");
-equal(
-  connectionLabel(sourceConnection()),
-  "agenticos_external · ws_source",
-  "enrolled label",
-);
 equal(
   plainRequirement({ slot: "publication", declaration: publication() }),
   "Publish via text.publish v1.",

@@ -4,6 +4,7 @@ import type {
   Installation,
   SlotDeclaration,
 } from "./workspaceApps";
+import { isLocalOutbox } from "../../lib/connections";
 
 /**
  * The installed-App slot-binding view (CAD-585) — which declared slots
@@ -14,10 +15,11 @@ import type {
  *
  * Compatibility mirrors the daemon's exact check
  * (`app_binding_config`): a candidate must map the declared
- * capability/version/action/resource-kind with the same effect, on a
- * matched deployment pin, with its credential in custody. The board
- * never invents a match the daemon would refuse — the typed
- * create/update calls enforce it again server-side.
+ * capability/version/action/resource-kind with the same effect, cover
+ * the mapping's scopes when enrolled, sit on a matched deployment pin
+ * with its credential in custody. The board never invents a match the
+ * daemon would refuse — the typed create/update calls enforce it again
+ * server-side.
  */
 
 export interface DeclaredSlot {
@@ -78,9 +80,17 @@ export function candidatesFor(
     .filter((row) => {
       if (!isLive(row)) return false;
       if (declaration === null) return row.descriptor !== null;
-      return (row.descriptor?.action_mappings ?? []).some((mapping) =>
-        mappingMatches(mapping, declaration),
+      const mapping = (row.descriptor?.action_mappings ?? []).find((candidate) =>
+        mappingMatches(candidate, declaration),
       );
+      if (!mapping) return false;
+      // Enrolled credentials must cover the reviewed action scopes, exactly
+      // as the daemon's `app_binding_config` requires; built-ins carry none.
+      if (row.kind === "enrolled") {
+        const held = new Set(row.scopes ?? []);
+        if (!mapping.scopes.every((scope) => held.has(scope))) return false;
+      }
+      return true;
     })
     .sort((a, b) => {
       const local = Number(isLocalOutbox(b)) - Number(isLocalOutbox(a));
@@ -90,17 +100,6 @@ export function candidatesFor(
       return a.account.localeCompare(b.account);
     });
   return { offered, withheld: connections.length - offered.length };
-}
-
-/** Is this the built-in Local outbox — always present, provider local. */
-export function isLocalOutbox(row: Pick<Connection, "provider" | "account">): boolean {
-  return row.provider === "local" && row.account === "local";
-}
-
-/** The connection's plain name: "Local outbox", else `provider · account`. */
-export function connectionLabel(row: Pick<Connection, "provider" | "account">): string {
-  if (isLocalOutbox(row)) return "Local outbox";
-  return `${row.provider} · ${row.account}`;
 }
 
 const EFFECT_WORDS: Record<string, string> = {

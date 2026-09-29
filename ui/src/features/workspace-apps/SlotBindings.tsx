@@ -7,10 +7,10 @@ import {
   bindingForSlot,
   bindingHealth,
   candidatesFor,
-  connectionLabel,
   plainRequirement,
   type DeclaredSlot,
 } from "./bindingChoices";
+import { connectionLabel } from "../../lib/connections";
 import { workspaceApps, type AppBinding, type Connection } from "./workspaceApps";
 
 /**
@@ -49,6 +49,8 @@ export function SlotBindings({
   mutate: (work: () => Promise<void>) => Promise<void>;
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const typed = slots.filter((slot) => slot.declaration !== null);
+  const untyped = slots.filter((slot) => slot.declaration === null);
   if (slots.length === 0) {
     return (
       <p className="wa-muted">
@@ -56,16 +58,31 @@ export function SlotBindings({
       </p>
     );
   }
+  // Drafts are keyed by context and slot: an unsaved choice in one
+  // brand never carries into another context's save.
+  const draftKey = (slot: string) => `${contextId ?? ""}::${slot}`;
   return (
     <>
-      {slots.map((slot) => {
+      <p className="wa-muted">
+        Saving a new connection closes this slot&apos;s waiting sends; new runs pin the new
+        binding. The daemon re-checks the reviewed contract on every save.
+      </p>
+      {untyped.length > 0 && (
+        <p className="wa-muted">
+          Legacy {untyped.length === 1 ? "slot" : "slots"} {untyped.map((slot) => slot.slot).join(", ")}{" "}
+          {untyped.length === 1 ? "binds" : "bind"} through <code>cadence app set</code> — the board binds
+          only reviewed capability slots, and an untyped slot never authorizes a connection effect.
+        </p>
+      )}
+      {typed.map((slot) => {
         const binding = bindingForSlot(bindings, contextId, slot.slot, digest);
         const health = bindingHealth(binding, digest, connections);
         // The store refuses an update across bundle digests — a stale
         // pin rebinds through create, with a fresh request identity.
         const stale = health === "stale-bundle";
         const { offered, withheld } = candidatesFor(slot.declaration, connections);
-        const selected = drafts[slot.slot] ?? binding?.config.connection_id ?? "";
+        const key = draftKey(slot.slot);
+        const selected = drafts[key] ?? binding?.config.connection_id ?? "";
         const unchanged =
           binding !== undefined && !stale && selected === binding.config.connection_id;
         return (
@@ -103,7 +120,7 @@ export function SlotBindings({
                 <Select
                   value={selected}
                   onChange={(next) =>
-                    setDrafts((current) => ({ ...current, [slot.slot]: next }))
+                    setDrafts((current) => ({ ...current, [key]: next }))
                   }
                   options={offered.map((value) => ({
                     value: value.id,
@@ -137,7 +154,7 @@ export function SlotBindings({
                       });
                     setDrafts((current) => {
                       const next = { ...current };
-                      delete next[slot.slot];
+                      delete next[key];
                       return next;
                     });
                   })
