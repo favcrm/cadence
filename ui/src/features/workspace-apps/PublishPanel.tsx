@@ -190,10 +190,16 @@ export default function PublishPanel({
           . A bare success string never counts.
         </p>
       )}
-      {(intent.state === "refused" || intent.state === "held") &&
-        intent.refusal && (
-          <p className="wa-alert">{refusalCopy(intent.refusal)}</p>
-        )}
+      {intent.state === "refused" && intent.refusal && (
+        <p className="wa-alert">{refusalCopy(intent.refusal)}</p>
+      )}
+      {/* Held surfaces state plus a human reason string, never a machine
+        code (backend-confirmed): "dispatch authority differs from frozen
+        approval" or "approved material changed since freeze". Raw, then
+        the needs-human reading. */}
+      {intent.state === "held" && intent.refusal?.message && (
+        <p className="wa-alert">Dispatch report: {intent.refusal.message}</p>
+      )}
       {intent.state === "processing" && !unconfirmed && (
         <p className="wa-muted">
           Provider call in flight — outcomes reconcile through the status
