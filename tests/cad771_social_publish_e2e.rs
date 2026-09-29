@@ -25,8 +25,7 @@
 mod common;
 
 use cadence_agent::platform::agenticos_external::publish::{
-    caption_digest_of, Destination, FakeProviderBehavior, FakePublishLedger, SendBinding,
-    SendGrant, Toolkit,
+    Destination, FakeProviderBehavior, FakePublishLedger, SendBinding, SendGrant, Toolkit,
 };
 use common::app_release::{Release, A};
 use serde_json::{json, Value};
@@ -405,7 +404,7 @@ fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
             "social_publish_report",
             json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
                 "receipt": {"permalink": exec["permalink"],
-                    "destination_id": DEST_FB, "caption_digest": reviewed_hex,
+                    "destination_id": DEST_FB, "caption_digest": reviewed_hex, "image_digest": intent["frozen"]["image_digest"],
                     "provider_ids": ["provider-post-1"],
                     "provider_payload": exec["provider_payload"]}}),
         )
@@ -454,13 +453,18 @@ fn cad771_e2e_forged_freeze_inputs_fail_closed() {
             "{field}"
         );
     }
-    // Mixed mode (derived + explicit digest) refuses — never ambiguous.
-    let mut mixed = base.clone();
-    mixed["caption_digest"] = json!(caption_digest_of("attacker caption"));
-    assert!(h
-        .daemon
-        .operator_rpc("social_publish_schedule", mixed)
-        .is_err());
+    // Explicit caller-frozen digests are refused at the boundary: schedule
+    // takes artifact-freeze fields only, never caller strings.
+    for field in ["caption_digest", "image_digest", "connection_id"] {
+        let mut explicit = base.clone();
+        explicit[field] = json!("attacker-string");
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_schedule", explicit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported fields"), "{field}: {err}");
+    }
     // Unproven agent-shaped callers cannot reach any of the six methods:
     // the operator gate refuses before any field is read.
     for method in [
@@ -567,6 +571,7 @@ fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
             json!({"intent_id": claimed2["intent"]["intent_id"], "decision": "posted",
                 "receipt": {"permalink": exec2["permalink"], "destination_id": DEST_FB,
                     "caption_digest": intent2["frozen"]["caption_digest"],
+                    "image_digest": intent2["frozen"]["image_digest"],
                     "provider_ids": ["provider-post-1"],
                     "provider_payload": exec2["provider_payload"]}}),
         )
@@ -653,6 +658,7 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
             json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
                 "receipt": {"permalink": status["permalink"], "destination_id": DEST_FB,
                     "caption_digest": intent["frozen"]["caption_digest"],
+                    "image_digest": intent["frozen"]["image_digest"],
                     "provider_ids": ["provider-post-1"],
                     "provider_payload": status["provider_payload"]}}),
         )

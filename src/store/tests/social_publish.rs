@@ -210,6 +210,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
             &json!({"permalink": "https://www.instagram.com/p/ABC/",
                 "destination_id": "17841400008460056",
                 "caption_digest": digest(1),
+            "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
                 "provider_payload": {"id": "provider-post-1"}})
         )
@@ -240,6 +241,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
             &json!({"permalink": "https://www.instagram.com/p/ABC/",
                 "destination_id": "17841400008460056",
                 "caption_digest": digest(1),
+            "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
                 "provider_payload": {"id": "provider-post-1"}}),
         )
@@ -257,6 +259,7 @@ fn cad771_report_needs_verified_receipt_and_never_bare_success() {
             &json!({"permalink": "https://www.instagram.com/p/ABC/",
                 "destination_id": "17841400008460056",
                 "caption_digest": digest(1),
+            "image_digest": img_digest(),
                 "provider_ids": ["provider-post-1"],
                 "provider_payload": {"id": "provider-post-1"}})
         )
@@ -325,6 +328,7 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
         &json!({"permalink": "https://www.instagram.com/p/ABC/",
             "destination_id": "17841400008460056",
             "caption_digest": digest(1),
+            "image_digest": img_digest(),
             "provider_ids": ["provider-post-1"],
             "provider_payload": {"id": "provider-post-1"}}),
     )
@@ -398,4 +402,49 @@ fn cad771_material_reproof_covers_modes_and_unknown_intents() {
     assert!(s.social_publish_show(&id).unwrap()["intent"]["frozen"]["artifact_id"].is_null());
     // Unknown intents are refused, never current.
     assert!(s.social_publish_material_current("spub-nope").is_err());
+}
+
+#[test]
+fn cad771_posted_receipt_must_match_frozen_intent() {
+    // Operator JSON alone never posts: a forged or mismatched receipt is
+    // refused and the intent stays processing (uncertain) for reconcile.
+    let (_dir, s) = store();
+    let staged = s
+        .social_publish_schedule(&intent("req-receipt-bind"))
+        .unwrap();
+    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+    let frozen = &staged["intent"]["frozen"];
+    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    let good = json!({"permalink": "https://www.instagram.com/p/ABC/",
+        "destination_id": frozen["destination_id"],
+        "caption_digest": frozen["caption_digest"],
+        "image_digest": frozen["image_digest"],
+        "provider_ids": ["provider-post-1"],
+        "provider_payload": {"id": "provider-post-1"}});
+    // Forged destination, caption, and image digests each refuse.
+    for (field, value) in [
+        ("destination_id", json!("999999999999999")),
+        ("caption_digest", json!(digest(7))),
+        ("image_digest", json!(digest(8))),
+    ] {
+        let mut forged = good.clone();
+        forged[field] = value;
+        let err = s
+            .social_publish_report(&id, "posted", &forged)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match the frozen intent"),
+            "{field}: {err}"
+        );
+        assert_eq!(
+            s.social_publish_show(&id).unwrap()["intent"]["state"],
+            "processing"
+        );
+    }
+    // The matching receipt posts.
+    let posted = s.social_publish_report(&id, "posted", &good).unwrap();
+    assert_eq!(posted["intent"]["state"], "posted");
 }

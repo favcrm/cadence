@@ -10,7 +10,6 @@
 
 use super::app_bindings_rpc::strict_fields;
 use super::*;
-use crate::store::social_publish::NewSocialPublish;
 
 impl Shared {
     pub(super) fn rpc_social_publish(
@@ -29,19 +28,16 @@ impl Shared {
                     "context_id",
                     "run_id",
                     "effect_id",
-                    "connection_id",
+                    "artifact_id",
+                    "bundle_digest",
+                    "slot",
                     "destination_id",
                     "toolkit",
-                    "caption_digest",
-                    "image_digest",
                     "media_key",
                     "grant_id",
                     "approval_id",
                     "due_epoch",
                     "timezone",
-                    "artifact_id",
-                    "bundle_digest",
-                    "slot",
                 ],
                 "social_publish_cancel" => &["intent_id"],
                 "social_publish_show" => &["intent_id"],
@@ -75,11 +71,11 @@ impl Shared {
         }
     }
 
-    /// Schedule in one of two modes, never mixed: freeze-from-artifact
-    /// derives every digest from the approved run's reviewed material
-    /// (explicit digest/connection fields are refused alongside it);
-    /// explicit mode takes caller-frozen digests for runs whose material
-    /// the operator verified out-of-band.
+    /// Schedule freezes from the approved run's reviewed material only:
+    /// every digest and the connection derive server-side (explicit
+    /// caller-frozen digests are refused — no caller-string trust at
+    /// either point). Post now is `due_epoch` at now; Schedule is a
+    /// future `due_epoch` with an explicit timezone.
     fn schedule_social_publish(&self, params: &Value) -> Result<Value> {
         use crate::store::social_publish::FreezeFromArtifact;
         let due = params
@@ -87,54 +83,24 @@ impl Shared {
             .and_then(Value::as_i64)
             .ok_or_else(|| Error::rejected("Missing or non-integer 'due_epoch'"))?;
         let common = |field: &str| required_str(params, field);
-        if optional_str(params, "artifact_id").is_some() {
-            for field in ["caption_digest", "image_digest", "connection_id"] {
-                if optional_str(params, field).is_some() {
-                    return Err(Error::rejected(format!(
-                        "'{field}' is derived in artifact-freeze mode"
-                    )));
-                }
-            }
-            return self
-                .store
-                .social_publish_freeze_from_artifact(&FreezeFromArtifact {
-                    request_id: common("request_id")?,
-                    install_id: common("install_id")?,
-                    context_id: optional_str(params, "context_id"),
-                    run_id: common("run_id")?,
-                    artifact_id: common("artifact_id")?,
-                    bundle_digest: common("bundle_digest")?,
-                    slot: common("slot")?,
-                    effect_id: common("effect_id")?,
-                    destination_id: common("destination_id")?,
-                    toolkit: common("toolkit")?,
-                    media_key: optional_str(params, "media_key"),
-                    grant_id: common("grant_id")?,
-                    approval_id: common("approval_id")?,
-                    due_epoch: due,
-                    timezone: common("timezone")?,
-                });
-        }
-        self.store.social_publish_schedule(&NewSocialPublish {
-            request_id: common("request_id")?,
-            install_id: common("install_id")?,
-            context_id: optional_str(params, "context_id"),
-            run_id: common("run_id")?,
-            effect_id: common("effect_id")?,
-            artifact_id: None,
-            bundle_digest: None,
-            slot: None,
-            connection_id: common("connection_id")?,
-            destination_id: common("destination_id")?,
-            toolkit: common("toolkit")?,
-            caption_digest: common("caption_digest")?,
-            image_digest: optional_str(params, "image_digest"),
-            media_key: optional_str(params, "media_key"),
-            grant_id: common("grant_id")?,
-            approval_id: common("approval_id")?,
-            due_epoch: due,
-            timezone: common("timezone")?,
-        })
+        self.store
+            .social_publish_freeze_from_artifact(&FreezeFromArtifact {
+                request_id: common("request_id")?,
+                install_id: common("install_id")?,
+                context_id: optional_str(params, "context_id"),
+                run_id: common("run_id")?,
+                artifact_id: common("artifact_id")?,
+                bundle_digest: common("bundle_digest")?,
+                slot: common("slot")?,
+                effect_id: common("effect_id")?,
+                destination_id: common("destination_id")?,
+                toolkit: common("toolkit")?,
+                media_key: optional_str(params, "media_key"),
+                grant_id: common("grant_id")?,
+                approval_id: common("approval_id")?,
+                due_epoch: due,
+                timezone: common("timezone")?,
+            })
     }
 
     /// Dispatch claim with recheck: the operator supplies current authority

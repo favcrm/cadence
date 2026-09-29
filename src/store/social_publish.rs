@@ -406,9 +406,20 @@ impl Store {
     }
 
     /// Record the dispatch outcome. `posted` requires a verified
-    /// permalink/receipt (a bare success string is refused); `refused`
-    /// requires an error; `held` requires a reason and returns the intent
-    /// to a human decision — it never silently republishes.
+    /// permalink/receipt (a bare success string is refused) AND a receipt
+    /// bound to the frozen intent: destination and content digests must
+    /// equal frozen, or the report is refused and the intent stays
+    /// processing (uncertain) — operator JSON alone never posts.
+    /// `refused` requires an error; `held` requires a reason and returns
+    /// the intent to a human decision — it never silently republishes.
+    ///
+    /// Processing-row recovery: a claimed intent whose dispatcher died
+    /// survives restart as `processing` (durable row; re-claim finds
+    /// nothing to claim, so no second send). Recover by reconciling the
+    /// upstream status query for the intent's stable `request` key, then
+    /// reporting the reconciled outcome here: posted with the reconciled
+    /// binding+evidence, refused with the provider error, or held with
+    /// the reason. Never re-execute to recover.
     pub fn social_publish_report(
         &self,
         intent_id: &str,
@@ -449,6 +460,27 @@ impl Store {
         };
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        if state == "posted" {
+            let frozen_text: String = tx
+                .query_row(
+                    "SELECT frozen FROM social_publish_intents WHERE intent_id=? AND state='processing'",
+                    [intent_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
+            let frozen: Value = serde_json::from_str(&frozen_text)?;
+            let receipt_digest = |field: &str| receipt.get(field).unwrap_or(&Value::Null);
+            let frozen_digest = |field: &str| frozen.get(field).unwrap_or(&Value::Null);
+            if receipt_digest("destination_id") != frozen_digest("destination_id")
+                || receipt_digest("caption_digest") != frozen_digest("caption_digest")
+                || receipt_digest("image_digest") != frozen_digest("image_digest")
+            {
+                return Err(Error::rejected(
+                    "posted receipt does not match the frozen intent",
+                ));
+            }
+        }
         let changed = tx.execute("UPDATE social_publish_intents SET state=?1,receipt=?2,updated=?3 WHERE intent_id=?4 AND state='processing'",params![state,receipt.to_string(),now(),intent_id])?;
         if changed != 1 {
             return Err(Error::rejected("social publish intent is not processing"));
