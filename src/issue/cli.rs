@@ -342,13 +342,16 @@ pub enum IssueAction {
         #[arg(long, conflicts_with = "id")]
         merged: bool,
         /// Limit the sweep to one project (all projects when omitted).
-        #[arg(long, requires = "merged")]
+        /// Sweep-only: rejected with a single-ID finish.
+        #[arg(long, requires = "merged", conflicts_with = "id")]
         project: Option<String>,
         /// Print the sweep plan without changing anything.
-        #[arg(long, requires = "merged")]
+        /// Sweep-only: rejected with a single-ID finish.
+        #[arg(long, requires = "merged", conflicts_with = "id")]
         dry_run: bool,
-        /// Emit the sweep rows as JSON.
-        #[arg(long, requires = "merged")]
+        /// Emit the sweep rows as JSON. Single-ID output is already
+        /// JSON, so this is accepted everywhere as a no-op there.
+        #[arg(long)]
         json: bool,
     },
     /// Show one issue — frontmatter, body, links both ways, comments,
@@ -1252,6 +1255,20 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "issue finish needs an id — or --merged to sweep",
                 ));
             };
+            // CAD-800: fail closed — clap's `requires = "merged"` alone
+            // does not reject `finish <ID> --dry-run` when the positional
+            // ID is present (the installed build silently ignored the flag
+            // and ran a real finish). Sweep-only flags are parser-rejected
+            // via `conflicts_with = "id"` above; this guard covers any
+            // parser bypass (argument order, future flags). `--json` is
+            // deliberately NOT guarded: single-ID output is always JSON,
+            // so it is an accepted no-op there (see
+            // `finish_guard_per_worktree`).
+            if *dry_run || project.is_some() {
+                return Err(Error::rejected(
+                    "issue finish --dry-run and --project need --merged — a single-ID finish has no preview; omit them or use `issue finish --merged --dry-run` to preview the sweep",
+                ));
+            }
             let args = finish::FinishArgs {
                 force: *force,
                 keep_branch: *keep_branch,
