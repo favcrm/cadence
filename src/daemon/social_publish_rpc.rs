@@ -4,8 +4,8 @@
 //! exact destination, digests, due time and state), the human approves by
 //! scheduling with an approval identity, then chooses Post now
 //! (`due_epoch` at now) or Schedule (a future `due_epoch` with timezone).
-//! Cancellation is operator-only before dispatch. Dispatch claim/report RPC
-//! lands in slice 3 with the recheck wiring and fake-provider E2E; the
+//! Cancellation is operator-only before dispatch. Dispatch claims recheck
+//! operator authority field-for-field and re-prove approved material;
 //! store already enforces the lifecycle (`pub(crate)` claim/report).
 
 use super::app_bindings_rpc::strict_fields;
@@ -121,6 +121,9 @@ impl Shared {
             context_id: optional_str(params, "context_id"),
             run_id: common("run_id")?,
             effect_id: common("effect_id")?,
+            artifact_id: None,
+            bundle_digest: None,
+            slot: None,
             connection_id: common("connection_id")?,
             destination_id: common("destination_id")?,
             toolkit: common("toolkit")?,
@@ -136,9 +139,11 @@ impl Shared {
 
     /// Dispatch claim with recheck: the operator supplies current authority
     /// and the daemon compares it field-for-field against frozen before
-    /// claiming. On mismatch the intent is claimed and immediately held
-    /// for a new human decision — never silently published. Backend grant
-    /// liveness (revocation/remaining uses) wires in slice 3.
+    /// claiming. Artifact-frozen intents additionally re-prove the approved
+    /// material is unchanged (stale binding or changed review holds even
+    /// when the operator recheck matches). On any mismatch the intent is
+    /// claimed and immediately held for a new human decision - never
+    /// silently published. Backend grant liveness wires at the provider.
     fn claim_social_publish(&self, params: &Value) -> Result<Value> {
         let now = params
             .get("now_epoch")
@@ -173,9 +178,23 @@ impl Shared {
             );
         }
         let expected = frozen.clone();
-        Ok(self
+        let claimed = self
             .store
-            .social_publish_claim_due(now, move |_, frozen| Ok(frozen == &expected))?
-            .unwrap_or(json!({"claimed": false})))
+            .social_publish_claim_due(now, move |_, frozen| Ok(frozen == &expected))?;
+        let Some(claimed) = claimed else {
+            return Ok(json!({"claimed": false}));
+        };
+        // Daemon-side re-proof: a stale operator recheck must not dispatch
+        // against changed approved material. Mismatch holds the just-claimed
+        // intent for a new human decision.
+        let id = claimed["intent"]["intent_id"].as_str().unwrap_or("");
+        if !self.store.social_publish_material_current(id)? {
+            return self.store.social_publish_report(
+                id,
+                "held",
+                &json!({"reason": "approved material changed since freeze"}),
+            );
+        }
+        Ok(claimed)
     }
 }

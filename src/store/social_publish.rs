@@ -45,13 +45,20 @@ pub const SOCIAL_PUBLISH_CANCELLED_EVENT: &str = "social_publish_cancelled";
 pub const SOCIAL_PUBLISH_CLAIMED_EVENT: &str = "social_publish_claimed";
 pub const SOCIAL_PUBLISH_REPORTED_EVENT: &str = "social_publish_reported";
 
-/// Params for [`Store::social_publish_schedule`].
+/// Params for [`Store::social_publish_schedule`]. The artifact triple
+/// (`artifact_id`, `bundle_digest`, `slot`) is present exactly for
+/// artifact-frozen intents; it lets dispatch re-prove the approved
+/// material is unchanged instead of trusting a stale operator recheck.
+#[allow(clippy::too_many_arguments)]
 pub struct NewSocialPublish<'a> {
     pub request_id: &'a str,
     pub install_id: &'a str,
     pub context_id: Option<&'a str>,
     pub run_id: &'a str,
     pub effect_id: &'a str,
+    pub artifact_id: Option<&'a str>,
+    pub bundle_digest: Option<&'a str>,
+    pub slot: Option<&'a str>,
     pub connection_id: &'a str,
     pub destination_id: &'a str,
     pub toolkit: &'a str,
@@ -72,6 +79,16 @@ fn validate_new(row: &NewSocialPublish<'_>) -> Result<()> {
     }
     if row.install_id.is_empty() || row.run_id.is_empty() || row.effect_id.is_empty() {
         return Err(bad("run identity"));
+    }
+    match (row.artifact_id, row.bundle_digest, row.slot) {
+        (None, None, None) => {}
+        (Some(artifact), Some(bundle), Some(slot))
+            if !artifact.is_empty()
+                && artifact.len() <= 200
+                && !bundle.is_empty()
+                && !slot.is_empty()
+                && slot.len() <= 120 => {}
+        _ => return Err(bad("artifact freeze triple")),
     }
     if !device::valid_connection_id(row.connection_id) {
         return Err(bad("connection"));
@@ -121,7 +138,9 @@ fn validate_new(row: &NewSocialPublish<'_>) -> Result<()> {
 
 fn frozen_of(row: &NewSocialPublish<'_>) -> Value {
     json!({"schema":1,"version":"1","install_id":row.install_id,"context_id":row.context_id,
-        "run_id":row.run_id,"effect_id":row.effect_id,"connection_id":row.connection_id,
+        "run_id":row.run_id,"effect_id":row.effect_id,"artifact_id":row.artifact_id,
+        "bundle_digest":row.bundle_digest,"slot":row.slot,
+        "connection_id":row.connection_id,
         "destination_id":row.destination_id,"toolkit":row.toolkit,
         "caption_digest":row.caption_digest,"image_digest":row.image_digest,
         "media_key":row.media_key,"grant_id":row.grant_id,"approval_id":row.approval_id,
@@ -298,6 +317,42 @@ impl Store {
             )
             .optional()?;
         next.map(|id| read_row(&conn, &id)).transpose()
+    }
+
+    /// Re-prove approved material at dispatch for artifact-frozen intents.
+    /// Reloads publication material (refuses stale binding or changed
+    /// review itself) and requires artifact/asset digests to equal frozen.
+    /// Any failure returns false: hold for a new human decision.
+    /// Explicit-mode intents return true; operator recheck owns them.
+    pub(crate) fn social_publish_material_current(&self, intent_id: &str) -> Result<bool> {
+        let shown = read_row(&self.conn(), intent_id)?;
+        let frozen = &shown["intent"]["frozen"];
+        let artifact = frozen["artifact_id"].as_str();
+        let bundle = frozen["bundle_digest"].as_str();
+        let slot = frozen["slot"].as_str();
+        if artifact.is_none() {
+            return Ok(bundle.is_none() && slot.is_none());
+        }
+        let material = match self.app_publication_material(
+            frozen["run_id"].as_str().unwrap_or(""),
+            artifact.unwrap_or(""),
+            bundle.unwrap_or(""),
+            slot.unwrap_or(""),
+        ) {
+            Ok(material) => material,
+            Err(_) => return Ok(false),
+        };
+        let caption = material["artifact"]["digest"].as_str().unwrap_or("");
+        if caption.strip_prefix("sha256:").unwrap_or("")
+            != frozen["caption_digest"].as_str().unwrap_or("")
+        {
+            return Ok(false);
+        }
+        let asset = material
+            .get("asset")
+            .and_then(|asset| asset["digest"].as_str())
+            .and_then(|digest| digest.strip_prefix("sha256:"));
+        Ok(asset == frozen["image_digest"].as_str())
     }
 
     /// Atomically claim the oldest due queued intent for dispatch. The
@@ -487,6 +542,9 @@ impl Store {
             context_id: row.context_id,
             run_id: row.run_id,
             effect_id: row.effect_id,
+            artifact_id: Some(row.artifact_id),
+            bundle_digest: Some(row.bundle_digest),
+            slot: Some(row.slot),
             connection_id,
             destination_id: row.destination_id,
             toolkit: row.toolkit,

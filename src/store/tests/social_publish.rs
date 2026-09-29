@@ -32,6 +32,9 @@ fn intent(request: &str) -> NewSocialPublish<'_> {
         context_id: None,
         run_id: "cad_run_01",
         effect_id: "cad_fx_01",
+        artifact_id: None,
+        bundle_digest: None,
+        slot: None,
         connection_id: "con_harbour_ig",
         destination_id: "17841400008460056",
         toolkit: "instagram",
@@ -365,4 +368,34 @@ fn cad771_freeze_without_approved_material_is_refused() {
             .len(),
         0
     );
+}
+
+#[test]
+fn cad771_partial_artifact_triple_is_refused() {
+    let (_dir, s) = store();
+    let mut partial = intent("req-partial-triple");
+    partial.artifact_id = Some("artifact-a");
+    assert!(s.social_publish_schedule(&partial).is_err());
+    assert_eq!(
+        s.social_publish_list(Some("install-harbour"), None)
+            .unwrap()["intents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn cad771_material_reproof_covers_modes_and_unknown_intents() {
+    let (_dir, s) = store();
+    // Explicit-mode intents carry no artifact triple: re-proof is vacuous.
+    let staged = s
+        .social_publish_schedule(&intent("req-explicit-reproof"))
+        .unwrap();
+    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+    assert!(s.social_publish_material_current(&id).unwrap());
+    assert!(s.social_publish_show(&id).unwrap()["intent"]["frozen"]["artifact_id"].is_null());
+    // Unknown intents are refused, never current.
+    assert!(s.social_publish_material_current("spub-nope").is_err());
 }

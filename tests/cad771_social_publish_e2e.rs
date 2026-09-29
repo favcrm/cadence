@@ -830,3 +830,52 @@ fn cad771_browser_board_serves_social_content_app_surface() {
         "{workflows:?}"
     );
 }
+
+#[test]
+fn cad771_e2e_revoked_binding_holds_despite_matching_recheck() {
+    // Daemon-side re-proof: the operator recheck still matches frozen, but
+    // the approved material is stale (binding revoked after schedule), so
+    // dispatch holds instead of trusting the stale attestation.
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "stale");
+    let binding = h.bind(&context, "cad771-e2e-stale-binding");
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-stale",
+                "cad_fx_stale_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({"install_id": install_id, "binding_id": binding["id"],
+                "expected_revision": binding["revision"]}),
+        )
+        .unwrap();
+    let recheck = recheck_for(&intent);
+    let held = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(held["intent"]["state"], "held");
+    assert_eq!(
+        held["intent"]["receipt"]["reason"],
+        "approved material changed since freeze"
+    );
+    assert_eq!(door.ledger.provider_calls(), 0);
+}
