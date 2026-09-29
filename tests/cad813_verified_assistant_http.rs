@@ -1,14 +1,16 @@
 //! CAD-813 live board HTTP peer for verified assistant email proposals.
 //!
-//! ADVERSARIAL-FIRST (RED): the board exposes no assistant-mint
-//! route — the browser can request or display a verified proposal but
-//! can never mint its provenance. A proposal the daemon recorded
-//! behind a host-verified chat turn lists over HTTP with its
-//! assistant receipt intact; operator Apply/Discard over HTTP keep
-//! their operator proof (an agent caller and a sessionless caller are
-//! refused without mutation), receipt-shaped fields refuse at the
-//! transport grammar, and unknown assistant paths 404. The board is
-//! at least as strict as daemon RPC. No SMTP send happens anywhere.
+//! ADVERSARIAL-FIRST (RED): the board exposes exactly one mint route
+//! (`POST …/content/proposal-requests`) for the operator's one-time,
+//! host-stamped request — the browser names only the chat message,
+//! never campaign authority, source, token or receipt. The assistant
+//! redemption itself has no HTTP route. A proposal the daemon
+//! recorded behind a host-verified turn lists over HTTP with its
+//! assistant receipt intact; operator Apply/Discard keep their
+//! operator proof (agent and sessionless callers 403 without
+//! mutation); same-context wrong campaign, stale source and fresh-ID
+//! replay refuse without changing HTTP-visible state. The board is at
+//! least as strict as daemon RPC. No SMTP send happens anywhere.
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::issue::Pm;
@@ -210,7 +212,7 @@ impl Drop for Board {
 }
 
 #[test]
-fn cad813_http_verified_proposal_lists_with_receipt() {
+fn cad813_http_request_mint_then_verified_proposal_lists() {
     let b = Board::new();
     let base = b.base();
     b.value(
@@ -219,17 +221,30 @@ fn cad813_http_verified_proposal_lists_with_receipt() {
         json!({"campaign_id": "launch-1", "subject": "Spring launch", "blocks": blocks()}),
     );
 
-    // The assistant turn proposes over the daemon socket (its own
-    // pane connection); the operator path could never mint this.
     let mut lane = LaneShell::spawn(b.root.path());
     plant_member_pane(&b.daemon, "crm-http-writer", "claude", None, lane.pid());
     let token = b.chat_turn("crm-http-writer", "chat-813-http-1");
+
+    // The operator mints the one-time request over HTTP: campaign and
+    // source arrive host-stamped, never from the browser.
+    let minted: Value = b.value(
+        "POST",
+        &format!("{base}/proposal-requests"),
+        json!({"campaign_id": "launch-1", "message_id": "chat-813-http-1", "request_id": "req-http-1"}),
+    );
+    assert_eq!(minted["request"]["campaign_id"], "launch-1");
+    assert_eq!(minted["request"]["source_revision"], 1);
+    assert_eq!(minted["request"]["state"], "open");
+
+    // The assistant turn redeems it over the daemon socket (its own
+    // pane connection); the operator path could never mint this.
     let frame: Value = lane.rpc(
         &b.daemon.state,
         "app_content_assistant_propose",
         json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-1",
                "proposal_id": "prop-http-1", "subject": "Assistant draft over chat",
-               "blocks": blocks(), "message": "chat-813-http-1", "token": token}),
+               "blocks": blocks(), "message": "chat-813-http-1", "token": token,
+               "request_id": "req-http-1"}),
     );
     assert_eq!(frame["ok"], true, "{frame}");
 
@@ -245,6 +260,7 @@ fn cad813_http_verified_proposal_lists_with_receipt() {
         "chat-813-http-1"
     );
     assert_eq!(proposal["assistant_receipt"]["agent"], "crm-http-writer");
+    assert_eq!(proposal["assistant_receipt"]["request_id"], "req-http-1");
     assert_eq!(proposal["assistant_receipt"]["campaign_id"], "launch-1");
     let shown: Value = b.value("GET", &format!("{base}/proposals/prop-http-1"), json!({}));
     assert_eq!(shown["proposal"], *proposal);
@@ -271,30 +287,42 @@ fn cad813_http_browser_cannot_mint_provenance() {
         &format!("{base}/campaigns"),
         json!({"campaign_id": "launch-1", "subject": "Spring launch", "blocks": blocks()}),
     );
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(&b.daemon, "crm-http-forge", "claude", None, lane.pid());
+    let token = b.chat_turn("crm-http-forge", "chat-813-http-forge");
+    b.value(
+        "POST",
+        &format!("{base}/proposal-requests"),
+        json!({"campaign_id": "launch-1", "message_id": "chat-813-http-forge", "request_id": "req-forge"}),
+    );
 
-    // Receipt/turn-shaped fields refuse at the HTTP transport grammar
-    // on every body that could carry one — the browser never names a
-    // turn, a token or a receipt.
+    // Turn/token/receipt/source fields refuse at the HTTP transport
+    // grammar on every body that could carry one — the browser never
+    // names a turn, a token, a receipt or a source.
     for (path, body) in [
         (
-            format!("{base}/proposals"),
-            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "message": "m-1", "token": "t-1"}),
+            format!("{base}/proposal-requests"),
+            json!({"campaign_id": "launch-1", "message_id": "chat-813-http-forge", "request_id": "req-x", "token": "t-1"}),
+        ),
+        (
+            format!("{base}/proposal-requests"),
+            json!({"campaign_id": "launch-1", "message_id": "chat-813-http-forge", "request_id": "req-x", "source_revision": 1}),
+        ),
+        (
+            format!("{base}/proposal-requests"),
+            json!({"campaign_id": "launch-1", "message_id": "chat-813-http-forge", "request_id": "req-x", "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+        (
+            format!("{base}/proposal-requests"),
+            json!({"campaign_id": "launch-1", "message_id": "chat-813-http-forge", "request_id": "req-x", "actor": "assistant"}),
         ),
         (
             format!("{base}/proposals"),
-            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "assistant_receipt": {"turn_id": "t-1"}}),
+            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "request_id": "req-forge"}),
         ),
         (
             format!("{base}/proposals"),
             json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "turn_id": "t-1"}),
-        ),
-        (
-            format!("{base}/proposals"),
-            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "source_revision": 1}),
-        ),
-        (
-            format!("{base}/proposals/prop-x/apply"),
-            json!({"expected_revision": 1, "message": "m-1"}),
         ),
         (
             format!("{base}/campaigns"),
@@ -304,7 +332,7 @@ fn cad813_http_browser_cannot_mint_provenance() {
         let (code, _) = b.operator("POST", &path, &body.to_string());
         assert_eq!(code, 400, "browser-minted provenance accepted: {body}");
     }
-    // There is no assistant-mint route: assistant-shaped paths 404.
+    // There is no assistant redemption route over HTTP at all.
     for (method, path) in [
         ("POST", format!("{base}/assistant-proposals")),
         (
@@ -323,13 +351,43 @@ fn cad813_http_browser_cannot_mint_provenance() {
             "assistant-mint path answered {method} {path}: {code}"
         );
     }
-    // Nothing above created a proposal or moved the draft.
+
+    // Same-context wrong campaign and fresh-ID replay refuse at the
+    // daemon, and HTTP-visible state never changes.
+    let wrong: Value = lane.rpc(
+        &b.daemon.state,
+        "app_content_assistant_propose",
+        json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-2",
+               "proposal_id": "prop-http-wrong", "subject": "Attached elsewhere", "blocks": blocks(),
+               "message": "chat-813-http-forge", "token": token, "request_id": "req-forge"}),
+    );
+    assert_eq!(
+        wrong["ok"], false,
+        "same-context wrong campaign admitted: {wrong}"
+    );
+    let ok: Value = lane.rpc(
+        &b.daemon.state,
+        "app_content_assistant_propose",
+        json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-1",
+               "proposal_id": "prop-http-forge", "subject": "Assistant draft", "blocks": blocks(),
+               "message": "chat-813-http-forge", "token": token, "request_id": "req-forge"}),
+    );
+    assert_eq!(ok["ok"], true, "{ok}");
+    let fresh: Value = lane.rpc(
+        &b.daemon.state,
+        "app_content_assistant_propose",
+        json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-1",
+               "proposal_id": "prop-http-fresh", "subject": "Assistant draft", "blocks": blocks(),
+               "message": "chat-813-http-forge", "token": token, "request_id": "req-forge"}),
+    );
+    assert_eq!(fresh["ok"], false, "fresh-ID replay admitted: {fresh}");
     let listed: Value = b.value("GET", &format!("{base}/proposals/list"), json!({}));
-    assert_eq!(listed["proposals"].as_array().unwrap().len(), 0);
+    assert_eq!(listed["proposals"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["proposals"][0]["proposal_id"], "prop-http-forge");
 }
 
 #[test]
-fn cad813_http_agent_and_sessionless_cannot_apply_or_discard() {
+fn cad813_http_agent_and_sessionless_cannot_mint_apply_or_discard() {
     let b = Board::new();
     let base = b.base();
     let created = b.value(
@@ -340,22 +398,33 @@ fn cad813_http_agent_and_sessionless_cannot_apply_or_discard() {
     let mut lane = LaneShell::spawn(b.root.path());
     plant_member_pane(&b.daemon, "crm-http-agent", "claude", None, lane.pid());
     let token = b.chat_turn("crm-http-agent", "chat-813-http-2");
+    b.value(
+        "POST",
+        &format!("{base}/proposal-requests"),
+        json!({"campaign_id": "launch-1", "message_id": "chat-813-http-2", "request_id": "req-http-2"}),
+    );
     let frame: Value = lane.rpc(
         &b.daemon.state,
         "app_content_assistant_propose",
         json!({"install_id": b.install, "context_id": b.context_id, "campaign_id": "launch-1",
                "proposal_id": "prop-http-2", "subject": "Assistant draft",
-               "blocks": blocks(), "message": "chat-813-http-2", "token": token}),
+               "blocks": blocks(), "message": "chat-813-http-2", "token": token,
+               "request_id": "req-http-2"}),
     );
     assert_eq!(frame["ok"], true, "{frame}");
     let show_path = format!("{base}/campaigns/launch-1");
 
     // The agent's own HTTP request (its pane process relaying a signed
     // session) is refused at the board's operator peer guard — 403,
-    // never a decision.
+    // never a mint or a decision.
     let mut failures = Vec::new();
     for prefix in ["", "setsid "] {
         for (method, path, body) in [
+            (
+                "POST",
+                format!("{base}/proposal-requests"),
+                json!({"campaign_id": "launch-1", "message_id": "chat-813-http-2", "request_id": "req-evil"}).to_string(),
+            ),
             (
                 "POST",
                 format!("{base}/proposals/prop-http-2/apply"),
@@ -370,10 +439,7 @@ fn cad813_http_agent_and_sessionless_cannot_apply_or_discard() {
             let stolen =
                 common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
             let wire = stolen.request_as(method, &path, &body, "");
-            let file = lane
-                .dir
-                .path()
-                .join(format!("request-813-{}.txt", lane.seq));
+            let file = lane.dir.path().join(format!("request-813-{}.txt", lane.seq));
             std::fs::write(&file, wire).unwrap();
             let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
             assert_eq!(rc, 0, "HTTP native process failed");
@@ -387,15 +453,31 @@ fn cad813_http_agent_and_sessionless_cannot_apply_or_discard() {
         failures.is_empty(),
         "assistant HTTP operator peer guard failed: {failures:?}"
     );
-    // A sessionless Apply/Discard is refused too.
+    // A sessionless mint/Apply/Discard is refused too.
     let host = common::op::board_host(b.port);
-    for path in [
-        format!("{base}/proposals/prop-http-2/apply"),
-        format!("{base}/proposals/prop-http-2/discard"),
+    for (method, path, body) in [
+        (
+            "POST",
+            format!("{base}/proposal-requests"),
+            json!({"campaign_id": "launch-1", "message_id": "chat-813-http-2", "request_id": "req-bare"}).to_string(),
+        ),
+        (
+            "POST",
+            format!("{base}/proposals/prop-http-2/apply"),
+            json!({"expected_revision": 1}).to_string(),
+        ),
+        (
+            "POST",
+            format!("{base}/proposals/prop-http-2/discard"),
+            String::new(),
+        ),
     ] {
-        let bare = format!("POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
-        let (code, _, _) = common::op::raw(b.port, &bare);
-        assert_eq!(code, 403, "sessionless decision admitted: {path}");
+        let wire = format!(
+            "{method} {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (code, _, _) = common::op::raw(b.port, &wire);
+        assert_eq!(code, 403, "sessionless request admitted: {method} {path}");
     }
     // The proposal is still pending and the draft never moved.
     let pending: Value = b.value("GET", &format!("{base}/proposals/prop-http-2"), json!({}));

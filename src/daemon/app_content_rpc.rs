@@ -21,8 +21,12 @@
 //! `rpc_app_content_assistant_propose` (CAD-813), which derives the
 //! agent from the connection alone, binds its live assigned chat turn
 //! (`message` + `token`) and re-proves the turn's server-verified App
-//! binding against the store — the browser may request or display a
-//! proposal but can never mint its provenance. Sender material renders
+//! binding against the store, then redeems the operator-minted,
+//! host-stamped proposal request (`request_id`): campaign and source
+//! revision come from the stamp alone, never agent text — the browser
+//! may request or display a proposal but can never mint its
+//! provenance. The operator mints requests through
+//! `app_content_proposal_request` on this same operator path. Sender material renders
 //! only through typed preview-only bindings; final-send preparation
 //! always refuses until CAD-785/786 supply host-verified evidence.
 //! There is no agent-origin edit/approve/send path: proposals, Apply,
@@ -111,22 +115,8 @@ fn content_render_scope(params: &Value) -> Result<(Option<i64>, Option<String>)>
     Ok((revision, sample))
 }
 
-fn content_source_revision(params: &Value) -> Result<Option<i64>> {
-    match params.get("source_revision") {
-        None => Ok(None),
-        Some(Value::Number(number)) => Ok(Some(
-            number
-                .as_u64()
-                .and_then(|value| i64::try_from(value).ok())
-                .filter(|value| *value >= 0)
-                .ok_or_else(|| {
-                    Error::rejected("proposal source revision must be a nonnegative integer")
-                })?,
-        )),
-        Some(_) => Err(Error::rejected(
-            "proposal source revision must be a nonnegative integer",
-        )),
-    }
+fn content_request_id(params: &Value) -> Result<&str> {
+    required_str(params, "request_id")
 }
 
 impl Shared {
@@ -190,6 +180,13 @@ impl Shared {
                 "subject",
                 "preheader",
                 "blocks",
+            ],
+            "app_content_proposal_request" => &[
+                "install_id",
+                "context_id",
+                "campaign_id",
+                "message",
+                "request_id",
             ],
             "app_content_proposal_show" => &["install_id", "context_id", "proposal_id"],
             "app_content_proposal_list" => &["install_id", "context_id", "campaign_id"],
@@ -307,6 +304,40 @@ impl Shared {
                 required_str(params, "proposal_id")?,
                 &content_draft(params)?,
             ),
+            // CAD-813: the operator mints a one-time proposal
+            // request against a chat message. The message must exist
+            // and carry the server-verified App binding for this
+            // installation and context — the stamp is host scope,
+            // never a browser value. Campaign and source revision
+            // are stamped here and re-proved at redemption.
+            "app_content_proposal_request" => {
+                let message_id = required_str(params, "message")?;
+                if message_id.is_empty()
+                    || message_id.len() > 128
+                    || message_id.chars().any(char::is_control)
+                {
+                    return Err(Error::rejected("proposal message identity is malformed"));
+                }
+                self.store
+                    .message(message_id)?
+                    .ok_or_else(|| Error::rejected("proposal request message is unknown"))?;
+                let hint = self.store.message_app(message_id)?.ok_or_else(|| {
+                    Error::rejected("proposal request message carries no verified App scope")
+                })?;
+                if hint.get("install_id").and_then(Value::as_str) != Some(install)
+                    || hint.get("context_id").and_then(Value::as_str) != Some(context)
+                {
+                    return Err(Error::rejected(
+                        "proposal request scope does not match its verified chat message",
+                    ));
+                }
+                records.app_content_proposal_request(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    message_id,
+                    content_request_id(params)?,
+                )
+            }
             "app_content_proposal_show" => {
                 records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
             }
@@ -412,7 +443,10 @@ impl Shared {
     /// discards it; this verb can never edit, approve, test-send or
     /// send. The browser can never reach this verb with an agent
     /// caller: the board relays from its own operator process, which
-    /// this gate refuses.
+    /// this gate refuses. Campaign and source revision are compared
+    /// against the operator-minted, host-stamped proposal request
+    /// the call redeems — never against agent text — and the request
+    /// is spent atomically across all proposal ids.
     pub(super) fn rpc_app_content_assistant_propose(
         self: &Arc<Self>,
         params: &Value,
@@ -431,7 +465,7 @@ impl Shared {
             "blocks",
             "message",
             "token",
-            "source_revision",
+            "request_id",
         ];
         if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
             return Err(Error::rejected(
@@ -572,15 +606,15 @@ impl Shared {
             Ok(())
         })?;
         let draft = content_draft(params)?;
-        let expected = content_source_revision(params)?;
+        let request_id = content_request_id(params)?;
         let records = RecordStore::open(&self.state_dir, install)?;
-        let turn = crate::store::app_content::AssistantTurn {
+        let claim = crate::store::app_content::AssistantClaim {
             agent: &caller,
             message: message_id,
-            expected_source: expected,
+            request: request_id,
         };
         let result =
-            records.app_content_assistant_propose(context, campaign, proposal, &draft, &turn)?;
+            records.app_content_assistant_propose(context, campaign, proposal, &draft, &claim)?;
         let digest = result
             .get("proposal")
             .and_then(|proposal| proposal.get("content_digest"))
