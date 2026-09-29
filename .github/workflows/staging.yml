@@ -8,6 +8,9 @@ on:
       - '.github/workflows/staging.yml'
       - 'scripts/delivery-candidate.py'
       - 'scripts/staging-rehearsal.py'
+      - 'scripts/auto-stage.py'
+      - 'tests/scripts/test_auto_stage.py'
+      - 'config/production-baseline.json'
       - 'scripts/e2e/**'
       - 'tests/e2e/**'
       - 'tests/e2e_mvp.rs'
@@ -23,14 +26,22 @@ on:
         description: Main CI artifact for the previous production release (migration rehearsal)
         required: true
         type: string
+  # CAD-770 bounded release train: every 15 minutes the selector picks at
+  # most the newest eligible attested main candidate and pins its identity.
+  # Ticks coalesce: an in-flight staging run or an unchanged candidate
+  # skips without work, and refusal (no baseline, no candidate) stays green.
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
   actions: read
 
 # Preserve explicit candidates and approval waits. Main keeps merging.
+# Scheduled ticks share one serial group so a moving main cannot pile a
+# second candidate onto an in-flight one; the selector skips while busy.
 concurrency:
-  group: staging-${{ github.event.pull_request.number || inputs.ci_run_id }}
+  group: staging-${{ github.event.pull_request.number || inputs.ci_run_id || 'auto' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
@@ -87,11 +98,58 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # CAD-770 automatic selector: on the schedule, pin at most the newest
+  # eligible attested main candidate plus the verified production baseline.
+  # Refusal and duplicate/in-flight skips exit 0 with a receipt; the stage
+  # job below only runs on decision == 'stage'. Never stages on PR runs.
+  select:
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      decision: ${{ steps.select.outputs.decision }}
+      source_sha: ${{ steps.select.outputs.source_sha }}
+      ci_run_id: ${{ steps.select.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.select.outputs.ci_run_attempt }}
+      sha256: ${{ steps.select.outputs.sha256 }}
+      baseline_ci_run_id: ${{ steps.select.outputs.baseline_ci_run_id }}
+      supersedes: ${{ steps.select.outputs.supersedes }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Select the newest eligible attested candidate
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/auto-stage.py select --repo "$REPO" \
+            --baseline-file config/production-baseline.json \
+            --current-run-id "$GITHUB_RUN_ID" \
+            --out "$RUNNER_TEMP/selection-receipt.json"
+          cat "$RUNNER_TEMP/selection-receipt.json" >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: staging-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selection-receipt.json
+          if-no-files-found: warn
+          retention-days: 90
+
   stage:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: select
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.select.outputs.decision == 'stage')
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     environment: staging
+    env:
+      CANDIDATE_RUN_ID: ${{ inputs.ci_run_id || needs.select.outputs.ci_run_id }}
+      BASELINE_RUN_ID: ${{ inputs.baseline_ci_run_id || needs.select.outputs.baseline_ci_run_id }}
+      SELECTED_DIGEST: ${{ needs.select.outputs.sha256 }}
+      SELECTED_SUPERSEDES: ${{ needs.select.outputs.supersedes }}
     outputs:
       source_sha: ${{ steps.candidate.outputs.source_sha }}
       ci_run_id: ${{ steps.candidate.outputs.ci_run_id }}
@@ -108,8 +166,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          CI_RUN_ID: ${{ env.CANDIDATE_RUN_ID }}
         run: python3 control/scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$CI_RUN_ID" --dest "$RUNNER_TEMP/candidate"
+      - name: Refuse a candidate that drifted from the selection pin
+        if: github.event_name == 'schedule'
+        env:
+          EXPECTED_DIGEST: ${{ env.SELECTED_DIGEST }}
+        run: test "$(jq -r .sha256 "$RUNNER_TEMP/candidate/candidate.json")" = "$EXPECTED_DIGEST"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ steps.candidate.outputs.source_sha }}
@@ -125,6 +188,7 @@ jobs:
           cache-dependency-path: candidate-source/tests/e2e/pnpm-lock.yaml
       - run: rustup toolchain install 1.98.1 --profile minimal
       - name: MVP journey against the exact downloadable binary
+        id: mvp
         env:
           RUSTUP_TOOLCHAIN: 1.98.1
           CARGO_BUILD_JOBS: 4
@@ -134,10 +198,11 @@ jobs:
           CADENCE_E2E_PORT: 3186
         run: sh control/scripts/e2e/mvp.sh --no-build
       - name: Verify the previous release and rehearse migration and backup recovery
+        id: rehearsal
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BASELINE_RUN: ${{ inputs.baseline_ci_run_id }}
+          BASELINE_RUN: ${{ env.BASELINE_RUN_ID }}
           SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
         run: |
           python3 control/scripts/delivery-candidate.py prepare --repo "$REPO" --run-id "$BASELINE_RUN" --dest "$RUNNER_TEMP/baseline"
@@ -145,9 +210,37 @@ jobs:
           python3 control/scripts/staging-rehearsal.py --baseline "$RUNNER_TEMP/baseline/cadence" \
             --candidate "$RUNNER_TEMP/candidate/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"
       - name: Check the journey did not replace the candidate bytes
+        id: digest
         env:
           EXPECTED: ${{ steps.candidate.outputs.sha256 }}
         run: test "$(sha256sum "$RUNNER_TEMP/candidate/cadence" | cut -d' ' -f1)" = "$EXPECTED"
+      - name: Emit the machine-readable staging receipt
+        if: always()
+        env:
+          MVP: ${{ steps.mvp.outcome }}
+          REHEARSAL: ${{ steps.rehearsal.outcome }}
+          DIGEST: ${{ steps.digest.outcome }}
+        run: |
+          python3 control/scripts/auto-stage.py staging-receipt \
+            --trigger "${{ github.event_name }}" --staging-run-id "$GITHUB_RUN_ID" \
+            --staging-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --candidate-json "$RUNNER_TEMP/candidate/candidate.json" \
+            --baseline-json "$RUNNER_TEMP/baseline/candidate.json" \
+            --mvp "$MVP" --rehearsal "$REHEARSAL" --digest-recheck "$DIGEST" \
+            --expected-digest "${{ env.SELECTED_DIGEST }}" \
+            --supersedes-json '${{ env.SELECTED_SUPERSEDES }}' \
+            --run-head-sha "$GITHUB_SHA" --out "$RUNNER_TEMP/staging-receipt.json"
+          cat "$RUNNER_TEMP/staging-receipt.json" >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: staging-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/staging-receipt.json
+            ${{ runner.temp }}/candidate/candidate.json
+            ${{ runner.temp }}/baseline/candidate.json
+          if-no-files-found: warn
+          retention-days: 90
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -164,8 +257,11 @@ jobs:
 
   # Approval records a candidate; installation/restart remains with the
   # rollout owner. No deployment credentials and no production access.
+  # CAD-770: scheduled candidates stage and record only; promotion stays a
+  # manual dispatch so superseded candidates are never promoted implicitly.
   promote:
     needs: stage
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: production

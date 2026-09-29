@@ -221,6 +221,7 @@ jobs:
       - name: Test delivery candidate and mutation validation
         run: |
           python3 tests/scripts/test_delivery_candidate.py
+          python3 tests/scripts/test_auto_stage.py
           python3 tests/scripts/test_native_review_observation.py
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
