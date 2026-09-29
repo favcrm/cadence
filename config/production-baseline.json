@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "ci_run_id": 36512004509,
+  "source_sha": "7ab874a236b4bdaef3fc056e220d63586569bac8",
+  "sha256": "d77f6421eb82a5c07ebd5227b03c893aba8c3e41f5146d3830df68e7959dc01c",
+  "verified_by": "operator:codex-root",
+  "verified_at": "2026-09-29T05:06:43Z",
+  "evidence": "Production /api/health build 7ab874a236b4bdaef3fc056e220d63586569bac8, daemon reachable and ok, and rollout lease held=false at 2026-09-29T05:06:43Z; staging run https://github.com/favcrm/cadence/actions/runs/36520851809 production-candidate artifact pins CI run 36512004509 attempt 1 and this binary digest"
+}
