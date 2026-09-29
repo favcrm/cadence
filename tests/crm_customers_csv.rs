@@ -20,13 +20,13 @@ const CSV_MIXED: &str = "record_id,display_name,email,tags,consent_email,expecte
 customer-9,Chidi Anagonye,chidi@example.com,newcomer,granted,\n\
 customer-1,Amina Diallo,amina@example.com,vip,granted,\n\
 customer-2,Boris Feld Jr,boris@example.com,,denied,\n\
-customer-3,Chidi Anagonye,chidi3@example.com,,granted,1\n\
+customer-3,Chidi Anagonye Jr,chidi3@example.com,,granted,1\n\
 customer-bad,Bad Row,not-an-email,,granted,\n";
 const PROFILE_C: &str = r#"{"schema":1,"display_name":"Chidi Anagonye","email":"chidi3@example.com","tags":[],"consent":{"email":"granted"}}"#;
 
 struct Records {
     _root: tempfile::TempDir,
-    pm: Pm,
+    _pm: Pm,
     daemon: TestDaemon,
 }
 
@@ -41,7 +41,7 @@ impl Records {
         let daemon = TestDaemon::start_opts(opts);
         Self {
             _root: root,
-            pm,
+            _pm: pm,
             daemon,
         }
     }

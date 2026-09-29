@@ -256,6 +256,37 @@ pub(crate) enum RecordAction {
         #[arg(long)]
         profile: PathBuf,
     },
+    /// Preview bounded CSV text as per-row create/update/skip/error
+    /// decisions without mutating anything; prints the preview token
+    /// that binds the exact bytes for `csv-import`.
+    CsvPreview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file (bounded to 256KiB, 500 rows).
+        #[arg(long)]
+        csv: PathBuf,
+    },
+    /// Explicitly import previewed CSV text at a request id: retries
+    /// with the same request id replay the stored receipt.
+    CsvImport {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// CSV file holding the exact previewed bytes.
+        #[arg(long)]
+        csv: PathBuf,
+        /// Preview token from `csv-preview` over the same bytes.
+        #[arg(long)]
+        preview_token: String,
+        /// Idempotency key; reuse with different bytes is refused.
+        #[arg(long)]
+        request_id: String,
+        /// Optional JSON array of `{row, action, expected_revision?}`
+        /// decisions overriding the preview plan.
+        #[arg(long)]
+        decisions: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +389,47 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
+fn read_record_csv(path: &Path) -> Result<String> {
+    use std::io::Read;
+    const MAX_CSV_BYTES: usize = 256 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open CSV: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_CSV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read CSV: {e}")))?;
+    if bytes.len() > MAX_CSV_BYTES {
+        return Err(Error::invalid("app_record_csv", "CSV exceeds 256KiB"));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::invalid("app_record_csv", "CSV must be UTF-8 text"))
+}
+
+fn read_csv_decisions(path: &Path) -> Result<serde_json::Value> {
+    use std::io::Read;
+    const MAX_DECISIONS_BYTES: usize = 64 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot open decisions: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_DECISIONS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::invalid("app_record_csv", format!("cannot read decisions: {e}")))?;
+    if bytes.len() > MAX_DECISIONS_BYTES {
+        return Err(Error::invalid(
+            "app_record_csv",
+            "decisions JSON exceeds 64KiB",
+        ));
+    }
+    let decisions: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("app_record_csv", "decisions must be a JSON array"))?;
+    if !decisions.is_array() {
+        return Err(Error::invalid(
+            "app_record_csv",
+            "decisions must be a JSON array",
+        ));
+    }
+    Ok(decisions)
+}
+
 fn read_record_profile(path: &Path) -> Result<serde_json::Value> {
     use std::io::Read;
     const MAX_PROFILE_BYTES: usize = 16 * 1024;
@@ -420,6 +492,28 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
             "app_record_update",
             json!({"install_id": install_id, "context_id": context_id, "record_id": record_id, "expected_revision": expected_revision, "profile": read_record_profile(profile)?}),
         ),
+        RecordAction::CsvPreview {
+            install_id,
+            context_id,
+            csv,
+        } => (
+            "app_record_csv_preview",
+            json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?}),
+        ),
+        RecordAction::CsvImport {
+            install_id,
+            context_id,
+            csv,
+            preview_token,
+            request_id,
+            decisions,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "csv_text": read_record_csv(csv)?, "preview_token": preview_token, "request_id": request_id});
+            if let Some(path) = decisions {
+                params["decisions"] = read_csv_decisions(path)?;
+            }
+            ("app_record_csv_import", params)
+        }
     })
 }
 

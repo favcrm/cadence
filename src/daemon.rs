@@ -2755,6 +2755,8 @@ impl Shared {
             "app_record_list" => self.rpc_app_record(method, params, peer_pid),
             "app_record_show" => self.rpc_app_record(method, params, peer_pid),
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
