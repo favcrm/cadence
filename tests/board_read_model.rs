@@ -446,7 +446,134 @@ struct Fixture {
     _tmp: TempDir,
 }
 
+/// Fully seeded tracker + daemon store for the one repeated expensive
+/// shape (420 issues, 24 jobs: `tracker_writes` + `overview_cache`),
+/// built once and copied per test. Seeding pays ~700 RPC roundtrips plus
+/// 1500 file writes and a git commit; copying pays file creation only.
+/// Copies stay hermetic: each test owns its dirs, and the one absolute
+/// path baked at seed time (`notes_dir` in `pm.yaml`) is rewritten to
+/// the copy on every materialization. Agent `cwd`s also bake the
+/// template path, but the fake provider never touches the filesystem
+/// and tests register their own agents against the copy — verified by
+/// the suite passing with template paths nowhere in its assertions.
+struct SeedTemplate {
+    _tmp: TempDir,
+    pm: PathBuf,
+    state: PathBuf,
+    notes: PathBuf,
+}
+
+static TEMPLATE_420_24: std::sync::OnceLock<SeedTemplate> = std::sync::OnceLock::new();
+
+fn template_420_24() -> (PathBuf, PathBuf, PathBuf) {
+    // Exactly one builder; every other test waits instead of reseeding.
+    // A build panic poisons the lock and fails dependents loudly.
+    let entry = TEMPLATE_420_24.get_or_init(|| {
+        let tmp = TempDir::new().unwrap();
+        let pm = tmp.path().join("pm");
+        let state = tmp.path().join("st");
+        let notes = tmp.path().join("notes");
+        std::fs::create_dir_all(&pm).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        seed_tracker(&pm, &state, &notes, ISSUES);
+        {
+            let daemon = Daemon::start(state.clone());
+            seed_daemon(&daemon, &pm, 24);
+            // Daemon drops here: stop flag + join before any copy reads
+            // the store, so no WAL is ever copied under a live writer.
+        }
+        SeedTemplate {
+            _tmp: tmp,
+            pm,
+            state,
+            notes,
+        }
+    });
+    (entry.pm.clone(), entry.state.clone(), entry.notes.clone())
+}
+
+/// Recursive directory copy for the seeded fixture (no new
+/// dependency; portable across Linux/macOS runners). Creates `dst`,
+/// copies regular files and recreates subdirectories and empty dirs;
+/// symlinks are refused rather than followed or copied (a seeded
+/// fixture must never escape its root). Panics loudly on any I/O
+/// error: a partial fixture copy must fail the test, not run it.
+fn copy_dir_all(src: &Path, dst: &Path) {
+    assert!(src.is_dir(), "copy source is not a dir: {}", src.display());
+    std::fs::create_dir_all(dst).unwrap();
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        for entry in std::fs::read_dir(&s).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            assert!(
+                !ty.is_symlink(),
+                "fixture copy refuses symlink: {}",
+                entry.path().display()
+            );
+            let target = d.join(entry.file_name());
+            if ty.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                stack.push((entry.path(), target));
+            } else {
+                assert!(
+                    ty.is_file(),
+                    "fixture copy refuses special file: {}",
+                    entry.path().display()
+                );
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+}
+
 fn fixture(issues: usize, jobs: usize) -> Fixture {
+    if (issues, jobs) == (ISSUES, 24) {
+        return fixture_from_template();
+    }
+    fixture_seeded(issues, jobs)
+}
+
+fn fixture_from_template() -> Fixture {
+    let (src_pm, src_state, src_notes) = template_420_24();
+    let tmp = TempDir::new().unwrap();
+    let pm = tmp.path().join("pm");
+    let state = tmp.path().join("st");
+    let notes = tmp.path().join("notes");
+    copy_dir_all(&src_pm, &pm);
+    copy_dir_all(&src_state, &state);
+    copy_dir_all(&src_notes, &notes);
+    // Re-point the one baked absolute path at the copy; everything
+    // else in the seed is relative or content-addressed.
+    let yaml = pm.join("pm.yaml");
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    let text = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("notes_dir:") {
+                format!("notes_dir: {}", notes.display())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&yaml, format!("{text}\n")).unwrap();
+    let daemon = Daemon::start(state.clone());
+    let (port, board) = start_ui(&pm, &state);
+    Fixture {
+        _board: board,
+        _tmp: tmp,
+        pm,
+        state,
+        daemon,
+        port,
+    }
+}
+
+/// Direct seeding for singleton shapes: no dedup win, keep the
+/// straightforward path.
+fn fixture_seeded(issues: usize, jobs: usize) -> Fixture {
     let tmp = TempDir::new().unwrap();
     let pm = tmp.path().join("pm");
     let state = tmp.path().join("st");
