@@ -284,6 +284,29 @@ fn epoch_now() -> i64 {
         .as_secs() as i64
 }
 
+/// Real cross-layer setup for the browser-surface test: the board must
+/// serve the actual SPA build. If `ui/dist` is absent (fresh checkout,
+/// CI), build it here with the repo toolchain — never a placeholder
+/// shell, never a skip. Fails loudly when the toolchain is missing.
+fn ensure_spa_dist() -> std::path::PathBuf {
+    let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let dist = ui.join("dist");
+    if dist.join("index.html").is_file() {
+        return dist;
+    }
+    let status = std::process::Command::new("pnpm")
+        .arg("--dir")
+        .arg(&ui)
+        .arg("build")
+        .status()
+        .expect("node/pnpm toolchain is required to build the SPA for this test");
+    assert!(
+        status.success() && dist.join("index.html").is_file(),
+        "building the actual SPA failed; run `pnpm --dir ui install && pnpm --dir ui build`"
+    );
+    dist
+}
+
 fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
     let context = h.context("Harbour", A, &format!("cad771-e2e-{tag}-context"));
     h.bind(&context, &format!("cad771-e2e-{tag}-binding"));
@@ -764,7 +787,10 @@ fn cad771_browser_board_serves_social_content_app_surface() {
     // The real board HTTP stack over the live daemon state serves a
     // browser-shaped client with zero provider involvement. The shared
     // harness board carries no SPA build, so this test serves the
-    // checked-in web build explicitly (the lane touches no UI file).
+    // checked-in web build explicitly (the lane touches no UI file). If the
+    // build is absent (a fresh checkout, CI), build the actual SPA here -
+    // never a placeholder shell, never a skip.
+    let dist = ensure_spa_dist();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -778,7 +804,7 @@ fn cad771_browser_board_serves_social_content_app_surface() {
             &cadence_agent::ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
-                dist: Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist")),
+                dist: Some(dist),
                 ..Default::default()
             },
         );
