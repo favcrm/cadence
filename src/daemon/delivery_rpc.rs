@@ -100,6 +100,10 @@ impl Shared {
             return Ok(0);
         }
         let pm = self.pm()?;
+        // CAD-362: pair-precision history, snapshot before the mutable
+        // pass — `pick_reviewer` reads every record for the pair.
+        let history: Vec<delivery::Record> = all.values().cloned().collect();
+        let hist: Vec<&delivery::Record> = history.iter().collect();
         // The PRs live records hold — one PR belongs to one ticket.
         let held: Vec<(String, String)> = all
             .values()
@@ -111,7 +115,7 @@ impl Shared {
             // One ticket's failure (a message the queue refuses, an
             // unreadable ticket) never holds up the others; it is
             // retried next pass.
-            match self.route_record(&pm, rec, &held) {
+            match self.route_record(&pm, rec, &held, &hist) {
                 Ok(true) => moved += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!("delivery router, {}: {e}", rec.issue),
@@ -130,6 +134,7 @@ impl Shared {
         pm: &Pm,
         rec: &mut Record,
         held: &[(String, String)],
+        hist: &[&Record],
     ) -> Result<bool> {
         if rec.state.terminal() || rec.state == State::Escalated {
             return Ok(false);
@@ -159,7 +164,7 @@ impl Shared {
         });
         let Some(latest) = fresh.last().cloned() else {
             if rec.state == State::Unstaffed {
-                self.start_review(pm, rec)?;
+                self.start_review(pm, rec, hist)?;
                 return Ok(rec.state != State::Unstaffed);
             }
             return Ok(false);
@@ -168,7 +173,7 @@ impl Shared {
         let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
             (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
                 None => {
-                    self.on_done(pm, rec, sha, pr)?;
+                    self.on_done(pm, rec, sha, pr, hist)?;
                     None
                 }
                 why => why,
@@ -233,7 +238,14 @@ impl Shared {
     }
 
     /// The worker reported `sha` done on `pr`.
-    fn on_done(self: &Arc<Self>, pm: &Pm, rec: &mut Record, sha: &str, pr: &str) -> Result<()> {
+    fn on_done(
+        self: &Arc<Self>,
+        pm: &Pm,
+        rec: &mut Record,
+        sha: &str,
+        pr: &str,
+        hist: &[&Record],
+    ) -> Result<()> {
         let same_head = rec.head.as_deref() == Some(sha) && rec.pr.as_deref() == Some(pr);
         if same_head
             && matches!(
@@ -251,51 +263,136 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.pr = Some(pr.to_string());
+        if rec.head.as_deref() != Some(sha) {
+            // A new head is a new diff — the risk tier is re-measured.
+            rec.risk = None;
+        }
         rec.head = Some(sha.to_string());
         rec.head_at = now();
-        self.start_review(pm, rec)
+        self.start_review(pm, rec, hist)
     }
 
     /// The head moved without a done report from the worker: whoever
     /// reviewed it may have pushed it, so that reviewer is barred from
     /// this ticket and the review goes to someone else.
-    fn review_moved_head(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
+    fn review_moved_head(
+        self: &Arc<Self>,
+        pm: &Pm,
+        rec: &mut Record,
+        hist: &[&Record],
+    ) -> Result<()> {
         if let Some(prev) = rec.reviewer.take() {
             if !rec.excluded.contains(&prev) {
                 rec.excluded.push(prev);
             }
         }
-        self.start_review(pm, rec)
+        // The head that was measured is gone — re-measure the new one.
+        rec.risk = None;
+        self.start_review(pm, rec, hist)
+    }
+
+    /// `(files, additions, deletions)` for the head under review —
+    /// the record's own observation when it names this head, else one
+    /// bounded `gh pr view`. `None` means the diff could not be sized
+    /// (offline, the head moved mid-read): the review proceeds without
+    /// a tier rather than blocking on a stat fetch.
+    fn review_stats(rec: &Record) -> Option<(u64, u64, u64)> {
+        let head = rec.head.as_deref()?;
+        if let Some(o) = &rec.observed {
+            if o.head == head {
+                return Some((o.files, o.additions, o.deletions));
+            }
+        }
+        let pr = rec.pr.as_deref()?;
+        let text = delivery::gh(
+            delivery::GH,
+            &[
+                "pr",
+                "view",
+                pr,
+                "--json",
+                "additions,deletions,changedFiles,headRefOid",
+            ],
+        )
+        .ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        // The PR tip moved since `head` was recorded — the size read
+        // belongs to a different diff; the observe path re-routes.
+        if v["headRefOid"].as_str()? != head {
+            return None;
+        }
+        Some((
+            v["changedFiles"].as_u64()?,
+            v["additions"].as_u64()?,
+            v["deletions"].as_u64()?,
+        ))
     }
 
     /// Route a review of `rec.head` to an independent reviewer, or mark
-    /// the record unstaffed when nobody qualifies.
-    fn start_review(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
+    /// the record unstaffed when nobody qualifies. CAD-362: an
+    /// oversized diff is flagged for splitting instead — no reviewer
+    /// reads a diff too big to verify.
+    fn start_review(self: &Arc<Self>, pm: &Pm, rec: &mut Record, hist: &[&Record]) -> Result<()> {
         let (Some(sha), Some(pr)) = (rec.head.clone(), rec.pr.clone()) else {
             return Ok(());
         };
+        // Risk is measured once per head — `on_done`/`review_moved_head`
+        // clear it when the head moves.
+        if rec.risk.is_none() {
+            rec.risk = Self::review_stats(rec)
+                .map(|(files, adds, dels)| delivery::risk_class(adds, dels, files).as_str())
+                .map(str::to_string);
+        }
+        if rec.risk.as_deref() == Some(delivery::Risk::Oversized.as_str()) {
+            let why = "the diff is oversized for a single review — split it into \
+                       reviewable pieces (smaller PRs), then file a new done report";
+            rec.note = Some(format!("{sha} held from review: {why}"));
+            // The flag is raised once — an Unstaffed record retries the
+            // route every pass and must not re-comment each time.
+            if rec.state != State::Unstaffed {
+                rec.enter(State::Unstaffed, now());
+                let _ = issue::write::add_comment(
+                    pm,
+                    &rec.issue,
+                    &format!("Held from review at {sha}: {why}."),
+                    Some(DAEMON_ALIAS),
+                    Some("review"),
+                    None,
+                    DAEMON_ALIAS,
+                );
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "review_oversized",
+                    json!({"issue": rec.issue, "sha": sha, "pr": pr}),
+                );
+            }
+            return Ok(());
+        }
         let agents = self.store.agents()?;
-        let worker_provider = agents
+        let worker_vendor = agents
             .iter()
             .find(|a| a.alias == rec.worker)
-            .map(|a| a.provider.clone());
+            .map(|a| delivery::vendor(&a.provider, a.model.as_deref()));
         let candidates: Vec<Candidate> = agents
             .iter()
             .map(|a| Candidate {
                 alias: a.alias.clone(),
                 provider: a.provider.clone(),
+                model: a.model.clone(),
                 state: a.state.clone(),
                 enabled: a.enabled,
                 upstream: super::agent_upstream(a).map(str::to_string),
                 role: a.role.clone(),
             })
             .collect();
-        let Some(reviewer) = delivery::pick_reviewer(
+        let Some(pick) = delivery::pick_reviewer(
             &rec.worker,
-            worker_provider.as_deref(),
+            worker_vendor.as_deref(),
             rec.reviewer.as_deref(),
             &rec.excluded,
             &candidates,
+            &pm.config.review,
+            hist,
         ) else {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
@@ -312,6 +409,7 @@ impl Shared {
             }
             return Ok(());
         };
+        let reviewer = pick.alias.clone();
         let agent = agents
             .iter()
             .find(|a| a.alias == reviewer)
@@ -326,6 +424,7 @@ impl Shared {
             &pr,
             &sha,
             &rec.worker,
+            rec.risk.as_deref(),
             listing.as_deref(),
             &ticket.dir.join("issue.md"),
             store::kickoff_ceiling(&agent.provider, &agent.endpoint_kind),
@@ -337,12 +436,23 @@ impl Shared {
         )?;
         rec.rounds = round;
         rec.reviewer = Some(reviewer.clone());
-        rec.note = None;
+        rec.note = if pick.reason.is_fallback() {
+            Some(format!("reviewer {reviewer}: {}", pick.reason.describe()))
+        } else {
+            None
+        };
         rec.enter(State::Reviewing, now());
+        let mut cmt = format!("Review round {round} routed to {reviewer}: {pr} at {sha}");
+        cmt.push_str(&format!(" [{}]", pick.reason.describe()));
+        if let Some(risk) = rec.risk.as_deref() {
+            cmt.push_str(&format!(" Risk: {risk}."));
+        } else {
+            cmt.push('.');
+        }
         let _ = issue::write::add_comment(
             pm,
             &rec.issue,
-            &format!("Review round {round} routed to {reviewer}: {pr} at {sha}."),
+            &cmt,
             Some(DAEMON_ALIAS),
             Some("review"),
             None,
@@ -352,7 +462,8 @@ impl Shared {
             DAEMON_ALIAS,
             "review_routed",
             json!({"issue": rec.issue, "reviewer": reviewer, "sha": sha, "pr": pr,
-                   "round": round, "message": mid}),
+                   "round": round, "message": mid,
+                   "reason": pick.reason.as_str(), "risk": rec.risk}),
         );
         Ok(())
     }
@@ -601,6 +712,9 @@ impl Shared {
         let pm = self.pm()?;
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
+        // CAD-362: pair-precision history for any re-route below.
+        let history: Vec<Record> = all.values().cloned().collect();
+        let hist: Vec<&Record> = history.iter().collect();
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
         let before = rec.state;
         // CAD-776: readiness before this observation — the wake fires
@@ -627,7 +741,7 @@ impl Shared {
                 {
                     rec.head = Some(head.clone());
                     rec.head_at = now();
-                    self.review_moved_head(&pm, rec)?;
+                    self.review_moved_head(&pm, rec, &hist)?;
                     let _ = issue::write::add_comment(
                         &pm,
                         id,

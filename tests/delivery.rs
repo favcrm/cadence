@@ -2067,6 +2067,118 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     }
 }
 
+/// CAD-362: a diff over the oversized tier is flagged for splitting —
+/// the record parks `unstaffed`, the ticket and the record's note say
+/// why, and no reviewer ever gets the kickoff. A follow-up done report
+/// on a small head routes normally and its kickoff names the tier.
+#[test]
+fn an_oversized_diff_is_flagged_for_splitting_not_routed() {
+    let lf = LoopFixture::dispatched();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+
+    // The operator's observe pass has already sized head `a` — the
+    // record carries the stats the router's risk class reads.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": a, "pr_state": "OPEN",
+                   "additions": 2000, "deletions": 1500, "files": 50}),
+        )
+        .unwrap();
+    lf.done(&a);
+    let rec = lf.wait_rec("oversized held", |r| {
+        r["state"] == "unstaffed" && r["risk"] == "oversized"
+    });
+    assert!(rec["note"].as_str().unwrap().contains("split"), "{rec}");
+    assert!(rec["reviewer"].is_null(), "{rec}");
+    // No reviewer was asked.
+    for rev in ["r1", "r2"] {
+        assert!(
+            !lf.f
+                .messages_of(rev)
+                .iter()
+                .any(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-"))),
+            "{rev} got a kickoff for an oversized diff"
+        );
+    }
+    // The ticket carries the flag, and the event names it.
+    let comments = lf.f.pm_dir.join("demo/D-2/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            let t = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            t.contains("oversized") && t.contains("split")
+        }),
+        "no comment flags the diff for splitting"
+    );
+    assert!(
+        lf.daemon_events("review_oversized")
+            .iter()
+            .any(|e| e["payload"]["issue"] == "D-2"),
+        "{:#?}",
+        lf.daemon_events("review_oversized")
+    );
+
+    // The worker splits, files a new done report at `b` — already
+    // measured small — and the route proceeds, the kickoff naming
+    // the tier.
+    lf.f.d
+        .operator_rpc(
+            "delivery_observe",
+            json!({"issue": "D-2", "head": b, "pr_state": "OPEN",
+                   "additions": 30, "deletions": 8, "files": 3}),
+        )
+        .unwrap();
+    lf.done(&b);
+    let rec = lf.wait_rec("small routed", |r| r["state"] == "reviewing");
+    assert_eq!(rec["risk"], "small", "{rec}");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    let kickoff =
+        lf.f.messages_of("r1")
+            .into_iter()
+            .find(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-")))
+            .expect("r1 got the review kickoff");
+    assert!(
+        kickoff["body"].as_str().unwrap().contains("Risk: small."),
+        "{}",
+        kickoff["body"]
+    );
+}
+
+/// CAD-362: every fixture agent is `claude` — the pick is the
+/// same-vendor fallback, and the record's note and the routed comment
+/// both say so; a fallback is never silent.
+#[test]
+fn a_same_vendor_pick_records_its_fallback_reason() {
+    let lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    assert!(
+        rec["note"]
+            .as_str()
+            .unwrap()
+            .contains("same-vendor fallback"),
+        "{rec}"
+    );
+    let comments = lf.f.pm_dir.join("demo/D-2/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .contains("[same-vendor fallback")
+        }),
+        "no routed comment carries the fallback reason"
+    );
+    assert!(
+        lf.daemon_events("review_routed")
+            .iter()
+            .any(|e| e["payload"]["reason"] == "same-vendor-fallback"),
+        "{:#?}",
+        lf.daemon_events("review_routed")
+    );
+}
+
 /// CAD-591: an agent caller cannot mint an independent reviewer — not
 /// from its own connection, and not from a detached (`setsid`) child.
 /// A reviewer it plants under itself is not assigned its own review.
