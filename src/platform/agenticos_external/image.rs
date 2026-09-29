@@ -13,6 +13,16 @@ use crate::platform::AppCapabilityAsset;
 use super::{IMAGE_TOOL, PLATFORM};
 
 const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+/// CAD-734: base64 image custody keeps the existing 1 MiB AgenticOS JSON
+/// response cap end to end. A 512 KiB decoded asset needs at most 699,052
+/// base64 characters, which plus a bounded envelope fits the unchanged
+/// 1 MiB Cadence JSON cap and the 2 MiB upstream Treg body cap. Larger
+/// assets stay on the URL-mode path; raising this bound requires a
+/// coordinated storage/replay and failure-cost proof, never a lone buffer.
+pub(crate) const BASE64_ASSET_LIMIT: usize = 512 * 1024;
+/// Ceiling for the single encoded field, checked before any decode work.
+/// 699,052 characters carry 512 KiB; the slack covers padding only.
+pub(crate) const BASE64_ENCODED_LIMIT: usize = 700_000;
 // The fixed image-01 operation asks for one square image. Keep decode work
 // independent of the compressed byte count: a tiny file can expand enormously.
 const IMAGE_SIDE_LIMIT: u32 = 2048;
@@ -236,6 +246,17 @@ pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a s
     {
         return Err("image provider did not attest one successful image".into());
     }
+    // A base64-mode payload must never be accepted as a URL-mode result;
+    // mode confusion would let one paid outcome satisfy the other run.
+    if let Some(entries) = result["data"].get("image_base64") {
+        let non_empty = entries
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(true);
+        if non_empty {
+            return Err("image URL result carries an unexpected base64 payload".into());
+        }
+    }
     let images = result["data"]["image_urls"]
         .as_array()
         .ok_or("image URL list is missing")?;
@@ -262,7 +283,64 @@ pub(super) fn image_url<'a>(result: &'a Value, hosts: &[String]) -> Result<&'a s
     Ok(url)
 }
 
+/// CAD-734: accept exactly one successful `data.image_base64` value and
+/// return its custody-checked bytes plus sniffed media type. The encoded
+/// field is bounded before decoding, the decoded bytes are bounded to
+/// [`BASE64_ASSET_LIMIT`], and the bytes then pass the same full
+/// PNG/JPEG/WebP decode, square/dimension/pixel/allocation limits as
+/// CDN custody. The encoded string is never retained: callers keep only
+/// the decoded asset bytes behind an immutable run-scoped receipt.
+pub(super) fn image_base64_bytes(result: &Value) -> Result<(Vec<u8>, &'static str), String> {
+    if result["base_resp"]["status_code"] != 0
+        || !matches!(result["metadata"]["success_count"].as_str(), Some("1"))
+        || !matches!(result["metadata"]["failed_count"].as_str(), Some("0"))
+    {
+        return Err("image provider did not attest one successful image".into());
+    }
+    // URL-mode output must never satisfy a base64-mode run (and vice
+    // versa): a retry under the same idempotency key cannot change mode.
+    if let Some(urls) = result["data"].get("image_urls") {
+        let non_empty = urls
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(true);
+        if non_empty {
+            return Err("image base64 result carries an unexpected URL payload".into());
+        }
+    }
+    let entries = result["data"]["image_base64"]
+        .as_array()
+        .ok_or("image base64 list is missing")?;
+    if entries.len() != 1 {
+        return Err("image provider returned a different number of images".into());
+    }
+    let encoded = entries[0]
+        .as_str()
+        .ok_or("image base64 value is malformed")?;
+    if encoded.is_empty() || encoded.len() > BASE64_ENCODED_LIMIT {
+        return Err("image base64 value exceeds the supported bound".into());
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "image base64 value is malformed")?;
+    if bytes.is_empty() || bytes.len() > BASE64_ASSET_LIMIT {
+        return Err("image base64 payload exceeds the 512 KiB base64 asset bound".into());
+    }
+    let media_type = image_data_mime(&bytes)?;
+    Ok((bytes, media_type))
+}
 pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+    let sniffed = image_data_mime(bytes)?;
+    if header.trim().to_ascii_lowercase() != sniffed {
+        return Err("downloaded image MIME differs from its bytes".into());
+    }
+    Ok(sniffed)
+}
+
+/// Byte-sniffed custody decode shared by CDN and base64 paths: no header
+/// trust, full decode inside square/dimension/pixel/allocation limits.
+fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
     let png = bytes.len() >= 45
         && bytes.starts_with(&[
             0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
@@ -285,9 +363,6 @@ pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, Str
     } else {
         return Err("downloaded image has no supported image signature".into());
     };
-    if header.trim().to_ascii_lowercase() != sniffed {
-        return Err("downloaded image MIME differs from its bytes".into());
-    }
     let format = match sniffed {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -351,6 +426,60 @@ pub(super) fn download_image(agent: &ureq::Agent, url: &str) -> Result<AppCapabi
     })
 }
 
+/// CAD-734 mapping onto the AOS-94 slice-1 device media-import shape
+/// (agenticos-stack/agenticos-v2#214, `devicePublishMediaImportSchema`):
+/// `{connectionId, digest, mime, sizeBytes}` where digest is bare 64-hex
+/// SHA-256 and mime is `image/jpeg`/`image/png` within 10 MiB.
+/// This is a mapping, not a parallel contract: the backend owns the schema,
+/// the media key (`dp1.<workspace>.<connection>.<digest32>`, backend-issued
+/// and opaque to Cadence) and read-back verification. Cadence maps its
+/// retained custody bytes here and refuses publish-bound use of anything
+/// outside the slice-1 shape: WebP stays valid for Local draft custody but
+/// is refused here until PM decides transcode-or-amend, and the run
+/// receipt's `sha256:` prefix is stripped, never sent. Slice-2 send
+/// authority (preflight/send HTTP, grant presentation) is open and untouched
+/// by this lane.
+#[cfg(test)]
+pub(crate) const DEVICE_PUBLISH_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+#[cfg(test)]
+pub(super) fn device_import_fields(media_type: &str, bytes: &[u8]) -> Result<Value, String> {
+    if !matches!(media_type, "image/jpeg" | "image/png") {
+        return Err("publish-bound media type is outside the device import shape".into());
+    }
+    if bytes.is_empty() || bytes.len() > DEVICE_PUBLISH_MAX_IMAGE_BYTES {
+        return Err("publish-bound media size is outside the device import shape".into());
+    }
+    use sha2::Digest as _;
+    let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+    Ok(serde_json::json!({"digest": digest, "mime": media_type, "sizeBytes": bytes.len()}))
+}
+
+/// CAD-734 binding digests for the slice-1 grant/presentation gate
+/// (`grantSendStatus` in agenticos-stack/agenticos-v2#214): the presented
+/// claim Cadence will one day bind to a server-issued grant — exact caption
+/// digest plus exact image digest, computed over the approved caption bytes
+/// and the retained custody bytes. Caption follows the preflight request
+/// bound (1..=8000 chars); the image half reuses [`device_import_fields`]
+/// so only slice-1-shaped bytes can bind. Test-only until slice-2 wires
+/// the send: this lane creates no grant, presents none, and the pilot
+/// credential never carries `publish.send` (see the fixed-body tests).
+#[cfg(test)]
+pub(super) fn publish_binding_digests(
+    caption: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> Result<Value, String> {
+    let chars = caption.chars().count();
+    if !(1..=8000).contains(&chars) {
+        return Err("publish-bound caption is outside the device preflight shape".into());
+    }
+    let import = device_import_fields(media_type, bytes)?;
+    use sha2::Digest as _;
+    let caption_digest = format!("{:x}", sha2::Sha256::digest(caption.as_bytes()));
+    Ok(serde_json::json!({"captionDigest": caption_digest, "imageDigest": import["digest"]}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +512,170 @@ mod tests {
             .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn cad734_base64_custody_accepts_one_bounded_image_and_refuses_forgeries() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let png = encoded_png(1, 1);
+        let good = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}});
+        let (bytes, mime) = image_base64_bytes(&good).unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(mime, "image/png");
+        let jpeg = encoded_jpeg(1, 1);
+        let (bytes, mime) = image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&jpeg)]}}))
+            .unwrap();
+        assert_eq!(bytes, jpeg);
+        assert_eq!(mime, "image/jpeg");
+        for (name, result) in [
+            (
+                "missing field",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{}}),
+            ),
+            (
+                "empty list",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[]}}),
+            ),
+            (
+                "two images",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png), engine.encode(&png)]}}),
+            ),
+            (
+                "not a string",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[42]}}),
+            ),
+            (
+                "empty string",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[""]}}),
+            ),
+            (
+                "malformed base64",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":["!!!not-base64!!!"]}}),
+            ),
+            (
+                "non-standard alphabet rejected",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("-{}", engine.encode(&png))]}}),
+            ),
+            (
+                "data-url prefix rejected",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[format!("data:image/png;base64,{}", engine.encode(&png))]}}),
+            ),
+            (
+                "failed attestation",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"1","success_count":"0"},"data":{"image_base64":[engine.encode(&png)]}}),
+            ),
+            (
+                "bad status",
+                serde_json::json!({"base_resp":{"status_code":1},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)]}}),
+            ),
+            (
+                "url payload in base64 result",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&png)],"image_urls":["https://images.example.test/a.png"]}}),
+            ),
+            (
+                "not an image",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(b"<svg>not an image</svg>")]}}),
+            ),
+            (
+                "non-square",
+                serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(encoded_png(2, 1))]}}),
+            ),
+        ] {
+            assert!(image_base64_bytes(&result).is_err(), "{name}");
+        }
+        // URL-mode results must refuse a smuggled base64 payload, and an
+        // oversized encoded field must fail before any decode work.
+        let smuggled = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_urls":["https://images.example.test/a.png"],"image_base64":[engine.encode(&png)]}});
+        assert!(image_url(&smuggled, &["images.example.test".into()]).is_err());
+        let oversized = "A".repeat(BASE64_ENCODED_LIMIT + 1);
+        assert!(image_base64_bytes(&serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[oversized]}})).is_err());
+        // A 512 KiB asset fits; anything larger is refused even though the
+        // field bound would admit its encoding.
+        let big = vec![0u8; BASE64_ASSET_LIMIT + 1];
+        let big_result = serde_json::json!({"base_resp":{"status_code":0},"metadata":{"failed_count":"0","success_count":"1"},"data":{"image_base64":[engine.encode(&big)]}});
+        assert!(image_base64_bytes(&big_result).is_err());
+        // Encoded-size proof: the largest supported asset plus a bounded
+        // envelope must fit the unchanged 1 MiB JSON response cap.
+        let max_encoded = BASE64_ASSET_LIMIT.div_ceil(3) * 4;
+        assert!(
+            max_encoded <= BASE64_ENCODED_LIMIT,
+            "encoded bound must admit 512 KiB"
+        );
+        assert!(
+            max_encoded + 2048 <= 1024 * 1024,
+            "base64 JSON must fit the 1 MiB cap"
+        );
+    }
+
+    #[test]
+    fn cad734_publish_binding_digests_match_grant_gate_shapes() {
+        // Slice-1 fixture digest is sha256("test"): the caption half must
+        // reproduce the gate's exact content binding.
+        let fixture_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let png = encoded_png(1, 1);
+        let binding = publish_binding_digests("test", "image/png", &png).unwrap();
+        assert_eq!(binding["captionDigest"], fixture_digest);
+        assert_eq!(
+            binding["imageDigest"],
+            device_import_fields("image/png", &png).unwrap()["digest"]
+        );
+        // Boundary: 8000 chars bind, 8001 do not; empty never binds.
+        assert!(publish_binding_digests(&"x".repeat(8000), "image/png", &png).is_ok());
+        for bad in ["", &"x".repeat(8001)] {
+            assert!(publish_binding_digests(bad, "image/png", &png).is_err());
+        }
+        // The image half reuses the import gate: webp and empty bytes fail.
+        assert!(publish_binding_digests("test", "image/webp", &encoded_webp(1, 1)).is_err());
+        assert!(publish_binding_digests("test", "image/png", b"").is_err());
+        // Changed content binds a different digest: the gate's
+        // content_mismatch verdict is computable from custody outputs.
+        let altered_caption = publish_binding_digests("test!", "image/png", &png).unwrap();
+        assert_ne!(altered_caption["captionDigest"], binding["captionDigest"]);
+        assert_eq!(altered_caption["imageDigest"], binding["imageDigest"]);
+        let mut altered_bytes = png.clone();
+        altered_bytes.extend([0]);
+        let altered_image = publish_binding_digests("test", "image/png", &altered_bytes).unwrap();
+        assert_ne!(altered_image["imageDigest"], binding["imageDigest"]);
+        assert_eq!(altered_image["captionDigest"], binding["captionDigest"]);
+    }
+
+    #[test]
+    fn cad734_device_import_maps_custody_bytes_onto_slice1_shape() {
+        // Slice-1 fixture vector: sha256("test") is the fixture digest.
+        let fixture_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let fields = device_import_fields("image/jpeg", b"test").unwrap();
+        assert_eq!(fields["digest"], fixture_digest);
+        assert_eq!(fields["mime"], "image/jpeg");
+        assert_eq!(fields["sizeBytes"], 4);
+        // Digest is bare 64-hex: the run receipt's `sha256:` prefix is
+        // stripped, never sent; size is the exact retained byte count.
+        let png = encoded_png(1, 1);
+        let fields = device_import_fields("image/png", &png).unwrap();
+        assert_eq!(fields["digest"].as_str().unwrap().len(), 64);
+        assert!(fields["digest"]
+            .as_str()
+            .unwrap()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!fields["digest"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(fields["sizeBytes"], png.len() as u64);
+        // Adversarial: publish-bound mapping refuses everything outside the
+        // slice-1 shape, even custody-valid bytes.
+        assert!(device_import_fields("image/webp", &encoded_webp(1, 1)).is_err());
+        assert!(device_import_fields("IMAGE/JPEG", b"test").is_err());
+        assert!(device_import_fields("application/octet-stream", b"test").is_err());
+        assert!(device_import_fields("", b"test").is_err());
+        assert!(device_import_fields("image/jpeg", b"").is_err());
+        assert!(
+            device_import_fields("image/png", &vec![0u8; DEVICE_PUBLISH_MAX_IMAGE_BYTES + 1])
+                .is_err()
+        );
+        // Slice-1 cap admits every Cadence custody bound by construction.
+        const {
+            assert!(BASE64_ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
+            assert!(ASSET_LIMIT <= DEVICE_PUBLISH_MAX_IMAGE_BYTES);
+        }
     }
 
     #[test]
