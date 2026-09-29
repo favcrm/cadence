@@ -61,6 +61,8 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+pub mod app_audiences;
+pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_bindings;
 pub mod app_capabilities;
 pub mod app_contexts;

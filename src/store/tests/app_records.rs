@@ -467,3 +467,145 @@ fn cad779_invalid_csv_decision_does_not_reserve_request_id() {
         .unwrap();
     assert_eq!(imported["summary"]["applied"], 1);
 }
+
+#[test]
+fn cad780_concurrent_fresh_opens_converge_on_one_file() {
+    let dir = TempDir::new().unwrap();
+    // Six threads open the same never-created installation at once:
+    // exactly one runs the fresh initialization while the rest wait
+    // out its commit instead of mistaking the half-written file for
+    // corruption. Every create then lands exactly once.
+    let barrier = std::sync::Barrier::new(6);
+    let dir_ref = &dir;
+    let barrier_ref = &barrier;
+    std::thread::scope(|scope| {
+        (0..6)
+            .map(|index| {
+                scope.spawn(move || {
+                    barrier_ref.wait();
+                    let store = record_file(dir_ref, "install-fresh");
+                    let id = format!("customer-{index}");
+                    store
+                        .app_record_create(
+                            "ctx-1",
+                            &id,
+                            &customer(
+                                &format!("Racer {index}"),
+                                &format!("racer{index}@example.com"),
+                            ),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|h| h.join().unwrap());
+    });
+    let listed = record_file(&dir, "install-fresh")
+        .app_record_list("ctx-1")
+        .unwrap();
+    assert_eq!(listed["records"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn cad780_open_waits_out_a_held_write_lock_then_succeeds() {
+    let dir = TempDir::new().unwrap();
+    // The installation file exists and is initialized; a sibling
+    // holds a write transaction on it while a loser opens. Coded
+    // lock contention at the WAL pragma must ride the bounded wait
+    // and converge — never refuse the file as corrupt or unavailable.
+    record_file(&dir, "install-locked")
+        .app_record_create(
+            "ctx-1",
+            "customer-1",
+            &customer("Amina", "amina@example.com"),
+        )
+        .unwrap();
+    let path = record_db_path(dir.path(), "install-locked").unwrap();
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO app_suppressions(context_id,kind,key,reason,at) VALUES('ctx-1','email','held@example.com','test',0.0);")
+        .unwrap();
+    let opened = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-locked"));
+        // The opener's first attempts meet the held write lock; the
+        // holder commits inside the bounded wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holder.execute_batch("COMMIT;").unwrap();
+        worker.join().unwrap()
+    });
+    let store = opened.unwrap();
+    assert_eq!(
+        store.app_record_show("ctx-1", "customer-1").unwrap()["record"]["revision"],
+        1
+    );
+    assert_eq!(
+        store.app_suppression_list("ctx-1").unwrap()["suppressions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cad780_open_sees_an_initializing_file_then_converges() {
+    let dir = TempDir::new().unwrap();
+    // A valid SQLite file with no record tables yet: exactly what a
+    // loser sees while a sibling is mid-initialization. The version
+    // read must return the in-progress signal for the bounded wait —
+    // never an immediate corruption refusal — and converge once the
+    // sibling commits its init.
+    let path = record_db_path(dir.path(), "install-initializing").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    rusqlite::Connection::open(&path).unwrap();
+    let opened = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-initializing"));
+        // The opener's first reads land before any table exists; the
+        // initializer commits inside the bounded wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let init = rusqlite::Connection::open(&path).unwrap();
+        init.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE record_schema(version INTEGER NOT NULL);
+             INSERT INTO record_schema(version) VALUES(1);
+             CREATE TABLE record_identity(install_id TEXT PRIMARY KEY, created REAL NOT NULL);
+             INSERT INTO record_identity(install_id, created) VALUES('install-initializing', 0.0);
+             COMMIT;",
+        )
+        .unwrap();
+        worker.join().unwrap()
+    });
+    let store = opened.unwrap();
+    // The converged open migrated the half-initialized file forward.
+    let rule = crate::store::Predicate::parse(
+        &serde_json::json!({"field": "tag", "op": "eq", "value": "vip"}),
+    )
+    .unwrap();
+    store
+        .app_segment_save("ctx-1", "seg-vip", None, "VIP", &[rule])
+        .unwrap();
+}
+
+#[test]
+fn cad780_open_on_a_forever_table_less_file_refuses_corrupt() {
+    let dir = TempDir::new().unwrap();
+    // A valid SQLite file that never gains record tables: the
+    // bounded wait must expire into the rejected CORRUPT diagnosis —
+    // never the transient in-progress signal, and never silently.
+    let path = record_db_path(dir.path(), "install-empty").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    rusqlite::Connection::open(&path).unwrap();
+    let Err(refused) = RecordStore::open(dir.path(), "install-empty") else {
+        panic!("table-less file opened");
+    };
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("corrupt") && refused.contains("backup"),
+        "table-less file refused unclearly: {refused}"
+    );
+    assert!(
+        !refused.contains("in progress"),
+        "exhausted wait leaked the transient signal: {refused}"
+    );
+}

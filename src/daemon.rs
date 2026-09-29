@@ -18,6 +18,7 @@
 
 mod agents_rpc;
 mod answer_rpc;
+mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
 mod app_contexts_rpc;
@@ -2807,6 +2808,18 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_exclusion_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_add" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_remove" => self.rpc_app_audience(method, params, peer_pid),
+            "app_suppression_list" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_preview" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_prepare" => self.rpc_app_audience(method, params, peer_pid),
+            "app_audience_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
