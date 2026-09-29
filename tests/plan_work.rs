@@ -3956,6 +3956,333 @@ fn work_model_unapproved_gate_edits_fall_back_to_defaults() {
     assert!(stage()["config_unapproved"].is_string());
 }
 
+/// CAD-826 (CAD-814 slice 1): `project_work_approve` records the
+/// resolved `delivery:` policy and its digest — computed by the daemon
+/// from the file, never from a param — and refuses while the section
+/// is malformed. Until CAD-814 slice 2 nothing consumes it; readers
+/// report `source`/`digest`/`note`.
+#[test]
+fn delivery_policy_approval_and_resolution() {
+    use cadence_agent::issue::delivery_policy::{default_policy, digest, DeliveryPolicy};
+    let f = PlanFixture::start();
+    let project_md = f.pm_dir.join("demo/PROJECT.md");
+    let delivery_yaml = concat!(
+        "delivery:\n",
+        "  max_revise: 5\n",
+        "  reviews:\n",
+        "    review: {kind: agent, focus: general}\n",
+        "    gate: {kind: operator}\n",
+        "  risk:\n",
+        "    - require: [review]\n",
+        "    - when: {paths: [\"ui/**\"]}\n",
+        "      require: [review, gate]\n",
+    );
+    let file_policy: DeliveryPolicy =
+        cadence_agent::issue::delivery_policy::parse(&format!("---\n{delivery_yaml}---\n"))
+            .unwrap()
+            .unwrap();
+    std::fs::write(
+        &project_md,
+        format!("---\nproject: demo\n{delivery_yaml}---\n# Demo\n"),
+    )
+    .unwrap();
+    let ls_delivery = |f: &PlanFixture, key: &str| -> Value {
+        let (ok, out) = f.cli(&["issue", "project", "ls", "--json"]);
+        assert!(ok, "{out}");
+        out["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["key"] == key)
+            .unwrap()["delivery"]
+            .clone()
+    };
+
+    // A second project with a malformed `delivery:` — it degrades its
+    // own row to the defaults plus a delivery_error note and never
+    // breaks the listing or demo's row.
+    let (ok, out) = f.cli(&["issue", "project", "add", "other", "--prefix", "O"]);
+    assert!(ok, "{out}");
+    let other_md = f.pm_dir.join("other/PROJECT.md");
+    std::fs::write(&other_md, "---\ndelivery: {risk: []}\n---\n").unwrap();
+    let d_other = ls_delivery(&f, "other");
+    assert_eq!(d_other["source"], "default", "{d_other}");
+    assert!(
+        d_other["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("delivery_error: other/PROJECT.md delivery is malformed"),
+        "{d_other}"
+    );
+    let d_demo = ls_delivery(&f, "demo");
+    assert_eq!(d_demo["source"], "default", "{d_demo}");
+    assert!(
+        d_demo["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery_unapproved"),
+        "{d_demo}"
+    );
+
+    // A pane and a detached agent-env caller cannot approve.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "project_work_approve",
+        json!({"project": "demo"}),
+    );
+    assert!(frame_err(&r).contains("operator action"), "{r}");
+    // A literal detached child: `setsid` inside the agent pane — an
+    // agent-descended caller in a fresh session is still refused.
+    // (`unprovable_rpc` below is the agent-env caller; this one adds
+    // the missing detached ancestry shape.)
+    let req = pane.dir.path().join("detached-req.json");
+    std::fs::write(
+        &req,
+        cadence_agent::proto::request("project_work_approve", json!({"project": "demo"}))
+            .to_string(),
+    )
+    .unwrap();
+    let (rc, out) = pane.run(&format!(
+        "setsid python3 -c 'import socket,sys;\
+         s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+         s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+         print(s.makefile().readline())' {} {}",
+        client::socket_path(&f.d.state).display(),
+        req.display()
+    ));
+    assert_eq!(rc, 0, "{out}");
+    let r: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(frame_err(&r).contains("operator action"), "{r}");
+    let r = unprovable_rpc(&f.d, "project_work_approve", json!({"project": "demo"}));
+    assert!(frame_err(&r).contains("operator action"), "{r}");
+
+    // Before approval the custom section resolves as default + note.
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "default", "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery_unapproved"),
+        "{d}"
+    );
+
+    // Forged `delivery`/`delivery_digest` params are ignored — the
+    // daemon computes both fields from the file it read.
+    let out =
+        f.d.operator_rpc(
+            "project_work_approve",
+            json!({"project": "demo", "delivery_digest": "sha256:forged",
+                   "delivery": {"max_revise": 9}}),
+        )
+        .unwrap();
+    assert_eq!(out["delivery_digest"], json!(digest(&file_policy)), "{out}");
+    let recorded: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+    assert_eq!(digest(&recorded), out["delivery_digest"].as_str().unwrap());
+    assert_eq!(recorded.max_revise, 5, "{out}");
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(
+        (d["source"].as_str(), d["note"].is_null()),
+        (Some("approved"), true),
+        "{d}"
+    );
+
+    // Concurrent approves: every call succeeds on the same stable
+    // file and records a consistent delivery/delivery_digest pair;
+    // afterwards the resolution still names the approved policy —
+    // while a pane's attempt in the middle is still refused.
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(s.spawn(|| {
+                f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+                    .unwrap()
+            }));
+        }
+        let r = pane.rpc(
+            &f.d.state,
+            "project_work_approve",
+            json!({"project": "demo"}),
+        );
+        assert!(frame_err(&r).contains("operator action"), "{r}");
+        for h in handles {
+            let out = h.join().unwrap();
+            let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+            assert_eq!(
+                out["delivery_digest"].as_str().unwrap(),
+                digest(&p),
+                "{out}"
+            );
+            assert_eq!(digest(&p), digest(&file_policy), "{out}");
+        }
+    });
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+
+    // An agent-style edit afterwards: the approved policy stays in
+    // force, reported with the old digest and a delivery_unapproved
+    // note; lint warns the same.
+    std::fs::write(
+        &project_md,
+        concat!(
+            "---\nproject: demo\ndelivery:\n  max_revise: 9\n",
+            "  reviews:\n    review: {kind: agent, focus: general}\n",
+            "  risk:\n    - require: [review]\n---\n",
+        ),
+    )
+    .unwrap();
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("changed since approval"),
+        "{d}"
+    );
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "{lint}");
+    assert!(
+        lint["warnings"].to_string().contains("delivery_unapproved"),
+        "{lint}"
+    );
+
+    // A default-equivalent section does the same: the approved custom
+    // policy stays in force, reported with its digest and the
+    // "changed since approval" note — the weaker default never slips
+    // in silently.
+    std::fs::write(
+        &project_md,
+        concat!(
+            "---\nproject: demo\ndelivery:\n",
+            "  reviews:\n    review: {kind: agent, focus: general}\n",
+            "  risk:\n    - require: [review]\n---\n",
+        ),
+    )
+    .unwrap();
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("changed since approval"),
+        "{d}"
+    );
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "{lint}");
+    assert!(
+        lint["warnings"].to_string().contains("delivery_unapproved"),
+        "{lint}"
+    );
+
+    // Removing the section keeps the approved policy in force.
+    std::fs::write(&project_md, "---\nproject: demo\n---\n").unwrap();
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("was removed since approval"),
+        "{d}"
+    );
+
+    // A malformed section: same resolution, and approve refuses.
+    std::fs::write(&project_md, "---\ndelivery: {risk: []}\n---\n").unwrap();
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert!(d["note"].as_str().unwrap().contains("malformed"), "{d}");
+    let err =
+        f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("delivery"), "{err}");
+
+    // A project without a section records `delivery: null` and the
+    // default policy's digest; a file racing the approve never yields
+    // a delivery/delivery_digest mismatch.
+    std::fs::remove_file(&project_md).unwrap();
+    let out =
+        f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+            .unwrap();
+    assert!(out["delivery"].is_null(), "{out}");
+    assert_eq!(
+        out["delivery_digest"],
+        json!(digest(&default_policy())),
+        "{out}"
+    );
+    assert_eq!(out["stages"].as_array().unwrap().len(), 5, "{out}");
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "default", "{d}");
+    assert!(d["note"].is_null(), "{d}");
+
+    // A file racing the approve never yields a torn read (writes are
+    // atomic: temp + rename) nor a mixed snapshot — the recorded gate
+    // stages and delivery policy always come from the same write.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let pm = project_md.clone();
+    let writer = thread::spawn(move || {
+        // A: custom stages + max_revise 3. B: default stages +
+        // max_revise 4.
+        let base = "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                    risk: [{require: [r]}]";
+        let variants = [
+            format!("---\nstages: [a, b]\n{base}, max_revise: 3}}\n---\n"),
+            format!("---\n{base}, max_revise: 4}}\n---\n"),
+        ];
+        let tmp = pm.with_file_name("PROJECT.md.tmp");
+        let mut flip = false;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let v = &variants[flip as usize];
+            if std::fs::write(&tmp, v).is_ok() {
+                let _ = std::fs::rename(&tmp, &pm);
+            }
+            flip = !flip;
+        }
+        let _ = std::fs::remove_file(&tmp);
+    });
+    let default_stages = json!(["shape", "build", "verify", "release", "done"]);
+    for _ in 0..10 {
+        let out =
+            f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+                .unwrap();
+        if out["delivery"].is_null() {
+            // The file was briefly absent: defaults, one snapshot.
+            assert_eq!(
+                out["delivery_digest"],
+                json!(digest(&default_policy())),
+                "{out}"
+            );
+            assert_eq!(out["stages"], default_stages, "{out}");
+            continue;
+        }
+        let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+        assert_eq!(
+            out["delivery_digest"].as_str().unwrap(),
+            digest(&p),
+            "{out}"
+        );
+        // The single-snapshot pairing: max_revise 3 rides with
+        // stages [a, b], max_revise 4 with the five default stages.
+        match p.max_revise {
+            3 => assert_eq!(out["stages"], json!(["a", "b"]), "{out}"),
+            4 => assert_eq!(out["stages"], default_stages, "{out}"),
+            other => panic!("unexpected max_revise {other}: {out}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
 // ---- CAD-358: `cadence project new` ----
 
 /// CAD-358: `cadence project new <key> --repo <path>` registers the repo

@@ -718,9 +718,11 @@ pub enum ProjectAction {
         json: bool,
     },
     /// Approve the project's PROJECT.md gate keys (`stages`,
-    /// `operator_stages`) as they are now — operator only, through the
-    /// daemon. Until approved (and after any later edit), the default
-    /// stages and operator stages apply.
+    /// `operator_stages`) and its `delivery:` policy as they are now —
+    /// operator only, through the daemon. Until approved (and after
+    /// any later edit), the default stages and operator stages apply;
+    /// a custom `delivery:` policy likewise applies only while it
+    /// matches this approval.
     ApproveWork {
         /// Project key.
         key: String,
@@ -803,9 +805,19 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             } => {
                 let pm = open_pm()?;
                 let projects = project::list(&pm.dir)?;
+                // CAD-826: the resolved delivery policy per project. A
+                // malformed section or an unreachable daemon degrades
+                // that project's entry, never the listing.
+                let approvals = crate::issue::delivery_policy::fetch_approvals(state_dir);
                 let mut rows: Vec<Value> = projects
                     .iter()
                     .map(|p| {
+                        let file = crate::issue::delivery_policy::load(&pm.dir, &p.key);
+                        let eff = crate::issue::delivery_policy::effective(
+                            &p.key,
+                            file,
+                            approvals.get(&p.key),
+                        );
                         json!({
                             "key": p.key, "prefix": p.prefix,
                             "components": p.components,
@@ -814,6 +826,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                             "repos": p.repos.iter().map(|r| json!({
                                 "path": r.path, "remote": r.remote,
                             })).collect::<Vec<_>>(),
+                            "delivery": {
+                                "source": eff.source,
+                                "digest": eff.digest,
+                                "note": eff.note,
+                            },
                         })
                     })
                     .collect();
@@ -1678,7 +1695,9 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         IssueAction::Lint { project } => {
             let pm = open_pm()?;
             let approvals = work::fetch_approvals(state_dir);
-            let report = lint::run_with(&pm, project.as_deref(), Some(&approvals))?;
+            let delivery = crate::issue::delivery_policy::fetch_approvals(state_dir);
+            let report =
+                lint::run_with(&pm, project.as_deref(), Some(&approvals), Some(&delivery))?;
             if report["ok"].as_bool() == Some(true) {
                 print_json(&report);
                 Ok(0)

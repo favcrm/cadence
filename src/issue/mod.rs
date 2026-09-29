@@ -13,6 +13,7 @@ pub mod board;
 pub mod claim;
 pub mod cli;
 pub mod context;
+pub mod delivery_policy;
 pub mod dispatch;
 pub mod doctor;
 pub mod finish;

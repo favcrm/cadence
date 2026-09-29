@@ -336,7 +336,9 @@ cadence issue epic stage CAD-38 verify [--note why]
                                             # forward into build/release = operator
 cadence issue project approve-work <key>    # CAD-405, operator only: PROJECT.md
                                             # stages/operator_stages take effect
-                                            # only while they match this approval
+                                            # only while they match this approval;
+                                            # CAD-826: same for the `delivery:`
+                                            # policy (see below)
 cadence milestone ls|show [m2] [--project p] [--json]
     [--stage s] [--health h] [--sort k]     # milestones (PROJECT.md, `milestone:`
     [--limit n] [--fields f,…]              # or an m<n>-… tag) with rolled-up
@@ -438,6 +440,75 @@ per id, so each issue's `log` and `blame` read it as their own.
 Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
+
+### PROJECT.md `delivery:` — the per-project delivery policy (CAD-826)
+
+A project may declare the delivery policy the loop will run under in
+`<pm>/<key>/PROJECT.md` frontmatter. Like the work gates it lives in
+PROJECT.md and not `project.yaml` (strict `deny_unknown_fields` — an
+older binary would refuse the whole file), and it takes effect only
+once the operator approves it: `cadence issue project approve-work
+<key>` records the resolved policy and its `sha256:` digest beside the
+stage-gate digest. A malformed `delivery:` refuses the whole approval;
+the daemon computes both fields from the file it read — a
+`delivery`/`delivery_digest` param is ignored. With no section the
+recorded policy is `null` and the digest is the default policy's. The
+digest is canonical across reordered keys and defaults written out or
+left implicit — but `risk` rule order is significant, so reordering
+rules changes it and needs re-approval.
+
+```yaml
+delivery:
+  merge: {method: squash, queue: true}    # optional; method: squash|merge|rebase
+  max_revise: 2                           # optional; 1..=10
+  reviews:                                # required, non-empty: the names
+    standards: {kind: agent, focus: standards}      # focus: general|standards|
+    spec:      {kind: agent, focus: spec-security}  #   spec-security|browser-qa
+    browser:   {kind: agent, focus: browser-qa}
+    devin:     {kind: check, app: devin-ai-integration, mode: advisory}  # or required
+    operator:  {kind: operator}
+  risk:                                   # required, non-empty: a delivery
+    - require: [standards, spec]          # must satisfy every review
+    - when: {paths: ["ui/**"]}            # `require`d by every rule whose
+      require: [browser]                  # `when` holds; no `when` = always
+    - when: {paths: [".github/**"], lines_over: 1500, files_over: 40}
+      require: [operator]
+  heavy:     {lines_over: 800, files_over: 10}    # optional
+  oversized: {lines_over: 3000, files_over: 40}   # optional
+```
+
+`merge`, `max_revise`, `heavy` and `oversized` fall back to today's
+loop constants: `squash` through the merge queue, `max_revise`
+`MAX_REVISE`, `HEAVY_*`/`OVERSIZED_*` — and the default policy is one
+`review` agent review (`focus: general`) required unconditionally.
+Unknown keys are refused at every level. Validation: review names are
+tags; an `agent` needs a `focus` from the allowlist above and takes no
+`app`/`mode`; a `check` needs an `app` — a GitHub App slug
+(`^[a-z0-9][a-z0-9-]{0,99}$`) or an all-digits App id — and a `mode`
+(`advisory` never blocks) and takes no `focus`; an `operator` takes no
+other key. `reviews`, `risk` and each `require` are non-empty, with no
+duplicates and every `require` name defined — and never an advisory
+check. A `when` holds ≥ 1 condition; `lines_over`/`files_over` are ≥ 1
+and `paths` are non-empty repo-relative globs (no leading `/`, `..`
+segment, `\`, control character or `[`/`]`/`{`/`}` — `*`, `**`, `?`
+are the only wildcards; slice 3 owns matching). `heavy` sits strictly
+under `oversized`. And the safety floor: at least one unconditional
+rule must require a blocking review (`agent`, `operator` or a
+`required` check), so a merge can never need no review at all.
+
+While the file's section is not the approved one, every reader falls
+back — to the approved policy, else the defaults — and reports the
+policy in `cadence issue project ls --json` as
+`delivery: {source: default|file|approved, digest, note}`. A section
+equal to the defaults reads `file` only while no custom policy is
+approved — once one is, even a default-equivalent edit keeps the
+approved policy in force (`approved`, `delivery_unapproved`), so an
+agent cannot swap a stricter policy for the defaults silently. The
+notes: `delivery_unapproved: …` when the section changed, was removed
+or is malformed since approval (the approved policy stays in force),
+and `delivery_error: …` when it is malformed with none; `issue lint`
+warns the same. Nothing in the delivery loop consumes the policy until
+CAD-814 slices 2–5.
 
 ## Multi-host trackers — `issue sync`
 
