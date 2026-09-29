@@ -339,3 +339,70 @@ fn cad796_credential_revoke_and_rotate_withdraw_bound_approvals() {
         "revoked"
     );
 }
+
+/// CAD-796 adversarial: a corrupt derived-grant row must fail the rebind
+/// closed — the whole transaction rolls back — instead of committing a
+/// partial cleanup. RED without error propagation: the update succeeds,
+/// the approval is withdrawn, and cleanup silently skipped the bad row.
+#[test]
+fn cad796_corrupt_grant_row_rolls_back_rebind() {
+    let (_dir, s) = store();
+    s.conn()
+        .execute_batch(crate::store::app_bindings::SCHEMA)
+        .unwrap();
+    let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    s.app_capability_decide("install-a", digest, true).unwrap();
+    s.app_grants_set(
+        "project/app",
+        "install-a",
+        &[(
+            "worker-a".into(),
+            "fixture".into(),
+            "work".into(),
+            vec!["widgets:write".into()],
+        )],
+        "operator",
+    )
+    .unwrap();
+    // A second derivation row for the same installation with malformed
+    // scope JSON — the rebind must refuse rather than skip it.
+    s.conn()
+        .execute(
+            "INSERT INTO app_grants(app, agent, platform, account, scopes, granted_at, by, install_id) VALUES(?,?,?,?,?,?,?,?)",
+            params!["project/legacy", "worker-a", "fixture", "work", "not-json", 1.0, "operator", "install-a"],
+        )
+        .unwrap();
+    let config = json!({"schema":1,"install_id":"install-a","context":null,
+        "bundle_digest":digest,"workspace_id":"ws","connection_id":"conn-a",
+        "provider":"fixture","account":"work","connection_kind":"enrolled",
+        "connection_revision":1,"registration_digest":"reg-1","descriptor_revision":1,
+        "mapping":{"effect":"send","scopes":["widgets:write"]},"declaration":{}});
+    let first = s
+        .app_binding_create(
+            "install-a",
+            None,
+            "publication",
+            &config,
+            "cad796-corrupt-req",
+        )
+        .unwrap();
+    let id = first["binding"]["id"].as_str().unwrap().to_string();
+    let mut changed = config.clone();
+    changed["connection_id"] = json!("conn-b");
+    assert!(s.app_binding_update("install-a", &id, 1, &changed).is_err());
+    // Nothing committed: same revision, approval still in force.
+    assert_eq!(
+        s.app_binding_show("install-a", &id).unwrap()["binding"]["revision"],
+        1
+    );
+    assert_eq!(
+        s.conn()
+            .query_row(
+                "SELECT state FROM app_install_capabilities WHERE install_id='install-a'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        "approved"
+    );
+}
