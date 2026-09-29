@@ -48,7 +48,13 @@ pub(super) fn run(state_dir: &Path, action: IdeaAction) -> Result<i32> {
             "idea decide needs exactly one of --approve, --reject, or --park",
         ));
     };
-    let mut params = json!({ "issue": issue, "action": action });
+    // CAD-140: the decision binds the revision shown — read now, so a
+    // concurrent write between this read and the daemon's voids the
+    // decision instead of landing on a moved issue.
+    let pm = cadence_agent::issue::Pm::open_default()?;
+    let found = cadence_agent::issue::board::find_issue(&pm.dir, &issue)?;
+    let expect_rev = cadence_agent::issue::write::issue_rev(&found.dir)?;
+    let mut params = json!({ "issue": issue, "action": action, "expect_rev": expect_rev });
     if let Some(reason) = reason {
         params["reason"] = json!(reason);
     }

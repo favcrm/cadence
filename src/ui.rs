@@ -2271,7 +2271,11 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::decide_idea(&mut request, state_dir, pm_dir, id);
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = home::decide_idea(&mut request, state_dir, pm_dir, caller.actor(), id);
         send(request, resp);
         return;
     }
@@ -2291,7 +2295,11 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::decide_delivery(&mut request, state_dir, opts, id, verb);
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = home::decide_delivery(&mut request, state_dir, caller.actor(), id, verb);
         send(request, resp);
         return;
     }

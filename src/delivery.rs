@@ -11,12 +11,17 @@
 //! through the loop, just as a report file can never put a question in
 //! Needs-you (CAD-339).
 //!
-//! GitHub is touched only from the operator's own process: [`sync`]
+//! GitHub reads happen from the operator's own process: [`sync`]
 //! (`cadence delivery sync`) reads each PR's head, CI and diff stats and
-//! hands them to the daemon's operator-only `delivery_observe`; `cadence
-//! delivery merge` enqueues with `gh pr merge --auto --squash
-//! --match-head-commit <reviewed head>`. The daemon never runs `gh`, and
-//! no agent environment needs GitHub credentials for the loop.
+//! hands them to the daemon's operator-only `delivery_observe`. The
+//! merge enqueue runs inside the daemon's approve-and-land transaction
+//! (CAD-140): the operator's decision arrives as `delivery_approve`
+//! with the shown head, and the daemon — holding `delivery_lock` —
+//! re-reads the head, voids a moved one, records the approval object,
+//! and enqueues pinned to it. Neither the board nor the CLI shells
+//! `gh` for a merge anymore; the daemon shells it only there, bound
+//! to a recorded approval with the operator's actor on it. No agent
+//! environment needs GitHub credentials for the loop.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -899,12 +904,10 @@ pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value 
     }
 }
 
-fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
-    let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
-    // CAD-564: the read starts now — whatever this call returns was
-    // true at `read_at`, and a record change applied after it (a done
-    // report's new head) is newer than anything the observation shows.
-    let read_at = crate::issue::time::now_epoch();
+/// One bounded `gh pr view` — the read half every GitHub touch
+/// shares (the sync and the approve-and-land transaction). Returned
+/// parsed; the caller stamps `read_at` (CAD-564: the read starts now).
+pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
     let view = gh(
         gh_bin,
         &[
@@ -912,13 +915,22 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
             "view",
             &number.to_string(),
             "-R",
-            &slug,
+            slug,
             "--json",
             "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
         ],
     )?;
-    let pr: Value = serde_json::from_str(&view)
-        .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
+    serde_json::from_str(&view)
+        .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))
+}
+
+fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
+    let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
+    // CAD-564: the read starts now — whatever this call returns was
+    // true at `read_at`, and a record change applied after it (a done
+    // report's new head) is newer than anything the observation shows.
+    let read_at = crate::issue::time::now_epoch();
+    let pr = pr_view(gh_bin, &slug, number)?;
     let rollup = pr["statusCheckRollup"]
         .as_array()
         .cloned()
@@ -950,82 +962,6 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
         answer["auto_merge_disabled"] = json!(true);
     }
     Ok(answer)
-}
-
-/// `cadence delivery merge <ID>`: the operator's merge decision. The
-/// daemon checks the caller is the proven operator and the PASS stands
-/// on the head GitHub shows with green CI (a fresh [`sync`] first);
-/// then the operator's own `gh` enqueues it in the merge queue pinned
-/// to the reviewed head, and the daemon records it. A refused check
-/// runs no `gh` merge at all.
-/// Twelve hex chars — enough to name a head in an error line.
-fn short(sha: &str) -> String {
-    sha.chars().take(12).collect()
-}
-
-/// CAD-140: `expect_sha` is the head the operator approved against
-/// (the board sends what its card showed). After the fresh sync+check,
-/// a mismatch refuses the merge — the head moved since it was shown.
-/// The queue's `--match-head-commit` pin below stays the atomic
-/// backstop; `None` keeps the CLI's behaviour (merge the live head).
-pub fn merge(
-    state_dir: &Path,
-    issue: &str,
-    gh_bin: &str,
-    expect_sha: Option<&str>,
-) -> Result<Value> {
-    // The check runs first: an agent is refused before anything else,
-    // the sync included.
-    crate::client::rpc(
-        state_dir,
-        "delivery_merge",
-        json!({"issue": issue, "phase": "authorize"}),
-    )?;
-    let synced = sync(state_dir, Some(issue), gh_bin)?;
-    if let Some(e) = synced["synced"][0]["error"].as_str() {
-        return Err(Error::rejected(format!(
-            "{issue}: reading the PR failed, nothing was merged — {e}"
-        )));
-    }
-    let check = crate::client::rpc(
-        state_dir,
-        "delivery_merge",
-        json!({"issue": issue, "phase": "check"}),
-    )?;
-    let sha = check["sha"].as_str().unwrap_or_default().to_string();
-    if let Some(want) = expect_sha.map(str::trim).filter(|s| !s.is_empty()) {
-        if want != sha {
-            return Err(Error::invalid(
-                "head_moved",
-                format!(
-                    "{issue}: the PR head moved since it was shown (shown {}, now {}) — re-review before merging",
-                    short(want),
-                    short(&sha),
-                ),
-            ));
-        }
-    }
-    let url = check["pr"].as_str().unwrap_or_default();
-    let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
-    gh(
-        gh_bin,
-        &[
-            "pr",
-            "merge",
-            &number.to_string(),
-            "-R",
-            &slug,
-            "--auto",
-            "--squash",
-            "--match-head-commit",
-            &sha,
-        ],
-    )?;
-    crate::client::rpc(
-        state_dir,
-        "delivery_merge",
-        json!({"issue": issue, "phase": "enqueued", "sha": sha}),
-    )
 }
 
 pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {

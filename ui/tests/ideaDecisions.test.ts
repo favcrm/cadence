@@ -59,6 +59,7 @@ const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import(".
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 
 const host = document.createElement("div");
+host.setAttribute("style", "width:390px;overflow:hidden;");
 document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
@@ -203,24 +204,53 @@ await settle(() => assert(text().includes("acme/app#9"), "merge card renders"));
   assert(host.querySelector('[aria-label="decline reason"]'), "decline asks why");
 }
 
-// Shipped CSS: the rail's decision surfaces carry no fixed widths —
-// the row positions its menu, the menu anchors right and fits 390px.
+// 390px containment on the RENDERED tree. happy-dom has no layout
+// engine — scrollWidth/clientWidth are always 0, so no harness can
+// measure overflow here (verified: a 600px child in a 390px parent
+// reports scrollWidth 0). What the harness CAN check on rendered
+// nodes: the computed styles that decide containment, plus the class
+// contracts the Tailwind bundle (stubbed in tests) fulfills in the
+// browser. The operator re-verifies `scrollWidth <= innerWidth` at
+// 390px in a real browser.
+const card = host.querySelector('[data-idea-card="D-9"]')!;
+const must = (el: Element | null, cls: string, why: string) => {
+  assert(el, `node present: ${why}`);
+  assert(el.classList.contains(cls), `${why} carries .${cls} (wrap/shrink contract)`);
+};
+// Every text container shrinks and wraps; every button row wraps.
+must(card.querySelector("header"), "min-w-0", "idea header shrinks");
+must(card.querySelector(".text-cardtitle"), "break-words", "idea title wraps");
+must(card.querySelector(".flex.flex-wrap"), "flex-wrap", "decision buttons wrap");
+const row = host.querySelector('[data-need="idea_plan"]')!;
+must(row.querySelector(".min-w-0.flex-1"), "break-words", "row title wraps");
+// Shipped rail CSS, injected and read back computed: the row takes
+// the rail's width (no fixed floor) and the overflow menu anchors to
+// the row's right edge within a 390px column.
 const fs = require("fs");
 const path = require("path");
 const proc = (globalThis as any).process;
-const cssPath = path.join(proc.cwd(), "src/styles.css");
-assert(fs.existsSync(cssPath), "shipped CSS present");
-const css: string = fs.readFileSync(cssPath, "utf8");
-const block = (selector: string): string => {
-  const match = css.match(new RegExp(`${selector.replace(/\./g, "\\.")}\\s*\\{([^}]*)\\}`));
-  assert(match, `CSS block exists: ${selector}`);
-  return match![1];
-};
-const rowCss = block(".needrow");
-assert(!/(?:min-)?width\s*:\s*\d+(px|rem)/.test(rowCss), "need rows take the rail's width");
-const menuCss = block(".needmenu");
-assert(/right\s*:/.test(menuCss), "overflow menu anchors to the row's right edge");
-assert(!/min-width\s*:\s*\d+px/.test(menuCss), "overflow menu has no pixel width floor");
+const css: string = fs.readFileSync(path.join(proc.cwd(), "src/styles.css"), "utf8");
+const shipped = [".needrow", ".needmenu"].map((sel) => {
+  const match = css.match(new RegExp(`${sel.replace(/\./g, "\\.")}\\s*\\{([^}]*)\\}`));
+  assert(match, `shipped CSS block exists: ${sel}`);
+  return `${sel} {${match![1]}}`;
+}).join("\n");
+const style = document.createElement("style");
+style.textContent = shipped;
+document.head.append(style);
+const cs = (el: Element) => win.getComputedStyle(el);
+assert(cs(row).position === "relative", "need row positions its menu");
+const menuProbe = document.createElement("div");
+menuProbe.className = "needmenu";
+row.append(menuProbe);
+const menuCs = cs(menuProbe);
+assert(menuCs.position === "absolute", "overflow menu floats");
+assert(menuCs.right !== "" && menuCs.right !== "auto", "overflow menu anchors to the row's right edge");
+const minW = menuCs.getPropertyValue("min-width");
+assert(!/^\d+px$/.test(minW.trim()) || parseFloat(minW) <= PASS_WIDTH, `overflow menu fits 390px (min-width: ${minW})`);
+const rowMinW = cs(row).getPropertyValue("min-width");
+assert(rowMinW === "" || rowMinW === "0px", `need rows take the rail's width (min-width: ${rowMinW})`);
+menuProbe.remove();
 
 await React.act(async () => { root.unmount(); });
 console.log("idea decisions checks passed");

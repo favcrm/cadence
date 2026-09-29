@@ -1,10 +1,12 @@
 //! The board's delivery sync (CAD-446): merge decisions appear without
-//! a terminal. The daemon never runs `gh`; the board process runs as
+//! a terminal. The board process runs as
 //! the operator, so it reads the worker loop's PRs from GitHub with the
 //! operator's own `gh` ([`crate::delivery::sync_pr`], the same read as
 //! `cadence delivery sync`) on a timer and when a page loads the
 //! overview, and hands each observation to the daemon's operator-only
-//! `delivery_observe`. A PASS on a green head so becomes a merge
+//! `delivery_observe`. (The daemon shells `gh` only inside the
+//! approval-bound land transaction — CAD-140 — never for these reads.)
+//! A PASS on a green head so becomes a merge
 //! decision in Needs-you within one interval of the board being open.
 //!
 //! The rules:

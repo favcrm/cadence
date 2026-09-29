@@ -993,7 +993,7 @@ fn mvp_journey_end_to_end() {
         j.gh_log().contains(&format!(
             "pr merge 1 -R acme/demo --auto --squash --match-head-commit {sha}"
         )),
-        "the board's Merge ran the operator's gh pinned to the reviewed head:\n{}",
+        "the board's Merge landed pinned to the reviewed head (daemon-side gh):\n{}",
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "enqueued");

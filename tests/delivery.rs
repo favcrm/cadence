@@ -2051,9 +2051,15 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(reply.contains("operator_session_required"), "{reply}");
     assert_eq!(lf.snapshot(), before, "a merge without a session wrote");
     let op = sign_in(&lf.f.d.state, port);
+    // CAD-140: the approval names its head — REQUIRED now.
     let (status, reply) = board_http(
         port,
-        &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), "{}"),
+        &cad328_post(
+            port,
+            "/api/delivery/D-2/merge",
+            &op_guards(&op),
+            &format!(r#"{{"sha":"{c}"}}"#),
+        ),
     );
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("enqueued"), "{reply}");
@@ -4457,12 +4463,12 @@ fn cad776_merge_ready_wake_grants_no_merge_authority() {
     assert!(r.unwrap_err().to_string().contains("not ready to merge"));
 }
 
-/// CAD-140: the board's Merge carries the head its card showed. A head
-/// that moved since refuses 409 `head_moved` before any `gh` merge
-/// runs — the record is untouched and still passed; the shown head
-/// enqueues pinned to itself.
+/// CAD-140: the board's Merge is the daemon's approve-and-land
+/// transaction — the board shells no `gh` itself. The approval names
+/// its head (REQUIRED) and voids on a moved one; the recorded object
+/// carries the head SHA and the deciding actor.
 #[test]
-fn board_merge_binds_its_shown_head() {
+fn board_merge_approves_and_lands_without_board_gh() {
     let mut lf = LoopFixture::dispatched();
     let a = "a".repeat(40);
     lf.done(&a);
@@ -4480,11 +4486,33 @@ fn board_merge_binds_its_shown_head() {
         lf.f.needs_me()
     );
 
+    // The board's `gh` refuses every call: a merge that shells it
+    // fails loudly instead of passing silently.
+    let refuse_dir = lf.f.tmp.path().join("board-gh");
+    std::fs::create_dir_all(&refuse_dir).unwrap();
+    let refuse_log = refuse_dir.join("gh.log");
+    std::fs::write(&refuse_log, "").unwrap();
+    std::fs::write(
+        refuse_dir.join("gh"),
+        format!(
+            "#!/bin/sh\necho \"BOARD-GH: $*\" >> {log}\nexit 64\n",
+            log = refuse_log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            refuse_dir.join("gh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     let port = start_board_gh(
         &lf.f.pm_dir,
         &lf.f.d.state,
         false,
-        Some(lf.gh_dir.join("gh")),
+        Some(refuse_dir.join("gh")),
     );
     let op = sign_in(&lf.f.d.state, port);
     let merge = |body: &str| {
@@ -4493,27 +4521,43 @@ fn board_merge_binds_its_shown_head() {
             &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), body),
         )
     };
-    // The head moved since the card was shown: 409, nothing merged.
+    let board_calls = || std::fs::read_to_string(&refuse_log).unwrap();
+    // No head named: the approval cannot bind — 400, nothing written.
+    let before = lf.snapshot();
+    let (status, reply) = merge("{}");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("sha_required"), "{reply}");
+    assert_eq!(lf.snapshot(), before, "a refused approval wrote something");
+    // The head moved since the card was shown: 409 `head_moved`
+    // before anything is recorded — no approval, no enqueue.
     let wrong = "0".repeat(40);
     let (status, reply) = merge(&format!(r#"{{"sha":"{wrong}"}}"#));
     assert_eq!(status, 409, "{reply}");
     assert!(reply.contains("head_moved"), "{reply}");
-    assert!(
-        !lf.gh_log().contains("pr merge 7 -R"),
-        "a refused merge ran gh: {}",
-        lf.gh_log()
-    );
+    assert_eq!(lf.snapshot(), before, "a refused approval wrote something");
     assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
-    // The shown head enqueues, pinned to itself.
+    // The shown head: the approval object records it with the
+    // deciding actor, and the daemon lands it pinned to itself.
     let (status, reply) = merge(&format!(r#"{{"sha":"{a}"}}"#));
     assert_eq!(status, 200, "{reply}");
-    assert!(reply.contains("enqueued"), "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["state"], "enqueued", "{v}");
+    assert_eq!(v["approval_id"], format!("merge-pr7-{}", &a[..12]), "{v}");
+    assert_eq!(v["approved_by"], "operator (ui)", "{v}");
+    assert_eq!(v["head"], a, "the receipt names the approved head");
     assert!(
-        lf.gh_log().contains(&format!("--match-head-commit {a}")),
-        "{}",
+        lf.gh_log().contains(&format!(
+            "pr merge 7 -R acme/app --auto --squash --match-head-commit {a}"
+        )),
+        "the daemon landed it pinned: {}",
         lf.gh_log()
     );
     assert_eq!(lf.rec()["state"], "enqueued", "{}", lf.rec());
+    assert!(
+        board_calls().is_empty(),
+        "the board shelled gh: {}",
+        board_calls()
+    );
 }
 
 /// CAD-140: the board's Decline states its reason — without one the

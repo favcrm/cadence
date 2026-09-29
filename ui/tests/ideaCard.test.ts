@@ -51,32 +51,34 @@ async function main() {
     equal(parkDateError("2026-10-15"), null, "a date passes");
   }
 
-  // The request: one POST per decision, no identity fields — the
-  // daemon attributes the board's proven connection, never the body.
+  // The request: one POST per decision, always bound to the shown
+  // rev — no `by`/`actor` fields; the daemon attributes the board's
+  // proven connection, and the actor rides the sanctioned
+  // `request_actor` the board sets server-side.
   {
     let calls = stubFetch(200, { decision: { action: "approve" } });
-    const out = await api.ideaDecide("D-9", "approve");
+    const out = await api.ideaDecide("D-9", "approve", { expect_rev: "fnv1a:abc" });
     equal(out, { decision: { action: "approve" } }, "approve answer");
     equal(calls[0].url, "/api/ideas/D-9/decide", "decide url");
     equal(calls[0].init.method, "POST", "POST");
     equal(calls[0].init.headers, { "Content-Type": "application/json", "X-Cadence-Board": "1" }, "write guards");
-    equal(JSON.parse(String(calls[0].init.body)), { action: "approve" }, "no identity fields");
+    equal(JSON.parse(String(calls[0].init.body)), { action: "approve", expect_rev: "fnv1a:abc" }, "rev bound, no identity fields");
 
     calls = stubFetch(200, { decision: { action: "reject" } });
-    await api.ideaDecide("D-9", "reject", { reason: "too big" });
-    equal(JSON.parse(String(calls[0].init.body)), { action: "reject", reason: "too big" }, "reject body");
+    await api.ideaDecide("D-9", "reject", { reason: "too big", expect_rev: "fnv1a:abc" });
+    equal(JSON.parse(String(calls[0].init.body)), { action: "reject", reason: "too big", expect_rev: "fnv1a:abc" }, "reject body");
 
     calls = stubFetch(200, { decision: { action: "park" } });
-    await api.ideaDecide("D-9", "park", { park_until: "2026-10-15" });
+    await api.ideaDecide("D-9", "park", { park_until: "2026-10-15", expect_rev: "fnv1a:abc" });
     equal(
       JSON.parse(String(calls[0].init.body)),
-      { action: "park", park_until: "2026-10-15" },
+      { action: "park", park_until: "2026-10-15", expect_rev: "fnv1a:abc" },
       "park body",
     );
 
     calls = stubFetch(403, { error: "idea decide is the operator's decision — agent 'wk'", check: "operator_only" });
     let err: ApiError | null = null;
-    await api.ideaDecide("D-9", "approve").catch((e: ApiError) => {
+    await api.ideaDecide("D-9", "approve", { expect_rev: "fnv1a:abc" }).catch((e: ApiError) => {
       err = e;
     });
     const refusal = err as ApiError | null;

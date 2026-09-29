@@ -452,7 +452,7 @@ export const api = {
   ideaDecide: (
     issue: string,
     action: "approve" | "reject" | "park",
-    opts?: { reason?: string; park_until?: string; expect_rev?: string },
+    opts: { reason?: string; park_until?: string; expect_rev: string },
   ) =>
     post<Record<string, unknown>>(
       `/api/ideas/${encodeURIComponent(issue)}/decide`,
@@ -609,11 +609,12 @@ export const api = {
       `/api/epics/${encodeURIComponent(epic)}/stage`,
       note && note.trim() ? { stage, note: note.trim() } : { stage },
     ),
-  /** `POST /api/delivery/<id>/merge` — the operator's merge decision
-   *  (CAD-431, CAD-140): the board's own `gh` enqueues the PR pinned
-   *  to the reviewed head. `sha` is the head the card showed — a moved
-   *  head refuses with 409 `head_moved` before any `gh` merge runs. */
-  mergeDelivery: (issue: string, sha?: string) =>
+  /** `POST /api/delivery/<id>/merge` — the operator's merge approval
+   *  (CAD-431, CAD-140): the daemon records the approval object and
+   *  lands pinned to the reviewed head. `sha` is REQUIRED — the head
+   *  the card showed; a moved head refuses with 409 `head_moved` and
+   *  nothing is recorded. */
+  mergeDelivery: (issue: string, sha: string) =>
     post<Record<string, unknown>>(
       `/api/delivery/${encodeURIComponent(issue)}/merge`,
       sha ? { sha } : {},

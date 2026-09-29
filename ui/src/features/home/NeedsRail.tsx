@@ -139,6 +139,9 @@ function MergeForm({
   onDone: (text: string) => void;
 }) {
   const { issue, pr, sha, reviewer, verdict } = need.action;
+  // CAD-140: the approval names its head — REQUIRED. A row that
+  // predates the field cannot merge until it is re-read.
+  const shown = sha && sha.trim() ? sha : null;
   const [busy, setBusy] = useState<null | "merge" | "decline">(null);
   const [declining, setDeclining] = useState(false);
   const [reason, setReason] = useState("");
@@ -146,8 +149,12 @@ function MergeForm({
   const merge = () => {
     setBusy("merge");
     setError(null);
+    if (!shown) {
+      setError("Re-read the row — it names no head to approve.");
+      return;
+    }
     api
-      .mergeDelivery(issue, sha ?? undefined)
+      .mergeDelivery(issue, shown)
       .then((out) => {
         void resources.overview.invalidate();
         onDone(`merge ${String((out as { state?: unknown }).state ?? "sent")}`);
@@ -198,10 +205,13 @@ function MergeForm({
             </label>
           )}
           <div className="flex flex-wrap items-center gap-2">
-            {!declining && (
+            {!declining && shown && (
               <Button variant="primary" size="sm" disabled={busy !== null} loading={busy === "merge"} onClick={merge}>
                 {busy === "merge" ? "Merging…" : "Merge"}
               </Button>
+            )}
+            {!declining && !shown && (
+              <p className="text-micro text-ink-500">Re-read the row — it names no head to approve.</p>
             )}
             {declining ? (
               <>

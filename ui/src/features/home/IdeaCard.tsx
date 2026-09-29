@@ -42,13 +42,16 @@ export default function IdeaCard({
       return;
     }
     const body = decided.body;
+    if (!detail) {
+      setError("Re-read the idea — it is still loading.");
+      return;
+    }
     setBusy(action);
     setError(null);
-    // CAD-140: bind the decision to the plan shown — the card read
-    // this rev; a moved issue refuses with 409 `stale_view`.
-    const rev = detail?.rev;
+    // CAD-140: bind the decision to the plan shown — REQUIRED. The
+    // card read this rev; a moved issue refuses with 409 `stale_view`.
     api
-      .ideaDecide(issue, action, rev ? { ...body, expect_rev: rev } : body)
+      .ideaDecide(issue, action, { ...body, expect_rev: detail.rev })
       .then((out) => {
         setMode(null);
         setReason("");

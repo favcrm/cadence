@@ -1052,7 +1052,7 @@ tests = [
     "cad776_agent_detached_and_forged_observe_cannot_wake",
     "cad776_concurrent_observe_wakes_once",
     "cad776_merge_ready_wake_grants_no_merge_authority",
-    "board_merge_binds_its_shown_head",
+    "board_merge_approves_and_lands_without_board_gh",
     "board_decline_states_its_reason",
 ]
 helpers = [

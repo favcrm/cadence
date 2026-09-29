@@ -308,13 +308,24 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
     );
     assert_eq!(issue_ids(&f), before);
 
+    // CAD-140: the revision binds — read what is shown now; a direct
+    // call without it refuses instead of deciding.
+    let rev = cadence_agent::issue::write::issue_rev(&f.pm_dir.join("demo").join(&happy)).unwrap();
+    let missing =
+        f.d.operator_rpc("idea_decide", json!({"issue": &happy, "action": "approve"}))
+            .unwrap_err()
+            .to_string();
+    assert!(missing.contains("expect_rev"), "{missing}");
     let mut oks = 0;
     let mut errs = Vec::new();
     std::thread::scope(|s| {
         let mut joins = Vec::new();
         for _ in 0..2 {
             joins.push(s.spawn(|| {
-                f.d.operator_rpc("idea_decide", json!({"issue": &happy, "action": "approve"}))
+                f.d.operator_rpc(
+                    "idea_decide",
+                    json!({"issue": &happy, "action": "approve", "expect_rev": rev}),
+                )
             }));
         }
         for join in joins {
@@ -324,6 +335,9 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
                     assert_eq!(out["decision"]["source"], "operator", "{out}");
                     assert_eq!(out["decision"]["recorded_via"], "operator_connection");
                     assert_eq!(out["decision"]["action"], "approve");
+                    // No `request_actor` on a direct call: the object
+                    // records the default, never a forged name.
+                    assert_eq!(out["decision"]["actor"], "operator", "{out}");
                 }
                 Err(e) => errs.push(e.to_string()),
             }
@@ -368,9 +382,12 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
         .iter()
         .any(|r| r["kind"] == "idea_plan" && r["subject"]["id"] == happy));
     let again =
-        f.d.operator_rpc("idea_decide", json!({"issue": &happy, "action": "approve"}))
-            .unwrap_err()
-            .to_string();
+        f.d.operator_rpc(
+            "idea_decide",
+            json!({"issue": &happy, "action": "approve", "expect_rev": "stale"}),
+        )
+        .unwrap_err()
+        .to_string();
     assert!(again.contains("already"), "{again}");
     let still: Vec<_> = issue_ids(&f)
         .into_iter()
@@ -477,29 +494,54 @@ fn board_idea_decisions_bind_the_shown_issue_and_decide() {
     }
     assert_eq!(f.front(&approve_id).status, "done");
     assert!(f.front(&approve_id).tags.iter().any(|t| t == "planned"));
+    // The recorded decision carries the deciding actor — the board's
+    // admitted caller, not a fixed string.
+    let events = f.daemon_events("idea_decision");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["actor"], "operator (ui)", "{events:?}");
+    assert_eq!(events[0]["issue"], approve_id, "{events:?}");
 
-    // A second approve is a duplicate, whatever the rev.
-    let (status, reply) = decide(&op, &approve_id, r#"{"action":"approve"}"#);
+    // A second approve is a duplicate — the daemon's gate fires
+    // before the revision check.
+    let (status, reply) = decide(
+        &op,
+        &approve_id,
+        r#"{"action":"approve","expect_rev":"stale"}"#,
+    );
     assert_eq!(status, 409, "{reply}");
 
     // Reject states its reason; park names its UTC date.
-    let (status, reply) = decide(&op, &reject_id, r#"{"action":"reject"}"#);
+    let rev_reject = rev_of(&reject_id);
+    let (status, reply) = decide(
+        &op,
+        &reject_id,
+        &format!(r#"{{"action":"reject","expect_rev":{rev_reject:?}}}"#),
+    );
     assert_eq!(status, 400, "{reply}");
     let (status, reply) = decide(
         &op,
         &reject_id,
-        r#"{"action":"reject","reason":"too vague"}"#,
+        &format!(r#"{{"action":"reject","reason":"too vague","expect_rev":{rev_reject:?}}}"#),
     );
     assert_eq!(status, 200, "{reply}");
     assert_eq!(f.front(&reject_id).status, "dropped");
-    let (status, reply) = decide(&op, &park_id, r#"{"action":"park"}"#);
-    assert_eq!(status, 400, "{reply}");
-    let (status, reply) = decide(&op, &park_id, r#"{"action":"park","park_until":"someday"}"#);
+    let rev_park = rev_of(&park_id);
+    let (status, reply) = decide(
+        &op,
+        &park_id,
+        &format!(r#"{{"action":"park","expect_rev":{rev_park:?}}}"#),
+    );
     assert_eq!(status, 400, "{reply}");
     let (status, reply) = decide(
         &op,
         &park_id,
-        r#"{"action":"park","park_until":"2030-06-01"}"#,
+        &format!(r#"{{"action":"park","park_until":"someday","expect_rev":{rev_park:?}}}"#),
+    );
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = decide(
+        &op,
+        &park_id,
+        &format!(r#"{{"action":"park","park_until":"2030-06-01","expect_rev":{rev_park:?}}}"#),
     );
     assert_eq!(status, 200, "{reply}");
     assert!(f.front(&park_id).tags.iter().any(|t| t == "parked"));

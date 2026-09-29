@@ -380,6 +380,10 @@ pub struct Shared {
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
+    /// CAD-140: the `gh` the approve-and-land transaction runs — the
+    /// operator's own binary in production (`gh` on PATH, like the
+    /// review read); fixtures inject their fake here.
+    delivery_gh: PathBuf,
     /// CAD-139: serializes idea-pipeline.json and the operator decision.
     idea_lock: Mutex<()>,
     /// The actor's empty-queue poll — the backstop behind its wake.
@@ -591,6 +595,10 @@ impl Shared {
             perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
+            delivery_gh: opts
+                .delivery_gh
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(crate::delivery::GH)),
             idea_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
             continuity_due: Mutex::new(HashMap::new()),
@@ -2863,6 +2871,7 @@ impl Shared {
             "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
+            "delivery_approve" => self.rpc_delivery_approve(params, peer_pid),
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
             "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
             "operator_session_open" => self.rpc_operator_session_open(params, peer_pid),
@@ -3800,6 +3809,44 @@ fn inbox_reader(params: &Value) -> Result<&str> {
     Ok(reader)
 }
 
+/// CAD-140 `request_actor`: attribution, not authority. The operator
+/// connection already gated the call — whoever passes it could already
+/// do anything (the same-uid residual), so naming the human behind the
+/// request widens nothing: it only decides what the recorded object
+/// says. That is why the field is `request_actor` and not `actor` —
+/// `OPERATOR_FIELDS` still refuses every bare identity name, and a
+/// worker's output can never smuggle one in through a routed verb that
+/// keeps the refusal. Absent (the CLI, direct RPC) means `operator`.
+/// A tailnet board passes its proven login (`<login> (tailscale)`), a
+/// loopback board `operator (ui)`.
+pub(super) fn request_actor(params: &Value) -> Result<String> {
+    let Some(actor) = params
+        .get("request_actor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok("operator".to_string());
+    };
+    if actor.len() > 200 || actor.chars().any(char::is_control) {
+        return Err(Error::rejected(
+            "request_actor must be 1-200 non-control characters",
+        ));
+    }
+    // `user` is the default daemon message source, `daemon` the event
+    // stream identity — neither names the human who decided (the same
+    // rule the approval store applies to approval evidence).
+    if ["user", "daemon"]
+        .iter()
+        .any(|s| actor.eq_ignore_ascii_case(s))
+    {
+        return Err(Error::rejected(
+            "request_actor must identify the deciding operator",
+        ));
+    }
+    Ok(actor.to_string())
+}
+
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
     for field in IDENTITY_FIELDS {
         if params.get(field).is_some() {
@@ -3898,6 +3945,10 @@ pub struct ServeOptions {
     /// is 30; `Some(0)` turns it off — test daemons stay hermetic, no
     /// tracker scan.
     pub report_router: Option<u64>,
+    /// CAD-140: the `gh` the approve-and-land transaction shells.
+    /// `None` is `gh` on PATH; fixtures inject their fake. Never
+    /// sourced from an RPC — the binary is fixed at boot.
+    pub delivery_gh: Option<PathBuf>,
     /// CAD-477 checkup period in seconds: `None` (production) is
     /// [`checkup::DEFAULT_CHECKUP_SECS`]; `Some(0)` turns it off — test
     /// daemons stay hermetic, no unattended lane judgements.
