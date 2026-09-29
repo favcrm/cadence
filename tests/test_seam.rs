@@ -447,6 +447,39 @@ fn without_the_feature_a_plaintext_issuer_is_refused() {
     );
 }
 
+/// CAD-777 r9: the verification URL in the issuer's code answer gets
+/// the same gate — a plain-http loopback approval link is fixture-only;
+/// a production build refuses it.
+#[cfg(not(feature = "test-seam"))]
+#[test]
+fn without_the_feature_a_plaintext_verification_url_is_refused() {
+    struct Stub;
+    impl cadence_agent::device_login::IssuerTransport for Stub {
+        fn post(&self, _url: &str, _body: Value) -> cadence_agent::Result<(u16, Value)> {
+            Ok((
+                200,
+                json!({
+                    "device_code": "dc_abc",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "http://127.0.0.1:8810/approve",
+                    "verification_uri_complete": "http://127.0.0.1:8810/approve?c=ABCD-1234",
+                    "expires_in": 600,
+                    "interval": 2,
+                }),
+            ))
+        }
+        fn get(&self, _url: &str, _bearer: &str) -> cadence_agent::Result<(u16, Value)> {
+            unimplemented!()
+        }
+    }
+    let config =
+        cadence_agent::device_login::DeviceConfig::new("https://issuer.example", "ws_x").unwrap();
+    let err = cadence_agent::device_login::request_code(&Stub, &config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("verification"), "{err}");
+}
+
 /// With the feature the same loopback origins parse — the integration
 /// stub lives there.
 #[cfg(feature = "test-seam")]

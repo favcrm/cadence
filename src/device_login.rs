@@ -60,9 +60,63 @@ pub struct DevicePin {
     /// a few named operators. No wildcard: an empty list fails the
     /// pin's validation, i.e. the flow stays off.
     pub subjects: Vec<String>,
+    /// The board process that wrote this pin while holding the pin
+    /// lock. The daemon accepts the pin only while that pid is alive
+    /// AND the lock is still held (review r9) — a stale file behind a
+    /// dead or replaced board mints nothing. A pin written without
+    /// this field fails closed on read.
+    pub board_pid: u32,
 }
 
 const PIN_FILE: &str = "device-login.json";
+
+/// Advisory lock the serving board holds for its lifetime, taken
+/// before the pin is written or cleared — a second `ui run` on ANY
+/// port cannot rewrite or clear the pin under a live board. Lives
+/// in the `0700` operator dir next to the pin; the daemon also reads
+/// its held-ness as part of pin liveness ([`pin_is_live`]).
+pub const DEVICE_PIN_LOCK: &str = "device-login.lock";
+
+/// The pin is mint authority only while the board that wrote it is
+/// alive and still holds [`DEVICE_PIN_LOCK`]: (a) `kill(board_pid, 0)`
+/// must succeed, and (b) a shared non-blocking flock on the lock file
+/// must fail with EWOULDBLOCK — someone holds the exclusive lock. A
+/// missing file, a free lock, or a dead pid all fail closed with
+/// `capability_unavailable`; the daemon calls this before any issuer
+/// contact (review r9).
+pub fn pin_is_live(state_dir: &std::path::Path, pin: &DevicePin) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let gone = || {
+        Error::invalid(
+            "capability_unavailable",
+            "device login is not live: the board that pinned it is gone",
+        )
+    };
+    let alive = unsafe { libc::kill(pin.board_pid as i32, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        return Err(gone());
+    }
+    let lock_path = crate::operator_auth::dir(state_dir).join(DEVICE_PIN_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|_| gone())?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        // Nobody holds it — release ours and fail closed.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        return Err(gone());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(());
+    }
+    Err(Error::internal(format!("device pin liveness: {error}")))
+}
 
 /// Record the pin. Overwrites atomically (tmp + rename); a partial
 /// write never replaces a good one.
@@ -388,8 +442,10 @@ fn valid_https_url(raw: &str) -> bool {
     };
     let secure = uri.scheme_str() == Some("https");
     // Same loopback allowance as `issuer_origin`: operator-configured
-    // fixtures only, never caller input.
-    let loopback = uri.scheme_str() == Some("http")
+    // fixtures only (test / test-seam), never caller input and never a
+    // production approval link (review r9).
+    let loopback = cfg!(any(test, feature = "test-seam"))
+        && uri.scheme_str() == Some("http")
         && matches!(uri.host(), Some("127.0.0.1") | Some("localhost"));
     if !secure && !loopback {
         return false;
@@ -826,6 +882,7 @@ mod tests {
             issuer: "https://issuer.example".to_string(),
             org: "ws_company".to_string(),
             subjects: vec!["op_1".to_string()],
+            board_pid: std::process::id(),
         };
         write_pin(dir.path(), &pin).unwrap();
         assert_eq!(read_pin(dir.path()).unwrap(), pin);
@@ -855,6 +912,7 @@ mod tests {
                 issuer: "http://evil.example".to_string(),
                 org: "ws_company".to_string(),
                 subjects: vec!["op_1".to_string()],
+                board_pid: std::process::id(),
             }
         )
         .is_err());
@@ -862,6 +920,53 @@ mod tests {
         clear_pin(dir.path()).unwrap();
         clear_pin(dir.path()).unwrap();
         assert!(read_pin(dir.path()).is_err());
+    }
+
+    /// The pin is mint authority only while its writer is alive AND
+    /// holds the lock: no lock file, a free lock file, or a dead pid
+    /// all refuse `capability_unavailable` (review r9).
+    #[test]
+    fn pin_is_live_requires_a_live_lock_holder() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::io::AsRawFd;
+        let dir = pin_dir();
+        let lock_path = dir.path().join("operator").join(DEVICE_PIN_LOCK);
+        let pin = DevicePin {
+            issuer: "https://issuer.example".to_string(),
+            org: "ws_company".to_string(),
+            subjects: vec!["op_1".to_string()],
+            board_pid: std::process::id(),
+        };
+        // No operator dir at all → refuse.
+        let err = pin_is_live(dir.path(), &pin).unwrap_err();
+        assert_eq!(err.code(), Some("capability_unavailable"), "{err}");
+        // A lock file nobody holds → refuse.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(dir.path().join("operator"))
+            .unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        assert!(pin_is_live(dir.path(), &pin).is_err());
+        // Take the exclusive lock ourselves: a live holder.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(pin_is_live(dir.path(), &pin).is_ok());
+        // The lock is held but the writing pid is gone → refuse.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead = DevicePin {
+            board_pid: child.id(),
+            ..pin
+        };
+        assert!(pin_is_live(dir.path(), &dead).is_err());
     }
 
     /// The subject allowlist is a list of 1–16 workspace-style ids,
@@ -888,6 +993,7 @@ mod tests {
             issuer: "https://issuer.example".to_string(),
             org: "ws_company".to_string(),
             subjects: vec!["op_1".to_string()],
+            board_pid: std::process::id(),
         };
         write_pin(dir.path(), &pin).unwrap();
         let file = dir.path().join("operator").join("device-login.json");

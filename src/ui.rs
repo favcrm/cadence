@@ -4520,12 +4520,7 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
         })
 }
 
-/// The device trust pin's advisory lock — a serving board holds
-/// `flock` on it for `serve()`'s whole life (released by the kernel
-/// on exit), so a second `ui run` on ANY port cannot rewrite or
-/// clear the pin under a live board (review r4). Lives in the `0700`
-/// operator dir next to the pin.
-const DEVICE_PIN_LOCK: &str = "device-login.lock";
+use crate::device_login::DEVICE_PIN_LOCK;
 
 /// Try to take [`DEVICE_PIN_LOCK`]. `wait` retries up to 5 s so a
 /// restart's old-board/new-child handoff (`ui tailscale start`,
@@ -4609,6 +4604,9 @@ fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs
             issuer: login.config.issuer().to_string(),
             org: login.config.org().to_string(),
             subjects: login.subjects.clone(),
+            // Written under the held lock — the daemon treats the pin
+            // as live only while this pid holds it (review r9).
+            board_pid: std::process::id(),
         })
     {
         if lock.is_none() {
@@ -4786,6 +4784,12 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     // leak into the child (a `daemon restart --ui` under it would
     // blanket-assert every board→daemon RPC).
     command.env_remove(crate::test_seam::AS_ENV);
+    // CAD-777 r9: the child re-resolves device login — env must not
+    // beat the effective triple the parent just persisted.
+    command
+        .env_remove("CADENCE_DEVICE_LOGIN_ISSUER")
+        .env_remove("CADENCE_DEVICE_LOGIN_ORG")
+        .env_remove("CADENCE_DEVICE_LOGIN_SUBJECTS");
     command
         .arg("--state-dir")
         .arg(state_dir)

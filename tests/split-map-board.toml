@@ -375,6 +375,9 @@ tests = [
     "device_code_does_not_stall_unrelated_writes",
     "device_meta_advertises_sign_in_only_when_configured",
     "device_pin_survives_a_second_ui_run_while_a_board_is_live",
+    "device_pin_without_a_live_board_mints_nothing",
+    "a_pin_for_a_dead_board_mints_nothing",
+    "device_start_child_pins_the_saved_subjects_not_env",
 ]
 helpers = [
     "jwks_stub",

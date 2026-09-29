@@ -200,8 +200,12 @@ impl Shared {
         let origin = origin_param(params)?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
         // The pin is the only issuer/org authority: an absent file (or
-        // one failing strict modes) fails closed with no session.
+        // one failing strict modes) fails closed with no session. And
+        // the pin is mint authority only while the board that wrote it
+        // is alive and holds the pin lock — a stale file behind a dead
+        // or replaced board mints nothing, before any issuer contact.
         let pin = crate::device_login::read_pin(&self.state_dir)?;
+        crate::device_login::pin_is_live(&self.state_dir, &pin)?;
         let config = crate::device_login::DeviceConfig::new(&pin.issuer, &pin.org)?;
         let verified = crate::device_login::verify_session(
             &crate::device_login::UreqTransport::new(),

@@ -1569,12 +1569,14 @@ mod device {
         let state = TempDir::new().unwrap();
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, _stub) = device_stub("approve");
+        let _lock = hold_device_lock(state.path());
         write_pin(
             state.path(),
             &DevicePin {
                 issuer: issuer.clone(),
                 org: "ws_company".to_string(),
                 subjects: vec!["op_9".to_string()],
+                board_pid: std::process::id(),
             },
         )
         .unwrap();
@@ -1628,19 +1630,50 @@ mod device {
     }
 
     /// A daemon on `state` with the device pin written for `subjects`.
-    fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> UiDaemon {
+    /// The exclusive `device-login.lock` a serving board would hold —
+    /// the daemon's pin-liveness gate passes while the returned file
+    /// stays open.
+    fn hold_device_lock(state: &Path) -> std::fs::File {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::io::AsRawFd;
+        let dir = state.join("operator");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(cadence_agent::device_login::DEVICE_PIN_LOCK))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test's pin lock must be free"
+        );
+        file
+    }
+
+    /// A daemon on `state` with the device pin written for `subjects` —
+    /// live because the pin names this process and we hold the lock.
+    fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> (UiDaemon, std::fs::File) {
         use cadence_agent::device_login::{write_pin, DevicePin};
         let d = UiDaemon::start_on(state.to_path_buf());
+        let lock = hold_device_lock(state);
         write_pin(
             state,
             &DevicePin {
                 issuer: issuer.to_string(),
                 org: "ws_company".to_string(),
                 subjects: subjects.iter().map(|s| s.to_string()).collect(),
+                board_pid: std::process::id(),
             },
         )
         .unwrap();
-        d
+        (d, lock)
     }
 
     /// Run `probe` as a child of a pane planted for `alias` under `d`;
@@ -1738,7 +1771,7 @@ mod device {
     fn device_rpc_from_a_pane_is_refused_before_issuer_contact() {
         let state = TempDir::new().unwrap();
         let (issuer, stub) = device_stub("approve");
-        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
         let out_file = state.path().join("probe-out.json");
         let answer = pane_probe(
             &d,
@@ -1769,7 +1802,7 @@ mod device {
     fn device_rpc_from_a_detached_child_is_refused() {
         let state = TempDir::new().unwrap();
         let (issuer, stub) = device_stub("approve");
-        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
         let out_file = state.path().join("probe-out.json");
         let answer = pane_probe(
             &d,
@@ -1933,7 +1966,7 @@ mod device {
     fn device_rpc_mints_the_issuers_subject_not_forged_fields() {
         let state = TempDir::new().unwrap();
         let (issuer, _stub) = device_stub("approve");
-        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
         let opened = d
             .rpc_opt(
                 "operator_session_open_device",
@@ -2233,5 +2266,144 @@ mod device {
             before,
             "a lost bind rewrote the pin"
         );
+    }
+
+    /// A pin on disk outlives its board only as a file — the daemon
+    /// accepts it only while the writing board is alive and holds the
+    /// lock (review r9). A stopped board's pin mints nothing, and the
+    /// refusal comes before any issuer contact.
+    #[test]
+    fn device_pin_without_a_live_board_mints_nothing() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, stub) = device_stub("approve");
+        let (port, board) = start_device_board(pm.path(), state.path(), issuer);
+        let pin = state.path().join("operator").join("device-login.json");
+        assert!(pin.is_file(), "serve writes the pin");
+
+        drop(board);
+        // BoardStop only signals — wait for the serve thread (and its
+        // pin lock) to be gone before probing the daemon.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped board's port never closed"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            pin.is_file(),
+            "the pin file itself is still there — only its liveness is gone"
+        );
+        let err = _d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("capability_unavailable"),
+            "a stale pin minted or misreported: {err}"
+        );
+        assert_eq!(
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the issuer was contacted for a dead pin"
+        );
+    }
+
+    /// The same gate for a pin whose writing pid is simply gone — the
+    /// minimal stale-file shape (review r9).
+    #[test]
+    fn a_pin_for_a_dead_board_mints_nothing() {
+        use cadence_agent::device_login::{write_pin, DevicePin};
+        let state = TempDir::new().unwrap();
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, stub) = device_stub("approve");
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        write_pin(
+            state.path(),
+            &DevicePin {
+                issuer: issuer.clone(),
+                org: "ws_company".to_string(),
+                subjects: vec!["op_9".to_string()],
+                board_pid: gone.id(),
+            },
+        )
+        .unwrap();
+        let err = _d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("capability_unavailable"),
+            "a dead board's pin minted or misreported: {err}"
+        );
+        assert_eq!(
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the issuer was contacted for a dead pin"
+        );
+    }
+
+    /// A detached `ui start` child re-resolves device login — its env
+    /// must not beat the triple the parent just persisted (review r9).
+    /// `CADENCE_DEVICE_LOGIN_SUBJECTS=op_old` in the parent's env with
+    /// `--device-login-subject op_new` must leave `op_new` in the pin
+    /// the running child writes.
+    #[test]
+    fn device_start_child_pins_the_saved_subjects_not_env() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let port = free_port();
+        let mut cmd = std::process::Command::new(bin());
+        cmd.arg("--state-dir")
+            .arg(state.path())
+            .args([
+                "ui",
+                "start",
+                "--port",
+                &port.to_string(),
+                "--device-login-issuer",
+                &issuer,
+                "--device-login-org",
+                "ws_company",
+                "--device-login-subject",
+                "op_new",
+            ])
+            .env("CADENCE_PM_DIR", pm.path())
+            // The leak under test: env must lose to the persisted triple.
+            .env("CADENCE_DEVICE_LOGIN_SUBJECTS", "op_old")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Same operator-shaped spawn as the other detached-board tests.
+        cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+            .env(cadence_agent::test_seam::AS_ENV, "operator");
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "ui start failed");
+        // `ui start` answers only after the child's health does, and the
+        // child writes the pin before it serves.
+        let pin: Value = serde_json::from_slice(
+            &std::fs::read(state.path().join("operator").join("device-login.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pin["subjects"],
+            json!(["op_new"]),
+            "the detached child re-resolved the leaked env: {pin}"
+        );
+        let (ok, _) = cli(pm.path(), state.path(), &["ui", "stop"]);
+        assert!(ok, "ui stop failed");
     }
 }
