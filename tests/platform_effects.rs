@@ -353,6 +353,68 @@ fn db_snapshot(d: &Daemon) -> String {
     out
 }
 
+/// CAD-775: only the tables a refused outward call could legitimately
+/// write. A whole-database snapshot also moves when the daemon's monitor
+/// watch independently fails an authority-less fixture run
+/// (`app_run_invalidated` flips `app_runs`/`jobs`/`app_run_steps`/`tasks`
+/// to `failed` and bumps the events sequence), which masqueraded as a
+/// forbidden write in one #510 merge-queue run while `platform_effects`
+/// and `platform_drafts` stayed empty.
+fn effects_snapshot(d: &Daemon) -> String {
+    use rusqlite::types::ValueRef;
+    let mut out = String::new();
+    for table in ["platform_effects", "platform_drafts"] {
+        out.push_str(&format!("## {table}\n"));
+        let conn = d.db();
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let cols = stmt.column_count();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((0..cols)
+                    .map(|i| match r.get_ref(i).unwrap() {
+                        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                        ValueRef::Blob(b) => {
+                            format!("BLOB({}b){}", b.len(), String::from_utf8_lossy(b))
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        out.push_str(&rows.join("\n"));
+        out.push('\n');
+    }
+    out
+}
+
+/// CAD-775: block until the monitor watch's `advance_app_runs` fails the
+/// authority-less fixture run. Waiting (rather than sleeping) forces the
+/// lifecycle interleave inside the before/after window on every run, so a
+/// whole-database comparison would deterministically flap here while the
+/// effects-scoped one stays put.
+fn wait_for_app_run_invalidation(d: &Daemon, run: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let state: String = d
+            .db()
+            .query_row("SELECT state FROM app_runs WHERE id=?1", [run], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        if state == "failed" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never invalidated authority-less run {run}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// One effect row straight from the store — no scan, no RPC.
 fn effect_row(d: &Daemon, request: &str) -> Option<Value> {
     let conn = d.db();
@@ -1678,7 +1740,10 @@ fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
         INSERT INTO tasks(id,job_id,state,created,updated) VALUES('app-effect-task','app-effect-job','draft',1,1);
         INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,created,updated) VALUES('app-effect-job','app-install',1,'digest','{}','digest','app-writer','effect-request','running',1,1);
         INSERT INTO app_run_steps(run_id,step_id,task_id,spec,identity_digest,state) VALUES('app-effect-job','s1','app-effect-task','{}','identity','pending');").unwrap();
-    let before = db_snapshot(&d);
+    let before = effects_snapshot(&d);
+    // CAD-775: force the daemon-invalidation interleave inside the
+    // before/after window — a whole-database comparison flaps here.
+    wait_for_app_run_invalidation(&d, "app-effect-job");
     let mut forged = request.clone();
     forged["task"] = json!("app-effect-task");
     let error = refused(worker.rpc(&d, "platform_call", forged));
@@ -1687,14 +1752,17 @@ fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
         "{error}"
     );
     assert_eq!(
-        db_snapshot(&d),
+        effects_snapshot(&d),
         before,
-        "forged app attribution wrote durable state"
+        "forged app attribution wrote an effect or draft"
     );
 
     conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('older-generic-active','app-writer','generic prompt','send','running','generic-turn',0)", []).unwrap();
     conn.execute("INSERT INTO messages(id,alias,body,source,state,turn_id,created) VALUES('app-effect-active','app-writer','private kickoff','app_run_dispatch','running','active-turn',1)", []).unwrap();
-    let before = db_snapshot(&d);
+    let before = effects_snapshot(&d);
+    // CAD-775: the run is already failed by now, so this returns at once;
+    // it keeps the interleave inside this window too if timing shifts.
+    wait_for_app_run_invalidation(&d, "app-effect-job");
     for tool in ["widgets.list", "widgets.preview"] {
         let mut call = request.clone();
         call["tool"] = json!(tool);
@@ -1705,9 +1773,15 @@ fn cad631_valid_account_grant_cannot_escape_local_app_text_capability() {
         );
     }
     assert_eq!(
-        db_snapshot(&d),
+        effects_snapshot(&d),
         before,
         "active local app turn wrote effect or draft state"
+    );
+    assert!(
+        effects_snapshot(&d)
+            .lines()
+            .all(|l| l.is_empty() || l.starts_with("##")),
+        "refused app-turn calls left an effect or draft row"
     );
     conn.execute(
         "UPDATE messages SET state='completed' WHERE id='app-effect-active'",
