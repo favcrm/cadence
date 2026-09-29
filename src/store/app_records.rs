@@ -104,6 +104,19 @@ pub fn record_db_path(state_dir: &Path, install_id: &str) -> Result<PathBuf> {
         .join(format!("{install_id}.sqlite3")))
 }
 
+/// Concurrent first opens race the fresh initialization and
+/// SQLite locking: a loser can see a half-committed file, lose the
+/// init commit, or take BUSY setting WAL mode while a sibling holds
+/// the write transaction. Only these transient signals may retry an
+/// open — every other refusal (corruption, identity, schema,
+/// permissions) fails closed on the first attempt.
+fn is_transient_open_error(error: &Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "record file initialization diverged" | "record file unavailable"
+    )
+}
+
 /// One installation's record file. Opened per operator action and
 /// closed after it — persistence is the file itself, shared through
 /// SQLite locking, never daemon memory.
@@ -121,16 +134,23 @@ impl RecordStore {
     /// identity row does not match is refused with an explicit
     /// recovery error — user data is never deleted or rewritten.
     pub fn open(state_dir: &Path, install_id: &str) -> Result<Self> {
-        // Concurrent first opens race the fresh initialization: the
-        // loser's init diverges (a sibling committed first) and it
-        // re-opens through the existing-file path with its wait for
-        // a mid-flight commit. Genuine corruption refuses on every
-        // attempt — only the diverged-init signal retries.
-        match Self::open_once(state_dir, install_id) {
-            Err(error) if error.to_string() == "record file initialization diverged" => {
-                Self::open_once(state_dir, install_id)
+        // Concurrent first opens race the fresh initialization and
+        // SQLite locking: a loser can see a half-committed file (no
+        // record tables yet), lose the init commit itself, or take
+        // BUSY setting WAL mode while a sibling holds the write
+        // transaction. Each of those transient signals retries
+        // through a fresh open attempt; genuine corruption, identity
+        // mismatch, unsupported schema or an unwritable directory
+        // never match and refuse on the first attempt as before.
+        let mut attempt = 0;
+        loop {
+            match Self::open_once(state_dir, install_id) {
+                Err(error) if is_transient_open_error(&error) && attempt < 40 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                settled => return settled,
             }
-            settled => settled,
         }
     }
 
