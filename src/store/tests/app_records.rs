@@ -311,3 +311,63 @@ fn cad779_concurrent_creates_conflict_on_normalized_email() {
         "racer@example.com"
     );
 }
+
+#[test]
+fn cad779_update_cannot_move_customer_onto_another_email() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    store
+        .app_record_create("ctx-1", "customer-a", &customer("A", "held@example.com"))
+        .unwrap();
+    store
+        .app_record_create("ctx-1", "customer-b", &customer("B", "other@example.com"))
+        .unwrap();
+    let before = store.app_record_show("ctx-1", "customer-b").unwrap();
+    let refused = store
+        .app_record_update("ctx-1", "customer-b", 1, &customer("B", "HELD@example.com"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("another record"),
+        "email move was not refused: {refused}"
+    );
+    assert_eq!(
+        store.app_record_show("ctx-1", "customer-b").unwrap(),
+        before
+    );
+}
+
+#[test]
+fn cad779_corrupt_existing_profile_closes_email_create() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    store
+        .app_record_create("ctx-1", "customer-a", &customer("A", "held@example.com"))
+        .unwrap();
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        "UPDATE app_records SET body='not-json' WHERE context_id='ctx-1' AND id='customer-a'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let refused = store
+        .app_record_create("ctx-1", "customer-b", &customer("B", "new@example.com"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("corrupt") || refused.contains("profile"),
+        "corrupt profile was ignored during uniqueness check: {refused}"
+    );
+    let conn =
+        rusqlite::Connection::open(record_db_path(dir.path(), "install-a").unwrap()).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM app_records WHERE context_id='ctx-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "a new row was committed past a corrupt profile");
+}
