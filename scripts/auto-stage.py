@@ -237,6 +237,9 @@ def fetch_json(path, field=None):
 
 CI_PATH = ".github/workflows/ci.yml"
 STAGING_PATH = ".github/workflows/staging.yml"
+# Only these events can stage; pull_request rehearsal runs use a separate
+# concurrency group and never stage, so they must not count as in-flight.
+STAGING_EVENTS = ("schedule", "workflow_run", "workflow_dispatch")
 
 
 def fetch_main_runs(repo, limit):
@@ -257,14 +260,16 @@ def fetch_run(repo, run_id):
 
 
 def fetch_staging_state(repo, limit_runs, limit_receipts, current_run_id):
-    """List recent staging.yml runs; collect inflight ids and download up
-    to limit_receipts prior staging receipts (newest first)."""
+    """List recent staging.yml runs on staging events; collect inflight ids
+    and download up to limit_receipts prior staging receipts (newest first)."""
     data = json.loads(gh_api(
         f"repos/{repo}/actions/runs?per_page={limit_runs * 3}"))
     state = {"inflight": [], "receipts": []}
     completed = []
     for run in data.get("workflow_runs", []):
         if run.get("path") != STAGING_PATH:
+            continue
+        if run.get("event") not in STAGING_EVENTS:
             continue
         if run.get("id") == current_run_id:
             continue
