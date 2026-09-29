@@ -512,3 +512,99 @@ fn cad771_posted_receipt_must_match_frozen_intent() {
     let posted = s.social_publish_report(&id, "posted", &good).unwrap();
     assert_eq!(posted["intent"]["state"], "posted");
 }
+
+#[test]
+fn cad771_note_evidence_with_foreign_binding_fails_closed() {
+    // A status reply for the same key with a different destination or
+    // content must never persist: the intent stays processing with no
+    // upstream evidence recorded.
+    let (_dir, s) = store();
+    let staged = s
+        .social_publish_schedule(&intent("req-foreign-note"))
+        .unwrap();
+    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    for (field, value) in [
+        ("destination_id", json!("999999999999999")),
+        ("caption_digest", json!(digest(7))),
+        ("image_digest", json!(digest(8))),
+    ] {
+        let mut foreign = json!({"state": "posted",
+            "permalink": "https://www.instagram.com/p/ABC/",
+            "provider_ids": ["provider-post-1"],
+            "provider_payload": "{\"id\":\"provider-post-1\"}",
+            "destination_id": "17841400008460056",
+            "caption_digest": digest(1),
+            "image_digest": img_digest()});
+        foreign[field] = value;
+        let err = s
+            .social_publish_note_evidence(&id, &foreign)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match the frozen intent"),
+            "{field}: {err}"
+        );
+    }
+    let shown = s.social_publish_show(&id).unwrap()["intent"].clone();
+    assert_eq!(shown["state"], "processing");
+    assert!(shown["upstream"].is_null());
+}
+
+#[test]
+fn cad771_report_rejects_planted_foreign_upstream() {
+    // Defense in depth, proven by surgery: even if foreign evidence were
+    // somehow persisted, a posted report still requires upstream binding
+    // equality with frozen.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.sqlite3");
+    let id = {
+        let s = Store::open(&path).unwrap();
+        let staged = s.social_publish_schedule(&intent("req-planted")).unwrap();
+        let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+        s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+            .unwrap()
+            .unwrap();
+        note_matching_evidence(&s, &id);
+        id
+    };
+    let foreign = json!({"state": "posted",
+        "permalink": "https://www.instagram.com/p/ABC/",
+        "provider_ids": ["provider-post-1"],
+        "provider_payload": "{\"id\":\"provider-post-1\"}",
+        "destination_id": "999999999999999",
+        "caption_digest": digest(1),
+        "image_digest": img_digest()})
+    .to_string();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE social_publish_intents SET upstream=? WHERE intent_id=?",
+            rusqlite::params![foreign, id],
+        )
+        .unwrap();
+    let s = Store::open(&path).unwrap();
+    let err = s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/",
+                "destination_id": "17841400008460056",
+                "caption_digest": digest(1),
+                "image_digest": img_digest(),
+                "provider_ids": ["provider-post-1"],
+                "provider_payload": "{\"id\":\"provider-post-1\"}"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not match trusted upstream evidence"),
+        "{err}"
+    );
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "processing"
+    );
+}

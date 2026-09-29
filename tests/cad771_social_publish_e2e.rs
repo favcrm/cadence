@@ -1405,3 +1405,90 @@ fn cad771_e2e_missing_upstream_echo_fails_closed_never_filled() {
     // Nothing was filled from the request: no upstream evidence recorded.
     assert!(refused["intent"]["upstream"].is_null());
 }
+
+#[test]
+fn cad771_e2e_cross_key_evidence_confusion_fails_closed() {
+    // Two intents, two provider evidences: reporting A with B's payload —
+    // even alongside A's own binding fields — refuses and retains
+    // processing. Evidence is key-bound, never interchangeable.
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 4);
+    let (h, _sender) = e2e_release(&door);
+    let (context_a, run_a, bundle_a, install_a) = approved_run(&h, "xkey-a");
+    let (context_b, run_b, bundle_b, install_b) = approved_run(&h, "xkey-b");
+    // Staggered dues make dispatch order deterministic: A then B.
+    let due_a = epoch_now();
+    let due_b = due_a + 3600;
+    let intent_a = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context_a,
+                &run_a,
+                &bundle_a,
+                &install_a,
+                "cad771-e2e-xkey-a",
+                "cad_fx_xkey_a_01",
+                due_a,
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let intent_b = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context_b,
+                &run_b,
+                &bundle_b,
+                &install_b,
+                "cad771-e2e-xkey-b",
+                "cad_fx_xkey_b_01",
+                due_b,
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    for (intent, at) in [(&intent_a, due_a + 5), (&intent_b, due_b + 5)] {
+        let claimed = h
+            .daemon
+            .operator_rpc(
+                "social_publish_claim_due",
+                json!({"now_epoch": at, "recheck": recheck_for(intent)}),
+            )
+            .unwrap();
+        assert_eq!(claimed["intent"]["intent_id"], intent["intent_id"]);
+        assert_eq!(claimed["intent"]["state"], "processing");
+    }
+    // A's binding fields with B's evidence bytes: refused, A retained.
+    let confused = h
+        .daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": intent_a["intent_id"], "decision": "posted",
+                "receipt": {"permalink": intent_b["frozen"]["destination_id"],
+                    "destination_id": intent_a["frozen"]["destination_id"],
+                    "caption_digest": intent_a["frozen"]["caption_digest"],
+                    "image_digest": intent_a["frozen"]["image_digest"],
+                    "provider_ids": ["provider-post-1"],
+                    "provider_payload": "copied-bytes"}}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        confused.contains("does not match trusted upstream evidence"),
+        "{confused}"
+    );
+    assert_eq!(
+        h.daemon
+            .operator_rpc(
+                "social_publish_show",
+                json!({"intent_id": intent_a["intent_id"]}),
+            )
+            .unwrap()["intent"]["state"],
+        "processing"
+    );
+    assert_eq!(door.ledger.provider_calls(), 2);
+}

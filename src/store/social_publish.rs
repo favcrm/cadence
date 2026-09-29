@@ -428,8 +428,10 @@ impl Store {
 
     /// Persist daemon-observed dispatch evidence on a processing intent.
     /// The evidence must carry the provider's exact binding plus its
-    /// byte-exact payload as an opaque string (never re-serialized).
-    /// Refused while the intent is not processing.
+    /// byte-exact payload as an opaque string (never re-serialized), AND
+    /// its binding must equal the frozen intent: a status reply for the
+    /// same key with a different destination/caption/image is refused
+    /// here, never persisted. Refused while the intent is not processing.
     pub fn social_publish_note_evidence(&self, intent_id: &str, evidence: &Value) -> Result<Value> {
         for field in [
             "state",
@@ -460,6 +462,25 @@ impl Store {
         }
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        let frozen_text: Option<String> = tx
+            .query_row(
+                "SELECT frozen FROM social_publish_intents WHERE intent_id=? AND state='processing'",
+                [intent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let frozen_text = frozen_text
+            .ok_or_else(|| Error::rejected("social publish intent is not processing"))?;
+        let frozen: Value = serde_json::from_str(&frozen_text)?;
+        let field = |doc: &Value, name: &str| doc.get(name).cloned().unwrap_or(Value::Null);
+        if field(evidence, "destination_id") != field(&frozen, "destination_id")
+            || field(evidence, "caption_digest") != field(&frozen, "caption_digest")
+            || field(evidence, "image_digest") != field(&frozen, "image_digest")
+        {
+            return Err(Error::rejected(
+                "dispatch evidence does not match the frozen intent",
+            ));
+        }
         let changed = tx.execute("UPDATE social_publish_intents SET upstream=?1,updated=?2 WHERE intent_id=?3 AND state='processing'",params![evidence.to_string(),now(),intent_id])?;
         if changed != 1 {
             return Err(Error::rejected("social publish intent is not processing"));
@@ -563,8 +584,15 @@ impl Store {
                 })?;
             // Full receipt-to-outcome equality: payload-only comparison
             // lets a copied payload with forged permalink or IDs pass.
-            // Every reported field must equal the daemon-observed outcome.
+            // Every reported field must equal the daemon-observed outcome,
+            // and the outcome's own binding must equal frozen (defense in
+            // depth with the persistence-time check: no foreign evidence
+            // can satisfy a posted report).
+            let upstream_field = |name: &str| upstream.get(name).unwrap_or(&Value::Null);
             if upstream["state"] != "posted"
+                || upstream_field("destination_id") != frozen_digest("destination_id")
+                || upstream_field("caption_digest") != frozen_digest("caption_digest")
+                || upstream_field("image_digest") != frozen_digest("image_digest")
                 || receipt["permalink"] != upstream["permalink"]
                 || receipt["provider_ids"] != upstream["provider_ids"]
                 || receipt_digest("destination_id") != frozen_digest("destination_id")
