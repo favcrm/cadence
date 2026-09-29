@@ -808,7 +808,7 @@ fn classify_profile_cells(
 }
 
 fn plan_row_json(row: &PlanRow) -> Value {
-    json!({
+    let mut receipt = json!({
         "row": row.number,
         "record_id": row.record_id,
         "decision": row.decision,
@@ -817,8 +817,13 @@ fn plan_row_json(row: &PlanRow) -> Value {
         "profile": row.profile.as_ref().map(|profile| serde_json::to_value(profile).unwrap_or(Value::Null)).unwrap_or(Value::Null),
         "errors": row.errors,
         "reason": row.reason,
-        "duplicate_of": row.duplicate_of,
-    })
+    });
+    // A row with no duplicate candidate carries no duplicate key at
+    // all: absence — not null — is the isolation proof's signal.
+    if let Some(other) = &row.duplicate_of {
+        receipt["duplicate_of"] = Value::String(other.clone());
+    }
+    receipt
 }
 
 impl RecordStore {
