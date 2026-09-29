@@ -59,10 +59,11 @@
 //!   policy grants its worktree, the repo's shared git dir, the
 //!   effective/shared target dirs, the declared cargo + sccache
 //!   caches, the PM tracker and its own dir under the state dir —
-//!   reads the toolchain and system trees, the single Devin
-//!   provider-auth file (CAD-751), and denies every other `$HOME`
+//!   reads the toolchain and system trees, and denies every `$HOME`
 //!   secret (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
-//!   cargo `credentials.toml`, `~/.local/share` itself), every other agent's dir and the daemon store
+//!   cargo `credentials.toml`, `~/.local/share` itself) — except the
+//!   single Devin provider-auth file, and only for workers whose
+//!   effective model is a Devin provider model (CAD-751) — every other agent's dir and the daemon store
 //!   by omission. `TMPDIR` is redirected into the worker dir (a shared
 //!   `/tmp` grant would expose every lane, and a denied one makes
 //!   rustc retry for ~1s) and `GIT_CONFIG_GLOBAL` at the worker's own
@@ -757,7 +758,8 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   `credentials.toml` (registry tokens) is never in the policy;
 ///   the Devin CLI login (`~/.local/share/devin/credentials.toml`)
 ///   is the one deliberate exception — read-only, the single file,
-///   never its parents (CAD-751). The pinned `[pi].providers`
+///   never its parents, and only for workers whose effective model
+///   is a Devin provider model (CAD-751). The pinned `[pi].providers`
 ///   package dirs the `-e` argv loads (CAD-559).
 /// - **denied** by omission: `$HOME` itself and everything under it
 ///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
@@ -768,6 +770,21 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///
 /// `GIT_CONFIG_GLOBAL` is redirected to the worker's own file by
 /// `open` (git fatals on an unreadable `~/.gitconfig` — proven).
+///
+/// CAD-751: does this worker run a Devin provider model? Only those
+/// workers are granted the read of the Devin CLI login — every other
+/// confined worker is denied the file, so a non-Devin worker never
+/// gains the operator's Devin credential. The provider namespace is
+/// the part before the first `/` (the same convention
+/// `pi_policy::require_allowed` uses); a bare id names no provider
+/// and earns no grant — confined Devin workers use `devin/<model>`
+/// form.
+fn worker_uses_devin_model(params: &Value) -> bool {
+    params
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.starts_with("devin/"))
+}
 pub fn pi_worker_confinement(
     env: &ProviderEnv,
     state_dir: &Path,
@@ -902,15 +919,18 @@ pub fn pi_worker_confinement(
         // and under Landlock that read EACCES'd, failing bootstrap
         // and every dispatch with "OAuth auth derivation failed for
         // devin". The grant is the single credential FILE,
-        // read-only: `~/.local/share`, `~/.local/share/devin` and
-        // every sibling stay denied, as do cargo registry tokens and
-        // every other login. A missing file is skipped by `cadence
-        // confine` (never widened to its parent), so a signed-out
-        // operator gets Pi's own not-signed-in error instead. The
-        // daemon never reads this file — the path is granted, the
-        // bytes stay inside the confined child — so no credential
-        // content can reach events, argv, task results or worktrees.
-        read.push(home.join(".local/share/devin/credentials.toml"));
+        // read-only, scoped to Devin-model workers
+        // ([`worker_uses_devin_model`]): `~/.local/share`,
+        // `~/.local/share/devin` and every sibling stay denied, as
+        // do cargo registry tokens and every other login. A missing
+        // file is skipped by `cadence confine` (never widened to its
+        // parent). The daemon never reads this file — the path is
+        // granted, the bytes stay inside the confined child — so no
+        // credential content can reach events, argv, task results or
+        // worktrees.
+        if worker_uses_devin_model(&params) {
+            read.push(home.join(".local/share/devin/credentials.toml"));
+        }
     }
     // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
     // named explicitly so the write set shows it — it is inside the
