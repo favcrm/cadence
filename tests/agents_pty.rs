@@ -5480,22 +5480,28 @@ fn pty_silent_end_fires_once() {
 /// so on an idle pane it gate-waits and dies with its bound turn — while
 /// a plain follow-up send queues behind the unreported turn until it is
 /// reported. Once-per-message timing is proven by `pty_silent_end_fires_once`
-/// above, so this test skips that sweep sleep; and nothing here asserts
-/// the gate-backoff length (CAD-185 precedent), so the retry base is
-/// shrunk to 0.5s (30s cap becomes 3s) and the cancelled-wait bound drops
-/// from 45s to 15s.
+/// above, so this test skips that sweep sleep; the silent budget elapses
+/// on the injected clock while hot ticks drive the scheduler; and nothing
+/// here asserts the gate-backoff length (CAD-185 precedent), so the retry
+/// base is shrunk to 0.5s (30s cap becomes 3s) and the cancelled-wait
+/// bound drops from 45s to 15s.
 #[test]
 fn pty_silent_end_views_and_recovery() {
     // Shrink gate backoff before the daemon clones this test's provider
     // env: base 0.5s caps at 3s, so the post-report cancelled wait below
-    // clears in seconds, not past the production 30s cap.
+    // clears in seconds, not past the production 30s cap. The claim loop
+    // is actor-side wall machinery — outside the stall-clock slice.
     test_env().set("CADENCE_PTY_RETRY_SECS", "0.5");
-    let d = TestDaemon::start();
+    let offset = stall_clock_offset();
+    let mut opts = daemon_opts();
+    opts.stall_clock_offset = std::sync::Arc::clone(&offset);
+    opts.stall_tick = Some(Duration::from_millis(50));
+    let d = TestDaemon::start_opts(opts);
     let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
-        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+        json!({"auto_ready": "verified", "silent_end_secs": 3600, "stall_secs": 14400}),
     );
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
@@ -5503,10 +5509,15 @@ fn pty_silent_end_views_and_recovery() {
     let token = pty_token(&d, "w1", "ms9");
 
     // The stub pane returns to `» stub ready` after the submission —
-    // the message still runs but the probe reads idle.
-    let e = d.wait_event("w1", "turn_silent_end", 40);
+    // the message still runs but the probe reads idle. The budget
+    // elapses on the clock; the streak lands on hot ticks.
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let e = d.wait_event("w1", "turn_silent_end", 10);
     assert_eq!(e["payload"]["message"], "ms9", "{e}");
-    assert!(e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 4, "{e}");
+    assert!(
+        e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 3600,
+        "{e}"
+    );
     assert_eq!(e["payload"]["probe"]["idle"], true, "{e}");
     assert!(
         e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
@@ -5518,7 +5529,7 @@ fn pty_silent_end_views_and_recovery() {
     // the ready-gated recovery command.
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(show["silent_ended"], true, "{show}");
-    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 4, "{show}");
+    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 3600, "{show}");
     let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
         .as_array()
         .unwrap()

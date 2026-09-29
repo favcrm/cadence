@@ -1030,6 +1030,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
         stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
+        stall_clock_offset: Default::default(),
+        stall_tick: None,
         // Explicit defaults keep test daemons hermetic — a real pm.yaml
         // [host] table on the dev host must never leak into a test.
         slots: Some(cadence_agent::slots::SlotConfig::default()),
@@ -2612,6 +2614,14 @@ impl FakeGh {
             .map(str::to_string)
             .collect()
     }
+}
+
+/// Fresh stall-watch logic-time offset in seconds (starts at wall `0`).
+/// Tests install it in `ServeOptions` before start and advance the
+/// RUNNING daemon past budgets — no wall sleeps. Owned per test (a
+/// fresh `Arc`, not thread-local), so nothing leaks across tests.
+pub fn stall_clock_offset() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+    Default::default()
 }
 
 // ---------- CAD-52: stall detection ----------
