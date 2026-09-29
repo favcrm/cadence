@@ -803,70 +803,173 @@ mod tests {
         assert!(ok.is_ok(), "{ok:?}");
     }
 
-    /// Validation rules 1–11, each a failing case.
+    /// Validation rules 1–11, each a failing case that names WHY the
+    /// rule refused — a case failing for another reason would hide a
+    /// missing guard.
     #[test]
     fn validation_rules_each_refuse() {
-        for yaml in [
+        for (yaml, why) in [
             // 1: reviews non-empty; names are tags.
-            "delivery: {reviews: {}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {Bad: {kind: agent, focus: general}}, risk: [{require: [Bad]}]}",
+            ("delivery: {reviews: {}, risk: [{require: [r]}]}", "at least one review"),
+            (
+                "delivery: {reviews: {Bad: {kind: agent, focus: general}}, risk: [{require: [Bad]}]}",
+                "not a valid name",
+            ),
             // 2: agent needs focus in FOCI; app/mode refused.
-            "delivery: {reviews: {r: {kind: agent}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: madeup}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: general, app: x}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: general, mode: advisory}}, risk: [{require: [r]}]}",
+            (
+                "delivery: {reviews: {r: {kind: agent}}, risk: [{require: [r]}]}",
+                "needs a 'focus'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: madeup}}, risk: [{require: [r]}]}",
+                "not a known focus",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general, app: x}}, risk: [{require: [r]}]}",
+                "takes no 'app'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general, mode: advisory}}, risk: [{require: [r]}]}",
+                "takes no 'mode'",
+            ),
             // 3: check needs a slug-or-id app and a mode; focus refused.
-            "delivery: {reviews: {r: {kind: check, mode: advisory}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: check, app: '-x', mode: advisory}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: check, app: 'X', mode: advisory}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: check, app: a, mode: advisory, focus: general}}, risk: [{require: [r]}]}",
+            (
+                "delivery: {reviews: {r: {kind: check, mode: advisory}}, risk: [{require: [r]}]}",
+                "needs an 'app'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: '-x', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: 'X', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: a}}, risk: [{require: [r]}]}",
+                "needs a 'mode'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: check, app: a, mode: advisory, focus: general}}, risk: [{require: [r]}]}",
+                "takes no 'focus'",
+            ),
             // 4: operator refuses focus/app/mode.
-            "delivery: {reviews: {r: {kind: operator, focus: general}}, risk: [{require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator, mode: advisory}}, risk: [{require: [r]}]}",
+            (
+                "delivery: {reviews: {r: {kind: operator, focus: general}}, risk: [{require: [r]}]}",
+                "takes no 'focus'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator, mode: advisory}}, risk: [{require: [r]}]}",
+                "takes no 'mode'",
+            ),
             // 6: risk non-empty; require non-empty, no dups, defined.
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: []}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: []}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r, r]}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [nope]}]}",
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: []}",
+                "at least one rule",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: []}]}",
+                "require must name at least one review",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r, r]}]}",
+                "twice",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [nope]}]}",
+                "undefined review 'nope'",
+            ),
             // 7: require may not name an advisory check.
-            "delivery: {reviews: {r: {kind: check, app: ok, mode: advisory}, \
-                       g: {kind: operator}}, risk: [{require: [r, g]}]}",
+            (
+                "delivery: {reviews: {r: {kind: check, app: ok, mode: advisory}, \
+                           g: {kind: operator}}, risk: [{require: [r, g]}]}",
+                "advisory check",
+            ),
             // 8: when needs a condition; sizes >= 1; path syntax.
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                       risk: [{require: [r]}, {when: {}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                       risk: [{require: [r]}, {when: {lines_over: 0}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['/abs']}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a/../b']}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a\\\\b']}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a[bc]']}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a{b}']}, require: [r]}]}",
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {}, require: [r]}]}",
+                "has no condition",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {lines_over: 0}, require: [r]}]}",
+                "when.lines_over must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
+                "'': empty",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['/abs']}, require: [r]}]}",
+                "absolute",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a/../b']}, require: [r]}]}",
+                "'..' segment",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a\\\\b']}, require: [r]}]}",
+                "a '\\'",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a[bc]']}, require: [r]}]}",
+                "wildcards",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: ['a{b}']}, require: [r]}]}",
+                "wildcards",
+            ),
             // 9: the safety floor — no unconditional blocking require.
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                       risk: [{when: {paths: [a]}, require: [r]}]}",
-            "delivery: {reviews: {r: {kind: operator}, d: {kind: check, app: a, mode: advisory}}, \
-                       risk: [{require: [d]}]}",
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{when: {paths: [a]}, require: [r]}]}",
+                "unconditional rule",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: operator}, d: {kind: check, app: a, mode: required}}, \
+                           risk: [{when: {paths: [x]}, require: [d]}]}",
+                "unconditional rule",
+            ),
             // 10: max_revise in 1..=10.
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 0}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 11}",
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 0}",
+                "outside 1..=10",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], max_revise: 11}",
+                "outside 1..=10",
+            ),
             // 11: sizes >= 1, heavy strictly under oversized.
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
-                       heavy: {lines_over: 0}}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
-                       oversized: {files_over: 0}}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
-                       oversized: {lines_over: 100}}",
-            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
-                       heavy: {files_over: 50}}",
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {lines_over: 0}}",
+                "heavy sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {files_over: 0}}",
+                "oversized sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {lines_over: 100}}",
+                "heavy must be under oversized",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {files_over: 50}}",
+                "heavy must be under oversized",
+            ),
         ] {
             let e = err_of(yaml);
+            assert!(e.contains(why), "{yaml} -> {e}");
             assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
         }
         // …and the floor accepts an agent, an operator or a required

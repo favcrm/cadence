@@ -397,21 +397,31 @@ impl Shared {
         {
             return Err(crate::issue::project::unknown_project(project, &pm_dir));
         }
-        let cfg = crate::issue::work::load_config(&pm_dir, project)?;
-        // A malformed delivery: section refuses the whole approval.
-        let delivery = crate::issue::delivery_policy::load(&pm_dir, project)?;
-        let (delivery_json, delivery_digest) = match &delivery {
-            Some(p) => (
-                serde_json::to_value(p).unwrap_or(Value::Null),
-                crate::issue::delivery_policy::digest(p),
-            ),
-            None => (
-                Value::Null,
-                crate::issue::delivery_policy::digest(
-                    &crate::issue::delivery_policy::default_policy(),
-                ),
-            ),
+        // CAD-826: one read of PROJECT.md feeds both halves of the
+        // approval — the gate digest and the delivery digest always
+        // come from the same snapshot, so a concurrent edit can never
+        // record a pairing the file never held.
+        let text = crate::issue::work::read_project_md(&pm_dir, project)?;
+        let cfg = match &text {
+            None => crate::issue::work::WorkConfig::default(),
+            Some(t) => crate::issue::work::parse_config(t)
+                .map_err(|e| Error::rejected(format!("{project}: {e}")))?,
         };
+        // A malformed delivery: section refuses the whole approval.
+        let delivery = match &text {
+            None => None,
+            Some(t) => crate::issue::delivery_policy::parse(t)
+                .map_err(|e| Error::rejected(format!("{project}: {e}")))?,
+        };
+        let delivery_json = match &delivery {
+            Some(p) => serde_json::to_value(p)?,
+            None => Value::Null,
+        };
+        let delivery_digest = crate::issue::delivery_policy::digest(
+            delivery
+                .as_ref()
+                .unwrap_or(&crate::issue::delivery_policy::default_policy()),
+        );
         let payload = json!({
             "project": project,
             "digest": crate::issue::work::gate_digest(&cfg),

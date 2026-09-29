@@ -3986,17 +3986,43 @@ fn delivery_policy_approval_and_resolution() {
         format!("---\nproject: demo\n{delivery_yaml}---\n# Demo\n"),
     )
     .unwrap();
-    let ls_delivery = |f: &PlanFixture| -> Value {
+    let ls_delivery = |f: &PlanFixture, key: &str| -> Value {
         let (ok, out) = f.cli(&["issue", "project", "ls", "--json"]);
         assert!(ok, "{out}");
         out["projects"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["key"] == "demo")
+            .find(|p| p["key"] == key)
             .unwrap()["delivery"]
             .clone()
     };
+
+    // A second project with a malformed `delivery:` — it degrades its
+    // own row to the defaults plus a delivery_error note and never
+    // breaks the listing or demo's row.
+    let (ok, out) = f.cli(&["issue", "project", "add", "other", "--prefix", "O"]);
+    assert!(ok, "{out}");
+    let other_md = f.pm_dir.join("other/PROJECT.md");
+    std::fs::write(&other_md, "---\ndelivery: {risk: []}\n---\n").unwrap();
+    let d_other = ls_delivery(&f, "other");
+    assert_eq!(d_other["source"], "default", "{d_other}");
+    assert!(
+        d_other["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("delivery_error: other/PROJECT.md delivery is malformed"),
+        "{d_other}"
+    );
+    let d_demo = ls_delivery(&f, "demo");
+    assert_eq!(d_demo["source"], "default", "{d_demo}");
+    assert!(
+        d_demo["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery_unapproved"),
+        "{d_demo}"
+    );
 
     // A pane and a detached agent-env caller cannot approve.
     let home = TempDir::new().unwrap();
@@ -4012,7 +4038,7 @@ fn delivery_policy_approval_and_resolution() {
     assert!(frame_err(&r).contains("operator action"), "{r}");
 
     // Before approval the custom section resolves as default + note.
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(d["source"], "default", "{d}");
     assert!(
         d["note"]
@@ -4035,7 +4061,7 @@ fn delivery_policy_approval_and_resolution() {
     let recorded: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
     assert_eq!(digest(&recorded), out["delivery_digest"].as_str().unwrap());
     assert_eq!(recorded.max_revise, 5, "{out}");
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(
         (d["source"].as_str(), d["note"].is_null()),
         (Some("approved"), true),
@@ -4054,7 +4080,7 @@ fn delivery_policy_approval_and_resolution() {
         ),
     )
     .unwrap();
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(d["source"], "approved", "{d}");
     assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
     assert!(
@@ -4073,7 +4099,7 @@ fn delivery_policy_approval_and_resolution() {
 
     // Removing the section keeps the approved policy in force.
     std::fs::write(&project_md, "---\nproject: demo\n---\n").unwrap();
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(d["source"], "approved", "{d}");
     assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
     assert!(
@@ -4086,7 +4112,7 @@ fn delivery_policy_approval_and_resolution() {
 
     // A malformed section: same resolution, and approve refuses.
     std::fs::write(&project_md, "---\ndelivery: {risk: []}\n---\n").unwrap();
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(d["source"], "approved", "{d}");
     assert!(d["note"].as_str().unwrap().contains("malformed"), "{d}");
     let err =
@@ -4109,44 +4135,63 @@ fn delivery_policy_approval_and_resolution() {
         "{out}"
     );
     assert_eq!(out["stages"].as_array().unwrap().len(), 5, "{out}");
-    let d = ls_delivery(&f);
+    let d = ls_delivery(&f, "demo");
     assert_eq!(d["source"], "default", "{d}");
     assert!(d["note"].is_null(), "{d}");
 
+    // A file racing the approve never yields a torn read (writes are
+    // atomic: temp + rename) nor a mixed snapshot — the recorded gate
+    // stages and delivery policy always come from the same write.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     let pm = project_md.clone();
     let writer = thread::spawn(move || {
+        // A: custom stages + max_revise 3. B: default stages +
+        // max_revise 4.
+        let base = "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                    risk: [{require: [r]}]";
+        let variants = [
+            format!("---\nstages: [a, b]\n{base}, max_revise: 3}}\n---\n"),
+            format!("---\n{base}, max_revise: 4}}\n---\n"),
+        ];
+        let tmp = pm.with_file_name("PROJECT.md.tmp");
         let mut flip = false;
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-            let base = "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                        risk: [{require: [r]}]";
-            let yaml = if flip {
-                format!("---\n{base}, max_revise: 3}}\n---\n")
-            } else {
-                format!("---\n{base}, max_revise: 4}}\n---\n")
-            };
-            let _ = std::fs::write(&pm, yaml);
+            let v = &variants[flip as usize];
+            if std::fs::write(&tmp, v).is_ok() {
+                let _ = std::fs::rename(&tmp, &pm);
+            }
             flip = !flip;
         }
+        let _ = std::fs::remove_file(&tmp);
     });
+    let default_stages = json!(["shape", "build", "verify", "release", "done"]);
     for _ in 0..10 {
         let out =
             f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
                 .unwrap();
         if out["delivery"].is_null() {
+            // The file was briefly absent: defaults, one snapshot.
             assert_eq!(
                 out["delivery_digest"],
                 json!(digest(&default_policy())),
                 "{out}"
             );
-        } else {
-            let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
-            assert_eq!(
-                out["delivery_digest"].as_str().unwrap(),
-                digest(&p),
-                "{out}"
-            );
+            assert_eq!(out["stages"], default_stages, "{out}");
+            continue;
+        }
+        let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+        assert_eq!(
+            out["delivery_digest"].as_str().unwrap(),
+            digest(&p),
+            "{out}"
+        );
+        // The single-snapshot pairing: max_revise 3 rides with
+        // stages [a, b], max_revise 4 with the five default stages.
+        match p.max_revise {
+            3 => assert_eq!(out["stages"], json!(["a", "b"]), "{out}"),
+            4 => assert_eq!(out["stages"], default_stages, "{out}"),
+            other => panic!("unexpected max_revise {other}: {out}"),
         }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
