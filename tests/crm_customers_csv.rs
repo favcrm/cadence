@@ -1285,14 +1285,14 @@ fn cad779_concurrent_creates_refuse_same_normalized_email_at_write_boundary() {
             barrier.wait();
             w.daemon.operator_rpc(
                 "app_record_create",
-                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-a", "profile": {"schema": 1, "display_name": "First", "email": "RACE@example.com", "consent": {"email": "unknown"}}}),
+                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-a", "profile": {"schema": 1, "display_name": "First", "email": "RACE@example.com", "tags": [], "consent": {"email": "unknown"}}}),
             )
         });
         let second = scope.spawn(|| {
             barrier.wait();
             w.daemon.operator_rpc(
                 "app_record_create",
-                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-b", "profile": {"schema": 1, "display_name": "Second", "email": "race@example.com", "consent": {"email": "unknown"}}}),
+                json!({"install_id": install, "context_id": context_id, "record_id": "customer-email-b", "profile": {"schema": 1, "display_name": "Second", "email": "race@example.com", "tags": [], "consent": {"email": "unknown"}}}),
             )
         });
         (first.join().unwrap(), second.join().unwrap())
