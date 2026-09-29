@@ -367,7 +367,8 @@ pub fn load(pm_dir: &Path, key: &str) -> Result<Option<DeliveryPolicy>> {
 /// `sha256:<hex>` of the policy's canonical JSON — struct fields in
 /// declaration order, `reviews` as a BTreeMap — so reordered keys and
 /// omitted-vs-written defaults share one digest. `risk` rule ORDER is
-/// significant (slice 3 evaluates them in order), so reordering rules
+/// significant (the rules are hashed as a list, even though slice 3
+/// applies the union of every matching rule), so reordering rules
 /// changes the digest and needs re-approval.
 pub fn digest(p: &DeliveryPolicy) -> String {
     use sha2::{Digest, Sha256};
