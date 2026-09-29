@@ -182,8 +182,6 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    env:
-      CADENCE_TEST_PARTITION: ${{ matrix.shard }}/8
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -332,6 +330,9 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
+          # Partition applies to the tests phase only: inventory must
+          # always list every test, and no other step invokes the runner.
+          CADENCE_TEST_PARTITION: ${{ matrix.shard }}/8
         run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests
       # Observational timings come from the same run, including failed tests.
       # The recorded scope artifact distinguishes selected from full timings.
