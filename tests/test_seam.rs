@@ -433,3 +433,25 @@ fn without_the_feature_the_field_is_refused() {
     let err = cadence_agent::proto::unwrap(frame).expect_err("test_caller must refuse");
     assert!(err.to_string().contains("test-seam"), "{err}");
 }
+
+/// CAD-777 r4: a plain-http loopback issuer is a fixture allowance,
+/// not a production door — without the feature the board's device
+/// config refuses it, exactly like `remote_auth`'s `cfg!(test)` gate.
+#[cfg(not(feature = "test-seam"))]
+#[test]
+fn without_the_feature_a_plaintext_issuer_is_refused() {
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://127.0.0.1:9", "ws_x").is_err());
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://localhost:9", "ws_x").is_err());
+    assert!(
+        cadence_agent::device_login::DeviceConfig::new("https://issuer.example", "ws_x").is_ok()
+    );
+}
+
+/// With the feature the same loopback origins parse — the integration
+/// stub lives there.
+#[cfg(feature = "test-seam")]
+#[test]
+fn with_the_feature_a_loopback_issuer_parses() {
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://127.0.0.1:9", "ws_x").is_ok());
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://example.com", "ws_x").is_err());
+}

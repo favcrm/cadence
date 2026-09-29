@@ -3333,11 +3333,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let session = operator::meta(&request, state_dir, opts);
             // Display the same verified identity that attributes public
             // board writes, never a name supplied by request fields.
-            let actor = serde_json::from_value::<crate::operator_auth::BoardUser>(
-                session["session"]["user"].clone(),
-            )
-            .map(|user| user.actor())
-            .unwrap_or(actor);
+            // Public-origin sessions carry a verified user; every other
+            // session is the operator's, matching `held_of`'s
+            // attribution exactly.
+            let actor = if session["session"]["origin"].as_str() == Some("public") {
+                serde_json::from_value::<crate::operator_auth::BoardUser>(
+                    session["session"]["user"].clone(),
+                )
+                .map(|user| user.actor())
+                .unwrap_or(actor)
+            } else {
+                actor
+            };
             send(
                 request,
                 json_response(json!({
@@ -4162,7 +4169,9 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // loses the port touches nothing) and while no OTHER live UI owns
     // this state dir — a second `ui run` must not rewrite or delete
     // the pin out from under the running board (review r3).
-    pin_device_login(state_dir, &opts)?;
+    // The lock File stays bound for the rest of `serve()` — the
+    // board's claim on the pin dies only with this process.
+    let _device_pin_lock = pin_device_login(state_dir, &opts)?;
     // CAD-446: merge decisions appear without a terminal — this process
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
@@ -4270,19 +4279,53 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
         })
 }
 
-/// Write or clear the daemon's device trust pin for this board
-/// (`opts.device_login` ⇔ the pin file). Refuses when ANOTHER live UI
-/// owns this state dir: `ui.pid` names the detached server's pid
-/// (`start_inner` writes it after spawn), `read_pid` drops stale
-/// pids, and our own pid passes — `ui start`'s `ui run` child may
-/// read the file its parent already recorded for it.
-fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<()> {
-    if let Some(pid) = read_pid(state_dir).filter(|pid| *pid != std::process::id() as i32) {
-        return Err(Error::rejected(format!(
-            "a UI is already running for this state dir (pid {pid}) — \
-             stop it before changing device login"
-        )));
+/// The device trust pin's advisory lock — a serving board holds
+/// `flock` on it for `serve()`'s whole life (released by the kernel
+/// on exit), so a second `ui run` on ANY port cannot rewrite or
+/// clear the pin under a live board (review r4). Lives in the `0700`
+/// operator dir next to the pin.
+const DEVICE_PIN_LOCK: &str = "device-login.lock";
+
+/// Try to take [`DEVICE_PIN_LOCK`]. Retries up to 5 s so a restart's
+/// old-board/new-child handoff (`ui tailscale start`, `ui start`
+/// after `ui stop`) does not race the exiting holder. `Ok(Some)` —
+/// this board owns the pin; `Ok(None)` — another live board does.
+fn device_pin_lock(state_dir: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = crate::operator_auth::checked_dir(state_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir.join(DEVICE_PIN_LOCK))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(Error::internal(format!("device pin lock: {error}")));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Write or clear the daemon's device trust pin for this board
+/// (`opts.device_login` ⇔ the pin file), guarded by the lock. The
+/// returned File must stay bound for the rest of `serve()`. While
+/// ANOTHER board holds the lock: a board WITH device login refuses
+/// to start — nothing is written; a board WITHOUT it serves anyway
+/// but never clears the pin (two unconfigured boards on one state
+/// dir keeps working as before).
+fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs::File>> {
+    let lock = device_pin_lock(state_dir)?;
     if let Some(login) = opts
         .device_login
         .as_ref()
@@ -4292,10 +4335,17 @@ fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<()> {
             subjects: login.subjects.clone(),
         })
     {
-        crate::device_login::write_pin(state_dir, &login)
-    } else {
-        crate::device_login::clear_pin(state_dir)
+        if lock.is_none() {
+            return Err(Error::rejected(
+                "device login is pinned by another live board on this state dir — \
+                 stop it first",
+            ));
+        }
+        crate::device_login::write_pin(state_dir, &login)?;
+    } else if lock.is_some() {
+        crate::device_login::clear_pin(state_dir)?;
     }
+    Ok(lock)
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client

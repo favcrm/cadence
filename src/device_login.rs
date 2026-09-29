@@ -180,13 +180,14 @@ fn issuer_origin(input: &str) -> Result<String> {
         .authority()
         .ok_or_else(|| rejected("Issuer must be an HTTPS origin"))?;
     let secure = uri.scheme_str() == Some("https");
-    // Loopback issuers (local fixtures, staging on this host) are
-    // allowed over plain HTTP in every build: the issuer is
-    // operator-configured (flag/env/persisted), never caller input, so
-    // nothing the network says chooses it, and bodies stay on-host.
-    // This mirrors the board-identity issuer, which already accepts
-    // local http:// origins (CAD-526).
-    let loopback = uri.scheme_str() == Some("http")
+    // Loopback issuers over plain HTTP exist only for test fixtures:
+    // the integration stub serves `127.0.0.1` under the `test-seam`
+    // feature the suite runs with, and this module's unit tests
+    // under `cfg(test)`. A production build refuses a plaintext
+    // issuer, exactly like `remote_auth`'s `cfg!(test)` gate —
+    // device credentials must never ride the wire unencrypted.
+    let loopback = cfg!(any(test, feature = "test-seam"))
+        && uri.scheme_str() == Some("http")
         && matches!(uri.host(), Some("127.0.0.1") | Some("localhost"));
     if (!secure && !loopback)
         || authority.as_str().contains('@')

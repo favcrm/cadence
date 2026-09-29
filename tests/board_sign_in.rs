@@ -7,7 +7,9 @@
 mod board_common;
 use board_common::*;
 
+#[cfg(feature = "test-seam")]
 use cadence_agent::device_login::DeviceConfig;
+#[cfg(feature = "test-seam")]
 use cadence_agent::store::Store;
 use cadence_agent::ui;
 use serde_json::json;
@@ -953,1166 +955,1264 @@ fn a_member_session_never_decides() {
 }
 
 // ---------- CAD-777: device-grant sign-in ----------
+//
+// The whole area is test-build only: the issuer stub serves plain-http
+// loopback, which `DeviceConfig` accepts only under `test-seam` (the
+// feature the suite runs with) — under a production feature shape the
+// tests below are absent, not silently passing.
+#[cfg(feature = "test-seam")]
+mod device {
+    use super::*;
 
-/// A scripted AgenticOS device issuer: device code, token poll and
-/// session check. `mode` is `approve`, `deny` or `wrongorg`; the first
-/// token poll is always pending so the board proves it waits.
-struct DeviceStub {
-    mode: std::sync::Mutex<String>,
-    polls: std::sync::atomic::AtomicUsize,
-    /// `/v1/runtime/session` hits — the issuer-side verify. A refused
-    /// caller must never reach it.
-    verifies: std::sync::atomic::AtomicUsize,
-}
+    /// A scripted AgenticOS device issuer: device code, token poll and
+    /// session check. `mode` is `approve`, `deny` or `wrongorg`; the first
+    /// token poll is always pending so the board proves it waits.
+    struct DeviceStub {
+        mode: std::sync::Mutex<String>,
+        polls: std::sync::atomic::AtomicUsize,
+        /// `/v1/runtime/session` hits — the issuer-side verify. A refused
+        /// caller must never reach it.
+        verifies: std::sync::atomic::AtomicUsize,
+    }
 
-fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
-    let port = free_port();
-    let stub = std::sync::Arc::new(DeviceStub {
-        mode: std::sync::Mutex::new(mode.to_string()),
-        polls: std::sync::atomic::AtomicUsize::new(0),
-        verifies: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let serve = stub.clone();
-    thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).unwrap();
-        loop {
-            let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(100)) else {
-                continue;
-            };
-            let mut body = String::new();
-            let _ = req.as_reader().read_to_string(&mut body);
-            let bearer = req
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Authorization"))
-                .map(|h| h.value.as_str().to_string())
-                .unwrap_or_default();
-            let (status, doc) = match (req.method(), req.url()) {
-                (tiny_http::Method::Post, "/v1/device/code") => {
-                    if serve.mode.lock().unwrap().as_str() == "slow_code" {
-                        // A slow issuer: the code answer takes ~3 s.
-                        thread::sleep(Duration::from_secs(3));
-                    }
-                    (
-                        200,
-                        json!({
-                            "device_code": "agd_t",
-                            "user_code": "ABCD-1234",
-                            "verification_uri": format!("http://127.0.0.1:{port}/approve"),
-                            "verification_uri_complete": format!("http://127.0.0.1:{port}/approve?code=ABCD-1234"),
-                            "expires_in": 600,
-                            "interval": 1
-                        }),
-                    )
-                }
-                (tiny_http::Method::Post, "/v1/device/token") => {
-                    // The real issuer's gate: the grant type is
-                    // required, exactly like the CLI posts it.
-                    if !body.contains("urn:ietf:params:oauth:grant-type:device_code") {
-                        (400, json!({"error": "unsupported_grant_type"}))
-                    } else if !body.contains("agd_t") {
-                        (400, json!({"error": "invalid_grant"}))
-                    } else if serve
-                        .polls
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        == 0
-                    {
-                        (400, json!({"error": "authorization_pending"}))
-                    } else {
-                        match serve.mode.lock().unwrap().as_str() {
-                            "deny" => (400, json!({"error": "access_denied"})),
-                            "wrongorg" => (
-                                200,
-                                json!({
-                                    "access_token": "agc_t",
-                                    "token_type": "bearer",
-                                    "expires_in": 999,
-                                    "scope": "read draft",
-                                    "workspace_id": "ws_other"
-                                }),
-                            ),
-                            _ => (
-                                200,
-                                json!({
-                                    "access_token": "agc_t",
-                                    "token_type": "bearer",
-                                    "expires_in": 999,
-                                    "scope": "read draft",
-                                    "workspace_id": "ws_company"
-                                }),
-                            ),
+    fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
+        let port = free_port();
+        let stub = std::sync::Arc::new(DeviceStub {
+            mode: std::sync::Mutex::new(mode.to_string()),
+            polls: std::sync::atomic::AtomicUsize::new(0),
+            verifies: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let serve = stub.clone();
+        thread::spawn(move || {
+            let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).unwrap();
+            loop {
+                let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(100)) else {
+                    continue;
+                };
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let bearer = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                let (status, doc) = match (req.method(), req.url()) {
+                    (tiny_http::Method::Post, "/v1/device/code") => {
+                        if serve.mode.lock().unwrap().as_str() == "slow_code" {
+                            // A slow issuer: the code answer takes ~3 s.
+                            thread::sleep(Duration::from_secs(3));
                         }
-                    }
-                }
-                (tiny_http::Method::Get, "/v1/runtime/session") => {
-                    serve
-                        .verifies
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if bearer == "Bearer agc_t" {
                         (
                             200,
                             json!({
-                                "ok": true,
-                                "data": {
-                                    "workspace": {"id": "ws_company"},
-                                    "subject": {"anonymous": false, "id": "op_9"},
-                                    "scopes": ["read", "draft"]
-                                }
+                                "device_code": "agd_t",
+                                "user_code": "ABCD-1234",
+                                "verification_uri": format!("http://127.0.0.1:{port}/approve"),
+                                "verification_uri_complete": format!("http://127.0.0.1:{port}/approve?code=ABCD-1234"),
+                                "expires_in": 600,
+                                "interval": 1
                             }),
                         )
-                    } else {
-                        (401, json!({"ok": false, "error": "unauthorized"}))
                     }
-                }
-                _ => (404, json!({"ok": false})),
-            };
-            let _ = req.respond(
-                tiny_http::Response::from_string(doc.to_string()).with_status_code(status),
-            );
-        }
-    });
-    (format!("http://127.0.0.1:{port}"), stub)
-}
-
-/// A board with device login armed for `ws_company` against the stub,
-/// allowlisting the stub's approved subject `op_9`.
-fn start_device_board(pm: &Path, state: &Path, issuer: String) -> (u16, BoardStop) {
-    start_device_board_for(pm, state, issuer, vec!["op_9".to_string()])
-}
-
-/// `start_device_board` with a caller-chosen subject allowlist.
-fn start_device_board_for(
-    pm: &Path,
-    state: &Path,
-    issuer: String,
-    subjects: Vec<String>,
-) -> (u16, BoardStop) {
-    start_ui_opts(pm.to_path_buf(), state.to_path_buf(), move |opts| {
-        opts.device_login = Some(ui::DeviceLogin::with_issuer(
-            DeviceConfig::new(&issuer, "ws_company").unwrap(),
-            subjects.clone(),
-        ));
-    })
-}
-
-/// Device sessions on disk (`<state>/operator/sessions.json`) — the
-/// mint count the gate tests assert on.
-fn device_session_count(state: &Path) -> usize {
-    std::fs::read(state.join("operator").join("sessions.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v["sessions"].as_array().map(|s| s.len()))
-        .unwrap_or(0)
-}
-
-/// POST to a device route on the board's own name with write guards.
-fn device_post(port: u16, host: &str, path: &str, body: &str) -> (u16, String, String) {
-    op::raw(
-        port,
-        &op::request(
-            "POST",
-            path,
-            host,
-            Some(&format!("http://{host}")),
-            None,
-            body,
-        ),
-    )
-}
-
-/// The `status` of a poll answer body.
-fn status_of(body: &str) -> String {
-    serde_json::from_str::<Value>(body).unwrap()["status"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
-/// Unconfigured boards answer the device routes like unknown shapes.
-#[test]
-fn device_routes_are_dead_without_configuration() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
-    let host = op::board_host(port);
-    for path in ["/api/session/device/code", "/api/session/device/poll"] {
-        let (code, _, body) = device_post(port, &host, path, "{}");
-        assert_eq!(code, 404, "{path}: {body}");
+                    (tiny_http::Method::Post, "/v1/device/token") => {
+                        // The real issuer's gate: the grant type is
+                        // required, exactly like the CLI posts it.
+                        if !body.contains("urn:ietf:params:oauth:grant-type:device_code") {
+                            (400, json!({"error": "unsupported_grant_type"}))
+                        } else if !body.contains("agd_t") {
+                            (400, json!({"error": "invalid_grant"}))
+                        } else if serve
+                            .polls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            == 0
+                        {
+                            (400, json!({"error": "authorization_pending"}))
+                        } else {
+                            match serve.mode.lock().unwrap().as_str() {
+                                "deny" => (400, json!({"error": "access_denied"})),
+                                "wrongorg" => (
+                                    200,
+                                    json!({
+                                        "access_token": "agc_t",
+                                        "token_type": "bearer",
+                                        "expires_in": 999,
+                                        "scope": "read draft",
+                                        "workspace_id": "ws_other"
+                                    }),
+                                ),
+                                _ => (
+                                    200,
+                                    json!({
+                                        "access_token": "agc_t",
+                                        "token_type": "bearer",
+                                        "expires_in": 999,
+                                        "scope": "read draft",
+                                        "workspace_id": "ws_company"
+                                    }),
+                                ),
+                            }
+                        }
+                    }
+                    (tiny_http::Method::Get, "/v1/runtime/session") => {
+                        serve
+                            .verifies
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if bearer == "Bearer agc_t" {
+                            (
+                                200,
+                                json!({
+                                    "ok": true,
+                                    "data": {
+                                        "workspace": {"id": "ws_company"},
+                                        "subject": {"anonymous": false, "id": "op_9"},
+                                        "scopes": ["read", "draft"]
+                                    }
+                                }),
+                            )
+                        } else {
+                            (401, json!({"ok": false, "error": "unauthorized"}))
+                        }
+                    }
+                    _ => (404, json!({"ok": false})),
+                };
+                let _ = req.respond(
+                    tiny_http::Response::from_string(doc.to_string()).with_status_code(status),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), stub)
     }
-    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 404);
-}
 
-/// The full loop: code, one pending poll, approval, session cookie +
-/// key — and the cookie opens a live operator session. Issuer secrets
-/// never appear in any board response.
-#[test]
-fn device_grant_opens_a_remote_session() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
+    /// A board with device login armed for `ws_company` against the stub,
+    /// allowlisting the stub's approved subject `op_9`.
+    fn start_device_board(pm: &Path, state: &Path, issuer: String) -> (u16, BoardStop) {
+        start_device_board_for(pm, state, issuer, vec!["op_9".to_string()])
+    }
 
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let doc: Value = serde_json::from_str(&body).unwrap();
-    let pending = doc["pending_id"].as_str().unwrap().to_string();
-    assert_eq!(pending.len(), 64, "{body}");
-    assert_eq!(doc["user_code"], json!("ABCD-1234"));
-    assert!(!body.contains("agd_t"), "device code leaked: {body}");
+    /// `start_device_board` with a caller-chosen subject allowlist.
+    fn start_device_board_for(
+        pm: &Path,
+        state: &Path,
+        issuer: String,
+        subjects: Vec<String>,
+    ) -> (u16, BoardStop) {
+        start_ui_opts(pm.to_path_buf(), state.to_path_buf(), move |opts| {
+            opts.device_login = Some(ui::DeviceLogin::with_issuer(
+                DeviceConfig::new(&issuer, "ws_company").unwrap(),
+                subjects.clone(),
+            ));
+        })
+    }
 
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "pending", "{body}");
+    /// Device sessions on disk (`<state>/operator/sessions.json`) — the
+    /// mint count the gate tests assert on.
+    fn device_session_count(state: &Path) -> usize {
+        std::fs::read(state.join("operator").join("sessions.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["sessions"].as_array().map(|s| s.len()))
+            .unwrap_or(0)
+    }
 
-    let (code, head, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert!(!body.contains("agc_t"), "credential leaked: {body}");
-    let key = serde_json::from_str::<Value>(&body).unwrap()["session_key"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(key.len(), 64, "{body}");
-    let set = op::set_cookie(&head).unwrap();
-    assert!(
-        set.starts_with(&format!("cadence_operator_{port}=")),
-        "{set}"
-    );
-    let cookie = set.split(';').next().unwrap().to_string();
+    /// POST to a device route on the board's own name with write guards.
+    fn device_post(port: u16, host: &str, path: &str, body: &str) -> (u16, String, String) {
+        op::raw(
+            port,
+            &op::request(
+                "POST",
+                path,
+                host,
+                Some(&format!("http://{host}")),
+                None,
+                body,
+            ),
+        )
+    }
 
-    // The session is live: ending it answers 204.
-    let (code, _, _) = op::raw(
-        port,
-        &op::request(
-            "POST",
-            "/api/session/logout",
-            &host,
-            Some(&format!("http://{host}")),
-            Some(&cookie),
-            "{}",
-        ),
-    );
-    assert_eq!(code, 204);
-
-    // The grant is spent: polling again finds nothing.
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "expired", "{body}");
-}
-
-/// Denial, wrong-org approval and unknown pendings all settle without
-/// a session; malformed bodies and methods refuse loudly.
-#[test]
-fn device_grant_terminal_states_settle_without_a_session() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("deny");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let pending = |port: u16| -> String {
-        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-        assert_eq!(code, 200, "{body}");
-        serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+    /// The `status` of a poll answer body.
+    fn status_of(body: &str) -> String {
+        serde_json::from_str::<Value>(body).unwrap()["status"]
             .as_str()
             .unwrap()
             .to_string()
-    };
+    }
 
-    // Denied on second poll (first is pending), then expired.
-    let id = pending(port);
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{id}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "pending", "{body}");
-    let (code, head, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{id}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "denied", "{body}");
-    assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{id}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "expired", "{body}");
+    /// Unconfigured boards answer the device routes like unknown shapes.
+    #[test]
+    fn device_routes_are_dead_without_configuration() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+        let host = op::board_host(port);
+        for path in ["/api/session/device/code", "/api/session/device/poll"] {
+            let (code, _, body) = device_post(port, &host, path, "{}");
+            assert_eq!(code, 404, "{path}: {body}");
+        }
+        let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 404);
+    }
 
-    // Unknown and malformed pendings.
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{}"}}"#, "0".repeat(64)),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "expired", "{body}");
-    let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "{}");
-    assert_eq!(code, 400);
-    let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "not json");
-    assert_eq!(code, 400);
-    // Like `/api/session` itself, the device exchange has no GET shape.
-    let (code, _, _) = op::raw(
-        port,
-        &op::request(
+    /// The full loop: code, one pending poll, approval, session cookie +
+    /// key — and the cookie opens a live operator session. Issuer secrets
+    /// never appear in any board response.
+    #[test]
+    fn device_grant_opens_a_remote_session() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        let pending = doc["pending_id"].as_str().unwrap().to_string();
+        assert_eq!(pending.len(), 64, "{body}");
+        assert_eq!(doc["user_code"], json!("ABCD-1234"));
+        assert!(!body.contains("agd_t"), "device code leaked: {body}");
+
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "pending", "{body}");
+
+        let (code, head, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert!(!body.contains("agc_t"), "credential leaked: {body}");
+        let key = serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(key.len(), 64, "{body}");
+        let set = op::set_cookie(&head).unwrap();
+        assert!(
+            set.starts_with(&format!("cadence_operator_{port}=")),
+            "{set}"
+        );
+        let cookie = set.split(';').next().unwrap().to_string();
+
+        // A loopback device session is the OPERATOR's session: meta's
+        // actor is what a write records (`operator (ui)`), not the
+        // issuer's subject id — `held_of` attributes every non-public
+        // session the same (review r4).
+        let (code, _, body) = http_write(
+            port,
             "GET",
-            "/api/session/device/code",
+            "/api/meta",
+            &host,
+            &[
+                &format!("Cookie: {cookie}"),
+                &format!("X-Cadence-Session: {key}"),
+            ],
+            b"",
+        );
+        assert_eq!(code, 200, "{body}");
+        let meta: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(meta["signed_in"], json!(true), "{body}");
+        assert_eq!(meta["actor"], json!("operator (ui)"), "{body}");
+
+        // The session is live: ending it answers 204.
+        let (code, _, _) = op::raw(
+            port,
+            &op::request(
+                "POST",
+                "/api/session/logout",
+                &host,
+                Some(&format!("http://{host}")),
+                Some(&cookie),
+                "{}",
+            ),
+        );
+        assert_eq!(code, 204);
+
+        // The grant is spent: polling again finds nothing.
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "expired", "{body}");
+    }
+
+    /// Denial, wrong-org approval and unknown pendings all settle without
+    /// a session; malformed bodies and methods refuse loudly.
+    #[test]
+    fn device_grant_terminal_states_settle_without_a_session() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("deny");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let pending = |port: u16| -> String {
+            let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Denied on second poll (first is pending), then expired.
+        let id = pending(port);
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{id}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "pending", "{body}");
+        let (code, head, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{id}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "denied", "{body}");
+        assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{id}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "expired", "{body}");
+
+        // Unknown and malformed pendings.
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{}"}}"#, "0".repeat(64)),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "expired", "{body}");
+        let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "{}");
+        assert_eq!(code, 400);
+        let (code, _, _) = device_post(port, &host, "/api/session/device/poll", "not json");
+        assert_eq!(code, 400);
+        // Like `/api/session` itself, the device exchange has no GET shape.
+        let (code, _, _) = op::raw(
+            port,
+            &op::request(
+                "GET",
+                "/api/session/device/code",
+                &host,
+                Some(&format!("http://{host}")),
+                None,
+                "",
+            ),
+        );
+        assert_eq!(code, 404);
+    }
+
+    /// A poll from a pane child is refused and spends nothing: the pending
+    /// grant survives for the operator's own poll, which still approves.
+    #[test]
+    fn device_poll_from_a_pane_is_refused_without_side_effects() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Past pending: the stub answers pending once, then approves.
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(status_of(&body), "pending", "{code} {body}");
+
+        // The same poll from inside a pane: refused as an agent caller.
+        let req = op::request(
+            "POST",
+            "/api/session/device/poll",
             &host,
             Some(&format!("http://{host}")),
             None,
-            "",
-        ),
-    );
-    assert_eq!(code, 404);
-}
-
-/// A poll from a pane child is refused and spends nothing: the pending
-/// grant survives for the operator's own poll, which still approves.
-#[test]
-fn device_poll_from_a_pane_is_refused_without_side_effects() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // Past pending: the stub answers pending once, then approves.
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(status_of(&body), "pending", "{code} {body}");
-
-    // The same poll from inside a pane: refused as an agent caller.
-    let req = op::request(
-        "POST",
-        "/api/session/device/poll",
-        &host,
-        Some(&format!("http://{host}")),
-        None,
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    let mut pane = std::process::Command::new("bash")
-        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
-        .env(
-            "CLIENT",
-            format!(
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        let mut pane = std::process::Command::new("bash")
+            .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+            .env(
+                "CLIENT",
+                format!(
                 "exec 3<>/dev/tcp/127.0.0.1/{port}; printf '%s' \"$REQ\" >&3; timeout 10 cat <&3"
             ),
-        )
-        .env("REQ", req)
-        .env_remove("CADENCE_ALIAS")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    plant_pane(&d, "w-device", pane.id());
-    use std::io::Write as _;
-    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    let mut out = String::new();
-    use std::io::Read as _;
-    pane.stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    assert!(pane.wait().unwrap().success());
-    assert!(out.contains("403"), "{out}");
-    assert!(out.contains("session_from_agent"), "{out}");
+            )
+            .env("REQ", req)
+            .env_remove("CADENCE_ALIAS")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        plant_pane(&d, "w-device", pane.id());
+        use std::io::Write as _;
+        pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let mut out = String::new();
+        use std::io::Read as _;
+        pane.stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(pane.wait().unwrap().success());
+        assert!(out.contains("403"), "{out}");
+        assert!(out.contains("session_from_agent"), "{out}");
 
-    // The pending survived: the operator's poll still approves.
-    let (code, head, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert!(
-        serde_json::from_str::<Value>(&body).unwrap()["session_key"]
-            .as_str()
-            .is_some(),
-        "{body}"
-    );
-    assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-}
+        // The pending survived: the operator's poll still approves.
+        let (code, head, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert!(
+            serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+                .as_str()
+                .is_some(),
+            "{body}"
+        );
+        assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+    }
 
-/// Disabling device login while the board runs is refused — the live
-/// routes, the pin file and the saved options cannot drift apart.
-/// A restart without the pair clears the pin and the routes go 404.
-#[test]
-fn device_login_change_refused_while_running_cleared_on_restart() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, board) = start_device_board(pm.path(), state.path(), issuer.clone());
-    let host = op::board_host(port);
-    let pin = state.path().join("operator").join("device-login.json");
-    assert!(pin.is_file(), "serve writes the pin");
-    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200);
+    /// Disabling device login while the board runs is refused — the live
+    /// routes, the pin file and the saved options cannot drift apart.
+    /// A restart without the pair clears the pin and the routes go 404.
+    #[test]
+    fn device_login_change_refused_while_running_cleared_on_restart() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, board) = start_device_board(pm.path(), state.path(), issuer.clone());
+        let host = op::board_host(port);
+        let pin = state.path().join("operator").join("device-login.json");
+        assert!(pin.is_file(), "serve writes the pin");
+        let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200);
 
-    // A reset while running is refused; nothing changes. The fixture
-    // board never persists ui.json, so record what a real `ui start`
-    // would have saved (pair + port).
-    std::fs::write(
-        state.path().join("ui.json"),
-        serde_json::to_vec_pretty(&ui::UiOpts {
-            port: Some(port),
-            device_login: Some(ui::DeviceLoginOpts {
-                issuer: issuer.clone(),
-                org: "ws_company".to_string(),
-                subjects: vec!["op_9".to_string()],
-            }),
-            ..Default::default()
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
-    let reset = ui::UiFlags::default();
-    let err = ui::run_cli(
-        state.path(),
-        &ui::UiAction::Start {
-            flags: reset,
-            reset: true,
-        },
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("device login configuration cannot change"),
-        "{err}"
-    );
-    assert!(pin.is_file(), "refused reset keeps the pin");
-    // A subjects-only change is refused the same way — the running
-    // comparison covers the allowlist (DeviceLoginOpts !=).
-    let err = ui::run_cli(
-        state.path(),
-        &ui::UiAction::Start {
-            flags: ui::UiFlags {
-                device_login_issuer: Some(issuer.clone()),
-                device_login_org: Some("ws_company".to_string()),
-                device_login_subject: vec!["op_1".to_string()],
+        // A reset while running is refused; nothing changes. The fixture
+        // board never persists ui.json, so record what a real `ui start`
+        // would have saved (pair + port).
+        std::fs::write(
+            state.path().join("ui.json"),
+            serde_json::to_vec_pretty(&ui::UiOpts {
+                port: Some(port),
+                device_login: Some(ui::DeviceLoginOpts {
+                    issuer: issuer.clone(),
+                    org: "ws_company".to_string(),
+                    subjects: vec!["op_9".to_string()],
+                }),
                 ..Default::default()
-            },
-            reset: false,
-        },
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("device login configuration cannot change"),
-        "subjects-only change while running: {err}"
-    );
-    let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "live routes untouched by the refused reset");
-    std::fs::remove_file(state.path().join("ui.pid")).unwrap();
-    drop(board);
-
-    // Restarted without the pair: pin gone, routes dead.
-    let (port2, _board2) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
-    assert!(!pin.exists(), "restart without the pair clears the pin");
-    let host2 = op::board_host(port2);
-    let (code, _, _) = device_post(port2, &host2, "/api/session/device/code", "{}");
-    assert_eq!(code, 404);
-}
-
-/// An approval for another workspace settles with no session.
-#[test]
-fn device_grant_for_another_workspace_settles_without_a_session() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("wrongorg");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // First poll is pending; the wrong-org approval then settles expired.
-    let (code, _, _) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200);
-    let (code, head, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(status_of(&body), "expired", "{body}");
-    assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-}
-
-/// The reviewer's exploit, closed: the daemon RPC mints nothing for a
-/// forged bearer, and nothing at all without its pinned trust root.
-/// The only key that opens a session is an issuer-minted grant the
-/// live issuer verifies — verified here against the stub.
-#[test]
-fn device_daemon_rpc_needs_an_issuer_verified_bearer_and_a_pin() {
-    use cadence_agent::device_login::{write_pin, DevicePin};
-    // No pin file anywhere: fail closed before any issuer contact.
-    let lonely = TempDir::new().unwrap();
-    let _alone = UiDaemon::start_on(lonely.path().to_path_buf());
-    let err = _alone
-        .rpc_opt(
-            "operator_session_open_device",
-            json!({"token": "agc_t", "origin": "loopback"}),
+            })
+            .unwrap(),
         )
-        .unwrap_err();
-    assert_eq!(
-        err.code(),
-        Some("capability_unavailable"),
-        "unpinned daemon minted or misreported: {err}"
-    );
-
-    // Pinned daemon, forged bearer: the stub answers 401, no session.
-    let state = TempDir::new().unwrap();
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    write_pin(
-        state.path(),
-        &DevicePin {
-            issuer: issuer.clone(),
-            org: "ws_company".to_string(),
-            subjects: vec!["op_9".to_string()],
-        },
-    )
-    .unwrap();
-    let err = _d
-        .rpc_opt(
-            "operator_session_open_device",
-            json!({"token": "agc_forged", "origin": "loopback"}),
+        .unwrap();
+        std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
+        let reset = ui::UiFlags::default();
+        let err = ui::run_cli(
+            state.path(),
+            &ui::UiAction::Start {
+                flags: reset,
+                reset: true,
+            },
         )
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("rejected") || err.contains("Issuer rejected"),
-        "forged bearer minted or misreported: {err}"
-    );
-    // Positive control: the stub-verified grant mints (the test
-    // process is no agent). Proves the gate is bearer possession +
-    // live issuer verification, not field assertion.
-    let opened = _d
-        .rpc_opt(
-            "operator_session_open_device",
-            json!({"token": "agc_t", "origin": "loopback"}),
-        )
-        .unwrap();
-    assert_eq!(opened["session"]["origin"], json!("loopback"));
-    assert!(opened["token"].as_str().is_some_and(|t| t.len() == 64));
-}
-
-// --- adversarial gate proofs (review of #541) ---
-//
-// Each test below names the guard it pins; each was run against the
-// tree with that guard removed and failed — the failure logs are in
-// the PR thread.
-
-/// The daemon's events of `kind` on its own stream, read-only.
-fn device_daemon_events(state: &Path, kind: &str) -> Vec<Value> {
-    let conn = rusqlite::Connection::open_with_flags(
-        state.join("cadence.sqlite3"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let mut stmt = conn
-        .prepare("SELECT payload FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq")
-        .unwrap();
-    let rows = stmt
-        .query_map(rusqlite::params![Store::DAEMON_STREAM, kind], |r| {
-            r.get::<_, String>(0)
-        })
-        .unwrap();
-    rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap())
-        .collect()
-}
-
-/// A daemon on `state` with the device pin written for `subjects`.
-fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> UiDaemon {
-    use cadence_agent::device_login::{write_pin, DevicePin};
-    let d = UiDaemon::start_on(state.to_path_buf());
-    write_pin(
-        state,
-        &DevicePin {
-            issuer: issuer.to_string(),
-            org: "ws_company".to_string(),
-            subjects: subjects.iter().map(|s| s.to_string()).collect(),
-        },
-    )
-    .unwrap();
-    d
-}
-
-/// Run `probe` as a child of a pane planted for `alias` under `d`;
-/// `detached` wraps it in `setsid` (new session, same /proc ancestry —
-/// a double fork that reparents away is a systemic ancestry limit this
-/// test does not claim to cover). `envs` feed the probe. Returns the
-/// JSON the probe landed at its `CADENCE_PROBE_OUT`.
-fn pane_probe(d: &UiDaemon, alias: &str, detached: bool, envs: &[(&str, String)]) -> Value {
-    let exe = std::env::current_exe().unwrap();
-    let mut probe = format!("{} --exact device_gate_probe --nocapture", exe.display());
-    if detached {
-        // `setsid` (no --fork) detaches the child's session while
-        // keeping its parent — the ancestry the gate walks is intact.
-        probe = format!("setsid {probe}");
-    }
-    let mut pane = std::process::Command::new("bash")
-        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
-        .env("CLIENT", probe)
-        .env_remove("CADENCE_ALIAS")
-        .envs(envs.iter().map(|(k, v)| (k.to_string(), v.clone())))
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    plant_pane(d, alias, pane.id());
-    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    let out = envs
-        .iter()
-        .find(|(k, _)| *k == "CADENCE_PROBE_OUT")
-        .map(|(_, v)| v.clone())
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !Path::new(&out).exists() {
         assert!(
-            std::time::Instant::now() < deadline,
-            "probe never answered at {out}"
+            err.contains("device login configuration cannot change"),
+            "{err}"
         );
-        thread::sleep(Duration::from_millis(25));
-    }
-    let answer: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    let _ = pane.wait();
-    answer
-}
+        assert!(pin.is_file(), "refused reset keeps the pin");
+        // A subjects-only change is refused the same way — the running
+        // comparison covers the allowlist (DeviceLoginOpts !=).
+        let err = ui::run_cli(
+            state.path(),
+            &ui::UiAction::Start {
+                flags: ui::UiFlags {
+                    device_login_issuer: Some(issuer.clone()),
+                    device_login_org: Some("ws_company".to_string()),
+                    device_login_subject: vec!["op_1".to_string()],
+                    ..Default::default()
+                },
+                reset: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("device login configuration cannot change"),
+            "subjects-only change while running: {err}"
+        );
+        let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "live routes untouched by the refused reset");
+        std::fs::remove_file(state.path().join("ui.pid")).unwrap();
+        drop(board);
 
-/// The gate-probe half of this binary: a no-op in the suite, a live
-/// caller only when a pane child re-execs it with `CADENCE_PROBE_*`.
-/// `rpc` calls `operator_session_open_device` on `CADENCE_PROBE_STATE`'s
-/// daemon; `poll` posts the device poll to `CADENCE_PROBE_PORT` and
-/// lands `{status, headers, body}` at `CADENCE_PROBE_OUT`.
-#[test]
-fn device_gate_probe() {
-    let Ok(kind) = std::env::var("CADENCE_PROBE_KIND") else {
-        return;
-    };
-    let out = std::env::var("CADENCE_PROBE_OUT").unwrap();
-    let answer = match kind.as_str() {
-        "rpc" => {
-            let state = std::env::var("CADENCE_PROBE_STATE").unwrap();
-            match cadence_agent::client::rpc(
-                Path::new(&state),
+        // Restarted without the pair: pin gone, routes dead.
+        let (port2, _board2) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+        assert!(!pin.exists(), "restart without the pair clears the pin");
+        let host2 = op::board_host(port2);
+        let (code, _, _) = device_post(port2, &host2, "/api/session/device/code", "{}");
+        assert_eq!(code, 404);
+    }
+
+    /// An approval for another workspace settles with no session.
+    #[test]
+    fn device_grant_for_another_workspace_settles_without_a_session() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("wrongorg");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // First poll is pending; the wrong-org approval then settles expired.
+        let (code, _, _) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200);
+        let (code, head, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "expired", "{body}");
+        assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+    }
+
+    /// The reviewer's exploit, closed: the daemon RPC mints nothing for a
+    /// forged bearer, and nothing at all without its pinned trust root.
+    /// The only key that opens a session is an issuer-minted grant the
+    /// live issuer verifies — verified here against the stub.
+    #[test]
+    fn device_daemon_rpc_needs_an_issuer_verified_bearer_and_a_pin() {
+        use cadence_agent::device_login::{write_pin, DevicePin};
+        // No pin file anywhere: fail closed before any issuer contact.
+        let lonely = TempDir::new().unwrap();
+        let _alone = UiDaemon::start_on(lonely.path().to_path_buf());
+        let err = _alone
+            .rpc_opt(
                 "operator_session_open_device",
                 json!({"token": "agc_t", "origin": "loopback"}),
-            ) {
-                Ok(v) => json!({"ok": true, "text": v.to_string()}),
-                Err(e) => json!({"ok": false, "text": e.to_string()}),
-            }
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("capability_unavailable"),
+            "unpinned daemon minted or misreported: {err}"
+        );
+
+        // Pinned daemon, forged bearer: the stub answers 401, no session.
+        let state = TempDir::new().unwrap();
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        write_pin(
+            state.path(),
+            &DevicePin {
+                issuer: issuer.clone(),
+                org: "ws_company".to_string(),
+                subjects: vec!["op_9".to_string()],
+            },
+        )
+        .unwrap();
+        let err = _d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({"token": "agc_forged", "origin": "loopback"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rejected") || err.contains("Issuer rejected"),
+            "forged bearer minted or misreported: {err}"
+        );
+        // Positive control: the stub-verified grant mints (the test
+        // process is no agent). Proves the gate is bearer possession +
+        // live issuer verification, not field assertion.
+        let opened = _d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+            .unwrap();
+        assert_eq!(opened["session"]["origin"], json!("loopback"));
+        assert!(opened["token"].as_str().is_some_and(|t| t.len() == 64));
+    }
+
+    // --- adversarial gate proofs (review of #541) ---
+    //
+    // Each test below names the guard it pins; each was run against the
+    // tree with that guard removed and failed — the failure logs are in
+    // the PR thread.
+
+    /// The daemon's events of `kind` on its own stream, read-only.
+    fn device_daemon_events(state: &Path, kind: &str) -> Vec<Value> {
+        let conn = rusqlite::Connection::open_with_flags(
+            state.join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![Store::DAEMON_STREAM, kind], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// A daemon on `state` with the device pin written for `subjects`.
+    fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> UiDaemon {
+        use cadence_agent::device_login::{write_pin, DevicePin};
+        let d = UiDaemon::start_on(state.to_path_buf());
+        write_pin(
+            state,
+            &DevicePin {
+                issuer: issuer.to_string(),
+                org: "ws_company".to_string(),
+                subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            },
+        )
+        .unwrap();
+        d
+    }
+
+    /// Run `probe` as a child of a pane planted for `alias` under `d`;
+    /// `detached` wraps it in `setsid` (new session, same /proc ancestry —
+    /// a double fork that reparents away is a systemic ancestry limit this
+    /// test does not claim to cover). `envs` feed the probe. Returns the
+    /// JSON the probe landed at its `CADENCE_PROBE_OUT`.
+    fn pane_probe(d: &UiDaemon, alias: &str, detached: bool, envs: &[(&str, String)]) -> Value {
+        let exe = std::env::current_exe().unwrap();
+        let mut probe = format!(
+            "{} --exact device::device_gate_probe --nocapture",
+            exe.display()
+        );
+        if detached {
+            // `setsid` (no --fork) detaches the child's session while
+            // keeping its parent — the ancestry the gate walks is intact.
+            probe = format!("setsid {probe}");
         }
-        "poll" => {
-            let port: u16 = std::env::var("CADENCE_PROBE_PORT")
+        let mut pane = std::process::Command::new("bash")
+            .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+            .env("CLIENT", probe)
+            .env_remove("CADENCE_ALIAS")
+            .envs(envs.iter().map(|(k, v)| (k.to_string(), v.clone())))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        plant_pane(d, alias, pane.id());
+        pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let out = envs
+            .iter()
+            .find(|(k, _)| *k == "CADENCE_PROBE_OUT")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !Path::new(&out).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe never answered at {out}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let answer: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let _ = pane.wait();
+        answer
+    }
+
+    /// The gate-probe half of this binary: a no-op in the suite, a live
+    /// caller only when a pane child re-execs it with `CADENCE_PROBE_*`.
+    /// `rpc` calls `operator_session_open_device` on `CADENCE_PROBE_STATE`'s
+    /// daemon; `poll` posts the device poll to `CADENCE_PROBE_PORT` and
+    /// lands `{status, headers, body}` at `CADENCE_PROBE_OUT`.
+    #[test]
+    fn device_gate_probe() {
+        let Ok(kind) = std::env::var("CADENCE_PROBE_KIND") else {
+            return;
+        };
+        let out = std::env::var("CADENCE_PROBE_OUT").unwrap();
+        let answer = match kind.as_str() {
+            "rpc" => {
+                let state = std::env::var("CADENCE_PROBE_STATE").unwrap();
+                match cadence_agent::client::rpc(
+                    Path::new(&state),
+                    "operator_session_open_device",
+                    json!({"token": "agc_t", "origin": "loopback"}),
+                ) {
+                    Ok(v) => json!({"ok": true, "text": v.to_string()}),
+                    Err(e) => json!({"ok": false, "text": e.to_string()}),
+                }
+            }
+            "poll" => {
+                let port: u16 = std::env::var("CADENCE_PROBE_PORT")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let host = std::env::var("CADENCE_PROBE_HOST").unwrap();
+                let pending = std::env::var("CADENCE_PROBE_PENDING").unwrap();
+                let (status, headers, body) = device_post(
+                    port,
+                    &host,
+                    "/api/session/device/poll",
+                    &format!(r#"{{"pending_id":"{pending}"}}"#),
+                );
+                json!({"status": status, "headers": headers, "body": body})
+            }
+            other => json!({"ok": false, "text": format!("unknown probe kind {other}")}),
+        };
+        std::fs::write(format!("{out}.tmp"), answer.to_string()).unwrap();
+        std::fs::rename(format!("{out}.tmp"), &out).unwrap();
+    }
+
+    /// The RPC's `slot_identity` gate: an agent pane's child presenting a
+    /// stub-valid grant is refused before any issuer contact — no
+    /// `/v1/runtime/session` hit, no session row.
+    #[test]
+    fn device_rpc_from_a_pane_is_refused_before_issuer_contact() {
+        let state = TempDir::new().unwrap();
+        let (issuer, stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let out_file = state.path().join("probe-out.json");
+        let answer = pane_probe(
+            &d,
+            "w-device",
+            false,
+            &[
+                ("CADENCE_PROBE_KIND", "rpc".to_string()),
+                ("CADENCE_PROBE_STATE", state.path().display().to_string()),
+                ("CADENCE_PROBE_OUT", out_file.display().to_string()),
+            ],
+        );
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        assert!(
+            answer["text"].as_str().unwrap().contains("agent"),
+            "{answer}"
+        );
+        assert_eq!(
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refused pane caller reached the issuer"
+        );
+        assert_eq!(device_session_count(state.path()), 0);
+    }
+
+    /// Same gate, from a `setsid` child of the pane: a new session is no
+    /// escape — the /proc ancestry still names the pane.
+    #[test]
+    fn device_rpc_from_a_detached_child_is_refused() {
+        let state = TempDir::new().unwrap();
+        let (issuer, stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let out_file = state.path().join("probe-out.json");
+        let answer = pane_probe(
+            &d,
+            "w-device",
+            true,
+            &[
+                ("CADENCE_PROBE_KIND", "rpc".to_string()),
+                ("CADENCE_PROBE_STATE", state.path().display().to_string()),
+                ("CADENCE_PROBE_OUT", out_file.display().to_string()),
+            ],
+        );
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        assert!(
+            answer["text"].as_str().unwrap().contains("agent"),
+            "{answer}"
+        );
+        assert_eq!(
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refused detached caller reached the issuer"
+        );
+        assert_eq!(device_session_count(state.path()), 0);
+    }
+
+    /// The HTTP twin: a detached pane child polling spends nothing — the
+    /// pending grant survives for the operator's own poll.
+    #[test]
+    fn device_poll_from_a_detached_child_is_refused_and_spares_the_grant() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out_file = state.path().join("probe-out.json");
+        let answer = pane_probe(
+            &d,
+            "w-device",
+            true,
+            &[
+                ("CADENCE_PROBE_KIND", "poll".to_string()),
+                ("CADENCE_PROBE_PORT", port.to_string()),
+                ("CADENCE_PROBE_HOST", host.clone()),
+                ("CADENCE_PROBE_PENDING", pending.clone()),
+                ("CADENCE_PROBE_OUT", out_file.display().to_string()),
+            ],
+        );
+        assert_eq!(answer["status"], json!(403), "{answer}");
+        assert!(
+            answer["body"]
+                .as_str()
                 .unwrap()
-                .parse()
-                .unwrap();
-            let host = std::env::var("CADENCE_PROBE_HOST").unwrap();
-            let pending = std::env::var("CADENCE_PROBE_PENDING").unwrap();
-            let (status, headers, body) = device_post(
+                .contains("session_from_agent"),
+            "{answer}"
+        );
+        assert!(
+            !answer["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("set-cookie"),
+            "{answer}"
+        );
+
+        // The pending survived: the operator's own poll still approves.
+        let mut minted = None;
+        for _ in 0..3 {
+            let (code, head, body) = device_post(
                 port,
                 &host,
                 "/api/session/device/poll",
                 &format!(r#"{{"pending_id":"{pending}"}}"#),
             );
-            json!({"status": status, "headers": headers, "body": body})
+            assert_eq!(code, 200, "{body}");
+            if serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+                .as_str()
+                .is_some()
+            {
+                assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+                minted = Some(());
+                break;
+            }
         }
-        other => json!({"ok": false, "text": format!("unknown probe kind {other}")}),
-    };
-    std::fs::write(format!("{out}.tmp"), answer.to_string()).unwrap();
-    std::fs::rename(format!("{out}.tmp"), &out).unwrap();
-}
+        assert!(minted.is_some(), "operator poll never minted");
+    }
 
-/// The RPC's `slot_identity` gate: an agent pane's child presenting a
-/// stub-valid grant is refused before any issuer contact — no
-/// `/v1/runtime/session` hit, no session row.
-#[test]
-fn device_rpc_from_a_pane_is_refused_before_issuer_contact() {
-    let state = TempDir::new().unwrap();
-    let (issuer, stub) = device_stub("approve");
-    let d = device_daemon(state.path(), &issuer, &["op_9"]);
-    let out_file = state.path().join("probe-out.json");
-    let answer = pane_probe(
-        &d,
-        "w-device",
-        false,
-        &[
-            ("CADENCE_PROBE_KIND", "rpc".to_string()),
-            ("CADENCE_PROBE_STATE", state.path().display().to_string()),
-            ("CADENCE_PROBE_OUT", out_file.display().to_string()),
-        ],
-    );
-    assert_eq!(answer["ok"], json!(false), "{answer}");
-    assert!(
-        answer["text"].as_str().unwrap().contains("agent"),
-        "{answer}"
-    );
-    assert_eq!(
-        stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "refused pane caller reached the issuer"
-    );
-    assert_eq!(device_session_count(state.path()), 0);
-}
-
-/// Same gate, from a `setsid` child of the pane: a new session is no
-/// escape — the /proc ancestry still names the pane.
-#[test]
-fn device_rpc_from_a_detached_child_is_refused() {
-    let state = TempDir::new().unwrap();
-    let (issuer, stub) = device_stub("approve");
-    let d = device_daemon(state.path(), &issuer, &["op_9"]);
-    let out_file = state.path().join("probe-out.json");
-    let answer = pane_probe(
-        &d,
-        "w-device",
-        true,
-        &[
-            ("CADENCE_PROBE_KIND", "rpc".to_string()),
-            ("CADENCE_PROBE_STATE", state.path().display().to_string()),
-            ("CADENCE_PROBE_OUT", out_file.display().to_string()),
-        ],
-    );
-    assert_eq!(answer["ok"], json!(false), "{answer}");
-    assert!(
-        answer["text"].as_str().unwrap().contains("agent"),
-        "{answer}"
-    );
-    assert_eq!(
-        stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "refused detached caller reached the issuer"
-    );
-    assert_eq!(device_session_count(state.path()), 0);
-}
-
-/// The HTTP twin: a detached pane child polling spends nothing — the
-/// pending grant survives for the operator's own poll.
-#[test]
-fn device_poll_from_a_detached_child_is_refused_and_spares_the_grant() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let out_file = state.path().join("probe-out.json");
-    let answer = pane_probe(
-        &d,
-        "w-device",
-        true,
-        &[
-            ("CADENCE_PROBE_KIND", "poll".to_string()),
-            ("CADENCE_PROBE_PORT", port.to_string()),
-            ("CADENCE_PROBE_HOST", host.clone()),
-            ("CADENCE_PROBE_PENDING", pending.clone()),
-            ("CADENCE_PROBE_OUT", out_file.display().to_string()),
-        ],
-    );
-    assert_eq!(answer["status"], json!(403), "{answer}");
-    assert!(
-        answer["body"]
+    /// The pending `remove` under the lock is what makes one approved id
+    /// mint at most once: 8 racing polls see exactly one session.
+    #[test]
+    fn device_poll_mints_exactly_once_under_concurrent_polls() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
             .as_str()
             .unwrap()
-            .contains("session_from_agent"),
-        "{answer}"
-    );
-    assert!(
-        !answer["headers"]
-            .as_str()
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("set-cookie"),
-        "{answer}"
-    );
-
-    // The pending survived: the operator's own poll still approves.
-    let mut minted = None;
-    for _ in 0..3 {
-        let (code, head, body) = device_post(
+            .to_string();
+        // Past `pending`: the next exchange approves.
+        let (code, _, body) = device_post(
             port,
             &host,
             "/api/session/device/poll",
             &format!(r#"{{"pending_id":"{pending}"}}"#),
         );
-        assert_eq!(code, 200, "{body}");
-        if serde_json::from_str::<Value>(&body).unwrap()["session_key"]
-            .as_str()
-            .is_some()
-        {
-            assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-            minted = Some(());
-            break;
+        assert_eq!(status_of(&body), "pending", "{code} {body}");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let host = host.clone();
+            let pending = pending.clone();
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                device_post(
+                    port,
+                    &host,
+                    "/api/session/device/poll",
+                    &format!(r#"{{"pending_id":"{pending}"}}"#),
+                )
+            }));
         }
+        let mut minted = 0;
+        let mut expired = 0;
+        for join in joins {
+            let (code, head, body) = join.join().unwrap();
+            assert_eq!(code, 200, "{body}");
+            if serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+                .as_str()
+                .is_some()
+            {
+                minted += 1;
+                assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+            } else {
+                assert_eq!(status_of(&body), "expired", "{body}");
+                assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+                expired += 1;
+            }
+        }
+        assert_eq!((minted, expired), (1, 7), "one pending id mints once");
+        assert_eq!(device_session_count(state.path()), 1);
     }
-    assert!(minted.is_some(), "operator poll never minted");
-}
 
-/// The pending `remove` under the lock is what makes one approved id
-/// mint at most once: 8 racing polls see exactly one session.
-#[test]
-fn device_poll_mints_exactly_once_under_concurrent_polls() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // Past `pending`: the next exchange approves.
-    let (code, _, body) = device_post(
-        port,
-        &host,
-        "/api/session/device/poll",
-        &format!(r#"{{"pending_id":"{pending}"}}"#),
-    );
-    assert_eq!(status_of(&body), "pending", "{code} {body}");
+    /// Forged identity fields buy nothing: the minted session's user is
+    /// the issuer-verified subject, never a request field.
+    #[test]
+    fn device_rpc_mints_the_issuers_subject_not_forged_fields() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let opened = d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({
+                    "token": "agc_t",
+                    "origin": "loopback",
+                    "sub": "attacker_1",
+                    "subject": "attacker_1",
+                    "role": "owner",
+                    "org": "ws_other",
+                    "issuer": "https://attacker.example"
+                }),
+            )
+            .unwrap();
+        assert_eq!(opened["session"]["user"]["sub"], json!("op_9"));
+        assert_eq!(opened["session"]["user"]["role"], json!("operator"));
+    }
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-    let mut joins = Vec::new();
-    for _ in 0..8 {
-        let barrier = barrier.clone();
-        let host = host.clone();
-        let pending = pending.clone();
-        joins.push(thread::spawn(move || {
-            barrier.wait();
-            device_post(
+    /// The allowlist is the gate: a verified subject off it is refused at
+    /// the RPC (`device_subject_not_allowed`, no session, a loud event)
+    /// and at the HTTP poll (403, no cookie).
+    #[test]
+    fn device_subject_off_the_allowlist_is_refused() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        // The pin the board writes at serve carries `op_1` — the stub's
+        // approved subject `op_9` is verified but not allowed.
+        let (port, _board) = start_device_board_for(
+            pm.path(),
+            state.path(),
+            issuer.clone(),
+            vec!["op_1".to_string()],
+        );
+        let host = op::board_host(port);
+
+        let err = d
+            .rpc_opt(
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("device_subject_not_allowed"),
+            "allowlist refusal misreported: {err}"
+        );
+        assert!(err.to_string().contains("op_9"), "{err}");
+        let refused = device_daemon_events(state.path(), "operator_device_session_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["subject"], json!("op_9"));
+        assert_eq!(device_session_count(state.path()), 0);
+
+        // The HTTP path maps the same refusal to 403 — no cookie.
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut refused_http = None;
+        for _ in 0..3 {
+            let (code, head, body) = device_post(
                 port,
                 &host,
                 "/api/session/device/poll",
                 &format!(r#"{{"pending_id":"{pending}"}}"#),
-            )
-        }));
-    }
-    let mut minted = 0;
-    let mut expired = 0;
-    for join in joins {
-        let (code, head, body) = join.join().unwrap();
-        assert_eq!(code, 200, "{body}");
-        if serde_json::from_str::<Value>(&body).unwrap()["session_key"]
-            .as_str()
-            .is_some()
-        {
-            minted += 1;
-            assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-        } else {
-            assert_eq!(status_of(&body), "expired", "{body}");
-            assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-            expired += 1;
+            );
+            if code == 403 {
+                refused_http = Some((head, body));
+                break;
+            }
+            assert_eq!(code, 200, "{body}");
         }
+        let (head, body) = refused_http.expect("poll never refused");
+        assert!(body.contains("device_subject_not_allowed"), "{body}");
+        assert!(body.contains("op_9"), "{body}");
+        assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
+        assert_eq!(device_session_count(state.path()), 0);
     }
-    assert_eq!((minted, expired), (1, 7), "one pending id mints once");
-    assert_eq!(device_session_count(state.path()), 1);
-}
 
-/// Forged identity fields buy nothing: the minted session's user is
-/// the issuer-verified subject, never a request field.
-#[test]
-fn device_rpc_mints_the_issuers_subject_not_forged_fields() {
-    let state = TempDir::new().unwrap();
-    let (issuer, _stub) = device_stub("approve");
-    let d = device_daemon(state.path(), &issuer, &["op_9"]);
-    let opened = d
-        .rpc_opt(
-            "operator_session_open_device",
-            json!({
-                "token": "agc_t",
-                "origin": "loopback",
-                "sub": "attacker_1",
-                "subject": "attacker_1",
-                "role": "owner",
-                "org": "ws_other",
-                "issuer": "https://attacker.example"
-            }),
-        )
-        .unwrap();
-    assert_eq!(opened["session"]["user"]["sub"], json!("op_9"));
-    assert_eq!(opened["session"]["user"]["role"], json!("operator"));
-}
+    /// `/api/session/device/code` is exempt from the board-wide write
+    /// lock: a slow issuer (3 s on the stub's code answer) must not stall
+    /// an unrelated write. `/api/session/logout` posts through WRITE_LOCK,
+    /// so it is the probe — it must answer well before the issuer does.
+    #[test]
+    fn device_code_does_not_stall_unrelated_writes() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("slow_code");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
 
-/// The allowlist is the gate: a verified subject off it is refused at
-/// the RPC (`device_subject_not_allowed`, no session, a loud event)
-/// and at the HTTP poll (403, no cookie).
-#[test]
-fn device_subject_off_the_allowlist_is_refused() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    // The pin the board writes at serve carries `op_1` — the stub's
-    // approved subject `op_9` is verified but not allowed.
-    let (port, _board) = start_device_board_for(
-        pm.path(),
-        state.path(),
-        issuer.clone(),
-        vec!["op_1".to_string()],
-    );
-    let host = op::board_host(port);
+        let code_thread = {
+            let host = host.clone();
+            thread::spawn(move || device_post(port, &host, "/api/session/device/code", "{}"))
+        };
+        // Let the /code request reach the issuer and start its sleep.
+        thread::sleep(Duration::from_millis(300));
+        let began = std::time::Instant::now();
+        let (code, _, _body) = device_post(port, &host, "/api/session/logout", "{}");
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "unrelated write stalled behind the issuer call: {elapsed:?}"
+        );
+        // The logout answer is a refusal or a no-op — either way it did
+        // not wait for the issuer.
+        assert!(code == 204 || code / 100 == 4, "{code}");
+        let (code, _, body) = code_thread.join().unwrap();
+        assert_eq!(code, 200, "{body}");
+    }
 
-    let err = d
-        .rpc_opt(
-            "operator_session_open_device",
-            json!({"token": "agc_t", "origin": "loopback"}),
-        )
-        .unwrap_err();
-    assert_eq!(
-        err.code(),
-        Some("device_subject_not_allowed"),
-        "allowlist refusal misreported: {err}"
-    );
-    assert!(err.to_string().contains("op_9"), "{err}");
-    let refused = device_daemon_events(state.path(), "operator_device_session_refused");
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!(refused[0]["subject"], json!("op_9"));
-    assert_eq!(device_session_count(state.path()), 0);
+    /// `/api/meta` advertises device sign-in on a configured board's
+    /// loopback surface only — false when unconfigured.
+    #[test]
+    fn device_meta_advertises_sign_in_only_when_configured() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+        let (code, body) = http(port, "GET", "/api/meta", &host);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["device_login"],
+            json!(true),
+            "{body}"
+        );
 
-    // The HTTP path maps the same refusal to 403 — no cookie.
-    let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
-    assert_eq!(code, 200, "{body}");
-    let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let mut refused_http = None;
-    for _ in 0..3 {
-        let (code, head, body) = device_post(
-            port,
+        let pm2 = TempDir::new().unwrap();
+        let state2 = TempDir::new().unwrap();
+        seed(pm2.path(), state2.path());
+        let _d2 = UiDaemon::start_on(state2.path().to_path_buf());
+        let (port2, _board2) = start_ui(pm2.path().to_path_buf(), state2.path().to_path_buf());
+        let host2 = op::board_host(port2);
+        let (code, body) = http(port2, "GET", "/api/meta", &host2);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["device_login"],
+            json!(false),
+            "{body}"
+        );
+    }
+
+    /// A second foreground `ui run` against the same state dir must not
+    /// touch the daemon's device trust pin while a board is live — the
+    /// serving board holds `device-login.lock` for its lifetime, so a
+    /// run on ANY free port can neither re-point nor clear the pin, and
+    /// a run that loses the bind touches nothing (reviews r3/r4).
+    #[test]
+    fn device_pin_survives_a_second_ui_run_while_a_board_is_live() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        let pin = state.path().join("operator").join("device-login.json");
+
+        // Board one: a real `ui run` on a thread — no ui.pid anywhere,
+        // exactly the foreground case the pid-file guard could not see.
+        let port1 = free_port();
+        let first_state = state.path().to_path_buf();
+        let first_flags = ui::UiFlags {
+            port: Some(port1),
+            device_login_issuer: Some(issuer.clone()),
+            device_login_org: Some("ws_company".into()),
+            device_login_subject: vec!["op_9".into()],
+            ..Default::default()
+        };
+        thread::spawn(move || {
+            let _ = ui::run_cli(&first_state, &ui::UiAction::Run { flags: first_flags });
+        });
+        let host = op::board_host(port1);
+        // Bound port = serving: probe the socket, never a request that
+        // could refuse mid-start.
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port1)).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(http(port1, "GET", "/api/health", &host).0, 200);
+        let before = std::fs::read(&pin).unwrap();
+
+        // A run's answer: Err on a refusal; a run that starts SERVING
+        // never answers — detected as a timeout, which is failure either
+        // way for the refuse cases.
+        let run = |flags: ui::UiFlags| -> bool {
+            let state = state.path().to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(ui::run_cli(&state, &ui::UiAction::Run { flags }));
+            });
+            matches!(rx.recv_timeout(Duration::from_secs(10)), Ok(Err(_)))
+        };
+
+        // (i) re-pointing flags on a FREE port: refused by the held lock.
+        let errored = run(ui::UiFlags {
+            port: Some(free_port()),
+            device_login_issuer: Some("http://127.0.0.1:1".into()),
+            device_login_org: Some("ws_company".into()),
+            device_login_subject: vec!["op_evil".into()],
+            ..Default::default()
+        });
+        assert!(
+            errored,
+            "a second `ui run` with device login must refuse while a board owns the pin"
+        );
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            before,
+            "re-pointing run rewrote the pin"
+        );
+
+        // The live board still mints: its poll flow is untouched.
+        let (code, _, body) = device_post(port1, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending_id = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (code, _, body) = device_post(
+            port1,
             &host,
             "/api/session/device/poll",
-            &format!(r#"{{"pending_id":"{pending}"}}"#),
+            &format!(r#"{{"pending_id": "{pending_id}"}}"#),
         );
-        if code == 403 {
-            refused_http = Some((head, body));
-            break;
-        }
         assert_eq!(code, 200, "{body}");
-    }
-    let (head, body) = refused_http.expect("poll never refused");
-    assert!(body.contains("device_subject_not_allowed"), "{body}");
-    assert!(body.contains("op_9"), "{body}");
-    assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
-    assert_eq!(device_session_count(state.path()), 0);
-}
+        // pending then approve — second poll mints.
+        let mut minted = serde_json::from_str::<Value>(&body).unwrap()["session_key"].is_string();
+        if !minted {
+            let (code, _, body) = device_post(
+                port1,
+                &host,
+                "/api/session/device/poll",
+                &format!(r#"{{"pending_id": "{pending_id}"}}"#),
+            );
+            assert_eq!(code, 200, "{body}");
+            minted = serde_json::from_str::<Value>(&body).unwrap()["session_key"].is_string();
+        }
+        assert!(minted, "the first board's poll must still mint");
 
-/// `/api/session/device/code` is exempt from the board-wide write
-/// lock: a slow issuer (3 s on the stub's code answer) must not stall
-/// an unrelated write. `/api/session/logout` posts through WRITE_LOCK,
-/// so it is the probe — it must answer well before the issuer does.
-#[test]
-fn device_code_does_not_stall_unrelated_writes() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("slow_code");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-
-    let code_thread = {
-        let host = host.clone();
-        thread::spawn(move || device_post(port, &host, "/api/session/device/code", "{}"))
-    };
-    // Let the /code request reach the issuer and start its sleep.
-    thread::sleep(Duration::from_millis(300));
-    let began = std::time::Instant::now();
-    let (code, _, _body) = device_post(port, &host, "/api/session/logout", "{}");
-    let elapsed = began.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "unrelated write stalled behind the issuer call: {elapsed:?}"
-    );
-    // The logout answer is a refusal or a no-op — either way it did
-    // not wait for the issuer.
-    assert!(code == 204 || code / 100 == 4, "{code}");
-    let (code, _, body) = code_thread.join().unwrap();
-    assert_eq!(code, 200, "{body}");
-}
-
-/// `/api/meta` advertises device sign-in on a configured board's
-/// loopback surface only — false when unconfigured.
-#[test]
-fn device_meta_advertises_sign_in_only_when_configured() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let host = op::board_host(port);
-    let (code, body) = http(port, "GET", "/api/meta", &host);
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(
-        serde_json::from_str::<Value>(&body).unwrap()["device_login"],
-        json!(true),
-        "{body}"
-    );
-
-    let pm2 = TempDir::new().unwrap();
-    let state2 = TempDir::new().unwrap();
-    seed(pm2.path(), state2.path());
-    let _d2 = UiDaemon::start_on(state2.path().to_path_buf());
-    let (port2, _board2) = start_ui(pm2.path().to_path_buf(), state2.path().to_path_buf());
-    let host2 = op::board_host(port2);
-    let (code, body) = http(port2, "GET", "/api/meta", &host2);
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(
-        serde_json::from_str::<Value>(&body).unwrap()["device_login"],
-        json!(false),
-        "{body}"
-    );
-}
-
-/// A second `ui run` against the same state dir must not touch the
-/// daemon's device trust pin while a board is live: bare flags would
-/// clear it, re-pointing flags would replace it, and a run that loses
-/// the bind must not leave a re-pointed pin behind (review r3).
-#[test]
-fn device_pin_survives_a_second_ui_run_while_a_board_is_live() {
-    let pm = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    seed(pm.path(), state.path());
-    let _d = UiDaemon::start_on(state.path().to_path_buf());
-    let (issuer, _stub) = device_stub("approve");
-    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
-    let pin = state.path().join("operator").join("device-login.json");
-    let before = std::fs::read(&pin).unwrap();
-
-    // ui.pid naming a live process that is NOT this one stands in for
-    // a foreign board (a detached `ui start` server).
-    let mut foreign = Command::new("sleep").arg("300").spawn().unwrap();
-    std::fs::write(state.path().join("ui.pid"), foreign.id().to_string()).unwrap();
-
-    // run_cli answers Err quickly on a refusal; if the refusal is lost
-    // the run SERVES instead — the channel never answers, which is a
-    // failure either way.
-    let run = |flags: ui::UiFlags| -> bool {
-        let state = state.path().to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(ui::run_cli(&state, &ui::UiAction::Run { flags }));
+        // (ii) no device flags: a second board on another state dir-free
+        // port is allowed to serve — it just may not clear the pin.
+        let port2 = free_port();
+        let second_state = state.path().to_path_buf();
+        let second = thread::spawn(move || {
+            let _ = ui::run_cli(
+                &second_state,
+                &ui::UiAction::Run {
+                    flags: ui::UiFlags {
+                        port: Some(port2),
+                        ..Default::default()
+                    },
+                },
+            );
         });
-        matches!(rx.recv_timeout(Duration::from_secs(10)), Ok(Err(_)))
-    };
+        let host2 = op::board_host(port2);
+        let mut up = false;
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port2)).is_ok() {
+                up = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(up, "an unconfigured second board may serve");
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            before,
+            "an unconfigured board cleared the pin"
+        );
+        // Its device routes stay dead while it holds no config.
+        let (code, _, body) = device_post(port2, &host2, "/api/session/device/code", "{}");
+        assert_eq!(code, 404, "{body}");
+        drop(second); // a serve thread outlives the test, like every fixture board
 
-    // (i) bare flags — no ui.json, so device login resolves off and
-    // would clear the pin.
-    let errored = run(ui::UiFlags {
-        port: Some(free_port()),
-        ..Default::default()
-    });
-    assert!(
-        errored,
-        "a second `ui run` must refuse while a board owns the state dir"
-    );
-    assert_eq!(
-        std::fs::read(&pin).unwrap(),
-        before,
-        "bare run rewrote the pin"
-    );
-
-    // (ii) re-pointing flags — would replace the pin.
-    let errored = run(ui::UiFlags {
-        port: Some(free_port()),
-        device_login_issuer: Some("http://127.0.0.1:1".into()),
-        device_login_org: Some("ws_company".into()),
-        device_login_subject: vec!["op_evil".into()],
-        ..Default::default()
-    });
-    assert!(errored, "a re-pointing `ui run` must refuse");
-    assert_eq!(
-        std::fs::read(&pin).unwrap(),
-        before,
-        "re-pointing run rewrote the pin"
-    );
-
-    // (iii) no ui.pid at all, but the board's own port is taken: the
-    // bind loss must happen before the pin is touched.
-    std::fs::remove_file(state.path().join("ui.pid")).unwrap();
-    let errored = run(ui::UiFlags {
-        port: Some(port),
-        device_login_issuer: Some("http://127.0.0.1:1".into()),
-        device_login_org: Some("ws_company".into()),
-        device_login_subject: vec!["op_evil".into()],
-        ..Default::default()
-    });
-    assert!(errored, "a run that loses the bind must fail");
-    assert_eq!(
-        std::fs::read(&pin).unwrap(),
-        before,
-        "a lost bind rewrote the pin"
-    );
-
-    let _ = foreign.kill();
-    let _ = foreign.wait();
+        // (iii) the bind-loss case: a re-pointing run on board one's OWN
+        // port fails the bind and touches nothing.
+        let errored = run(ui::UiFlags {
+            port: Some(port1),
+            device_login_issuer: Some("http://127.0.0.1:1".into()),
+            device_login_org: Some("ws_company".into()),
+            device_login_subject: vec!["op_evil".into()],
+            ..Default::default()
+        });
+        assert!(errored, "a run that loses the bind must fail");
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            before,
+            "a lost bind rewrote the pin"
+        );
+    }
 }

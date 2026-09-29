@@ -1449,11 +1449,14 @@ pub(super) fn device_code(
                 "too many pending device grants — wait for one to settle and retry",
             );
         }
+        // Expiry counts from when the issuer answered, not from before
+        // its (up to 20 s) call — a slow issuer must not shorten the
+        // grant the operator sees.
         pending.insert(
             pending_id.clone(),
             DevicePending {
                 device_code: code,
-                expires_at: now + display.expires_in as i64,
+                expires_at: crate::issue::time::now_epoch() + display.expires_in as i64,
             },
         );
     }
@@ -1604,17 +1607,19 @@ pub(super) fn device_poll(
 /// grant past its TTL.
 fn repend(login: &DeviceLogin, pending_id: String, code: String, expires_at: i64) {
     let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
-    // The id was just removed, so this reinserts the same row — the
-    // cap cannot be hit by it, but refuse rather than grow if raced.
-    if pending.len() < super::DEVICE_PENDING_CAP {
-        pending.insert(
-            pending_id,
-            DevicePending {
-                device_code: code,
-                expires_at,
-            },
-        );
-    }
+    // Always reinsert: the row held a slot before this poll removed
+    // it, so the cap argument for dropping it does not hold — a
+    // concurrent `/code` may already have taken the freed slot and a
+    // transient overshoot is bounded by the in-flight polls. Dropping
+    // the grant here would strand it at the issuer while the next
+    // poll reports `expired`.
+    pending.insert(
+        pending_id,
+        DevicePending {
+            device_code: code,
+            expires_at,
+        },
+    );
 }
 
 // ---------- `/__platform/*` — the AgenticOS sign-in contract (CAD-526) ----------
