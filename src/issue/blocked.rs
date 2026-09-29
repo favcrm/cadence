@@ -449,7 +449,10 @@ mod tests {
         Claim {
             by: by.to_string(),
             at: time::iso(time::now_epoch() - age_secs),
+            session: None,
+            last_seen: None,
             note: None,
+            stale: None,
         }
     }
 
