@@ -284,7 +284,12 @@ function CustomerList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
         <>
-          <div className="crm-table-wrap">
+          <div
+            className="crm-table-wrap"
+            tabIndex={0}
+            role="region"
+            aria-label="Customers table — scroll horizontally to reach every column"
+          >
             <table className="crm-table">
               <thead>
                 <tr>

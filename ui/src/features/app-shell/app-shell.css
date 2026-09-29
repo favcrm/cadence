@@ -287,13 +287,27 @@
 .crm-table-wrap {
   overflow-x: auto;
   max-width: 100%;
+  /* Paint/layout containment keeps the wide table's ink inside the
+     wrap while it scrolls internally; the document never grows past
+     the viewport (CAD-781 visual follow-up). */
+  contain: layout paint;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
   background: var(--color-ink-850);
 }
 
+.crm-table-wrap:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 .crm-table {
   width: 100%;
+  /* Readable columns first: the table keeps a 680px floor so headers
+     (CONSENT/REV), values and Open never crush letter-by-letter at
+     390px viewports; the wrap above scrolls it internally instead.
+     At desktop widths the 100% width rules and this is a no-op. */
+  min-width: 680px;
   border-collapse: collapse;
   font-size: var(--text-table);
 }

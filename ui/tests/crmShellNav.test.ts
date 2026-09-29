@@ -118,6 +118,10 @@ await React.act(async () => {
 });
 await settle(() => assert(text().includes("Seed Alpha"), "shell list paints server rows"));
 assert(text().includes("Customers"), "CRM section renders inside the real shell");
+const wrap = host.querySelector(".crm-table-wrap");
+assert(wrap?.getAttribute("tabindex") === "0", "table wrap is keyboard-focusable for internal scroll");
+assert(wrap?.getAttribute("role") === "region", "table wrap is a labelled scroll region");
+assert((wrap?.getAttribute("aria-label") ?? "").length > 0, "table wrap names its scroll affordance");
 
 // F1: New → Create lands on list + details in ONE history push with no
 // stale `appview=new`. Two sequential writes would push twice and keep
@@ -172,6 +176,8 @@ const block = (selector: string): string => {
 assert(/min-width:\s*0/.test(block("\\.app-outlet")), ".app-outlet can shrink inside the shell grid");
 assert(/min-width:\s*0/.test(block("\\.crm-list")), ".crm-list can shrink");
 assert(/overflow-x:\s*auto/.test(block("\\.crm-table-wrap")), "table scrolls inside its wrap");
+assert(/contain:\s*layout paint/.test(block("\\.crm-table-wrap")), "wrap contains the wide table's paint");
+assert(/min-width:\s*680px/.test(block("\\.crm-table")), "table keeps readable columns via a width floor");
 assert(/max-width:\s*100%/.test(block("\\.crm-table-wrap")), "wrap never exceeds its column");
 assert(/overflow-wrap:\s*anywhere/.test(block("\\.crm-table th,\\s*\\.crm-table td")), "unbreakable tokens wrap in table cells");
 assert(/flex-wrap:\s*wrap/.test(block("\\.app-outlet-tabs")), "section tabs wrap at narrow widths");
