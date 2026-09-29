@@ -370,6 +370,11 @@ pub struct ServeOpts {
     /// and initialization; a bind failure carries its I/O kind. Never set
     /// from the command line. Other startup failures disconnect the channel.
     pub startup: Option<std::sync::mpsc::Sender<std::result::Result<(), std::io::ErrorKind>>>,
+    /// The readiness nonce `ui start` handed this child through its
+    /// environment — see [`READY_NONCE_ENV`]. Written to `ui.ready` only
+    /// after the bind succeeds; never served over HTTP. [`serve`] reads
+    /// it once and removes it from this process's own environment.
+    pub ready_nonce: Option<String>,
     /// CAD-526: this board's public AgenticOS name, when configured.
     /// Requests that carry its Host are the platform sign-in surface —
     /// `__platform/*` routes and `__Host-aos-board-session` reads —
@@ -670,6 +675,9 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync: None,
         stop: None,
         startup: None,
+        // `ui run` reads `CADENCE_UI_READY_NONCE` itself; nothing here
+        // copies a caller's env into the field.
+        ready_nonce: None,
         public: eff.board.clone(),
         // CAD-482: `ui run`/`ui start`'s fixture child arms from its
         // environment; in-process fixtures set the field directly.
@@ -4182,9 +4190,19 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             },
         )?;
     }
+    let mut opts = opts.clone();
+    // The readiness nonce reaches a spawned board through its
+    // environment (`ui start` sets it); an in-process fixture sets the
+    // field. Either way it is consumed here — it never appears in a
+    // response, and nothing after this point needs the env var.
+    if let Ok(nonce) = std::env::var(READY_NONCE_ENV) {
+        std::env::remove_var(READY_NONCE_ENV);
+        if !nonce.is_empty() && opts.ready_nonce.is_none() {
+            opts.ready_nonce = Some(nonce);
+        }
+    }
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
-    let mut opts = opts.clone();
     opts.agent_uid = board_boot_agent_uid(state_dir, opts.agent_uid)?;
     opts.tailnet_latch = if opts.tailnet.is_some() {
         crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
@@ -4235,6 +4253,18 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         let _ = startup.send(Ok(()));
     }
     let opts = &opts;
+    // Only now — the port is bound — prove readiness to the `ui start`
+    // that spawned this board. A bind failure above never writes it, so
+    // the waiting start sees the dead child plus its ui.log, not a
+    // foreign board's health answer (CAD-817).
+    if let Some(nonce) = &opts.ready_nonce {
+        let marker = json!({"pid": std::process::id(), "nonce": nonce});
+        // A `ui.json` save owns `ui.tmp`; keep the marker's sidecar apart.
+        let tmp = ready_file(state_dir).with_extension("ready.tmp");
+        if std::fs::write(&tmp, marker.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, ready_file(state_dir));
+        }
+    }
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     loop {
         let request = match &opts.stop {
@@ -4277,6 +4307,32 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
 
 fn pid_file(state_dir: &Path) -> PathBuf {
     state_dir.join("ui.pid")
+}
+
+/// The file a spawned `ui run` writes once its bind has succeeded —
+/// `{pid, nonce}` for the `ui start` that is waiting on it. The nonce
+/// reaches the child only through `CADENCE_UI_READY_NONCE` in its
+/// environment and this file, never over HTTP: any HTTP 200 a foreign
+/// listener answers can no longer stand in for this board's readiness
+/// (CAD-817).
+fn ready_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("ui.ready")
+}
+
+/// `ui start`'s env channel for the readiness nonce. The child writes
+/// it to `ui.ready` after binding; `serve` removes it from the child's
+/// own environment before serving so nothing downstream inherits it.
+pub(crate) const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
+
+/// Read `ui.ready`; `Some(pid)` only when it names `nonce` — a stale
+/// or foreign marker is a miss, not a match.
+fn ready_pid(state_dir: &Path, nonce: &str) -> Option<i32> {
+    let text = std::fs::read_to_string(ready_file(state_dir)).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v["nonce"].as_str()? != nonce {
+        return None;
+    }
+    v["pid"].as_i64().and_then(|p| i32::try_from(p).ok())
 }
 
 /// Is a detached `cadence ui` server alive for this state dir — the
@@ -4424,6 +4480,9 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     }
     save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
+    // A previous start's marker must not satisfy this one's wait —
+    // clear it before any `running`/`spawn` path can read it.
+    let _ = std::fs::remove_file(ready_file(state_dir));
     if let Some(pid) = running {
         let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             .unwrap_or((0, String::new()));
@@ -4460,6 +4519,12 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     if let Some(dist) = &eff.dist {
         command.arg("--dist").arg(dist);
     }
+    // Readiness the port cannot fake: a fresh nonce reaches the child
+    // through its environment, and the child lands it in `ui.ready`
+    // only after its own `Server::http` bind succeeds (CAD-817). An
+    // HTTP 200 — whoever answers it — no longer proves our board up.
+    let nonce = crate::operator_auth::random_credential()?;
+    command.env(READY_NONCE_ENV, &nonce);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log.try_clone()?))
@@ -4476,34 +4541,59 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     std::fs::write(pid_file(state_dir), child.id().to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok((200, _)) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[]) {
-            if !quiet {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "state": "started", "pid": child.id(),
-                        "url": format!("http://{host}:{port}"),
-                        "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
-                        "read_only": eff.read_only,
-                        "gateway": "http://cadence.localhost:18000",
-                        "log": state_dir.join("ui.log"),
-                        // CAD-313: board writes need the operator's session.
-                        "sign_in": "cadence ui login",
-                    }))
-                    .unwrap_or_default()
-                );
-            }
-            return Ok(0);
-        }
         if child.try_wait()?.is_some() {
+            // The bind failed (or the child died before it) — the log
+            // line is the why, the port the what.
             let _ = std::fs::remove_file(pid_file(state_dir));
+            let _ = std::fs::remove_file(ready_file(state_dir));
+            let detail = std::fs::read_to_string(state_dir.join("ui.log"))
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .find(|l| l.contains("bind") || l.contains("error"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let detail = if detail.is_empty() {
+                format!("see {}", state_dir.join("ui.log").display())
+            } else {
+                detail
+            };
             return Err(Error::rejected(format!(
-                "ui server exited during start — see {}",
-                state_dir.join("ui.log").display()
+                "ui server exited during start — port {port} on {host}: {detail}"
             )));
         }
+        if ready_pid(state_dir, &nonce) == Some(child.id() as i32) {
+            // The child bound and reported itself — the health check
+            // now confirms it serves, still not the other way around.
+            if let Ok((200, _)) =
+                http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
+            {
+                let _ = std::fs::remove_file(ready_file(state_dir));
+                if !quiet {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "state": "started", "pid": child.id(),
+                            "url": format!("http://{host}:{port}"),
+                            "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
+                            "read_only": eff.read_only,
+                            "gateway": "http://cadence.localhost:18000",
+                            "log": state_dir.join("ui.log"),
+                            // CAD-313: board writes need the operator's session.
+                            "sign_in": "cadence ui login",
+                        }))
+                        .unwrap_or_default()
+                    );
+                }
+                return Ok(0);
+            }
+        }
         if Instant::now() >= deadline {
-            return Err(Error::internal("ui server did not answer within 10s"));
+            let _ = std::fs::remove_file(ready_file(state_dir));
+            return Err(Error::internal(
+                "ui server did not prove its own start within 10s",
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -4531,6 +4621,7 @@ fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     if pid.is_none() {
         let _ = std::fs::remove_file(pid_file(state_dir));
     }
+    let _ = std::fs::remove_file(ready_file(state_dir));
     // --tailscale-off: only ever the mapping cadence recorded — a
     // foreign one on the same port is left alone and named in the
     // result.
