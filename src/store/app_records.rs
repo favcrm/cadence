@@ -58,6 +58,40 @@ CREATE TABLE IF NOT EXISTS app_record_csv_imports(
  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
  preview_token TEXT NOT NULL, result TEXT NOT NULL,
  state TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS app_segments(
+ context_id TEXT NOT NULL, id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ name TEXT NOT NULL, definition TEXT NOT NULL, digest TEXT NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, id));
+CREATE TABLE IF NOT EXISTS app_segment_revisions(
+ context_id TEXT NOT NULL, segment_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ definition TEXT NOT NULL, digest TEXT NOT NULL,
+ actor TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, segment_id, revision));
+CREATE TABLE IF NOT EXISTS app_exclusions(
+ context_id TEXT NOT NULL, id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ name TEXT NOT NULL, member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, id));
+CREATE TABLE IF NOT EXISTS app_exclusion_revisions(
+ context_id TEXT NOT NULL, list_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+ actor TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, list_id, revision));
+CREATE TABLE IF NOT EXISTS app_suppressions(
+ context_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('email','customer')),
+ key TEXT NOT NULL, reason TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, kind, key));
+CREATE TABLE IF NOT EXISTS app_audience_freezes(
+ context_id TEXT NOT NULL, freeze_id TEXT NOT NULL,
+ base TEXT NOT NULL, exclusion_list_id TEXT,
+ member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+ max_recipients INTEGER NOT NULL, pins TEXT NOT NULL,
+ created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id));
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -79,6 +113,9 @@ pub struct RecordStore {
 }
 
 impl RecordStore {
+    pub(crate) fn install(&self) -> &str {
+        &self.install_id
+    }
     /// Open (creating and initializing when missing) the
     /// installation's record file. A present file whose schema or
     /// identity row does not match is refused with an explicit
@@ -189,6 +226,56 @@ impl RecordStore {
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             }
+            // CAD-780 audience tables: segments, exclusion lists,
+            // suppressions and frozen audiences. Idempotent forward
+            // migration like the CSV receipts above; the version
+            // stays 1 and older files gain empty tables.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_segments(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 name TEXT NOT NULL, definition TEXT NOT NULL, digest TEXT NOT NULL,
+                 created REAL NOT NULL, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, id));
+                 CREATE TABLE IF NOT EXISTS app_segment_revisions(
+                 context_id TEXT NOT NULL, segment_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 definition TEXT NOT NULL, digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, segment_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_exclusions(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 name TEXT NOT NULL, member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+                 created REAL NOT NULL, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, id));
+                 CREATE TABLE IF NOT EXISTS app_exclusion_revisions(
+                 context_id TEXT NOT NULL, list_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, list_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_suppressions(
+                 context_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('email','customer')),
+                 key TEXT NOT NULL, reason TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, kind, key));
+                 CREATE TABLE IF NOT EXISTS app_audience_freezes(
+                 context_id TEXT NOT NULL, freeze_id TEXT NOT NULL,
+                 base TEXT NOT NULL, exclusion_list_id TEXT,
+                 member_ids TEXT NOT NULL, digest TEXT NOT NULL,
+                 max_recipients INTEGER NOT NULL, pins TEXT NOT NULL,
+                 created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id))",
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+            let needs_state = conn
+                .prepare("SELECT state FROM app_record_csv_imports LIMIT 0")
+                .is_err();
+            if needs_state {
+                conn.execute_batch(
+                    "ALTER TABLE app_record_csv_imports ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'",
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
         }
         Ok(Self {
             install_id: install_id.to_string(),
@@ -196,7 +283,7 @@ impl RecordStore {
         })
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -510,7 +597,7 @@ pub enum ConsentState {
 }
 
 impl ConsentState {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Granted => "granted",
             Self::Denied => "denied",

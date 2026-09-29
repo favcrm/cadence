@@ -1,5 +1,6 @@
 use super::super::app_audiences::{AudienceBase, Predicate};
-use super::super::app_records::{CustomerProfile, RecordStore};
+use super::super::app_records::{record_db_path, CustomerProfile, RecordStore};
+use super::super::app_runs::material_digest;
 use super::*;
 
 fn audience_file(dir: &TempDir, install: &str) -> RecordStore {
@@ -7,32 +8,57 @@ fn audience_file(dir: &TempDir, install: &str) -> RecordStore {
 }
 
 fn profile(name: &str, email: Option<&str>, consent: &str, tags: &[&str]) -> CustomerProfile {
-    let mut body = json!({"schema": 1, "display_name": name, "tags": tags, "consent": {"email": consent}});
+    let mut body =
+        json!({"schema": 1, "display_name": name, "tags": tags, "consent": {"email": consent}});
     if let Some(address) = email {
         body["email"] = json!(address);
     }
     CustomerProfile::parse(&body).unwrap()
 }
 
-fn seed(dir: &TempDir, store: &RecordStore, context: &str) {
-    // Five live rows: two VIP (one denied), one invalid address, one
-    // unknown consent, one plain eligible.
+fn seed_valid(store: &RecordStore, context: &str) {
     let rows = [
-        ("customer-a", profile("Amina", Some("amina@example.com"), "granted", &["vip"])),
-        ("customer-b", profile("Boris", Some("boris@example.com"), "denied", &["vip"])),
-        ("customer-c", profile("Cleo", Some("not-an-email"), "granted", &[])),
-        ("customer-d", profile("Dev", Some("dev@example.com"), "unknown", &[])),
-        ("customer-e", profile("Esme", Some("esme@example.com"), "granted", &[])),
+        (
+            "customer-a",
+            profile("Amina", Some("amina@example.com"), "granted", &["vip"]),
+        ),
+        (
+            "customer-b",
+            profile("Boris", Some("boris@example.com"), "denied", &["vip"]),
+        ),
+        (
+            "customer-d",
+            profile("Dev", Some("dev@example.com"), "unknown", &[]),
+        ),
+        (
+            "customer-e",
+            profile("Esme", Some("esme@example.com"), "granted", &[]),
+        ),
     ];
     for (id, entry) in rows {
         store.app_record_create(context, id, &entry).unwrap();
     }
 }
 
+fn plant_legacy(dir: &TempDir, store: &RecordStore, context: &str) {
+    // customer-c carries an address the current shape check
+    // refuses, planted as legacy data predating the check: its
+    // digest binds the exact body, so integrity still proves.
+    let body = json!({"schema": 1, "display_name": "Cleo", "email": "not-an-email", "tags": [], "consent": {"email": "granted"}});
+    let digest = material_digest(
+        &json!({"domain": "cadence-app-record-v1", "install_id": store.install(), "context_id": context, "kind": "customer", "profile": body}),
+    );
+    let path = record_db_path(dir.path(), store.install()).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO app_records(context_id,id,kind,revision,body,body_digest,created,updated) VALUES(?,?,'customer',1,?,?,0.0,0.0)",
+        rusqlite::params![context, "customer-c", body.to_string(), digest],
+    )
+    .unwrap();
+}
+
 fn vip_segment() -> Vec<Predicate> {
-    vec![
-        Predicate::parse(&json!({"field": "tag", "op": "eq", "value": "vip"})).unwrap(),
-    ]
+    vec![Predicate::parse(&json!({"field": "tag", "op": "eq", "value": "vip"})).unwrap()]
 }
 
 fn base_all() -> AudienceBase {
@@ -43,16 +69,25 @@ fn base_all() -> AudienceBase {
 fn cad780_all_segment_custom_with_exclusion_counts() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
-    seed(&dir, &store, "ctx-1");
+    seed_valid(&store, "ctx-1");
+    plant_legacy(&dir, &store, "ctx-1");
     store
         .app_segment_save("ctx-1", "seg-vip", None, "VIP", &vip_segment())
         .unwrap();
     store
-        .app_exclusion_save("ctx-1", "ex-hold", None, "Hold", &["customer-e".to_string()])
+        .app_exclusion_save(
+            "ctx-1",
+            "ex-hold",
+            None,
+            "Hold",
+            &["customer-e".to_string()],
+        )
         .unwrap();
 
     // All eligible: five rows minus invalid/denied/unknown = a and e.
-    let all = store.app_audience_preview("ctx-1", &base_all(), None).unwrap();
+    let all = store
+        .app_audience_preview("ctx-1", &base_all(), None)
+        .unwrap();
     assert_eq!(all["base_count"], 5);
     assert_eq!(all["final_count"], 2);
 
@@ -74,7 +109,9 @@ fn cad780_all_segment_custom_with_exclusion_counts() {
         &json!({"mode": "custom", "customer_ids": ["customer-a", "customer-a", "customer-e"]}),
     )
     .unwrap();
-    let custom = store.app_audience_preview("ctx-1", &base, Some("ex-hold")).unwrap();
+    let custom = store
+        .app_audience_preview("ctx-1", &base, Some("ex-hold"))
+        .unwrap();
     assert_eq!(custom["base_count"], 2);
     assert_eq!(custom["final_count"], 1);
 }
@@ -83,7 +120,8 @@ fn cad780_all_segment_custom_with_exclusion_counts() {
 fn cad780_final_exclusion_union_always_applies() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
-    seed(&dir, &store, "ctx-1");
+    seed_valid(&store, "ctx-1");
+    plant_legacy(&dir, &store, "ctx-1");
     store
         .app_suppression_add("ctx-1", Some("esme@example.com"), None, "bounce")
         .unwrap();
@@ -141,16 +179,12 @@ fn cad780_stale_segment_edit_refuses() {
         .unwrap();
     assert_eq!(created["segment"]["revision"], 1);
     // Blind overwrite without the observed revision refuses.
-    assert!(
-        store
-            .app_segment_save("ctx-1", "seg-vip", None, "VIP2", &vip_segment())
-            .is_err()
-    );
-    assert!(
-        store
-            .app_segment_save("ctx-1", "seg-vip", Some(9), "VIP2", &vip_segment())
-            .is_err()
-    );
+    assert!(store
+        .app_segment_save("ctx-1", "seg-vip", None, "VIP2", &vip_segment())
+        .is_err());
+    assert!(store
+        .app_segment_save("ctx-1", "seg-vip", Some(9), "VIP2", &vip_segment())
+        .is_err());
     let updated = store
         .app_segment_save("ctx-1", "seg-vip", Some(1), "VIP2", &vip_segment())
         .unwrap();
@@ -192,7 +226,7 @@ fn cad780_concurrent_segment_updates_one_wins() {
 fn cad780_freeze_drift_invalidates() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
-    seed(&dir, &store, "ctx-1");
+    seed_valid(&store, "ctx-1");
     store
         .app_segment_save("ctx-1", "seg-vip", None, "VIP", &vip_segment())
         .unwrap();
@@ -206,19 +240,22 @@ fn cad780_freeze_drift_invalidates() {
 
     // Consent drift on the frozen member invalidates the freeze.
     let denied = profile("Amina", Some("amina@example.com"), "denied", &["vip"]);
-    store.app_record_update("ctx-1", "customer-a", 1, &denied).unwrap();
+    store
+        .app_record_update("ctx-1", "customer-a", 1, &denied)
+        .unwrap();
     let drifted = store.app_audience_show("ctx-1", "freeze-1").unwrap();
     assert_eq!(drifted["valid"], false);
 
     // So does a segment revision change behind a fresh freeze.
     let granted = profile("Amina", Some("amina@example.com"), "granted", &["vip"]);
-    store.app_record_update("ctx-1", "customer-a", 2, &granted).unwrap();
+    store
+        .app_record_update("ctx-1", "customer-a", 2, &granted)
+        .unwrap();
     store
         .app_audience_prepare("ctx-1", "freeze-2", &base, None, 50)
         .unwrap();
-    let everybody = vec![
-        Predicate::parse(&json!({"field": "source", "op": "eq", "value": "web"})).unwrap(),
-    ];
+    let everybody =
+        vec![Predicate::parse(&json!({"field": "source", "op": "eq", "value": "web"})).unwrap()];
     store
         .app_segment_save("ctx-1", "seg-vip", Some(1), "VIP", &everybody)
         .unwrap();
@@ -230,13 +267,11 @@ fn cad780_freeze_drift_invalidates() {
 fn cad780_max_recipients_bound() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
-    seed(&dir, &store, "ctx-1");
+    seed_valid(&store, "ctx-1");
     // Two eligible recipients behind a ceiling of one refuses.
-    assert!(
-        store
-            .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 1)
-            .is_err()
-    );
+    assert!(store
+        .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 1)
+        .is_err());
     assert!(store.app_audience_show("ctx-1", "freeze-1").is_err());
     let prepared = store
         .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 2)
@@ -249,11 +284,17 @@ fn cad780_cross_install_context_isolation() {
     let dir = TempDir::new().unwrap();
     let a = audience_file(&dir, "install-a");
     let b = audience_file(&dir, "install-b");
-    seed(&dir, &a, "ctx-1");
+    seed_valid(&a, "ctx-1");
     a.app_segment_save("ctx-1", "seg-vip", None, "VIP", &vip_segment())
         .unwrap();
-    a.app_exclusion_save("ctx-1", "ex-hold", None, "Hold", &["customer-a".to_string()])
-        .unwrap();
+    a.app_exclusion_save(
+        "ctx-1",
+        "ex-hold",
+        None,
+        "Hold",
+        &["customer-a".to_string()],
+    )
+    .unwrap();
     a.app_suppression_add("ctx-1", Some("amina@example.com"), None, "bounce")
         .unwrap();
     // Nothing saved under install A is addressable from install B.
@@ -286,7 +327,9 @@ fn cad780_sample_is_bounded() {
             )
             .unwrap();
     }
-    let preview = store.app_audience_preview("ctx-1", &base_all(), None).unwrap();
+    let preview = store
+        .app_audience_preview("ctx-1", &base_all(), None)
+        .unwrap();
     assert_eq!(preview["final_count"], 14);
     assert!(
         preview["sample"].as_array().unwrap().len() <= 10,
@@ -298,23 +341,29 @@ fn cad780_sample_is_bounded() {
 fn cad780_suppression_add_remove_roundtrip() {
     let dir = TempDir::new().unwrap();
     let store = audience_file(&dir, "install-a");
-    seed(&dir, &store, "ctx-1");
+    seed_valid(&store, "ctx-1");
     assert_eq!(
-        store.app_audience_preview("ctx-1", &base_all(), None).unwrap()["final_count"],
+        store
+            .app_audience_preview("ctx-1", &base_all(), None)
+            .unwrap()["final_count"],
         2
     );
     store
         .app_suppression_add("ctx-1", Some("amina@example.com"), None, "bounce")
         .unwrap();
     assert_eq!(
-        store.app_audience_preview("ctx-1", &base_all(), None).unwrap()["final_count"],
+        store
+            .app_audience_preview("ctx-1", &base_all(), None)
+            .unwrap()["final_count"],
         1
     );
     store
         .app_suppression_remove("ctx-1", Some("AMINA@example.com"), None)
         .unwrap();
     assert_eq!(
-        store.app_audience_preview("ctx-1", &base_all(), None).unwrap()["final_count"],
+        store
+            .app_audience_preview("ctx-1", &base_all(), None)
+            .unwrap()["final_count"],
         2
     );
     // Customer-ID suppression works the same way.
@@ -322,7 +371,9 @@ fn cad780_suppression_add_remove_roundtrip() {
         .app_suppression_add("ctx-1", None, Some("customer-e"), "request")
         .unwrap();
     assert_eq!(
-        store.app_audience_preview("ctx-1", &base_all(), None).unwrap()["final_count"],
+        store
+            .app_audience_preview("ctx-1", &base_all(), None)
+            .unwrap()["final_count"],
         1
     );
 }
