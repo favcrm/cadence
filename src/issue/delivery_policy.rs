@@ -452,11 +452,13 @@ pub fn effective(
     match file {
         Ok(Some(p)) => {
             let dg = digest(&p);
-            if dg == digest(&default_policy()) {
-                return resolved(p, "file", None);
-            }
+            // The approval is checked first: while a custom policy is
+            // approved, ANY different section — including a
+            // default-equivalent one — keeps the approved policy in
+            // force, otherwise an agent could swap it for the weaker
+            // defaults with no note.
             if let Some(a) = approved {
-                if a.digest == dg {
+                if a.digest == dg && a.policy.is_some() {
                     return resolved(p, "approved", None);
                 }
                 if let Some(q) = &a.policy {
@@ -471,6 +473,9 @@ pub fn effective(
                         )),
                     );
                 }
+            }
+            if dg == digest(&default_policy()) {
+                return resolved(p, "file", None);
             }
             resolved(
                 default_policy(),
@@ -1025,13 +1030,38 @@ mod tests {
 
     #[test]
     fn effective_section_equal_to_default_is_file() {
-        let e = effective(
-            "demo",
-            Ok(Some(default_policy())),
-            Some(&approval_for(&custom())),
+        // No approval, and an approved "no section" (policy None):
+        // a default-equivalent section is the file's own, in force.
+        for approval in [
+            None,
+            Some(Approved {
+                digest: digest(&default_policy()),
+                policy: None,
+            }),
+        ] {
+            let e = effective("demo", Ok(Some(default_policy())), approval.as_ref());
+            assert_eq!((e.source, &e.note), ("file", &None));
+            assert_eq!(e.policy, default_policy());
+        }
+    }
+
+    /// Regression: while a custom policy is approved, rewriting
+    /// `delivery:` to a default-equivalent section must NOT silently
+    /// drop the stronger approved policy — it resolves as `approved`
+    /// with the "changed since approval" note, exactly like a removal.
+    #[test]
+    fn effective_default_equivalent_edit_keeps_approved_custom() {
+        let q = custom();
+        let a = approval_for(&q);
+        let e = effective("demo", Ok(Some(default_policy())), Some(&a));
+        assert_eq!((e.source, e.policy), ("approved", q.clone()));
+        assert_eq!(e.digest, digest(&q));
+        let n = e.note.unwrap();
+        assert!(
+            n.starts_with("delivery_unapproved: demo/PROJECT.md delivery changed since approval"),
+            "{n}"
         );
-        assert_eq!((e.source, &e.note), ("file", &None));
-        assert_eq!(e.policy, default_policy());
+        assert!(n.contains(&digest(&default_policy())), "{n}");
     }
 
     #[test]

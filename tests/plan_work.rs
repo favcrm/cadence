@@ -4097,6 +4097,36 @@ fn delivery_policy_approval_and_resolution() {
         "{lint}"
     );
 
+    // A default-equivalent section does the same: the approved custom
+    // policy stays in force, reported with its digest and the
+    // "changed since approval" note — the weaker default never slips
+    // in silently.
+    std::fs::write(
+        &project_md,
+        concat!(
+            "---\nproject: demo\ndelivery:\n",
+            "  reviews:\n    review: {kind: agent, focus: general}\n",
+            "  risk:\n    - require: [review]\n---\n",
+        ),
+    )
+    .unwrap();
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
+    assert!(
+        d["note"]
+            .as_str()
+            .unwrap()
+            .contains("changed since approval"),
+        "{d}"
+    );
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "{lint}");
+    assert!(
+        lint["warnings"].to_string().contains("delivery_unapproved"),
+        "{lint}"
+    );
+
     // Removing the section keeps the approved policy in force.
     std::fs::write(&project_md, "---\nproject: demo\n---\n").unwrap();
     let d = ls_delivery(&f, "demo");

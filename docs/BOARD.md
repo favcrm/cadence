@@ -496,10 +496,14 @@ rule must require a blocking review (`agent`, `operator` or a
 While the file's section is not the approved one, every reader falls
 back — to the approved policy, else the defaults — and reports the
 policy in `cadence issue project ls --json` as
-`delivery: {source: default|file|approved, digest, note}`, with a
-`delivery_unapproved: …` note when the section changed, was removed or
-is malformed since approval (the approved policy stays in force) and a
-`delivery_error: …` note when it is malformed with none; `issue lint`
+`delivery: {source: default|file|approved, digest, note}`. A section
+equal to the defaults reads `file` only while no custom policy is
+approved — once one is, even a default-equivalent edit keeps the
+approved policy in force (`approved`, `delivery_unapproved`), so an
+agent cannot swap a stricter policy for the defaults silently. The
+notes: `delivery_unapproved: …` when the section changed, was removed
+or is malformed since approval (the approved policy stays in force),
+and `delivery_error: …` when it is malformed with none; `issue lint`
 warns the same. Nothing in the delivery loop consumes the policy until
 CAD-814 slices 2–5.
 
