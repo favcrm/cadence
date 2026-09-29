@@ -127,18 +127,38 @@ def job_body(workflow, name):
     return re.split(r"\n  \S[^:\n]*:\n", body, maxsplit=1)[0]
 
 
-class TestSeamRefusalJob(unittest.TestCase):
-    """CAD-809: the default-feature refusal proofs run once, in their own
-    job in parallel with the shards — never inside every shard."""
+class TestOnceJob(unittest.TestCase):
+    """CAD-809: the proofs that run once — default-feature refusal
+    proofs and Rust doctests — live in `test-once`, parallel with the
+    shards, never inside every shard."""
 
     def setUp(self):
         self.workflow = WORKFLOW.read_text()
         self.shard = job_body(self.workflow, "test-shard")
-        self.refusal = job_body(self.workflow, "test-seam-refusal")
+        self.refusal = job_body(self.workflow, "test-once")
         self.aggregate = job_body(self.workflow, "test")
 
     def test_shard_body_has_no_refusal_compile(self):
         self.assertNotIn("--test test_seam", self.shard)
+
+    def test_runner_step_is_unconditional_docs_writes_assignment(self):
+        # Docs PRs never reach cargo, but the runner still must write
+        # its assignment — an `if:` here starves the upload and the
+        # coverage check (CAD-809 slice5b).
+        step = self.shard.split("- name: Run recorded Rust scope", 1)[1]
+        step = re.split(r"\n      - (?:name|uses):", step, maxsplit=1)[0]
+        self.assertNotIn("if:", step)
+        self.assertNotIn("steps.scope", step)
+        upload = self.shard.split("- name: Keep the shard's test assignment", 1)[1]
+        upload = re.split(r"\n      - (?:name|uses):", upload, maxsplit=1)[0]
+        self.assertIn("!cancelled()", upload)
+        self.assertIn("if-no-files-found: error", upload)
+
+    def test_shard_body_runs_no_doctests(self):
+        self.assertNotIn("cargo test --doc", self.shard)
+
+    def test_once_job_runs_doctests(self):
+        self.assertIn("cargo test --doc --locked", self.refusal)
 
     def test_refusal_job_runs_one_locked_default_feature_invocation(self):
         self.assertIn("run: scripts/cadence-nextest --test test_seam --locked", self.refusal)
@@ -148,17 +168,26 @@ class TestSeamRefusalJob(unittest.TestCase):
     def test_aggregate_needs_shards_and_refusal(self):
         needs = re.search(r"needs: \[([^\]]+)\]", self.aggregate)[1]
         self.assertIn("test-shard", needs)
-        self.assertIn("test-seam-refusal", needs)
+        self.assertIn("test-once", needs)
+
+    def test_aggregate_verifies_shard_assignments(self):
+        self.assertIn("download-artifact@", self.aggregate)
+        self.assertIn("shard-assignment-", self.aggregate)
+        self.assertIn("ci-shard-check.py", self.aggregate)
 
     def test_aggregate_fails_unless_both_succeed(self):
-        script = textwrap.dedent(self.aggregate.split("        run: |\n", 1)[1])
+        tail = self.aggregate.split("        run: |\n", 1)[1]
+        # The run block alone: stop at the first line dedented past it
+        # (the assignment download/check steps that follow).
+        block = re.split(r"\n {0,8}\S", tail, maxsplit=1)[0]
+        script = textwrap.dedent(block)
         results = ["success", "failure", "cancelled", "skipped", ""]
         for shard in results:
             for refusal in results:
                 with self.subTest(shard=shard, refusal=refusal):
                     substituted = (
                         script.replace("${{ needs.test-shard.result }}", shard)
-                        .replace("${{ needs.test-seam-refusal.result }}", refusal)
+                        .replace("${{ needs.test-once.result }}", refusal)
                     )
                     # Actions `run:` steps execute as `bash -eo pipefail`;
                     # without -e a failed early check is masked by the last.

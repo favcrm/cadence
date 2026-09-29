@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Generate tests/shard-weights.json from nextest-cost artifacts.
+
+Usage: scripts/shard-weights <costs-dir>... > tests/shard-weights.json
+
+Each costs dir holds `nextest-costs-<run>-<attempt>-shard-<n>/` dirs;
+every shard's `nextest-costs.json` lists executed tests under `slowest`
+as `{suite, name, duration_s}` where `suite` is the nextest binary id.
+Dirs are newest run first — a test's weight comes from the first dir
+that has it — and for one run the highest attempt's shard wins. Only
+tests at or above MIN_SECONDS are weighted; anything else falls back to
+the runner's default weight at assignment time.
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+MIN_SECONDS = 5.0
+
+SHARD_DIR = re.compile(r"^nextest-costs-\d+-(\d+)-shard-\d+$")
+
+
+def weights_from(costs_dir):
+    """{key: seconds} for one run, highest attempt per shard."""
+    weights = {}
+    # Sorted dir order puts attempt 1 before 2; later overwrites, so the
+    # highest attempt's measurement wins per shard.
+    for shard_dir in sorted(Path(costs_dir).iterdir()):
+        if not SHARD_DIR.match(shard_dir.name):
+            continue
+        report = shard_dir / "nextest-costs.json"
+        if not report.is_file():
+            continue
+        data = json.loads(report.read_text())
+        for entry in data.get("slowest", []):
+            suite, name = entry["suite"], entry["name"]
+            if " " in suite or " " in name:
+                raise ValueError(f"{report}: id contains a space: {suite!r} {name!r}")
+            weights[f"{suite} {name}"] = entry["duration_s"]
+    return weights
+
+
+def main(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    merged = {}
+    sources = []
+    for costs_dir in argv:
+        sources.append(Path(costs_dir).name.replace("costs-", ""))
+        for key, seconds in weights_from(costs_dir).items():
+            merged.setdefault(key, seconds)
+    out = {
+        "schema": 1,
+        "source": " ".join(sources),
+        "min_seconds": int(MIN_SECONDS),
+        "weights": {
+            key: round(seconds, 1)
+            for key, seconds in sorted(merged.items())
+            if seconds >= MIN_SECONDS
+        },
+    }
+    print(json.dumps(out, indent=2, sort_keys=False))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
