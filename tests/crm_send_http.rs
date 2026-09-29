@@ -496,6 +496,18 @@ fn cad786_send_routes_are_operator_gated() {
             assert_eq!(code, 403, "agent-replayed {method} {path}");
         }
     }
+    // A sessionless POST refuses outright — the RecipientToken class
+    // must never widen to API routes.
+    let bare = common::op::request(
+        "POST",
+        "/api/crm-send/prepare",
+        &format!("127.0.0.1:{}", board.port),
+        None,
+        None,
+        "{}",
+    );
+    let (code, _, _) = common::op::raw(board.port, &bare);
+    assert_eq!(code, 403, "sessionless send write was admitted");
     // Unknown fields on the write bodies refuse at the schema.
     let (code, _) = board.operator(
         "POST",
@@ -606,9 +618,9 @@ fn cad786_end_to_end_over_http() {
     assert_eq!(code, 200, "{text}");
     let listed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(listed["sends"].as_array().unwrap().len(), 1);
-    // The real unsubscribe token from cleo's message redeems over
-    // HTTP — a sessionless POST, exactly as the recipient's browser
-    // would send it.
+    // The real unsubscribe token from a campaign message redeems
+    // over HTTP — sessionless, exactly as a recipient's browser (or
+    // a one-click mail client) would send it.
     let token = {
         let unsubs = rig.unsubscribes.lock().unwrap();
         unsubs
@@ -617,8 +629,22 @@ fn cad786_end_to_end_over_http() {
             .find(|t| t.len() == 43)
             .expect("a campaign unsubscribe URL with a real token")
     };
+    let suppressions = |board: &Board| -> usize {
+        board
+            .daemon
+            .operator_rpc(
+                "app_suppression_list",
+                json!({"install_id": install, "context_id": context}),
+            )
+            .unwrap()["suppressions"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    // GET renders a confirmation page and mutates nothing.
+    let before = suppressions(&board);
     let request = common::op::request(
-        "POST",
+        "GET",
         &format!("/unsubscribe/{token}"),
         &format!("127.0.0.1:{}", board.port),
         None,
@@ -627,6 +653,20 @@ fn cad786_end_to_end_over_http() {
     );
     let (code, _, body) = common::op::raw(board.port, &request);
     assert_eq!(code, 200, "{body}");
+    assert!(body.contains("Unsubscribe"));
+    assert_eq!(suppressions(&board), before, "the GET mutated");
+    // POST with the RFC 8058 one-click body redeems the token.
+    let request = common::op::request(
+        "POST",
+        &format!("/unsubscribe/{token}"),
+        &format!("127.0.0.1:{}", board.port),
+        None,
+        None,
+        "List-Unsubscribe=One-Click",
+    );
+    let (code, _, body) = common::op::raw(board.port, &request);
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("Unsubscribed"));
     let suppressions = board
         .daemon
         .operator_rpc(

@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS app_campaign_sends(
 CREATE TABLE IF NOT EXISTS app_campaign_deliveries(
  context_id TEXT NOT NULL, send_id TEXT NOT NULL,
  customer_id TEXT NOT NULL, email TEXT NOT NULL,
- idempotency_key TEXT NOT NULL, unsubscribe_token TEXT NOT NULL,
+ idempotency_key TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('queued','submitting','accepted','failed','uncertain','suppressed','closed')),
  attempts INTEGER NOT NULL DEFAULT 0,
  smtp_code INTEGER, smtp_message TEXT, reason TEXT, resolved_by TEXT,
@@ -616,7 +616,7 @@ impl RecordStore {
                  CREATE TABLE IF NOT EXISTS app_campaign_deliveries(
                  context_id TEXT NOT NULL, send_id TEXT NOT NULL,
                  customer_id TEXT NOT NULL, email TEXT NOT NULL,
-                 idempotency_key TEXT NOT NULL, unsubscribe_token TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
                  state TEXT NOT NULL CHECK(state IN ('queued','submitting','accepted','failed','uncertain','suppressed','closed')),
                  attempts INTEGER NOT NULL DEFAULT 0,
                  smtp_code INTEGER, smtp_message TEXT, reason TEXT, resolved_by TEXT,

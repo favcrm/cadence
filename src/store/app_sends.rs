@@ -69,7 +69,6 @@ pub struct Delivery {
     pub customer_id: String,
     pub email: String,
     pub idempotency_key: String,
-    pub unsubscribe_token: String,
     pub state: String,
     pub attempts: i64,
     pub smtp_code: Option<i64>,
@@ -188,17 +187,16 @@ fn row_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delivery> {
         customer_id: row.get(1)?,
         email: row.get(2)?,
         idempotency_key: row.get(3)?,
-        unsubscribe_token: row.get(4)?,
-        state: row.get(5)?,
-        attempts: row.get(6)?,
-        smtp_code: row.get(7)?,
-        reason: row.get(8)?,
-        resolved_by: row.get(9)?,
+        state: row.get(4)?,
+        attempts: row.get(5)?,
+        smtp_code: row.get(6)?,
+        reason: row.get(7)?,
+        resolved_by: row.get(8)?,
     })
 }
 
 const DELIVERY_COLUMNS: &str =
-    "send_id,customer_id,email,idempotency_key,unsubscribe_token,state,attempts,smtp_code,reason,resolved_by";
+    "send_id,customer_id,email,idempotency_key,state,attempts,smtp_code,reason,resolved_by";
 
 fn send_json(install: &str, context: &str, send: &CampaignSend) -> Value {
     json!({
@@ -555,13 +553,14 @@ impl RecordStore {
 
     /// The approve transaction: `prepared → sending` under CAS (so
     /// two concurrent approves can never both win), then one `queued`
-    /// delivery per frozen member plus its unsubscribe-token hash —
-    /// one transaction, so a half-minted send cannot exist.
+    /// delivery per frozen member — one transaction, so a
+    /// half-minted send cannot exist. Unsubscribe tokens are minted
+    /// at claim time (`app_unsubscribe_token_record`), never stored.
     pub fn app_campaign_send_approve(
         &self,
         context: &str,
         send_id: &str,
-        deliveries: &[(String, String, String, String)], // (customer_id, email, idempotency_key, token)
+        deliveries: &[(String, String, String)], // (customer_id, email, idempotency_key)
     ) -> Result<()> {
         let conn = self.conn();
         let tx =
@@ -579,15 +578,10 @@ impl RecordStore {
                 "campaign send is not awaiting approval — already decided or unknown",
             ));
         }
-        for (customer_id, email, idempotency_key, token) in deliveries {
+        for (customer_id, email, idempotency_key) in deliveries {
             tx.execute(
-                "INSERT INTO app_campaign_deliveries(context_id,send_id,customer_id,email,idempotency_key,unsubscribe_token,state,attempts,updated) VALUES(?,?,?,?,?,?, 'queued', 0, ?)",
-                params![context, send_id, customer_id, email, idempotency_key, token, now],
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO app_unsubscribe_tokens(token_hash,context_id,customer_id,send_id,created) VALUES(?,?,?,?,?)",
-                params![unsubscribe_token_hash(token), context, customer_id, send_id, now],
+                "INSERT INTO app_campaign_deliveries(context_id,send_id,customer_id,email,idempotency_key,state,attempts,updated) VALUES(?,?,?,?,?, 'queued', 0, ?)",
+                params![context, send_id, customer_id, email, idempotency_key, now],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
         }
@@ -807,8 +801,27 @@ impl RecordStore {
         .map_err(|e| Error::internal(e.to_string()))
     }
 
-    /// Every token hash minted for one send — the approve path
-    /// mirrors these into the core index.
+    /// Record one freshly minted token's hash at claim time, before
+    /// the socket opens — a message never leaves whose token would
+    /// be unredeemable. Retries mint fresh tokens; earlier hashes
+    /// stay valid.
+    pub fn app_unsubscribe_token_record(
+        &self,
+        context: &str,
+        send_id: &str,
+        customer_id: &str,
+        token_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO app_unsubscribe_tokens(token_hash,context_id,customer_id,send_id,created) VALUES(?,?,?,?,?)",
+            params![token_hash, context, customer_id, send_id, super::now()],
+        )
+        .map_err(|e| Error::internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Every token hash minted for one send.
     pub fn app_unsubscribe_hashes(&self, context: &str, send_id: &str) -> Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt = conn

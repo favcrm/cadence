@@ -37,6 +37,9 @@ enum Step {
     Suppressed(String),
     /// A submission ran; the row follows its classified outcome.
     Done(crate::platform::smtp::SmtpOutcome),
+    /// The token hash could not be durably recorded — the row was
+    /// requeued and is picked up again; nothing was submitted.
+    Requeue,
 }
 
 impl Shared {
@@ -289,19 +292,33 @@ impl Shared {
             // Counts plus a bounded masked sample: `suppressed_now`
             // shows the live suppression shadow on the frozen list
             // before the operator approves.
-            let mut suppressed_now = 0_i64;
+            // Counts from the live recomputation of the frozen base:
+            // `included` counts the base before exclusions and
+            // suppression/consent filters, `suppressed_now` is their
+            // live sum, `final` is the frozen member list.
+            let audience_show = records.app_audience_show(context, freeze)?;
+            let base = crate::store::app_audiences::AudienceBase::parse(
+                &audience_show["freeze"]["base"],
+            )
+            .map_err(|_| Error::internal("frozen audience base no longer parses"))?;
+            let exclusion = audience_show["freeze"]["exclusion_list_id"].as_str();
+            let preview =
+                records.app_audience_preview(context, &base, exclusion)?;
+            let suppressed_now = ["invalid_email", "no_consent", "unsubscribed", "suppressed"]
+                .iter()
+                .map(|k| preview["final_excluded"][k].as_i64().unwrap_or(0))
+                .sum::<i64>();
             let mut sample = Vec::new();
             for customer_id in &facts.frozen_member_ids {
-                match records.app_customer_sendable(context, customer_id)? {
-                    Sendable::Ok { email, .. } => {
-                        if sample.len() < 5 {
-                            sample.push(json!({
-                                "customer_id": customer_id,
-                                "email": masked_email(&email),
-                            }));
-                        }
+                if let Sendable::Ok { email, .. } =
+                    records.app_customer_sendable(context, customer_id)?
+                {
+                    if sample.len() < 5 {
+                        sample.push(json!({
+                            "customer_id": customer_id,
+                            "email": masked_email(&email),
+                        }));
                     }
-                    Sendable::Refused(_) => suppressed_now += 1,
                 }
             }
             Ok(json!({
@@ -322,8 +339,8 @@ impl Shared {
                     "unsubscribe_origin": facts.origin,
                 },
                 "counts": {
-                    "included": facts.frozen_member_ids.len(),
-                    "excluded": 0,
+                    "included": preview["base_count"],
+                    "excluded": preview["exclusion_count"],
                     "suppressed_now": suppressed_now,
                     "final": facts.frozen_member_ids.len(),
                     "max_recipients": facts.max_recipients,
@@ -355,6 +372,7 @@ impl Shared {
                     "send digest does not match the prepared send",
                 ));
             }
+
             if send.state != "prepared" {
                 return Err(Error::rejected(
                     "campaign send is not awaiting approval — already decided",
@@ -406,9 +424,11 @@ impl Shared {
             // witness. A lost claim races a concurrent winner only in
             // the CAS below — and only the winner's row stays live.
             self.store.crm_send_open(install, context, send_id)?;
-            // One queued row per frozen member, each with its own
-            // unsubscribe token — minted here, hashed everywhere
-            // else.
+            // One queued row per frozen member. Unsubscribe tokens
+            // are deliberately not minted here: they exist only at
+            // claim time (crm_send_row_step), hashed into the App
+            // token table and the core index before the socket
+            // opens — a raw token never touches a durable row.
             let mut deliveries = Vec::with_capacity(facts.frozen_member_ids.len());
             for customer_id in &facts.frozen_member_ids {
                 let email = match records.app_customer_sendable(context, customer_id)? {
@@ -422,7 +442,6 @@ impl Shared {
                     customer_id.clone(),
                     email,
                     delivery_idempotency_key(install, context, send_id, customer_id),
-                    mint_unsubscribe_token(),
                 ));
             }
             if let Err(error) = records.app_campaign_send_approve(context, send_id, &deliveries) {
@@ -437,11 +456,6 @@ impl Shared {
                         .crm_send_transition(install, context, send_id, "closed");
                 }
                 return Err(error);
-            }
-            // Core learns only token hashes → file locations.
-            for hash in records.app_unsubscribe_hashes(context, send_id)? {
-                self.store
-                    .crm_unsubscribe_index_add(&hash, install, context)?;
             }
             self.spawn_crm_send_worker(install, context, send_id);
             let send = records
@@ -670,6 +684,7 @@ impl Shared {
                 }
             };
             match step {
+                Step::Requeue => {}
                 Step::Suppressed(why) => {
                     records.app_campaign_delivery_finish(
                         context,
@@ -768,6 +783,44 @@ impl Shared {
         send: &crate::store::app_sends::CampaignSend,
         customer_id: &str,
     ) -> Result<Step> {
+        // Mint this attempt's unsubscribe token and land its sha256
+        // in the App token table plus the core index BEFORE any
+        // socket opens — a submitted message's token must always be
+        // redeemable. Raw tokens never reach a durable row; a retry
+        // mints a fresh one. If the hash writes fail, the row goes
+        // back to `queued` (attempt already counted by the claim)
+        // and is never submitted.
+        let token = mint_unsubscribe_token();
+        let token_hash = unsubscribe_token_hash(&token);
+        if records
+            .app_unsubscribe_token_record(context, &send.send_id, customer_id, &token_hash)
+            .and_then(|()| {
+                self.store
+                    .crm_unsubscribe_index_add(&token_hash, install, context)
+            })
+            .is_err()
+        {
+            let _ = records.app_campaign_delivery_requeue(context, &send.send_id, customer_id);
+            let attempts = records
+                .app_campaign_delivery(context, &send.send_id, customer_id)?
+                .map(|d| d.attempts)
+                .unwrap_or(DELIVERY_ATTEMPT_MAX);
+            if attempts >= DELIVERY_ATTEMPT_MAX {
+                records.app_campaign_delivery_finish(
+                    context,
+                    &send.send_id,
+                    customer_id,
+                    "failed",
+                    None,
+                    None,
+                    Some("unsubscribe token could not be recorded"),
+                    None,
+                )?;
+            }
+            // The row is already back in `queued`; the loop's next
+            // pass claims and re-mints it.
+            return Ok(Step::Requeue);
+        }
         let _custody = self
             .platform_custody_lock
             .lock()
@@ -796,11 +849,7 @@ impl Shared {
         let delivery = records
             .app_campaign_delivery(context, &send.send_id, customer_id)?
             .ok_or_else(|| Error::internal("claimed delivery vanished"))?;
-        let unsubscribe_url = format!(
-            "{}/unsubscribe/{}",
-            self.crm_send_origin()?,
-            delivery.unsubscribe_token
-        );
+        let unsubscribe_url = format!("{}/unsubscribe/{}", self.crm_send_origin()?, token);
         let rendered = records.app_content_send_bytes(
             context,
             &send.campaign_id,
