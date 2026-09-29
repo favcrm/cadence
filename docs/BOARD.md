@@ -489,10 +489,13 @@ tags; an `agent` needs a `focus` from the allowlist above and takes no
 other key. `reviews`, `risk` and each `require` are non-empty, with no
 duplicates and every `require` name defined — and never an advisory
 check. A `when` holds ≥ 1 condition; `lines_over`/`files_over` are ≥ 1
-and `paths` are non-empty repo-relative globs (no leading `/`, `..`
-segment, `\`, control character or `[`/`]`/`{`/`}`/`?` — `*` may
-appear inside a segment, `**` only as a whole segment like `ui/**` or
-`a/**/b`; slice 3 owns matching). `heavy` sits strictly
+and `paths` are non-empty entries in the same repo-relative,
+file-level glob grammar the `areas:` reader and an issue's `paths=`
+field use (`*` and `?` match inside one path segment, a `**` segment
+any number of segments, a trailing `/` everything under it — no
+leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
+control characters; validated by `areas::check_path` and, in slice 3,
+matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
 under `oversized`. And the safety floor: at least one unconditional
 rule must require an `agent` or `operator` review — a `check` is a bot
 and never satisfies the floor, even `required` (it still blocks where

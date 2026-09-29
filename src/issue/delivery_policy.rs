@@ -112,9 +112,11 @@ pub struct RiskRule {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskWhen {
-    /// Repo-relative path globs (`*` inside a segment, `**` a whole
-    /// one); slice 3 owns matching, this slice only validates the
-    /// syntax.
+    /// Repo-relative, file-level globs — the same grammar as the
+    /// `areas:` reader and `paths=` ([`crate::issue::areas::check_path`]):
+    /// `*` and `?` match inside one segment, a `**` segment any number,
+    /// a trailing `/` everything under it. Slice 3 matches them with
+    /// `areas::matches`, so the two grammars must agree.
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -190,29 +192,13 @@ struct RawSize {
 }
 
 fn err(msg: impl std::fmt::Display) -> Error {
-    Error::rejected(format!("PROJECT.md delivery: {msg}"))
-}
-
-/// A serde_yaml error can echo a rejected key or value raw; strip
-/// control characters so none reach a lint warning or a `project ls`
-/// note (newline and tab stay — they are benign formatting).
-fn yaml_err(e: impl std::fmt::Display) -> Error {
-    err(sanitized(e))
-}
-
-/// The control characters of an echoed error text escaped, newline and
-/// tab kept (benign formatting).
-fn sanitized(e: impl std::fmt::Display) -> String {
-    e.to_string()
-        .chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
-                c.escape_debug().collect()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    // Rejected section text is embedded in these messages; scrub it so
+    // a control character or a bidi/format mark can never reach a lint
+    // warning or a `project ls` note.
+    Error::rejected(format!(
+        "PROJECT.md delivery: {}",
+        crate::issue::areas::scrub(&format!("{msg}"))
+    ))
 }
 
 impl RawReview {
@@ -368,15 +354,19 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
         return Ok(None);
     }
     let (yaml, _) = parse::split_front(trimmed)?;
-    let front: Front = serde_yaml::from_str(yaml)
-        .map_err(|e| Error::rejected(format!("PROJECT.md frontmatter: {}", sanitized(e))))?;
+    let front: Front = serde_yaml::from_str(yaml).map_err(|e| {
+        Error::rejected(format!(
+            "PROJECT.md frontmatter: {}",
+            crate::issue::areas::scrub(&e.to_string())
+        ))
+    })?;
     let Some(value) = front.delivery else {
         return Ok(None);
     };
     if value.is_null() {
         return Ok(None);
     }
-    let raw: RawDelivery = serde_yaml::from_value(value).map_err(yaml_err)?;
+    let raw: RawDelivery = serde_yaml::from_value(value).map_err(err)?;
     let policy = raw.into_policy()?;
     policy.validate()?;
     Ok(Some(policy))
@@ -576,43 +566,23 @@ fn valid_app(app: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A `when.paths` entry: a repo-relative glob — non-empty, no leading
-/// `/`, no `..` segment, no `\`, no control characters and none of
-/// `[` `]` `{` `}` `?`; `*` may appear inside a segment and `**` only
-/// as a whole segment (slice 3 owns their semantics).
+/// A `when.paths` entry: the same repo-relative, file-level glob
+/// grammar `areas:` and `paths=` use — slice 3 matches with
+/// `areas::matches`, so the two must accept exactly the same strings.
+/// On top of that, an entry carrying a control or format mark is
+/// refused outright: its text would be scrubbed on display anyway,
+/// never a valid glob.
 fn check_glob(path: &str) -> Result<()> {
-    // Callers add the `PROJECT.md delivery:` prefix (and the rule index).
-    // `{path:?}` escapes it — the entry is rejected text and may carry
-    // a control character, which must never reach a lint warning or a
-    // `project ls` note raw.
-    let bad = |msg: &str| Error::rejected(format!("when.paths entry {path:?}: {msg}"));
-    if path.is_empty() {
-        return Err(bad("empty"));
-    }
-    if path.starts_with('/') {
-        return Err(bad("absolute — paths are repo-relative"));
-    }
-    if path.contains('\\') {
-        return Err(bad("a '\\' — repo-relative paths use '/'"));
-    }
-    if path.chars().any(|c| c.is_control()) {
-        return Err(bad("a control character"));
-    }
-    if path.contains('[')
-        || path.contains(']')
-        || path.contains('{')
-        || path.contains('}')
-        || path.contains('?')
-    {
-        return Err(bad("only '*' and '**' wildcards are allowed"));
-    }
-    for seg in path.split('/') {
-        if seg == ".." {
-            return Err(bad("a '..' segment"));
-        }
-        if seg.contains("**") && seg != "**" {
-            return Err(bad("'**' must be a whole path segment"));
-        }
+    crate::issue::areas::check_path(path).map_err(|e| {
+        Error::rejected(format!(
+            "when.paths {}",
+            crate::issue::areas::scrub(&e.to_string())
+        ))
+    })?;
+    if crate::issue::areas::scrub(path) != path {
+        return Err(Error::rejected(format!(
+            "when.paths entry {path:?} carries a control or format mark"
+        )));
     }
     Ok(())
 }
@@ -984,12 +954,12 @@ mod tests {
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
-                "\"\": empty",
+                "is empty",
             ),
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['/abs']}, require: [r]}]}",
-                "absolute",
+                "relative to the repo root",
             ),
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
@@ -999,17 +969,7 @@ mod tests {
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['a\\\\b']}, require: [r]}]}",
-                "a '\\'",
-            ),
-            (
-                "delivery: {reviews: {r: {kind: operator}}, \
-                           risk: [{require: [r]}, {when: {paths: ['a[bc]']}, require: [r]}]}",
-                "wildcards",
-            ),
-            (
-                "delivery: {reviews: {r: {kind: operator}}, \
-                           risk: [{require: [r]}, {when: {paths: ['a{b}']}, require: [r]}]}",
-                "wildcards",
+                "backslash",
             ),
             (
                 // A control character (a tab) in a path entry.
@@ -1017,7 +977,7 @@ mod tests {
                            risk: [{require: [r]}, {when: {paths: [\"a\\tb\"]}, require: [r]}]}",
                 "a control character",
             ),
-            // 9: the safety floor — no unconditional blocking require.
+            // 9: the safety floor — an unconditional rule must require an agent or operator review.
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, \
                            risk: [{when: {paths: [a]}, require: [r]}]}",
@@ -1101,55 +1061,84 @@ mod tests {
         }
     }
 
-    /// `when.paths` glob syntax: `*` inside a segment, `**` a whole
-    /// one — nothing else.
+    /// `when.paths` uses the same file-level glob grammar as `areas:`
+    /// and `paths=` — slice 3 matches with `areas::matches`, so both
+    /// must accept exactly the same strings.
     #[test]
-    fn glob_syntax_is_star_and_whole_segment_star_star() {
+    fn paths_use_the_areas_glob_grammar() {
+        let accepted = [
+            "src/**", "**/x.rs", "src/*.rs", "a/**/b", "*", "**", "a?b", "ui/",
+        ];
+        let refused = [
+            ("", "is empty"),
+            ("/abs", "relative to the repo root"),
+            ("~/x", "relative to the repo root"),
+            ("a//b", "empty, '.' or '..' segment"),
+            ("a/./b", "empty, '.' or '..' segment"),
+            ("a/../b", "empty, '.' or '..' segment"),
+            ("a\\b", "backslash"),
+            ("a,b", "comma"),
+            ("a#sym", "names a symbol"),
+        ];
         let parse_paths = |paths: &str| {
             parse_delivery(&format!(
                 "delivery: {{reviews: {{r: {{kind: agent, focus: general}}}}, \
                  risk: [{{require: [r]}}, {{when: {{paths: [{paths}]}}, require: [r]}}]}}"
             ))
         };
-        for (path, why) in [
-            ("'a**b'", "'**' must be a whole path segment"),
-            ("'ab**'", "'**' must be a whole path segment"),
-            ("'**b'", "'**' must be a whole path segment"),
-            ("'src/a**'", "'**' must be a whole path segment"),
-            ("'***'", "'**' must be a whole path segment"),
-            ("'a?b'", "only '*' and '**' wildcards are allowed"),
-        ] {
-            let e = parse_paths(path).unwrap_err().to_string();
-            assert!(e.contains(why), "{path} -> {e}");
-        }
-        for path in ["src/**", "**/x.rs", "src/*.rs", "a/**/b", "*", "**"] {
+        for path in accepted {
             assert!(
                 parse_paths(&format!("'{path}'")).unwrap().is_some(),
                 "{path}"
             );
         }
+        for (path, why) in refused {
+            let e = parse_paths(&format!("'{path}'")).unwrap_err().to_string();
+            assert!(e.contains(why), "{path} -> {e}");
+        }
+        // `check_glob` and `areas::check_path` agree on every entry.
+        for path in accepted
+            .iter()
+            .copied()
+            .chain(refused.iter().map(|(p, _)| *p))
+        {
+            assert_eq!(
+                check_glob(path).is_ok(),
+                crate::issue::areas::check_path(path).is_ok(),
+                "{path}"
+            );
+        }
     }
 
-    /// Rejected text never reaches an error raw — a control character
-    /// in a `paths` entry (or any section string) is escaped. YAML
-    /// refuses raw control characters at the lexer, so the direct
-    /// `check_glob`/`validate` calls stand in for the file path.
+    /// Rejected text never reaches an error raw — control characters
+    /// and bidi/format marks (U+202E & co) are scrubbed from every
+    /// error a section can produce. YAML refuses raw control
+    /// characters at the lexer, so the direct `check_glob`/`validate`
+    /// calls stand in for the file path.
     #[test]
-    fn rejected_text_is_escaped_in_errors() {
+    fn rejected_text_is_scrubbed_in_errors() {
         let e = check_glob("a\u{7}b").unwrap_err().to_string();
         assert!(e.contains("a control character"), "{e}");
-        assert!(e.chars().all(|c| !c.is_control() || c == '\n'), "{e:?}");
-        // A review name carrying a control character escapes the same.
-        let mut p = default_policy();
-        p.reviews.insert(
-            "r\u{7}".to_string(),
-            Review::Agent {
-                focus: "general".into(),
-            },
-        );
-        let e = p.validate().unwrap_err().to_string();
         assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
-        // And serde_yaml's own echo of a rejected key is sanitized.
+        // A bidi mark in a paths entry is refused, unechoed.
+        let e = check_glob("a\u{202E}b").unwrap_err().to_string();
+        assert!(!e.contains('\u{202E}'), "{e:?}");
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // A review name carrying a control or bidi character scrubs the
+        // same.
+        for name in ["r\u{7}", "r\u{202E}"] {
+            let mut p = default_policy();
+            p.reviews.insert(
+                name.to_string(),
+                Review::Agent {
+                    focus: "general".into(),
+                },
+            );
+            let e = p.validate().unwrap_err().to_string();
+            assert!(e.chars().all(|c| !c.is_control()), "{name:?}: {e:?}");
+            assert!(!e.contains('\u{202E}'), "{name:?}: {e:?}");
+        }
+        // And serde_yaml's own echo of a rejected key is scrubbed.
         let e = parse_delivery(
             "delivery: {reviews: {r: {kind: agent, focus: general}}, \
              risk: [{require: [r]}], bogus\u{7}: 1}",
