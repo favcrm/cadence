@@ -187,10 +187,15 @@
   display: grid;
   gap: 0.75rem;
   align-content: start;
+  /* A grid item defaults to min-width: auto: without this, a wide
+     descendant (e.g. a customer table) forces the whole document
+     past narrow viewports instead of scrolling internally (CAD-781 F2). */
+  min-width: 0;
 }
 
 .app-outlet-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.25rem;
   border-bottom: 1px solid var(--color-ink-700);
 }
@@ -250,6 +255,7 @@
 .crm-crumb {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.5rem;
   min-width: 0;
 }
@@ -258,6 +264,7 @@
   display: grid;
   gap: 0.75rem;
   align-content: start;
+  min-width: 0;
 }
 
 .crm-toolbar {
@@ -265,6 +272,7 @@
   align-items: center;
   gap: 0.75rem;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .crm-search {
@@ -278,6 +286,7 @@
 
 .crm-table-wrap {
   overflow-x: auto;
+  max-width: 100%;
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
   background: var(--color-ink-850);
@@ -295,6 +304,10 @@
   padding: 0.55rem 0.75rem;
   border-bottom: 1px solid var(--color-ink-700);
   vertical-align: top;
+  /* Long unbreakable tokens (emails, digests) wrap instead of
+     forcing the table — and the document — past the viewport.
+     Horizontal scrolling stays inside `.crm-table-wrap` (CAD-781 F2). */
+  overflow-wrap: anywhere;
 }
 
 .crm-table thead th {
@@ -312,12 +325,20 @@
 .crm-pager {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.75rem;
+  min-width: 0;
 }
 
 .crm-field {
   display: grid;
   gap: 0.3rem;
+  min-width: 0;
+}
+
+.crm-field .field {
+  width: 100%;
+  max-width: 100%;
 }
 
 .crm-field-row {

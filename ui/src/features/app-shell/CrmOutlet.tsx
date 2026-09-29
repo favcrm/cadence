@@ -22,6 +22,7 @@ export default function CrmOutlet({
   viewer,
   onView,
   onSelect,
+  onRecordCreated,
 }: {
   scope: HostScope;
   installationTitle: string;
@@ -32,6 +33,8 @@ export default function CrmOutlet({
   viewer: Viewer;
   onView: (view: OutletView) => void;
   onSelect: (recordId: string | null) => void;
+  /** Atomic created-record landing (list + details in one URL write). */
+  onRecordCreated?: (recordId: string) => void;
 }) {
   if (appKind === "crm") {
     return (
@@ -42,6 +45,7 @@ export default function CrmOutlet({
         recordId={recordId}
         onView={onView}
         onSelect={onSelect}
+        onRecordCreated={onRecordCreated}
       />
     );
   }

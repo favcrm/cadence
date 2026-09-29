@@ -395,6 +395,11 @@ export default function AppShell({
                   viewer={viewer}
                   onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
                   onSelect={(id) => writeQuery({ record: id })}
+                  // Created records land on list + details in ONE query
+                  // write. Two sequential writes would each start from the
+                  // stale render's href, so the second would re-apply the
+                  // first's pre-image and retain `appview=new` (CAD-781 F1).
+                  onRecordCreated={(id) => writeQuery({ appview: null, record: id })}
                 />
               )}
             </>

@@ -38,6 +38,7 @@ export default function CrmShell({
   recordId,
   onView,
   onSelect,
+  onRecordCreated,
 }: {
   scope: HostScope;
   viewer: Viewer;
@@ -45,6 +46,7 @@ export default function CrmShell({
   recordId: string | null;
   onView: (view: "list" | "new") => void;
   onSelect: (recordId: string | null) => void;
+  onRecordCreated?: (recordId: string) => void;
 }) {
   const [section, setSection] = useState<CrmSection>("customers");
   const canWrite = viewer.operator && !viewer.readOnly;
@@ -122,8 +124,13 @@ export default function CrmShell({
           scope={scope}
           viewer={viewer}
           onCreated={(id) => {
-            onView("list");
-            onSelect(id);
+            // Prefer the shell's atomic landing; the two-step fallback
+            // is only for hosts without it (and keeps stale `appview=new`).
+            if (onRecordCreated) onRecordCreated(id);
+            else {
+              onView("list");
+              onSelect(id);
+            }
           }}
           onCancel={() => onView("list")}
         />
