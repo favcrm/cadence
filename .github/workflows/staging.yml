@@ -139,9 +139,13 @@ jobs:
 
   stage:
     needs: select
+    # A skipped select job otherwise skips this job before its event condition
+    # is evaluated. Manual dispatch must still stage its explicit CI run.
     if: >
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.select.outputs.decision == 'stage')
+      !cancelled() && (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && needs.select.outputs.decision == 'stage')
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     environment: staging
