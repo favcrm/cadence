@@ -2074,3 +2074,47 @@ fn cad767_activation_failure_rolls_back_core_and_first_record() {
     assert_eq!(std::fs::read(&live_b).unwrap(), b"new b");
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 3);
 }
+
+#[test]
+fn cad767_activation_failure_removes_new_files_without_asides() {
+    let root = TempDir::new().unwrap();
+    let dir = root.path();
+    // Core and first record are absent (a core-only or partially
+    // populated target); only the second record file pre-exists.
+    let live_core = dir.join("cadence.sqlite3");
+    let live_a = dir.join("a.sqlite3");
+    let live_b = dir.join("b.sqlite3");
+    std::fs::write(&live_b, "old b").unwrap();
+    // Valid staged core and first record; the second staged file is
+    // missing, so activation fails deterministically at the second
+    // record link — after core and first record linked with no asides.
+    let new_core = dir.join("new-core.partial");
+    let new_a = dir.join("new-a.partial");
+    let missing_b = dir.join("new-b.partial");
+    std::fs::write(&new_core, "new core").unwrap();
+    std::fs::write(&new_a, "new a").unwrap();
+    let pairs = vec![
+        (new_core.clone(), live_core.clone(), vec![live_core.clone()]),
+        (new_a.clone(), live_a.clone(), vec![live_a.clone()]),
+        (missing_b.clone(), live_b.clone(), vec![live_b.clone()]),
+    ];
+
+    let err = activate_all(&pairs).unwrap_err().to_string();
+
+    assert!(err.contains("put back"), "{err}");
+    // No new live file, partial live link, or aside: core and first
+    // record absent exactly as before, second record byte-identical.
+    assert!(!live_core.exists(), "new core link left behind");
+    assert!(!live_a.exists(), "new record link left behind");
+    assert_eq!(std::fs::read(&live_b).unwrap(), b"old b");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["b.sqlite3", "new-a.partial", "new-core.partial"]
+    );
+}

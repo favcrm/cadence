@@ -50,10 +50,12 @@
 //!   staged state activates at once ([`activate_all`]: every live file
 //!   moves aside first, every staged file links in, and any failure
 //!   renames every aside back, so a returned error never leaves a partial
-//!   replacement). Record-file identity (filename, `record_identity` row)
-//!   and file schema are verified before activation; catalog binding
-//!   itself is enforced when the daemon opens each file and proves the
-//!   installation and live context per action.
+//!   replacement). Record-file identity (filename versus the file's own
+//!   `record_identity` row) and file schema are verified before
+//!   activation; the installation catalog proof itself lives in the RPC
+//!   layer (`RecordStore::open` checks identity and schema, the record
+//!   RPCs resolve the installation through the workspace catalog and
+//!   prove the live context per action).
 //! - [`before_self_update`] is the backup a self-update takes before it
 //!   swaps the binary. `cadence upgrade` (`upgrade::run`) calls it before
 //!   it installs anything or moves the link, and refuses on `Err`.
@@ -2045,8 +2047,10 @@ fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> 
 /// must never replay onto a restored file) is renamed aside under one
 /// tag; every partial is then hard-linked into place, which refuses an
 /// existing target; partials and asides are removed only after every
-/// link succeeded. Any failure renames every aside back, so a returned
-/// error leaves the previous files in place — never a partial
+/// link succeeded. Any failure first unlinks every live path this call
+/// created for a previously absent file (those have no aside to put
+/// back), then renames every aside back — so a returned error leaves the
+/// previous files in place and no new live file behind, never a partial
 /// replacement spanning core and record files. Callers stage and fully
 /// verify every partial before calling: nothing here checks content.
 /// A process crash mid-activation leaves `.replaced-*` asides behind,
@@ -2074,13 +2078,20 @@ fn activate_all(pairs: &[(PathBuf, PathBuf, Vec<PathBuf>)]) -> Result<()> {
             moved.push((old.clone(), aside));
         }
     }
+    let mut linked: Vec<PathBuf> = Vec::new();
     for (partial, live, _) in pairs {
         if let Err(e) = fs::hard_link(partial, live) {
+            for live in linked.iter().rev() {
+                if !moved.iter().any(|(from, _)| from == live) {
+                    let _ = fs::remove_file(live);
+                }
+            }
             return Err(put_back(
                 &moved,
                 format!("could not install {} ({e})", live.display()),
             ));
         }
+        linked.push(live.clone());
     }
     for (partial, _, _) in pairs {
         let _ = fs::remove_file(partial);
