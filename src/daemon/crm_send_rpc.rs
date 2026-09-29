@@ -72,6 +72,8 @@ impl Shared {
                 "customer_id",
                 "resolution",
             ],
+            "crm_send_origin_set" => &["unsubscribe_origin"],
+            "crm_send_origin_show" => &[],
             _ => return Err(Error::rejected("unknown CRM send method")),
         };
         let fields = params
@@ -81,9 +83,32 @@ impl Shared {
             if !allowed.contains(&key.as_str()) {
                 return Err(Error::rejected(format!("{key} is not a {method} field")));
             }
-            if !value.is_string() {
+            if !value.is_string()
+                && !(method == "crm_send_origin_set"
+                    && key == "unsubscribe_origin"
+                    && value.is_null())
+            {
                 return Err(Error::rejected(format!("{key} must be a string")));
             }
+        }
+        // The origin verbs are daemon-global — no installation or
+        // context on the wire.
+        if method == "crm_send_origin_set" || method == "crm_send_origin_show" {
+            return match method {
+                "crm_send_origin_set" => {
+                    let origin = match params.get("unsubscribe_origin") {
+                        Some(Value::Null) | None => None,
+                        Some(Value::String(value)) => Some(value.as_str()),
+                        _ => {
+                            return Err(Error::rejected(
+                                "unsubscribe_origin must be a string or null",
+                            ))
+                        }
+                    };
+                    self.crm_send_origin_set(origin)
+                }
+                _ => self.crm_send_origin_show(),
+            };
         }
         let install = required_str(params, "install_id")?;
         let context = required_str(params, "context_id")?;
@@ -189,16 +214,48 @@ impl Shared {
     /// isolated test rigs. Anything else refuses rather than minting
     /// dead links.
     fn crm_send_origin(&self) -> Result<String> {
-        let origin = self
-            .unsubscribe_origin
-            .clone()
-            .ok_or_else(|| Error::rejected("unsubscribe origin is not configured"))?;
+        let stored = self.store.crm_setting("unsubscribe_origin")?;
+        let origin = stored
+            .or_else(|| self.unsubscribe_origin.clone())
+            .ok_or_else(|| {
+                Error::rejected(
+                    "no unsubscribe origin is configured — set it with POST /api/crm-send/origin",
+                )
+            })?;
         if !unsubscribe_origin_valid(&origin) {
             return Err(Error::rejected(
                 "unsubscribe origin must be https, or http on a loopback host",
             ));
         }
         Ok(origin.trim_end_matches('/').to_string())
+    }
+
+    /// `crm_send_origin_set` — operator-set persisted origin. String
+    /// sets (normalized, no trailing slash), JSON null clears.
+    fn crm_send_origin_set(self: &Arc<Self>, origin: Option<&str>) -> Result<Value> {
+        let normalized = origin.map(|o| o.trim().trim_end_matches('/').to_string());
+        if let Some(value) = normalized.as_deref() {
+            if !unsubscribe_origin_configurable(value) {
+                return Err(Error::rejected(
+                    "unsubscribe origin must be https anywhere (or http on a loopback host), with no path, query, fragment or credentials, and at most 200 bytes",
+                ));
+            }
+        }
+        self.store
+            .crm_setting_set("unsubscribe_origin", normalized.as_deref(), "operator")?;
+        self.store.note_crm_send_origin(normalized.as_deref());
+        Ok(json!({"unsubscribe_origin": normalized}))
+    }
+
+    /// `crm_send_origin_show` — the effective origin (stored setting
+    /// wins over the serve option) and where it came from.
+    fn crm_send_origin_show(self: &Arc<Self>) -> Result<Value> {
+        let stored = self.store.crm_setting("unsubscribe_origin")?;
+        let effective = stored.clone().or_else(|| self.unsubscribe_origin.clone());
+        Ok(json!({
+            "unsubscribe_origin": effective,
+            "stored": stored.is_some(),
+        }))
     }
 
     /// The facts `send_digest` commits and `approve` re-verifies:
@@ -285,6 +342,7 @@ impl Shared {
                 link_revision: facts.link.link_revision,
                 link_digest: facts.link.digest.clone(),
                 max_recipients: facts.max_recipients,
+                unsubscribe_origin: facts.origin.clone(),
                 send_digest: String::new(),
             };
             draft.send_digest = send_digest(install, context, &draft);
@@ -394,6 +452,11 @@ impl Shared {
             {
                 return Err(Error::rejected(
                     "approved content changed since prepare; prepare again",
+                ));
+            }
+            if facts.origin != send.unsubscribe_origin {
+                return Err(Error::rejected(
+                    "unsubscribe origin changed since prepare; prepare again",
                 ));
             }
             if facts.frozen_digest != send.audience_digest {
@@ -637,6 +700,7 @@ impl Shared {
                         None,
                         Some(reason),
                         None,
+                        &["queued", "submitting"],
                     );
                 }
             }
@@ -695,6 +759,7 @@ impl Shared {
                         None,
                         Some(&why),
                         None,
+                        &["submitting"],
                     )?;
                 }
                 Step::Done(outcome) => match outcome {
@@ -708,6 +773,7 @@ impl Shared {
                             Some(&message),
                             None,
                             None,
+                            &["submitting"],
                         )?;
                     }
                     crate::platform::smtp::SmtpOutcome::Rejected { code, message } => {
@@ -720,6 +786,7 @@ impl Shared {
                             Some(&message),
                             None,
                             None,
+                            &["submitting"],
                         )?;
                     }
                     crate::platform::smtp::SmtpOutcome::Uncertain { message } => {
@@ -732,6 +799,7 @@ impl Shared {
                             Some(&message),
                             None,
                             None,
+                            &["submitting"],
                         )?;
                     }
                     crate::platform::smtp::SmtpOutcome::Deferred { code, message } => {
@@ -815,6 +883,7 @@ impl Shared {
                     None,
                     Some("unsubscribe token could not be recorded"),
                     None,
+                    &["queued"],
                 )?;
             }
             // The row is already back in `queued`; the loop's next
@@ -902,6 +971,7 @@ impl Shared {
                 Some(message),
                 Some("retry bound exhausted"),
                 None,
+                &["submitting"],
             )?;
         } else {
             records.app_campaign_delivery_finish(
@@ -913,6 +983,7 @@ impl Shared {
                 Some(message),
                 Some("retry scheduled"),
                 None,
+                &["submitting"],
             )?;
         }
         Ok(())
@@ -927,6 +998,29 @@ struct SendFacts {
     frozen_digest: String,
     max_recipients: i64,
     link: crate::store::crm_smtp::SmtpLink,
+}
+
+/// The stricter shape `crm_send_origin_set` stores: the base rules
+/// plus no path beyond "/", no query, fragment or userinfo, and a
+/// 200-byte bound — a minted link must stay what it looked like.
+fn unsubscribe_origin_configurable(origin: &str) -> bool {
+    if origin.len() > 200 || !unsubscribe_origin_valid(origin) {
+        return false;
+    }
+    let rest = match origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if rest.contains(['?', '#', '@']) {
+        return false;
+    }
+    match rest.find('/') {
+        None => true,
+        Some(at) => rest[at..] == *"/",
+    }
 }
 
 /// `https://` anywhere, or loopback `http://` for the isolated test

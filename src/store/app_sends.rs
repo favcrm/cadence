@@ -37,6 +37,9 @@ pub struct SendDraft {
     pub link_revision: i64,
     pub link_digest: String,
     pub max_recipients: i64,
+    /// The unsubscribe origin frozen into the digest — the links a
+    /// later origin change would strand.
+    pub unsubscribe_origin: String,
     pub send_digest: String,
 }
 
@@ -55,6 +58,7 @@ pub struct CampaignSend {
     pub link_revision: i64,
     pub link_digest: String,
     pub max_recipients: i64,
+    pub unsubscribe_origin: String,
     pub send_digest: String,
     pub state: String,
     pub close_reason: Option<String>,
@@ -125,6 +129,7 @@ pub fn send_digest(install: &str, context: &str, draft: &SendDraft) -> String {
         "link_revision": draft.link_revision,
         "link_digest": draft.link_digest,
         "max_recipients": draft.max_recipients,
+        "unsubscribe_origin": draft.unsubscribe_origin,
     }))
 }
 
@@ -172,14 +177,15 @@ fn row_send(row: &rusqlite::Row<'_>) -> rusqlite::Result<CampaignSend> {
         link_digest: row.get(10)?,
         max_recipients: row.get(11)?,
         send_digest: row.get(12)?,
-        state: row.get(13)?,
-        close_reason: row.get(14)?,
-        created: row.get(15)?,
-        approved_at: row.get(16)?,
+        unsubscribe_origin: row.get(13)?,
+        state: row.get(14)?,
+        close_reason: row.get(15)?,
+        created: row.get(16)?,
+        approved_at: row.get(17)?,
     })
 }
 
-const SEND_COLUMNS: &str = "send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,state,close_reason,created,approved_at";
+const SEND_COLUMNS: &str = "send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,unsubscribe_origin,state,close_reason,created,approved_at";
 
 fn row_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delivery> {
     Ok(Delivery {
@@ -457,6 +463,7 @@ impl RecordStore {
                 && stored.link_digest == draft.link_digest
                 && stored.max_recipients == draft.max_recipients
                 && stored.send_digest == draft.send_digest
+                && stored.unsubscribe_origin == draft.unsubscribe_origin
             {
                 tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                 return Ok(stored);
@@ -468,7 +475,7 @@ impl RecordStore {
         let now = super::now();
         let changed = tx
             .execute(
-                "INSERT INTO app_campaign_sends(context_id,send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'prepared', ?, ?)",
+                "INSERT INTO app_campaign_sends(context_id,send_id,campaign_id,request_id,content_revision,content_digest,audience_freeze_id,audience_digest,connection_id,auth_revision,link_revision,link_digest,max_recipients,send_digest,unsubscribe_origin,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'prepared', ?, ?)",
                 params![
                     context,
                     draft.send_id,
@@ -484,6 +491,7 @@ impl RecordStore {
                     draft.link_digest,
                     draft.max_recipients,
                     draft.send_digest,
+                    draft.unsubscribe_origin,
                     now,
                     now
                 ],
@@ -686,8 +694,9 @@ impl RecordStore {
         Ok(())
     }
 
-    /// Terminal/suppression state on one delivery, with the SMTP
-    /// evidence or the refusal reason recorded beside it.
+    /// Terminal/suppression state on one delivery, compare-and-set:
+    /// the row must sit in one of `from` — otherwise this is a stale
+    /// writer racing a finish that already landed, and it refuses.
     #[allow(clippy::too_many_arguments)]
     pub fn app_campaign_delivery_finish(
         &self,
@@ -699,17 +708,47 @@ impl RecordStore {
         smtp_message: Option<&str>,
         reason: Option<&str>,
         resolved_by: Option<&str>,
+        from: &[&str],
     ) -> Result<()> {
         debug_assert!(matches!(
             state,
             "accepted" | "failed" | "uncertain" | "suppressed" | "closed" | "queued" | "submitting"
         ));
+        if from.is_empty()
+            || !from
+                .iter()
+                .all(|s| matches!(*s, "queued" | "submitting" | "uncertain"))
+        {
+            return Err(Error::internal(
+                "delivery transition has no valid source states",
+            ));
+        }
+        // `from` members are whitelisted literals — safe to inline.
+        let clause = if from.len() == 1 {
+            format!("AND state='{}'", from[0])
+        } else {
+            format!(
+                "AND state IN ({})",
+                from.iter()
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         let conn = self.conn();
-        conn.execute(
-            "UPDATE app_campaign_deliveries SET state=?, smtp_code=COALESCE(?, smtp_code), smtp_message=COALESCE(?, smtp_message), reason=COALESCE(?, reason), resolved_by=COALESCE(?, resolved_by), updated=? WHERE context_id=? AND send_id=? AND customer_id=?",
-            params![state, smtp_code, smtp_message, reason, resolved_by, super::now(), context, send_id, customer_id],
-        )
-        .map_err(|e| Error::internal(e.to_string()))?;
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE app_campaign_deliveries SET state=?, smtp_code=COALESCE(?, smtp_code), smtp_message=COALESCE(?, smtp_message), reason=COALESCE(?, reason), resolved_by=COALESCE(?, resolved_by), updated=? WHERE context_id=? AND send_id=? AND customer_id=? {clause}"
+                ),
+                params![state, smtp_code, smtp_message, reason, resolved_by, super::now(), context, send_id, customer_id],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if changed != 1 {
+            return Err(Error::rejected(
+                "delivery is no longer in a state that allows this transition",
+            ));
+        }
         Ok(())
     }
 

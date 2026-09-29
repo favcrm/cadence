@@ -402,6 +402,11 @@ impl Crm {
     /// origin and a fast send interval — the shape every live-send
     /// test needs.
     fn with_ca(ca: &tempfile::TempDir, interval_ms: u64, origin: String) -> Self {
+        Self::with_ca_opt(ca, interval_ms, Some(origin))
+    }
+
+    /// Same, with the serve-opt origin unset when `None`.
+    fn with_ca_opt(ca: &tempfile::TempDir, interval_ms: u64, origin: Option<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let pm = Pm::init(&dir.path().join("pm")).unwrap();
         Self::copy_source(&dir.path().join("source"), "blog-post");
@@ -410,7 +415,7 @@ impl Crm {
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
         cadence_agent::platform::smtp::attach(&mut opts);
         opts.crm_send_interval_ms = interval_ms;
-        opts.unsubscribe_origin = Some(origin);
+        opts.unsubscribe_origin = origin;
         opts.smtp_test_ca_pem = Some(std::fs::read(ca.path().join("ca.pem")).unwrap());
         let daemon = TestDaemon::start_opts(opts);
         Self {
@@ -1947,4 +1952,201 @@ fn cad786_bounded_campaign_counts_and_no_pii_in_core() {
         .operator_rpc("crm_unsubscribe_redeem", json!({"token": token}))
         .unwrap();
     assert_eq!(out, json!({"unsubscribed": true}));
+}
+
+// ---------- concurrent resolve: exactly one winner ----------
+
+#[test]
+fn cad786_concurrent_resolves_one_wins() {
+    let rig_dir = ca();
+    let mut script: std::collections::HashMap<String, std::collections::VecDeque<Act>> =
+        Default::default();
+    script.insert("amina@example.com".into(), [Act::DropLate].into());
+    script.insert("cleo@example.com".into(), [Act::Accept].into());
+    let rig = Rig::start(rig_dir, script);
+    let crm = Crm::with_ca(&rig._dir, 10, "https://board.example".into());
+    let (install, context, _) = crm.ready(&rig); // a + c in the freeze
+    let prepared = crm.prepare(&install, &context, "launch-1", "freeze-1", "res-race");
+    let digest = prepared["send_digest"].as_str().unwrap().to_string();
+    let send_id = prepared["send"]["send_id"].as_str().unwrap().to_string();
+    crm.approve(&install, &context, &send_id, &digest);
+    assert!(wait_until(60, || {
+        crm.show(&install, &context, &send_id)["send"]["state"] == "completed"
+    }));
+
+    let mut results = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let daemon = &crm.daemon;
+            let install = &install;
+            let context = &context;
+            let send_id = &send_id;
+            handles.push(scope.spawn(move || {
+                daemon.operator_rpc(
+                    "crm_send_resolve",
+                    json!({"install_id": install, "context_id": context, "send_id": send_id,
+                        "customer_id": "customer-a", "resolution": "accepted"}),
+                )
+            }));
+        }
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+    });
+    let wins = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(wins, 1, "expected exactly one winning resolve: {results:?}");
+    let shown = crm.show(&install, &context, &send_id);
+    let row = shown["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["customer_id"] == "customer-a")
+        .unwrap();
+    assert_eq!(row["state"], "accepted");
+    assert_eq!(row["resolved_by"], "operator");
+}
+
+// ---------- the persisted unsubscribe origin (item 4) ----------
+
+#[test]
+fn cad786_origin_setting_drives_prepare_and_gates() {
+    let rig_dir = ca();
+    let rig = Rig::start(rig_dir, Default::default());
+    // No serve-opt origin: prepare must refuse and name the route.
+    let crm = Crm::with_ca_opt(&rig._dir, 10, None);
+    let install = crm.install_as("orig1");
+    let context = crm.context(&install, "brand", "ctx-1");
+    crm.seed_customers(&install, &context, &[("customer-a", PROFILE_A)]);
+    crm.save_and_approve(&install, &context, "launch-1");
+    crm.freeze(&install, &context, "freeze-1", json!({"mode": "all"}), 50);
+    let err = crm
+        .daemon
+        .operator_rpc(
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "o-1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unsubscribe origin") && err.contains("/api/crm-send/origin"),
+        "{err}"
+    );
+
+    // Agent and detached child cannot set the origin.
+    crm.daemon.register("send-gate");
+    assert!(crm
+        .daemon
+        .agent_rpc(
+            "send-gate",
+            "crm_send_origin_set",
+            json!({"unsubscribe_origin": "https://unsub.example.com"}),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("operator action"));
+    let mut lane = LaneShell::spawn(crm.daemon.dir.path());
+    plant_member_pane(&crm.daemon, "send-peer", "claude", None, lane.pid());
+    let frame = native(
+        &mut lane,
+        &crm.daemon.state,
+        true,
+        "crm_send_origin_set",
+        json!({"unsubscribe_origin": "https://unsub.example.com"}),
+    );
+    assert_eq!(frame["ok"], false, "{frame}");
+
+    // Invalid origins refuse — every shape the validator forbids.
+    for bad in [
+        "http://example.com",                                // non-loopback http
+        "https://example.com/x",                             // path
+        "https://example.com/?q=1",                          // query
+        "https://user@example.com",                          // userinfo
+        "https://example.com/#frag",                         // fragment
+        "ftp://example.com",                                 // scheme
+        &format!("https://{}.example.com", "a".repeat(300)), // >200 bytes
+        "https://example.com",                               // placeholder replaced below
+    ] {
+        if bad == "https://example.com" {
+            continue;
+        }
+        assert!(
+            crm.daemon
+                .operator_rpc("crm_send_origin_set", json!({"unsubscribe_origin": bad}),)
+                .is_err(),
+            "{bad} accepted"
+        );
+    }
+    let shown = crm
+        .daemon
+        .operator_rpc("crm_send_origin_show", json!({}))
+        .unwrap();
+    assert_eq!(shown["unsubscribe_origin"], Value::Null);
+    assert_eq!(shown["stored"], false);
+
+    // Set → show reflects the normalized value; bind + test send +
+    // prepare succeed against the rig.
+    crm.daemon
+        .operator_rpc(
+            "crm_send_origin_set",
+            json!({"unsubscribe_origin": "https://unsub.example.com/"}),
+        )
+        .unwrap();
+    let shown = crm
+        .daemon
+        .operator_rpc("crm_send_origin_show", json!({}))
+        .unwrap();
+    assert_eq!(
+        shown["unsubscribe_origin"], "https://unsub.example.com",
+        "trailing slash normalized"
+    );
+    let connection = crm.enroll("smtp-orig1", rig.port);
+    let connection_id = connection["id"].as_str().unwrap().to_string();
+    crm.bind(&install, &context, &connection_id, "bind-1");
+    crm.test_send(&install, &context, "launch-1");
+    let prepared = crm.prepare(&install, &context, "launch-1", "freeze-1", "o-1");
+    assert_eq!(
+        prepared["send"]["unsubscribe_origin"],
+        "https://unsub.example.com"
+    );
+    let digest = prepared["send_digest"].as_str().unwrap().to_string();
+    let send_id = prepared["send"]["send_id"].as_str().unwrap().to_string();
+
+    // Changing the origin after prepare refuses at approve — zero
+    // delivery rows minted.
+    crm.daemon
+        .operator_rpc(
+            "crm_send_origin_set",
+            json!({"unsubscribe_origin": "https://elsewhere.example.com"}),
+        )
+        .unwrap();
+    assert!(crm
+        .daemon
+        .operator_rpc(
+            "crm_send_approve",
+            json!({"install_id": install, "context_id": context, "send_id": send_id,
+                "send_digest": digest}),
+        )
+        .is_err());
+    assert_eq!(
+        crm.show(&install, &context, &send_id)["deliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // Clearing returns the setting to unset — prepare refuses again.
+    crm.daemon
+        .operator_rpc("crm_send_origin_set", json!({"unsubscribe_origin": null}))
+        .unwrap();
+    assert!(crm
+        .daemon
+        .operator_rpc(
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "o-2"}),
+        )
+        .is_err());
 }

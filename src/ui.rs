@@ -2609,7 +2609,10 @@ fn write_route(
     // CAD-786: the send verbs — operator-proof POST-only writes,
     // exactly like the daemon RPCs they relay.
     if let Some(route) = crm_send::route(path) {
-        if *method != Method::Post || route.is_read() {
+        // Origin is both: POST writes it, GET reads it (read
+        // dispatch below takes the GET).
+        let write = !route.is_read() || route.is_origin();
+        if *method != Method::Post || !write {
             send(request, err_response(405, "method not allowed"));
             return;
         }

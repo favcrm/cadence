@@ -27,6 +27,9 @@ pub(super) enum Route {
     Resolve,
     Show,
     List,
+    /// `POST /api/crm-send/origin` sets/clears the unsubscribe
+    /// origin; `GET /api/crm-send/origin` reads it.
+    Origin,
 }
 
 pub(super) fn route(path: &str) -> Option<Route> {
@@ -36,13 +39,20 @@ pub(super) fn route(path: &str) -> Option<Route> {
         "/api/crm-send/resolve" => Some(Route::Resolve),
         "/api/crm-send/show" => Some(Route::Show),
         "/api/crm-send/list" => Some(Route::List),
+        "/api/crm-send/origin" => Some(Route::Origin),
         _ => None,
     }
 }
 
 impl Route {
     pub(super) fn is_read(self) -> bool {
-        matches!(self, Self::Show | Self::List)
+        matches!(self, Self::Show | Self::List | Self::Origin)
+    }
+
+    /// `Origin` is read over GET, written over POST — dispatch
+    /// splits by method, so the method selects the meaning.
+    pub(super) fn is_origin(self) -> bool {
+        matches!(self, Self::Origin)
     }
 }
 
@@ -75,6 +85,12 @@ struct ResolveBody {
     send_id: String,
     customer_id: String,
     resolution: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginBody {
+    unsubscribe_origin: serde_json::Value,
 }
 
 fn relay(state_dir: &Path, method: &str, params: serde_json::Value) -> HttpResp {
@@ -141,6 +157,17 @@ pub(super) fn handle_write(request: &mut Request, state_dir: &Path, route: Route
             )
         }
         Route::Show | Route::List => err_response(405, "method not allowed"),
+        Route::Origin => {
+            let parsed: OriginBody = match super::parse_json(&body) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            relay(
+                state_dir,
+                "crm_send_origin_set",
+                json!({"unsubscribe_origin": parsed.unsubscribe_origin}),
+            )
+        }
     }
 }
 
@@ -176,6 +203,7 @@ pub(super) fn handle_read(
             }
             relay(state_dir, "crm_send_list", params)
         }
+        Route::Origin => relay(state_dir, "crm_send_origin_show", json!({})),
         _ => err_response(405, "method not allowed"),
     }
 }

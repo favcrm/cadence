@@ -498,16 +498,27 @@ fn cad786_send_routes_are_operator_gated() {
     }
     // A sessionless POST refuses outright — the RecipientToken class
     // must never widen to API routes.
-    let bare = common::op::request(
+    for path in ["/api/crm-send/prepare", "/api/crm-send/origin"] {
+        let bare = common::op::request(
+            "POST",
+            path,
+            &format!("127.0.0.1:{}", board.port),
+            None,
+            None,
+            "{}",
+        );
+        let (code, _, _) = common::op::raw(board.port, &bare);
+        assert_eq!(code, 403, "sessionless write admitted: {path}");
+    }
+    // Agent-replayed session on the origin write too.
+    let replay = session.request_as(
         "POST",
-        "/api/crm-send/prepare",
-        &format!("127.0.0.1:{}", board.port),
-        None,
-        None,
-        "{}",
+        "/api/crm-send/origin",
+        &json!({"unsubscribe_origin": "https://unsub.example.com"}).to_string(),
+        &common::op::seam_headers(&board.daemon.state, "agent:w1"),
     );
-    let (code, _, _) = common::op::raw(board.port, &bare);
-    assert_eq!(code, 403, "sessionless send write was admitted");
+    let (code, _, _) = common::op::raw(board.port, &replay);
+    assert_eq!(code, 403, "agent-replayed origin write admitted");
     // Unknown fields on the write bodies refuse at the schema.
     let (code, _) = board.operator(
         "POST",
@@ -618,6 +629,32 @@ fn cad786_end_to_end_over_http() {
     assert_eq!(code, 200, "{text}");
     let listed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(listed["sends"].as_array().unwrap().len(), 1);
+    // The origin routes over HTTP: GET shows the configured value,
+    // POST round-trips a change, a bad shape refuses with 400.
+    let (code, text) = board.operator("GET", "/api/crm-send/origin", "");
+    assert_eq!(code, 200, "{text}");
+    let (code, text): (u16, String) = board.operator(
+        "POST",
+        "/api/crm-send/origin",
+        &json!({"unsubscribe_origin": "https://board.unsub.example"}).to_string(),
+    );
+    assert_eq!(code, 200, "{text}");
+    let (code, text) = board.operator("GET", "/api/crm-send/origin", "");
+    assert_eq!(code, 200, "{text}");
+    let shown: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(shown["unsubscribe_origin"], "https://board.unsub.example");
+    let (code, _) = board.operator(
+        "POST",
+        "/api/crm-send/origin",
+        &json!({"unsubscribe_origin": "http://example.com/nope"}).to_string(),
+    );
+    assert_eq!(code, 400);
+    // Restore the rig origin for the unsubscribe flow below.
+    board.operator(
+        "POST",
+        "/api/crm-send/origin",
+        &json!({"unsubscribe_origin": "http://localhost"}).to_string(),
+    );
     // The real unsubscribe token from a campaign message redeems
     // over HTTP — sessionless, exactly as a recipient's browser (or
     // a one-click mail client) would send it.

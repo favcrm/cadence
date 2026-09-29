@@ -336,6 +336,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // session. Agent peers are refused without side effects.
     route("POST", "/api/session/device/code", RouteClass::Session),
     route("POST", "/api/session/device/poll", RouteClass::Session),
+    // CAD-786: the unsubscribe origin write is operator-only like
+    // every other /api/crm-send write (the class default).
+    route("POST", "/api/crm-send/origin", RouteClass::OperatorOnly),
     // CAD-786: the token in the path is the credential — the
     // recipient's browser holds no board session.
     route("POST", "/unsubscribe/*", RouteClass::RecipientToken),

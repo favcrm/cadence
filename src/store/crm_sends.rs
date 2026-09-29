@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS crm_sends(
  PRIMARY KEY(install_id,context_id,send_id));
 CREATE TABLE IF NOT EXISTS crm_unsubscribe_index(
  token_hash TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS crm_settings(
+ key TEXT PRIMARY KEY, value TEXT NOT NULL,
+ by TEXT NOT NULL, updated REAL NOT NULL);
 ";
 
 /// One core send row — the crash-reconciliation unit.
@@ -116,5 +119,58 @@ impl Store {
         )
         .optional()
         .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    /// One persisted operator setting — key/value in `crm_settings`.
+    /// `None` clears it.
+    pub fn crm_setting_set(&self, key: &str, value: Option<&str>, by: &str) -> Result<()> {
+        let conn = self.write_conn()?;
+        match value {
+            Some(value) => conn
+                .execute(
+                    "INSERT INTO crm_settings(key,value,by,updated) VALUES(?,?,?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value, by=excluded.by, updated=excluded.updated",
+                    params![key, value, by, now()],
+                )
+                .map(|_| ()),
+            None => conn
+                .execute("DELETE FROM crm_settings WHERE key=?", params![key])
+                .map(|_| ()),
+        }
+        .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    /// The current value of one persisted operator setting.
+    pub fn crm_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT value FROM crm_settings WHERE key=?",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    /// Best-effort audit for the unsubscribe origin — the origin is
+    /// public configuration, never a secret.
+    pub fn note_crm_send_origin(&self, origin: Option<&str>) {
+        let guard = match self.write_conn() {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("send origin audit event skipped: {error}");
+                return;
+            }
+        };
+        if Self::event(
+            &guard,
+            Self::DAEMON_STREAM,
+            "crm_send_origin_set",
+            json!({"unsubscribe_origin": origin}),
+        )
+        .is_err()
+        {
+            eprintln!("send origin audit event skipped: event write refused");
+        }
     }
 }
