@@ -39,9 +39,9 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   and this file. Most gates on a PR run from the PR's
   own workflow files, so review is the only control on a change to them.
   The operator decides. An agent the operator designates may prepare
-  and relay the decision; the PR's author never does. Before enqueue,
-  record the decision from an operator connection (not an agent pane or
-  endpoint):
+  the decision and relay it, but never records it, and the PR's author
+  does neither. Before enqueue, the operator records the decision from
+  an operator connection (not an agent pane or endpoint):
   `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
   A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
 
@@ -72,9 +72,11 @@ Record the evidence so that every merge can be audited:
 
   For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`.
   The `>` header lines must follow the title directly. A bare `Issue:`
-  line does not link the note to the ticket. The audit takes the result
-  from the first line under `## Verdict`, not from the title. Link the
-  note from the ticket.
+  line does not link the note to the ticket. The ticket view takes the
+  result from the title, and the audit takes it from the first line
+  under `## Verdict`. The two must say the same thing: a note titled
+  `— pass` whose section says `revise` shows as passed on the ticket.
+  Link the note from the ticket.
 - Before you enqueue, post one ticket comment for the head you enqueue.
   It lists every required verdict note, the green CI run and, for a
   `human`-class PR, the approval id.
