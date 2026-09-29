@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
 import type { AppMenu } from "../features/app-shell/CrmOutlet";
@@ -68,38 +68,39 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
           </span>
         </span>
       </div>
-      <nav className="grid gap-[3px]">
+      <nav className="grid gap-[3px]" aria-label="Primary">
         {NAV.map((item) => (
-          <Link
-            key={item.screen}
-            href={navHref(item.route)}
-            className="navlink"
-            aria-current={navMatches(screen, item.screen) ? "page" : undefined}
-          >
-            {NAV_ICONS[item.screen]}
-            {item.label}
-          </Link>
+          <Fragment key={item.screen}>
+            <Link
+              href={navHref(item.route)}
+              className="navlink"
+              aria-current={navMatches(screen, item.screen) ? "page" : undefined}
+            >
+              {NAV_ICONS[item.screen]}
+              {item.label}
+            </Link>
+            {item.screen === "apps" && appMenu && (
+              <div className="mt-[4px] mb-[2px]">
+                <div className="slabel mx-[11px] mb-[7px]">
+                  <span className="truncate" title={appMenu.title}>{appMenu.title}</span>
+                </div>
+                <nav aria-label={`${appMenu.title} sections`} className="grid gap-[2px] ml-[10px] border-l border-ink-700 pl-[6px]">
+                  {appMenu.sections.map((s) => (
+                    <Link
+                      key={s.label}
+                      href={s.href}
+                      className="navlink"
+                      aria-current={s.current ? "page" : undefined}
+                    >
+                      {s.label}
+                    </Link>
+                  ))}
+                </nav>
+              </div>
+            )}
+          </Fragment>
         ))}
       </nav>
-      {appMenu && (
-        <>
-          <div className="slabel mx-[11px] mt-[22px] mb-[7px]">
-            <span className="truncate" title={appMenu.title}>{appMenu.title}</span>
-          </div>
-          <nav aria-label={`${appMenu.title} sections`} className="grid gap-[2px] ml-[10px] border-l border-ink-700 pl-[6px]">
-            {appMenu.sections.map((s) => (
-              <Link
-                key={s.label}
-                href={s.href}
-                className="navlink"
-                aria-current={s.current ? "page" : undefined}
-              >
-                {s.label}
-              </Link>
-            ))}
-          </nav>
-        </>
-      )}
       <div className="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]">
         <span>Projects</span>
         <span className="text-[10px]">~/pm</span>

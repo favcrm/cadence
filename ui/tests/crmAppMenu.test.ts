@@ -157,6 +157,24 @@ assert(
   sidebarMenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Customers",
   "sidebar marks the current section",
 );
+// Apps > CRM > children: the verified group nests immediately under
+// the Apps item, ahead of the next top-level item (Agents).
+const primaryNav = () => host.querySelector('aside > nav[aria-label="Primary"]');
+assert(primaryNav(), "desktop primary nav renders");
+const primaryKids = () => Array.from(primaryNav()?.children ?? []);
+const appsIdx = primaryKids().findIndex(
+  (el) => el.tagName === "A" && (el.textContent ?? "").trim() === "Apps",
+);
+assert(appsIdx >= 0, "Apps item renders in the primary nav");
+const nestedGroup = primaryKids()[appsIdx + 1];
+assert(
+  nestedGroup?.tagName === "DIV" && nestedGroup.querySelector('nav[aria-label="CRM sections"]'),
+  "CRM group nests immediately under Apps",
+);
+assert(
+  (primaryKids()[appsIdx + 2]?.textContent ?? "").trim() === "Agents",
+  "Agents follows the CRM group",
+);
 // A sidebar move routes, keeps the single chat node, and follows state.
 const chatBefore = host.querySelector("[data-chat-pane]");
 assert(chatBefore, "chat pane mounts with the shell");
@@ -175,6 +193,26 @@ const phoneLinks = () =>
     ["Customers", "Segments", "Campaigns"].includes((el.textContent ?? "").trim()),
   );
 assert(phoneLinks().length === 3, "phone menu nests the CRM submenu");
+// Same hierarchy on phone: the CRM group follows the Apps cell
+// inside the main grid, ahead of Agents.
+const phoneGrid = () => host.querySelector("#mobile-navigation div.grid-cols-2");
+assert(phoneGrid(), "phone main grid renders");
+const phoneKids = () => Array.from(phoneGrid()?.children ?? []);
+const phoneAppsIdx = phoneKids().findIndex(
+  (el) => el.tagName === "A" && (el.textContent ?? "").trim() === "Apps",
+);
+assert(phoneAppsIdx >= 0, "Apps cell renders in the phone grid");
+const phoneGroup = phoneKids()[phoneAppsIdx + 1];
+assert(
+  phoneGroup?.tagName === "DIV" &&
+    phoneGroup.getAttribute("aria-label") === "CRM sections" &&
+    phoneGroup.querySelectorAll("a").length === 3,
+  "CRM group nests immediately under Apps on phone",
+);
+assert(
+  (phoneKids()[phoneAppsIdx + 2]?.textContent ?? "").trim() === "Agents",
+  "Agents follows the CRM group on phone",
+);
 assert(
   phoneLinks().find((el) => el.getAttribute("aria-current") === "page")?.textContent?.trim() === "Segments",
   "phone menu marks the current section",
