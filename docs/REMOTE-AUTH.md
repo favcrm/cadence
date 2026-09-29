@@ -158,24 +158,33 @@ Production flags remain off until a separate rollout approves them.
 ## Board sign-in through the device grant (CAD-777)
 
 The same grant signs a remote operator into the board — no SSH, no
-on-host link. Configure the pair once:
+on-host link. Configure the triple once:
 
 ```sh
 cadence ui start --device-login-issuer https://your-agenticos-api.example \
-  --device-login-org ws_company
+  --device-login-org ws_company \
+  --device-login-subject op_1
 ```
 
-Both or neither (env `CADENCE_DEVICE_LOGIN_ISSUER` /
-`CADENCE_DEVICE_LOGIN_ORG` work too); the pair persists in `ui.json`
-and validates at boot. Unconfigured boards answer both routes 404.
+Issuer + org + at least one subject, or none (env
+`CADENCE_DEVICE_LOGIN_ISSUER` / `CADENCE_DEVICE_LOGIN_ORG` /
+`CADENCE_DEVICE_LOGIN_SUBJECTS` — the last comma-separated — work
+too); the triple persists in `ui.json` and validates at boot. The
+subjects are the operator's allowlist: only those verified issuer
+principals may mint a board session. Find yours with
+`cadence auth status` (it prints `principal.subject_id`); a refusal
+also names the subject it saw. Unconfigured boards answer both routes
+404.
 `POST /api/session/device/code` requests a `read draft` grant and
 returns the user code, verification link and a pending id.
 `POST /api/session/device/poll` reports `pending`/`slow_down`/
 `denied`/`expired`, and on approval verifies the credential through
 `/v1/runtime/session` (named principal, exact workspace, `read`
-scope) before the daemon mints a board session: same cookie shape as
-`/api/session`, 12 h idle / 24 h absolute, one per verified subject,
-owner-mapped. The device code stays server-side under a bounded
+scope) before the daemon mints a board session for an allowlisted
+subject only — any other verified workspace member gets
+`device_subject_not_allowed` (403, no cookie). Same cookie shape as
+`/api/session`, 12 h idle / 24 h absolute, one per verified subject.
+The device code stays server-side under a bounded
 TTL-pruned pending map; the `agc_` is verified and dropped, never
 stored or returned. Agent peers are refused without side effects, and
 an ambiguous exchange is a new code, never a retry. This signs the

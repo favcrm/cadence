@@ -747,11 +747,12 @@ impl Auth {
         })
     }
 
-    /// Open a session for a device-grant-verified owner (CAD-777).
+    /// Open a session for a device-grant-verified subject (CAD-777).
     /// The caller has already run the grant through
-    /// `device_login::verify_session` for the exact workspace: `user`
-    /// carries the verified subject as an operator-mapped [`BoardUser`]
-    /// (the grant's approver is owner by issuer rule). One session per
+    /// `device_login::verify_session` for the exact workspace AND
+    /// matched the verified subject against the operator's pinned
+    /// allowlist: `user` carries that subject as an operator-mapped
+    /// [`BoardUser`]. One session per
     /// subject — a fresh sign-in ends the earlier device session, like
     /// [`Auth::open_public`]. Lifetimes are the shorter remote bounds
     /// ([`crate::device_login::REMOTE_IDLE_SECS`] idle,
@@ -774,7 +775,7 @@ impl Auth {
         if !user.is_operator() {
             return Err(Error::invalid(
                 "invalid_request",
-                "device sessions open for a verified owner only",
+                "device sessions open for an allowlisted operator only",
             ));
         }
         self.sessions.retain(|r| {

@@ -43,10 +43,12 @@ fn rejected(message: &str) -> Error {
 
 /// The daemon-side trust pin for device sign-in (CAD-777, fix of the
 /// reviewer finding on #541): the operator-configured issuer + exact
-/// workspace, written by `ui run`/`ui start` resolve and read by the
-/// daemon at mint time. The daemon verifies the presented `agc_`
-/// against THIS pin — never against caller-supplied issuer/org — so a
-/// socket caller cannot mint a session for a forged subject.
+/// workspace + the subject allowlist, written by `ui run`/`ui start`
+/// resolve and read by the daemon at mint time. The daemon verifies
+/// the presented `agc_` against THIS pin — never against
+/// caller-supplied issuer/org — and mints only when the verified
+/// subject is on `subjects`, so a socket caller can neither choose
+/// the trust root nor mint for a principal the operator did not name.
 /// Lives at `<state>/operator/device-login.json`, `0600` in the
 /// `0700` operator directory, under the same hygiene as the secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +56,10 @@ fn rejected(message: &str) -> Error {
 pub struct DevicePin {
     pub issuer: String,
     pub org: String,
+    /// The verified issuer subjects allowed a board session — one or
+    /// a few named operators. No wildcard: an empty list fails the
+    /// pin's validation, i.e. the flow stays off.
+    pub subjects: Vec<String>,
 }
 
 const PIN_FILE: &str = "device-login.json";
@@ -61,9 +67,9 @@ const PIN_FILE: &str = "device-login.json";
 /// Record the pin. Overwrites atomically (tmp + rename); a partial
 /// write never replaces a good one.
 pub fn write_pin(state_dir: &std::path::Path, pin: &DevicePin) -> Result<()> {
-    // Validate before persisting: a bad pair fails the board at boot,
-    // never at first sign-in.
-    DeviceConfig::new(&pin.issuer, &pin.org)?;
+    // Validate before persisting: a bad triple fails the board at
+    // boot, never at first sign-in.
+    pin.check()?;
     crate::operator_auth::write_private(
         state_dir,
         PIN_FILE,
@@ -93,8 +99,50 @@ pub fn read_pin(state_dir: &std::path::Path) -> Result<DevicePin> {
         )
     })?;
     // Re-validate on read: a hand-edited file cannot widen the grant.
-    DeviceConfig::new(&pin.issuer, &pin.org)?;
+    pin.check()?;
     Ok(pin)
+}
+
+impl DevicePin {
+    /// The pin's own consistency: a valid issuer + workspace AND a
+    /// well-formed non-empty allowlist. Used by both the write and the
+    /// read path so a hand-edited file fails closed the same way.
+    fn check(&self) -> Result<()> {
+        DeviceConfig::new(&self.issuer, &self.org)?;
+        validate_subjects(&self.subjects)
+    }
+}
+
+/// At most this many named operators may sign in remotely.
+const MAX_SUBJECTS: usize = 16;
+
+/// The operator-configured subject allowlist: 1–16 ids, each under
+/// the same charset rule `validate_org` applies (the verified subject
+/// id already passes it in `parse_session`), no duplicates. An empty
+/// or malformed list is an operator error — the allowlist is the gate,
+/// never a wildcard.
+pub fn validate_subjects(subjects: &[String]) -> Result<()> {
+    if subjects.is_empty() {
+        return Err(rejected(
+            "Device login needs at least one allowlisted subject (--device-login-subject)",
+        ));
+    }
+    if subjects.len() > MAX_SUBJECTS {
+        return Err(rejected(
+            "Device login allows at most 16 subjects — name the few operators who sign in remotely",
+        ));
+    }
+    for (i, subject) in subjects.iter().enumerate() {
+        validate_org(subject).map_err(|_| {
+            rejected(
+                "Device login subjects must be workspace-style ids (letters, digits, '_' or '-')",
+            )
+        })?;
+        if subjects[..i].contains(subject) {
+            return Err(rejected("Device login subjects must not repeat"));
+        }
+    }
+    Ok(())
 }
 
 /// An issuer origin plus the exact workspace the sign-in is for.
@@ -762,6 +810,7 @@ mod tests {
         let pin = DevicePin {
             issuer: "https://issuer.example".to_string(),
             org: "ws_company".to_string(),
+            subjects: vec!["op_1".to_string()],
         };
         write_pin(dir.path(), &pin).unwrap();
         assert_eq!(read_pin(dir.path()).unwrap(), pin);
@@ -778,17 +827,60 @@ mod tests {
         )
         .unwrap();
         assert!(read_pin(dir.path()).is_err());
+        // A pin written before the allowlist existed fails closed too.
+        std::fs::write(
+            dir.path().join("operator").join("device-login.json"),
+            br#"{"issuer":"https://issuer.example","org":"ws_company"}"#,
+        )
+        .unwrap();
+        assert!(read_pin(dir.path()).is_err());
         assert!(write_pin(
             dir.path(),
             &DevicePin {
                 issuer: "http://evil.example".to_string(),
                 org: "ws_company".to_string(),
+                subjects: vec!["op_1".to_string()],
             }
         )
         .is_err());
         // Clearing removes mint authority; clearing twice is fine.
         clear_pin(dir.path()).unwrap();
         clear_pin(dir.path()).unwrap();
+        assert!(read_pin(dir.path()).is_err());
+    }
+
+    /// The subject allowlist is a list of 1–16 workspace-style ids,
+    /// never empty, never duplicated — the gate, not a wildcard.
+    #[test]
+    fn device_subjects_validate_all_or_nothing() {
+        assert!(validate_subjects(&["op_1".to_string()]).is_ok());
+        assert!(validate_subjects(&[]).is_err());
+        assert!(validate_subjects(&vec!["op_x".to_string(); 17]).is_err());
+        for bad in ["", "op 1", "op@1", "op.1"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(std::iter::once("x".repeat(201)))
+        {
+            assert!(
+                validate_subjects(std::slice::from_ref(&bad)).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(validate_subjects(&["op_1".to_string(), "op_1".to_string()]).is_err());
+        // A hand-edited pin with a bad allowlist fails closed on read.
+        let dir = pin_dir();
+        let pin = DevicePin {
+            issuer: "https://issuer.example".to_string(),
+            org: "ws_company".to_string(),
+            subjects: vec!["op_1".to_string()],
+        };
+        write_pin(dir.path(), &pin).unwrap();
+        let file = dir.path().join("operator").join("device-login.json");
+        std::fs::write(
+            &file,
+            br#"{"issuer":"https://issuer.example","org":"ws_company","subjects":[]}"#,
+        )
+        .unwrap();
         assert!(read_pin(dir.path()).is_err());
     }
 }

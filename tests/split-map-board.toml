@@ -364,6 +364,13 @@ tests = [
     "device_grant_terminal_states_settle_without_a_session",
     "device_poll_from_a_pane_is_refused_without_side_effects",
     "device_grant_for_another_workspace_settles_without_a_session",
+    "device_gate_probe",
+    "device_rpc_from_a_pane_is_refused_before_issuer_contact",
+    "device_rpc_from_a_detached_child_is_refused",
+    "device_poll_from_a_detached_child_is_refused_and_spares_the_grant",
+    "device_poll_mints_exactly_once_under_concurrent_polls",
+    "device_rpc_mints_the_issuers_subject_not_forged_fields",
+    "device_subject_off_the_allowlist_is_refused",
 ]
 helpers = [
     "jwks_stub",
@@ -375,4 +382,9 @@ helpers = [
     "session_post",
     "set_cookie_line",
     "cookie_token",
+    "device_daemon_events",
+    "device_daemon",
+    "pane_probe",
+    "start_device_board_for",
+    "device_session_count",
 ]

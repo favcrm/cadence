@@ -178,8 +178,9 @@ impl Shared {
     /// by `ui run`/`ui start` resolve) before anything is minted: the
     /// subject and workspace come out of that verification, never out
     /// of request fields, so a socket caller cannot forge them. The
-    /// grant's approver is owner by issuer rule, hence the minted
-    /// session is operator-mapped with the shorter remote lifetimes.
+    /// verified subject must then be on the pin's allowlist — the
+    /// operator named the few principals who may sign in remotely;
+    /// any other verified workspace member is refused, loudly.
     ///
     /// A connection that derives an agent is refused before any issuer
     /// contact — a browser session is never minted for a pane.
@@ -207,6 +208,27 @@ impl Shared {
             &config,
             token,
         )?;
+        // The allowlist is the operator's gate (review of #541): a
+        // verified workspace member who is not on it gets no session.
+        // The refusal echoes the subject id — ids aren't credentials,
+        // and naming it is how the operator learns what to allowlist.
+        if !pin.subjects.contains(&verified.subject_id) {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "operator_device_session_refused",
+                json!({"subject": verified.subject_id, "org": verified.org,
+                       "origin": origin.as_str()}),
+            );
+            return Err(Error::invalid(
+                "device_subject_not_allowed",
+                format!(
+                    "device sign-in refused: subject '{}' is not on this board's \
+                     device-login allowlist — add it with --device-login-subject {} \
+                     and restart the UI",
+                    verified.subject_id, verified.subject_id
+                ),
+            ));
+        }
         let user = auth::BoardUser {
             sub: verified.subject_id.clone(),
             email: String::new(),

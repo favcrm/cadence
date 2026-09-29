@@ -1518,7 +1518,12 @@ pub(super) fn device_poll(
                     None,
                 );
             }
-            let opened = client::rpc(
+            // `rpc_answer` keeps the two failures apart (CAD-384): the
+            // outer Err is transport — no daemon at the socket — and
+            // the inner one is the daemon's own refusal, which the
+            // browser reads as a sign-in refusal (403), never a
+            // retryable outage.
+            let opened = client::rpc_answer(
                 state_dir,
                 "operator_session_open_device",
                 json!({
@@ -1531,10 +1536,18 @@ pub(super) fn device_poll(
                 }),
             );
             let opened = match opened {
-                Ok(v) => v,
                 Err(e) => {
                     return coded_response(503, "daemon_unavailable", &e.to_string(), None);
                 }
+                Ok(Err(e)) => {
+                    return coded_response(
+                        403,
+                        e.code().unwrap_or("device_sign_in_refused"),
+                        &e.to_string(),
+                        None,
+                    );
+                }
+                Ok(Ok(v)) => v,
             };
             let token = opened["token"].as_str().unwrap_or_default().to_string();
             let key = opened["key"].as_str().unwrap_or_default();
