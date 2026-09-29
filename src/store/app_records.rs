@@ -27,7 +27,9 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const RECORDS_DIR: &str = "app-records";
-const FILE_SCHEMA: i64 = 1;
+/// Schema version of each per-installation record file. Backup manifests
+/// bind this per file; restore refuses a newer version than this binary.
+pub const FILE_SCHEMA: i64 = 1;
 
 pub const RECORD_BODY_BYTES: usize = 16 * 1024;
 pub const RECORD_LIMIT: i64 = 100;
