@@ -1078,13 +1078,13 @@ impl Store {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TextArtifact {
+pub(super) struct TextArtifact {
     media_type: String,
     text: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
-enum LocalResult {
+pub(super) enum LocalResult {
     #[serde(rename = "produce_text")]
     Produce {
         schema: u32,
@@ -1112,45 +1112,106 @@ enum LocalResult {
     },
 }
 
-/// Pi sometimes surrounds its final material envelope with explanatory
-/// prose. Accept only a standalone, single JSON fence in that case; never
-/// search arbitrary prose for the first parseable object. The decoded result
-/// still passes the active-turn, pinned-run, artifact and review checks below.
-fn parse_local_result_text(text: &str) -> Option<LocalResult> {
-    if let Ok(result) = serde_json::from_str::<LocalResult>(text) {
-        return Some(result);
-    }
-    // A max-size artifact can expand when JSON-escaped. Bound the alternate
-    // path before scanning or allocating; raw JSON retains its old behavior.
-    if text.len() > ARTIFACT_BYTES * 6 + 64 * 1024 {
-        return None;
-    }
-    let mut opening = None;
-    let mut closing = None;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let marker = line.trim_end_matches(['\r', '\n']);
-        match marker {
-            "```json" if opening.is_none() && closing.is_none() => {
-                opening = Some((offset, offset + line.len()));
+/// Bound applied before either parse path below. A max-size artifact can
+/// expand when JSON-escaped, so the raw final text may legitimately exceed
+/// `ARTIFACT_BYTES` by several times; anything beyond this still fails closed.
+pub(super) const MAX_RESULT_TEXT_BYTES: usize = ARTIFACT_BYTES * 6 + 64 * 1024;
+
+/// Locate exactly one top-level balanced-brace object in `text`, honouring
+/// JSON string escapes. Returns `None` for zero, multiple, or unbalanced
+/// brace spans, or when a fence marker is present anywhere outside the span.
+fn extract_single_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
             }
-            "```" if opening.is_some() && closing.is_none() => {
-                closing = Some((offset, offset + line.len()));
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    spans.push((start.take().expect("brace span start"), i + 1));
+                }
             }
             _ => {}
         }
-        offset += line.len();
     }
-    let ((open_start, body_start), (body_end, close_end)) = (opening?, closing?);
-    let before = &text[..open_start];
-    let after = &text[close_end..];
-    if [before, after]
-        .iter()
-        .any(|part| part.contains("```") || part.contains('{') || part.contains('}'))
-    {
+    if in_string || depth != 0 || spans.len() != 1 {
         return None;
     }
-    serde_json::from_str::<LocalResult>(&text[body_start..body_end]).ok()
+    let (start, end) = spans[0];
+    if text[..start].contains("```") || text[end..].contains("```") {
+        return None;
+    }
+    Some(&text[start..end])
+}
+
+/// Pi sometimes surrounds its final material envelope with explanatory
+/// prose, either bare or inside one standalone `json` fence. Accept exactly
+/// one complete, bounded envelope in either form amid brace-free prose;
+/// never search prose for the first of several parseable objects. Multiple,
+/// conflicting, malformed, oversized, or extra-fence candidates fail closed.
+/// The decoded result still passes the active-turn, pinned-run, artifact and
+/// review checks below; unknown fields and forged identity are refused by
+/// the strict `LocalResult` deserialization.
+pub(super) fn parse_local_result_text(text: &str) -> Option<LocalResult> {
+    if text.len() > MAX_RESULT_TEXT_BYTES {
+        return None;
+    }
+    if text.contains("```") {
+        let mut opening = None;
+        let mut closing = None;
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let marker = line.trim_end_matches(['\r', '\n']);
+            match marker {
+                "```json" if opening.is_none() && closing.is_none() => {
+                    opening = Some((offset, offset + line.len()));
+                }
+                "```" if opening.is_some() && closing.is_none() => {
+                    closing = Some((offset, offset + line.len()));
+                }
+                _ => {}
+            }
+            offset += line.len();
+        }
+        let ((open_start, body_start), (body_end, close_end)) = (opening?, closing?);
+        let before = &text[..open_start];
+        let after = &text[close_end..];
+        if [before, after]
+            .iter()
+            .any(|part| part.contains("```") || part.contains('{') || part.contains('}'))
+        {
+            return None;
+        }
+        return serde_json::from_str::<LocalResult>(&text[body_start..body_end]).ok();
+    }
+    if let Ok(result) = serde_json::from_str::<LocalResult>(text) {
+        return Some(result);
+    }
+    serde_json::from_str::<LocalResult>(extract_single_json_object(text)?).ok()
 }
 
 impl Store {
@@ -1734,49 +1795,5 @@ impl Store {
             return Err(Error::rejected("local app runs authorize run-owned text artifacts only; account grants do not authorize app outward effects"));
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod result_envelope_tests {
-    use super::parse_local_result_text;
-
-    const PRODUCER: &str = r##"{"schema":1,"kind":"produce_text","run_id":"run-a","step_id":"s1","revision":1,"outcome":"succeeded","artifacts":[{"media_type":"text/markdown","text":"# Twelve retained posts"}]}"##;
-
-    #[test]
-    fn cad749_accepts_one_complete_fenced_result_but_no_ambiguous_or_forged_envelope() {
-        assert!(parse_local_result_text(PRODUCER).is_some());
-        let observed = format!(
-            "The source call succeeded; the broker receipt is authoritative.\n\n```json\n{PRODUCER}\n```\n\n## Scope compliance\nNo outward action."
-        );
-        assert!(parse_local_result_text(&observed).is_some());
-
-        let cases = [
-            format!("```json\n{PRODUCER}\n```\n```json\n{PRODUCER}\n```"),
-            format!("{{\"another\":true}}\n```json\n{PRODUCER}\n```"),
-            format!("```json\n{PRODUCER}\n{PRODUCER}\n```"),
-            format!("```json\n{PRODUCER}"),
-            format!("```text\n{PRODUCER}\n```"),
-            format!("```json\n{PRODUCER}\n```\n{{\"another\":true}}"),
-            format!(
-                "```json\n{}\n```",
-                PRODUCER.replace("\"schema\":1,", "\"schema\":1,\"turn_id\":\"forged\",")
-            ),
-            format!(
-                "```json\n{}\n```",
-                PRODUCER.replace("\"revision\":1", "\"revision\":1,\"revision\":2")
-            ),
-        ];
-        for (n, case) in cases.iter().enumerate() {
-            assert!(
-                parse_local_result_text(case).is_none(),
-                "accepted ambiguous or forged envelope case {n}"
-            );
-        }
-        assert!(parse_local_result_text(&format!(
-            "```json\n{PRODUCER}\n```{}",
-            "x".repeat(2 * 1024 * 1024)
-        ))
-        .is_none());
     }
 }

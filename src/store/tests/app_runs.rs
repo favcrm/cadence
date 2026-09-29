@@ -879,3 +879,101 @@ fn cad631_operator_audit_survives_revoke_while_worker_fetch_and_corruption_refus
         .unwrap();
     assert!(s.app_artifact_for_operator(artifact).is_err());
 }
+
+const CAD749_PRODUCER: &str = r##"{"schema":1,"kind":"produce_text","run_id":"run-a","step_id":"s1","revision":1,"outcome":"succeeded","artifacts":[{"media_type":"text/markdown","text":"# Twelve retained posts"}]}"##;
+
+fn cad749_parse(text: &str) -> bool {
+    super::super::app_runs::parse_local_result_text(text).is_some()
+}
+
+#[test]
+fn cad749_accepts_one_bounded_bare_or_fenced_envelope_amid_prose() {
+    use super::super::app_runs::MAX_RESULT_TEXT_BYTES;
+    assert!(cad749_parse(CAD749_PRODUCER));
+    // Bare envelope with trailing whitespace is still one envelope.
+    assert!(cad749_parse(&format!("{CAD749_PRODUCER}  \n")));
+    // Observed Pi shape: prose / one json fence / prose.
+    assert!(cad749_parse(&format!(
+        "The source call succeeded; the broker receipt is authoritative.\n\n```json\n{CAD749_PRODUCER}\n```\n\n## Scope compliance\nNo outward action."
+    )));
+    // Prose plus one unfenced envelope is also exactly one candidate.
+    assert!(cad749_parse(&format!(
+        "The source call succeeded; the broker receipt is authoritative.\n\n{CAD749_PRODUCER}\n\n## Scope compliance\nNo outward action."
+    )));
+    // Fence body with surrounding blank lines still decodes.
+    assert!(cad749_parse(&format!(
+        "Notes.\n\n```json\n\n{CAD749_PRODUCER}\n\n```\n\nDone."
+    )));
+    // Braces inside JSON strings do not create a second candidate.
+    let braces_in_string = CAD749_PRODUCER.replace(
+        "# Twelve retained posts",
+        "# Twelve retained posts {not a candidate}",
+    );
+    assert!(cad749_parse(&format!(
+        "Done.\n\n{braces_in_string}\n\nNo outward action."
+    )));
+
+    let reject = [
+        // Multiple fenced candidates.
+        format!("```json\n{CAD749_PRODUCER}\n```\n```json\n{CAD749_PRODUCER}\n```"),
+        // Bare candidate plus a fenced candidate.
+        format!("{{\"another\":true}}\n```json\n{CAD749_PRODUCER}\n```"),
+        // Two envelopes inside one fence.
+        format!("```json\n{CAD749_PRODUCER}\n{CAD749_PRODUCER}\n```"),
+        // Unclosed fence.
+        format!("```json\n{CAD749_PRODUCER}"),
+        // Wrong fence language.
+        format!("```text\n{CAD749_PRODUCER}\n```"),
+        // Fence plus trailing bare candidate.
+        format!("```json\n{CAD749_PRODUCER}\n```\n{{\"another\":true}}"),
+        // Unknown (forged identity) field.
+        format!(
+            "```json\n{}\n```",
+            CAD749_PRODUCER.replace("\"schema\":1,", "\"schema\":1,\"turn_id\":\"forged\",")
+        ),
+        // Duplicate field.
+        format!(
+            "```json\n{}\n```",
+            CAD749_PRODUCER.replace("\"revision\":1", "\"revision\":1,\"revision\":2")
+        ),
+        // Unknown field in an unfenced envelope.
+        format!(
+            "Done.\n\n{}\n\nDone.",
+            CAD749_PRODUCER.replace("\"schema\":1,", "\"schema\":1,\"turn_id\":\"forged\",")
+        ),
+        // Two unfenced candidates amid prose.
+        format!("Done.\n\n{CAD749_PRODUCER}\n\n{CAD749_PRODUCER}\n\nDone."),
+        // Stray braces in prose around one unfenced envelope.
+        format!("Done {{later}}.\n\n{CAD749_PRODUCER}\n\nDone."),
+        // Truncated envelope amid prose.
+        "Done.\n\n{\"schema\":1,\"kind\":\"produce_text\"\n\nDone.".to_string(),
+        // Stray fence marker around one unfenced envelope.
+        format!("Done.\n\n{CAD749_PRODUCER}\n\n```\nDone."),
+        // Missing envelope entirely.
+        "The source call succeeded; no envelope follows.".to_string(),
+    ];
+    for (n, case) in reject.iter().enumerate() {
+        assert!(
+            !cad749_parse(case),
+            "accepted ambiguous, conflicting, malformed, or forged envelope case {n}"
+        );
+    }
+    // Oversized input fails closed on both paths: bare with trailing
+    // whitespace, and fenced with trailing prose.
+    let oversized_bare = format!("{CAD749_PRODUCER} {}", "x".repeat(MAX_RESULT_TEXT_BYTES));
+    assert!(!cad749_parse(&oversized_bare));
+    assert!(!cad749_parse(&format!(
+        "```json\n{CAD749_PRODUCER}\n```{}",
+        "x".repeat(MAX_RESULT_TEXT_BYTES)
+    )));
+    // The bound itself still admits the largest allowed text.
+    let room = MAX_RESULT_TEXT_BYTES - CAD749_PRODUCER.len();
+    assert!(cad749_parse(&format!(
+        "{CAD749_PRODUCER}{}",
+        " ".repeat(room)
+    )));
+    assert!(!cad749_parse(&format!(
+        "{CAD749_PRODUCER}{}",
+        " ".repeat(room + 1)
+    )));
+}
