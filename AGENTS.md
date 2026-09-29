@@ -51,8 +51,10 @@ Record the evidence so that every merge can be audited:
   `cadence audit` and the ticket view recognise:
   - the file is named `<UTC>-<slug>-verdict.md`;
   - the first line is `# Verdict: <ID> — pass` (or `— revise`);
-  - it has an `Issue: <ID>` header, the PR as `#<n>`, and a line
-    `head <full-sha>`;
+  - the next line is the blockquote header `> Issue: <ID>`. A bare
+    `Issue:` line, or one that follows body text, does not link the
+    note to the ticket;
+  - the body names the PR as `#<n>` and has a line `head <full-sha>`;
   - it lists the gates run and what was read.
   Link the note from the ticket.
 - Before you enqueue, post one ticket comment for the head you enqueue.
