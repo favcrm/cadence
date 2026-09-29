@@ -14,9 +14,10 @@ import { sessionHeaders } from "../../lib/sessionKey";
  * secrets or project links ever enter this client. Authority stays
  * server-checked; drafts submitted here are recorded as operator
  * work and stay inert until the operator explicitly applies them.
- * Sender/unsubscribe material travels only as typed host-owned
- * bindings; previews render explicitly labelled preview-only
- * placeholders that final-send preparation refuses.
+ * Sender/unsubscribe material travels only as typed preview-only
+ * operator bindings; every render and test preparation is labelled
+ * preview-only and final-send preparation refuses until CAD-785/786
+ * supply host-verified evidence.
  */
 
 /** URL-bound scope: the only identity this client will use. */

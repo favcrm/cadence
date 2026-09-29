@@ -10,8 +10,11 @@ import { contentClient, type ContentBlock, type ContentScope } from "./contentCl
  * The operator drafts subject/preheader and bounded heading,
  * paragraph and button blocks; a sample name previews the approved
  * first-name token; HTML/text tabs render the exact saved revision
- * with sender material from the named binding (preview-only
- * placeholders when unnamed, bannered as such — never send-ready).
+ * with sender material from the named binding. Every binding in
+ * this ticket is operator-typed preview-only material — never
+ * send-ready — and final-send preparation refuses until CAD-785/786
+ * supply host-verified evidence; the preview banner below always
+ * shows for that reason.
  * A submitted draft offers explicit Apply (new revision, approval
  * invalidated) or Discard (no change); submissions are recorded as
  * operator work, and the assistant never edits silently.
@@ -124,7 +127,7 @@ export default function CrmCompose({
           </button>
         </div>
         <label>
-          Sender binding (verified sender; empty previews placeholders)
+          Sender binding (preview-only operator material; final send refuses until CAD-785/786)
           <input
             value={bindingId}
             onChange={(e) => setBindingId(e.target.value)}
@@ -133,7 +136,8 @@ export default function CrmCompose({
         </label>
         {previewOnly && (
           <p role="note">
-            Preview-only sender placeholders — final-send preparation refuses them.
+            Preview-only sender material — final-send preparation refuses until CAD-785/786
+            supply verified evidence.
           </p>
         )}
         <label>

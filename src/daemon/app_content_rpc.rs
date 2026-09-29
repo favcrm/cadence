@@ -18,8 +18,8 @@
 //! submitted the draft, never that an assistant produced it —
 //! `assistant` attribution stays reserved for CAD-784
 //! receipt-backed writes. Sender material renders only through
-//! typed host-owned bindings; final-send preparation requires a
-//! verified (non-preview) binding. There is no agent-origin
+//! typed preview-only bindings; final-send preparation always refuses
+//! until CAD-785/786 supply host-verified evidence. There is no agent-origin
 //! edit/approve/send path: proposals, Apply, Discard, approval and
 //! send preparation all require the operator connection, so an agent
 //! caller or detached child is refused without mutation. The board

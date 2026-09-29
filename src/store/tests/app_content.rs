@@ -4,9 +4,10 @@
 //! it protects — invalid HTML/URL/token/oversize input refuses
 //! without mutation, stale and concurrent CAS writes refuse, renders
 //! derive deterministically from one exact revision, proposals are
-//! inert until Apply, Discard changes nothing, and test/final
-//! preparation share the content hash with locked host-owned sender
-//! material.
+//! inert until Apply, Discard changes nothing, test preparation
+//! shares the content hash with labelled preview-only sender
+//! material, and final-send preparation always refuses until
+//! CAD-785/786 supply host-verified evidence.
 use super::super::app_content::{Block, Draft};
 use super::super::app_records::RecordStore;
 use super::*;
@@ -202,8 +203,10 @@ fn cad782_render_is_deterministic_and_personalized() {
     assert_eq!(first["render"]["preview_only"], true);
     assert_eq!(first["render"]["send_ready"], false);
     assert_eq!(first["render"]["binding"]["binding_id"], "preview");
-    // A verified binding renders its own sender material with a
-    // distinct render digest; the content digest stays identical.
+    // A saved binding renders its own sender material with a
+    // distinct render digest, but stays preview-only: operator text
+    // is never verification, so readiness never follows the binding.
+    // The content digest stays identical.
     save_binding(
         &store,
         "bind-1",
@@ -213,7 +216,7 @@ fn cad782_render_is_deterministic_and_personalized() {
     let verified = store
         .app_content_render("ctx-1", "launch-1", None, Some("Amina"), Some("bind-1"))
         .unwrap();
-    assert_eq!(verified["render"]["preview_only"], false);
+    assert_eq!(verified["render"]["preview_only"], true);
     assert_eq!(verified["render"]["send_ready"], false);
     assert!(verified["render"]["html"]
         .as_str()
@@ -386,7 +389,10 @@ fn cad782_sender_binding_round_trip_with_cas() {
         "https://example.com/unsub",
     );
     assert_eq!(created["binding"]["revision"], 1);
-    assert_eq!(created["binding"]["preview_only"], false);
+    // Every saved binding is preview-only: operator text and domain
+    // syntax are never verification. CAD-785/786 own the verified
+    // seam; until then readiness never follows a save.
+    assert_eq!(created["binding"]["preview_only"], true);
     assert!(created["binding"]["binding_digest"]
         .as_str()
         .unwrap()
@@ -395,7 +401,8 @@ fn cad782_sender_binding_round_trip_with_cas() {
     assert_eq!(shown["binding"], created["binding"]);
     let listed = store.app_sender_binding_list("ctx-1").unwrap();
     assert_eq!(listed["bindings"].as_array().unwrap().len(), 1);
-    // `.invalid` material resolves preview-only, on either side.
+    // `.invalid` material and real-looking domains resolve identically:
+    // every saved binding is preview-only until host verification exists.
     let preview_sender = save_binding(
         &store,
         "bind-prev-a",
@@ -536,10 +543,11 @@ fn cad782_send_prepare_refuses_until_verified_binding() {
         "news@cadence.invalid",
         "https://cadence.invalid/unsub",
     );
-    // Unknown bindings, the reserved preview ID and preview-only
-    // rows all refuse final-send preparation: `.invalid` bytes can
-    // never freeze as send-ready.
-    for binding in ["bind-missing", "preview", "bind-prev"] {
+    // Final-send preparation always refuses in this ticket: unknown
+    // bindings refuse as unavailable, and every saved binding —
+    // real-looking or `.invalid` — refuses as unverified. No
+    // operator-typed byte pattern is send-ready.
+    for binding in ["bind-missing", "preview", "bind-prev", "bind-1"] {
         assert!(
             store
                 .app_content_send_prepare("ctx-1", "launch-1", binding, None)
@@ -547,22 +555,10 @@ fn cad782_send_prepare_refuses_until_verified_binding() {
             "send prepared behind {binding}"
         );
     }
-    // A verified binding prepares a send-ready payload whose sender
-    // material is the binding's — not the preview placeholders.
-    let send = store
-        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
-        .unwrap()["send"]
-        .clone();
-    assert_eq!(send["send_ready"], true);
-    assert_eq!(send["preview_only"], false);
-    assert_eq!(
-        send["sender"],
-        json!({"name": "News", "address": "news@example.com"})
-    );
-    assert!(send["html"].as_str().unwrap().contains("news@example.com"));
-    assert!(!send["html"].as_str().unwrap().contains(".invalid"));
-    // Test preparation defaults to labelled preview placeholders
-    // and is never send-ready — even behind a verified binding.
+    // Test preparation still works and is always labelled preview-only,
+    // never send-ready — behind the default placeholders and behind a
+    // named binding. The named binding changes the bytes and the
+    // digest while the content digest stands independent.
     let test = store
         .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", None)
         .unwrap()["test_send"]
@@ -570,13 +566,22 @@ fn cad782_send_prepare_refuses_until_verified_binding() {
     assert_eq!(test["preview_only"], true);
     assert_eq!(test["send_ready"], false);
     assert!(test["html"].as_str().unwrap().contains(".invalid"));
-    let test_verified = store
+    let test_named = store
         .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
         .unwrap()["test_send"]
         .clone();
-    assert_eq!(test_verified["send_ready"], false);
-    assert_eq!(test_verified["html"], send["html"]);
-    assert_eq!(test_verified["content_digest"], send["content_digest"]);
+    assert_eq!(test_named["preview_only"], true);
+    assert_eq!(test_named["send_ready"], false);
+    assert!(test_named["html"]
+        .as_str()
+        .unwrap()
+        .contains("news@example.com"));
+    assert_eq!(test_named["content_digest"], test["content_digest"]);
+    assert_ne!(test_named["payload_digest"], test["payload_digest"]);
+    // Unknown bindings refuse test preparation too.
+    assert!(store
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-missing"))
+        .is_err());
     // The test recipient shapes refuse; nothing sends here — the
     // payload is preparation only, with no SMTP credential or call.
     assert!(store
@@ -585,6 +590,83 @@ fn cad782_send_prepare_refuses_until_verified_binding() {
     assert!(store
         .app_content_test_prepare("ctx-1", "launch-1", "op@example.com<script>", None)
         .is_err());
+}
+
+#[test]
+fn cad782_operator_text_and_fictitious_connection_never_send_ready() {
+    // The operator precheck counterexample: `app_sender_binding_save`
+    // accepts arbitrary sender bytes plus an absent or fictitious
+    // connection_id, and domain syntax must not promote either to
+    // send-ready. Every variant below stays preview-only and every
+    // final-send preparation refuses.
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    let variants: Vec<(&str, Option<&str>)> = vec![
+        ("bind-none", None),
+        ("bind-fiction", Some("conn-fictitious-1")),
+        ("bind-real-conn", Some("conn-smtp-1")),
+    ];
+    for (binding, connection) in &variants {
+        let saved = store
+            .app_sender_binding_save(
+                "ctx-1",
+                binding,
+                None,
+                &binding_draft(
+                    "News",
+                    "news@example.com",
+                    "https://example.com/unsub",
+                    *connection,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            saved["binding"]["preview_only"], true,
+            "saved binding reads send-ready: {binding}"
+        );
+        let rendered = store
+            .app_content_render("ctx-1", "launch-1", None, None, Some(binding))
+            .unwrap();
+        assert_eq!(rendered["render"]["preview_only"], true);
+        assert_eq!(rendered["render"]["send_ready"], false);
+        assert!(rendered["render"]["html"]
+            .as_str()
+            .unwrap()
+            .contains("news@example.com"));
+        // The per-recipient token is still the literal placeholder
+        // marker: CAD-786 mints real tokens, never this string.
+        assert!(rendered["render"]["unsubscribe_url"]
+            .as_str()
+            .unwrap()
+            .contains("token=RECIPIENT"));
+        let test = store
+            .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some(binding))
+            .unwrap()["test_send"]
+            .clone();
+        assert_eq!(test["preview_only"], true);
+        assert_eq!(test["send_ready"], false);
+        assert!(
+            store
+                .app_content_send_prepare("ctx-1", "launch-1", binding, None)
+                .is_err(),
+            "final send prepared behind operator text: {binding}"
+        );
+    }
+    // Positive controls: the default preview placeholders render
+    // labelled preview-only, and saved bindings stay readable and
+    // listable as preview-only rows.
+    let preview = store
+        .app_content_render("ctx-1", "launch-1", None, Some("Amina"), None)
+        .unwrap();
+    assert_eq!(preview["render"]["preview_only"], true);
+    assert_eq!(preview["render"]["send_ready"], false);
+    assert_eq!(preview["render"]["binding"]["binding_id"], "preview");
+    let listed = store.app_sender_binding_list("ctx-1").unwrap();
+    assert_eq!(listed["bindings"].as_array().unwrap().len(), 3);
+    for binding in listed["bindings"].as_array().unwrap() {
+        assert_eq!(binding["preview_only"], true);
+    }
 }
 
 #[test]
@@ -599,12 +681,15 @@ fn cad782_binding_rotation_invalidates_send_not_content_approval() {
         "https://example.com/unsub",
     );
     store.app_content_approve("ctx-1", "launch-1", 1).unwrap();
+    // Test preparation pins the binding digest: rotating the binding
+    // changes the prepared digest while the content digest — and the
+    // content-only approval — stand. Final-send preparation refuses
+    // throughout (no verified binding exists yet), so rotation is
+    // proven through test preparation.
     let first = store
-        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
-        .unwrap()["send"]
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
+        .unwrap()["test_send"]
         .clone();
-    // Rotating the binding changes the send digest while the
-    // content digest — and the content-only approval — stand.
     store
         .app_sender_binding_save(
             "ctx-1",
@@ -619,14 +704,14 @@ fn cad782_binding_rotation_invalidates_send_not_content_approval() {
         )
         .unwrap();
     let second = store
-        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
-        .unwrap()["send"]
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
+        .unwrap()["test_send"]
         .clone();
     assert_ne!(first["payload_digest"], second["payload_digest"]);
     assert_eq!(first["content_digest"], second["content_digest"]);
     assert_eq!(
         second["sender_binding"]["revision"], 2,
-        "send did not pin the rotated binding"
+        "test prepare did not pin the rotated binding"
     );
     let shown = store.app_content_show("ctx-1", "launch-1").unwrap();
     assert_eq!(shown["content"]["approval"]["valid"], true);
@@ -658,8 +743,10 @@ fn cad782_approval_lifecycle_and_send_parity() {
         store.app_content_show("ctx-1", "launch-1").unwrap()["content"]["approval"]["valid"],
         false
     );
-    // Test-send (preview binding) and final-send (verified binding)
-    // share the content hash; sender material follows the binding.
+    // Test-send preparations behind the default and named bindings
+    // share the content hash; sender material follows the binding and
+    // every payload stays preview-only. Final-send preparation refuses
+    // until CAD-785/786 supply verified evidence.
     save_binding(
         &store,
         "bind-1",
@@ -669,15 +756,18 @@ fn cad782_approval_lifecycle_and_send_parity() {
     let test = store
         .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
         .unwrap();
-    let send = store
-        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
+    let test_default = store
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", None)
         .unwrap();
     assert_eq!(
         test["test_send"]["content_digest"],
-        send["send"]["content_digest"]
+        test_default["test_send"]["content_digest"]
     );
-    assert_eq!(test["test_send"]["html"], send["send"]["html"]);
-    assert_eq!(test["test_send"]["text"], send["send"]["text"]);
+    assert_eq!(test["test_send"]["preview_only"], true);
+    assert_eq!(test["test_send"]["send_ready"], false);
+    assert!(store
+        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
+        .is_err());
     assert!(test["test_send"]["headers"]["List-Unsubscribe"]
         .as_str()
         .unwrap()
@@ -754,7 +844,9 @@ fn cad782_contexts_and_installs_are_isolated() {
     let other = content_file(&dir, "install-b");
     assert!(other.app_content_show("ctx-1", "launch-1").is_err());
     // Sender bindings are scoped the same way: ctx-1's binding is
-    // unusable from ctx-2 and vice versa.
+    // unusable from ctx-2 and vice versa. (Final-send preparation
+    // refuses everywhere in this ticket; the cross-context refusal
+    // below holds independently of that gate.)
     save_binding(
         &store,
         "bind-1",

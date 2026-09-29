@@ -10,15 +10,18 @@
 //!
 //! The same exact revision renders deterministic sanitized
 //! email-compatible HTML and a plain-text alternative. Sender
-//! identity and unsubscribe material come from a typed host-owned
-//! sender binding bound into the payload digest — never editable
-//! blocks. Until a verified binding exists, renders and test
-//! preparations carry explicitly labelled preview-only `.invalid`
-//! placeholders that final-send preparation refuses. Revisions are
+//! identity and unsubscribe material travel as typed sender bindings
+//! bound into the payload digest — never editable blocks. Every
+//! binding in this ticket is operator-typed preview-only material:
+//! no host verification exists yet, so renders and test
+//! preparations carry explicitly labelled preview-only sender bytes
+//! and final-send preparation always refuses until CAD-785 supplies
+//! a host-custodied verified connection/sender and CAD-786 supplies
+//! unsubscribe authority with per-recipient tokens. Revisions are
 //! CAS (expected-revision) with immutable attribution; content
 //! revision stays independent of sender/audience material (actual
 //! SMTP submission is CAD-785/786, which consume the binding seam).
-//! Approval pins content only; a rotated binding changes the send
+//! Approval pins content only; a rotated binding changes the test
 //! digest while content approval stands, and must be re-prepared.
 //!
 //! Drafts reach the proposal flow through operator submission and
@@ -62,11 +65,12 @@ pub const CONTENT_LIST_MAX: usize = 100;
 /// Preview-only sender identity and unsubscribe/footer material. These
 /// `.invalid` bytes are render placeholders so previews never look
 /// send-ready: they are labelled `preview_only` everywhere they
-/// appear, and final-send preparation refuses them. Verified sender
-/// material arrives as typed host-owned sender bindings (CAD-785
-/// owns the SMTP connection behind them); per-recipient unsubscribe
-/// tokens arrive with CAD-786. Preview material is never editable
-/// blocks, never operator input, never agent input.
+/// appear, and final-send preparation refuses until CAD-785/786
+/// supply host-verified material. Saved bindings are operator-typed
+/// preview-only material too — operator text and domain syntax are
+/// never verification — so every render and test preparation in this
+/// ticket is labelled preview-only. Preview material is never editable
+/// blocks, never agent input.
 pub const SENDER_NAME: &str = "Cadence CRM";
 pub const SENDER_ADDRESS: &str = "noreply@cadence.invalid";
 pub const UNSUBSCRIBE_BASE: &str = "https://cadence.invalid/unsubscribe";
@@ -439,9 +443,10 @@ fn personalize(text: &str, sample: Option<&str>) -> String {
 
 /// Sender material a render or payload is built with: either the
 /// built-in preview placeholders or one saved binding revision.
-/// The per-recipient token stays the literal `RECIPIENT` marker —
-/// CAD-786 substitutes real tokens at send time inside its own
-/// digest, never by editing frozen bytes here.
+/// Every view in this ticket is preview-only: the per-recipient token
+/// stays the literal `RECIPIENT` marker — a placeholder, never a real
+/// token — and CAD-786 substitutes real per-recipient tokens at send
+/// time inside its own digest, never by editing frozen bytes here.
 #[derive(Clone, Debug)]
 pub struct BindingView {
     pub sender_name: String,
@@ -468,18 +473,13 @@ fn unsubscribe_url(binding: &BindingView) -> String {
     format!("{}?token=RECIPIENT", binding.unsubscribe_base)
 }
 
-/// A binding is preview-only when either its sender domain or its
-/// unsubscribe host is a reserved `.invalid` placeholder. Verified
-/// bindings (CAD-785) use real domains; the check is suffix-exact
-/// so `notinvalid.example.com` never counts.
-fn binding_preview_only(sender_address: &str, unsubscribe_base: &str) -> bool {
-    let sender_invalid = sender_address
-        .rsplit('@')
-        .next()
-        .is_some_and(|domain| domain.to_lowercase().ends_with(".invalid"));
-    let host_invalid = unsubscribe_host(unsubscribe_base)
-        .is_some_and(|host| host.to_lowercase().ends_with(".invalid"));
-    sender_invalid || host_invalid
+/// Every binding in this ticket is preview-only: no host verification
+/// exists yet, so domain syntax is never consulted. CAD-785 will
+/// supply host-custodied connection identity plus verified-sender
+/// evidence and CAD-786 unsubscribe authority; until then the only
+/// honest value is `true`.
+fn binding_preview_only() -> bool {
+    true
 }
 
 fn unsubscribe_host(base: &str) -> Option<&str> {
@@ -534,8 +534,11 @@ fn reject_unsubscribe_base(base: &str) -> Result<()> {
 }
 
 fn reject_connection_id(connection: &str) -> Result<()> {
-    // Forward reference to a CAD-585 connection; bounded opaque text
-    // until that ticket types it. Never markup, never blank.
+    // Opaque operator note naming the intended CAD-785 connection.
+    // This string is never authority: no connection is resolved or
+    // verified here, so a present, absent or fictitious value changes
+    // nothing about send readiness. Bounded opaque text until CAD-785
+    // types the connection. Never markup, never blank.
     if connection.is_empty()
         || connection.len() > CONNECTION_ID_BYTES
         || connection.chars().any(char::is_control)
@@ -1025,7 +1028,7 @@ impl RecordStore {
             revision: record.revision,
             digest: record.digest.clone(),
             connection_id: record.connection_id.clone(),
-            preview_only: binding_preview_only(&record.sender_address, &record.unsubscribe_base),
+            preview_only: binding_preview_only(),
             view: BindingView {
                 sender_name: record.sender_name.clone(),
                 sender_address: record.sender_address.clone(),
@@ -1082,16 +1085,20 @@ impl RecordStore {
             "sender": {"name": record.sender_name, "address": record.sender_address},
             "unsubscribe_base": record.unsubscribe_base,
             "connection_id": record.connection_id,
-            "preview_only": binding_preview_only(&record.sender_address, &record.unsubscribe_base),
+            "preview_only": binding_preview_only(),
             "binding_digest": record.digest,
         })
     }
 
-    /// Save a typed host-owned sender binding with CAS. The binding
-    /// carries the verified sender identity (CAD-785) and the
-    /// unsubscribe authority (CAD-786); `.invalid` material resolves
-    /// `preview_only` and can never back a final send. The reserved
-    /// preview ID is unaddressable here.
+    /// Save operator-typed preview-only sender material with CAS. The
+    /// saved rows preserve the typed binding/content digest boundary
+    /// for CAD-785/786, but nothing saved here is verified: the
+    /// operator connection proves the operator typed the bytes, never
+    /// that an SMTP connection exists, that the sender is authorized,
+    /// or that the unsubscribe base carries authority. Every saved
+    /// binding resolves `preview_only: true` and final-send
+    /// preparation refuses it. The reserved preview ID is
+    /// unaddressable here.
     pub fn app_sender_binding_save(
         &self,
         context: &str,
@@ -1217,9 +1224,11 @@ impl RecordStore {
     /// Render deterministic sanitized HTML and plain text from one
     /// exact revision (current when unnamed), with sample
     /// personalization and sender material from the named binding
-    /// (preview placeholders when unnamed). Renders are labelled
-    /// `preview_only`/`send_ready: false` and are never send-ready
-    /// output, even behind a verified binding.
+    /// (preview placeholders when unnamed). Every render is labelled
+    /// `preview_only: true` / `send_ready: false` and is never
+    /// send-ready output: saved bindings are unverified operator
+    /// material, so naming one changes the bytes and the digest but
+    /// never the readiness.
     pub fn app_content_render(
         &self,
         context: &str,
@@ -1632,7 +1641,9 @@ impl RecordStore {
         // digest while the content digest — and content approval —
         // stand independent. Substituting frozen bytes outside this
         // digest (a different sender, a real unsubscribe token) is a
-        // different payload, never a silent edit.
+        // different payload, never a silent edit. In this ticket every
+        // payload is preview-only (`preview_only: true`,
+        // `send_ready: false`): no verified binding exists yet.
         let payload = json!({
             "kind": kind,
             "campaign_id": campaign,
@@ -1649,8 +1660,8 @@ impl RecordStore {
                 "connection_id": binding.connection_id,
                 "preview_only": binding.preview_only,
             },
-            "preview_only": binding.preview_only,
-            "send_ready": kind == "final" && !binding.preview_only,
+            "preview_only": true,
+            "send_ready": false,
             "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
             "unsubscribe_url": unsubscribe,
             "headers": {
@@ -1679,9 +1690,9 @@ impl RecordStore {
 
     /// Test-send preparation for one operator address: frozen content
     /// hash, same renderer as final send, sender material from the
-    /// named binding (preview placeholders when unnamed, labelled
-    /// `preview_only`, never send-ready). No SMTP submission happens
-    /// here (CAD-785/786 own delivery).
+    /// named binding (preview placeholders when unnamed, always
+    /// labelled `preview_only: true`, never send-ready). No SMTP
+    /// submission happens here (CAD-785/786 own delivery).
     pub fn app_content_test_prepare(
         &self,
         context: &str,
@@ -1702,28 +1713,27 @@ impl RecordStore {
         )
     }
 
-    /// Final-send preparation freezes the content hash plus the
-    /// audience freeze digest plus the sender binding digest. The
-    /// binding is required and must be verified: unknown bindings
-    /// and preview-only placeholders refuse — `.invalid` bytes can
-    /// never be frozen as send-ready. Still no SMTP submission.
+    /// Final-send preparation always refuses in this ticket: no
+    /// verified sender binding exists yet. A named saved binding only
+    /// proves the operator typed sender bytes — never a host-custodied
+    /// CAD-785 connection, a verified sender, or CAD-786 unsubscribe
+    /// authority — and domain syntax is not verification, so a
+    /// real-looking address, an absent connection_id and a fictitious
+    /// connection_id all refuse identically. Unknown bindings refuse
+    /// as unavailable before this gate. CAD-785/786 supply the trusted
+    /// evidence and the refusal lifts there. Still no SMTP submission.
     pub fn app_content_send_prepare(
         &self,
         context: &str,
-        campaign: &str,
+        _campaign: &str,
         binding_id: &str,
-        audience_freeze_id: Option<&str>,
+        _audience_freeze_id: Option<&str>,
     ) -> Result<Value> {
         let conn = self.conn();
-        let binding = self.resolve_binding(&conn, context, Some(binding_id))?;
-        if binding.preview_only {
-            return Err(Error::rejected(
-                "email sender binding is preview-only; bind a verified sender before preparing a send",
-            ));
-        }
-        Ok(
-            json!({"send": self.send_payload(&conn, &SendPrep { context, campaign, kind: "final", to_email: None, audience_freeze_id, binding: &binding })?}),
-        )
+        let _binding = self.resolve_binding(&conn, context, Some(binding_id))?;
+        Err(Error::rejected(
+            "email final-send preparation is unavailable until CAD-785 supplies a verified sender connection and CAD-786 supplies unsubscribe authority",
+        ))
     }
 }
 

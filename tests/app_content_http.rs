@@ -232,13 +232,16 @@ fn cad782_http_content_roundtrip_matches_rpc() {
         .unwrap()
         .contains("Hello Amina"));
 
-    // A verified sender binding backs preparations over HTTP too.
+    // Saved sender material stays preview-only over HTTP too: the row
+    // round-trips, test preparation behind it is labelled preview-only,
+    // and final-send preparation refuses — including behind a
+    // fictitious connection_id, which is operator text, not authority.
     let binding = b.value(
         "POST",
         &format!("{base}/sender-bindings"),
         json!({"binding_id": "bind-1", "sender_name": "News", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub"}),
     );
-    assert_eq!(binding["binding"]["preview_only"], false);
+    assert_eq!(binding["binding"]["preview_only"], true);
     let bound = b.value("GET", &format!("{base}/sender-bindings/bind-1"), json!({}));
     assert_eq!(bound["binding"], binding["binding"]);
     let listed = b.value("GET", &format!("{base}/sender-bindings/list"), json!({}));
@@ -278,32 +281,57 @@ fn cad782_http_content_roundtrip_matches_rpc() {
         200,
         "binding-less send-prepare admitted"
     );
-    // Test-send and final-send preparation share the content hash
-    // behind the same verified binding.
+    // Test-send preparation behind the named binding shares the content
+    // hash and stays labelled preview-only. Final-send preparation
+    // refuses at the daemon — with a saved binding, a fictitious
+    // connection, and a missing binding alike — until CAD-785/786
+    // supply host-verified evidence.
     let test = b.value(
         "POST",
         &format!("{base}/campaigns/launch-1/test-prepare"),
         json!({"to_email": "op@example.com", "binding_id": "bind-1"}),
     );
-    let send = b.value(
-        "POST",
-        &format!("{base}/campaigns/launch-1/send-prepare"),
+    assert_eq!(test["test_send"]["preview_only"], true);
+    assert_eq!(test["test_send"]["send_ready"], false);
+    for body in [
         json!({"binding_id": "bind-1"}),
+        json!({"binding_id": "bind-missing"}),
+    ] {
+        assert_ne!(
+            b.operator(
+                "POST",
+                &format!("{base}/campaigns/launch-1/send-prepare"),
+                &body.to_string()
+            )
+            .0,
+            200,
+            "send-prepare admitted: {body}"
+        );
+    }
+    let fiction = b.value(
+        "POST",
+        &format!("{base}/sender-bindings"),
+        json!({"binding_id": "bind-fiction", "sender_name": "News", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub", "connection_id": "conn-no-such-connection"}),
     );
-    assert_eq!(
-        test["test_send"]["content_digest"],
-        send["send"]["content_digest"]
+    assert_eq!(fiction["binding"]["preview_only"], true);
+    assert_ne!(
+        b.operator(
+            "POST",
+            &format!("{base}/campaigns/launch-1/send-prepare"),
+            &json!({"binding_id": "bind-fiction"}).to_string()
+        )
+        .0,
+        200,
+        "send prepared behind a fictitious connection"
     );
-    assert_eq!(test["test_send"]["html"], send["send"]["html"]);
-    assert_eq!(send["send"]["send_ready"], true);
     // Render over HTTP matches RPC render byte for byte, including
-    // the binding snapshot.
+    // the binding snapshot — always preview-only, never send-ready.
     let rendered_bound = b.value(
         "POST",
         &format!("{base}/campaigns/launch-1/render"),
         json!({"binding_id": "bind-1"}),
     );
-    assert_eq!(rendered_bound["render"]["preview_only"], false);
+    assert_eq!(rendered_bound["render"]["preview_only"], true);
     assert_eq!(rendered_bound["render"]["send_ready"], false);
 }
 

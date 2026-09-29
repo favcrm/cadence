@@ -235,9 +235,14 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
         )
         .unwrap();
     assert_eq!(approved["content"]["approval"]["valid"], true);
-    // A verified sender binding backs preparations; unbound and
-    // preview-only send preparation refuses.
-    w.bind(install, context_id, "bind-1");
+    // Saved sender material is preview-only operator text: the binding
+    // round-trips as a readable row, test preparation behind it shares
+    // the content hash and stays preview-only, and final-send
+    // preparation refuses — with a binding, without one, and behind a
+    // fictitious connection alike. No operator-typed byte pattern is
+    // send-ready until CAD-785/786 supply host-verified evidence.
+    let saved = w.bind(install, context_id, "bind-1");
+    assert_eq!(saved["binding"]["preview_only"], true);
     assert!(
         w.daemon
             .operator_rpc(
@@ -254,22 +259,43 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
             json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "to_email": "op@example.com", "binding_id": "bind-1"}),
         )
         .unwrap();
-    let send = w
+    assert_eq!(test["test_send"]["preview_only"], true);
+    assert_eq!(test["test_send"]["send_ready"], false);
+    assert!(test["test_send"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("news@example.com"));
+    for binding in ["bind-1", "bind-missing"] {
+        assert!(
+            w.daemon
+                .operator_rpc(
+                    "app_content_send_prepare",
+                    json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": binding}),
+                )
+                .is_err(),
+            "send prepared behind {binding}"
+        );
+    }
+    // A fictitious connection_id changes nothing: the row saves as
+    // preview-only operator text and final preparation still refuses.
+    let fiction = w
         .daemon
         .operator_rpc(
-            "app_content_send_prepare",
-            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-1"}),
+            "app_sender_binding_save",
+            json!({"install_id": install, "context_id": context_id, "binding_id": "bind-fiction", "sender_name": "News", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub", "connection_id": "conn-no-such-connection"}),
         )
         .unwrap();
-    assert_eq!(
-        test["test_send"]["content_digest"],
-        send["send"]["content_digest"]
+    assert_eq!(fiction["binding"]["preview_only"], true);
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_content_send_prepare",
+                json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-fiction"}),
+            )
+            .is_err(),
+        "send prepared behind a fictitious connection"
     );
-    assert_eq!(test["test_send"]["html"], send["send"]["html"]);
-    assert_eq!(test["test_send"]["text"], send["send"]["text"]);
-    assert_eq!(send["send"]["send_ready"], true);
-    assert_eq!(send["send"]["preview_only"], false);
-    // Rotating the binding invalidates the prepared send digest
+    // Rotating the binding invalidates the prepared test digest
     // while the content digest and content-only approval stand.
     w.daemon
         .operator_rpc(
@@ -280,17 +306,17 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
     let rotated = w
         .daemon
         .operator_rpc(
-            "app_content_send_prepare",
-            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-1"}),
+            "app_content_test_prepare",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "to_email": "op@example.com", "binding_id": "bind-1"}),
         )
         .unwrap();
     assert_ne!(
-        rotated["send"]["payload_digest"],
-        send["send"]["payload_digest"]
+        rotated["test_send"]["payload_digest"],
+        test["test_send"]["payload_digest"]
     );
     assert_eq!(
-        rotated["send"]["content_digest"],
-        send["send"]["content_digest"]
+        rotated["test_send"]["content_digest"],
+        test["test_send"]["content_digest"]
     );
     assert_eq!(
         w.show(install, context_id, "launch-1")["content"]["approval"]["valid"],
