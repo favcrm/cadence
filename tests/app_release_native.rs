@@ -2153,7 +2153,7 @@ fn cad692_existing_other_install_cannot_stage_or_retarget_accepted_material() {
 fn cad692_binding_context_and_capability_changes_refuse_waiting_and_decided_release() {
     for hold_decided in [false, true] {
         for mutation in [
-            "binding_update",
+            "binding_rebind",
             "binding_revoke",
             "context_update",
             "context_archive",
@@ -2172,29 +2172,37 @@ fn cad692_binding_context_and_capability_changes_refuse_waiting_and_decided_rele
                 );
             }
             assert!(h.items().as_array().unwrap().is_empty());
-            let (method, params) = match mutation {
-                "binding_update" => (
-                    "app_binding_update",
-                    json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"],"connection_id":h.connection}),
-                ),
-                "binding_revoke" => (
-                    "app_binding_revoke",
-                    json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
-                ),
-                "context_update" => (
-                    "app_context_update",
-                    json!({"install_id":h.install["install_id"],"context_id":c["id"],"expected_revision":c["revision"],"label":"Changed","input_defaults":{"source":format!("CONTEXT_SOURCE={B}")}}),
-                ),
-                "context_archive" => (
-                    "app_context_archive",
-                    json!({"install_id":h.install["install_id"],"context_id":c["id"],"expected_revision":c["revision"]}),
-                ),
-                _ => (
-                    "app_local_install_revoke",
-                    json!({"install_id":h.install["install_id"],"digest":h.install["digest"]}),
-                ),
-            };
-            h.daemon.operator_rpc(method, params).unwrap();
+            match mutation {
+                // A genuine rebind: revoke the old incarnation and bind the
+                // slot anew. Frozen proofs pin the old binding id, so the
+                // waiting and decided releases must refuse exactly as with
+                // a material in-place update.
+                "binding_rebind" => {
+                    h.daemon.operator_rpc("app_binding_revoke", json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]})).unwrap();
+                    h.daemon.operator_rpc("app_binding_create", json!({"install_id":h.install["install_id"],"context_id":c["id"],"slot":"publication","connection_id":h.connection,"request_id":"mutation-rebinding"})).unwrap();
+                }
+                _ => {
+                    let (method, params) = match mutation {
+                        "binding_revoke" => (
+                            "app_binding_revoke",
+                            json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
+                        ),
+                        "context_update" => (
+                            "app_context_update",
+                            json!({"install_id":h.install["install_id"],"context_id":c["id"],"expected_revision":c["revision"],"label":"Changed","input_defaults":{"source":format!("CONTEXT_SOURCE={B}")}}),
+                        ),
+                        "context_archive" => (
+                            "app_context_archive",
+                            json!({"install_id":h.install["install_id"],"context_id":c["id"],"expected_revision":c["revision"]}),
+                        ),
+                        _ => (
+                            "app_local_install_revoke",
+                            json!({"install_id":h.install["install_id"],"digest":h.install["digest"]}),
+                        ),
+                    };
+                    h.daemon.operator_rpc(method, params).unwrap();
+                }
+            }
             let attempt = h.daemon.operator_rpc("app_effect_decide", json!({"effect_id":effect["effect_id"],"digest":effect["digest"],"decision":"accept"}));
             assert!(
                 attempt.is_err(),
@@ -2220,6 +2228,30 @@ fn cad692_binding_context_and_capability_changes_refuse_waiting_and_decided_rele
             assert_eq!(h.artifact(&run)["text"], format!("Context draft: {A}"));
         }
     }
+}
+
+/// CAD-796: re-saving the identical binding is a complete no-op — same
+/// revision and receipt, the waiting release still decides and writes,
+/// and the installation approval still stands for new runs.
+#[test]
+fn cad796_identical_binding_resave_changes_nothing() {
+    let h = Release::new();
+    let c = h.context("Client A", A, "cad796-nochurn-context");
+    let binding = h.bind(&c, "cad796-nochurn-binding");
+    let run = h.complete(&c, "cad796-nochurn-run");
+    let effect = h.stage(&run, "cad796-nochurn-effect");
+    let resaved = h
+        .daemon
+        .operator_rpc(
+            "app_binding_update",
+            json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"],"connection_id":h.connection}),
+        )
+        .unwrap()["binding"]
+        .clone();
+    assert_eq!(resaved, binding);
+    assert_eq!(h.decide(&effect)["state"], "done");
+    assert_eq!(h.items().as_array().unwrap().len(), 1);
+    h.create(&c, "cad796-nochurn-after");
 }
 
 #[test]
@@ -3711,4 +3743,56 @@ fn cad692_legacy_adapter_without_typed_app_hook_refuses_without_legacy_execute()
         "typed unsupported fallback called legacy execute"
     );
     assert!(h.items().as_array().unwrap().is_empty());
+}
+
+/// CAD-796 operator workflow: revoking a bound Connection withdraws the
+/// installation's approval so execution stays closed, and operator
+/// re-approval reopens it. The daemon RPC is the authority — the board
+/// HTTP peer only relays it (covered by the existing CAD-692 stolen-session
+/// binding proofs, cited not mirrored).
+#[test]
+fn cad796_binding_revoke_withdraws_install_approval_until_reapproved() {
+    let h = Release::new();
+    let context = h.context("Client A", A, "cad796-revoke-context");
+    let binding = h.bind(&context, "cad796-revoke-binding");
+    // Baseline: an approved install with a live binding creates runs.
+    h.create(&context, "cad796-run-before");
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
+        )
+        .unwrap();
+    // Execution stays closed: new runs refuse on the withdrawn approval.
+    let create = |request: &str| {
+        h.daemon.operator_rpc(
+            "app_run_create",
+            json!({"install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                "inputs":{"subject":"Context draft","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":request,"owner_pm":OWNER}),
+        )
+    };
+    let refused = create("cad796-run-gated").unwrap_err();
+    assert!(
+        refused.to_string().contains("approval"),
+        "revoke left execution open: {refused}"
+    );
+    // A racing stale revision never lands on the revoked binding.
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_binding_revoke",
+                json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
+            )
+            .is_err(),
+        "stale revoke accepted"
+    );
+    // Operator re-approves the changed story: execution reopens.
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":h.install["install_id"],"digest":h.install["digest"]}),
+        )
+        .unwrap();
+    create("cad796-run-after").unwrap();
 }

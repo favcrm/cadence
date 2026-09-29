@@ -4,6 +4,7 @@ import {
   candidatesFor,
   declaredSlots,
   plainRequirement,
+  readinessFor,
 } from "../src/features/workspace-apps/bindingChoices";
 import type {
   AppBinding,
@@ -201,3 +202,40 @@ const freshRow = binding({ id: "bind-new" });
 equal(bindingForSlot([staleRow, freshRow], null, "publication", "sha256:current")?.id, "bind-new", "current pin first");
 equal(bindingForSlot([freshRow, staleRow], null, "publication", "sha256:current")?.id, "bind-new", "current pin either order");
 equal(bindingForSlot([staleRow], null, "publication", "sha256:current")?.id, "bind-old", "stale still visible");
+
+// Ready-to-run (CAD-796): each typed slot names its connection, health,
+// custody and approval with the next action; legacy slots stay out.
+const readyRows = readinessFor(installation(), [binding()], all, null);
+equal(readyRows.map((r) => r.slot), ["publication", "source"], "typed slots only");
+equal(readyRows[0].ready, true, "bound healthy approved slot is ready");
+equal(readyRows[0].nextAction, "Ready to run.", "ready needs nothing");
+equal(readyRows[0].connection?.id, "builtin-local", "names the bound connection");
+equal(readyRows[0].custody, true, "custody reported");
+equal(readyRows[1].ready, false, "unbound slot is not ready");
+equal(readyRows[1].nextAction, "Choose a source connection below and save it.", "missing slot action");
+const gatedRows = readinessFor({ ...installation(), approved: false }, [binding()], all, null);
+equal(gatedRows[0].ready, false, "rebind-era approval gates the run");
+equal(gatedRows[0].nextAction, "Approve the app's current version before running.", "reapproval action");
+const movedRows = readinessFor({ ...installation(), digest: "sha256:other" }, [binding()], all, null);
+equal(movedRows[0].health, "stale-bundle", "bundle move detected");
+equal(movedRows[0].nextAction, "Save the publication connection again for the current app version, then approve the app.", "stale rebind action");
+const goneRows = readinessFor(installation(), [binding({ config: { ...binding().config, connection_id: "conn-gone" } })], all, null);
+equal(goneRows[0].ready, false, "vanished connection is not ready");
+equal(goneRows[0].nextAction, "Its connection is gone — choose another publication connection below.", "gone connection action");
+const dark = localConnection();
+dark.id = "builtin-local";
+dark.status = { ...dark.status, custody_available: false };
+const darkRows = readinessFor(installation(), [binding()], [dark, sourceConnection()], null);
+equal(darkRows[0].ready, false, "unhealthy custody is not ready");
+equal(darkRows[0].nextAction, "Its connection is unhealthy — see Settings → Connections, then rebind.", "custody action");
+const revokedRows = readinessFor(installation(), [binding({ state: "revoked" })], all, null);
+equal(revokedRows[0].ready, false, "revoked binding is not ready");
+equal(revokedRows[0].nextAction, "Choose a publication connection below and save it.", "revoke rebind action");
+// A deregistered provider adapter never reads Ready, even bound and approved.
+const dereg = localConnection();
+dereg.status = { ...dereg.status, adapter_registered: false };
+const deregRows = readinessFor(installation(), [binding()], [dereg, sourceConnection()], null);
+equal(deregRows[0].health, "ok", "binding itself still resolves");
+equal(deregRows[0].registered, false, "registration reported");
+equal(deregRows[0].ready, false, "deregistered provider is not ready");
+equal(deregRows[0].nextAction, "Its connection's provider is no longer registered — see Settings → Connections, then rebind.", "registration action");

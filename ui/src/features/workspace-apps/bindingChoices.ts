@@ -142,6 +142,76 @@ export function bindingHealth(
   return "ok";
 }
 
+export interface SlotReadiness {
+  slot: string;
+  requirement: string;
+  binding: AppBinding | undefined;
+  connection: Connection | undefined;
+  health: BindingHealth;
+  custody: boolean;
+  registered: boolean;
+  approved: boolean;
+  ready: boolean;
+  nextAction: string;
+}
+
+/**
+ * The installed-App Ready-to-run checklist (CAD-796): one row per typed
+ * capability slot naming its bound connection, health, custody and whether
+ * installation approval is still in force, with the plain next action for
+ * whatever is missing, stale, revoked, unhealthy or unapproved. Legacy
+ * untyped slots never authorize an effect, so they stay out of the list.
+ */
+export function readinessFor(
+  installation: Installation,
+  bindings: AppBinding[],
+  connections: Connection[],
+  contextId: string | null,
+): SlotReadiness[] {
+  const approved = installation.approved === true;
+  return declaredSlots(installation)
+    .filter((slot) => slot.declaration !== null)
+    .map((slot) => {
+      const binding = bindingForSlot(bindings, contextId, slot.slot, installation.digest);
+      const health = bindingHealth(binding, installation.digest, connections);
+      const connection = binding
+        ? connections.find((row) => row.id === binding.config.connection_id)
+        : undefined;
+      const custody =
+        connection?.status?.manifest_status === "matched" &&
+        connection?.status?.custody_available === true;
+      // Candidate selection already requires a registered provider adapter;
+      // readiness must gate on it too, or a deregistered provider reads Ready.
+      const registered = connection?.status?.adapter_registered === true;
+      const ready = approved && health === "ok" && custody && registered;
+      const nextAction = !binding || health === "not-configured"
+        ? `Choose a ${slot.slot} connection below and save it.`
+        : health === "stale-bundle"
+          ? `Save the ${slot.slot} connection again for the current app version, then approve the app.`
+          : health === "missing-connection"
+            ? `Its connection is gone — choose another ${slot.slot} connection below.`
+            : !custody
+              ? `Its connection is unhealthy — see Settings → Connections, then rebind.`
+              : !registered
+                ? `Its connection's provider is no longer registered — see Settings → Connections, then rebind.`
+                : !approved
+                ? `Approve the app's current version before running.`
+                : `Ready to run.`;
+      return {
+        slot: slot.slot,
+        requirement: plainRequirement(slot),
+        binding,
+        connection,
+        health,
+        custody,
+        registered,
+        approved,
+        ready,
+        nextAction,
+      };
+    });
+}
+
 /** The binding for one slot in this context, preferring the current bundle's pin. */
 export function bindingForSlot(
   bindings: AppBinding[],

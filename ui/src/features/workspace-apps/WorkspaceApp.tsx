@@ -20,6 +20,7 @@ import { SourcesPanel } from "./SourcesPanel";
 import { ImageReceiptPanel, imageSubject, type VerifiedImage } from "./ImageReceiptPanel";
 import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
+import { ReadinessPanel } from "./ReadinessPanel";
 import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
@@ -785,6 +786,12 @@ export default function WorkspaceApp({
                       })}>Apply checked update</Button>
                   </div>}
                 </section>
+                <ReadinessPanel
+                  installation={data.installation}
+                  bindings={data.bindings}
+                  connections={data.connections}
+                  contextId={contextId || null}
+                />
                 <SlotBindings
                   installId={installId}
                   digest={data.installation.digest}
