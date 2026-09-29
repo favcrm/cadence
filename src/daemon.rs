@@ -21,6 +21,7 @@ mod answer_rpc;
 mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
+mod app_content_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
@@ -2820,6 +2821,21 @@ impl Shared {
             "app_audience_preview" => self.rpc_app_audience(method, params, peer_pid),
             "app_audience_prepare" => self.rpc_app_audience(method, params, peer_pid),
             "app_audience_show" => self.rpc_app_audience(method, params, peer_pid),
+            "app_sender_binding_save" => self.rpc_app_content(method, params, peer_pid),
+            "app_sender_binding_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_sender_binding_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_save" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_render" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_discard" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_approve" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_test_prepare" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_send_prepare" => self.rpc_app_content(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),

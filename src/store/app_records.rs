@@ -92,6 +92,47 @@ CREATE TABLE IF NOT EXISTS app_audience_freezes(
  member_ids TEXT NOT NULL, digest TEXT NOT NULL,
  max_recipients INTEGER NOT NULL, pins TEXT NOT NULL,
  created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id));
+CREATE TABLE IF NOT EXISTS app_content_docs(
+ context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ approval_revision INTEGER, approval_digest TEXT,
+ actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, campaign_id));
+CREATE TABLE IF NOT EXISTS app_content_revisions(
+ context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
+ proposal_id TEXT, at REAL NOT NULL,
+ PRIMARY KEY(context_id, campaign_id, revision));
+CREATE TABLE IF NOT EXISTS app_content_proposals(
+ context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
+ campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator-direct','assistant-receipt')),
+ state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+ created REAL NOT NULL, decided REAL,
+ PRIMARY KEY(context_id, proposal_id));
+CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
+CREATE TABLE IF NOT EXISTS app_sender_bindings(
+ context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
+ unsubscribe_base TEXT NOT NULL, connection_id TEXT,
+ binding_digest TEXT NOT NULL,
+ created REAL NOT NULL, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, binding_id));
+CREATE TABLE IF NOT EXISTS app_sender_binding_revisions(
+ context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
+ unsubscribe_base TEXT NOT NULL, connection_id TEXT,
+ binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, binding_id, revision));
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -393,6 +434,74 @@ impl RecordStore {
                  created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id))",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-782 versioned email content: docs, immutable
+            // revisions and assistant proposals. Idempotent forward
+            // migration like the audience tables above; the version
+            // stays 1 and older files gain empty tables.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_content_docs(
+                 context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 approval_revision INTEGER, approval_digest TEXT,
+                 actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, campaign_id));
+                 CREATE TABLE IF NOT EXISTS app_content_revisions(
+                 context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
+                 proposal_id TEXT, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, campaign_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_content_proposals(
+                 context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
+                 campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+                 created REAL NOT NULL, decided REAL,
+                 PRIMARY KEY(context_id, proposal_id));
+                 CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
+                 CREATE TABLE IF NOT EXISTS app_sender_bindings(
+                 context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
+                 unsubscribe_base TEXT NOT NULL, connection_id TEXT,
+                 binding_digest TEXT NOT NULL,
+                 created REAL NOT NULL, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, binding_id));
+                 CREATE TABLE IF NOT EXISTS app_sender_binding_revisions(
+                 context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
+                 unsubscribe_base TEXT NOT NULL, connection_id TEXT,
+                 binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, binding_id, revision))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-782 revision 2: proposals record their origin
+            // (`operator-direct`; `assistant-receipt` is reserved for
+            // CAD-784). Files created between the two landings gain
+            // the column with the only value their rows can carry.
+            // The probe classifies by code: contention retries
+            // through the bounded wait instead of misreading BUSY as
+            // a missing column and dying on a duplicate-column ALTER.
+            let needs_origin =
+                match conn.prepare("SELECT origin FROM app_content_proposals LIMIT 0") {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+            if needs_origin {
+                conn.execute_batch(
+                    "ALTER TABLE app_content_proposals ADD COLUMN origin TEXT NOT NULL DEFAULT 'operator-direct'",
+                )
+                .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            }
         }
         Ok(Self {
             install_id: install_id.to_string(),
