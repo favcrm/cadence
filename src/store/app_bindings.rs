@@ -227,13 +227,14 @@ impl Store {
                 )?;
                 let mapped = stmt.query_map(params![app, install_id], |r| {
                     let raw: String = r.get(3)?;
-                    let scopes: Vec<String> = serde_json::from_str(&raw)
-                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, raw))
                 })?;
                 let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
                 for row in mapped {
-                    rows.push(row?);
+                    let (agent, plat, account, raw): (String, String, String, String) = row?;
+                    let scopes: Vec<String> = serde_json::from_str(&raw)
+                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
+                    rows.push((agent, plat, account, scopes));
                 }
                 rows
             };
@@ -249,14 +250,15 @@ impl Store {
                     let mut stmt = tx.prepare(
                         "SELECT scopes FROM app_grants WHERE agent=? AND platform=? AND account=?",
                     )?;
-                    let mapped = stmt.query_map(params![agent, plat, account], |r| {
-                        let raw: String = r.get(0)?;
-                        serde_json::from_str::<Vec<String>>(&raw)
-                            .map_err(|_| Error::internal("derived grant receipt is corrupt"))
-                    })?;
+                    let mapped =
+                        stmt.query_map(params![agent, plat, account], |r| r.get::<_, String>(0))?;
                     let mut still: Vec<String> = Vec::new();
                     for row in mapped {
-                        still.extend(row?);
+                        let raw: String = row?;
+                        still
+                            .extend(serde_json::from_str::<Vec<String>>(&raw).map_err(|_| {
+                                Error::internal("derived grant receipt is corrupt")
+                            })?);
                     }
                     still
                 };
@@ -317,7 +319,9 @@ impl Store {
                 "SELECT install_id, id FROM app_bindings WHERE state='configured' AND json_extract(config,'$.provider')=? AND json_extract(config,'$.account')=?",
             )?;
             let mapped = stmt.query_map(params![platform_name, account], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                let install: String = r.get(0)?;
+                let binding: String = r.get(1)?;
+                Ok((install, binding))
             })?;
             let mut rows: Vec<(String, String)> = Vec::new();
             for row in mapped {
