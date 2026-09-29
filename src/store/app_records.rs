@@ -295,9 +295,13 @@ impl RecordStore {
         let digest = profile.digest(&self.install_id, context)?;
         let body = serde_json::to_string(profile).map_err(|e| Error::internal(e.to_string()))?;
         let conn = self.conn();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| Error::internal(e.to_string()))?;
+        // IMMEDIATE, not deferred: the normalized-email check below
+        // must see a racing writer's commit. A sibling create blocks
+        // on the write lock first, so exactly one ID wins an address
+        // and the loser is refused with no second live row.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
         if let Some(existing) = tx
             .query_row(
                 "SELECT body_digest FROM app_records WHERE context_id=? AND id=?",
@@ -314,6 +318,10 @@ impl RecordStore {
             tx.commit().map_err(|e| Error::internal(e.to_string()))?;
             return Ok(result);
         }
+        // One address, one live row per context: a new ID behind a
+        // held normalized email is refused, never merged. Profiles
+        // without an address skip the check.
+        Self::email_conflict_in(&tx, context, record_id, profile)?;
         let count: i64 = tx
             .query_row(
                 "SELECT count(*) FROM app_records WHERE context_id=?",
@@ -443,13 +451,18 @@ impl RecordStore {
         let digest = profile.digest(&self.install_id, context)?;
         let body = serde_json::to_string(profile).map_err(|e| Error::internal(e.to_string()))?;
         let conn = self.conn();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| Error::internal(e.to_string()))?;
+        // IMMEDIATE, like create: the normalized-email check below
+        // must see a racing writer's commit before this update lands.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
         let current = self.show_in(&tx, context, record_id)?;
         if current["revision"].as_i64() != Some(expected) {
             return Err(Error::rejected("record revision is stale"));
         }
+        // A move onto another live row's normalized email is refused,
+        // never merged; the row itself is excluded from the check.
+        Self::email_conflict_in(&tx, context, record_id, profile)?;
         let revision = expected
             .checked_add(1)
             .ok_or_else(|| Error::rejected("record revision exhausted"))?;
@@ -827,6 +840,53 @@ fn plan_row_json(row: &PlanRow) -> Value {
 }
 
 impl RecordStore {
+    /// Normalized-email conflict check inside an open write
+    /// transaction: any OTHER live row in this context holding the
+    /// profile's lowered address refuses the write. The caller holds
+    /// an IMMEDIATE transaction, so a sibling writer blocks on the
+    /// write lock and commits first — then this read sees it.
+    fn email_conflict_in(
+        tx: &rusqlite::Transaction<'_>,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+    ) -> Result<()> {
+        let Some(address) = profile.email.as_deref().map(str::to_lowercase) else {
+            return Ok(());
+        };
+        let mut stmt = tx
+            .prepare("SELECT id,body FROM app_records WHERE context_id=?")
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let found = stmt
+            .query_map([context], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::internal(e.to_string()))?;
+        for row in found {
+            let (id, body) = row.map_err(|e| Error::internal(e.to_string()))?;
+            if id == record_id {
+                continue;
+            }
+            let stored: Value = serde_json::from_str(&body).map_err(|_| {
+                Error::internal(
+                    "record profile is corrupt; restore the installation backup after inspection",
+                )
+            })?;
+            let stored = CustomerProfile::parse(&stored).map_err(|_| {
+                Error::internal(
+                    "record profile is corrupt; restore the installation backup after inspection",
+                )
+            })?;
+            let held = stored.email.as_deref().map(str::to_lowercase);
+            if held.as_deref() == Some(address.as_str()) {
+                return Err(Error::rejected(
+                    "record email is already used by another record",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn import_receipt_in(
         conn: &Connection,
         request_id: &str,
@@ -913,14 +973,15 @@ impl RecordStore {
         let mut raws: Vec<Raw> = Vec::with_capacity(data.len());
         for (number, fields) in &data {
             let mut errors: Vec<&'static str> = Vec::new();
-            let mut record_id = cell(fields, "record_id");
+            let record_id = cell(fields, "record_id");
             if fields.len() != header.len() {
-                // A ragged line keeps a derived id so the row receipt
-                // still joins back to its line.
-                record_id = format!("csv-{number:04}");
                 errors.push("column count");
-            } else if record_id.is_empty() {
-                record_id = format!("csv-{number:04}");
+            }
+            if record_id.is_empty() {
+                // Blank IDs are refused, never derived: a
+                // deterministic per-file id would collide across
+                // installations reusing the same import.
+                errors.push("record id");
             } else if crate::proto::identifier(&record_id, "record ID").is_err() {
                 errors.push("record id");
             }
@@ -1304,6 +1365,8 @@ impl RecordStore {
             let text = error.to_string();
             if text.contains("stale") {
                 "stale revision"
+            } else if text.contains("another record") {
+                "duplicate email"
             } else if text.contains("already holds") {
                 "record conflict"
             } else {
