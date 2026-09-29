@@ -64,8 +64,9 @@ pub fn run_cli(action: &SandboxAction) -> Result<i32> {
         SandboxAction::Env { name } => {
             let sb = Sandbox::open(name)?;
             refuse_production(&sb)?;
-            require_marker(&sb)?;
-            print!("{}", env_lines(&sb, persisted_port(&sb.state_dir())));
+            let marker = require_marker(&sb)?;
+            let allow = marker["allow_global"].as_bool() == Some(true);
+            print!("{}", env_lines(&sb, persisted_port(&sb.state_dir()), allow));
             return Ok(0);
         }
         SandboxAction::Down { name } => {
@@ -648,7 +649,7 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-fn env_lines(sb: &Sandbox, port: Option<u16>) -> String {
+fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
     let mut text = format!(
         "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
          unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n\
@@ -660,6 +661,9 @@ fn env_lines(sb: &Sandbox, port: Option<u16>) -> String {
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
     );
+    if allow_global {
+        text.push_str(&format!("export {ALLOW_GLOBAL_ENV}=1\n"));
+    }
     if let Some(port) = port {
         text.push_str(&format!(
             "# board: http://127.0.0.1:{port} (persisted in state/ui.json)\n"
@@ -751,17 +755,21 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         .as_ref()
         .and_then(|m| m["created_at"].as_str().map(str::to_string))
         .unwrap_or_else(|| crate::issue::time::iso(crate::issue::time::now_epoch()));
+    // Record the opt-in at up time: `sandbox env` re-exports exactly
+    // what was granted, so a later `up` without it revokes it.
+    let allow_global = std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1");
     let marker = json!({
         "name": sb.name,
         "created_at": created_at,
         "binary": exe,
         "profile": sb.profile(),
+        "allow_global": allow_global,
     });
     std::fs::write(
         sb.marker(),
         serde_json::to_string_pretty(&marker).unwrap_or_default() + "\n",
     )?;
-    std::fs::write(sb.env_file(), env_lines(sb, Some(port)))?;
+    std::fs::write(sb.env_file(), env_lines(sb, Some(port), allow_global))?;
     run_child(sb, &exe, &["issue", "init"])?;
     let daemon = run_child(sb, &exe, &["daemon", "start"])?;
     let port_arg = port.to_string();
@@ -1070,7 +1078,7 @@ mod tests {
             base: PathBuf::from("/t/it's"),
             root: PathBuf::from("/t/it's/q"),
         };
-        let text = env_lines(&sb, Some(3111));
+        let text = env_lines(&sb, Some(3111), false);
         assert!(
             text.contains(r"export CADENCE_STATE_DIR='/t/it'\''s/q/state'"),
             "{text}"

@@ -1074,7 +1074,12 @@ onto the tailnet — `ui tailscale start`, `ui start --tailscale`, and a
 persisted tailscale block in `ui.json` — is refused, unless the sandbox
 was started with the operator's explicit opt-in
 `CADENCE_SANDBOX_ALLOW_GLOBAL=1` (`cadence sandbox down <name>` then
-`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up <name>`).
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up <name>`). `up`
+records the grant in the sandbox marker and `cadence sandbox env`
+re-exports it, so a shell that evals the env gets the opt-in the
+sandbox was started with; a later `up` without the variable revokes
+it. The gate itself reads only the environment — the marker is the
+record, not an override.
 
 Writers are attributed per request. `Tailscale-User-Login` resolves
 the actor to `<login> (tailscale)` — the tracker commit's `Actor:`

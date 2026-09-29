@@ -4390,6 +4390,11 @@ fn kill_detached(state_dir: &Path) -> Option<i32> {
 }
 
 fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
+    if tailscale_off && load_opts(state_dir).tailscale.is_some() {
+        // Refuse before the board is killed: a denied stop leaves the
+        // board up and the mapping's record intact.
+        crate::sandbox::refuse_global_unless_allowed("`ui stop --tailscale-off`")?;
+    }
     let pid = kill_detached(state_dir);
     if pid.is_none() {
         let _ = std::fs::remove_file(pid_file(state_dir));
@@ -4682,6 +4687,12 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
 /// tailnet options, restart the board local-only when it runs.
 fn ts_stop(state_dir: &Path) -> Result<i32> {
     let mut opts = load_opts(state_dir);
+    if opts.tailscale.is_some() {
+        // Before touching anything: under a sandbox this needs the
+        // opt-in, or the serve write would be refused while the record
+        // of the live mapping was still dropped.
+        crate::sandbox::refuse_global_unless_allowed("`ui tailscale stop`")?;
+    }
     let Some(ts) = opts.tailscale.take() else {
         println!(
             "{}",

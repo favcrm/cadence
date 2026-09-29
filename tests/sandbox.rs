@@ -505,6 +505,13 @@ serve)
     port="${3#--https=}"
     printf '%s:%s\t%s\n' "$(cat "$d/dns")" "$port" "$4" >> "$d/serve.map"
     ;;
+  --https=*)
+    if [ "${3:-}" = "off" ]; then
+      key="$(cat "$d/dns"):${2#--https=}"
+      grep -v "^$key" "$d/serve.map" > "$d/.sm" 2>/dev/null || true
+      mv "$d/.sm" "$d/serve.map"
+    fi
+    ;;
   esac
   ;;
 esac
@@ -616,27 +623,31 @@ fn sandbox_tailnet_writes_refused_without_the_opt_in() {
     refused(&out, "persisted tailscale sharing");
     assert_eq!(ts_calls(&fake), "", "tailscale must never run");
 
-    // `ui tailscale stop` on the hand-written block: the serve write is
-    // gated too — the refusal is a warning (stop stays non-fatal) but
-    // tailscale is never invoked and the mapping is untouched.
+    // `ui tailscale stop` and `ui stop --tailscale-off` on the
+    // hand-written block refuse outright before anything is touched —
+    // a denied stop must not orphan the live mapping's record.
     std::fs::write(
         fake.join("serve.map"),
         format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n"),
     )
     .unwrap();
-    let out = host.run(
-        &["--state-dir", state_arg, "ui", "tailscale", "stop"],
-        &ts_sandbox_env(&path, None),
-    );
-    assert!(out.status.success(), "{}", text(&out));
-    assert!(
-        text(&out).contains("refused under CADENCE_PROFILE=sandbox:x"),
-        "{}",
-        text(&out)
-    );
+    for args in [
+        vec!["--state-dir", state_arg, "ui", "tailscale", "stop"],
+        vec!["--state-dir", state_arg, "ui", "stop", "--tailscale-off"],
+    ] {
+        let out = host.run(&args, &ts_sandbox_env(&path, None));
+        refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
+    }
     assert_eq!(
         std::fs::read_to_string(fake.join("serve.map")).unwrap(),
-        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n")
+        format!("{SANDBOX_TS_DNS}:9450\thttp://127.0.0.1:{port}\n"),
+        "the live mapping is untouched"
+    );
+    let opts: Value =
+        serde_json::from_str(&std::fs::read_to_string(state.join("ui.json")).unwrap()).unwrap();
+    assert_eq!(
+        opts["tailscale"]["https_port"], 9450,
+        "the mapping's record survives the refused stop"
     );
     assert_eq!(ts_calls(&fake), "", "tailscale must never run");
 
@@ -700,6 +711,25 @@ fn sandbox_tailnet_opt_in_reuses_and_refuses_a_foreign_mapping() {
         "identical mapping reused, no serve --bg: {}",
         ts_calls(&fake)
     );
+    // Under the opt-in, `ui tailscale stop` removes the recorded
+    // mapping and drops the block.
+    let out = host.run(&["--state-dir", state_arg, "ui", "tailscale", "stop"], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !std::fs::read_to_string(fake.join("serve.map"))
+            .unwrap()
+            .contains(":9450"),
+        "recorded mapping removed"
+    );
+    assert!(
+        ts_calls(&fake).contains("serve --https=9450 off"),
+        "{}",
+        ts_calls(&fake)
+    );
+    let opts: Value =
+        serde_json::from_str(&std::fs::read_to_string(state.join("ui.json")).unwrap()).unwrap();
+    assert_eq!(opts["tailscale"], Value::Null);
+
     // Stop the board this start spawned.
     let stop = host.run(&["--state-dir", state_arg, "ui", "stop"], &env);
     assert!(stop.status.success(), "{}", text(&stop));
@@ -965,5 +995,63 @@ fn a_forged_marker_beside_a_symlink_onto_production_is_refused() {
         std::fs::read_dir(&prod).unwrap().count(),
         0,
         "production touched"
+    );
+}
+
+/// The opt-in is granted at `up`, recorded in the marker and re-exported
+/// by `sandbox env` — an operator shell that evals the env gets exactly
+/// what the sandbox was started with, and a later `up` without it
+/// revokes it. A forged value at `up` records false.
+#[test]
+fn sandbox_env_exports_the_recorded_opt_in() {
+    let mut host = Host::new();
+    host.up_free("ga", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")]);
+    let root = host.base().join("ga");
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(marker["allow_global"], true, "{marker}");
+    let env_file = std::fs::read_to_string(root.join("sandbox.env")).unwrap();
+    assert!(
+        env_file.contains("export CADENCE_SANDBOX_ALLOW_GLOBAL=1"),
+        "{env_file}"
+    );
+    let out = host.run(&["sandbox", "env", "ga"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("export CADENCE_SANDBOX_ALLOW_GLOBAL=1"),
+        "{}",
+        text(&out)
+    );
+
+    // `up` again without the variable revokes it — marker and env file.
+    host.up("ga", &[]);
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(marker["allow_global"], false, "{marker}");
+    let env_file = std::fs::read_to_string(root.join("sandbox.env")).unwrap();
+    assert!(
+        !env_file.contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
+        "{env_file}"
+    );
+    let out = host.run(&["sandbox", "env", "ga"], &[]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
+        "{}",
+        text(&out)
+    );
+
+    // A forged value at `up` is not "1": recorded false, never exported.
+    host.up_free("gb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", " 1")]);
+    let marker: Value = serde_json::from_str(
+        &std::fs::read_to_string(host.base().join("gb").join(".cadence-sandbox")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["allow_global"], false, "{marker}");
+    let env_file = std::fs::read_to_string(host.base().join("gb").join("sandbox.env")).unwrap();
+    assert!(
+        !env_file.contains("CADENCE_SANDBOX_ALLOW_GLOBAL"),
+        "{env_file}"
     );
 }
