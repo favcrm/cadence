@@ -128,6 +128,20 @@ fn is_transient_open_error(error: &Error) -> bool {
     )
 }
 
+/// A lost fresh-init race, classified by typed SQLite extended
+/// code: only a PRIMARYKEY violation on the identity insert means
+/// a sibling won between our version check and the insert — the
+/// identity schema declares install_id TEXT PRIMARY KEY, so a
+/// duplicate insert reports SQLITE_CONSTRAINT_PRIMARYKEY (verified
+/// against a live duplicate insert, not assumed). Any other
+/// failure — including one whose message happens to mention
+/// uniqueness — fails closed through the caller's refusal.
+fn is_lost_init(error: &rusqlite::Error) -> bool {
+    error
+        .sqlite_error()
+        .is_some_and(|detail| detail.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+}
+
 /// Map a rusqlite failure at open time: coded contention becomes
 /// the retry signal, everything else keeps its existing refusal.
 fn busy_or(error: &rusqlite::Error, otherwise: Error) -> Error {
@@ -137,6 +151,11 @@ fn busy_or(error: &rusqlite::Error, otherwise: Error) -> Error {
         otherwise
     }
 }
+
+/// Fail-closed diagnosis for a foreign, corrupt, downgraded, or
+/// never-initialized record file. Shared by every refusal site so
+/// the operator-facing text stays identical.
+const CORRUPT_RECORD_FILE: &str = "record file is corrupt or foreign; restore the installation backup or remove the file after inspection";
 
 /// One installation's record file. Opened per operator action and
 /// closed after it — persistence is the file itself, shared through
@@ -157,7 +176,11 @@ impl RecordStore {
     pub fn open(state_dir: &Path, install_id: &str) -> Result<Self> {
         // Concurrent first opens race the fresh initialization and
         // SQLite locking. The three transient signals above retry
-        // through one single bounded wait (40 x 50ms); genuine
+        // through one single bounded wait (40 x 50ms of sleep here;
+        // each attempt's own SQLite busy handler may additionally
+        // wait up to BUSY_TIMEOUT under sustained contention). A
+        // file still table-less when the wait expires is refused as
+        // corrupt — never reported as still initializing. Genuine
         // corruption, identity mismatch, unsupported schema or an
         // unwritable directory never match and refuse immediately.
         let mut attempt = 0;
@@ -166,6 +189,9 @@ impl RecordStore {
                 Err(error) if is_transient_open_error(&error) && attempt < 40 => {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) if error.to_string() == "record file initialization in progress" => {
+                    return Err(Error::rejected(CORRUPT_RECORD_FILE));
                 }
                 settled => return settled,
             }
@@ -189,7 +215,6 @@ impl RecordStore {
         // not an internal error; a missing file takes the init path.
         // Coded lock contention retries through the single bounded
         // wait in `open`; every other failure refuses immediately.
-        const CORRUPT: &str = "record file is corrupt or foreign; restore the installation backup or remove the file after inspection";
         let fresh = !path.is_file();
         let conn = Connection::open(&path).map_err(|e| {
             busy_or(
@@ -197,7 +222,7 @@ impl RecordStore {
                 if fresh {
                     Error::internal("record file unavailable".to_string())
                 } else {
-                    Error::rejected(CORRUPT)
+                    Error::rejected(CORRUPT_RECORD_FILE)
                 },
             )
         })?;
@@ -210,7 +235,7 @@ impl RecordStore {
                     if fresh {
                         Error::internal("record file unavailable".to_string())
                     } else {
-                        Error::rejected(CORRUPT)
+                        Error::rejected(CORRUPT_RECORD_FILE)
                     },
                 )
             })?;
@@ -232,9 +257,9 @@ impl RecordStore {
             )
             .map_err(|e| {
                 // A sibling won the fresh initialization between our
-                // version check and this insert: retry through the
-                // existing-file path rather than failing the open.
-                if e.to_string().contains("UNIQUE") {
+                // version check and this insert — classified by the
+                // typed UNIQUE extended code, never by message text.
+                if is_lost_init(&e) {
                     Error::internal("record file initialization diverged")
                 } else {
                     busy_or(&e, Error::internal(e.to_string()))
@@ -250,23 +275,32 @@ impl RecordStore {
             // A foreign, downgraded or corrupt file refuses here; the
             // operator recovers explicitly (restore from backup, remove
             // after inspection) — the daemon never heals it in place.
-            // One exception is coded lock contention (retried by the
-            // single bounded wait in `open`); another is a sibling
-            // initializing this file right now, whose record tables
-            // are not yet visible — that returns the in-progress
-            // signal for the same bounded wait. Anything else refuses
-            // at once.
-            let version: i64 = match conn.query_row("SELECT version FROM record_schema", [], |r| {
-                r.get::<_, i64>(0)
-            }) {
-                Ok(found) => found,
-                Err(error) if error.to_string().contains("no such table") => {
-                    return Err(Error::internal("record file initialization in progress"));
-                }
+            // Table presence is decided by a typed sqlite_master
+            // query — sqlite_master itself always exists in a valid
+            // database, so an absent record_schema means a sibling is
+            // mid-initialization, never a corrupt read. That returns
+            // the in-progress signal for the single bounded wait in
+            // `open`; a still-table-less file after the wait refuses
+            // as corrupt. Coded contention at any read below rides
+            // the same wait; anything else refuses at once.
+            let schema_present: bool = match conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='record_schema'",
+                [],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(count) => count > 0,
                 Err(error) => {
-                    return Err(busy_or(&error, Error::rejected(CORRUPT)));
+                    return Err(busy_or(&error, Error::rejected(CORRUPT_RECORD_FILE)));
                 }
             };
+            if !schema_present {
+                return Err(Error::internal("record file initialization in progress"));
+            }
+            let version: i64 = conn
+                .query_row("SELECT version FROM record_schema", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(|e| busy_or(&e, Error::rejected(CORRUPT_RECORD_FILE)))?;
             if version != FILE_SCHEMA {
                 return Err(Error::rejected(
                     "record file schema is unsupported; restore the installation backup or remove the file after inspection",
@@ -274,7 +308,7 @@ impl RecordStore {
             }
             let identity: String = conn
                 .query_row("SELECT install_id FROM record_identity", [], |r| r.get(0))
-                .map_err(|_| Error::rejected(CORRUPT))?;
+                .map_err(|e| busy_or(&e, Error::rejected(CORRUPT_RECORD_FILE)))?;
             if identity != install_id {
                 return Err(Error::rejected(
                     "record file identity differs from the installation; restore the installation backup or remove the file after inspection",
@@ -301,9 +335,17 @@ impl RecordStore {
                  state TEXT NOT NULL, at REAL NOT NULL)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
-            let needs_state = conn
-                .prepare("SELECT state FROM app_record_csv_imports LIMIT 0")
-                .is_err();
+            // The probe classifies by code: contention retries
+            // through the bounded wait instead of misreading BUSY as
+            // a missing column and dying on a duplicate-column ALTER.
+            let needs_state = match conn.prepare("SELECT state FROM app_record_csv_imports LIMIT 0")
+            {
+                Ok(_) => false,
+                Err(error) if is_contention(&error) => {
+                    return Err(Error::internal("record file is busy"));
+                }
+                Err(_) => true,
+            };
             if needs_state {
                 conn.execute_batch(
                     "ALTER TABLE app_record_csv_imports ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'",
@@ -1807,5 +1849,47 @@ mod open_tests {
             Error::rejected("record file is corrupt or foreign"),
         );
         assert!(!is_transient_open_error(&corrupt));
+    }
+
+    #[test]
+    fn cad780_open_classifies_lost_init_by_extended_code() {
+        // The real race, pinned live: a duplicate install_id insert
+        // against the exact identity schema reports PRIMARYKEY.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE record_identity(install_id TEXT PRIMARY KEY, created REAL NOT NULL);
+             INSERT INTO record_identity(install_id, created) VALUES('install-a', 0.0);",
+        )
+        .unwrap();
+        let raced = conn
+            .execute(
+                "INSERT INTO record_identity(install_id, created) VALUES('install-a', 0.0)",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(
+            raced.sqlite_error().map(|detail| detail.extended_code),
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+        );
+        assert!(is_lost_init(&raced));
+        // Sibling constraint codes are not a lost init race —
+        // including UNIQUE, which this schema never emits here.
+        for code in [
+            rusqlite::ffi::SQLITE_CONSTRAINT,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
+        ] {
+            assert!(
+                !is_lost_init(&sqlite_failure(code)),
+                "code {code} misclassified as a lost init race"
+            );
+        }
+        // A message that merely mentions uniqueness with a generic
+        // code must not route to the init-race retry.
+        let decoy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(1),
+            Some("UNIQUE constraint failed: record_identity.install_id".to_string()),
+        );
+        assert!(!is_lost_init(&decoy));
     }
 }

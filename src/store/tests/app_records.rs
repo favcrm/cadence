@@ -586,3 +586,26 @@ fn cad780_open_sees_an_initializing_file_then_converges() {
         .app_segment_save("ctx-1", "seg-vip", None, "VIP", &[rule])
         .unwrap();
 }
+
+#[test]
+fn cad780_open_on_a_forever_table_less_file_refuses_corrupt() {
+    let dir = TempDir::new().unwrap();
+    // A valid SQLite file that never gains record tables: the
+    // bounded wait must expire into the rejected CORRUPT diagnosis —
+    // never the transient in-progress signal, and never silently.
+    let path = record_db_path(dir.path(), "install-empty").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    rusqlite::Connection::open(&path).unwrap();
+    let Err(refused) = RecordStore::open(dir.path(), "install-empty") else {
+        panic!("table-less file opened");
+    };
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("corrupt") && refused.contains("backup"),
+        "table-less file refused unclearly: {refused}"
+    );
+    assert!(
+        !refused.contains("in progress"),
+        "exhausted wait leaked the transient signal: {refused}"
+    );
+}
