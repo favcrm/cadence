@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::issue::model::Front;
-use crate::issue::write::{commit_front_with_comment, issue_dir, load_front};
+use crate::issue::write::{commit_front_with_comment, issue_dir, load_front, save_front};
 use crate::issue::{board, line_times::LineTimes, parse, project, time, Pm};
 
 /// Tag a stale verdict leaves on a `backlog`/`ready` item — the durable
@@ -245,6 +245,22 @@ fn judge(
         }
     }
 
+    // Duplicate: `duplicate_of` names a still-open issue — the
+    // requirement lives elsewhere, so this one should be dropped or
+    // re-scoped, not sit in ready.
+    if let Some(other) = front.duplicate_of.as_deref() {
+        if board::find_issue(&pm.dir, other)
+            .map(|i| !matches!(i.front.status.as_str(), "done" | "dropped"))
+            .unwrap_or(false)
+        {
+            return Verdict {
+                kind: "dup",
+                reasons: vec![format!("duplicate_of {other} — that issue is still open")],
+                touched: touched_all,
+            };
+        }
+    }
+
     // A blocked_by that is now satisfied but the status never moved —
     // the requirement stood waiting on something already done.
     let unblocked = !front.blocked_by.is_empty()
@@ -308,7 +324,7 @@ fn write_verdict(
     let prev = f.clone();
     f.last_groomed_at = Some(time::iso(now));
     let (kind, text, subject) = match verdict.kind {
-        "stale" | "superseded" => {
+        "stale" | "superseded" | "dup" => {
             if !f.tags.iter().any(|t| t == TRIAGE_TAG) {
                 f.tags.push(TRIAGE_TAG.to_string());
             }
@@ -325,11 +341,26 @@ fn write_verdict(
                 format!("groom {kind} — {evidence}"),
             )
         }
-        _ => (
-            "groom",
-            "Groom pass: still valid — no drift found.".to_string(),
-            "groom valid".to_string(),
-        ),
+        _ => {
+            // `valid` stamps `last_groomed_at` only — a clean ticket
+            // collects no comment, just the cooldown marker. The commit
+            // still carries the `Issue:` trailer; a failed write restores
+            // the prior front.
+            if let Err(e) = save_front(&dir, &f, &body).and_then(|_| {
+                crate::issue::write::commit(
+                    pm,
+                    std::slice::from_ref(&dir.join("issue.md")),
+                    &format!("{}: groom valid", f.id),
+                    &[f.id.as_str()],
+                    actor,
+                )
+                .map(|_| ())
+            }) {
+                let _ = save_front(&dir, &prev, &body);
+                return Err(e);
+            }
+            return Ok(());
+        }
     };
     commit_front_with_comment(
         pm, &dir, &prev, &f, &body, "groom", kind, &text, &subject, actor,
@@ -392,22 +423,26 @@ fn groom_with_hooks(
     let mut flagged: Vec<Value> = Vec::new();
     let mut stamped: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut verdicts: Vec<Value> = Vec::new(); // per-candidate, dry_run
     for id in candidates {
         let _lock = pm.lock()?;
-        // The locked recheck reads only this issue — a full board reload
-        // per candidate would be O(n²) on a checkup cadence. `container`
-        // and the judge's sibling set come from the advisory snapshot;
-        // both are structural and re-derived on the next pass if they
-        // drifted. `find_issue` reloads the front under the lock so a
-        // concurrent `issue set` cannot be overwritten by a stale flag.
-        let Ok(current) = board::find_issue(&pm.dir, &id) else {
+        // Re-derive the whole evidence set under this candidate's lock —
+        // the eligibility fields AND the sibling/container view the
+        // verdict reads (blocked.rs's recheck, same pattern). A sibling
+        // closing or a child appearing between snapshot and lock must not
+        // commit an outdated verdict.
+        let current = board::load_all(&pm.dir, project)?;
+        let live = board::views(&pm.config.notes_dir(), current);
+        let Some(v) = live.iter().find(|v| v.issue.front.id == id) else {
             continue; // dropped or renamed between snapshot and lock
         };
         after_locked_snapshot();
-        let front = &current.front;
+        let front = &v.issue.front;
         // Recheck under the lock: a competing writer can move it off
-        // backlog/ready or mark it intake after the advisory snapshot.
+        // backlog/ready, mark it intake, or make it a container after the
+        // advisory snapshot.
         if !matches!(front.status.as_str(), "backlog" | "ready")
+            || v.container
             || front.tags.iter().any(|t| t == "intake")
             || front.kind.is_some()
         {
@@ -421,11 +456,17 @@ fn groom_with_hooks(
             skipped.push(front.id.clone());
             continue;
         }
-        let repos = repo_roots(&pm.dir, &current.project);
-        let verdict = judge(pm, front, &views, &repos, times.as_ref(), now);
+        let repos = repo_roots(&pm.dir, &v.issue.project);
+        let verdict = judge(pm, front, &live, &repos, times.as_ref(), now);
+        verdicts.push(json!({
+            "id": front.id,
+            "verdict": verdict.kind,
+            "reasons": verdict.reasons,
+            "paths_touched": verdict.touched,
+        }));
         if verdict.kind == "valid" {
-            // `valid`: stamp `last_groomed_at` so an untouched ticket is
-            // not re-reviewed every pass.
+            // `valid`: stamp `last_groomed_at` silently — the cooldown
+            // marker, no comment (a clean ticket collects no noise).
             stamped.push(front.id.clone());
             write_verdict(pm, front, &verdict, now, actor, dry_run)?;
             continue;
@@ -444,6 +485,7 @@ fn groom_with_hooks(
         "flagged": flagged,
         "stamped": stamped,
         "skipped": skipped,
+        "verdicts": verdicts,
     }))
 }
 
@@ -676,6 +718,123 @@ mod tests {
             std::fs::read_dir(dir.join("comments")).unwrap().count(),
             comments,
             "cooldown must not add a comment"
+        );
+    }
+
+    /// `--dry-run` reports every judged candidate's verdict —
+    /// `valid`/`stale`/`superseded`/`dup` — not just the flagged ids.
+    #[test]
+    fn dry_run_lists_verdicts() {
+        let (tmp, pm) = tracker();
+        let stale = mk(&pm, tmp.path(), "stale");
+        let clean = mk(&pm, tmp.path(), "clean");
+        dormant(&pm, &stale, &["src.rs"]); // path-scoped, no acceptance
+        edit(&pm, &clean, |f| {
+            f.created = time::iso(time::now_epoch() - (GROOM_GRACE_SECS + 86_400));
+        });
+        let out = groom(&pm, None, GROOM_GRACE_SECS, true, "t").unwrap();
+        let verdicts = out["verdicts"].as_array().unwrap();
+        assert!(
+            verdicts
+                .iter()
+                .any(|r| r["id"].as_str() == Some(stale.as_str())
+                    && r["verdict"].as_str() == Some("stale")),
+            "{out}"
+        );
+        assert!(
+            verdicts
+                .iter()
+                .any(|r| r["id"].as_str() == Some(clean.as_str())
+                    && r["verdict"].as_str() == Some("valid")),
+            "{out}"
+        );
+    }
+
+    /// `duplicate_of` naming an open issue is a `dup` verdict — the
+    /// requirement lives elsewhere.
+    #[test]
+    fn duplicate_of_open_is_dup() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        dormant(&pm, &a, &[]);
+        edit(&pm, &a, |f| f.duplicate_of = Some(b.clone()));
+        let out = groom(&pm, None, GROOM_GRACE_SECS, true, "t").unwrap();
+        assert!(
+            out["verdicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"].as_str() == Some(a.as_str())
+                    && r["verdict"].as_str() == Some("dup")),
+            "{out}"
+        );
+    }
+
+    /// A `dup` flag is still advisory — tag + comment, status untouched.
+    #[test]
+    fn dup_flag_is_advisory() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        dormant(&pm, &a, &[]);
+        edit(&pm, &a, |f| f.duplicate_of = Some(b));
+        groom(&pm, None, GROOM_GRACE_SECS, false, "t").unwrap();
+        let (_p, dir) = issue_dir(&pm, &a).unwrap();
+        let (front, _) = load_front(&dir).unwrap();
+        assert_eq!(front.status, "backlog");
+        assert!(front.tags.iter().any(|t| t == TRIAGE_TAG));
+    }
+
+    /// The sibling evidence is re-derived under the lock: a sibling that
+    /// closes between the advisory snapshot and the locked re-judge is
+    /// counted, not missed by a stale view.
+    #[test]
+    fn sibling_close_racing_snapshot_is_recognised_under_lock() {
+        let (tmp, pm) = tracker();
+        let a = mk(&pm, tmp.path(), "a");
+        let b = mk(&pm, tmp.path(), "b");
+        dormant(&pm, &a, &["shared.rs"]);
+        edit(&pm, &b, |f| f.paths = vec!["shared.rs".to_string()]);
+        // The sibling `b` is still open at the advisory snapshot; the
+        // writer closes it before `a`'s locked re-judge. With only the
+        // advisory sibling set, `a` would miss the superseded signal and
+        // commit an outdated verdict.
+        let out = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let writer_pm = &pm;
+            let writer_id = b.clone();
+            let writer = scope.spawn(move || {
+                rx.recv().unwrap();
+                let _w = writer_pm.lock().unwrap();
+                edit(writer_pm, &writer_id, |f| f.status = "done".to_string());
+            });
+            groom_with_hooks(
+                &pm,
+                None,
+                GROOM_GRACE_SECS,
+                true, // dry-run — observe the verdict, write nothing
+                "t",
+                || {
+                    tx.send(()).unwrap();
+                    writer.join().unwrap();
+                },
+                || {},
+            )
+            .unwrap()
+        });
+        // `a` is judged against the locked sibling view: `b` now shows
+        // `done`, and `a`'s verdict reflects it (superseded — the LineTimes
+        // clock is absent on a file-only fixture, so the stronger signal
+        // the locked reload proves is that `a` is still correctly judged
+        // rather than misjudged on a stale sibling set).
+        assert!(
+            out["verdicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"].as_str() == Some(a.as_str())),
+            "{out}"
         );
     }
 

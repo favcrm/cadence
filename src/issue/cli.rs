@@ -501,6 +501,9 @@ pub enum IssueAction {
         /// Report what would be flagged — nothing is written.
         #[arg(long)]
         dry_run: bool,
+        /// Limit the pass to one project (all projects when omitted).
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
         /// Seconds a `backlog`/`ready` leaf may sit before the pass
         /// judges it — inside the window the ticket is its own evidence
         /// [default: 1209600 (14d)].
@@ -1763,11 +1766,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             print_json(&out);
             Ok(0)
         }
-        IssueAction::Groom { dry_run, grace } => {
+        IssueAction::Groom {
+            dry_run,
+            project,
+            grace,
+        } => {
             let pm = open_pm()?;
             let out = groom::groom(
                 &pm,
-                None,
+                project.as_deref(),
                 grace.unwrap_or(groom::GROOM_GRACE_SECS),
                 *dry_run,
                 "",
