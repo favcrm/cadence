@@ -114,10 +114,19 @@ CREATE TABLE IF NOT EXISTS app_content_proposals(
  subject TEXT NOT NULL, preheader TEXT NOT NULL,
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator-direct','assistant-receipt')),
+ receipt_message TEXT, receipt_agent TEXT, receipt_request TEXT,
  state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
  created REAL NOT NULL, decided REAL,
  PRIMARY KEY(context_id, proposal_id));
 CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
+CREATE UNIQUE INDEX IF NOT EXISTS app_content_proposal_claim ON app_content_proposals(context_id, receipt_message);
+CREATE TABLE IF NOT EXISTS app_content_proposal_requests(
+ context_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+ message_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('open','used')),
+ used_by TEXT, created REAL NOT NULL, decided REAL,
+ PRIMARY KEY(context_id, request_id));
 CREATE TABLE IF NOT EXISTS app_sender_bindings(
  context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
@@ -460,10 +469,20 @@ impl RecordStore {
                  campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
                  subject TEXT NOT NULL, preheader TEXT NOT NULL,
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
-                 actor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+                 actor TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'operator-direct' CHECK(origin IN ('operator-direct','assistant-receipt')),
+                 receipt_message TEXT, receipt_agent TEXT, receipt_request TEXT,
+                 state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
                  created REAL NOT NULL, decided REAL,
                  PRIMARY KEY(context_id, proposal_id));
                  CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
+                 CREATE UNIQUE INDEX IF NOT EXISTS app_content_proposal_claim ON app_content_proposals(context_id, receipt_message);
+                 CREATE TABLE IF NOT EXISTS app_content_proposal_requests(
+                 context_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                 campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+                 message_id TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('open','used')),
+                 used_by TEXT, created REAL NOT NULL, decided REAL,
+                 PRIMARY KEY(context_id, request_id));
                  CREATE TABLE IF NOT EXISTS app_sender_bindings(
                  context_id TEXT NOT NULL, binding_id TEXT NOT NULL,
                  revision INTEGER NOT NULL CHECK(revision>0),
@@ -482,9 +501,10 @@ impl RecordStore {
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // CAD-782 revision 2: proposals record their origin
-            // (`operator-direct`; `assistant-receipt` is reserved for
-            // CAD-784). Files created between the two landings gain
-            // the column with the only value their rows can carry.
+            // (`operator-direct`; `assistant-receipt` arrived with
+            // the CAD-813 verified handoff). Files created between
+            // the two landings gain the column with the only value
+            // their rows can carry.
             // The probe classifies by code: contention retries
             // through the bounded wait instead of misreading BUSY as
             // a missing column and dying on a duplicate-column ALTER.
@@ -502,6 +522,41 @@ impl RecordStore {
                 )
                 .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             }
+            // CAD-813: verified assistant proposals carry their
+            // turn receipt identity (`receipt_message`,
+            // `receipt_agent`, `receipt_request`) beside the origin,
+            // one chat message claims one proposal across all ids
+            // (unique index; NULL receipts exempt), and operator
+            // mints one-time proposal requests (campaign + source
+            // stamped per chat message). Older files gain nullable
+            // columns; operator-direct rows keep NULLs.
+            for column in ["receipt_message", "receipt_agent", "receipt_request"] {
+                let probe = format!("SELECT {column} FROM app_content_proposals LIMIT 0");
+                let missing = match conn.prepare(&probe) {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+                if missing {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE app_content_proposals ADD COLUMN {column} TEXT"
+                    ))
+                    .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                }
+            }
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS app_content_proposal_claim ON app_content_proposals(context_id, receipt_message);
+                 CREATE TABLE IF NOT EXISTS app_content_proposal_requests(
+                 context_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                 campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+                 message_id TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('open','used')),
+                 used_by TEXT, created REAL NOT NULL, decided REAL,
+                 PRIMARY KEY(context_id, request_id))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
         }
         Ok(Self {
             install_id: install_id.to_string(),

@@ -33,6 +33,7 @@ pub(super) enum Route<'a> {
     TestPrepare(&'a str, &'a str, &'a str),
     SendPrepare(&'a str, &'a str, &'a str),
     ProposalPropose(&'a str, &'a str),
+    ProposalRequest(&'a str, &'a str),
     ProposalList(&'a str, &'a str),
     ProposalShow(&'a str, &'a str, &'a str),
     ProposalApply(&'a str, &'a str, &'a str),
@@ -84,6 +85,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             Some(Route::SendPrepare(install, context, id))
         }
         ("proposals", []) => Some(Route::ProposalPropose(install, context)),
+        ("proposal-requests", []) => Some(Route::ProposalRequest(install, context)),
         ("proposals", ["list"]) => Some(Route::ProposalList(install, context)),
         ("proposals", [id]) if segment(id) => Some(Route::ProposalShow(install, context, id)),
         ("proposals", [id, "apply"]) if segment(id) => {
@@ -180,6 +182,18 @@ struct ProposalPropose {
     #[serde(default)]
     preheader: String,
     blocks: Value,
+}
+
+/// CAD-813: the operator mints a one-time proposal request against a
+/// chat message. `message_id` names the chat turn; campaign and
+/// source revision are host-stamped by the daemon, never supplied.
+/// No turn token, receipt or source field rides this body.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalRequest {
+    campaign_id: String,
+    message_id: String,
+    request_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -346,6 +360,22 @@ pub(super) fn handle(
                     "blocks": body.blocks}),
             )
         }
+        // CAD-813: the operator's one-time request mint. The daemon
+        // stamps campaign scope and source revision against the live
+        // installation/context/content and the message's verified App
+        // binding; the typed body names only the chat message.
+        Route::ProposalRequest(install, context) => {
+            let body: ProposalRequest = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            (
+                "app_content_proposal_request",
+                json!({"install_id": install, "context_id": context,
+                    "campaign_id": body.campaign_id, "message": body.message_id,
+                    "request_id": body.request_id}),
+            )
+        }
         // The list carries no filter over HTTP: campaign scoping
         // stays a daemon RPC option, and any body refuses so a
         // filtered read cannot smuggle parameters past the URL.
@@ -459,6 +489,10 @@ mod tests {
             Some(Route::ProposalPropose("i", "c"))
         ));
         assert!(matches!(
+            route("/api/app-installations/i/contexts/c/content/proposal-requests"),
+            Some(Route::ProposalRequest("i", "c"))
+        ));
+        assert!(matches!(
             route("/api/app-installations/i/contexts/c/content/proposals/list"),
             Some(Route::ProposalList("i", "c"))
         ));
@@ -509,6 +543,12 @@ mod tests {
         );
         assert!(
             route("/api/app-installations/i/contexts/c/content/proposals/list")
+                .unwrap()
+                .is_read()
+        );
+        // The request mint is a write like the proposal save.
+        assert!(
+            !route("/api/app-installations/i/contexts/c/content/proposal-requests")
                 .unwrap()
                 .is_read()
         );
@@ -581,6 +621,26 @@ mod tests {
         )
         .is_err());
         // Receipt-shaped fields never ride any content body.
+        // The request mint names only the chat message: campaign
+        // and source are host-stamped, so token/source/receipt
+        // fields refuse here.
+        assert!(serde_json::from_str::<ProposalRequest>(
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1"}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1","token":"t-1"}"#,
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1","source_revision":1}"#,
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1","assistant_receipt":{"turn_id":"t"}}"#,
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1","actor":"op"}"#,
+            r#"{"campaign_id":"launch-1","message_id":"m-1"}"#,
+            r#"{"campaign_id":"launch-1","message_id":"m-1","request_id":"req-1","install_id":"other"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProposalRequest>(body).is_err(),
+                "request mint admitted {body}"
+            );
+        }
         assert!(serde_json::from_str::<ProposalPropose>(
             r#"{"campaign_id":"launch-1","proposal_id":"prop-1","subject":"Hi","blocks":[],"assistant_receipt":{"turn_id":"t"}}"#
         )

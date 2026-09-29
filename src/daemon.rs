@@ -2841,6 +2841,10 @@ impl Shared {
             "app_content_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_render" => self.rpc_app_content(method, params, peer_pid),
             "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_proposal_request" => self.rpc_app_content(method, params, peer_pid),
+            "app_content_assistant_propose" => {
+                self.rpc_app_content_assistant_propose(params, peer_pid)
+            }
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),
