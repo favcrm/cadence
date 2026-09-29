@@ -4568,10 +4568,40 @@ fn device_pin_lock(state_dir: &Path, wait: bool) -> Result<Option<std::fs::File>
 /// but never clears the pin (two unconfigured boards on one state
 /// dir keeps working as before).
 fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs::File>> {
-    // Only a board that would WRITE the pin waits out the handoff —
-    // a board with no device login takes one non-blocking look: on
-    // success it clears a stale pin, and either way it serves at once.
-    let lock = device_pin_lock(state_dir, opts.device_login.is_some())?;
+    let configured = opts.device_login.is_some();
+    // A board with no device login never fails on pin handling
+    // (review r6/r8): absent operator dir → no pin could exist →
+    // nothing to clear or lock, and the dir is not created. A dir
+    // that exists gets one non-blocking lock attempt — clearing a
+    // stale pin on a win — and ANY error (dir check, open, flock)
+    // is one warning line, never a startup refusal.
+    if !configured {
+        let dir = crate::operator_auth::dir(state_dir);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let lock = match device_pin_lock(state_dir, false) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!(
+                    "warning: device pin lock skipped: {e} — serving without touching the pin"
+                );
+                return Ok(None);
+            }
+        };
+        if lock.is_some() {
+            if let Err(e) = crate::device_login::clear_pin(state_dir) {
+                eprintln!("warning: stale device pin not cleared: {e} — serving anyway");
+            }
+        }
+        // A board with no pin of its own does not keep the lock —
+        // releasing it lets a configured board start while this one
+        // serves.
+        return Ok(None);
+    }
+    // Configured: strict — create/verify the dir, wait out the
+    // restart handoff, refuse to start when the lock is held.
+    let lock = device_pin_lock(state_dir, true)?;
     if let Some(login) = opts
         .device_login
         .as_ref()
@@ -4588,8 +4618,6 @@ fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs
             ));
         }
         crate::device_login::write_pin(state_dir, &login)?;
-    } else if lock.is_some() {
-        crate::device_login::clear_pin(state_dir)?;
     }
     Ok(lock)
 }
