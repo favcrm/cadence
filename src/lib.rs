@@ -22,6 +22,8 @@ pub mod continuity;
 pub mod contract_fixture;
 pub mod daemon;
 pub mod delivery;
+// CAD-777: board sign-in through the AgenticOS device grant.
+pub mod device_login;
 pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
