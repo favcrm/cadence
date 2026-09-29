@@ -365,12 +365,13 @@ pub fn load(pm_dir: &Path, key: &str) -> Result<Option<DeliveryPolicy>> {
 }
 
 /// `sha256:<hex>` of the policy's canonical JSON — struct fields in
-/// declaration order, `reviews` as a BTreeMap — so equivalent YAML
-/// spellings (reordered keys, defaults written out or left implicit)
-/// share one digest.
+/// declaration order, `reviews` as a BTreeMap — so reordered keys and
+/// omitted-vs-written defaults share one digest. `risk` rule ORDER is
+/// significant (slice 3 evaluates them in order), so reordering rules
+/// changes the digest and needs re-approval.
 pub fn digest(p: &DeliveryPolicy) -> String {
     use sha2::{Digest, Sha256};
-    let canonical = serde_json::to_vec(p).unwrap_or_default();
+    let canonical = serde_json::to_vec(p).expect("DeliveryPolicy always serializes");
     let hash = Sha256::digest(&canonical);
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256:{hex}")
@@ -399,18 +400,32 @@ pub struct Approved {
 
 /// The delivery half of a `project_work_approve` payload, or `None`
 /// when the payload is an old-format approval (no `delivery_digest`
-/// key) or its `delivery` no longer deserializes and validates.
+/// key), its `delivery` no longer deserializes and validates, or the
+/// recorded digest does not match the recorded policy — any
+/// inconsistency reads as no delivery approval, the fail-safe
+/// direction.
 pub fn approved_from(payload: &Value) -> Option<Approved> {
-    let digest = payload["delivery_digest"].as_str()?.to_string();
+    let recorded = payload["delivery_digest"].as_str()?.to_string();
     let policy = match payload.get("delivery") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => {
+            if recorded != digest(&default_policy()) {
+                return None;
+            }
+            None
+        }
         Some(v) => {
             let p: DeliveryPolicy = serde_json::from_value(v.clone()).ok()?;
             p.validate().ok()?;
+            if digest(&p) != recorded {
+                return None;
+            }
             Some(p)
         }
     };
-    Some(Approved { digest, policy })
+    Some(Approved {
+        digest: recorded,
+        policy,
+    })
 }
 
 /// Project key → its recorded delivery approval.
@@ -520,10 +535,10 @@ pub fn effective(
 }
 
 /// A `check` `app`: a GitHub App slug (`^[a-z0-9][a-z0-9-]{0,99}$`) or
-/// an App id (all digits).
+/// an App id (all digits, same 100-char cap).
 fn valid_app(app: &str) -> bool {
     if !app.is_empty() && app.bytes().all(|b| b.is_ascii_digit()) {
-        return true;
+        return app.len() <= 100;
     }
     !app.is_empty()
         && app.len() <= 100
@@ -851,6 +866,16 @@ mod tests {
                 "not a GitHub App slug",
             ),
             (
+                // 101-char slug is over the cap.
+                "delivery: {reviews: {r: {kind: check, app: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
+                // A 101-digit App id is capped the same.
+                "delivery: {reviews: {r: {kind: check, app: '11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111', mode: advisory}}, risk: [{require: [r]}]}",
+                "not a GitHub App slug",
+            ),
+            (
                 "delivery: {reviews: {r: {kind: check, app: a}}, risk: [{require: [r]}]}",
                 "needs a 'mode'",
             ),
@@ -902,6 +927,11 @@ mod tests {
                 "when.lines_over must be >= 1",
             ),
             (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+                           risk: [{require: [r]}, {when: {files_over: 0}, require: [r]}]}",
+                "when.files_over must be >= 1",
+            ),
+            (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
                 "'': empty",
@@ -931,6 +961,12 @@ mod tests {
                            risk: [{require: [r]}, {when: {paths: ['a{b}']}, require: [r]}]}",
                 "wildcards",
             ),
+            (
+                // A control character (a tab) in a path entry.
+                "delivery: {reviews: {r: {kind: operator}}, \
+                           risk: [{require: [r]}, {when: {paths: [\"a\\tb\"]}, require: [r]}]}",
+                "a control character",
+            ),
             // 9: the safety floor — no unconditional blocking require.
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, \
@@ -956,6 +992,16 @@ mod tests {
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
                            heavy: {lines_over: 0}}",
                 "heavy sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           heavy: {files_over: 0}}",
+                "heavy sizes must be >= 1",
+            ),
+            (
+                "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
+                           oversized: {lines_over: 0}}",
+                "oversized sizes must be >= 1",
             ),
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}], \
@@ -1216,6 +1262,19 @@ mod tests {
         assert_eq!(approved_from(&bad), None);
         bad["delivery"] = json!("text");
         assert_eq!(approved_from(&bad), None);
+
+        // A digest that does not match the recorded policy is no
+        // approval — in both shapes (a policy, and "no section").
+        let mismatched = json!({
+            "delivery": serde_json::to_value(&p).unwrap(),
+            "delivery_digest": digest(&default_policy()),
+        });
+        assert_eq!(approved_from(&mismatched), None);
+        let mismatched_null = json!({
+            "delivery": null,
+            "delivery_digest": digest(&p),
+        });
+        assert_eq!(approved_from(&mismatched_null), None);
     }
 
     #[test]

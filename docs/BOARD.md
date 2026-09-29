@@ -452,7 +452,10 @@ once the operator approves it: `cadence issue project approve-work
 stage-gate digest. A malformed `delivery:` refuses the whole approval;
 the daemon computes both fields from the file it read — a
 `delivery`/`delivery_digest` param is ignored. With no section the
-recorded policy is `null` and the digest is the default policy's.
+recorded policy is `null` and the digest is the default policy's. The
+digest is canonical across reordered keys and defaults written out or
+left implicit — but `risk` rule order is significant, so reordering
+rules changes it and needs re-approval.
 
 ```yaml
 delivery:

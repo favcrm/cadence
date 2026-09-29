@@ -859,6 +859,7 @@ tests = [
     "app_remove_drops_the_derived_grant",
     "revoking_one_app_keeps_a_scope_another_app_still_derives",
     "propose_fills_only_the_rendered_workflows_roles",
+    "delivery_policy_approval_and_resolution",
 ]
 helpers = [
     "events_of_kind",

@@ -4034,6 +4034,28 @@ fn delivery_policy_approval_and_resolution() {
         json!({"project": "demo"}),
     );
     assert!(frame_err(&r).contains("operator action"), "{r}");
+    // A literal detached child: `setsid` inside the agent pane — an
+    // agent-descended caller in a fresh session is still refused.
+    // (`unprovable_rpc` below is the agent-env caller; this one adds
+    // the missing detached ancestry shape.)
+    let req = pane.dir.path().join("detached-req.json");
+    std::fs::write(
+        &req,
+        cadence_agent::proto::request("project_work_approve", json!({"project": "demo"}))
+            .to_string(),
+    )
+    .unwrap();
+    let (rc, out) = pane.run(&format!(
+        "setsid python3 -c 'import socket,sys;\
+         s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+         s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+         print(s.makefile().readline())' {} {}",
+        client::socket_path(&f.d.state).display(),
+        req.display()
+    ));
+    assert_eq!(rc, 0, "{out}");
+    let r: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(frame_err(&r).contains("operator action"), "{r}");
     let r = unprovable_rpc(&f.d, "project_work_approve", json!({"project": "demo"}));
     assert!(frame_err(&r).contains("operator action"), "{r}");
 
@@ -4067,6 +4089,39 @@ fn delivery_policy_approval_and_resolution() {
         (Some("approved"), true),
         "{d}"
     );
+
+    // Concurrent approves: every call succeeds on the same stable
+    // file and records a consistent delivery/delivery_digest pair;
+    // afterwards the resolution still names the approved policy —
+    // while a pane's attempt in the middle is still refused.
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(s.spawn(|| {
+                f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
+                    .unwrap()
+            }));
+        }
+        let r = pane.rpc(
+            &f.d.state,
+            "project_work_approve",
+            json!({"project": "demo"}),
+        );
+        assert!(frame_err(&r).contains("operator action"), "{r}");
+        for h in handles {
+            let out = h.join().unwrap();
+            let p: DeliveryPolicy = serde_json::from_value(out["delivery"].clone()).unwrap();
+            assert_eq!(
+                out["delivery_digest"].as_str().unwrap(),
+                digest(&p),
+                "{out}"
+            );
+            assert_eq!(digest(&p), digest(&file_policy), "{out}");
+        }
+    });
+    let d = ls_delivery(&f, "demo");
+    assert_eq!(d["source"], "approved", "{d}");
+    assert_eq!(d["digest"], json!(digest(&file_policy)), "{d}");
 
     // An agent-style edit afterwards: the approved policy stays in
     // force, reported with the old digest and a delivery_unapproved
