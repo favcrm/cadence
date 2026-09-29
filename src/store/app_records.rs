@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS app_content_proposals(
  subject TEXT NOT NULL, preheader TEXT NOT NULL,
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator-direct','assistant-receipt')),
+ receipt_message TEXT, receipt_agent TEXT,
  state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
  created REAL NOT NULL, decided REAL,
  PRIMARY KEY(context_id, proposal_id));
@@ -460,7 +461,9 @@ impl RecordStore {
                  campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
                  subject TEXT NOT NULL, preheader TEXT NOT NULL,
                  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
-                 actor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+                 actor TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'operator-direct' CHECK(origin IN ('operator-direct','assistant-receipt')),
+                 receipt_message TEXT, receipt_agent TEXT,
+                 state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
                  created REAL NOT NULL, decided REAL,
                  PRIMARY KEY(context_id, proposal_id));
                  CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
@@ -501,6 +504,26 @@ impl RecordStore {
                     "ALTER TABLE app_content_proposals ADD COLUMN origin TEXT NOT NULL DEFAULT 'operator-direct'",
                 )
                 .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            }
+            // CAD-813: verified assistant proposals carry their
+            // turn receipt identity (`receipt_message`,
+            // `receipt_agent`) beside the origin. Older files gain
+            // nullable columns; operator-direct rows keep NULLs.
+            for column in ["receipt_message", "receipt_agent"] {
+                let probe = format!("SELECT {column} FROM app_content_proposals LIMIT 0");
+                let missing = match conn.prepare(&probe) {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+                if missing {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE app_content_proposals ADD COLUMN {column} TEXT"
+                    ))
+                    .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                }
             }
         }
         Ok(Self {

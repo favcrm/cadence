@@ -27,14 +27,17 @@
 //! Drafts reach the proposal flow through operator submission and
 //! are recorded `actor='operator'` with `origin='operator-direct'`:
 //! the operator connection proves the operator was present, never
-//! that an assistant produced the text. `assistant` attribution is
-//! reserved for CAD-784 chat-receipt-backed writes; receipt-shaped
-//! fields (`assistant_receipt`, `turn_id`, `nonce`) are refused
-//! until that seam exists. A proposal is bounded, bound to its
+//! that an assistant produced the text. `assistant` attribution
+//! arrives only through `app_content_assistant_propose` (CAD-813),
+//! which the daemon gates on a live assigned chat turn carrying a
+//! server-verified App binding; receipt-shaped fields
+//! (`assistant_receipt`, `turn_id`, `nonce`) stay refused on the
+//! operator path. A proposal is bounded, bound to its
 //! source revision, and inert until the operator explicitly applies
 //! it (new revision, approval invalidated) or discards it (no
 //! change). There is no agent-origin edit/approve/send path: every
-//! RPC in `daemon::app_content_rpc` requires the operator
+//! mutating RPC in `daemon::app_content_rpc` except the
+//! turn-bound assistant propose requires the operator
 //! connection, so an agent caller or detached child is refused
 //! before any file opens.
 
@@ -676,6 +679,17 @@ fn proposal_digest(
     }))
 }
 
+/// Daemon-resolved provenance for a verified assistant proposal
+/// (CAD-813): the assigned agent and chat message the daemon proved
+/// against its own turn rows and server-verified App binding, plus
+/// the source revision the turn drafted against (stale refuses).
+/// Never caller authority — the RPC layer derives every field.
+pub struct AssistantTurn<'a> {
+    pub agent: &'a str,
+    pub message: &'a str,
+    pub expected_source: Option<i64>,
+}
+
 struct ContentRow {
     revision: i64,
     subject: String,
@@ -693,6 +707,10 @@ struct ProposalRow {
     preheader: String,
     blocks: String,
     digest: String,
+    actor: String,
+    origin: String,
+    receipt_message: Option<String>,
+    receipt_agent: Option<String>,
     state: String,
     created: f64,
     decided: Option<f64>,
@@ -1293,9 +1311,10 @@ impl RecordStore {
     /// replays only behind identical bytes. Attribution is honestly
     /// `operator` with `origin: operator-direct`: the operator
     /// connection proves the operator submitted it, never that an
-    /// assistant produced it. `assistant` stays reserved for
-    /// CAD-784 receipt-backed writes; receipt-shaped fields are
-    /// refused by the RPC allowlist until that seam exists.
+    /// assistant produced it. `assistant` attribution arrives only
+    /// through `app_content_assistant_propose` (CAD-813), which the
+    /// daemon gates on a live assigned chat turn with a server-verified
+    /// App binding; receipt-shaped fields stay refused on this path.
     pub fn app_content_propose(
         &self,
         context: &str,
@@ -1316,20 +1335,27 @@ impl RecordStore {
             .map_err(|e| Error::internal(e.to_string()))?;
         if let Some(stored) = conn
             .query_row(
-                "SELECT campaign_id,source_revision,content_digest FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                "SELECT campaign_id,source_revision,content_digest,actor,origin,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
                 params![context, proposal_id],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| Error::internal(e.to_string()))?
         {
-            if stored.0 == campaign && stored.1 == source_revision && stored.2 == digest {
+            if stored.0 == campaign && stored.1 == source_revision && stored.2 == digest
+                && stored.3 == "operator" && stored.4 == "operator-direct"
+                && stored.5.is_none() && stored.6.is_none()
+            {
                 drop(conn);
                 return self.app_content_proposal_show(context, proposal_id);
             }
@@ -1353,7 +1379,7 @@ impl RecordStore {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(proposal_id, "proposal ID")?;
         conn.query_row(
-            "SELECT campaign_id,source_revision,subject,preheader,blocks,content_digest,state,created,decided FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+            "SELECT campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,state,created,decided FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
             params![context, proposal_id],
             |r| {
                 Ok(ProposalRow {
@@ -1363,9 +1389,13 @@ impl RecordStore {
                     preheader: r.get(3)?,
                     blocks: r.get(4)?,
                     digest: r.get(5)?,
-                    state: r.get(6)?,
-                    created: r.get(7)?,
-                    decided: r.get(8)?,
+                    actor: r.get(6)?,
+                    origin: r.get(7)?,
+                    receipt_message: r.get(8)?,
+                    receipt_agent: r.get(9)?,
+                    state: r.get(10)?,
+                    created: r.get(11)?,
+                    decided: r.get(12)?,
                 })
             },
         )
@@ -1380,6 +1410,17 @@ impl RecordStore {
         let conn = self.conn();
         let row = self.proposal_row(&conn, context, proposal_id)?;
         let raw: Value = serde_json::from_str(&row.blocks).unwrap_or(Value::Null);
+        let receipt = match (&row.receipt_message, &row.receipt_agent) {
+            (Some(message), Some(agent)) => json!({
+                "message_id": message,
+                "agent": agent,
+                "install_id": self.install(),
+                "context_id": context,
+                "campaign_id": row.campaign,
+                "source_revision": row.source_revision,
+            }),
+            _ => Value::Null,
+        };
         Ok(json!({"proposal": {
             "proposal_id": proposal_id,
             "install_id": self.install(),
@@ -1390,13 +1431,118 @@ impl RecordStore {
             "preheader": row.preheader,
             "blocks": raw,
             "content_digest": row.digest,
-            "actor": "operator",
-            "origin": "operator-direct",
-            "assistant_receipt": null,
+            "actor": row.actor,
+            "origin": row.origin,
+            "assistant_receipt": receipt,
             "state": row.state,
             "created": row.created,
             "decided": row.decided,
         }}))
+    }
+
+    /// CAD-813: record a bounded assistant-authored proposal draft
+    /// behind a host-verified chat turn receipt. The daemon — never
+    /// the caller — proved the turn (assigned agent, live token) and
+    /// the App binding (installation, context) before calling here, so
+    /// `agent` and `message` are daemon-resolved provenance, not
+    /// request fields. Inert like the operator path: the draft does
+    /// not change, approval does not change, nothing sends. Bound to
+    /// the observed source revision (`expected_source` refuses stale
+    /// when the caller names what it drafted against); a proposal ID
+    /// replays only behind identical bytes AND identical provenance.
+    /// Attribution is honestly `assistant` with
+    /// `origin: assistant-receipt`. Content validation and renderer
+    /// grammar are the shared CAD-782 path: the `Draft` arrived
+    /// already parsed.
+    pub fn app_content_assistant_propose(
+        &self,
+        context: &str,
+        campaign: &str,
+        proposal_id: &str,
+        draft: &Draft,
+        turn: &AssistantTurn<'_>,
+    ) -> Result<Value> {
+        let agent = turn.agent;
+        let message = turn.message;
+        let expected_source = turn.expected_source;
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(campaign, "campaign ID")?;
+        crate::proto::identifier(proposal_id, "proposal ID")?;
+        // Daemon-resolved provenance, never caller authority: the
+        // agent alias follows the agent grammar
+        // (`[A-Za-z0-9._-]`, 1-80) and the message id is bounded
+        // opaque text — the daemon proved both against its store
+        // before calling here, so an unknown pair refuses on lookup.
+        if agent.is_empty()
+            || agent.len() > 80
+            || !agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(Error::rejected("proposal agent identity is malformed"));
+        }
+        if message.is_empty() || message.len() > 128 || message.chars().any(char::is_control) {
+            return Err(Error::rejected("proposal message identity is malformed"));
+        }
+        if let Some(wanted) = expected_source {
+            if wanted < 0 {
+                return Err(Error::rejected(
+                    "email proposal source revision is malformed",
+                ));
+            }
+        }
+        let conn = self.conn();
+        let source_revision = self
+            .content_row(&conn, context, campaign)?
+            .map(|row| row.revision)
+            .unwrap_or(0);
+        if let Some(wanted) = expected_source {
+            if wanted != source_revision {
+                return Err(Error::rejected("email proposal source revision is stale"));
+            }
+        }
+        let digest = proposal_digest(self.install(), context, campaign, proposal_id, draft);
+        let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(stored) = conn
+            .query_row(
+                "SELECT campaign_id,source_revision,content_digest,actor,origin,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                params![context, proposal_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+        {
+            if stored.0 == campaign
+                && stored.1 == source_revision
+                && stored.2 == digest
+                && stored.3 == "assistant"
+                && stored.4 == "assistant-receipt"
+                && stored.5.as_deref() == Some(message)
+                && stored.6.as_deref() == Some(agent)
+            {
+                drop(conn);
+                return self.app_content_proposal_show(context, proposal_id);
+            }
+            return Err(Error::rejected("email proposal ID is already used"));
+        }
+        conn.execute(
+            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,'pending',?,NULL)",
+            params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, now()],
+        )
+        .map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        self.app_content_proposal_show(context, proposal_id)
     }
 
     pub fn app_content_proposal_list(
@@ -1743,6 +1889,20 @@ impl Store {
     /// committed inside its installation file. Advisory like
     /// `note_app_audience`: digests only, never content.
     pub fn note_app_content(&self, install: &str, context: &str, action: &str, digest: &str) {
+        self.note_app_content_by(install, context, action, digest, "operator");
+    }
+
+    /// CAD-813: the same advisory event with an explicit actor — the
+    /// assistant turn's agent alias for verified proposals. Digests
+    /// only, never content.
+    pub fn note_app_content_by(
+        &self,
+        install: &str,
+        context: &str,
+        action: &str,
+        digest: &str,
+        actor: &str,
+    ) {
         let guard = match self.write_conn() {
             Ok(guard) => guard,
             Err(error) => {
@@ -1754,7 +1914,7 @@ impl Store {
             &guard,
             Self::DAEMON_STREAM,
             "app_content_changed",
-            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": "operator"}),
+            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": actor}),
         )
         .is_err()
         {
