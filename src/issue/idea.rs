@@ -408,6 +408,7 @@ pub fn set_status_tags(
     status: &str,
     extra_tag: Option<&str>,
     drop_tags: &[&str],
+    done_reason: Option<&str>,
 ) -> Result<()> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, _) = write::load_front(&dir)?;
@@ -425,7 +426,7 @@ pub fn set_status_tags(
         format!("status={status}"),
         format!("tags={}", tags.join(",")),
     ];
-    write::set_fields(pm, &[id.to_string()], &pairs, "daemon")?;
+    write::set_fields(pm, &[id.to_string()], &pairs, "daemon", done_reason)?;
     Ok(())
 }
 
@@ -518,12 +519,15 @@ pub fn decide(
         .unwrap_or_default();
     if action == "approve" {
         children = create_children(pm, issue, &project, &proposed, &children)?;
+        // CAD-756: the approval decision IS the done evidence — the
+        // children it just minted are the work's continuation.
         set_status_tags(
             pm,
             issue,
             "done",
             Some("planned"),
             &["plan-ready", "parked", "idea-stale"],
+            Some("idea plan approved — children minted"),
         )?;
     } else if action == "reject" {
         set_status_tags(
@@ -532,9 +536,10 @@ pub fn decide(
             "dropped",
             None,
             &["plan-ready", "parked", "idea-stale"],
+            None,
         )?;
     } else {
-        set_status_tags(pm, issue, "review", Some("parked"), &["plan-ready"])?;
+        set_status_tags(pm, issue, "review", Some("parked"), &["plan-ready"], None)?;
     }
     let decision = Decision {
         id: format!("idea-{}-{action}", issue.to_ascii_lowercase()),

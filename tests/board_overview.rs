@@ -285,7 +285,14 @@ fn overview_tracker_items_and_tracker_behind() {
         cli(
             pm.path(),
             state.path(),
-            &["issue", "set", "CAD-4", "status=done"]
+            &[
+                "issue",
+                "set",
+                "CAD-4",
+                "status=done",
+                "--force",
+                "overview behind-probe close",
+            ]
         )
         .0
     );

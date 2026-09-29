@@ -151,7 +151,17 @@ fn sync_conflict_aborts_then_resolves() {
     // publish first: whichever `issue set` commits first wins the
     // remote via its own post-commit hook, so A writes only after B's
     // push has landed (A's hook push then fails non-ff, as intended).
-    let (ok, out) = t.cli(&t.b, &["issue", "set", &id, "status=done"]);
+    let (ok, out) = t.cli(
+        &t.b,
+        &[
+            "issue",
+            "set",
+            &id,
+            "status=done",
+            "--force",
+            "sync conflict probe close",
+        ],
+    );
     assert!(ok, "{out}");
     t.publish(&t.b);
     let (ok, out) = t.cli(&t.a, &["issue", "set", &id, "status=backlog"]);

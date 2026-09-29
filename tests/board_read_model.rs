@@ -658,7 +658,18 @@ fn tracker_writes_show_on_the_next_read_and_stream_as_entity_diffs() {
     assert_eq!(card(port, "CAD-3")["status"], "review");
     let review_before = open_review(port);
     assert_eq!(get_json(port, "/api/issues/CAD-3")["status"], "review");
-    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-3", "status=done"]);
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &[
+            "issue",
+            "set",
+            "CAD-3",
+            "status=done",
+            "--force",
+            "entity-diff probe close",
+        ],
+    );
     assert!(ok, "{out}");
     // The very next reads — no sleep, no refresh wait.
     assert_eq!(card(port, "CAD-3")["status"], "done");
@@ -965,7 +976,18 @@ fn collection_validators_omit_unchanged_bytes_and_move_after_writes() {
     assert_eq!(status, 304);
     assert_eq!(same, before);
     assert!(body.is_empty(), "unchanged collection transfers no body");
-    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-3", "status=done"]);
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &[
+            "issue",
+            "set",
+            "CAD-3",
+            "status=done",
+            "--force",
+            "validator probe close",
+        ],
+    );
     assert!(ok, "{out}");
     let (status, after, body) = get_validated(fx.port, "/api/issues", Some(&before));
     assert_eq!(status, 200);
@@ -1063,7 +1085,18 @@ fn title_only_tracker_changes_skip_aggregate_reads_but_status_and_count_changes_
         initial["projects"][0]["open_by_status"],
         get_json(fx.port, "/api/overview")["projects"][0]["open_by_status"]
     );
-    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-2", "status=done"]);
+    let (ok, out) = cli(
+        &fx.pm,
+        &fx.state,
+        &[
+            "issue",
+            "set",
+            "CAD-2",
+            "status=done",
+            "--force",
+            "aggregate probe close",
+        ],
+    );
     assert!(ok, "{out}");
     wait_for("status aggregate update", 15, || {
         frames(&stream, "aggregates").iter().any(|f| {

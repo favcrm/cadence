@@ -1598,8 +1598,17 @@ fn tags_fixture() -> (TempDir, TempDir) {
         "core",
     ]);
     run(&["issue", "new", "loose", "--project", "x", "--tag", "infra"]);
+    // CAD-756: closing X-3 needs recorded evidence — the fixture performs
+    // no merge, so it records the designed override.
+    run(&[
+        "issue",
+        "set",
+        "X-3",
+        "status=done",
+        "--force",
+        "tags fixture close",
+    ]);
     for (id, status) in [
-        ("X-3", "done"),
         ("X-4", "doing"),
         ("X-6", "dropped"),
         ("X-7", "ready"),
@@ -2035,8 +2044,23 @@ fn issue_ls_filters_and_epics_match_the_api() {
     );
     assert_eq!(b["blocked"], 0);
     assert_eq!(b["owners"], json!(["cy"]));
-    // Finishing the only live child completes epic B.
-    assert!(cli(pm, state, &["issue", "set", "X-7", "status=done"]).0);
+    // Finishing the only live child completes epic B. CAD-756: the
+    // fixture performed no merge, so the close records the override.
+    assert!(
+        cli(
+            pm,
+            state,
+            &[
+                "issue",
+                "set",
+                "X-7",
+                "status=done",
+                "--force",
+                "epic rollup probe close"
+            ]
+        )
+        .0
+    );
     let (_, out) = cli(pm, state, &["issue", "epic", "ls", "--json"]);
     assert_eq!(out["epics"][1]["done_ratio"], 1.0);
     assert_eq!(out["epics"][1]["status"], "done");

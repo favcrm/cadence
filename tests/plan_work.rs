@@ -158,7 +158,17 @@ fn plan_propose_approve_gate_and_progress() {
     assert!(ok, "approved plan's ticket starts: {out}");
 
     // Progress: S=1 M=3 L=8, unsized = M.
-    assert!(f.cli(&["issue", "set", "D-3", "status=done"]).0);
+    assert!(
+        f.cli(&[
+            "issue",
+            "set",
+            "D-3",
+            "status=done",
+            "--force",
+            "approve-gate probe close"
+        ])
+        .0
+    );
     assert!(f.cli(&["issue", "set", "D-4", "status=dropped"]).0);
     let (ok, show) = f.cli(&["issue", "show", "D-2", "--json"]);
     assert!(ok, "{show}");
@@ -3303,7 +3313,15 @@ fn work_model_stage_moves_are_gated_and_committed() {
         let (ok, out) = f.cli(&["issue", "new", title, "--project", "demo", "--epic", "D-1"]);
         assert!(ok, "{out}");
     }
-    let (ok, out) = f.cli(&["issue", "set", "D-2", "size=l", "status=done"]);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "size=l",
+        "status=done",
+        "--force",
+        "stage-move probe close",
+    ]);
     assert!(ok, "{out}");
     assert_eq!(f.front("D-2").size.as_deref(), Some("L"));
     assert!(f.cli(&["issue", "set", "D-3", "size=S"]).0);
@@ -3600,7 +3618,18 @@ fn work_model_project_md_and_milestones() {
             .contains("Unknown stage 'verify'"),
         "{r}"
     );
-    assert!(f.cli(&["issue", "set", "D-2", "size=S", "status=done"]).0);
+    assert!(
+        f.cli(&[
+            "issue",
+            "set",
+            "D-2",
+            "size=S",
+            "status=done",
+            "--force",
+            "milestone probe close"
+        ])
+        .0
+    );
 
     let (ok, out) = f.cli(&["milestone", "ls", "--json"]);
     assert!(ok, "{out}");
@@ -3635,7 +3664,17 @@ fn work_model_project_md_and_milestones() {
         f.cli(&["issue", "new", "Part", "--project", "demo", "--epic", "D-4"])
             .0
     );
-    assert!(f.cli(&["issue", "set", "D-5", "status=done"]).0);
+    assert!(
+        f.cli(&[
+            "issue",
+            "set",
+            "D-5",
+            "status=done",
+            "--force",
+            "milestone probe close"
+        ])
+        .0
+    );
     let (_, out) = f.cli(&["issue", "show", "D-4", "--json"]);
     assert_eq!(out["work"]["stage"]["id"], "done", "{out}");
     assert_eq!(out["work"]["stage"]["source"], "status", "{out}");
@@ -3703,7 +3742,17 @@ fn work_model_status_derived_stage_needs_operator_for_gates() {
         }
         assert!(f.cli(&args).0, "{title}");
     }
-    assert!(f.cli(&["issue", "set", "D-2", "status=done"]).0);
+    assert!(
+        f.cli(&[
+            "issue",
+            "set",
+            "D-2",
+            "status=done",
+            "--force",
+            "derived-stage probe close"
+        ])
+        .0
+    );
     let (_, out) = f.cli(&["issue", "show", "D-1", "--json"]);
     assert_eq!(out["work"]["stage"]["source"], "status", "{out}");
 

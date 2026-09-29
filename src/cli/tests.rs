@@ -1158,6 +1158,7 @@ fn overview_commands_all_parse() {
         &["CAD-1".to_string()],
         &["status=done".to_string()],
         "t",
+        Some("test fixture"),
     )
     .unwrap();
     let view = ov::overview(&dir.path().join("state"), &pm_dir);
