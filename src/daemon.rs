@@ -22,6 +22,7 @@ mod app_bindings_rpc;
 mod app_capabilities_rpc;
 mod app_contexts_rpc;
 mod app_effects_rpc;
+mod app_records_rpc;
 mod app_runs_rpc;
 mod approvals_rpc;
 mod area_rpc;
@@ -2750,6 +2751,10 @@ impl Shared {
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),
             "app_context_update" => self.rpc_app_context(method, params, peer_pid),
             "app_context_archive" => self.rpc_app_context(method, params, peer_pid),
+            "app_record_create" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_list" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_show" => self.rpc_app_record(method, params, peer_pid),
+            "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_workspace_install" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade" => self.rpc_app_workspace(method, params, peer_pid),
             "app_workspace_upgrade_check" => self.rpc_app_workspace(method, params, peer_pid),
