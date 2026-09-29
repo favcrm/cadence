@@ -112,6 +112,8 @@ struct FakeDoor {
     /// enforces destination-exactness against this value; unset means the
     /// tests drive discovery echo for liveness-only paths.
     expected_destination: Arc<Mutex<Option<String>>>,
+    /// Adversarial hook: when set, ok responses omit the binding echo.
+    omit_binding: Arc<std::sync::atomic::AtomicBool>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -124,11 +126,13 @@ impl FakeDoor {
         let ledger = Arc::new(FakePublishLedger::enabled());
         let calls = Arc::new(Mutex::new(0u64));
         let expected_destination = Arc::new(Mutex::new(None));
+        let omit_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
         let worker_expected = Arc::clone(&expected_destination);
+        let worker_omit = Arc::clone(&omit_binding);
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             while !worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -143,6 +147,7 @@ impl FakeDoor {
                     &worker_grants,
                     &worker_ledger,
                     &worker_expected,
+                    &worker_omit,
                     request.url(),
                     &value,
                 );
@@ -155,9 +160,15 @@ impl FakeDoor {
             ledger,
             calls,
             expected_destination,
+            omit_binding,
             stop,
             worker: Some(worker),
         }
+    }
+
+    fn omit_binding_echo(&self, omit: bool) {
+        self.omit_binding
+            .store(omit, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn expect_destination(&self, destination_id: &str) {
@@ -170,6 +181,7 @@ impl FakeDoor {
         grants: &Mutex<GrantAuthority>,
         ledger: &FakePublishLedger,
         expected: &Mutex<Option<String>>,
+        omit_binding: &std::sync::atomic::AtomicBool,
         url: &str,
         value: &Value,
     ) -> Value {
@@ -234,11 +246,21 @@ impl FakeDoor {
             return match ledger.execute(&binding, &dest, &mut grant, "ws_harbour", NOW, behavior) {
                 Ok(outcome) => {
                     grants.lock().unwrap().consume(&binding.grant_id);
-                    json!({"verdict": "ok", "state": outcome.state.as_str(),
+                    let mut reply = json!({"verdict": "ok", "state": outcome.state.as_str(),
                         "permalink": outcome.permalink,
                         "provider_ids": outcome.provider_ids,
                         "provider_payload": outcome.provider_payload,
-                        "repeated": outcome.repeated})
+                        "destination_id": outcome.destination_id,
+                        "caption_digest": outcome.caption_digest,
+                        "image_digest": outcome.image_digest,
+                        "repeated": outcome.repeated});
+                    if omit_binding.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Adversarial hook: upstream echo goes missing.
+                        for field in ["destination_id", "caption_digest", "image_digest"] {
+                            reply.as_object_mut().unwrap().remove(field);
+                        }
+                    }
+                    reply
                 }
                 Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
             };
@@ -331,12 +353,34 @@ impl HttpSender {
                 "fake door refused dispatch",
             ));
         }
-        let field = |name: &str, fallback: &str| {
-            verdict[name]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| fallback.to_owned())
-        };
+        // Strict echo: every binding field must arrive from upstream.
+        // Nothing is ever filled from the request — a missing echo
+        // refuses instead of masking a broken read-back.
+        let destination_id = verdict["destination_id"].as_str().ok_or_else(|| {
+            Refusal::new(
+                "bad_destination",
+                "fake door response omits destination echo",
+            )
+        })?;
+        let caption_digest = verdict["caption_digest"].as_str().ok_or_else(|| {
+            Refusal::new(
+                "bad_caption_digest",
+                "fake door response omits caption echo",
+            )
+        })?;
+        let image_digest = verdict.get("image_digest").and_then(|digest| {
+            if digest.is_null() {
+                None
+            } else {
+                digest.as_str().map(str::to_owned)
+            }
+        });
+        if image_digest.as_deref() != binding.image_digest.as_deref() {
+            return Err(Refusal::new(
+                "bad_image_digest",
+                "fake door response image differs from the dispatched binding",
+            ));
+        }
         Ok(LedgerOutcome {
             state: match verdict["state"].as_str().unwrap_or("") {
                 "posted" => PublishState::Posted,
@@ -345,12 +389,9 @@ impl HttpSender {
                 _ => PublishState::ReconnectNeeded,
             },
             permalink: verdict["permalink"].as_str().map(str::to_owned),
-            destination_id: field("destination_id", &binding.destination_id),
-            caption_digest: field("caption_digest", &binding.caption_digest),
-            image_digest: verdict["image_digest"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| binding.image_digest.clone()),
+            destination_id: destination_id.to_owned(),
+            caption_digest: caption_digest.to_owned(),
+            image_digest,
             provider_payload: verdict["provider_payload"].as_str().map(str::to_owned),
             provider_ids: verdict["provider_ids"]
                 .as_array()
@@ -1322,4 +1363,45 @@ fn cad771_e2e_revoked_binding_holds_despite_matching_recheck() {
         "approved material changed since freeze"
     );
     assert_eq!(door.ledger.provider_calls(), 0);
+}
+
+#[test]
+fn cad771_e2e_missing_upstream_echo_fails_closed_never_filled() {
+    // A provider response that omits the binding echo must refuse, never
+    // fill evidence from the request: missing upstream fields fail closed.
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "noecho");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-noecho",
+                "cad_fx_noecho_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    door.omit_binding_echo(true);
+    let refused = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck_for(&intent)}),
+        )
+        .unwrap();
+    assert_eq!(refused["intent"]["state"], "refused");
+    assert!(refused["intent"]["receipt"]["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("bad_destination"));
+    // Nothing was filled from the request: no upstream evidence recorded.
+    assert!(refused["intent"]["upstream"].is_null());
 }
