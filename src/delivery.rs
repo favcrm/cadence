@@ -230,8 +230,9 @@ pub struct Record {
     /// CAD-776: how often the record has become merge-ready. Bumped
     /// under `delivery_lock` on the transition into merge-ready, saved
     /// with the observation, so the wake key derives from persisted
-    /// record state only — concurrent observers converge on one key
-    /// and the message id dedupes them to one wake.
+    /// record state only — `delivery_lock` serializes observers, and
+    /// every post-save wake attempt reads the same saved key, which
+    /// the message id dedupes to one wake.
     #[serde(default)]
     pub ready_epoch: u32,
 }
@@ -1019,14 +1020,15 @@ mod tests {
         assert!(k.contains("/pm/demo/D-2/issue.md"), "{k}");
     }
 
-    /// CAD-776, deterministic concurrency proof: two observers that
-    /// both load the same pre-transition record and both apply the
-    /// ready-making observation converge on one epoch and one key —
-    /// the wake's message id therefore dedupes them to one wake no
-    /// matter how the lock interleaves them. A steady re-application
-    /// bumps nothing and recomputes the same key.
+    /// CAD-776, deterministic concurrency proof: `delivery_lock`
+    /// serializes observers, so B always loads A's saved record —
+    /// never the same pre-transition base twice. A transitions (epoch
+    /// 0→1); B's steady observation bumps nothing; then the post-lock
+    /// wakes run B-before-A and both use the identical persisted key,
+    /// so the message id dedupes them to one wake no matter the wake
+    /// order.
     #[test]
-    fn ready_epoch_converges_for_concurrent_transitions() {
+    fn ready_epoch_converges_for_serialized_observers() {
         let sha = "a".repeat(40);
         let mut base = Record::new("D-2", "demo", "w1", 0);
         base.state = State::Passed;
@@ -1044,33 +1046,29 @@ mod tests {
             ci_green: true,
             ..Observed::default()
         };
-        // Both observers load the same not-ready record.
+        // The base record is not ready: no key yet.
         assert!(!base.merge_ready());
         assert_eq!(base.ready_key(), None);
-        // Observer A transitions; observer B's stale load transitions
-        // identically — same epoch, same key, one message id.
+        // Observer A transitions under the lock and saves epoch 1.
         let mut a = base.clone();
-        let mut b = base.clone();
-        for r in [&mut a, &mut b] {
-            let was = r.merge_ready();
-            r.observed = Some(green.clone());
-            r.advance_ready_epoch(was);
-        }
+        let was_a = a.merge_ready();
+        assert!(!was_a);
+        a.observed = Some(green.clone());
+        a.advance_ready_epoch(was_a);
         assert_eq!(a.ready_epoch, 1);
+        let key_a = a.ready_key().unwrap();
+        // Observer B loads A's saved record: already ready, so its
+        // observation is steady — no bump, the same persisted key.
+        let mut b = a.clone();
+        let was_b = b.merge_ready();
+        assert!(was_b);
+        b.observed = Some(green.clone());
+        b.advance_ready_epoch(was_b);
         assert_eq!(b.ready_epoch, 1);
-        assert_eq!(a.ready_key(), b.ready_key());
-        // Whoever saves last still leaves epoch 1: B's bump of its
-        // stale copy converges rather than stacking.
-        let mut merged = a.clone();
-        merged.ready_epoch = b.ready_epoch;
-        assert_eq!(merged.ready_epoch, 1);
-        // A steady observation bumps nothing and reuses the key.
-        let mut steady = a.clone();
-        let was = steady.merge_ready();
-        steady.observed = Some(green.clone());
-        steady.advance_ready_epoch(was);
-        assert_eq!(steady.ready_epoch, 1);
-        assert_eq!(steady.ready_key(), a.ready_key());
+        assert_eq!(b.ready_key().as_deref(), Some(key_a.as_str()));
+        // Post-lock wakes run B-before-A: identical keys, one message
+        // id, one wake.
+        assert_eq!(b.ready_key(), a.ready_key());
         // Regression then recovery is a new streak: red observes to no
         // key, green again bumps to a new one.
         let mut red = a.clone();

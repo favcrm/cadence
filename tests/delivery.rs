@@ -4241,8 +4241,9 @@ fn cad776_concurrent_observe_wakes_once() {
     });
     lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
     thread::sleep(Duration::from_millis(2_000));
-    // One wake, and under the first-epoch key: concurrent transitions
-    // converge on the record-persisted epoch, never one key each.
+    // One wake, and under the first-epoch key: the lock serializes the
+    // observers, so the second is steady on the record-persisted
+    // epoch — never one key each.
     assert_eq!(
         ready_wakes(&lf.f)
             .iter()

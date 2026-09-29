@@ -627,8 +627,8 @@ fn merge_ready_text(rec: &Record) -> Option<String> {
     Some(format!(
         "{issue} is ready to merge: {pr} at {sha} — PASS by {reviewer}, CI green on an open \
          PR.\nSeen by the operator's delivery_observe; merge it with `cadence delivery merge \
-         {issue}` (the merge still needs the operator, a standing PASS and the reviewed head — \
-         this wake grants nothing).",
+         {issue}` (the merge re-checks this exact head and still needs the operator and a \
+         standing PASS — this wake grants nothing).",
         issue = shown_id(&rec.issue),
         sha = shown(sha),
         reviewer = shown(reviewer),
@@ -695,6 +695,7 @@ mod tests {
         assert!(text.contains("acme/app#7"), "{text}");
         assert!(text.contains(&sha), "{text}");
         assert!(text.contains("delivery_observe"), "{text}");
+        assert!(text.contains("re-checks this exact head"), "{text}");
         assert!(text.contains("grants nothing"), "{text}");
         // No caller field flows in: an evil issue id is sanitized, and
         // the raw PR URL never shows.
