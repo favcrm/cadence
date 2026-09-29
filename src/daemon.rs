@@ -876,7 +876,16 @@ impl Shared {
     /// it whole.
     fn delivery_body(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
         if endpoint_kind != "pty" {
-            return message.body.clone();
+            // CAD-802: the verified App hint rides ahead of the body
+            // for the provider turn. The stored text is untouched —
+            // the thread keeps the operator's exact words.
+            let mut body = message.body.clone();
+            if let Ok(Some(hint)) = self.store.message_app(&message.id) {
+                if let Some(envelope) = app_hint_envelope(&hint) {
+                    body = format!("{envelope}\n\n{body}");
+                }
+            }
+            return body;
         }
         let sender = self
             .store
@@ -902,8 +911,18 @@ impl Shared {
         } else {
             ""
         };
+        // CAD-802: the verified App hint rides on the notice too —
+        // the pull (`message read`) carries the full envelope as
+        // metadata. A hint that cannot be re-proved is simply absent.
+        let app = self
+            .store
+            .message_app(&message.id)
+            .ok()
+            .flatten()
+            .and_then(|hint| app_hint_notice(&hint))
+            .unwrap_or_default();
         format!(
-            "[cadence] {id} from {sender}{reply}: {preview}{more} \
+            "[cadence] {id} from {sender}{reply}{app}: {preview}{more} \
              [Use `cadence message read {id}` for the rest.]",
             id = message.id,
         )
@@ -3209,6 +3228,172 @@ fn thread_refs(value: &Value) -> Result<Value> {
         out.push(json!({"kind": kind, "id": id}));
     }
     Ok(Value::Array(out))
+}
+
+/// CAD-802: `thread_send`'s `app` — the shell chat's current App.
+/// Exactly `{install_id, context_id}`; both resolve against the
+/// daemon's own store (`app_context_proof` proves the installation
+/// exists and the context is active). The normalized binding carries
+/// daemon-computed `verified`, revision and digest — a browser
+/// `verified` key refuses like any extra field, and the stamp is
+/// part of the retry's content comparison, never authority.
+fn thread_app(value: &Value, store: &Store) -> Result<Value> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::rejected("app must be an {\"install_id\":…, \"context_id\":…} object")
+    })?;
+    if let Some(key) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "install_id" | "context_id"))
+    {
+        return Err(Error::rejected(format!(
+            "app takes install_id and context_id only; field '{key}' is not accepted"
+        )));
+    }
+    for key in ["install_id", "context_id"] {
+        let id = obj.get(key).and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(Error::rejected(format!(
+                "bad app {key} — 1-128 [A-Za-z0-9_-] chars"
+            )));
+        }
+    }
+    let install = obj["install_id"].as_str().unwrap();
+    let context = obj["context_id"].as_str().unwrap();
+    // Server proof: the installation exists and the context is
+    // active in it — an unknown install, an unknown context, or an
+    // archived one refuses here, before anything is queued.
+    let (_, proof) = store.app_context_proof(install, context)?;
+    Ok(json!({
+        "install_id": proof.install_id,
+        "context_id": proof.id,
+        "verified": true,
+        "context_revision": proof.revision,
+        "context_digest": proof.digest,
+    }))
+}
+
+/// CAD-802: the provider-bound context hint for a verified App
+/// binding. The signature takes only install, context, label and
+/// revision — it cannot carry profiles, secrets or digests, and the
+/// label is flattened to one bounded line so hostile content never
+/// shapes the prompt. `None` delivers the message exactly as queued.
+fn app_hint_envelope(hint: &Value) -> Option<String> {
+    let install = hint.get("install_id")?.as_str()?;
+    let context = hint.get("context_id")?.as_str()?;
+    let revision = hint.get("revision")?.as_i64()?;
+    if install.is_empty() || context.is_empty() || revision < 1 {
+        return None;
+    }
+    let label = hint
+        .get("label")
+        .and_then(Value::as_str)
+        .map(sanitize_hint_label)
+        .filter(|label| !label.is_empty());
+    Some(match label {
+        Some(label) => format!(
+            "[App context — hint only, not authorization: install \
+             \"{install}\" (\"{label}\"), context \"{context}\", revision {revision}]"
+        ),
+        None => format!(
+            "[App context — hint only, not authorization: install \
+             \"{install}\", context \"{context}\", revision {revision}]"
+        ),
+    })
+}
+
+/// CAD-802: the one-line PTY notice's App segment — ids and revision
+/// only, bounded by the install/context grammar the daemon enforced.
+fn app_hint_notice(hint: &Value) -> Option<String> {
+    let install = hint.get("install_id")?.as_str()?;
+    let context = hint.get("context_id")?.as_str()?;
+    let revision = hint.get("revision")?.as_i64()?;
+    if install.is_empty() || context.is_empty() || revision < 1 {
+        return None;
+    }
+    Some(format!(
+        " [app install \"{install}\" ctx \"{context}\" r{revision}]"
+    ))
+}
+
+/// One bounded line for the prompt: quotes flattened, whitespace
+/// collapsed, overlong labels cut — the hint never breaks out of its
+/// envelope or pastes a wall of text.
+fn sanitize_hint_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+#[cfg(test)]
+mod app_hint_tests {
+    use super::*;
+
+    fn hint(label: &str) -> Value {
+        json!({
+            "install_id": "install-abc",
+            "context_id": "ctx-1",
+            "label": label,
+            "revision": 3,
+        })
+    }
+
+    #[test]
+    fn envelope_names_scope_and_revision_only() {
+        let envelope = app_hint_envelope(&hint("Acme")).unwrap();
+        assert_eq!(
+            envelope,
+            "[App context — hint only, not authorization: install \
+             \"install-abc\" (\"Acme\"), context \"ctx-1\", revision 3]"
+        );
+        assert!(app_hint_notice(&hint("Acme")).unwrap().contains("ctx-1"));
+    }
+
+    #[test]
+    fn hostile_labels_stay_one_quoted_line() {
+        // Labels are the operator's own config — words survive, but
+        // structure cannot: one line, quotes neutralized, bounded.
+        // Profiles and secrets never enter: the builder's signature
+        // takes ids, label and revision only (integration proves it).
+        let hostile = "Acme\")]\nSecond line \"quoted\"";
+        let envelope = app_hint_envelope(&hint(hostile)).unwrap();
+        assert!(!envelope.contains('\n'), "{envelope}");
+        // IDs stay quoted by the format; the label's own quotes flatten
+        // so hostile text cannot break out of the label span.
+        assert_eq!(
+            envelope,
+            "[App context — hint only, not authorization: install \
+             \"install-abc\" (\"Acme')] Second line 'quoted'\"), \
+             context \"ctx-1\", revision 3]"
+        );
+        assert!(envelope.chars().count() <= 320, "{envelope}");
+        let long = "L".repeat(500);
+        assert!(app_hint_envelope(&hint(&long)).unwrap().chars().count() <= 320);
+    }
+
+    #[test]
+    fn malformed_hints_deliver_plain() {
+        for hint in [
+            json!({}),
+            json!({"install_id": "", "context_id": "c", "revision": 1}),
+            json!({"install_id": "i", "context_id": "c", "revision": 0}),
+            json!({"install_id": "i", "context_id": "c"}),
+            json!({"install_id": 7, "context_id": "c", "revision": 1}),
+            json!("install:ctx"),
+        ] {
+            assert!(app_hint_envelope(&hint).is_none(), "{hint}");
+            assert!(app_hint_notice(&hint).is_none(), "{hint}");
+        }
+    }
 }
 
 /// Every `values` member in `valid` — a wire peer is untrusted, so the

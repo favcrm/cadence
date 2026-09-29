@@ -716,6 +716,9 @@ tests = [
     "cad574_needs_dismiss_gate_and_suppression",
     "cad574_needs_board_gate",
     "cad574_thread_send_refs",
+    "cad802_thread_send_app_binding_is_server_verified",
+    "cad802_thread_send_app_hint_reaches_provider_and_pull_paths",
+    "cad802_thread_send_app_hint_rides_pty_notice",
 ]
 helpers = [
     "start_operator_board",

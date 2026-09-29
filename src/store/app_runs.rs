@@ -985,6 +985,7 @@ impl Store {
                 &Sender::Unattributed,
                 super::Priority::Normal,
                 None,
+                None,
             )?;
             tx.execute("UPDATE tasks SET state='dispatched',revision=1,dispatch_message=?,updated=? WHERE id=? AND state='draft'",params![message,now(),task_id])?;
             tx.execute("UPDATE app_run_steps SET state='dispatched',message_id=? WHERE run_id=? AND step_id=? AND state='pending'",params![message,id,step_id])?;

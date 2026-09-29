@@ -278,11 +278,24 @@ impl Shared {
             None | Some(Value::Null) => None,
             Some(v) => Some(thread_refs(v)?),
         };
+        // CAD-802: `thread_send`'s App binding arrives already
+        // server-verified (threads_rpc proved it against the store);
+        // re-prove here so `agent_send`/`send` can never carry one.
+        let app = match params.get("app") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(thread_app(v, &self.store)?),
+        };
         let sender = sender_of(&alias)?;
         if refs.is_some() && sender != store::Sender::OperatorChat {
             return Err(Error::rejected(
                 "refs is a thread_send field — only the operator's chat cites \
                  needs rows; `cadence send` and `agent_send` carry none",
+            ));
+        }
+        if app.is_some() && sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "app is a thread_send field — only the operator's chat carries \
+                 a verified App binding; `cadence send` and `agent_send` carry none",
             ));
         }
         let (duplicate, state) = self.store.enqueue_steered(
@@ -297,6 +310,7 @@ impl Shared {
             &sender,
             &steer,
             refs.as_ref(),
+            app.as_ref(),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.
@@ -358,6 +372,15 @@ impl Shared {
             .min(MESSAGE_READ_LIMIT as u64) as usize;
         let total = message.body.chars().count();
         let text: String = message.body.chars().skip(offset).take(limit).collect();
+        // CAD-802: the verified App hint as receipt metadata — the
+        // pulled text stays exactly the stored body (offsets stable).
+        // A hint that cannot be re-proved is null, never an error.
+        let app_context = self
+            .store
+            .message_app(&message.id)
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
         Ok(json!({
             "message": message.id,
             "text": text,
@@ -365,6 +388,7 @@ impl Shared {
             "limit": limit,
             "chars_total": total,
             "truncated": offset + text.chars().count() < total,
+            "app_context": app_context,
         }))
     }
 

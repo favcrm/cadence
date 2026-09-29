@@ -3,6 +3,7 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
+import AppShell from "./features/app-shell/AppShell";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -880,7 +881,9 @@ export default function App() {
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
-          <WorkspaceApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }}>
+            <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
+          </AppShell>
         )}
         {route.screen === "apps" && route.project && route.name && (
           <AppDetail

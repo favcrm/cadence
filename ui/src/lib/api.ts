@@ -359,11 +359,25 @@ export const api = {
   },
   /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent.
    *  `refs` are the needs-me subjects the message cites (CAD-574 "Ask
-   *  master"): they land on the entry's payload, never in the text. */
-  threadSend: (alias: string, text: string, message: string, refs?: ThreadRef[]) =>
+   *  master"): they land on the entry's payload, never in the text.
+   *  `app` is the shell chat's current installation/context (CAD-802):
+   *  never authority — the daemon proves both against its store and
+   *  stamps the verified binding on the entry, refusing anything else. */
+  threadSend: (
+    alias: string,
+    text: string,
+    message: string,
+    refs?: ThreadRef[],
+    app?: { install_id: string; context_id: string },
+  ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
-      refs && refs.length > 0 ? { text, message, refs } : { text, message },
+      {
+        text,
+        message,
+        ...(refs && refs.length > 0 ? { refs } : {}),
+        ...(app ? { app } : {}),
+      },
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
