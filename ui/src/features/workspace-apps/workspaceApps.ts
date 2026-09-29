@@ -8,7 +8,16 @@ export interface Installation {
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   project_link: string | null; approved: boolean | null; executable: boolean;
   approval: { state: string }; guide: string; files: string[];
+  /** Declared slot contract from the live bundle manifest (CAD-585): typed capability slots. */
+  capabilities: Record<string, SlotDeclaration> | null;
+  /** Untyped legacy slots from `needs.connections`, kept working as before. */
+  connection_slots: string[];
   workflows?: { name: string; inputs: { name: string; default?: string | null }[] }[];
+}
+/** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
+export interface SlotDeclaration {
+  schema: number; capability: string; version: number;
+  action: string; resource_kind: string; effect: string;
 }
 export interface AppContext {
   id: string; install_id: string; revision: number; digest: string; state: string;

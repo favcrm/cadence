@@ -8,7 +8,6 @@ import {
   connectionLabel,
   isAvailable,
   isLocalOutbox,
-  pickerConnections,
   pinWord,
   readinessText,
   scopeHint,
@@ -142,22 +141,6 @@ equal(
   "reviewed contract matches the deployment",
   "healthy enrolled",
 );
-
-// The picker offers usable connections, Local outbox first; the rest are counted, not shown.
-const mixed = [
-  row({ id: "c-b", provider: "zeta", account: "b" }),
-  row({ id: "c-a", provider: "agenticos_external", account: "ws_12345678-1234-1234-1234-123456789012" }),
-  localRow(),
-  row({ id: "c-dead", status: { ...row().status, custody_available: false } }),
-];
-const picked = pickerConnections(mixed);
-equal(
-  picked.offered.map((c) => c.id),
-  ["builtin-local", "c-a", "c-b"],
-  "picker order",
-);
-equal(picked.withheld, 1, "picker withholds the unavailable row");
-equal(pickerConnections([]), { offered: [], withheld: 0 }, "empty picker");
 
 // Provider words: capabilities, enrollment and scope hints.
 equal(capabilityWords(provider()), "blog.publish, social.post", "capability words");

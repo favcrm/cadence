@@ -59,28 +59,6 @@ export function readinessText(row: Connection): string {
   return pinWord(row.status);
 }
 
-/**
- * The connections an app slot picker may offer (CAD-585): the usable
- * ones, Local outbox first, then enrolled accounts by provider. Rows
- * that are not usable are excluded — the picker names their count so
- * the operator knows to look in Settings → Connections.
- */
-export function pickerConnections(rows: Connection[]): {
-  offered: Connection[];
-  withheld: number;
-} {
-  const offered = rows
-    .filter(isAvailable)
-    .sort((a, b) => {
-      const local = Number(isLocalOutbox(b)) - Number(isLocalOutbox(a));
-      if (local !== 0) return local;
-      const byProvider = a.provider.localeCompare(b.provider);
-      if (byProvider !== 0) return byProvider;
-      return a.account.localeCompare(b.account);
-    });
-  return { offered, withheld: rows.length - offered.length };
-}
-
 /** The provider's capabilities in plain words — "blog.publish, social.post". */
 export function capabilityWords(provider: ConnectionProvider): string | null {
   const caps = provider.descriptor?.capabilities ?? [];

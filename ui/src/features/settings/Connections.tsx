@@ -4,7 +4,6 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
-import Link from "../../ui/Link";
 import { ResourceGate } from "../../ui/ResourceStatus";
 import { IconRefresh } from "../../ui/icons";
 import {
@@ -14,7 +13,6 @@ import {
   connectionCapabilities,
   connectionLabel,
   isAvailable,
-  pickerConnections,
   pinWord,
   readinessText,
   scopeHint,
@@ -717,76 +715,5 @@ function AddConnection({
         </div>
       )}
     </section>
-  );
-}
-
-/**
- * The app Settings "Publishes to" picker (CAD-585): one select per used
- * slot, limited to the usable connections with Local outbox first. The
- * board has no typed slot-binding write yet, so choosing a connection
- * shows the operator the exact `cadence app set` command that binds it
- * — the secret itself never leaves daemon custody either way.
- */
-export function SlotConnectionPicker({
-  project,
-  app,
-  slot,
-  bound,
-  connections,
-}: {
-  project: string;
-  app: string;
-  slot: string;
-  bound: string | null;
-  connections: Connection[] | null;
-}) {
-  const [choice, setChoice] = useState<string>("");
-  const { offered, withheld } = pickerConnections(connections ?? []);
-  const id = useId();
-  const rebind = bound != null && bound !== "" && bound !== choice;
-  return (
-    <div className="mt-1.5 min-w-0">
-      <label htmlFor={id} className="text-micro text-ink-500">
-        Compatible connections
-      </label>
-      <div className="flex flex-wrap items-center gap-2 mt-1">
-        <select
-          id={id}
-          value={choice}
-          onChange={(e) => setChoice(e.target.value)}
-          className="field flex-1 min-w-0"
-          aria-label={`Compatible connections for ${slot}`}
-        >
-          <option value="">Choose a connection…</option>
-          {offered.map((c) => (
-            <option key={c.id} value={c.account}>
-              {connectionLabel(c)}
-            </option>
-          ))}
-        </select>
-        <Link href="/settings/connections" className="lnk text-label shrink-0">
-          Add connection →
-        </Link>
-      </div>
-      {withheld > 0 && (
-        <p className="text-micro text-ink-500 mt-1 break-words">
-          {withheld} unavailable {withheld === 1 ? "connection is" : "connections are"} hidden —{" "}
-          <Link href="/settings/connections" className="lnk">
-            see Settings → Connections
-          </Link>
-          .
-        </p>
-      )}
-      {choice !== "" && (
-        <p className="text-micro text-ink-400 mt-1 break-words">
-          To bind it, the operator runs{" "}
-          <code className="num">cadence app set {project} {app} {slot}={choice}</code>
-          {rebind && (
-            <> — currently bound to <span className="num">{bound}</span>, so this rebind
-            re-requires app approval.</>
-          )}
-        </p>
-      )}
-    </div>
   );
 }
