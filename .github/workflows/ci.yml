@@ -360,6 +360,13 @@ jobs:
         env:
           CADENCE_REHEARSAL_BINARY: ${{ github.workspace }}/target/release/cadence
         run: python3 scripts/test-hosted-migration.py -v
+      # CAD-778: the release binary parses with production features (no
+      # dev-deps), so only it proves frozen snapshot digests survive the
+      # store round trip — in-lane test binaries mask the default parser
+      # via dev-only jsonschema unification. Minimal port of the closed
+      # #463 release check; staging-rehearsal/MVP paths deliberately out.
+      - name: Verify frozen snapshot digests with the release CLI
+        run: python3 tests/e2e/app_snapshot_digest_778.py --binary target/release/cadence
       # CAD-482: the test seam must never reach a release binary —
       # the canary exists only under the feature, so this grep on the
       # shipped default-feature binary proves its bytes carry none of

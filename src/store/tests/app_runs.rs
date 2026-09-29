@@ -977,3 +977,190 @@ fn cad749_accepts_one_bounded_bare_or_fenced_envelope_amid_prose() {
         " ".repeat(room + 1)
     )));
 }
+
+// CAD-778 regression suite: frozen app-run snapshot digests must survive
+// the store text round trip bit-identically, and the digest guard must stay
+// strict.
+//
+// Masking warning (read before drawing conclusions from green runs): the
+// dev-dependency `jsonschema` enables `serde_json/float_roundtrip`, and
+// cargo feature unification turns that on for every in-lane `cargo test`
+// binary. Parser-behavior assertions below therefore pass in-lane with or
+// without the Cargo.toml fix; they pin the approve-time contract, not the
+// production parser. The failing-first guards for the production parser
+// are `cad778_production_json_graph_has_exact_float_parsing` (this file)
+// and the no-dev-deps CLI freeze → approve rehearsal from the ticket.
+//
+// Proven 2026-09-29 against true default-feature serde_json 1.0.151 builds:
+// the pilot float `1790647563.6348941` parses 1 ULP low without the flag
+// (59,122 drifts / 200,000 shortest-repr samples) and exactly with it.
+
+#[test]
+fn cad778_production_json_graph_has_exact_float_parsing() {
+    // The shipped binary builds without dev-dependencies, so dev-only
+    // `jsonschema` must not be the only source of exact float parsing.
+    // `--edges normal,build,features` excludes dev edges: this fails
+    // pre-fix (feature count 0) and passes once Cargo.toml enables
+    // `float_roundtrip` directly.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let cargo = env!("CARGO");
+    let out = std::process::Command::new(cargo)
+        .args([
+            "tree",
+            "--locked",
+            "--offline",
+            "--edges",
+            "normal,build,features",
+            "--invert",
+            "serde_json",
+        ])
+        .current_dir(manifest)
+        .output()
+        .expect("cargo tree must run for the production feature probe");
+    assert!(
+        out.status.success(),
+        "cargo tree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tree = String::from_utf8(out.stdout).expect("cargo tree is UTF-8");
+    assert!(
+        tree.contains("serde_json feature \"float_roundtrip\""),
+        "production JSON graph lacks exact float round-tripping;\n\
+         frozen snapshot digests drift 1 ULP on reread without it"
+    );
+}
+
+#[test]
+fn cad778_float_snapshot_digest_survives_store_round_trip() {
+    use crate::store::app_runs::material_digest;
+    // Exact `assignments.identity.created` floats from the frozen pilot row.
+    // Freeze serializes them exactly (Ryū shortest repr), but the default
+    // float parser reads back a 1-ULP neighbor, so the approve-time
+    // re-serialization hashes differently and the frozen digest is refused.
+    for created in [1790647563.6348941f64, 1790648372.680178f64] {
+        let identity = json!({
+            "created": created,
+            "created_bits": created.to_bits(),
+            "provider": "pi",
+            "endpoint_kind": "managed",
+        });
+        let digest = material_digest(&identity);
+        // Freeze path: exact text into the store.
+        let stored = identity.to_string();
+        assert!(
+            stored.contains("1790647") || stored.contains("1790648"),
+            "freeze must keep the exact float text, got {stored}"
+        );
+        // Approve path: reparse the stored text, then rehash.
+        let reparsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            material_digest(&reparsed),
+            digest,
+            "float {created} did not survive the store round trip bit-identically"
+        );
+    }
+}
+
+#[test]
+fn cad778_frozen_run_with_float_identity_approves() {
+    // End-to-end freeze → approve on one build with hostile identity floats.
+    let (dir, s) = store();
+    for (alias, role) in [("lead", "pm"), ("writer", "worker"), ("reviewer", "worker")] {
+        s.register_agent(&NewAgent {
+            alias,
+            provider: "claude",
+            endpoint_kind: "managed",
+            role,
+            cwd: dir.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some("{\"upstream\":\"lead\"}"),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        s.set_identity(alias, &endpoint_at(4242)).unwrap();
+    }
+    // Pin every agent's row timestamp to the exact pilot floats whose
+    // shortest repr the default parser misreads by one ULP.
+    for (alias, created) in [
+        ("lead", 1790647563.6348941f64),
+        ("writer", 1790648372.680178f64),
+        ("reviewer", 1790647563.6348941f64),
+    ] {
+        s.conn()
+            .execute(
+                "UPDATE agents SET created=?1, updated=?1 WHERE alias=?2",
+                rusqlite::params![created, alias],
+            )
+            .unwrap();
+    }
+    let text="---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let inputs = std::collections::BTreeMap::new();
+    let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
+    s.app_capability_decide("install-1", "sha256:bundle", true)
+        .unwrap();
+    let run = s
+        .app_run_create(crate::store::app_runs::LocalRunRequest {
+            install_id: "install-1",
+            bundle_digest: "sha256:bundle",
+            workflow: &workflow,
+            inputs: &inputs,
+            request_id: "request-1",
+            owner_pm: "lead",
+            project_link: None,
+        })
+        .unwrap();
+    let id = run["id"].as_str().unwrap();
+    s.app_run_decide(
+        id,
+        run["snapshot_digest"].as_str(),
+        false,
+        Some("sha256:bundle"),
+    )
+    .unwrap();
+    assert_eq!(s.app_run_show(id).unwrap()["state"], "approved");
+}
+
+#[test]
+fn cad778_tampered_snapshot_still_refused() {
+    // The digest guard stays strict: stored text that no longer matches the
+    // frozen digest must still be refused at approve time.
+    let (_dir, s, run) = runtime_fixture();
+    let id = run["id"].as_str().unwrap();
+    let mut snapshot: Value = run["snapshot"].clone();
+    snapshot["inputs"] = json!({"injected": "forged"});
+    s.conn()
+        .execute(
+            "UPDATE app_runs SET snapshot=?1 WHERE id=?2",
+            rusqlite::params![snapshot.to_string(), id],
+        )
+        .unwrap();
+    assert!(s
+        .app_run_decide(
+            id,
+            run["snapshot_digest"].as_str(),
+            false,
+            Some("sha256:bundle")
+        )
+        .is_err());
+    assert_eq!(s.app_run_show(id).unwrap()["state"], "awaiting_approval");
+}
+
+#[test]
+fn cad778_benign_floats_round_trip_exactly() {
+    // Historical rows whose floats already parsed exactly must hash
+    // identically after the fix: exact parsing agrees with the default
+    // parser wherever the default parser was already exact.
+    use crate::store::app_runs::material_digest;
+    for created in [0.0f64, 1.5, 4242.0, 1750000000.123, 1790648000.5] {
+        let identity = json!({"created": created, "created_bits": created.to_bits()});
+        let digest = material_digest(&identity);
+        let reparsed: Value = serde_json::from_str(&identity.to_string()).unwrap();
+        assert_eq!(
+            reparsed["created"].as_f64().unwrap().to_bits(),
+            created.to_bits()
+        );
+        assert_eq!(material_digest(&reparsed), digest);
+    }
+}
