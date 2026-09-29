@@ -39,6 +39,9 @@ impl Shared {
                     "approval_id",
                     "due_epoch",
                     "timezone",
+                    "artifact_id",
+                    "bundle_digest",
+                    "slot",
                 ],
                 "social_publish_cancel" => &["intent_id"],
                 "social_publish_show" => &["intent_id"],
@@ -49,29 +52,7 @@ impl Shared {
             },
         )?;
         match method {
-            "social_publish_schedule" => {
-                let due = params
-                    .get("due_epoch")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| Error::rejected("Missing or non-integer 'due_epoch'"))?;
-                self.store.social_publish_schedule(&NewSocialPublish {
-                    request_id: required_str(params, "request_id")?,
-                    install_id: required_str(params, "install_id")?,
-                    context_id: optional_str(params, "context_id"),
-                    run_id: required_str(params, "run_id")?,
-                    effect_id: required_str(params, "effect_id")?,
-                    connection_id: required_str(params, "connection_id")?,
-                    destination_id: required_str(params, "destination_id")?,
-                    toolkit: required_str(params, "toolkit")?,
-                    caption_digest: required_str(params, "caption_digest")?,
-                    image_digest: optional_str(params, "image_digest"),
-                    media_key: optional_str(params, "media_key"),
-                    grant_id: required_str(params, "grant_id")?,
-                    approval_id: required_str(params, "approval_id")?,
-                    due_epoch: due,
-                    timezone: required_str(params, "timezone")?,
-                })
-            }
+            "social_publish_schedule" => self.schedule_social_publish(params),
             "social_publish_cancel" => self
                 .store
                 .social_publish_cancel(required_str(params, "intent_id")?),
@@ -92,6 +73,65 @@ impl Shared {
             ),
             _ => Err(Error::rejected("unknown social publish method")),
         }
+    }
+
+    /// Schedule in one of two modes, never mixed: freeze-from-artifact
+    /// derives every digest from the approved run's reviewed material
+    /// (explicit digest/connection fields are refused alongside it);
+    /// explicit mode takes caller-frozen digests for runs whose material
+    /// the operator verified out-of-band.
+    fn schedule_social_publish(&self, params: &Value) -> Result<Value> {
+        use crate::store::social_publish::FreezeFromArtifact;
+        let due = params
+            .get("due_epoch")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::rejected("Missing or non-integer 'due_epoch'"))?;
+        let common = |field: &str| required_str(params, field);
+        if optional_str(params, "artifact_id").is_some() {
+            for field in ["caption_digest", "image_digest", "connection_id"] {
+                if optional_str(params, field).is_some() {
+                    return Err(Error::rejected(format!(
+                        "'{field}' is derived in artifact-freeze mode"
+                    )));
+                }
+            }
+            return self
+                .store
+                .social_publish_freeze_from_artifact(&FreezeFromArtifact {
+                    request_id: common("request_id")?,
+                    install_id: common("install_id")?,
+                    context_id: optional_str(params, "context_id"),
+                    run_id: common("run_id")?,
+                    artifact_id: common("artifact_id")?,
+                    bundle_digest: common("bundle_digest")?,
+                    slot: common("slot")?,
+                    effect_id: common("effect_id")?,
+                    destination_id: common("destination_id")?,
+                    toolkit: common("toolkit")?,
+                    media_key: optional_str(params, "media_key"),
+                    grant_id: common("grant_id")?,
+                    approval_id: common("approval_id")?,
+                    due_epoch: due,
+                    timezone: common("timezone")?,
+                });
+        }
+        self.store.social_publish_schedule(&NewSocialPublish {
+            request_id: common("request_id")?,
+            install_id: common("install_id")?,
+            context_id: optional_str(params, "context_id"),
+            run_id: common("run_id")?,
+            effect_id: common("effect_id")?,
+            connection_id: common("connection_id")?,
+            destination_id: common("destination_id")?,
+            toolkit: common("toolkit")?,
+            caption_digest: common("caption_digest")?,
+            image_digest: optional_str(params, "image_digest"),
+            media_key: optional_str(params, "media_key"),
+            grant_id: common("grant_id")?,
+            approval_id: common("approval_id")?,
+            due_epoch: due,
+            timezone: common("timezone")?,
+        })
     }
 
     /// Dispatch claim with recheck: the operator supplies current authority

@@ -409,3 +409,94 @@ impl Store {
         Ok(result)
     }
 }
+
+/// Strip the `sha256:` prefix Cadence artifact digests carry. The pinned
+/// device contract speaks bare 64-hex; anything else is a malformed pin.
+fn bare_digest(prefixed: &str) -> Result<&str> {
+    use crate::platform::agenticos_external::publish as device;
+    let hex = prefixed
+        .strip_prefix("sha256:")
+        .ok_or_else(|| Error::rejected("reviewed digest pin is malformed"))?;
+    if !device::valid_digest(hex) {
+        return Err(Error::rejected("reviewed digest pin is malformed"));
+    }
+    Ok(hex)
+}
+
+/// Params for freezing an intent from reviewed run material instead of
+/// caller-supplied digests.
+#[allow(clippy::too_many_arguments)]
+pub struct FreezeFromArtifact<'a> {
+    pub request_id: &'a str,
+    pub install_id: &'a str,
+    pub context_id: Option<&'a str>,
+    pub run_id: &'a str,
+    pub artifact_id: &'a str,
+    pub bundle_digest: &'a str,
+    pub slot: &'a str,
+    /// The operator's publish-approval identity (not an app_effect row).
+    pub effect_id: &'a str,
+    pub destination_id: &'a str,
+    pub toolkit: &'a str,
+    pub media_key: Option<&'a str>,
+    pub grant_id: &'a str,
+    pub approval_id: &'a str,
+    pub due_epoch: i64,
+    pub timezone: &'a str,
+}
+
+impl Store {
+    /// Freeze from the approved run's reviewed material: the completed
+    /// run, its independent review, the exact artifact bytes and the
+    /// currently-current binding are all re-proven here (a later rebind,
+    /// revoke or context change invalidates). Digests are derived, never
+    /// trusted from the caller: the caption digest is the reviewed
+    /// artifact's, the image digest the reviewed asset's (Instagram
+    /// refuses without one; Facebook text-only proceeds without).
+    pub fn social_publish_freeze_from_artifact(
+        &self,
+        row: &FreezeFromArtifact<'_>,
+    ) -> Result<Value> {
+        let material = self.app_publication_material(
+            row.run_id,
+            row.artifact_id,
+            row.bundle_digest,
+            row.slot,
+        )?;
+        let caption_digest = bare_digest(
+            material["artifact"]["digest"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("reviewed artifact digest is missing"))?,
+        )?;
+        let asset_digest = material
+            .get("asset")
+            .and_then(|asset| asset["digest"].as_str());
+        let image_digest = match (row.toolkit, asset_digest) {
+            ("instagram", Some(digest)) => Some(bare_digest(digest)?),
+            ("instagram", None) => {
+                return Err(Error::rejected("instagram needs a reviewed image asset"));
+            }
+            (_, digest) => digest.map(bare_digest).transpose()?,
+        };
+        let connection_id = material["binding"]["config"]["connection_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?;
+        self.social_publish_schedule(&NewSocialPublish {
+            request_id: row.request_id,
+            install_id: row.install_id,
+            context_id: row.context_id,
+            run_id: row.run_id,
+            effect_id: row.effect_id,
+            connection_id,
+            destination_id: row.destination_id,
+            toolkit: row.toolkit,
+            caption_digest,
+            image_digest,
+            media_key: row.media_key,
+            grant_id: row.grant_id,
+            approval_id: row.approval_id,
+            due_epoch: row.due_epoch,
+            timezone: row.timezone,
+        })
+    }
+}

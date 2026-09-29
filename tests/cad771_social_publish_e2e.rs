@@ -1,0 +1,820 @@
+//! CAD-771 slice-3 fake-provider end-to-end proofs.
+//!
+//! Pinned contract: `agenticos-stack/agenticos-v2` PR #214 @
+//! `12953144c50d13075af2323a2e09a70de9f72b87` (device-publish v1).
+//! AOS-94 is still unmerged, so every provider byte here comes from the
+//! loopback fake door below — no live Meta post, no paid call, no real
+//! credential. The exact-destination send adapter registration stays gated
+//! until AOS-94 lands and the contract is revalidated.
+//!
+//! Shape note: the harness produces genuinely approved text-only runs, so
+//! the run-freeze path exercises Facebook text-only sends end to end.
+//! Instagram-with-image is proven at contract level (slice 1: IG refuses
+//! without an image digest) and store level; its E2E with a reviewed asset
+//! waits on an asset-bearing harness run. The fake door speaks both
+//! destination shapes, and the connection namespace below is the fake
+//! provider's own — the local-bundle→provider connection mapping is what
+//! the gated adapter registration will own.
+//!
+//! The driver speaks only operator RPCs (`social_publish_*`) against a real
+//! daemon, enforces backend grant liveness (uses/revocation) at dispatch,
+//! and reconciles lost responses without a second send. Actor parity:
+//! unproven agent-shaped calls are refused, operator calls succeed, forged
+//! fields fail closed.
+#![allow(clippy::disallowed_methods)]
+mod common;
+
+use cadence_agent::platform::agenticos_external::publish::{
+    caption_digest_of, Destination, FakeProviderBehavior, FakePublishLedger, SendBinding,
+    SendGrant, Toolkit,
+};
+use common::app_release::{Release, A};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+const DEST_FB: &str = "275491372109884";
+const CONN_FB: &str = "con_harbour_fb";
+const GRANT_FB: &str = "dpq_synthetic_grant_fb";
+const DEST_IG: &str = "17841400008460056";
+const CONN_IG: &str = "con_harbour_ig";
+
+fn discovery(toolkit: Toolkit) -> Destination {
+    match toolkit {
+        Toolkit::Instagram => Destination {
+            connection_id: CONN_IG.into(),
+            toolkit: Toolkit::Instagram,
+            display_name: "Harbour stills".into(),
+            destination_id: DEST_IG.into(),
+            status_active: true,
+            available: true,
+        },
+        Toolkit::Facebook => Destination {
+            connection_id: CONN_FB.into(),
+            toolkit: Toolkit::Facebook,
+            display_name: "Harbour page".into(),
+            destination_id: DEST_FB.into(),
+            status_active: true,
+            available: true,
+        },
+    }
+}
+
+fn connection_for(toolkit: Toolkit) -> &'static str {
+    match toolkit {
+        Toolkit::Instagram => CONN_IG,
+        Toolkit::Facebook => CONN_FB,
+    }
+}
+
+/// Backend grant liveness, fake-side: remaining uses plus revocation.
+/// Dispatch consults this fresh — never the schedule-time copy.
+#[derive(Default)]
+struct GrantAuthority {
+    grants: HashMap<String, (u32, bool)>,
+}
+
+impl GrantAuthority {
+    fn issue(&mut self, id: &str, uses: u32) {
+        self.grants.insert(id.into(), (uses, false));
+    }
+
+    fn revoke(&mut self, id: &str) {
+        if let Some(entry) = self.grants.get_mut(id) {
+            entry.1 = true;
+        }
+    }
+
+    fn check(&self, id: &str) -> Result<u32, &'static str> {
+        match self.grants.get(id) {
+            None => Err("grant_mismatch"),
+            Some((_, true)) => Err("grant_revoked"),
+            Some((0, false)) => Err("grant_exhausted"),
+            Some((uses, false)) => Ok(*uses),
+        }
+    }
+
+    fn consume(&mut self, id: &str) {
+        if let Some(entry) = self.grants.get_mut(id) {
+            entry.0 = entry.0.saturating_sub(1);
+        }
+    }
+}
+
+struct FakeDoor {
+    addr: String,
+    grants: Arc<Mutex<GrantAuthority>>,
+    ledger: Arc<FakePublishLedger>,
+    calls: Arc<Mutex<u64>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeDoor {
+    fn start() -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string();
+        let grants = Arc::new(Mutex::new(GrantAuthority::default()));
+        let ledger = Arc::new(FakePublishLedger::new());
+        let calls = Arc::new(Mutex::new(0u64));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_grants = Arc::clone(&grants);
+        let worker_ledger = Arc::clone(&ledger);
+        let worker_calls = Arc::clone(&calls);
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(50)) else {
+                    continue;
+                };
+                *worker_calls.lock().unwrap() += 1;
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap_or(0);
+                let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let reply = Self::route(&worker_grants, &worker_ledger, request.url(), &value);
+                let _ = request.respond(tiny_http::Response::from_string(reply.to_string()));
+            }
+        });
+        Self {
+            addr,
+            grants,
+            ledger,
+            calls,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    /// Native-vs-HTTP parity core: the HTTP door reaches exactly the verdicts
+    /// the native [`FakePublishLedger`] gate computes for the same binding.
+    fn route(
+        grants: &Mutex<GrantAuthority>,
+        ledger: &FakePublishLedger,
+        url: &str,
+        value: &Value,
+    ) -> Value {
+        let toolkit =
+            Toolkit::parse(value["toolkit"].as_str().unwrap_or("")).unwrap_or(Toolkit::Facebook);
+        let binding = SendBinding {
+            key: value["key"].as_str().unwrap_or("").into(),
+            connection_id: value["connection_id"].as_str().unwrap_or("").into(),
+            destination_id: value["destination_id"].as_str().unwrap_or("").into(),
+            toolkit,
+            caption_digest: value["caption_digest"].as_str().unwrap_or("").into(),
+            image_digest: value["image_digest"].as_str().map(str::to_owned),
+            cadence_run_id: value["cadence_run_id"].as_str().unwrap_or("").into(),
+            cadence_effect_id: value["cadence_effect_id"].as_str().unwrap_or("").into(),
+            grant_id: value["grant_id"].as_str().unwrap_or("").into(),
+        };
+        let dest = discovery(toolkit);
+        let mut grant = SendGrant {
+            id: binding.grant_id.clone(),
+            workspace_id: "ws_harbour".into(),
+            connection_id: binding.connection_id.clone(),
+            destination_id: binding.destination_id.clone(),
+            toolkit: binding.toolkit,
+            caption_digest: binding.caption_digest.clone(),
+            image_digest: binding.image_digest.clone(),
+            cadence_approval_id: "cad_approval_01".into(),
+            max_uses: 3,
+            remaining_uses: 3,
+            revoked: false,
+            not_before_epoch: 1_700_000_000,
+            expires_at_epoch: 1_800_000_000,
+        };
+        // Backend liveness first: the schedule-time copy is never trusted.
+        let live = grants.lock().unwrap().check(&binding.grant_id);
+        if url.ends_with("/preflight") {
+            if let Err(code) = live {
+                return json!({"verdict": "refused", "code": code});
+            }
+            return match ledger.preflight(&binding, &dest, &grant, "ws_harbour", NOW) {
+                Ok(staged) => json!({"verdict": "ok", "staged": staged}),
+                Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
+            };
+        }
+        if url.ends_with("/exec") {
+            if let Err(code) = live {
+                return json!({"verdict": "refused", "code": code});
+            }
+            let behavior = match value["behavior"].as_str().unwrap_or("post") {
+                "refuse" => FakeProviderBehavior::Refuse,
+                "lose" => FakeProviderBehavior::LoseResponseAfterAccept,
+                _ => FakeProviderBehavior::Post,
+            };
+            return match ledger.execute(&binding, &dest, &mut grant, "ws_harbour", NOW, behavior) {
+                Ok(outcome) => {
+                    grants.lock().unwrap().consume(&binding.grant_id);
+                    json!({"verdict": "ok", "state": outcome.state.as_str(),
+                        "permalink": outcome.permalink,
+                        "provider_payload": outcome.provider_payload,
+                        "repeated": outcome.repeated})
+                }
+                Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
+            };
+        }
+        if url.starts_with("/v1/device/publish/status") {
+            return match ledger.status(&binding.key) {
+                Ok(outcome) => json!({"verdict": "ok", "state": outcome.state.as_str(),
+                    "permalink": outcome.permalink,
+                    "provider_payload": outcome.provider_payload,
+                    "repeated": outcome.repeated}),
+                Err(refusal) => json!({"verdict": "refused", "code": refusal.code}),
+            };
+        }
+        json!({"verdict": "refused", "code": "unknown_route"})
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Value {
+        let agent = ureq::Agent::new_with_defaults();
+        let mut response = agent
+            .post(format!("http://{}{path}", self.addr))
+            .send_json(body)
+            .unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn provider_calls(&self) -> u64 {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl Drop for FakeDoor {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+const NOW: i64 = 1_750_000_000;
+
+fn door_binding(intent: &Value, behavior: &str) -> Value {
+    let frozen = &intent["frozen"];
+    let toolkit =
+        Toolkit::parse(frozen["toolkit"].as_str().unwrap_or("")).unwrap_or(Toolkit::Facebook);
+    json!({"key": intent["request"],
+        "connection_id": connection_for(toolkit), "toolkit": frozen["toolkit"],
+        "destination_id": frozen["destination_id"],
+        "caption_digest": frozen["caption_digest"],
+        "image_digest": frozen["image_digest"],
+        "cadence_run_id": frozen["run_id"],
+        "cadence_effect_id": frozen["effect_id"],
+        "grant_id": frozen["grant_id"],
+        "behavior": behavior})
+}
+
+fn recheck_for(intent: &Value) -> Value {
+    let frozen = &intent["frozen"];
+    json!({"grant_id": frozen["grant_id"],
+        "connection_id": frozen["connection_id"],
+        "destination_id": frozen["destination_id"],
+        "caption_digest": frozen["caption_digest"],
+        "image_digest": frozen["image_digest"]})
+}
+
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
+    let context = h.context("Harbour", A, &format!("cad771-e2e-{tag}-context"));
+    h.bind(&context, &format!("cad771-e2e-{tag}-binding"));
+    let run = h.complete(&context, &format!("cad771-e2e-{tag}-run"));
+    let bundle_digest = run["snapshot"]["bundle_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let install_id = h.install["install_id"].as_str().unwrap().to_owned();
+    (context, run, bundle_digest, install_id)
+}
+
+fn freeze_params(
+    context: &Value,
+    run: &Value,
+    bundle_digest: &str,
+    install_id: &str,
+    request: &str,
+    effect: &str,
+    due: i64,
+) -> Value {
+    json!({"request_id": request, "install_id": install_id,
+        "context_id": context["id"], "run_id": run["id"],
+        "artifact_id": run["artifacts"][0]["id"],
+        "bundle_digest": bundle_digest,
+        "slot": "publication", "effect_id": effect,
+        "destination_id": DEST_FB, "toolkit": "facebook",
+        "grant_id": GRANT_FB, "approval_id": "cad_approval_e2e_01",
+        "due_epoch": due, "timezone": "Asia/Hong_Kong"})
+}
+
+#[test]
+fn cad771_e2e_post_now_from_approved_run_with_grant_liveness() {
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "now");
+    let _ = &context;
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+
+    // Freeze from the genuinely approved run: digests are derived, and the
+    // reviewed binding is re-proven current.
+    let due = epoch_now();
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-now",
+                "cad_fx_e2e_01",
+                due,
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(intent["state"], "queued");
+    assert_eq!(intent["frozen"]["destination_id"], DEST_FB);
+    // The frozen caption digest is the reviewed artifact's — never a
+    // caller-supplied string.
+    let artifact = h.artifact(&run);
+    let reviewed_hex = artifact["digest"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("sha256:")
+        .unwrap();
+    assert_eq!(intent["frozen"]["caption_digest"], reviewed_hex);
+
+    // Dispatch: recheck matches frozen, claim wins, fake door posts once.
+    let recheck = recheck_for(&intent);
+    let claimed = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": due + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    let preflight = door.post(
+        "/v1/device/publish/preflight",
+        &door_binding(&claimed["intent"], "post"),
+    );
+    assert_eq!(preflight["verdict"], "ok");
+    let exec = door.post(
+        "/v1/device/publish/exec",
+        &door_binding(&claimed["intent"], "post"),
+    );
+    assert_eq!(exec["verdict"], "ok");
+    assert_eq!(exec["state"], "posted");
+    assert!(!exec["repeated"].as_bool().unwrap());
+    let posted = h
+        .daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": exec["permalink"],
+                    "destination_id": DEST_FB, "caption_digest": reviewed_hex,
+                    "provider_ids": ["provider-post-1"],
+                    "provider_payload": exec["provider_payload"]}}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(posted["state"], "posted");
+    assert!(posted["receipt"]["permalink"].is_string());
+    // Re-claim finds nothing: no second send, ever.
+    let idle = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": due + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(idle["claimed"], false);
+    assert_eq!(door.ledger.provider_calls(), 1);
+}
+
+#[test]
+fn cad771_e2e_forged_freeze_inputs_fail_closed() {
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "forged");
+    let base = freeze_params(
+        &context,
+        &run,
+        &bundle_digest,
+        &install_id,
+        "cad771-e2e-forged",
+        "cad_fx_forged_01",
+        epoch_now(),
+    );
+    // Forged artifact, bundle, slot, and run each refuse.
+    for (field, value) in [
+        ("artifact_id", "artifact-forged"),
+        ("bundle_digest", "sha256:forge"),
+        ("slot", "other-slot"),
+        ("run_id", "run-forged"),
+    ] {
+        let mut forged = base.clone();
+        forged[field] = json!(value);
+        assert!(
+            h.daemon
+                .operator_rpc("social_publish_schedule", forged)
+                .is_err(),
+            "{field}"
+        );
+    }
+    // Mixed mode (derived + explicit digest) refuses — never ambiguous.
+    let mut mixed = base.clone();
+    mixed["caption_digest"] = json!(caption_digest_of("attacker caption"));
+    assert!(h
+        .daemon
+        .operator_rpc("social_publish_schedule", mixed)
+        .is_err());
+    // Unproven agent-shaped callers cannot schedule at all: operator only.
+    assert!(h
+        .daemon
+        .unproven_rpc("social_publish_schedule", base)
+        .unwrap_err()
+        .to_string()
+        .contains("operator"));
+}
+
+#[test]
+fn cad771_e2e_revoked_grant_holds_for_new_decision_and_exhaustion_refuses() {
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "revoke");
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 1);
+
+    // Revocation between schedule and dispatch: the door refuses liveness,
+    // and a stale recheck claims-then-holds for a new human decision.
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-revoke-1",
+                "cad_fx_revoke_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    door.grants.lock().unwrap().revoke(GRANT_FB);
+    let preflight = door.post(
+        "/v1/device/publish/preflight",
+        &door_binding(&intent, "post"),
+    );
+    assert_eq!(
+        preflight,
+        json!({"verdict": "refused", "code": "grant_revoked"})
+    );
+    let mut stale = recheck_for(&intent);
+    stale["destination_id"] = json!("999999999999999");
+    let held = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": stale}),
+        )
+        .unwrap();
+    assert_eq!(held["intent"]["state"], "held");
+    assert_eq!(door.ledger.provider_calls(), 0);
+
+    // Exhaustion: one use posts once; the second intent's exec is refused
+    // and reports refused without a provider call.
+    door.grants.lock().unwrap().issue(GRANT_FB, 1);
+    let intent2 = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-exhaust-2",
+                "cad_fx_exhaust_02",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let recheck2 = recheck_for(&intent2);
+    let claimed2 = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck2}),
+        )
+        .unwrap();
+    assert_eq!(claimed2["intent"]["state"], "processing");
+    let exec2 = door.post(
+        "/v1/device/publish/exec",
+        &door_binding(&claimed2["intent"], "post"),
+    );
+    assert_eq!(exec2["verdict"], "ok");
+    h.daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed2["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": exec2["permalink"], "destination_id": DEST_FB,
+                    "caption_digest": intent2["frozen"]["caption_digest"],
+                    "provider_ids": ["provider-post-1"],
+                    "provider_payload": exec2["provider_payload"]}}),
+        )
+        .unwrap();
+    let intent3 = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-exhaust-3",
+                "cad_fx_exhaust_03",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let exec3 = door.post("/v1/device/publish/exec", &door_binding(&intent3, "post"));
+    assert_eq!(
+        exec3,
+        json!({"verdict": "refused", "code": "grant_exhausted"})
+    );
+    assert_eq!(door.ledger.provider_calls(), 1);
+}
+
+#[test]
+fn cad771_e2e_lost_response_reconciles_without_second_send() {
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "lost");
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-lost",
+                "cad_fx_lost_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let recheck = recheck_for(&intent);
+    let claimed = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck}),
+        )
+        .unwrap();
+    // Provider accepts but the response is lost: processing, no evidence.
+    let lost = door.post(
+        "/v1/device/publish/exec",
+        &door_binding(&claimed["intent"], "lose"),
+    );
+    assert_eq!(lost["verdict"], "ok");
+    assert_eq!(lost["state"], "processing");
+    // After restart, reconcile upstream status before any retry: the status
+    // query finalizes to posted with byte-exact evidence — no second call.
+    let status = door.post(
+        "/v1/device/publish/status",
+        &json!({"key": claimed["intent"]["request"]}),
+    );
+    assert_eq!(status["verdict"], "ok");
+    assert_eq!(status["state"], "posted");
+    assert!(status["permalink"].is_string());
+    // Byte-exact provider evidence: the payload travels as an opaque
+    // string and parses to the recorded provider document — never a
+    // re-serialized approximation, never a bare success string.
+    let payload: Value =
+        serde_json::from_str(status["provider_payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["id"], "provider-post-1");
+    h.daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": status["permalink"], "destination_id": DEST_FB,
+                    "caption_digest": intent["frozen"]["caption_digest"],
+                    "provider_ids": ["provider-post-1"],
+                    "provider_payload": status["provider_payload"]}}),
+        )
+        .unwrap();
+    let shown = h
+        .daemon
+        .operator_rpc(
+            "social_publish_show",
+            json!({"intent_id": claimed["intent"]["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(shown["state"], "posted");
+    assert_eq!(door.ledger.provider_calls(), 1);
+    assert_eq!(door.provider_calls(), 2);
+}
+
+#[test]
+fn cad771_e2e_schedule_cancel_and_native_http_parity() {
+    let h = Release::new();
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "cancel");
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    // Future-dated schedule is not yet due; operator cancellation closes it.
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-cancel",
+                "cad_fx_cancel_01",
+                epoch_now() + 3600,
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    let recheck = recheck_for(&intent);
+    let idle = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now(), "recheck": recheck}),
+        )
+        .unwrap();
+    assert_eq!(idle["claimed"], false);
+    let cancelled = h
+        .daemon
+        .operator_rpc(
+            "social_publish_cancel",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(cancelled["state"], "cancelled");
+    // Native-vs-HTTP parity on the fake door: the same forged binding is
+    // refused with the same code through the HTTP JSON door that the native
+    // gate computes.
+    let mut forged = door_binding(&intent, "post");
+    forged["destination_id"] = json!("999999999999999");
+    // Retarget the forged binding at the IG discovery shape to prove the
+    // wrong-destination verdict is destination-exact, not toolkit luck.
+    forged["toolkit"] = json!("instagram");
+    forged["connection_id"] = json!(CONN_IG);
+    // Instagram shape needs an image digest before the destination gate;
+    // the point under test is destination-exactness, so supply one.
+    forged["image_digest"] =
+        json!("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
+    let http_verdict = door.post("/v1/device/publish/preflight", &forged);
+    assert_eq!(
+        http_verdict,
+        json!({"verdict": "refused", "code": "wrong_destination"})
+    );
+    let native = door.ledger.preflight(
+        &SendBinding {
+            key: forged["key"].as_str().unwrap().into(),
+            connection_id: CONN_IG.into(),
+            destination_id: "999999999999999".into(),
+            toolkit: Toolkit::Instagram,
+            caption_digest: forged["caption_digest"].as_str().unwrap().into(),
+            image_digest: Some(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            ),
+            cadence_run_id: forged["cadence_run_id"].as_str().unwrap().into(),
+            cadence_effect_id: forged["cadence_effect_id"].as_str().unwrap().into(),
+            grant_id: GRANT_FB.into(),
+        },
+        &discovery(Toolkit::Instagram),
+        &SendGrant {
+            id: GRANT_FB.into(),
+            workspace_id: "ws_harbour".into(),
+            connection_id: CONN_IG.into(),
+            destination_id: DEST_IG.into(),
+            toolkit: Toolkit::Instagram,
+            caption_digest: forged["caption_digest"].as_str().unwrap().into(),
+            image_digest: None,
+            cadence_approval_id: "cad_approval_01".into(),
+            max_uses: 3,
+            remaining_uses: 3,
+            revoked: false,
+            not_before_epoch: 1_700_000_000,
+            expires_at_epoch: 1_800_000_000,
+        },
+        "ws_harbour",
+        NOW,
+    );
+    assert_eq!(native.unwrap_err().code, "wrong_destination");
+    assert_eq!(door.ledger.provider_calls(), 0);
+}
+
+#[test]
+fn cad771_browser_board_serves_social_content_app_surface() {
+    use std::path::Path;
+    let h = Release::new();
+    // The operator installs and approves the real Social Content bundle
+    // through the exact RPCs the board's Apps screen drives.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/social-content");
+    let install = h
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source": source}))
+        .unwrap();
+    let install_id = install["install_id"].as_str().unwrap().to_owned();
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id": install_id, "digest": install["digest"]}),
+        )
+        .unwrap();
+    // The real board HTTP stack over the live daemon state serves a
+    // browser-shaped client with zero provider involvement. The shared
+    // harness board carries no SPA build, so this test serves the
+    // checked-in web build explicitly (the lane touches no UI file).
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (state, pm) = (h.daemon.state.clone(), h.root.path().join("pm"));
+    thread::spawn(move || {
+        let _ = cadence_agent::ui::serve(
+            &state,
+            &pm,
+            &cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".to_string(),
+                port,
+                dist: Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist")),
+                ..Default::default()
+            },
+        );
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (status, _) = common::board_get(port, "/api/health");
+            if status == 200 {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "board did not become healthy"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (status, body) = common::board_get(port, "/");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("<!doctype html>") || body.contains("<html"),
+        "board serves the SPA shell"
+    );
+    // Client-side app routes serve the same shell (deep links work).
+    let (status, _) = common::board_get(port, "/apps");
+    assert_eq!(status, 200);
+    // The data the Apps screen renders is present: the approved
+    // Social Content installation with its publication workflows.
+    let listed = h
+        .daemon
+        .operator_rpc("app_workspace_list", json!({}))
+        .unwrap();
+    let apps = listed.as_array().unwrap();
+    let app = apps
+        .iter()
+        .find(|app| app["install_id"] == install_id)
+        .expect("installed app is listed");
+    assert_eq!(app["name"], "social-content");
+    assert_eq!(app["approved"], true);
+    let workflows: Vec<&str> = app["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|workflow| workflow["name"].as_str())
+        .collect();
+    assert!(
+        workflows.contains(&"instagram") && workflows.contains(&"facebook"),
+        "{workflows:?}"
+    );
+}

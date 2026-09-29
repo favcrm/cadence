@@ -332,3 +332,37 @@ fn cad771_restart_loses_nothing_and_duplicates_nothing() {
     assert_eq!(shown["intent"]["state"], "posted");
     assert!(shown["intent"]["receipt"]["permalink"].is_string());
 }
+
+#[test]
+fn cad771_freeze_without_approved_material_is_refused() {
+    use crate::store::social_publish::FreezeFromArtifact;
+    let (_dir, s) = store();
+    // No run exists: nothing can be frozen from it.
+    assert!(s
+        .social_publish_freeze_from_artifact(&FreezeFromArtifact {
+            request_id: "req-freeze-unknown",
+            install_id: "install-harbour",
+            context_id: None,
+            run_id: "run-unknown",
+            artifact_id: "artifact-unknown",
+            bundle_digest: "digest-unknown",
+            slot: "publication",
+            effect_id: "cad_fx_freeze_01",
+            destination_id: "17841400008460056",
+            toolkit: "instagram",
+            media_key: None,
+            grant_id: "dpq_synthetic_grant_01",
+            approval_id: "cad_approval_freeze_01",
+            due_epoch: 1_750_000_000,
+            timezone: "Asia/Hong_Kong",
+        })
+        .is_err());
+    assert_eq!(
+        s.social_publish_list(Some("install-harbour"), None)
+            .unwrap()["intents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
