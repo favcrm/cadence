@@ -58,7 +58,7 @@ Three storage concerns stay distinct:
 | [src/review.rs](../src/review.rs), [src/audit.rs](../src/audit.rs) | Revision-bound review evidence and merge/audit reconstruction. |
 | [src/slots.rs](../src/slots.rs), [src/doctor/host/mod.rs](../src/doctor/host/mod.rs), [src/doctor/host/](../src/doctor/host/) | Build/test admission and partitioned host/session ownership/resource checks. |
 | [src/session.rs](../src/session.rs), [src/worktree.rs](../src/worktree.rs), [src/proc.rs](../src/proc.rs) | Session/worktree operations and process helpers. |
-| [src/ui.rs](../src/ui.rs), [src/overview.rs](../src/overview.rs) | HTTP/API surface and aggregated project/agent/actionable observations. |
+| [src/ui.rs](../src/ui.rs), [src/overview.rs](../src/overview.rs), [src/overview/monitoring.rs](../src/overview/monitoring.rs) | HTTP/API surface and aggregated project/agent/actionable observations. |
 | [ui/src/features/](../ui/src/features/), [ui/src/lib/](../ui/src/lib/), [ui/src/ui/](../ui/src/ui/) | React feature screens, shared frontend libraries and UI primitives. |
 | [tests/](../tests/), [tests/common/](../tests/common/), [tests/board_common/](../tests/board_common/) | Per-area integration suites, daemon/board fixtures and the partial unattended-team acceptance harness. |
 | [scripts/](../scripts/), [.config/nextest.toml](../.config/nextest.toml), [.github/workflows/](../.github/workflows/) | Review receipts, pinned test tooling and CI. |
