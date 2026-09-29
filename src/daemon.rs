@@ -2916,6 +2916,9 @@ impl Shared {
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
             "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
             "operator_session_open" => self.rpc_operator_session_open(params, peer_pid),
+            "operator_session_open_device" => {
+                self.rpc_operator_session_open_device(params, peer_pid)
+            }
             "operator_session_check" => self.rpc_operator_session_check(params),
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),

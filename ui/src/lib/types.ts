@@ -858,6 +858,9 @@ export interface Meta {
   } | null;
   /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
   login_hint?: string;
+  /** CAD-777: remote device-grant sign-in is configured on this board
+   *  (and this origin may use it — loopback/tailnet only). */
+  device_login?: boolean;
   /** This browser holds the session cookie but this tab has no live
    *  session key — a new tab: each tab signs in on its own. */
   tab_signed_out?: boolean;

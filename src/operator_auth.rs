@@ -48,6 +48,9 @@ pub const LINK_TTL_SECS: i64 = 120;
 pub const IDLE_SECS: i64 = 24 * 3600;
 /// No session outlives this, however much it is used.
 pub const ABSOLUTE_SECS: i64 = 7 * 24 * 3600;
+fn default_idle_secs() -> i64 {
+    IDLE_SECS
+}
 /// `last_used` is written at most this often — a busy tab does not
 /// rewrite the file on every request.
 const TOUCH_EVERY_SECS: i64 = 60;
@@ -182,6 +185,21 @@ fn check_dir(dir: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The operator directory, created `0700` when absent and
+/// [`check_dir`]-verified always — for files that live next to the
+/// secret but are not written through [`write_private`] (the device
+/// pin's advisory lock, CAD-777).
+pub(crate) fn checked_dir(state_dir: &Path) -> Result<PathBuf> {
+    let dir = dir(state_dir);
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(Error::internal(format!("{}: {e}", dir.display()))),
+    }
+    check_dir(&dir)?;
+    Ok(dir)
 }
 
 /// Create the secret when there is none (`O_CREAT|O_EXCL|O_NOFOLLOW`,
@@ -498,6 +516,13 @@ struct Row {
     expires_at: i64,
     #[serde(default)]
     user_agent: String,
+    /// Idle bound in seconds for this row. On-host sessions use
+    /// [`IDLE_SECS`]; device-grant (remote) sessions use the shorter
+    /// [`crate::device_login::REMOTE_IDLE_SECS`]. Old rows (written
+    /// before the field existed) deserialize to [`IDLE_SECS`], so
+    /// their behavior is unchanged (CAD-777).
+    #[serde(default = "default_idle_secs")]
+    max_idle_secs: i64,
     /// The named user a public session belongs to — `None` for the
     /// operator's loopback/tailnet sessions.
     #[serde(default)]
@@ -512,7 +537,7 @@ impl Row {
     }
 
     fn live(&self, now: i64) -> bool {
-        now < self.expires_at && now - self.last_used < IDLE_SECS
+        now < self.expires_at && now - self.last_used < self.max_idle_secs
     }
 
     fn view(&self) -> SessionView {
@@ -521,7 +546,7 @@ impl Row {
             origin: self.origin,
             created: self.created,
             last_used: self.last_used,
-            idle_expires_at: (self.last_used + IDLE_SECS).min(self.expires_at),
+            idle_expires_at: (self.last_used + self.max_idle_secs).min(self.expires_at),
             expires_at: self.expires_at,
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
@@ -724,7 +749,65 @@ impl Auth {
             last_used: now,
             expires_at: now + ABSOLUTE_SECS,
             user_agent: clean_user_agent(user_agent),
+            max_idle_secs: default_idle_secs(),
             user: None,
+        };
+        let session = row.view();
+        self.sessions.push(row);
+        self.persist()?;
+        Ok(Opened {
+            token,
+            key,
+            session,
+        })
+    }
+
+    /// Open a session for a device-grant-verified subject (CAD-777).
+    /// The caller has already run the grant through
+    /// `device_login::verify_session` for the exact workspace AND
+    /// matched the verified subject against the operator's pinned
+    /// allowlist: `user` carries that subject as an operator-mapped
+    /// [`BoardUser`]. One session per
+    /// subject — a fresh sign-in ends the earlier device session, like
+    /// [`Auth::open_public`]. Lifetimes are the shorter remote bounds
+    /// ([`crate::device_login::REMOTE_IDLE_SECS`] idle,
+    /// [`crate::device_login::REMOTE_ABSOLUTE_SECS`] absolute), never
+    /// the on-host values. Link sessions (no user) are untouched.
+    pub fn open_device(
+        &mut self,
+        user: BoardUser,
+        origin: Origin,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<Opened> {
+        self.prune(now);
+        if origin == Origin::Public {
+            return Err(Error::invalid(
+                "invalid_request",
+                "public sessions open through a verified assertion, not a device grant",
+            ));
+        }
+        if !user.is_operator() {
+            return Err(Error::invalid(
+                "invalid_request",
+                "device sessions open for an allowlisted operator only",
+            ));
+        }
+        self.sessions.retain(|r| {
+            !(r.origin != Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
+        });
+        let token = random_credential()?;
+        let key = random_credential()?;
+        let row = Row {
+            hash: digest(&token),
+            key_hash: digest(&key),
+            origin,
+            created: now,
+            last_used: now,
+            expires_at: now + crate::device_login::REMOTE_ABSOLUTE_SECS,
+            user_agent: clean_user_agent(user_agent),
+            max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
+            user: Some(user),
         };
         let session = row.view();
         self.sessions.push(row);
@@ -771,6 +854,7 @@ impl Auth {
             last_used: now,
             expires_at: now + PUBLIC_SESSION_SECS,
             user_agent: clean_user_agent(user_agent),
+            max_idle_secs: default_idle_secs(),
             user: Some(user),
         };
         let session = row.view();
@@ -1345,5 +1429,106 @@ mod tests {
         u.name = "  ".into();
         u.email = "".into();
         assert_eq!(u.actor(), "u_1 (board)");
+    }
+
+    /// CAD-777: a device session carries the verified owner, lives the
+    /// shorter remote bounds, and replaces only the same subject's
+    /// earlier device session — link sessions are untouched.
+    #[test]
+    fn device_sessions_use_remote_lifetimes_and_replace_per_sub() {
+        use crate::device_login::{REMOTE_ABSOLUTE_SECS, REMOTE_IDLE_SECS};
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let link = opened(&mut auth, Origin::Loopback, T0);
+        let a = auth
+            .open_device(user("op_1", "operator"), Origin::Tailnet, "ua", T0)
+            .unwrap();
+        assert_eq!(a.session.expires_at, T0 + REMOTE_ABSOLUTE_SECS);
+        assert_eq!(
+            a.session.idle_expires_at,
+            (T0 + REMOTE_IDLE_SECS).min(T0 + REMOTE_ABSOLUTE_SECS)
+        );
+        // Idle edge on two sessions (a dead `check` prunes the row,
+        // so each edge gets its own session).
+        assert!(auth
+            .check(&a.token, &a.key, Origin::Tailnet, T0 + REMOTE_IDLE_SECS)
+            .unwrap()
+            .is_none());
+        let c = auth
+            .open_device(user("op_3", "operator"), Origin::Tailnet, "ua", T0)
+            .unwrap();
+        assert!(auth
+            .check(&c.token, &c.key, Origin::Tailnet, T0 + REMOTE_IDLE_SECS - 1)
+            .unwrap()
+            .is_some());
+        // Same subject signs in again: the old device session dies,
+        // the link session and other subjects survive.
+        let other = auth
+            .open_device(user("op_2", "operator"), Origin::Tailnet, "ua", T0 + 1)
+            .unwrap();
+        let b = auth
+            .open_device(user("op_1", "operator"), Origin::Tailnet, "ua", T0 + 2)
+            .unwrap();
+        assert!(auth
+            .check(&a.token, &a.key, Origin::Tailnet, T0 + 3)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&b.token, &b.key, Origin::Tailnet, T0 + 3)
+            .unwrap()
+            .is_some());
+        assert!(auth
+            .check(&other.token, &other.key, Origin::Tailnet, T0 + 3)
+            .unwrap()
+            .is_some());
+        assert!(auth
+            .check(&link.token, &link.key, Origin::Loopback, T0 + 3)
+            .unwrap()
+            .is_some());
+    }
+
+    /// CAD-777: device sessions open for verified owners on a
+    /// browser origin only — never Public, never a lesser role.
+    #[test]
+    fn device_open_refuses_public_origin_and_non_owner() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        assert!(auth
+            .open_device(user("op_1", "operator"), Origin::Public, "ua", T0)
+            .is_err());
+        assert!(auth
+            .open_device(user("op_1", "member"), Origin::Tailnet, "ua", T0)
+            .is_err());
+    }
+
+    /// CAD-777: rows written before `max_idle_secs` existed keep the
+    /// on-host idle bound after reload.
+    #[test]
+    fn old_rows_keep_on_host_idle_bound() {
+        let s = state();
+        let dir = s.path().join("operator");
+        std::fs::create_dir_all(&dir).unwrap();
+        chmod(&dir, 0o700);
+        let file = dir.join("sessions.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({"sessions": [{
+                "hash": "aa".repeat(32),
+                "key_hash": "bb".repeat(32),
+                "origin": "loopback",
+                "created": T0,
+                "last_used": T0,
+                "expires_at": T0 + ABSOLUTE_SECS,
+                "user_agent": "ua",
+                "user": null
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        chmod(&file, 0o600);
+        let mut auth = Auth::load(s.path());
+        let listed = auth.list(T0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].idle_expires_at, T0 + IDLE_SECS);
     }
 }

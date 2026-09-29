@@ -171,6 +171,92 @@ impl Shared {
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
+    /// `operator_session_open_device {token, origin, user_agent?}` —
+    /// the board's device-grant sign-in exchange (CAD-777). `token` is
+    /// the issuer-approved `agc_` grant, verified LIVE against the
+    /// daemon-owned trust pin (`operator/device-login.json`, written
+    /// by `ui run`/`ui start` resolve) before anything is minted: the
+    /// subject and workspace come out of that verification, never out
+    /// of request fields, so a socket caller cannot forge them. The
+    /// verified subject must then be on the pin's allowlist — the
+    /// operator named the few principals who may sign in remotely;
+    /// any other verified workspace member is refused, loudly.
+    ///
+    /// A connection that derives an agent is refused before any issuer
+    /// contact — a browser session is never minted for a pane.
+    pub(super) fn rpc_operator_session_open_device(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            return Err(Error::rejected(format!(
+                "operator_session_open_device is the device sign-in exchange — this connection \
+                 is agent '{}'; a browser session is never minted for a pane",
+                who.lane()
+            )));
+        }
+        let token = required_str(params, "token")?;
+        let origin = origin_param(params)?;
+        let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        // The pin is the only issuer/org authority: an absent file (or
+        // one failing strict modes) fails closed with no session. And
+        // the pin is mint authority only while the board that wrote it
+        // is alive and holds the pin lock — a stale file behind a dead
+        // or replaced board mints nothing, before any issuer contact.
+        let pin = crate::device_login::read_pin(&self.state_dir)?;
+        crate::device_login::pin_is_live(&self.state_dir, &pin)?;
+        let config = crate::device_login::DeviceConfig::new(&pin.issuer, &pin.org)?;
+        let verified = crate::device_login::verify_session(
+            &crate::device_login::UreqTransport::new(),
+            &config,
+            token,
+        )
+        // A failed live verification is not a caller refusal — the
+        // HTTP layer maps this code to 502. The inner messages are
+        // fixed strings carrying no issuer content
+        // (`refusals_carry_no_issuer_content`).
+        .map_err(|e| Error::invalid("device_verification_failed", e.to_string()))?;
+        // The allowlist is the operator's gate (review of #541): a
+        // verified workspace member who is not on it gets no session.
+        // The refusal echoes the subject id — ids aren't credentials,
+        // and naming it is how the operator learns what to allowlist.
+        if !pin.subjects.contains(&verified.subject_id) {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "operator_device_session_refused",
+                json!({"subject": verified.subject_id, "org": verified.org,
+                       "origin": origin.as_str()}),
+            );
+            return Err(Error::invalid(
+                "device_subject_not_allowed",
+                format!(
+                    "device sign-in refused: subject '{}' is not on this board's \
+                     device-login allowlist — add it with --device-login-subject {} \
+                     and restart the UI",
+                    verified.subject_id, verified.subject_id
+                ),
+            ));
+        }
+        let user = auth::BoardUser {
+            sub: verified.subject_id.clone(),
+            email: String::new(),
+            name: String::new(),
+            role: "operator".to_string(),
+            handle: verified.subject_id,
+        };
+        let now = self.operator_now();
+        let opened = self
+            .operator_auth()
+            .open_device(user, origin, user_agent, now)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "operator_device_session_opened",
+            json!({"session": opened.session.id, "origin": origin.as_str(), "org": verified.org}),
+        );
+        Ok(json!({"token": opened.token, "key": opened.key, "session": opened.session}))
+    }
+
     /// `board_session_open {assertion, user_agent?}` — the board's
     /// `POST /__platform/session` (CAD-526, contract §4/§9). The
     /// assertion is the credential: structure, Ed25519 signature

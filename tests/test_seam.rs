@@ -433,3 +433,58 @@ fn without_the_feature_the_field_is_refused() {
     let err = cadence_agent::proto::unwrap(frame).expect_err("test_caller must refuse");
     assert!(err.to_string().contains("test-seam"), "{err}");
 }
+
+/// CAD-777 r4: a plain-http loopback issuer is a fixture allowance,
+/// not a production door — without the feature the board's device
+/// config refuses it, exactly like `remote_auth`'s `cfg!(test)` gate.
+#[cfg(not(feature = "test-seam"))]
+#[test]
+fn without_the_feature_a_plaintext_issuer_is_refused() {
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://127.0.0.1:9", "ws_x").is_err());
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://localhost:9", "ws_x").is_err());
+    assert!(
+        cadence_agent::device_login::DeviceConfig::new("https://issuer.example", "ws_x").is_ok()
+    );
+}
+
+/// CAD-777 r9: the verification URL in the issuer's code answer gets
+/// the same gate — a plain-http loopback approval link is fixture-only;
+/// a production build refuses it.
+#[cfg(not(feature = "test-seam"))]
+#[test]
+fn without_the_feature_a_plaintext_verification_url_is_refused() {
+    struct Stub;
+    impl cadence_agent::device_login::IssuerTransport for Stub {
+        fn post(&self, _url: &str, _body: Value) -> cadence_agent::Result<(u16, Value)> {
+            Ok((
+                200,
+                json!({
+                    "device_code": "dc_abc",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "http://127.0.0.1:8810/approve",
+                    "verification_uri_complete": "http://127.0.0.1:8810/approve?c=ABCD-1234",
+                    "expires_in": 600,
+                    "interval": 2,
+                }),
+            ))
+        }
+        fn get(&self, _url: &str, _bearer: &str) -> cadence_agent::Result<(u16, Value)> {
+            unimplemented!()
+        }
+    }
+    let config =
+        cadence_agent::device_login::DeviceConfig::new("https://issuer.example", "ws_x").unwrap();
+    let err = cadence_agent::device_login::request_code(&Stub, &config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("verification"), "{err}");
+}
+
+/// With the feature the same loopback origins parse — the integration
+/// stub lives there.
+#[cfg(feature = "test-seam")]
+#[test]
+fn with_the_feature_a_loopback_issuer_parses() {
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://127.0.0.1:9", "ws_x").is_ok());
+    assert!(cadence_agent::device_login::DeviceConfig::new("http://example.com", "ws_x").is_err());
+}

@@ -47,7 +47,8 @@ use tiny_http::{Header, Request, Response, StatusCode};
 
 use super::{
     agent_roots, coded_response, guard_fail, header_value, parse_json, pct_decode, proxied_actor,
-    read_body, tailnet_proxy, write_guard, HttpResp, ServeOpts, UI_ACTOR,
+    read_body, tailnet_proxy, write_guard, DeviceLogin, DevicePending, HttpResp, ServeOpts,
+    UI_ACTOR,
 };
 use crate::client;
 use crate::operator_auth::Origin;
@@ -326,6 +327,11 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
     route("POST", "/api/session", RouteClass::Session),
     route("POST", "/api/session/logout", RouteClass::Session),
+    // CAD-777: the device-grant sign-in exchange — the pending id (code)
+    // or the issuer-approved grant (poll) is the credential, never a
+    // session. Agent peers are refused without side effects.
+    route("POST", "/api/session/device/code", RouteClass::Session),
+    route("POST", "/api/session/device/poll", RouteClass::Session),
 ];
 
 fn matches(pattern: &str, path: &str) -> bool {
@@ -1102,11 +1108,19 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
         }
         ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
+    // CAD-777: device sign-in is advertised on the operator surface
+    // only — never to the public host or an unattributable request.
+    let device_login = opts.device_login.is_some()
+        && matches!(
+            request_origin(request, opts),
+            ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
+        );
     json!({
         "signed_in": session.is_some(),
         "hosted": hosted,
         "session": session,
         "login_hint": hint,
+        "device_login": device_login,
         // A cookie but no live session for this page: typically a new
         // tab — the key lives in the signing-in tab's `sessionStorage`.
         // Public sessions have no page key, so the cookie alone answers.
@@ -1299,6 +1313,325 @@ pub(super) fn logout(request: &Request, state_dir: &std::path::Path, opts: &Serv
         ),
     );
     no_store(resp)
+}
+
+// ---------- `/api/session/device/*` — device-grant sign-in (CAD-777) ----------
+//
+// The board backend acts like `cadence login`: `code` requests a grant
+// for the configured issuer + workspace and shows the human the user
+// code; `poll` exchanges the approval for a board session. The issuer
+// device code lives only in the board's pending map under a random
+// pending id — the browser never sees it. The `agc_` credential is
+// verified and dropped, never stored or returned.
+//
+// Both routes are inert unless device login resolved (404, like an
+// unknown shape), run the same guards as `/api/session`, and refuse
+// agent peers without side effects: nothing is spent, no pending is
+// dropped, no session is minted for a pane.
+
+/// Bodies the device routes accept — exact shapes, nothing else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceCodeReq {}
+
+/// Bodies the device routes accept — exact shapes, nothing else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevicePollReq {
+    pending_id: String,
+}
+
+fn device_off() -> HttpResp {
+    super::err_response(404, "no such write route")
+}
+
+fn device_origin(request: &Request, opts: &ServeOpts) -> std::result::Result<Origin, HttpResp> {
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(o) => o,
+        ReqOrigin::NoSession(why) => {
+            return Err(guard_fail(
+                "session_origin",
+                &format!("sign-in refused: {why}"),
+            ));
+        }
+    };
+    if origin == Origin::Public {
+        return Err(guard_fail(
+            "session_origin",
+            "sign-in on this board is the platform's — device login applies \
+             to the loopback/tailnet surface only",
+        ));
+    }
+    require_own_origin(request, origin)?;
+    Ok(origin)
+}
+
+/// Refuse agent peers on the device routes. Unlike the link exchange
+/// there is no nonce to spend: refusal is side-effect free, and a
+/// poll refusal never drops the pending grant.
+fn device_attribution(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    origin: Origin,
+) -> Option<HttpResp> {
+    match attribute(request, state_dir, opts, &ReqOrigin::Known(origin)) {
+        Attribution::Agent(alias) => Some(guard_fail(
+            "session_from_agent",
+            &format!(
+                "sign-in refused: this request comes from agent '{alias}' — \
+                 device sign-in is never minted for a pane"
+            ),
+        )),
+        Attribution::AgentUid => Some(guard_fail(
+            "session_from_agent",
+            "sign-in refused: this request comes from the agent UID — \
+             device sign-in is never minted for a pane",
+        )),
+        Attribution::Unknown(why) => Some(guard_fail(
+            "caller_identity",
+            &format!("sign-in refused: the board cannot attribute this caller — {why}"),
+        )),
+        Attribution::NoAgent | Attribution::Foreign(_) | Attribution::Proxy(_) => None,
+    }
+}
+
+/// `POST /api/session/device/code {}` — request a grant for the
+/// configured issuer + workspace. Answers the human's display block
+/// plus a pending id; the device code stays server-side.
+#[allow(clippy::too_many_lines)]
+pub(super) fn device_code(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let Some(login) = opts.device_login.clone() else {
+        return device_off();
+    };
+    if opts.read_only {
+        return guard_fail("read_only", "board is read-only — sign-in is disabled");
+    }
+    if let Err(resp) = write_guard(request, "application/json", opts) {
+        return resp;
+    }
+    let origin = match device_origin(request, opts) {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = device_attribution(request, state_dir, opts, origin) {
+        return resp;
+    }
+    let bytes = match read_body(request, 1024) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let _: DeviceCodeReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let now = crate::issue::time::now_epoch();
+    {
+        let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, p| p.expires_at > now);
+        if pending.len() >= super::DEVICE_PENDING_CAP {
+            return super::err_response(
+                429,
+                "too many pending device grants — wait for one to settle and retry",
+            );
+        }
+    }
+    // The issuer call runs WITHOUT the lock: holding it across up to
+    // 20 s of network would stall every poll's prune/remove.
+    let (display, code) = match crate::device_login::request_code(&*login.transport, &login.config)
+    {
+        Ok(v) => v,
+        Err(_) => {
+            return coded_response(
+                502,
+                "issuer_unavailable",
+                "the issuer refused the device request",
+                None,
+            );
+        }
+    };
+    let pending_id = match crate::operator_auth::random_credential() {
+        Ok(id) => id,
+        Err(e) => return coded_response(500, "internal", &e.to_string(), None),
+    };
+    {
+        // Re-check under the lock: the cap may have filled while the
+        // issuer answered — a dropped code is simply a dead grant.
+        let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() >= super::DEVICE_PENDING_CAP {
+            return super::err_response(
+                429,
+                "too many pending device grants — wait for one to settle and retry",
+            );
+        }
+        // Expiry counts from when the issuer answered, not from before
+        // its (up to 20 s) call — a slow issuer must not shorten the
+        // grant the operator sees.
+        pending.insert(
+            pending_id.clone(),
+            DevicePending {
+                device_code: code,
+                expires_at: crate::issue::time::now_epoch() + display.expires_in as i64,
+            },
+        );
+    }
+    super::json_response(json!({
+        "pending_id": pending_id,
+        "user_code": display.user_code,
+        "verification_uri": display.verification_uri,
+        "verification_uri_complete": display.verification_uri_complete,
+        "expires_in": display.expires_in,
+        "interval": display.interval,
+    }))
+}
+
+/// `POST /api/session/device/poll {pending_id}` — exchange one wait
+/// for its outcome. Terminal issuer states drop the pending; approval
+/// verifies the credential and opens a device session with the same
+/// cookie shape as `/api/session`.
+#[allow(clippy::too_many_lines)]
+pub(super) fn device_poll(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let Some(login) = opts.device_login.clone() else {
+        return device_off();
+    };
+    if opts.read_only {
+        return guard_fail("read_only", "board is read-only — sign-in is disabled");
+    }
+    if let Err(resp) = write_guard(request, "application/json", opts) {
+        return resp;
+    }
+    let origin = match device_origin(request, opts) {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = device_attribution(request, state_dir, opts, origin) {
+        return resp;
+    }
+    let bytes = match read_body(request, 1024) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: DevicePollReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if !crate::operator_auth::well_formed(&req.pending_id) {
+        return guard_fail("pending_id", "unknown device grant — request a code first");
+    }
+    let now = crate::issue::time::now_epoch();
+    let (code, expires_at) = {
+        let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, p| p.expires_at > now);
+        match pending.remove(&req.pending_id) {
+            Some(p) => (p.device_code, p.expires_at),
+            None => {
+                return super::json_response(json!({"status": "expired"}));
+            }
+        }
+    };
+    let user_agent = header_value(request, "User-Agent").unwrap_or_default();
+    match crate::device_login::poll_token(&*login.transport, &login.config, &code) {
+        Ok(crate::device_login::Poll::Pending) => {
+            repend(&login, req.pending_id, code, expires_at);
+            super::json_response(json!({"status": "pending"}))
+        }
+        Ok(crate::device_login::Poll::SlowDown) => {
+            repend(&login, req.pending_id, code, expires_at);
+            super::json_response(json!({"status": "slow_down"}))
+        }
+        Ok(crate::device_login::Poll::Denied) => super::json_response(json!({"status": "denied"})),
+        Ok(crate::device_login::Poll::Gone) => super::json_response(json!({"status": "expired"})),
+        Ok(crate::device_login::Poll::Approved { token, .. }) => {
+            // The daemon is the single live verification: it re-checks
+            // the bearer against its pinned trust root at mint time, so
+            // no second issuer call happens here — the device code is
+            // already consumed and a transient failure would strand an
+            // approved grant for nothing (review r5).
+            // `rpc_answer` keeps the two failures apart (CAD-384): the
+            // outer Err is transport — no daemon at the socket — and
+            // the inner one is the daemon's own refusal, which the
+            // browser reads as a sign-in refusal (403), never a
+            // retryable outage. A failed live verification is the
+            // issuer's answer, not a refusal — 502.
+            let opened = client::rpc_answer(
+                state_dir,
+                "operator_session_open_device",
+                json!({
+                    // The daemon verifies this bearer live against its
+                    // pinned trust root and derives subject/workspace
+                    // itself — no identity field crosses this call.
+                    "token": token,
+                    "origin": origin.as_str(),
+                    "user_agent": user_agent,
+                }),
+            );
+            let opened = match opened {
+                Err(e) => {
+                    return coded_response(503, "daemon_unavailable", &e.to_string(), None);
+                }
+                Ok(Err(e)) => {
+                    let (status, code) = if e.code() == Some("device_verification_failed") {
+                        (502, "device_verification_failed")
+                    } else {
+                        (403, e.code().unwrap_or("device_sign_in_refused"))
+                    };
+                    return coded_response(status, code, &e.to_string(), None);
+                }
+                Ok(Ok(v)) => v,
+            };
+            let token = opened["token"].as_str().unwrap_or_default().to_string();
+            let key = opened["key"].as_str().unwrap_or_default();
+            let now = crate::issue::time::now_epoch();
+            let expires = opened["session"]["expires_at"].as_i64().unwrap_or(now);
+            let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
+            let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            set_cookie(
+                &mut resp,
+                &format!(
+                    "{}={token}; {}",
+                    cookie_name(opts, origin),
+                    cookie_attrs(origin, (expires - now).max(0))
+                ),
+            );
+            no_store(resp)
+        }
+        Err(_) => {
+            // Uncertain transport outcome: the grant may or may not
+            // have been consumed issuer-side. Keep nothing pending —
+            // a retry after an ambiguous exchange is a new code, the
+            // same rule as the CLI's device login.
+            super::json_response(json!({"status": "expired"}))
+        }
+    }
+}
+
+/// Return a still-waiting grant to the pending map after a poll,
+/// keeping the issuer's expiry: a slow poller must not stretch the
+/// grant past its TTL.
+fn repend(login: &DeviceLogin, pending_id: String, code: String, expires_at: i64) {
+    let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+    // Always reinsert: the row held a slot before this poll removed
+    // it, so the cap argument for dropping it does not hold — a
+    // concurrent `/code` may already have taken the freed slot and a
+    // transient overshoot is bounded by the in-flight polls. Dropping
+    // the grant here would strand it at the issuer while the next
+    // poll reports `expired`.
+    pending.insert(
+        pending_id,
+        DevicePending {
+            device_code: code,
+            expires_at,
+        },
+    );
 }
 
 // ---------- `/__platform/*` — the AgenticOS sign-in contract (CAD-526) ----------
@@ -1652,6 +1985,15 @@ mod tests {
             RouteClass::AgentAllowed
         );
         assert_eq!(route_class("POST", "/api/session"), RouteClass::Session);
+        // CAD-777: the device exchange is a login credential like the link.
+        assert_eq!(
+            route_class("POST", "/api/session/device/code"),
+            RouteClass::Session
+        );
+        assert_eq!(
+            route_class("POST", "/api/session/device/poll"),
+            RouteClass::Session
+        );
         // Unlisted writes are operator-only.
         assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);
         assert_eq!(
