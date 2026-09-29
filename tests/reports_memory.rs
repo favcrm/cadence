@@ -1672,7 +1672,14 @@ fn report_ls_cad437_grammar() {
     assert_eq!(ids(&out), Vec::<String>::new(), "{out}");
 
     // --open drops resolved intake rows; --all brings them back.
-    let (ok, _) = s.cli(&["issue", "set", "P-1", "status=done"]);
+    let (ok, _) = s.cli(&[
+        "issue",
+        "set",
+        "P-1",
+        "status=done",
+        "--force",
+        "report grammar probe close",
+    ]);
     assert!(ok);
     let (_, out) = s.cli(&["report", "ls"]);
     assert_eq!(ids(&out), ["C-1", "C-2"], "{out}");

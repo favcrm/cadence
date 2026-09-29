@@ -3134,7 +3134,16 @@ fn finish_merged_sweep() {
     assert!(wt("d-3-unmerged").is_dir());
 
     // The done-hint: status=done with an open worktree prints it.
-    let (code, _, stderr) = cli_raw(&["issue", "set", "D-3", "status=done"]);
+    // CAD-756: the close itself records the designed override so the
+    // probe reaches the hint it is testing.
+    let (code, _, stderr) = cli_raw(&[
+        "issue",
+        "set",
+        "D-3",
+        "status=done",
+        "--force",
+        "sweep hint probe close",
+    ]);
     assert_eq!(code, 0, "{stderr}");
     assert!(
         stderr.contains("worktree open: run cadence issue finish D-3"),

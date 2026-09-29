@@ -2801,7 +2801,14 @@ fn delivery_merged_marks_ticket_done_once() {
 
     // D-3 (it waited on D-2): two observations of its merge race; the
     // ticket is marked done once.
-    let (ok, out) = lf.f.cli(&["issue", "set", "D-2", "status=done"]);
+    let (ok, out) = lf.f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "re-close after merge-reopen probe",
+    ]);
     assert!(ok, "{out}");
     let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
     assert!(ok, "{sent}");
@@ -2899,7 +2906,14 @@ fn delivery_unreviewed_or_unmerged_never_marks_ticket_done() {
             .any(|r| r["title"].as_str().unwrap_or_default().starts_with("D-4:"))
     };
     assert!(row(&lf), "{:#?}", lf.f.needs_me());
-    let (ok, out) = lf.f.cli(&["issue", "set", "D-4", "status=done"]);
+    let (ok, out) = lf.f.cli(&[
+        "issue",
+        "set",
+        "D-4",
+        "status=done",
+        "--force",
+        "operator hand-settles unmerged ticket",
+    ]);
     assert!(ok, "{out}");
     lf.wait_of("D-4", "settled by hand", |r| {
         r["ticket_done"]["outcome"] == "kept"
@@ -3674,7 +3688,15 @@ fn master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence() {
     // D-2 is done (the operator's tracker write, not through the
     // daemon): the router wakes the master for D-3. D-4's wake meets the
     // planted row and is refused loudly — never counted as sent.
-    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=done"]);
+    // CAD-756: the operator write records the override.
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "wake probe close",
+    ]);
     assert!(ok, "{out}");
     let wake = f.wait_thread("[wake] D-3 is ready to dispatch", 10);
     assert_eq!(wake["role"], "system", "{wake}");
@@ -3703,7 +3725,14 @@ fn master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence() {
     let (ok, out) = f.cli(&["issue", "set", "D-2", "status=doing"]);
     assert!(ok, "{out}");
     thread::sleep(Duration::from_millis(2_500));
-    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=done"]);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "set",
+        "D-2",
+        "status=done",
+        "--force",
+        "new-epoch wake probe",
+    ]);
     assert!(ok, "{out}");
     f.wait_thread("[wake] D-4 is ready to dispatch", 10);
     let d4_again = cadence_agent::master::wake_id("blocker_done", "D-4/D-2@2");
