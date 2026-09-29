@@ -924,10 +924,14 @@ pub fn pi_worker_confinement(
         // `~/.local/share/devin` and every sibling stay denied, as
         // do cargo registry tokens and every other login. A missing
         // file is skipped by `cadence confine` (never widened to its
-        // parent). The daemon never reads this file — the path is
-        // granted, the bytes stay inside the confined child — so no
-        // credential content can reach events, argv, task results or
-        // worktrees.
+        // parent). Cadence itself never reads or copies these bytes
+        // into logs, events, argv or worktrees — the grant names the
+        // path only. Residual risk, accepted: Landlock is a
+        // filesystem boundary, not a capability sandbox, so a model
+        // with this granted read could exfiltrate the bytes through
+        // its own worktree writes or task output; the canary sweep in
+        // `tests/pi_worker_confinement.rs` guards the ordinary path
+        // only.
         if worker_uses_devin_model(&params) {
             read.push(home.join(".local/share/devin/credentials.toml"));
         }

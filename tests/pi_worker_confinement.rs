@@ -968,8 +968,11 @@ fn join_pi_confine_end_to_end() {
     }
 }
 
-/// Every text file under `state` must be free of `canary` — credential
-/// bytes reach no log, record, session file or cache.
+/// Asserts the ordinary test path leaks no `canary` into any text
+/// file under `state` (log, record, session file, cache). This guards
+/// Cadence's own handling only — a model with a granted credential
+/// read could still exfiltrate through its own writes (accepted
+/// residual risk, see the CAD-751 grant comment in `src/adapter/pi.rs`).
 fn assert_state_has_no_canary(state: &Path, canary: &str) {
     let mut hits = Vec::new();
     let mut stack = vec![state.to_path_buf()];
@@ -1254,9 +1257,11 @@ print(json.dumps({"ok": ok, "fail": [c for c in checks if not c["ok"]]}))
 
 /// CAD-751 — a confined worker on the pinned `devin/swe-2-high`
 /// provider finishes bootstrap (`open`) and a dispatched turn
-/// (`run_turn`) under the emitted policy, and the Devin credential
-/// bytes it was granted to read reach no file under the state dir
-/// (provider log, launch record, session file, catalog cache).
+/// (`run_turn`) under the emitted policy, and on this ordinary
+/// (fake-pi) path the granted Devin credential bytes reach no file
+/// under the state dir (provider log, launch record, session file,
+/// catalog cache) — a real granted model could still exfiltrate
+/// through its own writes (accepted residual risk).
 #[test]
 fn confined_devin_model_bootstrap_and_dispatched_turn() {
     if cadence_agent::confine::available().is_err() {
@@ -1270,8 +1275,8 @@ fn confined_devin_model_bootstrap_and_dispatched_turn() {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(home.join(".local/share/devin")).unwrap();
     // Test-only bytes, never a real credential — the sweep below
-    // proves they reach no state file even though the policy grants
-    // the confined child this read.
+    // proves they reach no state file on this ordinary path even
+    // though the policy grants the confined child this read.
     let canary = "CAD751-TEST-ONLY-NOT-A-SECRET";
     std::fs::write(
         home.join(".local/share/devin/credentials.toml"),
@@ -1338,6 +1343,8 @@ fn confined_devin_model_bootstrap_and_dispatched_turn() {
         !log.contains("EACCES"),
         "confined devin turn logged EACCES: {log}"
     );
-    // The grant names the path; the bytes stay out of every state file.
+    // The grant names the path; on the ordinary (fake-pi) path no
+    // bytes reach a state file (a granted model could still
+    // exfiltrate through its own writes — accepted residual risk).
     assert_state_has_no_canary(&state, canary);
 }
