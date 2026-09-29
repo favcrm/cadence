@@ -322,13 +322,12 @@ impl AgenticosExternalAdapter {
             return Err("provider quote names an unreviewed action".into());
         }
         let token = bearer_token(credential)?;
-        let (status, envelope) = self
-            .get_media(
-                &format!("{}{MEDIA_PRICE_PATH}", self.base),
-                token,
-                MEDIA_BODY_CAP,
-                "AgenticOS media price read could not reach the service",
-            )?;
+        let (status, envelope) = self.get_media(
+            &format!("{}{MEDIA_PRICE_PATH}", self.base),
+            token,
+            MEDIA_BODY_CAP,
+            "AgenticOS media price read could not reach the service",
+        )?;
         match status {
             200 if envelope["ok"] == true => {}
             404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
