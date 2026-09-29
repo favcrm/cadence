@@ -65,7 +65,7 @@ def check(binary):
                 [(CREATED_WRITER, CREATED_WRITER, "writer"),
                  (CREATED_REVIEWER, CREATED_REVIEWER, "reviewer")],
             )
-        source = Path(__file__).resolve().parents[1] / "workspace-apps/social-content"
+        source = Path(__file__).resolve().parents[2] / "workspace-apps/social-content"
         installation = cli("app", "catalog", "install", str(source))
         install_id = installation["install_id"]
         cli("app", "catalog", "approve", install_id, "--digest", installation["digest"])
