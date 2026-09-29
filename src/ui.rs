@@ -3346,6 +3346,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "hosted": session["hosted"],
                     "session": session["session"],
                     "login_hint": session["login_hint"],
+                    "device_login": session["device_login"],
                     "tab_signed_out": session["tab_signed_out"],
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
@@ -4227,9 +4228,18 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         let (state_dir, pm_dir, opts) =
             (state_dir.to_path_buf(), pm_dir.to_path_buf(), opts.clone());
         std::thread::spawn(move || {
+            // CAD-777: the device sign-in exchange is exempt — its
+            // handlers make issuer HTTP calls (up to 20 s each), so a
+            // slow issuer or a `/code` spammer would stall every
+            // unrelated board write. Safe: their only shared state is
+            // the pending map under its own mutex, and the daemon
+            // serializes the mint itself.
             let is_write = matches!(
                 request.method(),
                 Method::Post | Method::Patch | Method::Delete
+            ) && !matches!(
+                request.url().split('?').next().unwrap_or(""),
+                "/api/session/device/code" | "/api/session/device/poll"
             );
             if is_write {
                 let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

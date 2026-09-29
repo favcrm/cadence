@@ -988,19 +988,29 @@ fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
             let (status, doc) = match (req.method(), req.url()) {
-                (tiny_http::Method::Post, "/v1/device/code") => (
-                    200,
-                    json!({
-                        "device_code": "agd_t",
-                        "user_code": "ABCD-1234",
-                        "verification_uri": format!("http://127.0.0.1:{port}/approve"),
-                        "verification_uri_complete": format!("http://127.0.0.1:{port}/approve?code=ABCD-1234"),
-                        "expires_in": 600,
-                        "interval": 1
-                    }),
-                ),
+                (tiny_http::Method::Post, "/v1/device/code") => {
+                    if serve.mode.lock().unwrap().as_str() == "slow_code" {
+                        // A slow issuer: the code answer takes ~3 s.
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    (
+                        200,
+                        json!({
+                            "device_code": "agd_t",
+                            "user_code": "ABCD-1234",
+                            "verification_uri": format!("http://127.0.0.1:{port}/approve"),
+                            "verification_uri_complete": format!("http://127.0.0.1:{port}/approve?code=ABCD-1234"),
+                            "expires_in": 600,
+                            "interval": 1
+                        }),
+                    )
+                }
                 (tiny_http::Method::Post, "/v1/device/token") => {
-                    if !body.contains("agd_t") {
+                    // The real issuer's gate: the grant type is
+                    // required, exactly like the CLI posts it.
+                    if !body.contains("urn:ietf:params:oauth:grant-type:device_code") {
+                        (400, json!({"error": "unsupported_grant_type"}))
+                    } else if !body.contains("agd_t") {
                         (400, json!({"error": "invalid_grant"}))
                     } else if serve
                         .polls
@@ -1953,4 +1963,72 @@ fn device_subject_off_the_allowlist_is_refused() {
     assert!(body.contains("op_9"), "{body}");
     assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
     assert_eq!(device_session_count(state.path()), 0);
+}
+
+/// `/api/session/device/code` is exempt from the board-wide write
+/// lock: a slow issuer (3 s on the stub's code answer) must not stall
+/// an unrelated write. `/api/session/logout` posts through WRITE_LOCK,
+/// so it is the probe — it must answer well before the issuer does.
+#[test]
+fn device_code_does_not_stall_unrelated_writes() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("slow_code");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+
+    let code_thread = {
+        let host = host.clone();
+        thread::spawn(move || device_post(port, &host, "/api/session/device/code", "{}"))
+    };
+    // Let the /code request reach the issuer and start its sleep.
+    thread::sleep(Duration::from_millis(300));
+    let began = std::time::Instant::now();
+    let (code, _, _body) = device_post(port, &host, "/api/session/logout", "{}");
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "unrelated write stalled behind the issuer call: {elapsed:?}"
+    );
+    // The logout answer is a refusal or a no-op — either way it did
+    // not wait for the issuer.
+    assert!(code == 204 || code / 100 == 4, "{code}");
+    let (code, _, body) = code_thread.join().unwrap();
+    assert_eq!(code, 200, "{body}");
+}
+
+/// `/api/meta` advertises device sign-in on a configured board's
+/// loopback surface only — false when unconfigured.
+#[test]
+fn device_meta_advertises_sign_in_only_when_configured() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let host = op::board_host(port);
+    let (code, body) = http(port, "GET", "/api/meta", &host);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["device_login"],
+        json!(true),
+        "{body}"
+    );
+
+    let pm2 = TempDir::new().unwrap();
+    let state2 = TempDir::new().unwrap();
+    seed(pm2.path(), state2.path());
+    let _d2 = UiDaemon::start_on(state2.path().to_path_buf());
+    let (port2, _board2) = start_ui(pm2.path().to_path_buf(), state2.path().to_path_buf());
+    let host2 = op::board_host(port2);
+    let (code, body) = http(port2, "GET", "/api/meta", &host2);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["device_login"],
+        json!(false),
+        "{body}"
+    );
 }

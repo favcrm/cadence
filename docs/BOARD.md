@@ -1045,7 +1045,10 @@ under `principal.subject_id`, and a refusal names the subject it saw.
 Sessions minted this way live 12 h idle, 24 h at most, one per
 verified subject, operator-mapped to the allowlisted subject only;
 agent peers are refused without side effects.
-Unconfigured boards answer both routes 404. The login audience
+When device login is configured, the header's Sign in menu offers
+"Sign in with AgenticOS" — it shows the user code and approval link
+and polls until the grant settles. Unconfigured boards answer both
+routes 404. The login audience
 (`read draft`) never enrolls a provider connection; issuing the grant
 still needs the issuer's device flag and an approver.
 

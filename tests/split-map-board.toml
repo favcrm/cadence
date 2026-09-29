@@ -371,6 +371,8 @@ tests = [
     "device_poll_mints_exactly_once_under_concurrent_polls",
     "device_rpc_mints_the_issuers_subject_not_forged_fields",
     "device_subject_off_the_allowlist_is_refused",
+    "device_code_does_not_stall_unrelated_writes",
+    "device_meta_advertises_sign_in_only_when_configured",
 ]
 helpers = [
     "jwks_stub",

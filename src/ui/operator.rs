@@ -1089,11 +1089,19 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
         }
         ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
+    // CAD-777: device sign-in is advertised on the operator surface
+    // only — never to the public host or an unattributable request.
+    let device_login = opts.device_login.is_some()
+        && matches!(
+            request_origin(request, opts),
+            ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
+        );
     json!({
         "signed_in": session.is_some(),
         "hosted": hosted,
         "session": session,
         "login_hint": hint,
+        "device_login": device_login,
         // A cookie but no live session for this page: typically a new
         // tab — the key lives in the signing-in tab's `sessionStorage`.
         // Public sessions have no page key, so the cookie alone answers.
@@ -1403,14 +1411,18 @@ pub(super) fn device_code(
         Err(resp) => return resp,
     };
     let now = crate::issue::time::now_epoch();
-    let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
-    pending.retain(|_, p| p.expires_at > now);
-    if pending.len() >= super::DEVICE_PENDING_CAP {
-        return super::err_response(
-            429,
-            "too many pending device grants — wait for one to settle and retry",
-        );
+    {
+        let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, p| p.expires_at > now);
+        if pending.len() >= super::DEVICE_PENDING_CAP {
+            return super::err_response(
+                429,
+                "too many pending device grants — wait for one to settle and retry",
+            );
+        }
     }
+    // The issuer call runs WITHOUT the lock: holding it across up to
+    // 20 s of network would stall every poll's prune/remove.
     let (display, code) = match crate::device_login::request_code(&*login.transport, &login.config)
     {
         Ok(v) => v,
@@ -1427,13 +1439,24 @@ pub(super) fn device_code(
         Ok(id) => id,
         Err(e) => return coded_response(500, "internal", &e.to_string(), None),
     };
-    pending.insert(
-        pending_id.clone(),
-        DevicePending {
-            device_code: code,
-            expires_at: now + display.expires_in as i64,
-        },
-    );
+    {
+        // Re-check under the lock: the cap may have filled while the
+        // issuer answered — a dropped code is simply a dead grant.
+        let mut pending = login.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() >= super::DEVICE_PENDING_CAP {
+            return super::err_response(
+                429,
+                "too many pending device grants — wait for one to settle and retry",
+            );
+        }
+        pending.insert(
+            pending_id.clone(),
+            DevicePending {
+                device_code: code,
+                expires_at: now + display.expires_in as i64,
+            },
+        );
+    }
     super::json_response(json!({
         "pending_id": pending_id,
         "user_code": display.user_code,

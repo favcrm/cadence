@@ -437,7 +437,13 @@ pub fn poll_token(
     validate_token(device_code)?;
     let (status, value) = transport.post(
         &format!("{}/v1/device/token", config.issuer),
-        json!({"device_code": device_code}),
+        // Same body the CLI exchange posts (remote_auth): the RFC 8628
+        // grant type is required — the real issuer answers
+        // `unsupported_grant_type` without it.
+        json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+        }),
     )?;
     if status == 200 {
         let token = value
@@ -669,6 +675,14 @@ mod tests {
             poll_token(&pending, &config(), "agd_x").unwrap(),
             Poll::Pending
         );
+        // The posted body carries the RFC 8628 grant type — the issuer
+        // refuses `unsupported_grant_type` without it.
+        let calls = pending.called();
+        assert_eq!(
+            calls[0].1["grant_type"],
+            json!("urn:ietf:params:oauth:grant-type:device_code")
+        );
+        assert_eq!(calls[0].1["device_code"], json!("agd_x"));
         let slow = Fake::new(vec![(400, json!({"error": "slow_down"}))]);
         assert_eq!(
             poll_token(&slow, &config(), "agd_x").unwrap(),
