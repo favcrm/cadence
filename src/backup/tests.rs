@@ -2118,3 +2118,141 @@ fn cad767_activation_failure_removes_new_files_without_asides() {
         vec!["b.sqlite3", "new-a.partial", "new-core.partial"]
     );
 }
+
+#[test]
+fn cad767_rollback_reports_stuck_new_file_and_puts_asides_back() {
+    let root = TempDir::new().unwrap();
+    let dir = root.path();
+    // A non-empty directory stands in for an undeletable new link at the
+    // file-operation boundary: `remove_file` fails on it, while the
+    // quarantine rename succeeds like it would for a file.
+    let stuck_dir = dir.join("stuck-new");
+    std::fs::create_dir(&stuck_dir).unwrap();
+    std::fs::write(stuck_dir.join("child"), "x").unwrap();
+    // A real aside pair proves aside recovery still happens alongside:
+    // the live path is absent (moved aside in phase A), the aside holds
+    // the previous file.
+    let live_b = dir.join("b.sqlite3");
+    let aside_b = dir.join("b.sqlite3.replaced-manual");
+    std::fs::write(&aside_b, "previous b").unwrap();
+    let moved = vec![(live_b.clone(), aside_b.clone())];
+
+    let err = rollback_links(
+        std::slice::from_ref(&stuck_dir),
+        &moved,
+        "could not install c (no_entry)".into(),
+    )
+    .to_string();
+
+    assert!(err.contains("ROLLBACK FAILED"), "{err}");
+    assert!(err.contains("stuck-new"), "{err}");
+    assert!(!err.contains("was put back"), "{err}");
+    // The aside was still put back; the stuck path is quarantined under
+    // an `.orphaned-` marker instead of left at the live path.
+    assert_eq!(std::fs::read(&live_b).unwrap(), b"previous b");
+    assert!(!aside_b.exists());
+    assert!(!stuck_dir.exists());
+    let markers: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .contains(".orphaned-")
+        })
+        .collect();
+    assert_eq!(markers.len(), 1);
+    assert!(markers[0].is_dir());
+    assert!(err.contains(&markers[0].display().to_string()), "{err}");
+}
+
+#[test]
+fn cad767_activation_cleanup_failure_is_surfaced_not_success() {
+    let root = TempDir::new().unwrap();
+    let dir = root.path();
+    let live_core = dir.join("cadence.sqlite3");
+    std::fs::write(&live_core, "old core").unwrap();
+    // A non-empty directory among the olds: renamed aside and linked
+    // fine, then its aside cannot be removed — cleanup must surface.
+    let old_dir = dir.join("old-dir");
+    std::fs::create_dir(&old_dir).unwrap();
+    std::fs::write(old_dir.join("child"), "x").unwrap();
+    let new_core = dir.join("new-core.partial");
+    let new_x = dir.join("new-x.partial");
+    let live_x = dir.join("x.sqlite3");
+    std::fs::write(&new_core, "new core").unwrap();
+    std::fs::write(&new_x, "new x").unwrap();
+
+    let err = activate_all(&[
+        (new_core.clone(), live_core.clone(), vec![live_core.clone()]),
+        (new_x.clone(), live_x.clone(), vec![old_dir.clone()]),
+    ])
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("activation completed"), "{err}");
+    assert!(!err.contains("ROLLBACK FAILED"), "{err}");
+    // The restored set IS live — this is not a rollback — and the stuck
+    // aside remains as the detectable recovery marker.
+    assert_eq!(std::fs::read(&live_core).unwrap(), b"new core");
+    assert_eq!(std::fs::read(&live_x).unwrap(), b"new x");
+    let asides: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .contains(".replaced-")
+        })
+        .collect();
+    assert_eq!(asides.len(), 1);
+    assert!(asides[0].is_dir());
+    assert!(err.contains(&asides[0].display().to_string()), "{err}");
+}
+
+#[test]
+fn cad767_orphan_markers_refuse_restore_and_start() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    // A quarantined stray from a failed activation: not a previous file.
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let marker = target
+        .join(RECORDS_DIR)
+        .join("install-a.sqlite3.orphaned-20260929T000000Z-deadbeef");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "quarantined new file").unwrap();
+
+    assert_eq!(interrupted_restore_leftovers(&target), vec![marker.clone()]);
+    for force in [false, true] {
+        let err = restore(
+            &manifest_path,
+            &target,
+            &RestoreOptions {
+                force,
+                repos: vec![],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("interrupted"), "{err}");
+        assert!(err.contains("orphaned"), "{err}");
+        assert!(err.contains("never move them back"), "{err}");
+    }
+    let err = refuse_interrupted_restore(&target).unwrap_err().to_string();
+    assert!(err.contains("remove them after inspection"), "{err}");
+    assert!(err.contains(&marker.display().to_string()), "{err}");
+    // No put-back `mv` is offered for the quarantined path itself.
+    assert!(
+        !err.contains(&format!("mv '{}'", marker.display())),
+        "{err}"
+    );
+    assert!(marker.exists());
+}

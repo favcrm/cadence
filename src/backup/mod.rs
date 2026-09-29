@@ -1533,7 +1533,7 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
     let _lock = lock_state_dir(state_dir)?;
     let leftovers = interrupted_restore_leftovers(state_dir);
     if !leftovers.is_empty() {
-        return Err(Error::rejected(format!(
+        let mut msg = format!(
             "an earlier restore into {} was interrupted: {} may hold the previous store. \
              Refusing to restore over it. Inspect them, move the store back to \
              cadence.sqlite3 (and its -wal/-shm) or each record file back to \
@@ -1544,7 +1544,16 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )));
+        );
+        if leftovers.iter().any(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .contains(".orphaned-")
+        }) {
+            msg += " Quarantined new files from a failed activation (*.orphaned-*) are not previous files: remove them after inspection, never move them back.";
+        }
+        return Err(Error::rejected(msg));
     }
     let live = db_file(state_dir);
     let wal = sidecar(&live, "-wal");
@@ -1708,6 +1717,22 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
                     )));
                 }
                 newer_record_schema_refusal(file_schema)?;
+                // Owner-only mode is a staged gate, not a post-activation
+                // best effort: a failure here refuses before anything
+                // activates, so a restored file can never stay too
+                // permissive under a success. (Copies are created 0600,
+                // so this only fires on genuine IO failures.)
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&app_partial, fs::Permissions::from_mode(0o600))
+                        .map_err(|e| {
+                            Error::rejected(format!(
+                                "record copy {} for installation {:?} could not be tightened to owner-only ({e}); refusing before activation",
+                                src.display(),
+                                entry.install_id
+                            ))
+                        })?;
+                }
                 sync_file(&app_partial)?;
                 Ok(StagedRecord {
                     install_id: entry.install_id.clone(),
@@ -1765,10 +1790,6 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
     if !staged_records.is_empty() {
         sync_dir(&records_dir);
         for staged in &staged_records {
-            // Tighten to the record file's owner-only mode; a restored
-            // copy inherits the backup dir's mode via hard link.
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&staged.dest, fs::Permissions::from_mode(0o600));
             restored_records.push(json!({"install_id": staged.install_id, "db": staged.dest, "sha256": staged.sha256, "bytes": staged.bytes, "file_schema": staged.file_schema}));
         }
     }
@@ -1922,17 +1943,22 @@ fn under(path: &str, root: &str) -> bool {
 /// Files an interrupted `restore --force` left behind: the previous store
 /// (or its sidecars) renamed aside as `cadence.sqlite3*.replaced-*` in the
 /// state dir, or a previous record file renamed aside as
-/// `app-records/*.sqlite3*.replaced-*`.
+/// `app-records/*.sqlite3*.replaced-*` — plus quarantined new files a
+/// failed activation could not unlink, `*.orphaned-*` (stray installs that
+/// are not previous files: remove after inspection, never move back).
 /// A restore refuses while any exist, and so does the daemon
 /// ([`refuse_interrupted_restore`]).
 pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
+    fn leftover(name: &str) -> bool {
+        name.contains(".replaced-") || name.contains(".orphaned-")
+    }
     let mut out: Vec<PathBuf> = fs::read_dir(state_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.starts_with(BUNDLE_DB) && name.contains(".replaced-")
+            name.starts_with(BUNDLE_DB) && leftover(&name)
         })
         .map(|e| e.path())
         .collect();
@@ -1941,7 +1967,7 @@ pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
         out.extend(
             entries
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().contains(".replaced-"))
+                .filter(|e| leftover(&e.file_name().to_string_lossy()))
                 .map(|e| e.path()),
         );
     }
@@ -1962,7 +1988,14 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
         return Ok(());
     }
     let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
-    let put_back = leftovers
+    let is_orphan = |p: &&PathBuf| {
+        p.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .contains(".orphaned-")
+    };
+    let (orphaned, replaced): (Vec<_>, Vec<_>) = leftovers.iter().partition(|p| is_orphan(p));
+    let put_back = replaced
         .iter()
         .map(|aside| {
             let name = aside.file_name().unwrap_or_default().to_string_lossy();
@@ -1972,6 +2005,23 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join(" && ");
+    let orphan_note = if orphaned.is_empty() {
+        None
+    } else {
+        let rms = orphaned
+            .iter()
+            .map(|p| format!("rm {}", quote(p)))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let scope = if replaced.is_empty() {
+            "are present"
+        } else {
+            "are also present"
+        };
+        Some(format!(
+            "Quarantined new files from a failed activation {scope}; remove them after inspection (they are not previous files, so do not move them back): {rms}"
+        ))
+    };
     let listed = leftovers
         .iter()
         .map(|p| p.display().to_string())
@@ -1980,21 +2030,45 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     let live = db_file(state_dir);
     let recovery = if live.exists() {
         let aside_dir = default_dir(state_dir);
+        let mut s = if put_back.is_empty() {
+            format!(
+                "{live} exists too. If it is not the store you restored (for \
+                 example an empty store created after the interruption), move {live} and its \
+                 -wal/-shm out of the state dir first",
+                live = live.display(),
+            )
+        } else {
+            format!(
+                "{live} exists too. If it is the store you restored, move the aside files \
+                 out of the state dir: mkdir -p {dir} && mv {files} {dir}. If it is not (for \
+                 example an empty store created after the interruption), move {live} and its \
+                 -wal/-shm out of the state dir first, then put the previous store back: {put_back}",
+                live = live.display(),
+                dir = quote(&aside_dir),
+                files = leftovers
+                    .iter()
+                    .map(|p| quote(p))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        };
+        if let Some(note) = &orphan_note {
+            s += " ";
+            s += note;
+        }
+        s
+    } else if put_back.is_empty() {
         format!(
-            "{live} exists too. If it is the store you restored, move the aside files \
-             out of the state dir: mkdir -p {dir} && mv {files} {dir}. If it is not (for \
-             example an empty store created after the interruption), move {live} and its \
-             -wal/-shm out of the state dir first, then put the previous store back: {put_back}",
-            live = live.display(),
-            dir = quote(&aside_dir),
-            files = leftovers
-                .iter()
-                .map(|p| quote(p))
-                .collect::<Vec<_>>()
-                .join(" "),
+            "There is no previous store to put back. {}",
+            orphan_note.expect("leftovers with neither asides nor markers")
         )
     } else {
-        format!("Put the previous store back: {put_back}")
+        let mut s = format!("Put the previous store back: {put_back}");
+        if let Some(note) = &orphan_note {
+            s += " ";
+            s += note;
+        }
+        s
     };
     Err(Error::rejected(format!(
         "an interrupted restore left {listed} in {}; refusing to open the store there. \
@@ -2003,11 +2077,10 @@ pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
     )))
 }
 
-/// Rename every aside file back after a failed install. The outcome is
-/// part of the error: a failed rollback says where the previous store now
-/// is instead of claiming it was put back.
-fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
-    let failed: Vec<String> = moved
+/// Rename every aside file back, collecting the failures instead of
+/// hiding them. Shared by [`put_back`] and link-phase rollback.
+fn rename_back(moved: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    moved
         .iter()
         .rev()
         .filter_map(|(from, aside)| {
@@ -2019,7 +2092,15 @@ fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
                 )
             })
         })
-        .collect();
+        .collect()
+}
+
+/// The rollback verdict: success claims the put-back only when nothing
+/// is stuck; anything stuck yields `ROLLBACK FAILED` naming every
+/// affected path. The outcome is part of the error: a failed rollback
+/// says where the previous store now is instead of claiming it was put
+/// back.
+fn finish_rollback(failed: Vec<String>, what: String) -> Error {
     if failed.is_empty() {
         Error::internal(format!("{what}; the previous store was put back"))
     } else {
@@ -2029,6 +2110,56 @@ fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
             failed.join("; ")
         ))
     }
+}
+
+/// Rename every aside file back after a failed install. The outcome is
+/// part of the error: a failed rollback says where the previous store now
+/// is instead of claiming it was put back.
+fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
+    finish_rollback(rename_back(moved), what)
+}
+
+/// Reverse a failed link phase: unlink every live path this activation
+/// linked for a previously absent file (those have no aside to put
+/// back), then rename every aside back. A new link whose removal fails
+/// is first moved out of the live path under an `.orphaned-<tag>`
+/// marker — picked up by [`interrupted_restore_leftovers`], with
+/// remove-after-inspection recovery, so the daemon cannot silently open
+/// the partial state; if that move also fails, the live path is reported
+/// stuck. Never claims the previous state was put back when any unlink,
+/// quarantine move or aside rename failed.
+fn rollback_links(linked: &[PathBuf], moved: &[(PathBuf, PathBuf)], what: String) -> Error {
+    let tag = format!(
+        "orphaned-{}-{}",
+        crate::issue::time::basic(epoch_now() as i64),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let mut stuck: Vec<String> = Vec::new();
+    for live in linked.iter().rev() {
+        if moved.iter().any(|(from, _)| from == live) {
+            continue;
+        }
+        if fs::remove_file(live).is_ok() {
+            continue;
+        }
+        let marker = sidecar(live, &format!(".{tag}"));
+        match fs::rename(live, &marker) {
+            Ok(()) => stuck.push(format!(
+                "newly installed {} could not be removed; it is quarantined at {} — remove {} after inspection",
+                live.display(),
+                marker.display(),
+                marker.display()
+            )),
+            Err(e) => stuck.push(format!(
+                "newly installed {} could not be removed ({e}) and left no recovery marker; remove {} after inspection",
+                live.display(),
+                live.display()
+            )),
+        }
+    }
+    let mut failed = stuck;
+    failed.append(&mut rename_back(moved));
+    finish_rollback(failed, what)
 }
 
 /// Single-pair [`activate_all`], kept for the focused no-clobber tests.
@@ -2047,11 +2178,14 @@ fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> 
 /// must never replay onto a restored file) is renamed aside under one
 /// tag; every partial is then hard-linked into place, which refuses an
 /// existing target; partials and asides are removed only after every
-/// link succeeded. Any failure first unlinks every live path this call
-/// created for a previously absent file (those have no aside to put
-/// back), then renames every aside back — so a returned error leaves the
-/// previous files in place and no new live file behind, never a partial
-/// replacement spanning core and record files. Callers stage and fully
+/// link succeeded, and any removal failure is returned as an error that
+/// names the activated live state plus the leftover to clear by hand.
+/// A link failure unlinks every live path this call created for a
+/// previously absent file (quarantining under an `.orphaned-` marker
+/// when removal itself fails) and renames every aside back via
+/// [`rollback_links`] — so a returned error leaves the previous files
+/// in place and no new live file behind, never a partial replacement
+/// spanning core and record files. Callers stage and fully
 /// verify every partial before calling: nothing here checks content.
 /// A process crash mid-activation leaves `.replaced-*` asides behind,
 /// which refuse the next restore and daemon start until the operator
@@ -2081,23 +2215,38 @@ fn activate_all(pairs: &[(PathBuf, PathBuf, Vec<PathBuf>)]) -> Result<()> {
     let mut linked: Vec<PathBuf> = Vec::new();
     for (partial, live, _) in pairs {
         if let Err(e) = fs::hard_link(partial, live) {
-            for live in linked.iter().rev() {
-                if !moved.iter().any(|(from, _)| from == live) {
-                    let _ = fs::remove_file(live);
-                }
-            }
-            return Err(put_back(
+            return Err(rollback_links(
+                &linked,
                 &moved,
                 format!("could not install {} ({e})", live.display()),
             ));
         }
         linked.push(live.clone());
     }
-    for (partial, _, _) in pairs {
-        let _ = fs::remove_file(partial);
+    // Post-activation cleanup: staged partials, then previous-file
+    // asides. A failure here is surfaced — never a quiet success — with
+    // the activated state distinguished from recovery: the restored set
+    // is live, the named staged/previous files remain for explicit
+    // removal, and leftover asides keep refusing the next restore and
+    // daemon start until recovered.
+    for (partial, live, _) in pairs {
+        if let Err(e) = fs::remove_file(partial) {
+            return Err(Error::internal(format!(
+                "activation completed: {} is live, but staged {} could not be removed ({e}); remove {} by hand",
+                live.display(),
+                partial.display(),
+                partial.display()
+            )));
+        }
     }
-    for (_, aside) in &moved {
-        let _ = fs::remove_file(aside);
+    for (from, aside) in &moved {
+        if let Err(e) = fs::remove_file(aside) {
+            return Err(Error::internal(format!(
+                "activation completed: the restored set is live, but previous-file aside {} (for {}) could not be removed ({e}); move it out of the state dir after verifying the live files, otherwise the next restore and daemon start will refuse",
+                aside.display(),
+                from.display()
+            )));
+        }
     }
     Ok(())
 }
