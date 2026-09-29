@@ -1,10 +1,11 @@
 //! CAD-771 slice 1: generic exact-destination send contract machinery.
 //!
-//! A read-only mirror of the versioned device publish wire contract pinned at
-//! `agenticos-stack/agenticos-v2` PR #214 @
-//! `12953144c50d13075af2323a2e09a70de9f72b87` (device-publish v1: discovery,
-//! `publish.send` grant, media import, preflight/execution pair, byte-exact
-//! status). This module is pure validation plus an in-memory fake ledger for
+//! A read-only mirror of the versioned device publish wire contract as
+//! LANDED in `agenticos-stack/agenticos-v2` staging at
+//! `3d6ced8581d637c39899e71c1187eae831759901` (PR #214 merge; revalidated
+//! 2026-09-29 — the contract paths are byte-identical to the reviewed
+//! head `12953144c50d13075af2323a2e09a70de9f72b87`, the only staging delta
+//! being the unrelated AOS-96 wake-barrier fix). This module is pure validation plus an in-memory fake ledger for
 //! adversarial tests. It performs no network, no custody and no live post.
 //!
 //! Conformance notes (pinned, do not drift without revalidation):
@@ -345,6 +346,12 @@ impl SendGrant {
                 "grant does not cover this exact destination/content",
             ));
         }
+        if self.max_uses == 0 || self.max_uses > 10 {
+            return Err(Refusal::new(
+                "grant_bounds",
+                "send grant bound is outside 1..=10 uses",
+            ));
+        }
         if self.remaining_uses == 0 {
             return Err(Refusal::new(
                 "grant_exhausted",
@@ -385,6 +392,10 @@ pub struct LedgerOutcome {
 
 /// In-memory fake of the upstream send ledger + provider. Deterministic,
 /// no network. Counts provider calls so tests prove "no second call".
+/// Dispatch stays closed until explicitly enabled — mirroring the landed
+/// `DEVICE_PUBLISH_SEND_ENABLED` default-off gate: a disabled execution
+/// validates everything, mutates nothing, calls no provider, and refuses
+/// with `send_disabled`. Preflight staging is unaffected.
 pub struct FakePublishLedger {
     inner: Mutex<FakeInner>,
 }
@@ -395,13 +406,29 @@ struct FakeInner {
     provider_calls: u64,
     /// Keys whose provider accepted but whose response was "lost".
     lost_response: HashMap<String, LedgerOutcome>,
+    /// Dispatch gate: closed until explicitly enabled (landed default-off).
+    send_enabled: bool,
 }
 
 impl FakePublishLedger {
+    /// Closed dispatch, mirroring the landed default-off gate.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FakeInner::default()),
         }
+    }
+
+    /// Test-only enablement: models operator-confirmed activation. The
+    /// production path has no send registration at all until AOS-94 is
+    /// revalidated and explicitly enabled.
+    pub fn enabled() -> Self {
+        let ledger = Self::new();
+        ledger.set_send_enabled(true);
+        ledger
+    }
+
+    pub fn set_send_enabled(&self, enabled: bool) {
+        self.inner.lock().unwrap().send_enabled = enabled;
     }
 
     pub fn provider_calls(&self) -> u64 {
@@ -452,6 +479,13 @@ impl FakePublishLedger {
         binding.validate()?;
         check_destination(binding, destination)?;
         grant.authorize(binding, credential_workspace, now_epoch)?;
+        if !self.inner.lock().unwrap().send_enabled {
+            // Default-off gate: validated everything, mutate nothing.
+            return Err(Refusal::new(
+                "send_disabled",
+                "send dispatch is not enabled",
+            ));
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some((recorded, outcome)) = inner.rows.get(&binding.key) {
             if recorded != binding {

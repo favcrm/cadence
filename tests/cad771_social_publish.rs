@@ -118,7 +118,7 @@ fn cad771_destination_is_selected_never_inferred_from_source() {
     // The source handle (@juicysuite_crm) and the pilot destination
     // (@sakeboyhk / 17841400008460056) are different roles. A binding that
     // names a source-derived destination never matches discovery.
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let mut binding = ig_binding("cad771-no-infer-01");
     binding.destination_id = "juicysuite_crm".into();
     let mut grant = grant_for(&binding);
@@ -139,7 +139,7 @@ fn cad771_destination_is_selected_never_inferred_from_source() {
 
 #[test]
 fn cad771_post_now_instagram_round_trip_with_replay() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-now-ig-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -184,7 +184,7 @@ fn cad771_post_now_instagram_round_trip_with_replay() {
 
 #[test]
 fn cad771_post_now_facebook_text_only_without_image() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = fb_text_binding("cad771-now-fb-01");
     let dest = fb_destination();
     let mut grant = grant_for(&binding);
@@ -205,7 +205,7 @@ fn cad771_post_now_facebook_text_only_without_image() {
 
 #[test]
 fn cad771_instagram_without_image_is_refused() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let mut binding = ig_binding("cad771-ig-noimg-01");
     binding.image_digest = None;
     let dest = ig_destination();
@@ -220,7 +220,7 @@ fn cad771_instagram_without_image_is_refused() {
 
 #[test]
 fn cad771_same_key_with_changed_content_or_destination_fails() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-keyfold-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -270,7 +270,7 @@ fn cad771_same_key_with_changed_content_or_destination_fails() {
 
 #[test]
 fn cad771_refusal_distinguishes_from_uncertain_and_calls_once() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-refuse-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -304,7 +304,7 @@ fn cad771_refusal_distinguishes_from_uncertain_and_calls_once() {
 
 #[test]
 fn cad771_lost_response_after_accept_reconciles_without_second_call() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-lost-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -339,7 +339,7 @@ fn cad771_lost_response_after_accept_reconciles_without_second_call() {
 fn cad771_agent_caller_cannot_broaden_destination() {
     // An agent holding the key but not the grant's exact binding cannot
     // redirect the send to another account.
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-agent-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -366,7 +366,7 @@ fn cad771_agent_caller_cannot_broaden_destination() {
 fn cad771_detached_child_cannot_submit_send() {
     // A detached child replays the key with a substituted caption digest;
     // the ledger's key-folding refuses without a provider call.
-    let ledger = Arc::new(FakePublishLedger::new());
+    let ledger = Arc::new(FakePublishLedger::enabled());
     let binding = ig_binding("cad771-detached-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -401,7 +401,7 @@ fn cad771_detached_child_cannot_submit_send() {
 
 #[test]
 fn cad771_concurrent_same_key_claims_provider_once() {
-    let ledger = Arc::new(FakePublishLedger::new());
+    let ledger = Arc::new(FakePublishLedger::enabled());
     let binding = ig_binding("cad771-concurrent-01");
     let results = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -433,7 +433,7 @@ fn cad771_concurrent_same_key_claims_provider_once() {
 
 #[test]
 fn cad771_forged_workspace_account_approval_fields_refused() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-forged-01");
     let dest = ig_destination();
     // Forged grant id: server-side lookup is the source of truth, so a
@@ -487,7 +487,7 @@ fn cad771_forged_workspace_account_approval_fields_refused() {
 
 #[test]
 fn cad771_rebind_revoke_context_change_invalidates_pending_authority() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-revoke-01");
     let mut dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -540,7 +540,7 @@ fn cad771_rebind_revoke_context_change_invalidates_pending_authority() {
 
 #[test]
 fn cad771_cross_workspace_and_cross_account_blocked() {
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-cross-01");
     let dest = ig_destination();
     // Same key material in another workspace: the credential binds
@@ -609,7 +609,7 @@ fn cad771_stale_run_and_receipt_mismatch_block_send() {
 fn cad771_schedule_cancel_and_due_replay_without_duplicate() {
     // Slice-2 durability shape: queue, cancel before dispatch, and
     // due-time/restart replay reusing the same stable key.
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let binding = ig_binding("cad771-sched-01");
     let dest = ig_destination();
     let mut grant = grant_for(&binding);
@@ -714,7 +714,7 @@ fn cad771_http_peer_parity_with_native_boundary() {
     worker.join().unwrap();
     // The forged HTTP field never reaches a provider call: the fake ledger
     // refuses the same binding natively with zero provider calls.
-    let ledger = FakePublishLedger::new();
+    let ledger = FakePublishLedger::enabled();
     let mut grant = grant_for(&native_forged);
     let err = ledger
         .execute(
@@ -727,5 +727,73 @@ fn cad771_http_peer_parity_with_native_boundary() {
         )
         .unwrap_err();
     assert_eq!(err.code, "wrong_destination");
+    assert_eq!(ledger.provider_calls(), 0);
+}
+
+#[test]
+fn cad771_send_dispatch_stays_closed_until_enabled() {
+    // Landed default-off gate: a disabled execution validates everything,
+    // mutates nothing, calls no provider. Preflight staging is unaffected.
+    use cadence_agent::platform::agenticos_external::publish::FakePublishLedger;
+    let ledger = FakePublishLedger::new();
+    let binding = ig_binding("cad771-gated-01");
+    let dest = ig_destination();
+    let mut grant = grant_for(&binding);
+    assert!(!ledger
+        .preflight(&binding, &dest, &grant, "ws_harbour", NOW)
+        .unwrap());
+    let err = ledger
+        .execute(
+            &binding,
+            &dest,
+            &mut grant,
+            "ws_harbour",
+            NOW,
+            FakeProviderBehavior::Post,
+        )
+        .unwrap_err();
+    assert_eq!(err.code, "send_disabled");
+    assert_eq!(ledger.provider_calls(), 0);
+    assert_eq!(grant.remaining_uses, 3);
+    assert!(ledger.status(&binding.key).is_err());
+    // Test-only enablement models operator-confirmed activation.
+    ledger.set_send_enabled(true);
+    let outcome = ledger
+        .execute(
+            &binding,
+            &dest,
+            &mut grant,
+            "ws_harbour",
+            NOW,
+            FakeProviderBehavior::Post,
+        )
+        .unwrap();
+    assert_eq!(outcome.state, PublishState::Posted);
+    assert_eq!(ledger.provider_calls(), 1);
+}
+
+#[test]
+fn cad771_grant_bounds_reject_out_of_range_uses() {
+    // Landed bound: maxUses is 1..=10. A forged grant outside it refuses
+    // before any provider call.
+    use cadence_agent::platform::agenticos_external::publish::FakePublishLedger;
+    let ledger = FakePublishLedger::enabled();
+    let binding = ig_binding("cad771-bounds-01");
+    let dest = ig_destination();
+    for uses in [0, 11, 99] {
+        let mut grant = grant_for(&binding);
+        grant.max_uses = uses;
+        let err = ledger
+            .execute(
+                &binding,
+                &dest,
+                &mut grant,
+                "ws_harbour",
+                NOW,
+                FakeProviderBehavior::Post,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "grant_bounds", "{uses}");
+    }
     assert_eq!(ledger.provider_calls(), 0);
 }

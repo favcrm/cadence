@@ -117,7 +117,7 @@ impl FakeDoor {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap().to_string();
         let grants = Arc::new(Mutex::new(GrantAuthority::default()));
-        let ledger = Arc::new(FakePublishLedger::new());
+        let ledger = Arc::new(FakePublishLedger::enabled());
         let calls = Arc::new(Mutex::new(0u64));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_grants = Arc::clone(&grants);
