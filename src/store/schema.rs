@@ -753,6 +753,14 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 29 {
+            // CAD-771: durable scheduled external-post intents. New table
+            // only; existing rows and code paths are untouched.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::social_publish::SCHEMA)?;
+            tx.execute("UPDATE schema_version SET version=29", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

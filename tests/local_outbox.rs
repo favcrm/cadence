@@ -1207,6 +1207,7 @@ fn decided_at_restart_never_refires() {
             agent_gc: Some(daemon::AgentGcSetting::default()),
             stop: Some(stop.clone()),
             effect_execute_gate: Some(Arc::new(move |_| !crash.load(Ordering::SeqCst))),
+            social_publish_sender: None,
             ..Default::default()
         };
         local::register_at(&state, &mut opts, outbox.clone(), BOARD.to_string());
