@@ -92,6 +92,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -341,6 +342,15 @@ pub struct Shared {
     started_at: f64,
     /// Stall screen-sample seconds for this daemon (0 = unset).
     stall_sample_secs: Arc<AtomicU64>,
+    /// Stall-watch logic-time offset in seconds, added to wall `Instant`s
+    /// at every accrual site (slice 2 of CAD-809). `0` is the wall clock;
+    /// tests advance a running daemon past budgets without wall sleeps.
+    /// Shared so the test holds the handle after start. Never set
+    /// outside tests — production timing stays wall.
+    stall_clock_offset: Arc<AtomicI64>,
+    /// Stall-watch loop pacing — resolved `STALL_TICK` (2s) unless a test
+    /// runs the loop hot while the offset provides elapsed time.
+    stall_tick: Duration,
     /// This run's instance id — recorded at start and stamped on the
     /// shutdown marker, so the next daemon can prove a marker belongs
     /// to the immediately preceding run (CAD-89).
@@ -571,6 +581,8 @@ impl Shared {
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
+            stall_clock_offset: Arc::clone(&opts.stall_clock_offset),
+            stall_tick: opts.stall_tick.unwrap_or(watch::STALL_TICK),
             instance,
             slots: Mutex::new(slots),
             slot_clock,
@@ -3878,6 +3890,12 @@ pub struct ServeOptions {
     /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
     /// an in-process test can shrink it after start.
     pub stall_sample_secs: Arc<AtomicU64>,
+    /// Stall-watch logic-time offset in seconds (`0` = wall clock).
+    /// Tests advance a running daemon's budgets; production never sets it.
+    pub stall_clock_offset: Arc<AtomicI64>,
+    /// Stall-watch loop pacing (`None` = 2s tick); tests run it hot
+    /// while the offset provides elapsed time.
+    pub stall_tick: Option<Duration>,
     /// CAD-113 slot configuration: `Some` is verbatim (tests);
     /// `None` resolves `[host]` in pm.yaml, falling back to defaults.
     pub slots: Option<SlotConfig>,
@@ -4412,6 +4430,24 @@ mod pty_retry_tests {
         assert_eq!(gate_backoff(one, u32::MAX), Duration::from_secs(6));
         let floor = Duration::from_millis(100);
         assert_eq!(gate_backoff(floor, 9), Duration::from_millis(600));
+    }
+}
+
+#[cfg(test)]
+mod stall_clock_tests {
+    use super::*;
+
+    #[test]
+    fn stall_clock_offset_defaults_to_wall() {
+        // Production-unreachable proof, part 1: a default-constructed
+        // daemon carries a zero offset (wall clock) and no tick override.
+        let opts = ServeOptions::default();
+        assert_eq!(
+            opts.stall_clock_offset.load(Ordering::SeqCst),
+            0,
+            "default offset must be wall"
+        );
+        assert_eq!(opts.stall_tick, None, "default tick must be unset");
     }
 }
 

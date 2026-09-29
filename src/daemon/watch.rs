@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 
 /// Stall watch cadence — `silent_secs` stays live without a store read
 /// per agent becoming pressure.
-const STALL_TICK: Duration = Duration::from_secs(2);
+pub(super) const STALL_TICK: Duration = Duration::from_secs(2);
 
 /// Provider WAL watch cadence — at the ~2 MiB/s a runaway devin WAL
 /// wrote, a one-minute tick bounds overshoot past `wal_max_bytes` to
@@ -202,7 +202,9 @@ impl StallWatch {
     /// Decide the running turn's stall episode at `now`. The caller applies
     /// the returned event after releasing the watch lock.
     fn stall_transition(&mut self, running: bool, budget: u64, now: Instant) -> StallTransition {
-        let silent = now.duration_since(self.activity);
+        // Saturating: a moved-back test clock can never panic a comparison;
+        // at zero offset this equals `duration_since` exactly.
+        let silent = now.saturating_duration_since(self.activity);
         if !running {
             StallTransition::Emit
         } else if let Some(stalled_at) = self.stalled_at {
@@ -298,6 +300,19 @@ impl StallView {
 impl Shared {
     // ---- Stall watch: report silent turns, never touch them (CAD-52) ----
 
+    /// Stall-watch logic now: wall clock plus the test offset (`0` in
+    /// production). Every accrual stamp and comparison reads through
+    /// here so tests advance budgets without wall sleeps; saturating
+    /// arithmetic means a moved-back clock can never panic a comparison.
+    fn stall_now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(
+                self.stall_clock_offset
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .max(0) as u64,
+            )
+    }
+
     /// Sample owned agents on a slow cadence until shutdown. The stall
     /// watch itself only ever emits events and notices — it never
     /// interrupts, re-dispatches or fences anything it observes. The
@@ -362,7 +377,7 @@ impl Shared {
                 self.reconcile_tick();
                 reconcile_at = Some(Instant::now());
             }
-            std::thread::sleep(STALL_TICK);
+            std::thread::sleep(self.stall_tick);
         }
     }
 
@@ -599,7 +614,7 @@ impl Shared {
                 .values()
                 .any(|req| req.alias == alias);
         if pending_req {
-            w.activity = Instant::now();
+            w.activity = self.stall_now();
         }
         // The adapter's own clock when it keeps one — managed
         // transcripts stamp every provider notification.
@@ -670,7 +685,7 @@ impl Shared {
                     if probe.idle {
                         w.idle_samples = w.idle_samples.saturating_add(1);
                         if w.idle_since.is_none() {
-                            w.idle_since = Some(Instant::now());
+                            w.idle_since = Some(self.stall_now());
                         }
                     } else {
                         w.idle_samples = 0;
@@ -697,14 +712,16 @@ impl Shared {
                 // Queued-head tracking is menu detection only — screen
                 // churn measures a turn's activity after it starts.
                 if running.is_some() {
-                    w.observe_screen(hash, probe.approval_menu, Instant::now());
+                    w.observe_screen(hash, probe.approval_menu, self.stall_now());
                 }
                 w.last_probe = Some(probe);
-                w.sample_at = Some(Instant::now());
+                w.sample_at = Some(self.stall_now());
             }
             if w.sample_rx.is_none()
-                && w.sample_at
-                    .is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs))
+                && w.sample_at.is_none_or(|at| {
+                    self.stall_now().saturating_duration_since(at)
+                        >= screen_sample(&self.stall_sample_secs)
+                })
             {
                 if let Some(ad) = ad {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -732,20 +749,28 @@ impl Shared {
                 && !pending_req
                 && w.menu_line.is_none()
                 && w.idle_samples >= 3
-                && w.idle_since
-                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(end_budget))
+                && w.idle_since.is_some_and(|t| {
+                    self.stall_now().saturating_duration_since(t) >= Duration::from_secs(end_budget)
+                })
             {
                 w.silent_end_sent = true;
                 if let Some(p) = w.last_probe.clone() {
-                    let age = w.idle_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                    let last_activity = epoch_secs() - w.activity.elapsed().as_secs_f64();
+                    let age = w
+                        .idle_since
+                        .map(|t| self.stall_now().saturating_duration_since(t).as_secs())
+                        .unwrap_or(0);
+                    let last_activity = epoch_secs()
+                        - self
+                            .stall_now()
+                            .saturating_duration_since(w.activity)
+                            .as_secs_f64();
                     end_fire = Some((age, last_activity, p));
                 }
             }
         }
         // Everything the lock decided, applied after it's dropped —
         // event writes take the store mutex and never run under `w`.
-        let after = w.stall_transition(running.is_some(), budget, Instant::now());
+        let after = w.stall_transition(running.is_some(), budget, self.stall_now());
         drop(w);
         if let Some(line) = menu_rise {
             self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
@@ -764,9 +789,12 @@ impl Shared {
             self.delivery_stalled_fired(&agent, tracked.as_ref(), &msg_id, queued_secs, &probe);
         }
         match after {
-            StallTransition::Resume(at, episode) => {
-                self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
-            }
+            StallTransition::Resume(at, episode) => self.stall_resumed(
+                &agent,
+                running.as_ref().unwrap(),
+                self.stall_now().saturating_duration_since(at),
+                episode,
+            ),
             StallTransition::Stall(episode, silent) => {
                 self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
             }
@@ -1166,10 +1194,15 @@ impl Shared {
         };
         if w.message.as_deref() == Some(running.id.as_str()) {
             return Some(StallView {
-                silent_secs: w.activity.elapsed().as_secs(),
+                silent_secs: self
+                    .stall_now()
+                    .saturating_duration_since(w.activity)
+                    .as_secs(),
                 stalled: w.stalled_at.is_some(),
                 menu: w.menu_line.clone(),
-                ended_secs: w.idle_since.map(|t| t.elapsed().as_secs()),
+                ended_secs: w
+                    .idle_since
+                    .map(|t| self.stall_now().saturating_duration_since(t).as_secs()),
                 silent_ended: w.silent_end_sent,
                 delivery_stalled: None,
             });
