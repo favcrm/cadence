@@ -206,6 +206,13 @@ jobs:
             if ! git show "$BASE_SHA:scripts/ci-rust-tests.py" > "$runner"; then
               cp scripts/ci-rust-tests.py "$runner"
             fi
+            # Shard partitioning needs runner support: a base predating
+            # --partition gets the head runner (plans stay schema-1,
+            # which the runner validates — a mismatch fails loud, never
+            # silently runs the wrong scope).
+            if ! grep -q -- "\-\-partition" "$runner"; then
+              cp scripts/ci-rust-tests.py "$runner"
+            fi
           else
             cp scripts/ci-rust-tests.py "$runner"
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
