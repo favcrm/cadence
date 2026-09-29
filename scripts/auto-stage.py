@@ -414,19 +414,29 @@ def read_json(path):
         return {}
 
 
+def gate_outcome(value):
+    """Translate Actions step outcomes to the receipt's gate vocabulary.
+
+    Unknown outcomes remain unknown so staging_receipt fails closed while
+    still writing a useful failure receipt.
+    """
+    return {"success": "pass", "failure": "fail", "skipped": "skip"}.get(value, value)
+
+
 def cmd_staging_receipt(args):
     candidate = read_json(args.candidate_json)
     baseline = read_json(args.baseline_json)
     if args.expected_digest:
         try:
             check_digest_pin(candidate, args.expected_digest)
-            digest_gate = args.digest_recheck
+            digest_gate = gate_outcome(args.digest_recheck)
         except ValueError as error:
             print(f"auto-stage: {error}", file=sys.stderr)
             digest_gate = "fail"
     else:
-        digest_gate = args.digest_recheck
-    gates = {"mvp_journey": args.mvp, "migration_rehearsal": args.rehearsal,
+        digest_gate = gate_outcome(args.digest_recheck)
+    gates = {"mvp_journey": gate_outcome(args.mvp),
+             "migration_rehearsal": gate_outcome(args.rehearsal),
              "digest_recheck": digest_gate}
     try:
         supersedes = json.loads(args.supersedes_json) if args.supersedes_json else []
@@ -460,9 +470,9 @@ def main(argv=None):
     receipt.add_argument("--staging-run-attempt", type=int, required=True)
     receipt.add_argument("--candidate-json", required=True)
     receipt.add_argument("--baseline-json", required=True)
-    receipt.add_argument("--mvp", choices=("pass", "fail", "skip"), required=True)
-    receipt.add_argument("--rehearsal", choices=("pass", "fail", "skip"), required=True)
-    receipt.add_argument("--digest-recheck", choices=("pass", "fail", "skip"), required=True)
+    receipt.add_argument("--mvp", required=True)
+    receipt.add_argument("--rehearsal", required=True)
+    receipt.add_argument("--digest-recheck", required=True)
     receipt.add_argument("--expected-digest", default="")
     receipt.add_argument("--supersedes-json", default="")
     receipt.add_argument("--run-head-sha", default="")
