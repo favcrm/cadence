@@ -1036,6 +1036,10 @@ tests = [
     "merged_delivery_marks_done_and_wakes_the_dependent_once",
     "master_wake_waits_queued_while_the_master_is_stopped",
     "delivery_observe_stale_read_never_rewinds_a_passed_review",
+    "cad776_observe_queues_one_merge_ready_wake_per_readiness_streak",
+    "cad776_agent_detached_and_forged_observe_cannot_wake",
+    "cad776_concurrent_observe_wakes_once",
+    "cad776_merge_ready_wake_grants_no_merge_authority",
 ]
 helpers = [
     "daemon_methods",
