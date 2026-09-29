@@ -92,6 +92,31 @@ CREATE TABLE IF NOT EXISTS app_audience_freezes(
  member_ids TEXT NOT NULL, digest TEXT NOT NULL,
  max_recipients INTEGER NOT NULL, pins TEXT NOT NULL,
  created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id));
+CREATE TABLE IF NOT EXISTS app_content_docs(
+ context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ approval_revision INTEGER, approval_digest TEXT,
+ actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, campaign_id));
+CREATE TABLE IF NOT EXISTS app_content_revisions(
+ context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
+ proposal_id TEXT, at REAL NOT NULL,
+ PRIMARY KEY(context_id, campaign_id, revision));
+CREATE TABLE IF NOT EXISTS app_content_proposals(
+ context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
+ campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+ subject TEXT NOT NULL, preheader TEXT NOT NULL,
+ blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+ actor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+ created REAL NOT NULL, decided REAL,
+ PRIMARY KEY(context_id, proposal_id));
+CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id);
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -391,6 +416,38 @@ impl RecordStore {
                  member_ids TEXT NOT NULL, digest TEXT NOT NULL,
                  max_recipients INTEGER NOT NULL, pins TEXT NOT NULL,
                  created REAL NOT NULL, PRIMARY KEY(context_id, freeze_id))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-782 versioned email content: docs, immutable
+            // revisions and assistant proposals. Idempotent forward
+            // migration like the audience tables above; the version
+            // stays 1 and older files gain empty tables.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_content_docs(
+                 context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 approval_revision INTEGER, approval_digest TEXT,
+                 actor TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, campaign_id));
+                 CREATE TABLE IF NOT EXISTS app_content_revisions(
+                 context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
+                 proposal_id TEXT, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, campaign_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_content_proposals(
+                 context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
+                 campaign_id TEXT NOT NULL, source_revision INTEGER NOT NULL CHECK(source_revision>=0),
+                 subject TEXT NOT NULL, preheader TEXT NOT NULL,
+                 blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
+                 actor TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','applied','discarded')),
+                 created REAL NOT NULL, decided REAL,
+                 PRIMARY KEY(context_id, proposal_id));
+                 CREATE INDEX IF NOT EXISTS app_content_proposals_campaign ON app_content_proposals(context_id,campaign_id)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
         }
