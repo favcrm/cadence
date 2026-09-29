@@ -233,6 +233,11 @@ export default function PublishPanel({
           </strong>
           . Never inferred from a source handle.
         </p>
+        <p className="wa-kicker">
+          Landed contract: send grants allow 1–10 uses · dispatch stays
+          closed (send_disabled) until the operator enables it · scheduling
+          freezes the intent, never sends.
+        </p>
         {!grantReady && (
           <p className="wa-alert">
             No publish grant is bound. Connect the destination and bind a send

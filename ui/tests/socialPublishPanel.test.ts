@@ -52,6 +52,7 @@ async function render(props: any) {
 async function main() {
   await render({});
   assert(text().includes("No publish grant") && text().includes("No approved drafts"), "Missing grant and drafts render honest empty states");
+  assert(text().includes("1–10 uses") && text().includes("send_disabled"), "Grant-use range and disabled gate are always visible");
   assert(!button("Post now"), "No send action without a candidate");
   await render({ candidates: [candidate] });
   assert(text().includes("No publish grant"), "Grant gate holds with a candidate present");
