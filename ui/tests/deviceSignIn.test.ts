@@ -70,6 +70,11 @@ equal(
   true,
   "subject-not-allowed message passes through",
 );
+equal(
+  describeRefusal(new ApiError("x", 502, { code: "device_verification_failed" })),
+  "The issuer could not confirm the approval — start again.",
+  "verification failure is its own message",
+);
 equal(describeRefusal(new ApiError("x", 403, { check: "session_from_agent" })).includes("agent"), true, "agent refusal");
 equal(describeRefusal(new ApiError("x", 502, { code: "issuer_unavailable" })).includes("issuer"), true, "issuer down");
 equal(describeRefusal(new ApiError("x", 429, {})).includes("Too many"), true, "429");

@@ -207,7 +207,12 @@ impl Shared {
             &crate::device_login::UreqTransport::new(),
             &config,
             token,
-        )?;
+        )
+        // A failed live verification is not a caller refusal — the
+        // HTTP layer maps this code to 502. The inner messages are
+        // fixed strings carrying no issuer content
+        // (`refusals_carry_no_issuer_content`).
+        .map_err(|e| Error::invalid("device_verification_failed", e.to_string()))?;
         // The allowlist is the operator's gate (review of #541): a
         // verified workspace member who is not on it gets no session.
         // The refusal echoes the subject id — ids aren't credentials,

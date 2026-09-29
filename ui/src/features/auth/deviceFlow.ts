@@ -48,6 +48,9 @@ export function describeRefusal(err: unknown): string {
     if (err.check === "session_from_agent" || err.code === "session_from_agent") {
       return "Sign-in refused: this request came from an agent — open the board in your own browser.";
     }
+    if (err.code === "device_verification_failed") {
+      return "The issuer could not confirm the approval — start again.";
+    }
     if (err.code === "issuer_unavailable" || err.status === 502) {
       return "The issuer could not be reached or refused the request — try again in a moment.";
     }

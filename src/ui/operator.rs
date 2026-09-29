@@ -1531,24 +1531,17 @@ pub(super) fn device_poll(
         Ok(crate::device_login::Poll::Denied) => super::json_response(json!({"status": "denied"})),
         Ok(crate::device_login::Poll::Gone) => super::json_response(json!({"status": "expired"})),
         Ok(crate::device_login::Poll::Approved { token, .. }) => {
-            // Fail fast on a bad grant before the daemon call; the
-            // daemon re-verifies against its own pinned trust root
-            // and is the only authority that mints.
-            if crate::device_login::verify_session(&*login.transport, &login.config, &token)
-                .is_err()
-            {
-                return coded_response(
-                    502,
-                    "issuer_unavailable",
-                    "the issuer rejected the approved credential",
-                    None,
-                );
-            }
+            // The daemon is the single live verification: it re-checks
+            // the bearer against its pinned trust root at mint time, so
+            // no second issuer call happens here — the device code is
+            // already consumed and a transient failure would strand an
+            // approved grant for nothing (review r5).
             // `rpc_answer` keeps the two failures apart (CAD-384): the
             // outer Err is transport — no daemon at the socket — and
             // the inner one is the daemon's own refusal, which the
             // browser reads as a sign-in refusal (403), never a
-            // retryable outage.
+            // retryable outage. A failed live verification is the
+            // issuer's answer, not a refusal — 502.
             let opened = client::rpc_answer(
                 state_dir,
                 "operator_session_open_device",
@@ -1566,12 +1559,12 @@ pub(super) fn device_poll(
                     return coded_response(503, "daemon_unavailable", &e.to_string(), None);
                 }
                 Ok(Err(e)) => {
-                    return coded_response(
-                        403,
-                        e.code().unwrap_or("device_sign_in_refused"),
-                        &e.to_string(),
-                        None,
-                    );
+                    let (status, code) = if e.code() == Some("device_verification_failed") {
+                        (502, "device_verification_failed")
+                    } else {
+                        (403, e.code().unwrap_or("device_sign_in_refused"))
+                    };
+                    return coded_response(status, code, &e.to_string(), None);
                 }
                 Ok(Ok(v)) => v,
             };

@@ -1164,7 +1164,7 @@ mod device {
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
-        let (issuer, _stub) = device_stub("approve");
+        let (issuer, stub) = device_stub("approve");
         let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
         let host = op::board_host(port);
 
@@ -1224,6 +1224,15 @@ mod device {
         let meta: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(meta["signed_in"], json!(true), "{body}");
         assert_eq!(meta["actor"], json!("operator (ui)"), "{body}");
+
+        // The daemon is the single live verifier: one approved grant =
+        // exactly ONE `/v1/runtime/session` hit (review r5 — the board
+        // must not double-verify after the code is consumed).
+        assert_eq!(
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the grant was verified more than once"
+        );
 
         // The session is live: ending it answers 204.
         let (code, _, _) = op::raw(
