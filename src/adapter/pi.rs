@@ -59,9 +59,10 @@
 //!   policy grants its worktree, the repo's shared git dir, the
 //!   effective/shared target dirs, the declared cargo + sccache
 //!   caches, the PM tracker and its own dir under the state dir —
-//!   reads the toolchain and system trees, and denies `$HOME` secrets
-//!   (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
-//!   `credentials.toml`), every other agent's dir and the daemon store
+//!   reads the toolchain and system trees, the single Devin
+//!   provider-auth file (CAD-751), and denies every other `$HOME`
+//!   secret (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
+//!   cargo `credentials.toml`, `~/.local/share` itself), every other agent's dir and the daemon store
 //!   by omission. `TMPDIR` is redirected into the worker dir (a shared
 //!   `/tmp` grant would expose every lane, and a denied one makes
 //!   rustc retry for ~1s) and `GIT_CONFIG_GLOBAL` at the worker's own
@@ -752,9 +753,12 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   push` over ssh + agent works while the keys themselves stay
 ///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
 ///   an unreadable config (proven), and this file carries the
-///   rustc-wrapper/source-mirror settings builds need. `credentials.
-///   toml` is never in the policy — it is the token file; the pinned
-///   `[pi].providers` package dirs the `-e` argv loads (CAD-559).
+///   rustc-wrapper/source-mirror settings builds need. Cargo's
+///   `credentials.toml` (registry tokens) is never in the policy;
+///   the Devin CLI login (`~/.local/share/devin/credentials.toml`)
+///   is the one deliberate exception — read-only, the single file,
+///   never its parents (CAD-751). The pinned `[pi].providers`
+///   package dirs the `-e` argv loads (CAD-559).
 /// - **denied** by omission: `$HOME` itself and everything under it
 ///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
 ///   agents' dirs under the state dir (`<state>/agents/<alias>` is the
@@ -889,6 +893,24 @@ pub fn pi_worker_confinement(
         read.push(home.join(".config/sccache"));
         read.push(home.join(".ssh/config"));
         read.push(home.join(".ssh/known_hosts"));
+        // CAD-751: the pinned pi-devin provider (0.2.1) derives its
+        // OAuth auth from the operator's Devin CLI login on EVERY
+        // turn — `readCredentials()` opens
+        // `$HOME/.local/share/devin/credentials.toml` via
+        // `os.homedir()`, ignoring `XDG_DATA_HOME` (on this host
+        // `XDG_DATA_HOME` is unset, so both conventions coincide) —
+        // and under Landlock that read EACCES'd, failing bootstrap
+        // and every dispatch with "OAuth auth derivation failed for
+        // devin". The grant is the single credential FILE,
+        // read-only: `~/.local/share`, `~/.local/share/devin` and
+        // every sibling stay denied, as do cargo registry tokens and
+        // every other login. A missing file is skipped by `cadence
+        // confine` (never widened to its parent), so a signed-out
+        // operator gets Pi's own not-signed-in error instead. The
+        // daemon never reads this file — the path is granted, the
+        // bytes stay inside the confined child — so no credential
+        // content can reach events, argv, task results or worktrees.
+        read.push(home.join(".local/share/devin/credentials.toml"));
     }
     // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
     // named explicitly so the write set shows it — it is inside the
