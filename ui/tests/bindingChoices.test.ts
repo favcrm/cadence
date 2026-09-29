@@ -231,3 +231,11 @@ equal(darkRows[0].nextAction, "Its connection is unhealthy — see Settings → 
 const revokedRows = readinessFor(installation(), [binding({ state: "revoked" })], all, null);
 equal(revokedRows[0].ready, false, "revoked binding is not ready");
 equal(revokedRows[0].nextAction, "Choose a publication connection below and save it.", "revoke rebind action");
+// A deregistered provider adapter never reads Ready, even bound and approved.
+const dereg = localConnection();
+dereg.status = { ...dereg.status, adapter_registered: false };
+const deregRows = readinessFor(installation(), [binding()], [dereg, sourceConnection()], null);
+equal(deregRows[0].health, "ok", "binding itself still resolves");
+equal(deregRows[0].registered, false, "registration reported");
+equal(deregRows[0].ready, false, "deregistered provider is not ready");
+equal(deregRows[0].nextAction, "Its connection's provider is no longer registered — see Settings → Connections, then rebind.", "registration action");

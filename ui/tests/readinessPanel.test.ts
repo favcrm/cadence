@@ -87,6 +87,12 @@ async function main() {
   assert(text().includes("health missing-connection"), "missing connection health named");
   assert(text().includes("choose another publication connection below"), "rebind action shown");
 
+  // Deregistered provider: bound, healthy custody, approved — still not Ready.
+  await render({ installation, bindings: [binding], connections: [{ ...connections[0], status: { ...connections[0].status, adapter_registered: false } }], contextId: null });
+  assert(text().includes("provider unregistered"), "registration state named");
+  assert(text().includes("no longer registered"), "registration action shown");
+  assert(text().includes("Needs you"), "deregistered slot needs you");
+
   // Legacy untyped slots never authorize an effect: no cms row.
   assert(!text().includes("cms readiness"), "legacy slot stays out of Ready-to-run");
   await React.act(async () => root.unmount());

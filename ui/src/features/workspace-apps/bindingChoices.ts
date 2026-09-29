@@ -149,6 +149,7 @@ export interface SlotReadiness {
   connection: Connection | undefined;
   health: BindingHealth;
   custody: boolean;
+  registered: boolean;
   approved: boolean;
   ready: boolean;
   nextAction: string;
@@ -179,7 +180,10 @@ export function readinessFor(
       const custody =
         connection?.status?.manifest_status === "matched" &&
         connection?.status?.custody_available === true;
-      const ready = approved && health === "ok" && custody;
+      // Candidate selection already requires a registered provider adapter;
+      // readiness must gate on it too, or a deregistered provider reads Ready.
+      const registered = connection?.status?.adapter_registered === true;
+      const ready = approved && health === "ok" && custody && registered;
       const nextAction = !binding || health === "not-configured"
         ? `Choose a ${slot.slot} connection below and save it.`
         : health === "stale-bundle"
@@ -188,7 +192,9 @@ export function readinessFor(
             ? `Its connection is gone — choose another ${slot.slot} connection below.`
             : !custody
               ? `Its connection is unhealthy — see Settings → Connections, then rebind.`
-              : !approved
+              : !registered
+                ? `Its connection's provider is no longer registered — see Settings → Connections, then rebind.`
+                : !approved
                 ? `Approve the app's current version before running.`
                 : `Ready to run.`;
       return {
@@ -198,6 +204,7 @@ export function readinessFor(
         connection,
         health,
         custody,
+        registered,
         approved,
         ready,
         nextAction,

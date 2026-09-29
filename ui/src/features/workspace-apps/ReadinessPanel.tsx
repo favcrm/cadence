@@ -50,7 +50,8 @@ export function ReadinessPanel({
               ? `${row.connection.provider}/${row.connection.account} (${row.connection.id})`
               : "none"}
             {row.binding ? ` · revision ${row.binding.revision}` : ""} · health{" "}
-            {row.health} · custody {row.custody ? "available" : "unavailable"} ·
+            {row.health} · custody {row.custody ? "available" : "unavailable"} · provider{" "}
+            {row.registered ? "registered" : "unregistered"} ·
             approval {row.approved ? "in force" : "required"}
           </p>
           {!row.ready && <p className="wa-muted">{row.nextAction}</p>}

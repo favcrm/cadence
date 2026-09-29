@@ -227,14 +227,15 @@ impl Store {
                 )?;
                 let mapped = stmt.query_map(params![app, install_id], |r| {
                     let raw: String = r.get(3)?;
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default(),
-                    ))
+                    let scopes: Vec<String> = serde_json::from_str(&raw)
+                        .map_err(|_| Error::internal("derived grant receipt is corrupt"))?;
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes))
                 })?;
-                mapped.flatten().collect()
+                let mut rows: Vec<(String, String, String, Vec<String>)> = Vec::new();
+                for row in mapped {
+                    rows.push(row?);
+                }
+                rows
             };
             if rows.is_empty() {
                 continue;
@@ -250,9 +251,14 @@ impl Store {
                     )?;
                     let mapped = stmt.query_map(params![agent, plat, account], |r| {
                         let raw: String = r.get(0)?;
-                        Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
+                        serde_json::from_str::<Vec<String>>(&raw)
+                            .map_err(|_| Error::internal("derived grant receipt is corrupt"))
                     })?;
-                    mapped.flatten().flatten().collect()
+                    let mut still: Vec<String> = Vec::new();
+                    for row in mapped {
+                        still.extend(row?);
+                    }
+                    still
                 };
                 let existing: Option<String> = tx
                     .query_row(
@@ -264,7 +270,8 @@ impl Store {
                 let Some(raw) = existing else {
                     continue;
                 };
-                let held: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                let held: Vec<String> = serde_json::from_str(&raw)
+                    .map_err(|_| Error::internal("platform grant receipt is corrupt"))?;
                 let kept: Vec<String> = held
                     .iter()
                     .filter(|s| !derived.contains(s) || still.contains(s))
@@ -312,7 +319,11 @@ impl Store {
             let mapped = stmt.query_map(params![platform_name, account], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
-            mapped.flatten().collect()
+            let mut rows: Vec<(String, String)> = Vec::new();
+            for row in mapped {
+                rows.push(row?);
+            }
+            rows
         };
         if rows.is_empty() {
             return Ok(());
@@ -545,11 +556,9 @@ impl Store {
                 "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
             ));
         }
-        if row["config"] == *config {
-            // Identical re-save: keep the revision, keep the approval.
-            tx.commit()?;
-            return Ok(json!({"binding": row}));
-        }
+        // CAD-692: every update bumps the revision and closes waiting
+        // effects, even an identical re-save. CAD-796 withdraws the
+        // installation approval only when the covered material changed.
         let material_changed = !binding_material_same(&row["config"], config);
         let slot = row["slot"]
             .as_str()
