@@ -10,9 +10,8 @@
 //! identity-shaped (`by`, `actor`), discovery-link (`project`,
 //! `project_link`) and routing (`workspace`) fields are unsupported
 //! and refused. File paths and SQL never leave this handler: callers
-//! name installations, contexts and records only. There is no HTTP
-//! peer in this slice; no HTTP route exposes these methods (the
-//! board peer is follow-up CAD-753-F1; backup/export coverage is
+//! name installations, contexts and records only. The board peer is
+//! CAD-768 (`src/ui/app_records.rs`); backup/export coverage is
 //! follow-up CAD-753-F2).
 use super::*;
 use crate::issue::app_catalog::workspace;
