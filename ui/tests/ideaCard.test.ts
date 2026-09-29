@@ -84,16 +84,40 @@ async function main() {
     equal(refusal?.message.includes("operator"), true, "with the server's reason");
   }
 
-  // Filing: a report carries its intake tags and description in one call.
+  // Filing: a report goes through the intake endpoint — kind plus the
+  // board filed from, never bare tags. Routing is the server's.
   {
-    const calls = stubFetch(201, { issue: {}, card: {} });
-    await api.create({ project: "demo", title: "Dark mode", priority: "P3", tags: ["intake", "idea"], body: "Dark mode\n\nWhy it matters" });
-    equal(calls[0].url, "/api/issues", "create url");
+    const calls = stubFetch(201, { issue: {}, card: {}, report: {} });
+    await api.report({ kind: "idea", project: "demo", title: "Dark mode", priority: "P3", body: "Why it matters" });
+    equal(calls[0].url, "/api/reports", "report url");
+    equal(calls[0].init.method, "POST", "POST");
     equal(
       JSON.parse(String(calls[0].init.body)),
-      { project: "demo", title: "Dark mode", priority: "P3", tags: ["intake", "idea"], body: "Dark mode\n\nWhy it matters" },
-      "report tags and body",
+      { kind: "idea", project: "demo", title: "Dark mode", priority: "P3", body: "Why it matters" },
+      "report kind, board, title and body",
     );
+  }
+
+  // Decisions carry what they were made against: the idea binds its
+  // shown rev, the merge its shown head; decline states its reason.
+  {
+    let calls = stubFetch(200, { decision: { action: "approve" } });
+    await api.ideaDecide("D-9", "approve", { expect_rev: "fnv1a:abc" });
+    equal(
+      JSON.parse(String(calls[0].init.body)),
+      { action: "approve", expect_rev: "fnv1a:abc" },
+      "idea binds its shown rev",
+    );
+
+    calls = stubFetch(200, { state: "enqueued" });
+    await api.mergeDelivery("D-2", "c".repeat(40));
+    equal(calls[0].url, "/api/delivery/D-2/merge", "merge url");
+    equal(JSON.parse(String(calls[0].init.body)), { sha: "c".repeat(40) }, "merge binds its shown head");
+
+    calls = stubFetch(200, { state: "declined" });
+    await api.declineDelivery("D-2", "not now");
+    equal(calls[0].url, "/api/delivery/D-2/decline", "decline url");
+    equal(JSON.parse(String(calls[0].init.body)), { reason: "not now" }, "decline states its reason");
   }
   console.log("idea card checks passed");
 }

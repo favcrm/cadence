@@ -4456,3 +4456,104 @@ fn cad776_merge_ready_wake_grants_no_merge_authority() {
     assert!(r.is_err(), "{r:?}");
     assert!(r.unwrap_err().to_string().contains("not ready to merge"));
 }
+
+/// CAD-140: the board's Merge carries the head its card showed. A head
+/// that moved since refuses 409 `head_moved` before any `gh` merge
+/// runs — the record is untouched and still passed; the shown head
+/// enqueues pinned to itself.
+#[test]
+fn board_merge_binds_its_shown_head() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    assert_eq!(
+        lf.needs("merge_decision").len(),
+        1,
+        "{:#?}",
+        lf.f.needs_me()
+    );
+
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(lf.gh_dir.join("gh")),
+    );
+    let op = sign_in(&lf.f.d.state, port);
+    let merge = |body: &str| {
+        board_http(
+            port,
+            &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), body),
+        )
+    };
+    // The head moved since the card was shown: 409, nothing merged.
+    let wrong = "0".repeat(40);
+    let (status, reply) = merge(&format!(r#"{{"sha":"{wrong}"}}"#));
+    assert_eq!(status, 409, "{reply}");
+    assert!(reply.contains("head_moved"), "{reply}");
+    assert!(
+        !lf.gh_log().contains("pr merge 7 -R"),
+        "a refused merge ran gh: {}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    // The shown head enqueues, pinned to itself.
+    let (status, reply) = merge(&format!(r#"{{"sha":"{a}"}}"#));
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.contains("enqueued"), "{reply}");
+    assert!(
+        lf.gh_log().contains(&format!("--match-head-commit {a}")),
+        "{}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["state"], "enqueued", "{}", lf.rec());
+}
+
+/// CAD-140: the board's Decline states its reason — without one the
+/// call refuses, with one the loop stands down as declined.
+#[test]
+fn board_decline_states_its_reason() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    lf.set_gh(&a, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(lf.gh_dir.join("gh")),
+    );
+    let op = sign_in(&lf.f.d.state, port);
+    let decline = |body: &str| {
+        board_http(
+            port,
+            &cad328_post(port, "/api/delivery/D-2/decline", &op_guards(&op), body),
+        )
+    };
+    let (status, reply) = decline("{}");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("reason_required"), "{reply}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let (status, reply) = decline(r#"{"reason":"not this sprint"}"#);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(lf.rec()["state"], "declined", "{}", lf.rec());
+    assert!(
+        lf.needs("merge_decision").is_empty(),
+        "{:#?}",
+        lf.f.needs_me()
+    );
+}

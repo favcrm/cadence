@@ -958,7 +958,22 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
 /// then the operator's own `gh` enqueues it in the merge queue pinned
 /// to the reviewed head, and the daemon records it. A refused check
 /// runs no `gh` merge at all.
-pub fn merge(state_dir: &Path, issue: &str, gh_bin: &str) -> Result<Value> {
+/// Twelve hex chars — enough to name a head in an error line.
+fn short(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
+/// CAD-140: `expect_sha` is the head the operator approved against
+/// (the board sends what its card showed). After the fresh sync+check,
+/// a mismatch refuses the merge — the head moved since it was shown.
+/// The queue's `--match-head-commit` pin below stays the atomic
+/// backstop; `None` keeps the CLI's behaviour (merge the live head).
+pub fn merge(
+    state_dir: &Path,
+    issue: &str,
+    gh_bin: &str,
+    expect_sha: Option<&str>,
+) -> Result<Value> {
     // The check runs first: an agent is refused before anything else,
     // the sync included.
     crate::client::rpc(
@@ -978,6 +993,18 @@ pub fn merge(state_dir: &Path, issue: &str, gh_bin: &str) -> Result<Value> {
         json!({"issue": issue, "phase": "check"}),
     )?;
     let sha = check["sha"].as_str().unwrap_or_default().to_string();
+    if let Some(want) = expect_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        if want != sha {
+            return Err(Error::invalid(
+                "head_moved",
+                format!(
+                    "{issue}: the PR head moved since it was shown (shown {}, now {}) — re-review before merging",
+                    short(want),
+                    short(&sha),
+                ),
+            ));
+        }
+    }
     let url = check["pr"].as_str().unwrap_or_default();
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
     gh(

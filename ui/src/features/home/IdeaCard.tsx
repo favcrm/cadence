@@ -44,8 +44,11 @@ export default function IdeaCard({
     const body = decided.body;
     setBusy(action);
     setError(null);
+    // CAD-140: bind the decision to the plan shown — the card read
+    // this rev; a moved issue refuses with 409 `stale_view`.
+    const rev = detail?.rev;
     api
-      .ideaDecide(issue, action, body)
+      .ideaDecide(issue, action, rev ? { ...body, expect_rev: rev } : body)
       .then((out) => {
         setMode(null);
         setReason("");

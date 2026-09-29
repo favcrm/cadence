@@ -229,16 +229,27 @@ function NewIssueForm({
     pending.current = true;
     setError(null);
     setBusy(true);
-    const report = kind !== "task";
-    const body = details.trim() ? `${t}\n\n${details.trim()}` : undefined;
-    api
-      .create({
-        project: projectKey,
-        title: t,
-        priority,
-        ...(report ? { tags: ["intake", kind] } : {}),
-        ...(body ? { body } : {}),
-      })
+    const detailsText = details.trim();
+    // CAD-140: reports file through the canonical intake endpoint
+    // (`POST /api/reports` → `report::file`) — never a bare create.
+    // Ideas land on this board; every other kind routes to the
+    // `cadence` project server-side, like `cadence report`.
+    const req =
+      kind === "task"
+        ? api.create({
+            project: projectKey,
+            title: t,
+            priority,
+            ...(detailsText ? { body: `${t}\n\n${detailsText}` } : {}),
+          })
+        : api.report({
+            kind,
+            project: projectKey,
+            title: t,
+            priority,
+            ...(detailsText ? { body: detailsText } : {}),
+          });
+    req
       .then((resp) => {
         onCreated(resp, `${resp.card.id} created`);
         onCancel();
@@ -288,12 +299,12 @@ function NewIssueForm({
       <div className="grid gap-3 sm:grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] items-start mt-3">
         <div className="min-w-0">
           <label className="slabel block mb-1" htmlFor={kindId}>Kind</label>
-          <Select id={kindId} full value={kind} onChange={(v) => setKind(v as NewIssueKind)} disabled={busy || readOnly} options={KIND_OPTIONS} />
+          <Select id={kindId} full value={kind} onChange={(v) => { const k = v as NewIssueKind; setKind(k); setPriority(k === "task" || k === "bug" ? "P2" : "P3"); }} disabled={busy || readOnly} options={KIND_OPTIONS} />
           {kind === "idea" && (
-            <p className="text-micro text-ink-500 mt-1">Files into this project and triggers research + a plan draft.</p>
+            <p className="text-micro text-ink-500 mt-1">Files into {projectKey || "this project"} and triggers research + a plan draft.</p>
           )}
           {kind !== "task" && kind !== "idea" && (
-            <p className="text-micro text-ink-500 mt-1">Files as an intake report for triage.</p>
+            <p className="text-micro text-ink-500 mt-1">Files into the cadence project for triage.</p>
           )}
         </div>
         <div className="min-w-0">

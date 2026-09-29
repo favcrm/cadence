@@ -147,7 +147,7 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
             },
         },
-        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue, delivery::GH)?,
+        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue, delivery::GH, None)?,
         DeliveryAction::ReviewEvidence { request_file } => {
             let request: serde_json::Value = serde_json::from_slice(&std::fs::read(request_file)?)
                 .map_err(|e| Error::rejected(format!("invalid evidence request JSON: {e}")))?;

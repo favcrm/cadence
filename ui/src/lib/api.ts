@@ -430,19 +430,38 @@ export const api = {
   answer: (issue: string, question: string, text: string) =>
     write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
   /**
+   * `POST /api/reports` (CAD-140) — file a question, feedback, idea
+   * or bug through the canonical intake path. `project` is the board
+   * filed from: ideas land there, every other kind routes to the
+   * `cadence` project server-side. Answers a `WriteResp`.
+   */
+  report: (req: {
+    kind: "question" | "feedback" | "idea" | "bug";
+    project: string;
+    title: string;
+    priority?: string;
+    body?: string;
+  }) => write("POST", "/api/reports", req),
+  /**
    * `POST /api/ideas/<id>/decide` (CAD-140) — the operator's idea
    * decision: `approve` takes nothing, `reject` needs a reason, `park`
-   * needs a `park_until` date. Attribution is the board's proven
-   * connection, never a body field.
+   * needs a `park_until` date. `expect_rev` binds the call to the
+   * issue shown — a moved issue refuses with 409 `stale_view`.
+   * Attribution is the board's proven connection, never a body field.
    */
   ideaDecide: (
     issue: string,
     action: "approve" | "reject" | "park",
-    opts?: { reason?: string; park_until?: string },
+    opts?: { reason?: string; park_until?: string; expect_rev?: string },
   ) =>
     post<Record<string, unknown>>(
       `/api/ideas/${encodeURIComponent(issue)}/decide`,
-      { action, ...(opts?.reason ? { reason: opts.reason } : {}), ...(opts?.park_until ? { park_until: opts.park_until } : {}) },
+      {
+        action,
+        ...(opts?.reason ? { reason: opts.reason } : {}),
+        ...(opts?.park_until ? { park_until: opts.park_until } : {}),
+        ...(opts?.expect_rev ? { expect_rev: opts.expect_rev } : {}),
+      },
     ),
   /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
   workflows: (project: string) =>
@@ -591,10 +610,18 @@ export const api = {
       note && note.trim() ? { stage, note: note.trim() } : { stage },
     ),
   /** `POST /api/delivery/<id>/merge` — the operator's merge decision
-   *  (CAD-431): the board's own `gh` enqueues the PR pinned to the
-   *  reviewed head. */
-  mergeDelivery: (issue: string) =>
-    post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/merge`, {}),
+   *  (CAD-431, CAD-140): the board's own `gh` enqueues the PR pinned
+   *  to the reviewed head. `sha` is the head the card showed — a moved
+   *  head refuses with 409 `head_moved` before any `gh` merge runs. */
+  mergeDelivery: (issue: string, sha?: string) =>
+    post<Record<string, unknown>>(
+      `/api/delivery/${encodeURIComponent(issue)}/merge`,
+      sha ? { sha } : {},
+    ),
+  /** `POST /api/delivery/<id>/decline` — the operator declines with a
+   *  reason (CAD-140); the worker loop stands down. */
+  declineDelivery: (issue: string, reason: string) =>
+    post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),

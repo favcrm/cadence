@@ -75,13 +75,16 @@ struct DecideReq {
 }
 
 /// `POST /api/ideas/<id>/decide`. Unknown fields are refused here so a
-/// forged `by` never reaches the daemon.
+/// forged `by` never reaches the daemon. `expect_rev` binds the
+/// decision to the issue the operator was shown: when present, the
+/// relay refuses (409 `stale_view`) if issue.md moved since.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdeaDecideReq {
     action: String,
     reason: Option<String>,
     park_until: Option<String>,
+    expect_rev: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,9 +335,14 @@ pub(super) fn decide_plan(
 
 /// `POST /api/ideas/<id>/decide` (CAD-139). The board relays
 /// `idea_decide`; the daemon's operator connection is the gate.
+/// CAD-140: `expect_rev` binds the call to the plan the operator was
+/// shown — a decision made against a moved issue is refused before
+/// the daemon is asked, so a stale card can neither approve nor
+/// reject.
 pub(super) fn decide_idea(
     request: &mut Request,
     state_dir: &std::path::Path,
+    pm_dir: &std::path::Path,
     id: &str,
 ) -> HttpResp {
     let Ok(id) = model::check_id(id) else {
@@ -351,6 +359,28 @@ pub(super) fn decide_idea(
     let action = req.action.trim();
     if !matches!(action, "approve" | "reject" | "park") {
         return err_response(400, "action must be approve, reject, or park");
+    }
+    if let Some(want) = req.expect_rev.as_deref().filter(|r| !r.is_empty()) {
+        let pm = match Pm::at(pm_dir) {
+            Ok(pm) => pm,
+            Err(e) => return err_response(503, &e.to_string()),
+        };
+        let dir = match crate::issue::write::issue_dir(&pm, id.as_str()) {
+            Ok((_, dir)) => dir,
+            Err(e) => return super::write_err(&e),
+        };
+        let cur = match crate::issue::write::issue_rev(&dir) {
+            Ok(rev) => rev,
+            Err(e) => return err_response(500, &e.to_string()),
+        };
+        if want != cur {
+            return coded_response(
+                409,
+                "stale_view",
+                &format!("{id} changed since it was shown — re-read it before deciding"),
+                None,
+            );
+        }
     }
     let mut params = json!({ "issue": id, "action": action });
     if let Some(reason) = req
@@ -384,6 +414,17 @@ pub(super) fn delivery_route(path: &str) -> Option<(&str, &str)> {
 
 /// `POST /api/delivery/<id>/merge|decline` (CAD-431) — the same
 /// operator rule as the plan decision (`operator::admit`).
+/// CAD-140: a merge carries the head it was approved against
+/// (`{"sha"}`); when the live head no longer matches, the merge is
+/// refused (409 `head_moved`) before any `gh` merge runs — the
+/// queue's `--match-head-commit` pin stays the atomic backstop.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeReq {
+    reason: Option<String>,
+    sha: Option<String>,
+}
+
 pub(super) fn decide_delivery(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -403,7 +444,7 @@ pub(super) fn decide_delivery(
         Ok(bytes) => bytes,
         Err(resp) => return resp,
     };
-    let req: DecideReq = match parse_json(&bytes) {
+    let req: MergeReq = match parse_json(&bytes) {
         Ok(req) => req,
         Err(resp) => return resp,
     };
@@ -422,10 +463,13 @@ pub(super) fn decide_delivery(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| crate::delivery::GH.to_string());
         (
-            crate::delivery::merge(state_dir, &id, &gh),
+            crate::delivery::merge(state_dir, &id, &gh, req.sha.as_deref()),
             "delivery_merge",
         )
     } else {
+        if req.sha.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return err_response(400, "a decline takes a reason, not a head");
+        }
         let Some(reason) = reason else {
             return coded_response(400, "reason_required", "a decline needs a reason", None);
         };
@@ -440,6 +484,11 @@ pub(super) fn decide_delivery(
     };
     match out {
         Ok(out) => json_response(out),
+        // CAD-140: the head moved since the operator was shown it —
+        // 409, not the check's 400, so the card can say "re-review".
+        Err(e) if e.code() == Some("head_moved") => {
+            coded_response(409, "head_moved", &e.to_string(), None)
+        }
         Err(e) => rpc_err(&e, method),
     }
 }

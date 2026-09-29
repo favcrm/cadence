@@ -188,6 +188,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
+    // CAD-140: filing a report or idea is creating a tracker issue —
+    // the same class as `POST /api/issues`, through `report::file`.
+    route("POST", "/api/reports", RouteClass::AgentAllowed),
     route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
     route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),
     route("DELETE", "/api/issues/*/links", RouteClass::AgentAllowed),
@@ -1637,6 +1640,11 @@ mod tests {
             RouteClass::AgentAllowed
         );
         assert_eq!(route_class("POST", "/api/issues"), RouteClass::AgentAllowed);
+        // CAD-140: filing a report is creating an issue, same class.
+        assert_eq!(
+            route_class("POST", "/api/reports"),
+            RouteClass::AgentAllowed
+        );
         assert_eq!(route_class("POST", "/api/session"), RouteClass::Session);
         // Unlisted writes are operator-only.
         assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);

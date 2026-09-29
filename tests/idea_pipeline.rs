@@ -378,3 +378,151 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
         .collect();
     assert_eq!(still.len(), 2);
 }
+
+/// CAD-140: the operator's idea decisions from the board — approve,
+/// reject and park through `POST /api/ideas/<id>/decide`, each bound
+/// to the issue shown (`expect_rev`: a moved issue refuses 409
+/// `stale_view` before the daemon is asked). The daemon's gate still
+/// applies: a second approve 409s, reject needs a reason, park needs
+/// a UTC date.
+#[test]
+fn board_idea_decisions_bind_the_shown_issue_and_decide() {
+    let f = PlanFixture::start_idea_router();
+    let approve_id = file_idea(&f, "gated idea one\nthe plan is ready");
+    let reject_id = file_idea(&f, "gated idea two\nthe plan is ready");
+    let park_id = file_idea(&f, "gated idea three\nthe plan is ready");
+    let stale_id = file_idea(&f, "gated idea four\nthe plan is ready");
+    // Plant pipeline records at the gate — the router's research and
+    // plan turns are CAD-139's path, covered above; the decision gate
+    // reads only this record.
+    let record = |tickets: Value| {
+        json!({
+            "issue": "", "project": "demo", "state": "plan_ready",
+            "event_emitted": true, "stale": false, "tickets": tickets,
+        })
+    };
+    let mut records = serde_json::Map::new();
+    let mut rec = record(json!([
+        {"title": "Ship the toggle", "acceptance": "a setting exists"},
+        {"title": "Document it", "acceptance": "the help page names it"},
+    ]));
+    rec["issue"] = json!(approve_id);
+    records.insert(approve_id.clone(), rec);
+    for id in [&reject_id, &park_id, &stale_id] {
+        let mut rec = record(json!([]));
+        rec["issue"] = json!(id);
+        records.insert(id.clone(), rec);
+    }
+    std::fs::write(
+        f.d.state.join("idea-pipeline.json"),
+        serde_json::to_string_pretty(&json!({"records": records})).unwrap(),
+    )
+    .unwrap();
+
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let decide = |op: &op::Session, id: &str, body: &str| {
+        board_http(
+            port,
+            &cad328_post(
+                port,
+                &format!("/api/ideas/{id}/decide"),
+                &op_guards(op),
+                body,
+            ),
+        )
+    };
+    let rev_of = |id: &str| {
+        let (status, reply) = board_get(port, &format!("/api/issues/{id}"));
+        assert_eq!(status, 200, "{reply}");
+        serde_json::from_str::<Value>(&reply).unwrap()["rev"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // No session, no decision.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/ideas/{approve_id}/decide"),
+            THREAD_GUARDS,
+            r#"{"action":"approve"}"#,
+        ),
+    );
+    assert_eq!(status, 403, "{reply}");
+
+    let op = sign_in(&f.d.state, port);
+    let before = issue_ids(&f);
+
+    // Approve mints exactly the proposed children, bound to the shown rev.
+    let rev = rev_of(&approve_id);
+    let (status, reply) = decide(
+        &op,
+        &approve_id,
+        &format!(r#"{{"action":"approve","expect_rev":{rev:?}}}"#),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let children: Vec<String> = issue_ids(&f)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(children.len(), 2, "{children:?}");
+    for child in &children {
+        assert_eq!(
+            f.front(child).parent.as_deref(),
+            Some(approve_id.as_str()),
+            "{child}"
+        );
+    }
+    assert_eq!(f.front(&approve_id).status, "done");
+    assert!(f.front(&approve_id).tags.iter().any(|t| t == "planned"));
+
+    // A second approve is a duplicate, whatever the rev.
+    let (status, reply) = decide(&op, &approve_id, r#"{"action":"approve"}"#);
+    assert_eq!(status, 409, "{reply}");
+
+    // Reject states its reason; park names its UTC date.
+    let (status, reply) = decide(&op, &reject_id, r#"{"action":"reject"}"#);
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = decide(
+        &op,
+        &reject_id,
+        r#"{"action":"reject","reason":"too vague"}"#,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(f.front(&reject_id).status, "dropped");
+    let (status, reply) = decide(&op, &park_id, r#"{"action":"park"}"#);
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = decide(&op, &park_id, r#"{"action":"park","park_until":"someday"}"#);
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = decide(
+        &op,
+        &park_id,
+        r#"{"action":"park","park_until":"2030-06-01"}"#,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(f.front(&park_id).tags.iter().any(|t| t == "parked"));
+
+    // The shown issue moved: the stale rev refuses before the daemon
+    // is asked — no decision, no children — and the fresh rev decides.
+    let shown = rev_of(&stale_id);
+    let (ok, out) = f.cli(&["issue", "set", &stale_id, "priority=P1"]);
+    assert!(ok, "{out}");
+    let (status, reply) = decide(
+        &op,
+        &stale_id,
+        &format!(r#"{{"action":"approve","expect_rev":{shown:?}}}"#),
+    );
+    assert_eq!(status, 409, "{reply}");
+    assert!(reply.contains("stale_view"), "{reply}");
+    assert_eq!(f.front(&stale_id).status, "backlog");
+    let fresh = rev_of(&stale_id);
+    let (status, reply) = decide(
+        &op,
+        &stale_id,
+        &format!(r#"{{"action":"approve","expect_rev":{fresh:?}}}"#),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(f.front(&stale_id).status, "done");
+}

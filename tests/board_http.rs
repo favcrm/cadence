@@ -612,6 +612,16 @@ fn read_only_board_refuses_every_write() {
             "/api/issues/CAD-2/refs",
             r#"{"kind":"commit","value":"abc"}"#,
         ),
+        // CAD-140: filing a report or idea, deciding one, and the
+        // merge decision all refuse identically.
+        (
+            "POST",
+            "/api/reports",
+            r#"{"kind":"idea","project":"cadence","title":"x"}"#,
+        ),
+        ("POST", "/api/ideas/CAD-1/decide", r#"{"action":"approve"}"#),
+        ("POST", "/api/delivery/CAD-1/merge", r#"{}"#),
+        ("POST", "/api/delivery/CAD-1/decline", r#"{"reason":"no"}"#),
         // Memory curation routes refuse identically — plain, and
         // carrying the accept-time body edit.
         ("POST", "/api/memories/cadence/foo/accept", r#"{}"#),
@@ -811,4 +821,100 @@ fn sse_hello_names_the_build() {
         text.contains(": ping"),
         "the liveness frame still follows: {text}"
     );
+}
+
+/// CAD-140: `POST /api/reports` files through the canonical intake
+/// path (`report::file`), not a bare issue create — and the server
+/// routes, not the UI: ideas land on the viewed board, every other
+/// kind lands in the `cadence` project. The commit is attributed to
+/// the admitted caller, and credential-shaped bodies are refused.
+#[test]
+fn board_reports_file_through_canonical_intake_routing() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "demo", "--prefix", "D"]
+        )
+        .0
+    );
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let op = sign_in(state.path(), port);
+    let post = |body: &str| {
+        let (code, _, text) = op_write_json(&op, port, "POST", "/api/reports", &host, body);
+        (code, serde_json::from_str::<Value>(&text).unwrap())
+    };
+
+    // An idea files into the viewed board with the intake shape.
+    let (code, v) = post(
+        r#"{"kind":"idea","project":"demo","title":"Dark mode","priority":"P3","body":"Why it matters"}"#,
+    );
+    assert_eq!(code, 201, "{v}");
+    assert!(
+        v["card"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("D-")),
+        "{v}"
+    );
+    assert_eq!(v["card"]["project"], "demo", "{v}");
+    let tags = v["card"]["tags"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tags.contains(&Value::from("intake")) && tags.contains(&Value::from("idea")),
+        "{v}"
+    );
+    assert_eq!(v["report"]["kind"], "idea", "{v}");
+    assert!(
+        v["issue"]["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Why it matters")),
+        "{v}"
+    );
+
+    // A question filed \"from\" demo still lands in the cadence project.
+    let (code, v) = post(r#"{"kind":"question","project":"demo","title":"How do lanes work?"}"#);
+    assert_eq!(code, 201, "{v}");
+    assert!(
+        v["card"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("CAD-")),
+        "{v}"
+    );
+    assert_eq!(v["card"]["project"], "cadence", "{v}");
+
+    // The write is attributed to the admitted caller, never a field.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(pm.path())
+        .args(["log", "-2", "--format=%B"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(log.contains("Actor: operator (ui)"), "{log}");
+    let (code, v) = post(r#"{"kind":"idea","project":"demo","title":"x","by":"operator"}"#);
+    assert_eq!(code, 400, "{v}");
+
+    // Shape refusals: unknown kind, empty title, oversized body.
+    let (code, _) = post(r#"{"kind":"task","project":"demo","title":"x"}"#);
+    assert_eq!(code, 400);
+    let (code, _) = post(r#"{"kind":"idea","project":"demo","title":"  "}"#);
+    assert_eq!(code, 400);
+    let big = format!(
+        r#"{{"kind":"idea","project":"demo","title":"big","body":"{}"}}"#,
+        "y".repeat(33 * 1024)
+    );
+    let (code, _) = post(&big);
+    assert_eq!(code, 400);
+
+    // The canonical path's secret scan: a credential-shaped body is
+    // refused with the rule named — a bare create would have filed it.
+    let leak = format!("leak: ghp_{}", "a".repeat(36));
+    let (code, v) = post(&format!(
+        r#"{{"kind":"bug","project":"demo","title":"keys","body":"{leak}"}}"#
+    ));
+    assert_eq!(code, 400, "{v}");
 }
