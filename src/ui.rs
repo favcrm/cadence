@@ -52,6 +52,7 @@ mod login;
 mod operator;
 mod platform_account;
 mod read_model;
+mod social_publish;
 mod stages;
 mod threads;
 mod updates;
@@ -2250,6 +2251,16 @@ fn write_route(
         send(request, response);
         return;
     }
+    if let Some(route) = social_publish::route(path) {
+        let writable = matches!(route, social_publish::Route::List) || !route.is_read();
+        if *method != Method::Post || !writable {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = social_publish::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
     let catalog_recovery = path
         .strip_prefix("/api/app-installations/migrations/")
         .and_then(|tail| tail.strip_suffix("/recover"))
@@ -3583,6 +3594,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
                 let response = app_runs::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
+            }
+            if let Some(route) = social_publish::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = social_publish::handle(&mut request, state_dir, route, false);
                 send(request, response);
                 return;
             }

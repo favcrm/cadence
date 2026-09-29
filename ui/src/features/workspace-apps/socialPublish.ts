@@ -42,6 +42,21 @@ export interface PublishRefusal {
   message: string;
 }
 
+/** Backend envelope as the relay returns it: the store envelope passed
+ *  through untouched, plus relay-joined writer/reviewer (null when the
+ *  run is unresolvable — the intent still serves). */
+interface BackendIntent {
+  intent_id: string;
+  request: string;
+  state: string;
+  frozen: Record<string, unknown>;
+  frozen_digest: string;
+  receipt: unknown;
+  upstream: unknown;
+  writer?: unknown;
+  reviewer?: unknown;
+}
+
 export interface PublishIntent {
   intent_id: string;
   install_id: string;
@@ -60,21 +75,80 @@ export interface PublishIntent {
   image_digest: string | null;
   /** The exact-binding digest. No separate destination_digest exists. */
   frozen_digest: string;
-  /** Taken from the schedule request — the relay derives it there. */
+  /** The schedule request key, echoed as the idempotency material. */
   idempotency_key: string;
   due_epoch: number;
   timezone: string;
   grant_id: string;
   approval_id: string;
-  writer: string;
-  reviewer: string;
+  writer: string | null;
+  reviewer: string | null;
   permalink: string | null;
   receipt: unknown | null;
   refusal: PublishRefusal | null;
-  /** Relay-provided reconcile evidence, set when the status query found a
-   *  lost response after accept for this processing intent. Absent means
-   *  no uncertain display. Never a stored state. */
-  reconcile: { lost_response: boolean; checked_epoch: number } | null;
+  /** Upstream dispatch evidence, passed through. Present on a processing
+   *  intent means dispatch went out with no reported outcome — the
+   *  uncertain reading. Never a stored state. */
+  upstream: unknown | null;
+}
+
+const STATES = ["queued", "processing", "posted", "refused", "cancelled", "held"] as const;
+
+function str(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/** Fail-closed envelope mapping: anything off-shape throws before render. */
+export function toPublishIntent(envelope: BackendIntent): PublishIntent {
+  const frozen = envelope.frozen;
+  const state = envelope.state;
+  const channel = frozen.toolkit;
+  const dueEpoch = frozen.due_epoch;
+  if (!(STATES as readonly string[]).includes(state))
+    throw new ApiError(`unknown publish state: ${state}`, 502);
+  if (channel !== "instagram" && channel !== "facebook")
+    throw new ApiError(`unknown publish channel: ${String(channel)}`, 502);
+  if (!Number.isInteger(dueEpoch))
+    throw new ApiError("publish due time is not an integer epoch", 502);
+  const get = (key: string) => str(frozen[key]);
+  const required = ["install_id", "run_id", "effect_id", "destination_id", "caption_digest", "grant_id", "approval_id", "timezone"] as const;
+  for (const key of required) {
+    if (get(key) === null) throw new ApiError(`publish intent misses ${key}`, 502);
+  }
+  const receipt = (envelope.receipt ?? null) as Record<string, unknown> | null;
+  const refusal: PublishRefusal | null =
+    state === "refused" && receipt && typeof receipt.error === "string"
+      ? { code: typeof receipt.code === "string" ? receipt.code : "", message: receipt.error }
+      : state === "held" && receipt && typeof receipt.reason === "string"
+        ? { code: "", message: receipt.reason }
+        : null;
+  return {
+    intent_id: envelope.intent_id,
+    install_id: get("install_id") as string,
+    context_id: get("context_id"),
+    run_id: get("run_id") as string,
+    effect_id: get("effect_id") as string,
+    state: state as PublishState,
+    channel,
+    destination_id: get("destination_id") as string,
+    caption_digest: get("caption_digest") as string,
+    image_digest: get("image_digest") ?? null,
+    frozen_digest: envelope.frozen_digest,
+    idempotency_key: envelope.request,
+    due_epoch: dueEpoch as number,
+    timezone: get("timezone") as string,
+    grant_id: get("grant_id") as string,
+    approval_id: get("approval_id") as string,
+    writer: str(envelope.writer),
+    reviewer: str(envelope.reviewer),
+    permalink:
+      state === "posted" && receipt && typeof receipt.permalink === "string"
+        ? receipt.permalink
+        : null,
+    receipt,
+    refusal,
+    upstream: (envelope.upstream ?? null) as unknown | null,
+  };
 }
 
 /** Artifact-freeze schedule body: digests derive server-side from the
@@ -162,14 +236,23 @@ async function request<T>(path: string, signal?: AbortSignal, body?: Record<stri
 }
 
 export const socialPublish = {
-  list: (installId: string, contextId: string | null, signal?: AbortSignal) =>
-    request<{ intents: PublishIntent[] }>(paths.list(installId, contextId), signal),
-  show: (intentId: string, signal?: AbortSignal) =>
-    request<{ intent: PublishIntent }>(paths.show(intentId), signal),
-  schedule: (body: SchedulePublishBody) =>
-    request<{ intent: PublishIntent }>(paths.schedule(), undefined, body as unknown as Record<string, unknown>),
-  cancel: (intentId: string) =>
-    request<{ intent: PublishIntent }>(paths.cancel(intentId), undefined, {}),
+  list: async (installId: string, contextId: string | null, signal?: AbortSignal) => {
+    const reply = await request<{ intents: BackendIntent[] }>(paths.list(installId, contextId), signal);
+    if (!Array.isArray(reply.intents)) throw new ApiError("The server returned an invalid publish list", 502);
+    return { intents: reply.intents.map(toPublishIntent) };
+  },
+  show: async (intentId: string, signal?: AbortSignal) => {
+    const reply = await request<{ intent: BackendIntent }>(paths.show(intentId), signal);
+    return { intent: toPublishIntent(reply.intent) };
+  },
+  schedule: async (body: SchedulePublishBody) => {
+    const reply = await request<{ intent: BackendIntent }>(paths.schedule(), undefined, body as unknown as Record<string, unknown>);
+    return { intent: toPublishIntent(reply.intent) };
+  },
+  cancel: async (intentId: string) => {
+    const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, {});
+    return { intent: toPublishIntent(reply.intent) };
+  },
 };
 
 export function publishStateText(state: PublishState): string {
@@ -193,15 +276,11 @@ export function publishStateTone(
 }
 
 /** Derived display flag: uncertain shows ONLY for a processing intent
- *  with lost-response evidence from the status query. The persisted
- *  intent remains processing — no stored enum is invented. Every other
- *  combination (no evidence, or any non-processing state) shows no
- *  uncertain display. */
+ *  with upstream dispatch evidence and no reported outcome. The
+ *  persisted intent remains processing — no stored enum is invented.
+ *  Every other combination shows no uncertain display. */
 export function showsUncertainReading(intent: PublishIntent): boolean {
-  return (
-    intent.state === "processing" &&
-    intent.reconcile?.lost_response === true
-  );
+  return intent.state === "processing" && intent.upstream != null;
 }
 
 /** Guidance for the two states the uncertain question can mean. Held

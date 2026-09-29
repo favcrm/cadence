@@ -153,6 +153,11 @@ export default function PublishPanel({
   const card = (intent: PublishIntent) => {
     const reading = reconcileReading(intent.state);
     const unconfirmed = showsUncertainReading(intent);
+    // Writer/reviewer prefer the relay-joined envelope values, then the
+    // approved-run candidates, never invented.
+    const meta = candidates.find((value) => value.run_id === intent.run_id) ?? null;
+    const writer = intent.writer ?? meta?.writer ?? "unknown writer";
+    const reviewer = intent.reviewer ?? meta?.reviewer ?? "unknown reviewer";
     return (
     <article key={intent.intent_id} className="wa-panel wa-stack">
       <div className="wa-row">
@@ -163,6 +168,9 @@ export default function PublishPanel({
       </div>
       <p className="wa-kicker">
         {intent.intent_id} · due {dueLabel(intent.due_epoch, intent.timezone)}
+      </p>
+      <p className="wa-kicker">
+        {writer} → {reviewer}
       </p>
       <p className="wa-muted">
         Destination id echoed <code>{intent.destination_id}</code> (handle

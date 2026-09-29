@@ -38,7 +38,7 @@ const stub = {
   schedule: async (body: any) => {
     assert(body.slot === "publication" && body.timezone === "Asia/Hong_Kong" && body.destination_id === "17841400008460056", "Panel schedules exact pilot destination with timezone");
     assert(!Object.hasOwn(body, "caption_digest"), "Panel never invents digests");
-    const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null, reconcile: null };
+    const intent = { intent_id: `intent-${scheduled.length}`, install_id: "install-a", context_id: null, run_id: body.run_id, effect_id: body.effect_id, state: body.due_epoch <= Math.floor(Date.now() / 1000) + 5 ? "processing" : "queued", channel: body.toolkit, destination_id: body.destination_id, caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest", idempotency_key: `key-${scheduled.length}`, due_epoch: body.due_epoch, timezone: body.timezone, grant_id: body.grant_id, approval_id: body.approval_id, writer: "writer-a", reviewer: "reviewer-a", permalink: null, receipt: null, refusal: null, upstream: null };
     scheduled.push(body); intents = [intent, ...intents];
     return { intent };
   },
@@ -94,8 +94,8 @@ async function main() {
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },
     { ...intents[0], intent_id: "i-refused", state: "refused", refusal: { code: "grant_exhausted", message: "raw" } },
-    { ...intents[0], intent_id: "i-processing", state: "processing", reconcile: null },
-    { ...intents[0], intent_id: "i-unconfirmed", state: "processing", reconcile: { lost_response: true, checked_epoch: 1790602000 } },
+    { ...intents[0], intent_id: "i-processing", state: "processing", upstream: null },
+    { ...intents[0], intent_id: "i-unconfirmed", state: "processing", upstream: { state: "processing" } },
     { ...intents[0], intent_id: "i-held", state: "held", refusal: { code: "", message: "dispatch authority differs from frozen approval" } },
     { ...intents[0], intent_id: "i-held-material", state: "held", refusal: { code: "", message: "approved material changed since freeze" } },
   ];

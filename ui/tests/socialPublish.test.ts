@@ -6,15 +6,21 @@ declare function require(name: string): any;
 const store = require("../src/features/workspace-apps/socialPublish") as typeof import("../src/features/workspace-apps/socialPublish");
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
 const calls: { url: string; method: string; body: any }[] = [];
-const intents: any[] = [{
-  intent_id: "intent-a", install_id: "install-a", context_id: null, run_id: "run-a",
-  effect_id: "effect-a", state: "queued", channel: "instagram",
-  destination_id: "17841400008460056",
-  caption_digest: "c-digest", image_digest: "i-digest", frozen_digest: "binding-digest",
-  idempotency_key: "key-a", due_epoch: 1790601000, timezone: "Asia/Hong_Kong",
-  grant_id: "grant-a", approval_id: "op-a", writer: "writer-a", reviewer: "reviewer-a",
-  permalink: null, receipt: null, refusal: null, reconcile: null,
-}];
+const envelope = (overrides: any = {}) => ({
+  intent_id: "intent-a", request: "key-a", state: "queued",
+  frozen: {
+    install_id: "install-a", context_id: null, run_id: "run-a",
+    effect_id: "effect-a", artifact_id: "artifact-a", bundle_digest: "bundle-a",
+    slot: "publication", connection_id: "conn-a",
+    destination_id: "17841400008460056", toolkit: "instagram",
+    caption_digest: "c-digest", image_digest: "i-digest", media_key: null,
+    grant_id: "grant-a", approval_id: "op-a",
+    due_epoch: 1790601000, timezone: "Asia/Hong_Kong",
+  },
+  frozen_digest: "binding-digest", receipt: null, upstream: null,
+  writer: "writer-a", reviewer: "reviewer-a", ...overrides,
+});
+let intents: any[] = [envelope()];
 (globalThis as any).fetch = async (input: unknown, init?: { method?: string; body?: string }) => {
   const url = String(input);
   calls.push({ url, method: init?.method ?? "GET", body: init?.body ? JSON.parse(init.body) : undefined });
@@ -22,7 +28,7 @@ const intents: any[] = [{
   if (url === "/api/social-publishes/intent-a") return new Response(JSON.stringify({ intent: intents[0] }), { status: 200 });
   if (url === "/api/social-publishes" && init?.method === "POST") {
     const body = JSON.parse(init.body ?? "{}");
-    intents.unshift({ ...intents[0], intent_id: "intent-b", state: "queued", due_epoch: body.due_epoch });
+    intents.unshift(envelope({ intent_id: "intent-b", state: "queued", frozen: { ...intents[0].frozen, due_epoch: body.due_epoch } }));
     return new Response(JSON.stringify({ intent: intents[0] }), { status: 200 });
   }
   if (url === "/api/social-publishes/intent-a/cancel" && init?.method === "POST") {
@@ -58,12 +64,26 @@ async function main() {
   assert(store.publishStateText("held").includes("human") && !store.publishStateText("held").includes("reconnect"), "Held names the human, not a reconnect state");
   assert(store.reconcileReading("held")?.includes("human")
     && store.reconcileReading("posted") === null && store.reconcileReading("processing") === null && store.reconcileReading("queued") === null, "Only held carries standing reconcile guidance");
-  const base = { ...intents[0] };
-  assert(store.showsUncertainReading({ ...base, state: "processing", reconcile: { lost_response: true, checked_epoch: 1 } }), "Processing plus lost-response evidence shows the uncertain display");
-  assert(!store.showsUncertainReading({ ...base, state: "processing", reconcile: null }), "Processing without evidence shows no uncertain display");
-  assert(!store.showsUncertainReading({ ...base, state: "processing", reconcile: { lost_response: false, checked_epoch: 1 } }), "Negative evidence shows no uncertain display");
-  assert(!store.showsUncertainReading({ ...base, state: "held", reconcile: { lost_response: true, checked_epoch: 1 } }), "Held never shows the uncertain display");
-  assert(!store.showsUncertainReading({ ...base, state: "posted", reconcile: { lost_response: true, checked_epoch: 1 } }), "Terminal states never show the uncertain display");
+  const mapped = store.toPublishIntent(intents[0]);
+  assert(mapped.channel === "instagram" && mapped.idempotency_key === "key-a" && mapped.frozen_digest === "binding-digest"
+    && mapped.writer === "writer-a" && mapped.reviewer === "reviewer-a" && mapped.upstream === null, "Envelope maps to the flat view without invention");
+  assert(store.toPublishIntent(envelope({ state: "posted", receipt: { permalink: "https://p/", destination_id: "d", caption_digest: "c", provider_ids: [], provider_payload: "{}" } })).permalink === "https://p/", "Permalink comes only from a posted receipt");
+  assert(store.toPublishIntent(envelope({ state: "held", receipt: { reason: "dispatch authority differs from frozen approval" } })).refusal?.message === "dispatch authority differs from frozen approval", "Held reason maps raw with no code");
+  for (const bad of [
+    envelope({ state: "uncertain" }),
+    envelope({ frozen: { ...intents[0].frozen, toolkit: "sms" } }),
+    envelope({ frozen: { ...intents[0].frozen, due_epoch: "tomorrow" } }),
+    envelope({ frozen: { ...intents[0].frozen, caption_digest: null } }),
+  ]) {
+    let threw = false;
+    try { store.toPublishIntent(bad); } catch { threw = true; }
+    assert(threw, "Off-shape envelope fails closed instead of rendering");
+  }
+  const base = mapped;
+  assert(store.showsUncertainReading({ ...base, state: "processing", upstream: { state: "processing" } }), "Processing plus upstream evidence shows the uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "processing", upstream: null }), "Processing without evidence shows no uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "held", upstream: { state: "processing" } }), "Held never shows the uncertain display");
+  assert(!store.showsUncertainReading({ ...base, state: "posted", upstream: { state: "processing" } }), "Terminal states never show the uncertain display");
   const vocabulary = ["bad_key", "bad_connection", "bad_destination", "bad_caption_digest", "bad_image_digest", "bad_run", "bad_effect", "bad_grant", "bad_intent", "bad_revision", "bad_timezone", "cancel_closed", "cross_workspace", "grant_mismatch", "grant_binding_mismatch", "grant_revoked", "grant_exhausted", "grant_window", "grant_approval", "grant_bounds", "image_required", "key_conflict", "not_publishable", "wrong_connection", "wrong_destination", "wrong_toolkit", "unknown_key", "send_disabled"];
   assert(vocabulary.length === 28, "Refusal vocabulary is exactly the 28-code list");
   for (const code of vocabulary) {
