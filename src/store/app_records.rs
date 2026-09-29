@@ -121,6 +121,20 @@ impl RecordStore {
     /// identity row does not match is refused with an explicit
     /// recovery error — user data is never deleted or rewritten.
     pub fn open(state_dir: &Path, install_id: &str) -> Result<Self> {
+        // Concurrent first opens race the fresh initialization: the
+        // loser's init diverges (a sibling committed first) and it
+        // re-opens through the existing-file path with its wait for
+        // a mid-flight commit. Genuine corruption refuses on every
+        // attempt — only the diverged-init signal retries.
+        match Self::open_once(state_dir, install_id) {
+            Err(error) if error.to_string() == "record file initialization diverged" => {
+                Self::open_once(state_dir, install_id)
+            }
+            settled => settled,
+        }
+    }
+
+    fn open_once(state_dir: &Path, install_id: &str) -> Result<Self> {
         let path = record_db_path(state_dir, install_id)?;
         if let Some(parent) = path.parent() {
             if !parent.is_dir() {
@@ -170,7 +184,16 @@ impl RecordStore {
                 "INSERT INTO record_identity(install_id, created) VALUES(?, ?)",
                 params![install_id, now()],
             )
-            .map_err(|e| Error::internal(e.to_string()))?;
+            .map_err(|e| {
+                // A sibling won the fresh initialization between our
+                // version check and this insert: retry through the
+                // existing-file path rather than failing the open.
+                if e.to_string().contains("UNIQUE") {
+                    Error::internal("record file initialization diverged")
+                } else {
+                    Error::internal(e.to_string())
+                }
+            })?;
             tx.execute("UPDATE record_schema SET version=?", [FILE_SCHEMA])
                 .map_err(|e| Error::internal(e.to_string()))?;
             tx.commit().map_err(|e| Error::internal(e.to_string()))?;
@@ -180,9 +203,28 @@ impl RecordStore {
             // A foreign, downgraded or corrupt file refuses here; the
             // operator recovers explicitly (restore from backup, remove
             // after inspection) — the daemon never heals it in place.
-            let version: i64 = conn
-                .query_row("SELECT version FROM record_schema", [], |r| r.get(0))
-                .map_err(|_| Error::rejected(CORRUPT))?;
+            // One exception: a sibling may be initializing this file
+            // right now (the fresh path above commits without holding
+            // a cross-open lock), so a readable file whose record
+            // tables are not yet visible is retried briefly before it
+            // refuses. Anything still table-less after the wait is
+            // corruption or a foreign file, refused as before.
+            let mut version: Option<i64> = None;
+            for _ in 0..40 {
+                match conn.query_row("SELECT version FROM record_schema", [], |r| {
+                    r.get::<_, i64>(0)
+                }) {
+                    Ok(found) => {
+                        version = Some(found);
+                        break;
+                    }
+                    Err(error) if error.to_string().contains("no such table") => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let version: i64 = version.ok_or_else(|| Error::rejected(CORRUPT))?;
             if version != FILE_SCHEMA {
                 return Err(Error::rejected(
                     "record file schema is unsupported; restore the installation backup or remove the file after inspection",

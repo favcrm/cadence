@@ -195,7 +195,10 @@ pub(super) fn handle(
             "app_segment_list",
             json!({"install_id": install, "context_id": context}),
         ),
-        Route::SegmentShow(install, context, id) => (
+        // Show arms refuse a write invocation here too: the outer
+        // router already guards, but a future caller must not get a
+        // read by mistake.
+        Route::SegmentShow(install, context, id) if !write => (
             "app_segment_show",
             json!({"install_id": install, "context_id": context, "segment_id": id}),
         ),
@@ -225,7 +228,7 @@ pub(super) fn handle(
             "app_exclusion_list",
             json!({"install_id": install, "context_id": context}),
         ),
-        Route::ExclusionShow(install, context, id) => (
+        Route::ExclusionShow(install, context, id) if !write => (
             "app_exclusion_show",
             json!({"install_id": install, "context_id": context, "list_id": id}),
         ),
@@ -280,7 +283,7 @@ pub(super) fn handle(
             }
             ("app_suppression_remove", params)
         }
-        Route::FreezeShow(install, context, id) => (
+        Route::FreezeShow(install, context, id) if !write => (
             "app_audience_show",
             json!({"install_id": install, "context_id": context, "freeze_id": id}),
         ),

@@ -4,15 +4,18 @@
 //! Every method first proves the operator connection, then resolves
 //! the installation through the workspace catalog snapshot — an
 //! unknown or diverted installation ID never reaches a file — and
-//! only then opens the installation's record file. Writes
-//! additionally prove the live context on core first. The payload
+//! proves the live context on core, reads included: an unknown,
+//! archived or foreign context refuses before any file opens, and
+//! only then opens the installation's record file. The payload
 //! grammar is exact: identity-shaped (`by`, `actor`),
 //! discovery-link (`project`, `project_link`) and routing
 //! (`workspace`) fields are unsupported and refused, as are the
 //! URL-scoped IDs themselves when they appear in a body. Predicate
 //! and base values never become SQL: the store evaluates an
-//! allowlisted grammar in Rust. The board peer is CAD-768
-//! (`src/ui/app_audiences.rs`).
+//! allowlisted grammar in Rust. The board peer lives in
+//! `src/ui/app_audiences.rs` under this ticket; it follows the
+//! CAD-768 strict-peer contract (URL IDs are authority, exact
+//! transport grammar, POST-only writes).
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_audiences::{AudienceBase, Predicate};
@@ -239,9 +242,9 @@ impl Shared {
                 .app_release_lock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if write {
-                self.store.app_context_proof(install, context)?;
-            }
+            // Reads prove the live context too: an unknown, archived
+            // or foreign context refuses before any file opens.
+            self.store.app_context_proof(install, context)?;
             Ok(())
         })?;
         let records = RecordStore::open(&self.state_dir, install)?;

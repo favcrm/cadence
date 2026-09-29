@@ -467,3 +467,42 @@ fn cad779_invalid_csv_decision_does_not_reserve_request_id() {
         .unwrap();
     assert_eq!(imported["summary"]["applied"], 1);
 }
+
+#[test]
+fn cad780_concurrent_fresh_opens_converge_on_one_file() {
+    let dir = TempDir::new().unwrap();
+    // Six threads open the same never-created installation at once:
+    // exactly one runs the fresh initialization while the rest wait
+    // out its commit instead of mistaking the half-written file for
+    // corruption. Every create then lands exactly once.
+    let barrier = std::sync::Barrier::new(6);
+    let dir_ref = &dir;
+    let barrier_ref = &barrier;
+    std::thread::scope(|scope| {
+        (0..6)
+            .map(|index| {
+                scope.spawn(move || {
+                    barrier_ref.wait();
+                    let store = record_file(dir_ref, "install-fresh");
+                    let id = format!("customer-{index}");
+                    store
+                        .app_record_create(
+                            "ctx-1",
+                            &id,
+                            &customer(
+                                &format!("Racer {index}"),
+                                &format!("racer{index}@example.com"),
+                            ),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|h| h.join().unwrap());
+    });
+    let listed = record_file(&dir, "install-fresh")
+        .app_record_list("ctx-1")
+        .unwrap();
+    assert_eq!(listed["records"].as_array().unwrap().len(), 6);
+}

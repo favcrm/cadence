@@ -973,8 +973,9 @@ impl RecordStore {
 
     /// Freeze the computed membership: member IDs, digest,
     /// installation/context and revision pins plus the recipient
-    /// ceiling. A reused freeze ID behind identical bytes replays;
-    /// behind different bytes it refuses before anything mutates.
+    /// ceiling. A reused freeze ID behind identical bytes and ceiling
+    /// replays; behind different bytes or a different ceiling it
+    /// refuses before anything mutates.
     pub fn app_audience_prepare(
         &self,
         context: &str,
@@ -1018,6 +1019,14 @@ impl RecordStore {
             .map_err(|e| Error::internal(e.to_string()))?
         {
             if stored.3 == computed.digest {
+                // A replay binds the ceiling too: the same freeze ID
+                // behind a different maximum is a different approval,
+                // never a silent reuse of the prior ceiling.
+                if stored.4 != max_recipients {
+                    return Err(Error::rejected(
+                        "audience freeze ceiling differs from the frozen ceiling",
+                    ));
+                }
                 let sample = self.sample_in(&conn, context, &computed.final_ids)?;
                 return Ok(json!({"freeze": {
                     "freeze_id": freeze_id, "install_id": self.install(), "context_id": context,

@@ -380,3 +380,101 @@ fn cad780_suppression_add_remove_roundtrip() {
         1
     );
 }
+
+#[test]
+fn cad780_freeze_replay_binds_the_ceiling() {
+    let dir = TempDir::new().unwrap();
+    let store = audience_file(&dir, "install-a");
+    seed_valid(&store, "ctx-1");
+    let prepared = store
+        .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 50)
+        .unwrap();
+    assert_eq!(prepared["freeze"]["replayed"], false);
+    // Identical bytes and ceiling replay the frozen receipt.
+    let replayed = store
+        .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 50)
+        .unwrap();
+    assert_eq!(replayed["freeze"]["replayed"], true);
+    assert_eq!(replayed["freeze"]["digest"], prepared["freeze"]["digest"]);
+    // The same freeze ID behind a different ceiling refuses rather
+    // than silently reusing the prior approval bound.
+    let refused = store
+        .app_audience_prepare("ctx-1", "freeze-1", &base_all(), None, 51)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("ceiling"),
+        "freeze ceiling change was not refused: {refused}"
+    );
+    // A different base behind the same ID refuses as well.
+    let other =
+        AudienceBase::parse(&json!({"mode": "custom", "customer_ids": ["customer-a"]})).unwrap();
+    assert!(store
+        .app_audience_prepare("ctx-1", "freeze-1", &other, None, 50)
+        .is_err());
+}
+
+#[test]
+fn cad780_older_installation_file_migrates_without_touching_rows() {
+    use super::super::app_records::FILE_SCHEMA;
+    let dir = TempDir::new().unwrap();
+    // A pre-CAD-780 installation file, crafted by hand: schema 1 with
+    // only the record tables, no CSV receipts and no audience tables.
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let profile = json!({"schema": 1, "display_name": "Amina", "email": "amina@example.com", "tags": [], "consent": {"email": "granted"}});
+    let digest = material_digest(
+        &json!({"domain": "cadence-app-record-v1", "install_id": "install-a", "context_id": "ctx-1", "kind": "customer", "profile": profile}),
+    );
+    let setup = rusqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "CREATE TABLE record_schema(version INTEGER NOT NULL);
+             INSERT INTO record_schema(version) VALUES(1);
+             CREATE TABLE record_identity(install_id TEXT PRIMARY KEY, created REAL NOT NULL);
+             INSERT INTO record_identity(install_id, created) VALUES('install-a', 0.0);
+             CREATE TABLE app_records(context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, body_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, PRIMARY KEY(context_id, id));
+             CREATE TABLE app_record_revisions(context_id TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, body_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(context_id, record_id, revision));",
+        )
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO app_records(context_id,id,kind,revision,body,body_digest,created,updated) VALUES('ctx-1','customer-a','customer',1,?,?,0.0,0.0)",
+            rusqlite::params![profile.to_string(), digest],
+        )
+        .unwrap();
+    drop(setup);
+    // Opening migrates forward: the version stays 1, the row and its
+    // digest are untouched, and every audience table exists empty.
+    let store = RecordStore::open(dir.path(), "install-a").unwrap();
+    let shown = store.app_record_show("ctx-1", "customer-a").unwrap();
+    assert_eq!(shown["record"]["revision"], 1);
+    assert_eq!(shown["record"]["digest"], digest);
+    let check = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = check
+        .query_row("SELECT version FROM record_schema", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, FILE_SCHEMA);
+    for table in [
+        "app_segments",
+        "app_segment_revisions",
+        "app_exclusions",
+        "app_exclusion_revisions",
+        "app_suppressions",
+        "app_audience_freezes",
+    ] {
+        let count: i64 = check
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "migrated table {table} is not empty");
+    }
+    drop(check);
+    // The migrated file serves the full audience surface.
+    store
+        .app_segment_save("ctx-1", "seg-vip", None, "VIP", &vip_segment())
+        .unwrap();
+    let preview = store
+        .app_audience_preview("ctx-1", &base_all(), None)
+        .unwrap();
+    assert_eq!(preview["final_count"], 1);
+}
