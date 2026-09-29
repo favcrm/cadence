@@ -260,7 +260,7 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
     let mock = d.mock_stub();
     stall_sample(1);
     d.register_inbox("pm");
-    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 8}));
+    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 4}));
     d.wait_agent("w1", "idle", 20);
     d.send(
         "w1",
@@ -638,8 +638,12 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
 /// a second reminder.
 #[test]
 fn pty_silent_end_sends_one_report_reminder() {
+    // Nothing here asserts the gate-backoff length (CAD-185 precedent),
+    // so shrink it: the 30s cap becomes 3s and the post-report
+    // cancelled wait below drops from a 45s bound to 15s.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "0.5");
     let d = TestDaemon::start();
-    let _mock = d.mock_stub();
+    let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
@@ -711,9 +715,12 @@ fn pty_silent_end_sends_one_report_reminder() {
     );
     assert!(body.contains("report_timeout_secs"), "{body}");
 
-    // Once per turn: the pane stays idle across more sweeps and no
-    // second reminder is minted.
-    thread::sleep(Duration::from_secs(6));
+    // Once per turn: three more observed sweeps mint nothing. Bound to
+    // ticker iterations, not wall time — a stalled scheduler cannot pass
+    // this vacuously the way a fixed sleep could.
+    let captures = d.stub_pane_file(&mock, "w1", "captures");
+    let from = std::fs::read_to_string(&captures).unwrap_or_default().len();
+    wait_capture_advance(&captures, from, 3, 15);
     assert_eq!(reminders(&d).len(), 1, "{:?}", reminders(&d));
     // The overview's silent_end row notes the worker was prompted.
     let home = TempDir::new().unwrap();
@@ -739,8 +746,10 @@ fn pty_silent_end_sends_one_report_reminder() {
         0
     );
     // CAD-565: with its bound turn gone the reminder is skipped on the
-    // next claim, never replayed into a later turn.
-    d.wait_message("w1", &rid, &["cancelled"], 45);
+    // next claim, never replayed into a later turn. The claim may sit out
+    // a gate backoff first; with the 0.5s test retry base the cap is 3s,
+    // so a 15s bound (5x) replaces the production 45s wait.
+    d.wait_message("w1", &rid, &["cancelled"], 15);
     let cancelled = d.wait_event_where(
         "w1",
         "nudge_cancelled",
@@ -761,12 +770,15 @@ fn pty_silent_end_sends_one_report_reminder() {
 /// second reminder is minted.
 #[test]
 fn pty_silent_end_reminder_is_not_resent_after_restart() {
+    // The dedupe-across-restart logic is threshold-agnostic (proven at 4s
+    // by `pty_silent_end_fires_once`); 2s exercises the same re-fire path
+    // with one fewer sweep each side of the restart.
     let mut d = TestDaemon::start();
     let _mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
-        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+        json!({"auto_ready": "verified", "silent_end_secs": 2}),
     );
     d.wait_agent("w1", "idle", 20);
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
@@ -2450,8 +2462,11 @@ fn pty_delivery_stalled_fires_once_and_clears() {
         title.contains("dv") && title.contains("m1") && title.contains("idle"),
         "{row}"
     );
-    // Once per head: a few more idle samples re-fire nothing.
-    thread::sleep(Duration::from_secs(4));
+    // Once per head: three more observed idle samples re-fire nothing.
+    // Bound to ticker iterations, not wall time.
+    let captures = d.pane_file(&mock, "dv", "captures");
+    let from = std::fs::read_to_string(&captures).unwrap_or_default().len();
+    wait_capture_advance(&captures, from, 3, 15);
     assert_eq!(
         wait_event_count(&d, "dv", "delivery_stalled", 1, 2).len(),
         1

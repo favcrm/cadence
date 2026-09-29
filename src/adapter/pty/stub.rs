@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
-use super::profile::{DraftView, TuiProfile};
+use super::profile::{open_deadline_override, DraftView, TuiProfile};
 use super::{descends_from, lock_holders, shlex_quote};
 
 /// Bound on the stub TUI acquiring its session after launch.
@@ -241,7 +241,7 @@ impl TuiProfile for StubProfile {
     }
 
     fn open_deadline(&self) -> Duration {
-        OPEN_DEADLINE
+        open_deadline_override().unwrap_or(OPEN_DEADLINE)
     }
 
     fn analyze(&self, screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
