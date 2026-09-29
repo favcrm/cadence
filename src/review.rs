@@ -38,8 +38,8 @@ const TAIL_LINES: usize = 40;
 pub const CONFIG_FILE: &str = "cadence-review.toml";
 /// Required and optional keys, named when the config file is absent.
 const CONFIG_KEYS: &str = "Required keys: prepare, gates, full_suite, test_globs, \
-     test_command, stress_pattern; optional: [timeouts] prepare_secs gate_secs \
-     stress_secs full_secs test_secs git_secs gh_secs";
+     test_command, stress_pattern; optional: test_command_lib, [timeouts] \
+     prepare_secs gate_secs stress_secs full_secs test_secs git_secs gh_secs";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -219,6 +219,14 @@ pub struct ReviewConfig {
     /// How one test runs alone; `{test}` = fn name, `{file}` = diff
     /// path, `{target}` = file stem (cargo `--test <target>`).
     pub test_command: String,
+    /// Optional (CAD-799): how a unit test whose file sits outside
+    /// `test_globs` runs alone — a `src/` unit test has no `--test
+    /// <stem>` target, only a module-qualified name like
+    /// `rollout::tests::x`. `{test}` substitutes that full name.
+    /// Absent means an unlocatable test stays `inconclusive`, the
+    /// pre-CAD-799 behavior.
+    #[serde(default)]
+    pub test_command_lib: Option<String>,
     /// Substrings marking a new test as "waits on daemon state" —
     /// matched tests are stressed `--stress` times each.
     #[serde(default)]
@@ -268,6 +276,13 @@ impl ReviewConfig {
                 "{origin}: `test_command` must contain a {{test}} placeholder"
             )));
         }
+        if let Some(lib) = &cfg.test_command_lib {
+            if !lib.contains("{test}") {
+                return Err(Error::rejected(format!(
+                    "{origin}: `test_command_lib` must contain a {{test}} placeholder"
+                )));
+            }
+        }
         if cfg.runner.result_format == ResultFormat::Junit
             && !safe_rel_path(&cfg.runner.result_path)
         {
@@ -281,16 +296,22 @@ impl ReviewConfig {
                     "{origin}: nextest requires runner.result_format = 'junit'"
                 )));
             }
+            let isolation_cmds = std::iter::once(&cfg.test_command)
+                .chain(cfg.test_command_lib.iter())
+                .collect::<Vec<_>>();
             if !command_mentions_nextest(&cfg.full_suite)
-                || !command_mentions_nextest(&cfg.test_command)
+                || !isolation_cmds.iter().all(|c| command_mentions_nextest(c))
             {
                 return Err(Error::rejected(format!(
-                    "{origin}: nextest backend requires both full_suite and test_command to use scripts/cadence-nextest"
+                    "{origin}: nextest backend requires full_suite and every test_command to use scripts/cadence-nextest"
                 )));
             }
-            if !cfg.test_command.contains("--exact") || !cfg.test_command.contains("--") {
+            if !isolation_cmds
+                .iter()
+                .all(|c| c.contains("--exact") && c.contains("--"))
+            {
                 return Err(Error::rejected(format!(
-                    "{origin}: nextest test_command must use an exact libtest filter after '--'"
+                    "{origin}: nextest test commands must use an exact libtest filter after '--'"
                 )));
             }
         }
@@ -1659,6 +1680,26 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The isolated command for a failing test name (CAD-799): the
+/// `--test <stem>` template when the test's file is known, else the
+/// recipe's `test_command_lib` — a `src/` unit test has no test file
+/// under `test_globs`, only a module-qualified name. `None` means the
+/// test cannot be isolated at all; the row stays `inconclusive`.
+fn isolated_command(cfg: &ReviewConfig, name: &str, file: Option<String>) -> Option<String> {
+    let nt = |file: String| NewTest {
+        name: name.to_string(),
+        file,
+        body: String::new(),
+    };
+    match file.filter(|f| safe_rel_path(f)) {
+        Some(file) => Some(test_command(&cfg.test_command, &nt(file))),
+        None => cfg
+            .test_command_lib
+            .as_deref()
+            .map(|t| test_command(t, &nt(String::new()))),
+    }
+}
+
 /// `^[A-Za-z0-9_:]+$` — cargo test names, nothing else. A name that
 /// fails validation is reported `unknown` and never executed.
 fn valid_test_name(name: &str) -> bool {
@@ -2345,7 +2386,10 @@ pub fn run(opts: &Options) -> Result<i32> {
                 .find(|t| &t.name == name)
                 .map(|t| t.file.clone())
                 .or_else(|| find_test_file(&tree.dir, name, &cfg.test_globs, t.git_secs));
-            let Some(file) = file.filter(|f| safe_rel_path(f)) else {
+            // CAD-799: a name with no `tests/` file is a `src/` unit
+            // test — `test_command_lib` isolates it by name when the
+            // recipe declares one; otherwise it stays inconclusive.
+            let Some(cmd) = isolated_command(&cfg, name, file) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
                     "result": "unknown",
@@ -2357,12 +2401,6 @@ pub fn run(opts: &Options) -> Result<i32> {
                 }));
                 continue;
             };
-            let nt = NewTest {
-                name: name.clone(),
-                file,
-                body: String::new(),
-            };
-            let cmd = test_command(&cfg.test_command, &nt);
             let on_gated = run_step_with_result(
                 "compare-gated",
                 &cmd,
@@ -3757,7 +3795,89 @@ result_path = "target/nextest/cadence/junit.xml"
         );
         std::fs::write(dir.path().join(CONFIG_FILE), mismatched).unwrap();
         let err = ReviewConfig::load(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("both full_suite and test_command"), "{err}");
+        assert!(err.contains("full_suite and every test_command"), "{err}");
+    }
+
+    /// CAD-799: `test_command_lib` is optional — absent parses to
+    /// `None`; when present it needs `{test}` and, under the nextest
+    /// backend, the same pinned runner and exact-filter shape as
+    /// `test_command`.
+    #[test]
+    fn test_command_lib_is_optional_and_validated_like_test_command() {
+        let toml = r#"
+prepare = []
+gates = ["true"]
+full_suite = "scripts/cadence-nextest --all-targets"
+test_globs = ["tests/**"]
+test_command = "scripts/cadence-nextest --test {target} -- {test} --exact"
+[runner]
+backend = "nextest"
+result_format = "junit"
+result_path = "target/nextest/cadence/junit.xml"
+"#;
+        let cfg = ReviewConfig::parse(toml, "t").unwrap();
+        assert_eq!(cfg.test_command_lib, None);
+
+        // The key is top-level — it must sit before the `[runner]`
+        // table, not after it.
+        let with = |lib: &str| toml.replace("[runner]", &format!("{lib}\n[runner]"));
+        let cfg = ReviewConfig::parse(
+            &with("test_command_lib = \"scripts/cadence-nextest --lib -- {test} --exact\""),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.test_command_lib.as_deref(),
+            Some("scripts/cadence-nextest --lib -- {test} --exact")
+        );
+
+        for bad in [
+            with("test_command_lib = \"scripts/cadence-nextest --lib --exact\""),
+            with("test_command_lib = \"cargo test --lib -- {test} --exact\""),
+            with("test_command_lib = \"scripts/cadence-nextest --lib {test}\""),
+        ] {
+            let err = ReviewConfig::parse(&bad, "t").unwrap_err().to_string();
+            assert!(
+                err.contains("test_command_lib")
+                    || err.contains("cadence-nextest")
+                    || err.contains("exact libtest filter"),
+                "{err}"
+            );
+        }
+    }
+
+    /// CAD-799: a failing test locatable under `test_globs` runs the
+    /// `--test <stem>` template; a `src/` unit test (no file under the
+    /// globs) runs `test_command_lib` by name; without that key it
+    /// cannot be isolated.
+    #[test]
+    fn isolated_command_falls_back_to_the_lib_template() {
+        let toml = r#"
+prepare = []
+gates = ["true"]
+full_suite = "x"
+test_globs = ["tests/**"]
+test_command = "cargo test --test {target} -- {test}"
+test_command_lib = "cargo test --lib --bins -- {test} --exact"
+"#;
+        let cfg = ReviewConfig::parse(toml, "t").unwrap();
+
+        let cmd = isolated_command(&cfg, "t::x", Some("tests/daemon.rs".into())).unwrap();
+        assert_eq!(cmd, "cargo test --test 'daemon' -- 't::x'");
+
+        let cmd = isolated_command(&cfg, "rollout::tests::x", None).unwrap();
+        assert_eq!(
+            cmd,
+            "cargo test --lib --bins -- 'rollout::tests::x' --exact"
+        );
+
+        let no_lib: ReviewConfig =
+            ReviewConfig::parse(&toml.replace("test_command_lib", "unused_lib"), "t").unwrap();
+        assert!(isolated_command(&no_lib, "rollout::tests::x", None).is_none());
+        // An unsafe relative path is never executed — falls to the
+        // lib template, not to `--test <stem>`.
+        let cmd = isolated_command(&cfg, "x", Some("../escape.rs".into())).unwrap();
+        assert_eq!(cmd, "cargo test --lib --bins -- 'x' --exact");
     }
 
     #[test]
