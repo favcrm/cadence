@@ -159,7 +159,7 @@ export interface ProposalInput {
   blocks: ContentBlock[];
 }
 
-/** Mount contract for CAD-781's outlet (deferred until its head merges):
+/** Mount contract (CAD-784 owns visible campaign wiring):
  *  `CrmOutlet` renders `<CrmCompose scope campaignId />` inside the
  *  campaign route; this client stays mount-agnostic. */
 export const contentClient = {
