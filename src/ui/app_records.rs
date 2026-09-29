@@ -140,24 +140,94 @@ fn typed_cap<T: serde::de::DeserializeOwned>(
         .map_err(|_| err_response(400, "invalid app record request schema"))
 }
 
+/// Bounded list selectors for `GET …/records`: `query` (a bounded
+/// substring over the record id and body), `limit` (1..=100) and
+/// `cursor` (page after a record id). Unknown or duplicate keys,
+/// malformed percent-encoding and out-of-bounds values refuse with a
+/// generic schema error that never echoes customer content.
+fn list_query(raw: &str) -> Result<Value, HttpResp> {
+    let mut params = json!({});
+    if raw.is_empty() {
+        return Ok(params);
+    }
+    for pair in raw.split('&') {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| err_response(400, "invalid app record request schema"))?;
+        let key = super::pct_decode(raw_key)
+            .ok_or_else(|| err_response(400, "invalid app record request schema"))?;
+        let value = super::pct_decode(raw_value)
+            .ok_or_else(|| err_response(400, "invalid app record request schema"))?;
+        match key.as_str() {
+            "query" => {
+                if params.get("query").is_some()
+                    || value.is_empty()
+                    || value.len() > 120
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(err_response(400, "invalid app record request schema"));
+                }
+                params["query"] = Value::String(value);
+            }
+            "limit" => {
+                if params.get("limit").is_some() {
+                    return Err(err_response(400, "invalid app record request schema"));
+                }
+                let limit: i64 = value
+                    .parse()
+                    .ok()
+                    .filter(|limit| (1..=crate::store::app_records::RECORD_LIMIT).contains(limit))
+                    .ok_or_else(|| err_response(400, "invalid app record request schema"))?;
+                params["limit"] = json!(limit);
+            }
+            "cursor" => {
+                if params.get("cursor").is_some() || !segment(&value) {
+                    return Err(err_response(400, "invalid app record request schema"));
+                }
+                params["cursor"] = Value::String(value);
+            }
+            _ => return Err(err_response(400, "invalid app record request schema")),
+        }
+    }
+    Ok(params)
+}
+
 pub(super) fn handle(
     request: &mut Request,
     state: &Path,
     route: Route<'_>,
     write: bool,
 ) -> HttpResp {
-    if request
+    let raw_query = request
         .url()
         .split_once('?')
-        .is_some_and(|(_, q)| !q.is_empty())
-    {
-        return err_response(400, "app record query parameters are unsupported");
-    }
+        .map(|(_, query)| query)
+        .unwrap_or("");
+    // List reads accept the bounded selectors above; every other route
+    // — including creates through `POST …/records` — refuses any query
+    // string, so URLs stay scope-only outside search pagination.
+    let list_extra = match route {
+        Route::List(..) if !write => Some(match list_query(raw_query) {
+            Ok(extra) => extra,
+            Err(response) => return response,
+        }),
+        _ => {
+            if !raw_query.is_empty() {
+                return err_response(400, "app record query parameters are unsupported");
+            }
+            None
+        }
+    };
     let (method, params) = match route {
-        Route::List(install, context) if !write => (
-            "app_record_list",
-            json!({"install_id": install, "context_id": context}),
-        ),
+        Route::List(install, context) if !write => {
+            let mut params = json!({"install_id": install, "context_id": context});
+            if let Some(extra) = list_extra {
+                for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+                    params[key] = value;
+                }
+            }
+            ("app_record_list", params)
+        }
         Route::List(install, context) => {
             let body: Create = match typed(request) {
                 Ok(body) => body,
@@ -372,5 +442,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn list_ok(raw: &str) -> Value {
+        match list_query(raw) {
+            Ok(params) => params,
+            Err(_) => panic!("list selector refused {raw}"),
+        }
+    }
+
+    #[test]
+    fn list_selectors_accept_bounded_queries_and_refuse_the_rest() {
+        // Empty selects everything within the daemon's default page.
+        let empty = list_ok("");
+        assert!(empty.as_object().unwrap().is_empty());
+        let full = list_ok("query=Beta&limit=20&cursor=customer-9");
+        assert_eq!(full["query"], "Beta");
+        assert_eq!(full["limit"], 20);
+        assert_eq!(full["cursor"], "customer-9");
+        // Percent-encoded selectors decode before validation.
+        let decoded = list_ok("query=Al%20pha&limit=%32%30");
+        assert_eq!(decoded["query"], "Al pha");
+        assert_eq!(decoded["limit"], 20);
+        for raw in [
+            // Unknown or duplicate keys are forged selectors, not filters.
+            "install_id=other",
+            "context_id=other",
+            "by=operator",
+            "project=client",
+            "query=a&query=b",
+            "limit=10&limit=10",
+            "cursor=a&cursor=b",
+            "query",
+            // Out-of-bounds values never reach the daemon.
+            "query=",
+            "limit=0",
+            "limit=101",
+            "limit=many",
+            "limit=-3",
+            "cursor=",
+            "cursor=a/b",
+            "cursor=..",
+            "query=%ZZ",
+            "query=%2",
+        ] {
+            assert!(list_query(raw).is_err(), "list selector admitted {raw}");
+        }
+        assert!(
+            list_query(&"q".repeat(121)).is_err(),
+            "overlong query admitted"
+        );
+        assert!(list_query("query=a%0Ab").is_err(), "control query admitted");
     }
 }

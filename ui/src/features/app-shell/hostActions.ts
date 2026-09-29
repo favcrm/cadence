@@ -16,6 +16,22 @@ import { sessionHeaders } from "../../lib/sessionKey";
  * is context for a turn, never proof of access.
  */
 
+/** Bounded list selectors for `GET …/records` (CAD-781). The search
+ *  text never enters the URL of the App shell route — it travels only
+ *  in this peer request — so no customer content lands in history. */
+export interface ListOptions {
+  query?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+/** One page of server rows with its continuation cursor. */
+export interface ListReceipt {
+  records: HostRecord[];
+  truncated: boolean;
+  nextCursor: string | null;
+}
+
 /** One record row as the daemon returns it: identity plus profile. */
 export interface HostRecord {
   id: string;
@@ -26,6 +42,7 @@ export interface HostRecord {
   digest: string;
   profile: unknown;
   history?: unknown;
+  consentHistory?: unknown;
 }
 
 /** URL-bound scope: the only identity this client will use. */
@@ -133,17 +150,51 @@ function asRecord(value: unknown): HostRecord {
     digest: row.digest,
     profile: row.profile,
     history: row.history,
+    consentHistory: (row as Record<string, unknown>).consent_history,
   };
 }
 
 export const hostActions = {
   paths: { listPath, recordPath, updatePath },
   guards: { assertScope, assertRecordId, assertCleanBody },
-  /** `GET …/records` — the server scopes rows to the URL's install/context. */
-  async list(scope: HostScope): Promise<HostRecord[]> {
-    const value = await request<{ records: unknown }>(listPath(scope));
+  /** `GET …/records` — the server scopes rows to the URL's install/context.
+   *  Selectors travel as a bounded query string on the peer request only:
+   *  the App shell route URL keeps scope (`ctx`, `record`) and never
+   *  customer content. Older receipts without a page envelope read as
+   *  one complete page. */
+  async list(scope: HostScope, opts?: ListOptions): Promise<ListReceipt> {
+    const params = new URLSearchParams();
+    if (opts?.query !== undefined) {
+      if (
+        opts.query.length === 0 ||
+        opts.query.length > 120 ||
+        /[\u0000-\u001f\u007f]/.test(opts.query)
+      ) {
+        throw new ApiError("record search query is out of bounds", 400);
+      }
+      params.set("query", opts.query);
+    }
+    if (opts?.limit !== undefined) {
+      if (!Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > 100) {
+        throw new ApiError("record page limit is out of bounds", 400);
+      }
+      params.set("limit", String(opts.limit));
+    }
+    if (opts?.cursor !== undefined) {
+      assertRecordId(opts.cursor);
+      params.set("cursor", opts.cursor);
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    const value = await request<{ records: unknown; truncated?: unknown; next_cursor?: unknown }>(
+      `${listPath(scope)}${suffix}`,
+    );
     if (!Array.isArray(value.records)) throw new ApiError("The server returned an invalid app receipt", 502);
-    return value.records.map((row) => asRecord({ record: row }));
+    const records = value.records.map((row) => asRecord({ record: row }));
+    return {
+      records,
+      truncated: value.truncated === true,
+      nextCursor: typeof value.next_cursor === "string" ? value.next_cursor : null,
+    };
   },
   /** `GET …/records/:id` — one row under the same URL scope. */
   async show(scope: HostScope, recordId: string): Promise<HostRecord> {
