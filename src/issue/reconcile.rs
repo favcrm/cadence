@@ -327,11 +327,10 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
         // counts its contribution over the default branch instead.
         let started = match (&tip_pair, &into) {
             (Some((t, true)), _) => !finish::not_started(root, branch, t),
-            (Some((t, false)), Some(into)) => finish::git(
-                root,
-                &["rev-list", "--count", &format!("{into}..{t}")],
-            )
-            .is_ok_and(|n| n != "0"),
+            (Some((t, false)), Some(into)) => {
+                finish::git(root, &["rev-list", "--count", &format!("{into}..{t}")])
+                    .is_ok_and(|n| n != "0")
+            }
             _ => true,
         };
         if !started {
