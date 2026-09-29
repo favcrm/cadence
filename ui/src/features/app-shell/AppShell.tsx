@@ -20,7 +20,7 @@ import {
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
-import CrmOutlet, { type OutletView } from "./CrmOutlet";
+import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import { assertRecordId, type HostScope } from "./hostActions";
 import "./app-shell.css";
 
@@ -46,15 +46,29 @@ import "./app-shell.css";
  * selector internally, so the shell shows none there and never a
  * second, divergent one. No App-provided JavaScript runs here.
  */
+/** Verified installation identity for the board-level App menu.
+ *  Reported only from the shell's HTTP receipt — never the bare
+ *  route — so a forged installId cannot conjure menu entries. */
+export interface ActiveInstallation {
+  installId: string;
+  kind: string;
+  title: string;
+}
+
 export default function AppShell({
   installId,
   viewer,
   children,
+  onInstallation,
 }: {
   installId: string;
   viewer: Viewer;
   /** Social-content's existing screen; other Apps use the generic outlet. */
   children?: React.ReactNode;
+  /** Board menu wiring: receives the verified installation (or null
+   *  while loading, failed, or switched away). The parent matches
+   *  installId to its route and compares values before storing. */
+  onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
@@ -72,6 +86,12 @@ export default function AppShell({
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
+  // CRM nested sections (CAD-784): Apps → CRM → Customers/Segments/
+  // Campaigns. Only the CRM outlet reads this — every other App keeps
+  // its generic list/detail/new shape untouched.
+  const rawSection = query.get("crm");
+  const crmSection: CrmSection =
+    rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   const [chatOpen, setChatOpen] = useState(false);
   const chatPaneRef = useRef<HTMLDivElement | null>(null);
   const chatOpenRef = useRef<HTMLButtonElement | null>(null);
@@ -83,11 +103,20 @@ export default function AppShell({
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
   // (direct links, browser back/forward) — never our own writes.
-  const queryKey = (ctx: string | null, record: string | null, appview: string | null) =>
-    `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}`;
+  const queryKey = (
+    ctx: string | null,
+    record: string | null,
+    appview: string | null,
+    crm: string | null,
+  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
   const writeQuery = useCallback(
     (
-      patch: { ctx?: string | null; appview?: OutletView | null; record?: string | null },
+      patch: {
+        ctx?: string | null;
+        appview?: OutletView | null;
+        record?: string | null;
+        crm?: CrmSection | null;
+      },
       opts?: { replace?: boolean },
     ) => {
       const [path, search] = href.split("?");
@@ -104,7 +133,11 @@ export default function AppShell({
         if (patch.record === null) q.delete("record");
         else q.set("record", patch.record);
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"));
+      if (patch.crm !== undefined) {
+        if (patch.crm === null || patch.crm === "customers") q.delete("crm");
+        else q.set("crm", patch.crm);
+      }
+      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
@@ -141,6 +174,25 @@ export default function AppShell({
     return () => controller.abort();
   }, [installId, viewer.operator]);
 
+  // Board-level App menu identity: report the verified receipt (or
+  // null while it is loading, failed, or belongs to another install)
+  // so the shared sidebar/phone menu can nest this installation's
+  // sections. Clearing on cleanup keeps a departed installation from
+  // lingering in host navigation.
+  useEffect(() => {
+    if (!onInstallation) return;
+    if (installation && installation.install_id === installId) {
+      onInstallation({
+        installId,
+        kind: installation.name,
+        title: installation.title || installation.name,
+      });
+    } else {
+      onInstallation(null);
+    }
+    return () => onInstallation(null);
+  }, [installId, installation, onInstallation]);
+
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
     return subscribeContext((changed, next) => {
@@ -159,7 +211,7 @@ export default function AppShell({
     setLoadError(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, crm: null }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -188,8 +240,15 @@ export default function AppShell({
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView);
+    const urlCrm = query.get("crm");
+    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
+    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    // An unknown CRM section never renders: strip it back to the
+    // default instead of guessing a section.
+    if (urlCrm !== null && urlCrm !== "segments" && urlCrm !== "campaigns") {
+      writeQuery({ crm: null }, { replace: true });
+      return;
+    }
     if (urlRecord !== null) {
       try {
         assertRecordId(urlRecord);
@@ -270,6 +329,13 @@ export default function AppShell({
     activeIds,
   });
   const scope: HostScope = { installId, contextId };
+  // CAD-813: the Campaigns page mints assistant proposal requests
+  // against the operator's most recent chat message stamped by the
+  // daemon with exactly this scope. The id travels as ordinary
+  // shell state — read back from the shared master-thread store,
+  // never a global — so a message bound to another install or
+  // context can never mint here.
+  const scopedChatMessage = useScopedChatMessage(scope);
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
 
@@ -388,13 +454,18 @@ export default function AppShell({
                 <CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}
+                  scopedChatMessage={scopedChatMessage}
                   installationTitle={title}
                   appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
                   recordId={recordId}
+                  section={crmSection}
                   viewer={viewer}
                   onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
                   onSelect={(id) => writeQuery({ record: id })}
+                  // Section moves ride real submenu links (CrmOutlet):
+                  // their hrefs already clear the record view and
+                  // drafts, so no callback is needed here.
                   // Created records land on list + details in ONE query
                   // write. Two sequential writes would each start from the
                   // stale render's href, so the second would re-apply the
@@ -460,6 +531,45 @@ export function entryApp(payload: unknown): {
     return null;
   }
   return { install_id: row.install_id, context_id: row.context_id };
+}
+
+/**
+ * CAD-813: the most recent operator chat message the daemon stamped
+ * with exactly `scope`'s verified App binding — the only
+ * `message_id` a proposal-request mint may name. Entries read back
+ * from the shared master-thread store are the source: a pending send
+ * or a foreign-scope message never qualifies. `null` when the
+ * operator has not sent a scoped message in this App yet.
+ */
+export function latestScopedChatMessage(
+  state: { entries?: { role?: string; message?: string | null; payload?: unknown }[] } | null,
+  scope: HostScope,
+): string | null {
+  if (scope.contextId === "") return null;
+  const entries = state?.entries ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.role !== "operator" || typeof entry.message !== "string") continue;
+    const bound = entryApp(entry.payload);
+    if (bound?.install_id === scope.installId && bound.context_id === scope.contextId) {
+      return entry.message;
+    }
+  }
+  return null;
+}
+
+/** Live view of [`latestScopedChatMessage`] over the shared store. */
+function useScopedChatMessage(scope: HostScope): string | null {
+  const thread = useQuery(resources.masterThread);
+  const [found, setFound] = useState<string | null>(() =>
+    latestScopedChatMessage(thread.data, scope),
+  );
+  const key = `${scope.installId}:${scope.contextId}`;
+  useEffect(() => {
+    setFound(latestScopedChatMessage(thread.data, scope));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, thread.data]);
+  return found;
 }
 
 /**

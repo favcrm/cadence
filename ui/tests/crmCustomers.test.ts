@@ -165,6 +165,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const CrmOutlet = (require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet")).default;
+const { useHref } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 
 const posts: { path: string; body: any }[] = [];
 const recordStore: Record<string, any> = {
@@ -204,6 +205,21 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const records = Object.values(recordStore).filter((r: any) => !query || JSON.stringify(r).includes(query));
     return new Response(JSON.stringify({ records, truncated: false, next_cursor: null }), { status: 200 });
   }
+  // CAD-784 sections serve empty server rows in this harness — the
+  // screens assert their empty states, never placeholders.
+  if (url.pathname.endsWith("/segments/list")) {
+    return new Response(JSON.stringify({ segments: [] }), { status: 200 });
+  }
+  if (url.pathname.endsWith("/exclusions/list") || url.pathname.endsWith("/suppressions/list")) {
+    const empty = url.pathname.endsWith("/exclusions/list") ? { exclusions: [] } : { suppressions: [] };
+    return new Response(JSON.stringify(empty), { status: 200 });
+  }
+  if (url.pathname.endsWith("/content/campaigns/list")) {
+    return new Response(JSON.stringify({ contents: [] }), { status: 200 });
+  }
+  if (url.pathname.endsWith("/content/proposals/list")) {
+    return new Response(JSON.stringify({ proposals: [] }), { status: 200 });
+  }
   const id = url.pathname.split("/").pop()!;
   const record = recordStore[id];
   if (!record) return new Response(JSON.stringify({ error: "record is unavailable for this installation and context" }), { status: 409 });
@@ -213,13 +229,22 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
 function Harness({ viewer }: { viewer: { operator: boolean; readOnly: boolean } }) {
   const [view, setView] = React.useState<"list" | "new">("list");
   const [recordId, setRecordId] = React.useState<string | null>(null);
+  // CAD-784: the nested CRM section is route state — the harness
+  // reads it from the URL like the shell does, so submenu links
+  // drive section moves end to end (record view cleared by the
+  // link href itself).
+  const href = useHref();
+  const crm = new URLSearchParams(href.split("?")[1] ?? "").get("crm");
+  const section = crm === "segments" || crm === "campaigns" ? crm : "customers";
   React.useEffect(() => {
-    const params = new URLSearchParams();
+    const params = new URLSearchParams(href.split("?")[1] ?? "");
     if (recordId) params.set("record", recordId);
-    history.replaceState(null, "", `/app-installations/install-crm?ctx=ctx-a${params.toString() ? `&${params}` : ""}`);
+    else params.delete("record");
+    const s = params.toString();
+    history.replaceState(null, "", `/app-installations/install-crm${s ? `?${s}` : ""}`);
   }, [recordId]);
   return React.createElement(CrmOutlet, {
-    scope, installationTitle: "CRM", appKind: "crm", view, recordId, viewer,
+    scope, installationTitle: "CRM", appKind: "crm", view, recordId, section, viewer,
     onView: setView, onSelect: setRecordId,
   });
 }
@@ -270,13 +295,27 @@ await fill("#crm-customer-search", "");
 await React.act(async () => { await sleep(400); });
 await settle(() => assert(text().includes("Search Alpha One"), "clearing restores rows"));
 
-// Section placeholders stay truthful.
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Segments"));
-assert(text().includes("later ticket"), "segments placeholder is truthful");
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Campaigns"));
-assert(text().includes("composer"), "campaigns placeholder names the out-of-scope editor");
-await click(Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Customers"));
-await settle(() => assert(text().includes("Search Alpha One"), "customers tab restores the list"));
+// CAD-784 sections render real server-driven screens: empty states off
+// empty server rows, and the list never contains an inline builder.
+// Moves ride the host-owned submenu links (real anchors), not pane buttons.
+const sectionLink = (label: string) =>
+  Array.from(host.querySelectorAll('nav[aria-label="CRM sections"] a')).find(
+    (el) => (el.textContent ?? "").trim() === label,
+  );
+assert(sectionLink("Segments")?.tagName === "A", "submenu offers real links");
+assert(
+  (sectionLink("Segments") as HTMLAnchorElement).getAttribute("href")?.includes("ctx=ctx-a"),
+  "submenu links keep the selected context",
+);
+await click(sectionLink("Segments"));
+await settle(() => assert(text().includes("No segments yet in this context"), "segments empty state is server-driven"));
+assert(location.search.includes("crm=segments"), "submenu move routes");
+await click(sectionLink("Campaigns"));
+await settle(() => assert(text().includes("No campaigns yet in this context"), "campaigns empty state is server-driven"));
+assert(!host.querySelector('section[aria-label="Campaigns list"] input'), "campaigns list holds no inline builder");
+await click(sectionLink("Customers"));
+await settle(() => assert(text().includes("Search Alpha One"), "customers link restores the list"));
+assert(!location.search.includes("crm="), "customers is the default route");
 
 // Drawer: profile, consent trail, keyboard close with focus restoration.
 const openBeta = Array.from(host.querySelectorAll("button.lnk")).find((el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Beta"));

@@ -422,3 +422,36 @@
   margin: 0.35rem 0 0;
   padding: 0;
 }
+
+/* Campaign email preview: source/text forms scroll internally so a
+   long render never pushes the document past narrow viewports. */
+.crm-preview {
+  margin: 0;
+  padding: 0.75rem;
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-950);
+  color: var(--color-ink-300);
+  font-family: var(--font-mono);
+  font-size: var(--text-label);
+}
+
+/* Visual preview: the host-sanitized render runs in a scriptless
+   sandbox (sandbox=""), so no preview markup can execute here. */
+.crm-preview-frame {
+  width: 100%;
+  min-height: 24rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: #fff;
+}
+
+/* The test-send panel reads apart from every save/preview control:
+   preparing a payload is not sending it. */
+.crm-test {
+  border-color: var(--color-info);
+}

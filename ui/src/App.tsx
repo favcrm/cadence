@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
-import AppShell from "./features/app-shell/AppShell";
+import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
+import { crmAppMenu, type CrmSection } from "./features/app-shell/CrmOutlet";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -560,6 +561,35 @@ export default function App() {
   };
   const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
+  // Board-level App menu (CAD-784): the shell reports its verified
+  // installation receipt; the board nests that installation's
+  // sections in the shared sidebar/phone menu only while the route
+  // still names the same verified CRM installation. A forged route
+  // or a non-CRM app never produces entries.
+  const [activeApp, setActiveApp] = useState<ActiveInstallation | null>(null);
+  const reportInstallation = useCallback((info: ActiveInstallation | null) => {
+    setActiveApp((prev) => {
+      if (prev === null && info === null) return prev;
+      if (
+        prev !== null && info !== null &&
+        prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title
+      ) {
+        return prev;
+      }
+      return info;
+    });
+  }, []);
+  const activeCrm =
+    route.screen === "workspaceApp" &&
+    activeApp !== null &&
+    activeApp.installId === route.installId &&
+    activeApp.kind === "crm"
+      ? activeApp
+      : null;
+  const crmQuery = new URLSearchParams(search).get("crm");
+  const crmSection: CrmSection =
+    crmQuery === "segments" || crmQuery === "campaigns" ? crmQuery : "customers";
+  const appMenu = activeCrm ? crmAppMenu(href, activeCrm.title, crmSection) : null;
 
   return (
     <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
@@ -572,6 +602,7 @@ export default function App() {
       <Sidebar
         screen={screen === "workspaceApp" ? "apps" : screen}
         navHref={hrefFor}
+        appMenu={appMenu}
         project={navProject}
         projectHref={projectHref}
         projects={projects}
@@ -633,19 +664,42 @@ export default function App() {
           <nav id="mobile-navigation" aria-label="Workspace" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
               {NAV.map((item) => (
-                <Link
-                  key={item.screen}
-                  href={hrefFor(item.route)}
-                  onClick={() => setMenuOpen(false)}
-                  aria-current={(screen === "workspaceApp" ? "apps" : screen) === item.screen ? "page" : undefined}
-                  className={`h-9 inline-flex items-center justify-center rounded text-secondary ${
-                    (screen === "workspaceApp" ? "apps" : screen) === item.screen
-                      ? "bg-accent/15 text-accent font-medium"
-                      : "bg-ink-800 text-ink-300"
-                  }`}
-                >
-                  {item.label}
-                </Link>
+                <Fragment key={item.screen}>
+                  <Link
+                    href={hrefFor(item.route)}
+                    onClick={() => setMenuOpen(false)}
+                    aria-current={(screen === "workspaceApp" ? "apps" : screen) === item.screen ? "page" : undefined}
+                    className={`h-9 inline-flex items-center justify-center rounded text-secondary ${
+                      (screen === "workspaceApp" ? "apps" : screen) === item.screen
+                        ? "bg-accent/15 text-accent font-medium"
+                        : "bg-ink-800 text-ink-300"
+                    }`}
+                  >
+                    {item.label}
+                  </Link>
+                  {item.screen === "apps" && appMenu && (
+                    <div className="col-span-2 sm:col-span-4" role="group" aria-label={`${appMenu.title} sections`}>
+                      <div className="slabel pt-1 truncate" title={appMenu.title}>{appMenu.title}</div>
+                      <div className="grid gap-1 mt-1">
+                        {appMenu.sections.map((s) => (
+                          <Link
+                            key={s.label}
+                            href={s.href}
+                            onClick={() => setMenuOpen(false)}
+                            aria-current={s.current ? "page" : undefined}
+                            className={`flex items-center h-8 px-2.5 rounded text-label ${
+                              s.current
+                                ? "bg-accent/15 text-accent font-medium"
+                                : "text-ink-300 hover:bg-ink-800"
+                            }`}
+                          >
+                            {s.label}
+                          </Link>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </Fragment>
               ))}
             </div>
             <div className="slabel pt-2">projects</div>
@@ -881,7 +935,7 @@ export default function App() {
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }}>
+          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>
             <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}

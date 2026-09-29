@@ -4,12 +4,17 @@ import Link from "./Link";
 export default function SectionTabs({
   label,
   tabs,
+  bare,
 }: {
   label: string;
   tabs: { label: string; href: string; on: boolean }[];
+  /** Embedded contexts (like the App shell outlet) drop the page
+   *  padding; full-bleed pages keep it. Styling stays the shared
+   *  `section-nav` kit either way. */
+  bare?: boolean;
 }) {
   return (
-    <nav className="section-nav px-4 lg:px-8" aria-label={`${label} sections`}>
+    <nav className={`section-nav${bare ? "" : " px-4 lg:px-8"}`} aria-label={`${label} sections`}>
       {tabs.map((t) => (
         <Link
           key={t.label}

@@ -1,11 +1,71 @@
 import { useEffect, useRef, useState } from "react";
+import { useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
+import SectionTabs from "../../ui/SectionTabs";
 import type { Viewer } from "../projects/work";
 import CrmShell from "./CrmCustomers";
 import type { HostScope } from "./hostActions";
 
 export type OutletView = "list" | "new";
+
+/** CRM nested sections under Apps → CRM (CAD-784). */
+export type CrmSection = "customers" | "segments" | "campaigns";
+
+/** The CRM submenu in host display order. Shared by the outlet
+ *  shortcuts and the board-level App menu. */
+export const CRM_SECTIONS: [CrmSection, string][] = [
+  ["customers", "Customers"],
+  ["segments", "Segments"],
+  ["campaigns", "Campaigns"],
+];
+
+export interface AppMenuSection {
+  label: string;
+  href: string;
+  current: boolean;
+}
+
+export interface AppMenu {
+  /** Verified installation title, e.g. "CRM". */
+  title: string;
+  sections: AppMenuSection[];
+}
+
+/**
+ * Board-level App menu data for an active CRM installation. Pure —
+ * unit-tested. Callers must only feed it verified installation
+ * detail (never the bare route): AppShell reports kind/title from
+ * its HTTP receipt, and App.tsx matches the installId to the route.
+ */
+export function crmAppMenu(href: string, title: string, active: CrmSection): AppMenu {
+  return {
+    title,
+    sections: CRM_SECTIONS.map(([key, label]) => ({
+      label,
+      href: crmSectionHref(href, key),
+      current: active === key,
+    })),
+  };
+}
+
+/**
+ * Section links for the host-owned CRM submenu. They keep the selected
+ * context (and any other host params), drop the record view and any
+ * New form — a section switch never carries a drawer or a draft — and
+ * never carry record content. Pure — unit-tested through the mounted
+ * shell suite.
+ */
+export function crmSectionHref(href: string, section: CrmSection): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  if (section === "customers") q.delete("crm");
+  else q.set("crm", section);
+  q.delete("appview");
+  q.delete("record");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
+}
 
 /**
  * The installed-App outlet (CAD-802 shell, CAD-781 CRM Customers).
@@ -15,38 +75,66 @@ export type OutletView = "list" | "new";
  */
 export default function CrmOutlet({
   scope,
+  scopedChatMessage,
   installationTitle,
   appKind,
   view,
   recordId,
+  section,
   viewer,
   onView,
   onSelect,
   onRecordCreated,
 }: {
   scope: HostScope;
+  /** CAD-813: the operator's newest left-chat message daemon-stamped
+   *  with this scope — the mint's message_id. `null` until one
+   *  exists; generic Apps ignore it. */
+  scopedChatMessage?: string | null;
   installationTitle: string;
   /** CRM names its records; every other App stays neutral. */
   appKind: "crm" | "generic";
   view: OutletView;
   recordId: string | null;
+  /** Nested CRM section from the route; generic Apps ignore it. */
+  section?: CrmSection;
   viewer: Viewer;
   onView: (view: OutletView) => void;
   onSelect: (recordId: string | null) => void;
   /** Atomic created-record landing (list + details in one URL write). */
   onRecordCreated?: (recordId: string) => void;
 }) {
+  // Host-owned submenu (CAD-499 v4): Apps → CRM → sections lives in
+  // the shared outlet switch as real links — not buttons inside the
+  // CRM pane — so direct links, new-tab opens, breadcrumbs and the
+  // persistent left chat all keep working. Only the query changes, so
+  // the shell (and its single ChatPane) stays mounted across moves.
+  const href = useHref();
   if (appKind === "crm") {
+    const active = section ?? "customers";
     return (
-      <CrmShell
-        scope={scope}
-        viewer={viewer}
-        view={view}
-        recordId={recordId}
-        onView={onView}
-        onSelect={onSelect}
-        onRecordCreated={onRecordCreated}
-      />
+      <>
+        <SectionTabs
+          bare
+          label="CRM"
+          tabs={CRM_SECTIONS.map(([key, label]) => ({
+            label,
+            href: crmSectionHref(href, key),
+            on: active === key,
+          }))}
+        />
+        <CrmShell
+          scope={scope}
+          scopedChatMessage={scopedChatMessage ?? null}
+          viewer={viewer}
+          view={view}
+          recordId={recordId}
+          section={active}
+          onView={onView}
+          onSelect={onSelect}
+          onRecordCreated={onRecordCreated}
+        />
+      </>
     );
   }
   return (
