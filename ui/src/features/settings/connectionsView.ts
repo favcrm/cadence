@@ -90,6 +90,30 @@ export function smtpSummary(row: Connection): string | null {
   return `${smtp.host}:${smtp.port} · ${mode} · ${name}<${smtp.sender}> · login ${smtp.username}`;
 }
 
+/**
+ * Mirrors the daemon's `validate_port_tls` (src/platform/smtp.rs):
+ * a public host submits on exactly (465, implicit) or (587, starttls);
+ * the isolated-test host `localhost` may bind any port — the rig uses
+ * ephemeral loopback ports — but the TLS mode stays mandatory either
+ * way. There is no plaintext mode on any host or port.
+ */
+export function smtpPortTlsError(host: string, port: string, tlsMode: string): string | null {
+  if (tlsMode !== "implicit" && tlsMode !== "starttls") {
+    return "SMTP submission requires implicit TLS or mandatory STARTTLS.";
+  }
+  if (!/^\d+$/.test(port)) {
+    return "SMTP port is a number between 1 and 65535.";
+  }
+  const n = Number(port);
+  if (n < 1 || n > 65535) {
+    return "SMTP port is a number between 1 and 65535.";
+  }
+  const normalized = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (normalized === "localhost") return null;
+  if ((n === 465 && tlsMode === "implicit") || (n === 587 && tlsMode === "starttls")) return null;
+  return "Port 465 pairs with implicit TLS; port 587 pairs with STARTTLS.";
+}
+
 /** The wizard's scope hint: the union of the reviewed capability scopes. */
 export function scopeHint(provider: ConnectionProvider): string[] {
   const seen = new Set<string>();

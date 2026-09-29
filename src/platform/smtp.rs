@@ -363,7 +363,7 @@ fn validate_sender_name(name: &str) -> Result<()> {
     if name.len() > SENDER_NAME_BYTES
         || (!name.is_empty() && name.trim() != name)
         || name.chars().any(char::is_control)
-        || name.contains(['<', '>', '\r', '\n', '"', '`'])
+        || name.contains(['<', '>', '\r', '\n', '"', '`', '\\'])
         || !name.is_ascii()
     {
         return Err(Error::rejected(
@@ -1331,6 +1331,18 @@ mod tests {
         params["port"] = json!(465);
         params["tls_mode"] = json!("implicit");
         parse_enrollment(&params).unwrap();
+    }
+
+    #[test]
+    fn sender_name_refuses_quoted_string_breakers() {
+        // `header_address` interpolates the display name into a
+        // quoted string with no escaping, so `"` and `\` would both
+        // break out or splice an escape into the header.
+        assert!(validate_sender_name("CRM News").is_ok());
+        assert!(validate_sender_name("").is_ok());
+        for name in ["News \"dept\"", "News \\ sales", "a\nb", "héllo"] {
+            assert!(validate_sender_name(name).is_err(), "{name:?}");
+        }
     }
 
     #[test]

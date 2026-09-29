@@ -17,6 +17,7 @@ import {
   pinWord,
   readinessText,
   scopeHint,
+  smtpPortTlsError,
   smtpSummary,
 } from "./connectionsView";
 import { connectionLabel } from "../../lib/connections";
@@ -638,8 +639,9 @@ function AddConnection({
         setError("Fill in the host, port, login, password and verified sender for the SMTP sender.");
         return;
       }
-      if ((port === "465") !== (smtp.tls_mode === "implicit")) {
-        setError("Port 465 pairs with implicit TLS; port 587 pairs with STARTTLS.");
+      const portTlsError = smtpPortTlsError(smtp.host.trim(), port, smtp.tls_mode);
+      if (portTlsError) {
+        setError(portTlsError);
         return;
       }
       setBusy(true);

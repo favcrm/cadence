@@ -11,6 +11,7 @@ import {
   pinWord,
   readinessText,
   scopeHint,
+  smtpPortTlsError,
   smtpSummary,
 } from "../src/features/settings/connectionsView";
 import { connectionLabel, isLocalOutbox } from "../src/lib/connections";
@@ -187,6 +188,24 @@ equal(
 );
 equal(connectionCapabilities([provider()], "unknown"), null, "unknown provider");
 equal(connectionCapabilities([], "local"), null, "no providers");
+
+// The client port/TLS gate mirrors the daemon's validate_port_tls:
+// public hosts accept exactly (465, implicit) and (587, starttls);
+// localhost keeps the mandatory mode but any port (ephemeral rig).
+equal(smtpPortTlsError("mail.example.com", "465", "implicit"), null, "465 implicit ok");
+equal(smtpPortTlsError("mail.example.com", "587", "starttls"), null, "587 starttls ok");
+equal(typeof smtpPortTlsError("mail.example.com", "465", "starttls"), "string", "465 starttls refused");
+equal(typeof smtpPortTlsError("mail.example.com", "587", "implicit"), "string", "587 implicit refused");
+equal(typeof smtpPortTlsError("mail.example.com", "2525", "starttls"), "string", "2525 refused");
+equal(typeof smtpPortTlsError("mail.example.com", "25", "implicit"), "string", "port 25 refused");
+equal(typeof smtpPortTlsError("mail.example.com", "465", "none"), "string", "plaintext mode refused");
+equal(smtpPortTlsError("localhost", "40211", "implicit"), null, "localhost ephemeral implicit ok");
+equal(smtpPortTlsError("localhost", "51997", "starttls"), null, "localhost ephemeral starttls ok");
+equal(smtpPortTlsError("localhost", "465", "implicit"), null, "localhost 465 ok");
+equal(smtpPortTlsError("localhost.", "587", "starttls"), null, "localhost trailing dot ok");
+equal(typeof smtpPortTlsError("localhost", "0", "implicit"), "string", "port 0 refused");
+equal(typeof smtpPortTlsError("localhost", "70000", "implicit"), "string", "port over 65535 refused");
+equal(typeof smtpPortTlsError("LOCALHOST", "40211", "implicit"), "string", "localhost is exact, not case-folded");
 
 // The Settings Connections route survives refresh and paste.
 equal(matchRoute("/settings/connections"), { screen: "settings", section: "connections" }, "match connections");
