@@ -177,13 +177,40 @@ class ReceiptTests(unittest.TestCase):
             argv = ["staging-receipt", "--trigger", "schedule", "--staging-run-id", "10",
                     "--staging-run-attempt", "1", "--candidate-json", str(candidate),
                     "--baseline-json", str(root / "absent.json"),
-                    "--mvp", "pass", "--rehearsal", "skip", "--digest-recheck", "pass",
+                    "--mvp", "success", "--rehearsal", "skipped", "--digest-recheck", "success",
                     "--expected-digest", "d" * 64, "--out", str(out)]
             mod.main(argv)
             receipt = json.loads(out.read_text())
             self.assertEqual(receipt["decision"], "failed")
             self.assertIn("migration_rehearsal", receipt["reason"])
             self.assertTrue(receipt["baseline"]["unverified"])
+            self.assertEqual(receipt["gates"], {"mvp_journey": "pass",
+                                                 "migration_rehearsal": "skip",
+                                                 "digest_recheck": "pass"})
+
+    def test_staging_receipt_cli_accepts_success_and_fails_closed_on_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.json"
+            candidate.write_text(json.dumps({"ci_run_id": 42, "ci_run_attempt": 1,
+                                             "source_sha": GOOD_SHA, "sha256": "d" * 64}))
+            baseline_file = root / "baseline.json"
+            baseline_file.write_text(json.dumps(baseline()))
+            out = root / "receipt.json"
+            argv = ["staging-receipt", "--trigger", "workflow_dispatch",
+                    "--staging-run-id", "10", "--staging-run-attempt", "1",
+                    "--candidate-json", str(candidate), "--baseline-json", str(baseline_file),
+                    "--mvp", "success", "--rehearsal", "success",
+                    "--digest-recheck", "success", "--out", str(out)]
+            mod.main(argv)
+            receipt = json.loads(out.read_text())
+            self.assertEqual(receipt["decision"], "staged")
+            self.assertEqual(set(receipt["gates"].values()), {"pass"})
+            argv[argv.index("--rehearsal") + 1] = "cancelled"
+            mod.main(argv)
+            receipt = json.loads(out.read_text())
+            self.assertEqual(receipt["decision"], "failed")
+            self.assertIn("unknown gate outcome", receipt["reason"])
 
     def test_staging_receipt_cli_rejects_digest_swap(self):
         with tempfile.TemporaryDirectory() as directory:
