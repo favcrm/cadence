@@ -111,7 +111,13 @@ is a display hint, not a retained image asset.
 ## Generate one image from a retained post or pasted facts
 
 An operator may bind the `image` capability to a company-scoped AgenticOS
-device connection with `provider.draft` scope. This binding requires a
+device connection whose credential carries the AgenticOS runtime `draft`
+scope. The media routes reject provider-audience `provider.*` credentials
+with `403 insufficient_scope`, and credential audiences cannot mix, so this
+is a separate connection from the source read's `provider.read` credential.
+Cadence's internal capability scope label for the binding stays
+`provider.draft` — that label is Cadence's review vocabulary, not the
+upstream runtime scope. This binding requires a
 matching manifest pin in root-owned provider deployment metadata; without
 that pin, image price discovery stays closed. The approval screen shows
 the current per-image rate read from AgenticOS; the run is billed at the

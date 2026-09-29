@@ -70,6 +70,14 @@ async function main() {
   assert(verified.at(-1)?.receiptId === receipt.id && verified.at(-1)?.digest === digest, "Exact retained digest can unlock release");
   assert(verified.at(-1)?.subject === imageSubject(run), "Release pin binds the selected run, image binding and source");
   assert(host.textContent?.includes("Independent review pinned these bytes"), "Board explains the reviewer pin");
+  assert(host.textContent?.includes("Billed USD 0.031500"), "Receipt shows the actual billed charge");
+  assert(!host.textContent?.includes("approved rate was"), "An equal approved rate is not restated");
+  returnedReceipt = { ...receipt, result: { ...receipt.result, charge: { ...receipt.result.charge, amount: "0.040000" } } };
+  await render({ ...run, state: "running" });
+  await settleUntil(() => !!host.textContent?.includes("approved rate was USD 0.031500"), "A billed charge above the approved rate must show the approved rate");
+  returnedReceipt = receipt;
+  await render(run);
+  await settleUntil(() => verified.at(-1)?.receiptId === receipt.id && !host.textContent?.includes("approved rate was"), "Matching charge did not hide the approved-rate suffix");
   let releaseResults!: () => void;
   holdResults = new Promise(resolve => { releaseResults = resolve; });
   await render({ ...run, state: "failed" });
