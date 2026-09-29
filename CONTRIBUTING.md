@@ -63,7 +63,7 @@ Check `cadence build-slot --help` and the project's configured recipes; recipe
 names are project configuration, not universal commands. The admitted focused
 test recipe for external reviewers — exact `build.recipes` proposal, fixed
 invocation and runbook — is documented in
-docs/EXTERNAL-TEST-RECIPE.md. If identity or recipe
+[docs/EXTERNAL-TEST-RECIPE.md](docs/EXTERNAL-TEST-RECIPE.md). If identity or recipe
 configuration refuses admission, report that blocker to the operator rather
 than running an unadmitted build. A suite lock is separate from build admission.
 

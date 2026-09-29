@@ -8,8 +8,8 @@ CAD-230's daemon-launched runner — `cadence build-slot launch <recipe>
 --project cadence --worktree <lane>` — which runs a **fixed**
 `build.recipes` entry from the `cadence` project's `project.yaml`.
 Nothing about the command comes from the request: unknown recipes,
-forged callers and any attempt to smuggle argv/env/worktree fields are
-refused before anything spawns (see "Refusals" below).
+forged callers and any attempt to smuggle command, cwd or env text
+are refused before anything spawns (see "Refusals" below).
 
 ## Status
 
@@ -71,8 +71,11 @@ build:
 
 ## External reviewer runbook
 
-From any shell that can reach the daemon (no pane or managed endpoint
-needed — an attached operator shell qualifies):
+From a shell that proves operator identity. A pane-less external
+reviewer has no pane agent and no managed endpoint, so
+`launch_requester` admits it only as the proven operator — an
+arbitrary daemon-reachable shell is refused, and the refusal names
+the failed proof. In practice this means an attached operator shell:
 
 ```bash
 cadence build-slot launch focused-confinement-kickoff \
@@ -85,8 +88,10 @@ with the recipe's exit code. Variants:
 - `--detach` prints the runner id and returns at once; read the result
   later with `cadence build-slot runner <id>`.
 - `--worktree` must be a checkout of a repo registered to project
-  `cadence` (a lane worktree qualifies). Omit it only when the cwd
-  already resolves to the project.
+  `cadence` (a lane worktree qualifies). Always pass it alongside an
+explicit `--project cadence`: in that case the CLI does not forward
+  the cwd, and the runner would otherwise default to the project's
+  first registered checkout instead of the intended lane.
 - `--wait-secs <n>` bounds only the slot queue (default 600); a queue
   timeout never starts the recipe.
 
@@ -100,7 +105,9 @@ path under the state dir. The log holds the full `cargo test` output.
 - Unknown recipe: `Unknown recipe '<name>' for project 'cadence' — it
   defines: focused-confinement-kickoff. Recipes come only from
   build.recipes in the project's project.yaml`.
-- Extra request fields (any `argv`/`env`/`cwd` override attempt):
+- Command/cwd/env overrides: no request field names a command — only
+  `recipe`, `project`, `worktree` and `wait_secs` are accepted (`--worktree`
+  itself is legitimate), so any command-shaped extra field is refused:
   `build-slot launch takes only recipe, project, worktree and wait_secs
   — '<field>' is refused`.
 - Foreign checkout: `'<path>' is not a checkout of a repo registered to
@@ -123,9 +130,12 @@ record on CAD-794:
 
 ## Operator apply step (the remaining step after this PR)
 
-1. Insert the YAML above into the `cadence` project's `project.yaml`
-   under `build: recipes:`, replacing `<HOST SUITE LOCK>` with the
-   host's designated suite-lock path.
+1. Add the YAML above as a top-level `build:` block in the `cadence`
+   project's `project.yaml`, replacing `<HOST SUITE LOCK>` with the
+   host's designated suite-lock path. If a top-level `build:` mapping
+   already exists, merge only the `focused-confinement-kickoff:`
+   mapping under the existing `build: recipes:` — never nest a second
+   `build:` inside `recipes:`.
 2. From an external operator session, run the runbook command in a CAD
    lane and confirm the exit receipt carries the lane's `HEAD` and the
    focused test result.
