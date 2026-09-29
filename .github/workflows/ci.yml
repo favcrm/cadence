@@ -158,6 +158,9 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component clippy
+      # Rust build cache (pinned): dependency artifacts keyed on
+      # toolchain + lockfile; final binaries always rebuild from sources.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --locked -- -D warnings
       # CAD-482: the test seam's gated code is dead to a default clippy
       # run — lint the feature-on shape too so it cannot rot.
@@ -200,6 +203,8 @@ jobs:
       - name: Test scope selection and execution contracts
         run: python3 tests/scripts/test_ci_test_plan.py
       - run: rustup toolchain install stable --profile minimal
+        if: steps.scope.outputs.mode != 'docs'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.scope.outputs.mode != 'docs'
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
@@ -270,7 +275,7 @@ jobs:
             cat "$RUNNER_TEMP/ci-test-plan.json"
             printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
             printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
-            echo 'profile=test (dev settings in Cargo.toml); no Rust cache action configured; actual warm/cold/cache hits not measured'
+            echo 'profile=test (dev settings in Cargo.toml); Rust cache via pinned Swatinem/rust-cache; actual warm/cold/cache hits not measured'
             sha256sum Cargo.toml Cargo.lock .config/nextest.toml
             echo 'Integration targets importing common (each unit also includes its own tests and link):'
             git grep -l '^mod common;' -- 'tests/*.rs'
@@ -349,6 +354,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --release --locked
       - name: Rehearse offline hosted migration with the built CLI
         env:
@@ -409,6 +415,7 @@ jobs:
       - name: Verify app development isolation and HMR
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
 
@@ -460,6 +467,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
@@ -668,6 +676,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
@@ -863,6 +872,7 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked
       - run: target/debug/cadence --version
 
