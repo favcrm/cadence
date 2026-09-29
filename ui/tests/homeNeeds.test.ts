@@ -189,4 +189,32 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   );
 }
 
+// CAD-140 — a researched idea waiting on the operator is a first-class
+// decision row: it parses to the idea action, ranks with plans, lands in
+// Decisions, and degrades to its command when the subject is not an issue.
+{
+  const needs = homeNeeds([
+    row({
+      kind: "idea_plan",
+      audience: "operator",
+      title: "idea plan ready for your decision — D-9 Dark mode",
+      age: 300,
+      subject: { kind: "issue", id: "D-9" },
+    }),
+    row({
+      kind: "question",
+      audience: "operator",
+      title: "q",
+      age: 120,
+      subject: { kind: "report", id: "D-2/q.md" },
+      question: { issue: "D-2", report: "q.md", agent: "w1" },
+    }),
+  ]);
+  equal(needs.map((n) => n.kind), ["idea_plan", "question"], "idea ranks with plans");
+  equal(needs[0].action, { type: "idea", issue: "D-9" }, "idea_plan → decide");
+  equal(needs[0].owner, "operator", "idea owner falls back to the operator");
+  const bad = homeNeeds([row({ kind: "idea_plan", audience: "operator", title: "bad", subject: { kind: "row", id: "x" } })]);
+  equal(bad[0].action.type, "command", "a non-issue subject keeps the command");
+}
+
 console.log("home needs checks passed");

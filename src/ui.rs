@@ -1571,6 +1571,10 @@ struct NewIssueReq {
     tags: Option<Vec<String>>,
     parent: Option<String>,
     blocked_by: Option<Vec<String>>,
+    /// CAD-140: the board's report/idea composer files the description
+    /// with the issue — one call instead of create-then-comment.
+    /// `None`/blank keeps `new_issue`'s default body.
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2528,6 +2532,17 @@ fn write_route(
             }
         };
         let blocked_by = req.blocked_by.unwrap_or_default();
+        // CAD-140: a blank body keeps `new_issue`'s default; a real one
+        // is capped like `cadence report`'s (BODY_MAX) so a paste cannot
+        // stuff the tracker through the board in one call.
+        let body = req.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        if body.is_some_and(|b| b.len() > crate::issue::report::BODY_MAX) {
+            send(
+                request,
+                err_response(400, "issue body exceeds the 32 KB cap — trim it"),
+            );
+            return;
+        }
         match issue_write::new_issue(
             &pm,
             &pm.dir,
@@ -2540,7 +2555,7 @@ fn write_route(
             req.component.as_deref(),
             &req.tags.unwrap_or_default(),
             None,
-            None,
+            body,
             &actor,
         ) {
             Ok(out) => {
@@ -5194,5 +5209,29 @@ mod tests {
         assert!(proxied_actor(Some("")).is_err());
         assert!(proxied_actor(Some("   ")).is_err());
         assert!(proxied_actor(Some("bad\u{1}login")).is_err());
+    }
+
+    /// CAD-140: the board's create takes an optional description body
+    /// for filed reports and ideas — and still refuses unknown fields,
+    /// so a forged `by`/`actor` never reaches the tracker write.
+    #[test]
+    fn new_issue_body_is_optional_and_unlisted_fields_refused() {
+        let bare: super::NewIssueReq = serde_json::from_value(serde_json::json!({
+            "project": "demo", "title": "t",
+        }))
+        .unwrap();
+        assert!(bare.body.is_none());
+        let filed: super::NewIssueReq = serde_json::from_value(serde_json::json!({
+            "project": "demo", "title": "t", "tags": ["intake", "idea"],
+            "body": "t\n\nwhy this matters",
+        }))
+        .unwrap();
+        assert_eq!(filed.body.as_deref(), Some("t\n\nwhy this matters"));
+        assert!(
+            serde_json::from_value::<super::NewIssueReq>(serde_json::json!({
+                "project": "demo", "title": "t", "by": "operator",
+            }))
+            .is_err()
+        );
     }
 }

@@ -272,6 +272,8 @@ export const api = {
     tags?: string[];
     parent?: string;
     blocked_by?: string[];
+    /** CAD-140: the report/idea description, filed with the issue. */
+    body?: string;
   }) => write("POST", "/api/issues", req),
 
   patch: (
@@ -427,6 +429,21 @@ export const api = {
   /** `POST /api/issues/<id>/answers` — the operator's answer report. */
   answer: (issue: string, question: string, text: string) =>
     write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
+  /**
+   * `POST /api/ideas/<id>/decide` (CAD-140) — the operator's idea
+   * decision: `approve` takes nothing, `reject` needs a reason, `park`
+   * needs a `park_until` date. Attribution is the board's proven
+   * connection, never a body field.
+   */
+  ideaDecide: (
+    issue: string,
+    action: "approve" | "reject" | "park",
+    opts?: { reason?: string; park_until?: string },
+  ) =>
+    post<Record<string, unknown>>(
+      `/api/ideas/${encodeURIComponent(issue)}/decide`,
+      { action, ...(opts?.reason ? { reason: opts.reason } : {}), ...(opts?.park_until ? { park_until: opts.park_until } : {}) },
+    ),
   /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
   workflows: (project: string) =>
     get<WorkflowsPayload>(`/api/projects/${encodeURIComponent(project)}/workflows`),

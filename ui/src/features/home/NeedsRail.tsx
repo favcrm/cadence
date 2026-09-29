@@ -18,6 +18,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import Button from "../../ui/Button";
 import PermissionCard from "./PermissionCard";
 import PlanCard from "./PlanCard";
+import IdeaCard from "./IdeaCard";
 import Link from "../../ui/Link";
 
 /** One row of a rail's inline menu (the `…` overflow and the Unfence
@@ -27,6 +28,7 @@ const MENU_ITEM =
 
 const KIND_CHIP: Record<string, string> = {
   plan: "bg-warn/10 text-warn",
+  idea_plan: "bg-warn/10 text-warn",
   question: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
   master_permission: "bg-warn/10 text-warn",
@@ -318,11 +320,13 @@ function NeedItem({
   const expandLabel =
     action.type === "plan"
       ? "Review plan"
-      : action.type === "answer"
-        ? "Answer"
-        : action.type === "permission"
-          ? "Decide"
-          : "Review merge";
+      : action.type === "idea"
+        ? "Decide"
+        : action.type === "answer"
+          ? "Answer"
+          : action.type === "permission"
+            ? "Decide"
+            : "Review merge";
   return (
     <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
       <div className="flex items-center gap-2 min-w-0">
@@ -353,6 +357,7 @@ function NeedItem({
             Ask master
           </button>
           {(action.type === "plan" ||
+            action.type === "idea" ||
             action.type === "answer" ||
             action.type === "merge" ||
             action.type === "permission") && (
@@ -456,6 +461,16 @@ function NeedItem({
       {open && action.type === "plan" && (
         <div className="mt-2">
           <PlanCard epic={action.epic} readOnly={readOnly} onOpenIssue={onOpenIssue} />
+        </div>
+      )}
+      {open && action.type === "idea" && !done && (
+        <div className="mt-2">
+          <IdeaCard
+            issue={action.issue}
+            readOnly={readOnly}
+            onOpenIssue={onOpenIssue}
+            onDecided={(id, decided) => setDone(`${id} ${decided}`)}
+          />
         </div>
       )}
       {open && action.type === "merge" && !done && (
