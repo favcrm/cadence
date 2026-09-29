@@ -112,8 +112,9 @@ pub struct RiskRule {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskWhen {
-    /// Repo-relative path globs (`*`, `**`, `?`); slice 3 owns
-    /// matching, this slice only validates the syntax.
+    /// Repo-relative path globs (`*` inside a segment, `**` a whole
+    /// one); slice 3 owns matching, this slice only validates the
+    /// syntax.
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -192,12 +193,34 @@ fn err(msg: impl std::fmt::Display) -> Error {
     Error::rejected(format!("PROJECT.md delivery: {msg}"))
 }
 
+/// A serde_yaml error can echo a rejected key or value raw; strip
+/// control characters so none reach a lint warning or a `project ls`
+/// note (newline and tab stay — they are benign formatting).
+fn yaml_err(e: impl std::fmt::Display) -> Error {
+    err(sanitized(e))
+}
+
+/// The control characters of an echoed error text escaped, newline and
+/// tab kept (benign formatting).
+fn sanitized(e: impl std::fmt::Display) -> String {
+    e.to_string()
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                c.escape_debug().collect()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 impl RawReview {
     fn into_review(self, name: &str) -> Result<Review> {
         let refused = |key: &str, has: &Option<String>| -> Result<()> {
             if has.is_some() {
                 return Err(err(format!(
-                    "reviews.{name}: a '{}' review takes no '{key}'",
+                    "reviews.{name:?}: a {:?} review takes no '{key}'",
                     self.kind
                 )));
             }
@@ -208,11 +231,13 @@ impl RawReview {
                 refused("app", &self.app)?;
                 refused("mode", &self.mode)?;
                 let focus = self.focus.ok_or_else(|| {
-                    err(format!("reviews.{name}: an 'agent' review needs a 'focus'"))
+                    err(format!(
+                        "reviews.{name:?}: an 'agent' review needs a 'focus'"
+                    ))
                 })?;
                 if !FOCI.contains(&focus.as_str()) {
                     return Err(err(format!(
-                        "reviews.{name}.focus '{focus}': not a known focus ({})",
+                        "reviews.{name:?}.focus {focus:?}: not a known focus ({})",
                         FOCI.join(", ")
                     )));
                 }
@@ -221,25 +246,27 @@ impl RawReview {
             "check" => {
                 refused("focus", &self.focus)?;
                 let app = self.app.ok_or_else(|| {
-                    err(format!("reviews.{name}: a 'check' review needs an 'app'"))
+                    err(format!("reviews.{name:?}: a 'check' review needs an 'app'"))
                 })?;
                 if !valid_app(&app) {
                     return Err(err(format!(
-                        "reviews.{name}.app '{app}': not a GitHub App slug \
+                        "reviews.{name:?}.app {app:?}: not a GitHub App slug \
                          (^[a-z0-9][a-z0-9-]{{0,99}}$) or an App id (all digits)"
                     )));
                 }
                 let mode = match self.mode.as_deref() {
                     None => {
                         return Err(err(format!(
-                            "reviews.{name}: a 'check' review needs a 'mode' \
+                            "reviews.{name:?}: a 'check' review needs a 'mode' \
                              (advisory|required)"
                         )))
                     }
                     Some("advisory") => CheckMode::Advisory,
                     Some("required") => CheckMode::Required,
                     Some(m) => {
-                        return Err(err(format!("reviews.{name}.mode '{m}': advisory|required")))
+                        return Err(err(format!(
+                            "reviews.{name:?}.mode {m:?}: advisory|required"
+                        )))
                     }
                 };
                 Ok(Review::Check { app, mode })
@@ -251,7 +278,7 @@ impl RawReview {
                 Ok(Review::Operator)
             }
             other => Err(err(format!(
-                "reviews.{name}.kind '{other}': unknown kind (agent|check|operator)"
+                "reviews.{name:?}.kind {other:?}: unknown kind (agent|check|operator)"
             ))),
         }
     }
@@ -342,14 +369,14 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
     }
     let (yaml, _) = parse::split_front(trimmed)?;
     let front: Front = serde_yaml::from_str(yaml)
-        .map_err(|e| Error::rejected(format!("PROJECT.md frontmatter: {e}")))?;
+        .map_err(|e| Error::rejected(format!("PROJECT.md frontmatter: {}", sanitized(e))))?;
     let Some(value) = front.delivery else {
         return Ok(None);
     };
     if value.is_null() {
         return Ok(None);
     }
-    let raw: RawDelivery = serde_yaml::from_value(value).map_err(err)?;
+    let raw: RawDelivery = serde_yaml::from_value(value).map_err(yaml_err)?;
     let policy = raw.into_policy()?;
     policy.validate()?;
     Ok(Some(policy))
@@ -551,11 +578,14 @@ fn valid_app(app: &str) -> bool {
 
 /// A `when.paths` entry: a repo-relative glob — non-empty, no leading
 /// `/`, no `..` segment, no `\`, no control characters and none of
-/// `[` `]` `{` `}`; `*`, `**` and `?` are the only wildcards (slice 3
-/// owns their semantics).
+/// `[` `]` `{` `}` `?`; `*` may appear inside a segment and `**` only
+/// as a whole segment (slice 3 owns their semantics).
 fn check_glob(path: &str) -> Result<()> {
     // Callers add the `PROJECT.md delivery:` prefix (and the rule index).
-    let bad = |msg: &str| Error::rejected(format!("when.paths entry '{path}': {msg}"));
+    // `{path:?}` escapes it — the entry is rejected text and may carry
+    // a control character, which must never reach a lint warning or a
+    // `project ls` note raw.
+    let bad = |msg: &str| Error::rejected(format!("when.paths entry {path:?}: {msg}"));
     if path.is_empty() {
         return Err(bad("empty"));
     }
@@ -568,11 +598,21 @@ fn check_glob(path: &str) -> Result<()> {
     if path.chars().any(|c| c.is_control()) {
         return Err(bad("a control character"));
     }
-    if path.contains('[') || path.contains(']') || path.contains('{') || path.contains('}') {
-        return Err(bad("only '*', '**' and '?' wildcards are allowed"));
+    if path.contains('[')
+        || path.contains(']')
+        || path.contains('{')
+        || path.contains('}')
+        || path.contains('?')
+    {
+        return Err(bad("only '*' and '**' wildcards are allowed"));
     }
-    if path.split('/').any(|seg| seg == "..") {
-        return Err(bad("a '..' segment"));
+    for seg in path.split('/') {
+        if seg == ".." {
+            return Err(bad("a '..' segment"));
+        }
+        if seg.contains("**") && seg != "**" {
+            return Err(bad("'**' must be a whole path segment"));
+        }
     }
     Ok(())
 }
@@ -586,7 +626,7 @@ impl DeliveryPolicy {
         }
         for name in self.reviews.keys() {
             if !model::valid_tag(name) {
-                return Err(err(format!("reviews.{name}: not a valid name")));
+                return Err(err(format!("reviews.{name:?}: not a valid name")));
             }
         }
         if self.risk.is_empty() {
@@ -602,17 +642,17 @@ impl DeliveryPolicy {
             let mut seen = std::collections::HashSet::new();
             for req in &rule.require {
                 if !seen.insert(req) {
-                    return Err(err(format!("risk[{i}].require names '{req}' twice")));
+                    return Err(err(format!("risk[{i}].require names {req:?} twice")));
                 }
                 match self.reviews.get(req) {
                     None => {
                         return Err(err(format!(
-                            "risk[{i}].require names undefined review '{req}'"
+                            "risk[{i}].require names undefined review {req:?}"
                         )))
                     }
                     Some(r) if !r.blocking() => {
                         return Err(err(format!(
-                            "risk[{i}].require names '{req}', an advisory check — \
+                            "risk[{i}].require names {req:?}, an advisory check — \
                              advisory reviews never block: use mode: required or drop \
                              it from require"
                         )))
@@ -908,7 +948,7 @@ mod tests {
             ),
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [nope]}]}",
-                "undefined review 'nope'",
+                "undefined review \"nope\"",
             ),
             // 7: require may not name an advisory check.
             (
@@ -935,7 +975,7 @@ mod tests {
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
-                "'': empty",
+                "\"\": empty",
             ),
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
@@ -1025,15 +1065,76 @@ mod tests {
             assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
         }
         // …and the floor accepts an agent, an operator or a required
-        // check; `?`, `*` and `**` are all legal wildcards.
+        // check.
         for yaml in [
             "delivery: {reviews: {g: {kind: operator}}, risk: [{require: [g]}]}",
             "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, risk: [{require: [c]}]}",
             "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a?b', '**', 'x/**/y']}, require: [r]}]}",
+                       risk: [{require: [r]}, {when: {paths: ['**', 'x/**/y']}, require: [r]}]}",
         ] {
             assert!(parse_delivery(yaml).unwrap().is_some(), "{yaml}");
         }
+    }
+
+    /// `when.paths` glob syntax: `*` inside a segment, `**` a whole
+    /// one — nothing else.
+    #[test]
+    fn glob_syntax_is_star_and_whole_segment_star_star() {
+        let parse_paths = |paths: &str| {
+            parse_delivery(&format!(
+                "delivery: {{reviews: {{r: {{kind: agent, focus: general}}}}, \
+                 risk: [{{require: [r]}}, {{when: {{paths: [{paths}]}}, require: [r]}}]}}"
+            ))
+        };
+        for (path, why) in [
+            ("'a**b'", "'**' must be a whole path segment"),
+            ("'ab**'", "'**' must be a whole path segment"),
+            ("'**b'", "'**' must be a whole path segment"),
+            ("'src/a**'", "'**' must be a whole path segment"),
+            ("'***'", "'**' must be a whole path segment"),
+            ("'a?b'", "only '*' and '**' wildcards are allowed"),
+        ] {
+            let e = parse_paths(path).unwrap_err().to_string();
+            assert!(e.contains(why), "{path} -> {e}");
+        }
+        for path in ["src/**", "**/x.rs", "src/*.rs", "a/**/b", "*", "**"] {
+            assert!(
+                parse_paths(&format!("'{path}'")).unwrap().is_some(),
+                "{path}"
+            );
+        }
+    }
+
+    /// Rejected text never reaches an error raw — a control character
+    /// in a `paths` entry (or any section string) is escaped. YAML
+    /// refuses raw control characters at the lexer, so the direct
+    /// `check_glob`/`validate` calls stand in for the file path.
+    #[test]
+    fn rejected_text_is_escaped_in_errors() {
+        let e = check_glob("a\u{7}b").unwrap_err().to_string();
+        assert!(e.contains("a control character"), "{e}");
+        assert!(e.chars().all(|c| !c.is_control() || c == '\n'), "{e:?}");
+        // A review name carrying a control character escapes the same.
+        let mut p = default_policy();
+        p.reviews.insert(
+            "r\u{7}".to_string(),
+            Review::Agent {
+                focus: "general".into(),
+            },
+        );
+        let e = p.validate().unwrap_err().to_string();
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // And serde_yaml's own echo of a rejected key is sanitized.
+        let e = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+             risk: [{require: [r]}], bogus\u{7}: 1}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'),
+            "{e:?}"
+        );
     }
 
     #[test]

@@ -490,8 +490,9 @@ other key. `reviews`, `risk` and each `require` are non-empty, with no
 duplicates and every `require` name defined — and never an advisory
 check. A `when` holds ≥ 1 condition; `lines_over`/`files_over` are ≥ 1
 and `paths` are non-empty repo-relative globs (no leading `/`, `..`
-segment, `\`, control character or `[`/`]`/`{`/`}` — `*`, `**`, `?`
-are the only wildcards; slice 3 owns matching). `heavy` sits strictly
+segment, `\`, control character or `[`/`]`/`{`/`}`/`?` — `*` may
+appear inside a segment, `**` only as a whole segment like `ui/**` or
+`a/**/b`; slice 3 owns matching). `heavy` sits strictly
 under `oversized`. And the safety floor: at least one unconditional
 rule must require a blocking review (`agent`, `operator` or a
 `required` check), so a merge can never need no review at all.
