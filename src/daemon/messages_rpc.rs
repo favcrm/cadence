@@ -80,6 +80,9 @@ impl Shared {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
+        if let Some(target) = &target {
+            crate::adapter::pi::refuse_confined_devin_agent(target)?;
+        }
         // CAD-158: `--priority urgent` / `--supersedes` steer the
         // recipient's queue — the operator or its own PM only
         // (`AgentMutation::Steer`), the caller derived from the

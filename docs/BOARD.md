@@ -110,7 +110,7 @@ fail-closed on both:
 
 ```yaml
 pi:
-  providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
+  providers: ["pi-devin@0.2.1"]            # extension pkgs, name@version
   agentic_providers: []                   # additional model provider namespaces
   models:
     allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
@@ -129,7 +129,13 @@ pi:
   back to `allow`. A confined master cannot run `devin/*` — the
   pi-devin extension shells out to a Devin CLI the sandbox cannot
   credential — so the master's list is typically the openrouter/other
-  subset while workers keep `devin/*`. An absent `[pi]` (or an empty
+  subset. Confined managed Pi workers also refuse `devin/*` before
+  registration or dispatch: pi-devin needs the operator's Devin login,
+  and granting that file would let a worker's tools disclose it.
+  Choose a non-Devin model for a confined worker, or have the operator
+  explicitly start an unconfined worker to use `devin/*`. The example
+  worker default above therefore requires an unconfined worker.
+  An absent `[pi]` (or an empty
   applicable list) allows nothing — a pi registration, start, or
   relaunch refuses rather than fall back. `model_policy:
   provider_default` is refused outright for pi.
@@ -235,7 +241,7 @@ unvetted build.
 
 ### Which models to use
 
-- **devin** models are the worker/reviewer path — check
+- **devin** models are the unconfined worker/reviewer path — check
   `devin models list` for cost_tier: `swe-2-{high,medium,max}` are
   **Free**; `deepseek-v4-1-flash-*` is low cost, not free. Default:
   `devin/swe-2-high` + `--effort max` (SWE-2 Max); DeepSeek V4.1 Flash
