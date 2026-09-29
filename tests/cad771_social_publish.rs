@@ -797,3 +797,69 @@ fn cad771_grant_bounds_reject_out_of_range_uses() {
     }
     assert_eq!(ledger.provider_calls(), 0);
 }
+
+#[test]
+fn cad771_revalidation_drift_tightening_against_landed_contract() {
+    // Field-for-field revalidation vs staging 3d6ced85: the landed
+    // sha256Schema is lowercase-only, cadenceApprovalId is max 120, and
+    // providerIds is max 10. Fail-open leniencies are refused here.
+    use cadence_agent::platform::agenticos_external::publish::{valid_digest, FakePublishLedger};
+    assert!(valid_digest(
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    ));
+    assert!(!valid_digest(
+        "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"
+    ));
+    let ledger = FakePublishLedger::enabled();
+    let dest = ig_destination();
+    // Uppercase caption digest refuses before any provider call.
+    let mut upper = ig_binding("cad771-drift-upper-01");
+    upper.caption_digest = upper.caption_digest.to_uppercase();
+    let mut grant = grant_for(&upper);
+    assert_eq!(
+        ledger
+            .execute(
+                &upper,
+                &dest,
+                &mut grant,
+                "ws_harbour",
+                NOW,
+                FakeProviderBehavior::Post
+            )
+            .unwrap_err()
+            .code,
+        "bad_caption_digest"
+    );
+    // Oversize approval identity refuses.
+    let binding = ig_binding("cad771-drift-approval-01");
+    let mut grant = grant_for(&binding);
+    grant.cadence_approval_id = "a".repeat(121);
+    assert_eq!(
+        ledger
+            .execute(
+                &binding,
+                &dest,
+                &mut grant,
+                "ws_harbour",
+                NOW,
+                FakeProviderBehavior::Post
+            )
+            .unwrap_err()
+            .code,
+        "grant_approval"
+    );
+    // Recorded provider evidence respects the landed max-10 bound.
+    let mut grant = grant_for(&binding);
+    let outcome = ledger
+        .execute(
+            &binding,
+            &dest,
+            &mut grant,
+            "ws_harbour",
+            NOW,
+            FakeProviderBehavior::Post,
+        )
+        .unwrap();
+    assert!(outcome.provider_ids.len() <= 10);
+    assert_eq!(ledger.provider_calls(), 1);
+}

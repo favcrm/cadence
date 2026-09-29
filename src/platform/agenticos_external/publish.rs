@@ -138,8 +138,13 @@ pub fn valid_connection_id(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// Lowercase 64-hex, exactly like the landed `sha256Schema`: uppercase
+/// never verifies backend-side, so the gate refuses it here too.
 pub fn valid_digest(raw: &str) -> bool {
-    raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+    raw.len() == 64
+        && raw
+            .bytes()
+            .all(|b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn valid_media_key(raw: &str) -> bool {
@@ -216,7 +221,9 @@ pub fn media_key_authorizes(
     }
     let prefix = parts[3];
     prefix.len() == 32
-        && prefix.bytes().all(|b| b.is_ascii_hexdigit())
+        && prefix
+            .bytes()
+            .all(|b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && digest.len() == 64
         && digest.starts_with(prefix)
 }
@@ -364,7 +371,7 @@ impl SendGrant {
                 "send grant is outside its validity window",
             ));
         }
-        if self.cadence_approval_id.is_empty() {
+        if self.cadence_approval_id.is_empty() || self.cadence_approval_id.len() > 120 {
             return Err(Refusal::new(
                 "grant_approval",
                 "send grant names no operator approval",
