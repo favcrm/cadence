@@ -560,9 +560,13 @@ impl Store {
                 "a new bundle needs a new version-pinned binding; update cannot rewrite an old version",
             ));
         }
-        // CAD-692: every update bumps the revision and closes waiting
-        // effects, even an identical re-save. CAD-796 withdraws the
-        // installation approval only when the covered material changed.
+        // CAD-796: an unchanged re-save is a complete no-op — same
+        // revision, open effects, standing approval. Only a material
+        // rebind (CAD-692) bumps the incarnation and closes the waiting
+        // effects pinned to the old one.
+        if row["config"] == *config {
+            return Ok(json!({"binding": row}));
+        }
         let material_changed = !binding_material_same(&row["config"], config);
         let slot = row["slot"]
             .as_str()

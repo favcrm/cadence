@@ -64,10 +64,10 @@ export function SlotBindings({
   return (
     <>
       <p className="wa-muted">
-        Saving a new connection closes this slot&apos;s waiting sends; saving a different
-        connection also withdraws this installation&apos;s approval until you re-approve
-        the changed binding. New runs pin the new binding. The daemon re-checks the
-        reviewed contract on every save.
+        Re-saving the same connection changes nothing. Choosing a different connection
+        closes this slot&apos;s waiting sends and withdraws this installation&apos;s approval
+        until you re-approve the changed binding. New runs pin the new binding. The daemon
+        re-checks the reviewed contract on every save.
       </p>
       {untyped.length > 0 && (
         <p className="wa-muted">

@@ -77,6 +77,7 @@ fn cad692_actual_operator_cli_binding_cas_and_exact_release_roundtrip() {
     let binding = success(&r.daemon, &args)["binding"].clone();
     assert_eq!(success(&r.daemon, &args)["binding"], binding);
     let id = binding["id"].as_str().unwrap();
+    let digest = r.install["digest"].as_str().unwrap();
     assert_eq!(
         success(&r.daemon, &["binding", "show", install, id])["binding"],
         binding
@@ -85,7 +86,9 @@ fn cad692_actual_operator_cli_binding_cas_and_exact_release_roundtrip() {
         success(&r.daemon, &["binding", "ls", install, "--context-id", ctx])["bindings"][0],
         binding
     );
-    let updated = success(
+    // CAD-796: re-saving the identical connection is a no-op — same
+    // revision, same receipt, no churn.
+    let resaved = success(
         &r.daemon,
         &[
             "binding",
@@ -99,18 +102,81 @@ fn cad692_actual_operator_cli_binding_cas_and_exact_release_roundtrip() {
         ],
     )["binding"]
         .clone();
-    assert_eq!(updated["revision"], 2);
+    assert_eq!(resaved, binding);
+    // CAS still holds on the unchanged pin: wrong revisions refuse.
     assert_ne!(
         cli(
             &r.daemon,
-            &["binding", "revoke", install, id, "--expected-revision", "1"]
+            &[
+                "binding",
+                "set",
+                install,
+                id,
+                "--expected-revision",
+                "999",
+                "--connection-id",
+                &r.connection,
+            ]
         )["rc"],
         0
     );
-    assert_eq!(
-        success(&r.daemon, &["binding", "show", install, id])["binding"],
-        updated
+    assert_ne!(
+        cli(
+            &r.daemon,
+            &[
+                "binding",
+                "revoke",
+                install,
+                id,
+                "--expected-revision",
+                "999"
+            ]
+        )["rc"],
+        0
     );
+    // A genuine rebind: revoke the old incarnation and bind anew. The
+    // rebind withdraws installation approval, so the operator re-approves
+    // the changed story before the exact release roundtrip continues.
+    success(
+        &r.daemon,
+        &["binding", "revoke", install, id, "--expected-revision", "1"],
+    );
+    let rebound = success(
+        &r.daemon,
+        &[
+            "binding",
+            "create",
+            install,
+            "--context-id",
+            ctx,
+            "--slot",
+            "publication",
+            "--connection-id",
+            &r.connection,
+            "--request-id",
+            "cli-binding-2",
+        ],
+    )["binding"]
+        .clone();
+    assert_ne!(rebound["id"], binding["id"]);
+    assert_eq!(rebound["revision"], 1);
+    success(
+        &r.daemon,
+        &["catalog", "approve", install, "--digest", digest],
+    );
+    let rebound_id = rebound["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        success(
+            &r.daemon,
+            &["binding", "show", install, rebound_id.as_str()]
+        )["binding"],
+        rebound
+    );
+    let listed =
+        success(&r.daemon, &["binding", "ls", install, "--context-id", ctx])["bindings"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0], rebound);
+    assert_eq!(listed[1]["state"], "revoked");
     let run = r.complete(&context, "cli-run");
     let run_id = run["id"].as_str().unwrap();
     let artifact = run["artifacts"][0]["id"].as_str().unwrap();

@@ -223,11 +223,10 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
         .app_binding_create("install-a", None, "publication", &config, "cad796-req-1")
         .unwrap();
     let id = first["binding"]["id"].as_str().unwrap().to_string();
-    // Identical re-save: the revision still bumps and waiting effects still
-    // close (CAD-692), but the installation approval and derived grants are
-    // untouched — no approval churn for an unchanged binding.
+    // Identical re-save: a complete no-op — same revision and receipt,
+    // open effects, standing approval and intact derived grants.
     let same = s.app_binding_update("install-a", &id, 1, &config).unwrap();
-    assert_eq!(same["binding"]["revision"], 2);
+    assert_eq!(same["binding"], first["binding"]);
     assert_eq!(approval_of(), Some("approved".into()));
     assert!(s
         .platform_grant("worker-a", "fixture", "work")
@@ -238,15 +237,15 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
     // Forged installation scope never reaches the guard: it refuses first.
     let mut forged = config.clone();
     forged["install_id"] = json!("install-b");
-    assert!(s.app_binding_update("install-a", &id, 2, &forged).is_err());
+    assert!(s.app_binding_update("install-a", &id, 1, &forged).is_err());
     assert!(s.app_binding_show("install-b", &id).is_err());
     assert_eq!(approval_of(), Some("approved".into()));
     // Material rebind: new connection incarnation withdraws approval and
     // the derived grant, and closes nothing it does not own.
     let mut changed = config.clone();
     changed["connection_id"] = json!("conn-b");
-    let second = s.app_binding_update("install-a", &id, 2, &changed).unwrap();
-    assert_eq!(second["binding"]["revision"], 3);
+    let second = s.app_binding_update("install-a", &id, 1, &changed).unwrap();
+    assert_eq!(second["binding"]["revision"], 2);
     assert_eq!(approval_of(), Some("revoked".into()));
     let grant = s
         .platform_grant("worker-a", "fixture", "work")
@@ -258,8 +257,8 @@ fn cad796_rebind_and_revoke_withdraw_approval_unchanged_resave_keeps_it() {
     s.app_capability_decide("install-a", digest, true).unwrap();
     assert_eq!(approval_of(), Some("approved".into()));
     // Revoke withdraws again; a concurrent stale revision never lands.
-    assert!(s.app_binding_revoke("install-a", &id, 2).is_err());
-    s.app_binding_revoke("install-a", &id, 3).unwrap();
+    assert!(s.app_binding_revoke("install-a", &id, 1).is_err());
+    s.app_binding_revoke("install-a", &id, 2).unwrap();
     assert_eq!(approval_of(), Some("revoked".into()));
 }
 
