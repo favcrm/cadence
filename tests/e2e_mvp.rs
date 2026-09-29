@@ -1000,6 +1000,30 @@ fn mvp_journey_end_to_end() {
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "passed");
+    // CAD-140: a researched idea waits beside the merge — both
+    // decision rows must fit a 390px phone viewport first.
+    let filed = j.ok(&[
+        "report",
+        "--kind",
+        "idea",
+        "--project",
+        "demo",
+        "-m",
+        "Phone-width idea\nEvery control reachable at 390px.",
+    ]);
+    let idea = filed["id"].as_str().unwrap().to_string();
+    j.ok(&[
+        "issue",
+        "set",
+        &idea,
+        "status=review",
+        "tags=intake,idea,plan-ready",
+    ]);
+    j.board("decisions390", json!({"idea": idea, "issue": "DEM-2"}));
+    j.pass(
+        7,
+        "the idea and merge decision rows fit 390px with every control inside the viewport",
+    );
     j.board(
         "merge",
         json!({"issue": "DEM-2", "reviewer": "r1", "sha": sha, "pr": "acme/demo#1",
@@ -1009,7 +1033,7 @@ fn mvp_journey_end_to_end() {
         j.gh_log().contains(&format!(
             "pr merge 1 -R acme/demo --auto --squash --match-head-commit {sha}"
         )),
-        "the board's Merge ran the operator's gh pinned to the reviewed head:\n{}",
+        "the board's Merge landed pinned to the reviewed head (daemon-side gh):\n{}",
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "enqueued");

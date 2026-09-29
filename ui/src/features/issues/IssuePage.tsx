@@ -20,6 +20,7 @@ import { IconClose } from "../../ui/icons";
 import "./issues.css";
 import { noDragReason } from "../projects/Card";
 import KickoffDialog from "./KickoffDialog";
+import IdeaCard from "../home/IdeaCard";
 import { LaneCard, type LanePayload } from "./LaneCard";
 import { LaneConversation } from "./LaneConversation";
 import {
@@ -357,6 +358,16 @@ function PageBody({
 
       <div className="grid xl:grid-cols-[minmax(0,1fr)_340px] items-start">
         <main className="min-w-0 px-4 lg:px-8 py-5 grid gap-4">
+          {tab === "overview" && (detail.tags ?? []).includes("plan-ready") && (
+            <section aria-label="Idea decision">
+              <IdeaCard
+                issue={id}
+                readOnly={readOnly}
+                onOpenIssue={onOpen}
+                onDecided={() => void resources.issue(id).invalidate()}
+              />
+            </section>
+          )}
           {tab === "overview" && (
             <section className="issue-description grid gap-4">
               {items.length > 0 && (

@@ -593,12 +593,27 @@ fn read_only_board_refuses_every_write() {
     let host = format!("127.0.0.1:{port}");
     let before = commits(pm.path());
 
-    // Every write shape answers 403 with the read-only marker.
+    // Every write shape answers 403 with the read-only marker — one
+    // entry per route in `operator::WRITE_ROUTES` (session open/logout
+    // are auth, not writes, and keep working so the mode is visible).
     for (method, path, body) in [
+        // Tracker writes (AgentAllowed still needs a writable board).
         (
             "POST",
             "/api/issues",
             r#"{"project":"cadence","title":"x"}"#,
+        ),
+        // CAD-140: intake in both routings (ideas stay local,
+        // questions route to cadence) refuses before routing.
+        (
+            "POST",
+            "/api/reports",
+            r#"{"kind":"idea","project":"cadence","title":"x"}"#,
+        ),
+        (
+            "POST",
+            "/api/reports",
+            r#"{"kind":"question","project":"demo","title":"x"}"#,
         ),
         ("PATCH", "/api/issues/CAD-2", r#"{"status":"done"}"#),
         ("POST", "/api/issues/CAD-2/comments", r#"{"body":"hi"}"#),
@@ -608,10 +623,173 @@ fn read_only_board_refuses_every_write() {
             r#"{"kind":"relates","target":"CAD-1"}"#,
         ),
         (
+            "DELETE",
+            "/api/issues/CAD-2/links",
+            r#"{"kind":"relates","target":"CAD-1"}"#,
+        ),
+        (
             "POST",
             "/api/issues/CAD-2/refs",
             r#"{"kind":"commit","value":"abc"}"#,
         ),
+        // CAD-140: every operator decision — answers, kickoff, idea
+        // plans, plan verdicts, and the merge decision both ways.
+        (
+            "POST",
+            "/api/issues/CAD-2/answers",
+            r#"{"question":"q","text":"a"}"#,
+        ),
+        (
+            "POST",
+            "/api/issues/CAD-2/kickoff",
+            r#"{"group":"g","provider":"p"}"#,
+        ),
+        ("POST", "/api/ideas/CAD-1/decide", r#"{"action":"approve"}"#),
+        (
+            "POST",
+            "/api/ideas/CAD-1/decide",
+            r#"{"action":"reject","reason":"no"}"#,
+        ),
+        (
+            "POST",
+            "/api/ideas/CAD-1/decide",
+            r#"{"action":"park","park_until":"2030-01-01"}"#,
+        ),
+        ("POST", "/api/plans/CAD-1/approve", r#"{}"#),
+        ("POST", "/api/plans/CAD-1/reject", r#"{"reason":"no"}"#),
+        ("POST", "/api/delivery/CAD-1/merge", r#"{"sha":"a"}"#),
+        ("POST", "/api/delivery/CAD-1/decline", r#"{"reason":"no"}"#),
+        ("POST", "/api/epics/CAD-1/stage", r#"{"stage":"s"}"#),
+        // The issue page's lane.
+        ("POST", "/api/issues/CAD-2/lane/ask", r#"{}"#),
+        (
+            "POST",
+            "/api/issues/CAD-2/lane/instruct",
+            r#"{"text":"go"}"#,
+        ),
+        ("POST", "/api/issues/CAD-2/lane/interrupt", r#"{}"#),
+        ("POST", "/api/issues/CAD-2/lane/stop", r#"{}"#),
+        (
+            "POST",
+            "/api/issues/CAD-2/lane/unfence",
+            r#"{"status":"completed"}"#,
+        ),
+        (
+            "POST",
+            "/api/issues/CAD-2/lane/reassign",
+            r#"{"provider":"p"}"#,
+        ),
+        // Home rail: threads, needs, agents, master, permissions.
+        (
+            "POST",
+            "/api/threads/master/messages",
+            r#"{"text":"hi","message":"m"}"#,
+        ),
+        ("POST", "/api/needs/dismiss", r#"{"kind":"k","id":"i"}"#),
+        (
+            "POST",
+            "/api/needs/snooze",
+            r#"{"kind":"k","id":"i","secs":86400}"#,
+        ),
+        ("POST", "/api/agents/w1/resume", r#"{}"#),
+        (
+            "POST",
+            "/api/agents/w1/unfence",
+            r#"{"status":"completed"}"#,
+        ),
+        ("POST", "/api/master/command", r#"{"command":"state"}"#),
+        ("POST", "/api/master/permissions/p1/allow-once", r#"{}"#),
+        (
+            "POST",
+            "/api/master/permissions/p1/always",
+            r#"{"scope":"exact"}"#,
+        ),
+        ("POST", "/api/master/permissions/p1/reject", r#"{}"#),
+        ("POST", "/api/master/permissions/rules/r1/revoke", r#"{}"#),
+        ("POST", "/api/monitors/m1/alerts/1/ack", r#"{}"#),
+        // Settings, update, workflows, apps.
+        (
+            "POST",
+            "/api/settings/model-defaults",
+            r#"{"expected_revision":1}"#,
+        ),
+        ("POST", "/api/update", r#"{}"#),
+        ("POST", "/api/update/check", r#"{}"#),
+        (
+            "POST",
+            "/api/projects/p1/workflows/w1/propose",
+            r#"{"inputs":{}}"#,
+        ),
+        (
+            "POST",
+            "/api/projects/p1/workflows/a/w1/propose",
+            r#"{"inputs":{}}"#,
+        ),
+        ("POST", "/api/apps/p1/a1/approve", r#"{}"#),
+        ("POST", "/api/apps/p1/a1/revoke", r#"{}"#),
+        ("POST", "/api/apps/p1/a1/team", r#"{"team":[]}"#),
+        ("POST", "/api/apps/p1/a1/worker", r#"{"role":"r"}"#),
+        // Wiki.
+        ("PUT", "/api/wiki/file", r#"{"path":"f","body":"b"}"#),
+        ("POST", "/api/wiki/upload", r#"{}"#),
+        ("POST", "/api/wiki/mkdir", r#"{}"#),
+        ("POST", "/api/wiki/mv", r#"{}"#),
+        ("POST", "/api/wiki/rm", r#"{}"#),
+        // App installations, runs, effects, contexts, records.
+        ("POST", "/api/app-installations", r#"{}"#),
+        ("POST", "/api/app-installations/migrate", r#"{}"#),
+        ("POST", "/api/app-installations/i1/approve", r#"{}"#),
+        ("POST", "/api/app-installations/i1/revoke", r#"{}"#),
+        ("POST", "/api/app-installations/i1/recover", r#"{}"#),
+        (
+            "POST",
+            "/api/app-installations/migrations/m1/recover",
+            r#"{}"#,
+        ),
+        ("POST", "/api/app-installations/i1/bindings", r#"{}"#),
+        (
+            "POST",
+            "/api/app-installations/i1/bindings/b1/update",
+            r#"{}"#,
+        ),
+        (
+            "POST",
+            "/api/app-installations/i1/bindings/b1/revoke",
+            r#"{}"#,
+        ),
+        ("POST", "/api/app-installations/i1/contexts", r#"{}"#),
+        (
+            "POST",
+            "/api/app-installations/i1/contexts/c1/update",
+            r#"{}"#,
+        ),
+        (
+            "POST",
+            "/api/app-installations/i1/contexts/c1/archive",
+            r#"{}"#,
+        ),
+        (
+            "POST",
+            "/api/app-installations/i1/contexts/c1/records",
+            r#"{}"#,
+        ),
+        (
+            "POST",
+            "/api/app-installations/i1/contexts/c1/records/r1/update",
+            r#"{}"#,
+        ),
+        ("POST", "/api/app-runs", r#"{}"#),
+        ("POST", "/api/app-runs/r1/approve", r#"{}"#),
+        ("POST", "/api/app-runs/r1/cancel", r#"{}"#),
+        ("POST", "/api/app-runs/r1/dispatch", r#"{}"#),
+        ("POST", "/api/app-runs/r1/effects", r#"{}"#),
+        ("POST", "/api/app-effects/e1/decide", r#"{}"#),
+        ("POST", "/api/app-effects/e1/resolve", r#"{}"#),
+        // Connections.
+        ("POST", "/api/connections", r#"{}"#),
+        ("POST", "/api/connections/c1/rotate", r#"{}"#),
+        ("POST", "/api/connections/c1/revoke", r#"{}"#),
+        ("POST", "/api/connections/c1/status", r#"{}"#),
         // Memory curation routes refuse identically — plain, and
         // carrying the accept-time body edit.
         ("POST", "/api/memories/cadence/foo/accept", r#"{}"#),
@@ -811,4 +989,100 @@ fn sse_hello_names_the_build() {
         text.contains(": ping"),
         "the liveness frame still follows: {text}"
     );
+}
+
+/// CAD-140: `POST /api/reports` files through the canonical intake
+/// path (`report::file`), not a bare issue create — and the server
+/// routes, not the UI: ideas land on the viewed board, every other
+/// kind lands in the `cadence` project. The commit is attributed to
+/// the admitted caller, and credential-shaped bodies are refused.
+#[test]
+fn board_reports_file_through_canonical_intake_routing() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "demo", "--prefix", "D"]
+        )
+        .0
+    );
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let op = sign_in(state.path(), port);
+    let post = |body: &str| {
+        let (code, _, text) = op_write_json(&op, port, "POST", "/api/reports", &host, body);
+        (code, serde_json::from_str::<Value>(&text).unwrap())
+    };
+
+    // An idea files into the viewed board with the intake shape.
+    let (code, v) = post(
+        r#"{"kind":"idea","project":"demo","title":"Dark mode","priority":"P3","body":"Why it matters"}"#,
+    );
+    assert_eq!(code, 201, "{v}");
+    assert!(
+        v["card"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("D-")),
+        "{v}"
+    );
+    assert_eq!(v["card"]["project"], "demo", "{v}");
+    let tags = v["card"]["tags"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tags.contains(&Value::from("intake")) && tags.contains(&Value::from("idea")),
+        "{v}"
+    );
+    assert_eq!(v["report"]["kind"], "idea", "{v}");
+    assert!(
+        v["issue"]["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Why it matters")),
+        "{v}"
+    );
+
+    // A question filed \"from\" demo still lands in the cadence project.
+    let (code, v) = post(r#"{"kind":"question","project":"demo","title":"How do lanes work?"}"#);
+    assert_eq!(code, 201, "{v}");
+    assert!(
+        v["card"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("CAD-")),
+        "{v}"
+    );
+    assert_eq!(v["card"]["project"], "cadence", "{v}");
+
+    // The write is attributed to the admitted caller, never a field.
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(pm.path())
+        .args(["log", "-2", "--format=%B"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(log.contains("Actor: operator (ui)"), "{log}");
+    let (code, v) = post(r#"{"kind":"idea","project":"demo","title":"x","by":"operator"}"#);
+    assert_eq!(code, 400, "{v}");
+
+    // Shape refusals: unknown kind, empty title, oversized body.
+    let (code, _) = post(r#"{"kind":"task","project":"demo","title":"x"}"#);
+    assert_eq!(code, 400);
+    let (code, _) = post(r#"{"kind":"idea","project":"demo","title":"  "}"#);
+    assert_eq!(code, 400);
+    let big = format!(
+        r#"{{"kind":"idea","project":"demo","title":"big","body":"{}"}}"#,
+        "y".repeat(33 * 1024)
+    );
+    let (code, _) = post(&big);
+    assert_eq!(code, 400);
+
+    // The canonical path's secret scan: a credential-shaped body is
+    // refused with the rule named — a bare create would have filed it.
+    let leak = format!("leak: ghp_{}", "a".repeat(36));
+    let (code, v) = post(&format!(
+        r#"{{"kind":"bug","project":"demo","title":"keys","body":"{leak}"}}"#
+    ));
+    assert_eq!(code, 400, "{v}");
 }

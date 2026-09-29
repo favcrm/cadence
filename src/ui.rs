@@ -35,7 +35,7 @@ use crate::adapter::registry;
 use crate::client;
 use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
-use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
+use crate::issue::{board, context, history, model, project, report, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
 mod app_audiences;
@@ -1573,6 +1573,26 @@ struct NewIssueReq {
     tags: Option<Vec<String>>,
     parent: Option<String>,
     blocked_by: Option<Vec<String>>,
+    /// CAD-140: the board's report/idea composer files the description
+    /// with the issue — one call instead of create-then-comment.
+    /// `None`/blank keeps `new_issue`'s default body.
+    body: Option<String>,
+}
+
+/// CAD-140: `POST /api/reports` — file a question, feedback, idea or
+/// bug through the canonical intake path. `project` is the board the
+/// operator files from: ideas land there, while questions, feedback
+/// and bugs route to the `cadence` project like `cadence report` (the
+/// server decides — the UI never routes). Unknown fields are refused
+/// so a forged `by`/`actor` never reaches the write.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportReq {
+    kind: String,
+    project: String,
+    title: String,
+    priority: Option<String>,
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1663,6 +1683,95 @@ fn write_reply(pm: &Pm, state_dir: &Path, id: &str, out: Value, created: bool) -
             resp
         }
         Err(e) => err_response(500, &format!("write committed but reload failed: {e}")),
+    }
+}
+
+/// CAD-140: `POST /api/reports` — the board's report/idea composer.
+/// This is `cadence report`'s write path (`report::file`), not a bare
+/// issue create: bodies pass the secret scan and prose scrub, the
+/// context block is captured, intake kind/tags take their canonical
+/// shape, and the PM inbox gets its heads-up line. Routing is
+/// `report::file`'s: an idea files into `project` (the viewed board),
+/// every other kind files into the `cadence` project. Answers the
+/// filed report's `{issue, card}` plus the filing record, 201.
+fn post_report(request: &mut Request, state_dir: &Path, pm_dir: &Path, actor: &str) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: ReportReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let kind = match req.kind.trim() {
+        "question" => report::Kind::Question,
+        "feedback" => report::Kind::Feedback,
+        "idea" => report::Kind::Idea,
+        "bug" => report::Kind::Bug,
+        other => {
+            return err_response(
+                400,
+                &format!("report kind is question, feedback, idea or bug — not '{other}'"),
+            );
+        }
+    };
+    let title = req.title.trim();
+    if title.is_empty() {
+        return err_response(400, "a report needs a title");
+    }
+    if title.chars().count() > 200 {
+        return err_response(400, "report title exceeds 200 characters");
+    }
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    // Ideas file into the viewed board; the project flag always wins
+    // in `report::file`. Every other kind is about cadence itself and
+    // files into the `cadence` project from wherever it is filed.
+    let project_flag = match kind {
+        report::Kind::Idea => Some(req.project.as_str()),
+        _ => None,
+    };
+    let text = match req.body.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        Some(details) => format!("{title}\n\n{details}"),
+        None => title.to_string(),
+    };
+    // No shell cwd answers for a browser file: the state dir stands
+    // in, so the context block names the board service honestly and
+    // no tracker checkout is claimed as the reporter's repo.
+    let out = match report::file(
+        &pm,
+        kind,
+        project_flag,
+        None,
+        req.priority.as_deref(),
+        &text,
+        actor,
+        state_dir,
+        state_dir,
+    ) {
+        Ok(out) => out,
+        // The intake path refuses bad input (oversize bodies, the
+        // secret scan) as rejections — 400 with the reason, never a
+        // 500: nothing was written and the caller can fix the text.
+        Err(e) if e.kind() == "rejected" => return err_response(400, &e.to_string()),
+        Err(e) => return write_err(&e),
+    };
+    let id = out["id"].as_str().unwrap_or_default().to_string();
+    match issue_payloads(&pm, state_dir, &id) {
+        Ok((card, detail)) => {
+            let body = json!({
+                "issue": detail, "card": card,
+                "warnings": out.get("secret_warnings").cloned().unwrap_or(json!([])),
+                "report": out,
+            });
+            let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
+            let mut resp = Response::from_data(bytes).with_status_code(StatusCode(201));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(e) => err_response(500, &format!("report filed but reload failed: {e}")),
     }
 }
 
@@ -2057,6 +2166,23 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-140: filing a report or idea — the same `report::file` path
+    // `cadence report` uses (scrubbing, context, intake shape, PM
+    // heads-up), never a bare issue create. Admitted above, like every
+    // write; the actor below is the admitted caller, never a field.
+    if path == "/api/reports" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = post_report(&mut request, state_dir, pm_dir, caller.actor());
+        send(request, resp);
+        return;
+    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a
@@ -2147,7 +2273,11 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::decide_idea(&mut request, state_dir, id);
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = home::decide_idea(&mut request, state_dir, pm_dir, caller.actor(), id);
         send(request, resp);
         return;
     }
@@ -2167,7 +2297,11 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::decide_delivery(&mut request, state_dir, opts, id, verb);
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = home::decide_delivery(&mut request, state_dir, caller.actor(), id, verb);
         send(request, resp);
         return;
     }
@@ -2550,6 +2684,17 @@ fn write_route(
             }
         };
         let blocked_by = req.blocked_by.unwrap_or_default();
+        // CAD-140: a blank body keeps `new_issue`'s default; a real one
+        // is capped like `cadence report`'s (BODY_MAX) so a paste cannot
+        // stuff the tracker through the board in one call.
+        let body = req.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        if body.is_some_and(|b| b.len() > crate::issue::report::BODY_MAX) {
+            send(
+                request,
+                err_response(400, "issue body exceeds the 32 KB cap — trim it"),
+            );
+            return;
+        }
         match issue_write::new_issue(
             &pm,
             &pm.dir,
@@ -2562,7 +2707,7 @@ fn write_route(
             req.component.as_deref(),
             &req.tags.unwrap_or_default(),
             None,
-            None,
+            body,
             &actor,
         ) {
             Ok(out) => {
@@ -5242,5 +5387,29 @@ mod tests {
         assert!(proxied_actor(Some("")).is_err());
         assert!(proxied_actor(Some("   ")).is_err());
         assert!(proxied_actor(Some("bad\u{1}login")).is_err());
+    }
+
+    /// CAD-140: the board's create takes an optional description body
+    /// for filed reports and ideas — and still refuses unknown fields,
+    /// so a forged `by`/`actor` never reaches the tracker write.
+    #[test]
+    fn new_issue_body_is_optional_and_unlisted_fields_refused() {
+        let bare: super::NewIssueReq = serde_json::from_value(serde_json::json!({
+            "project": "demo", "title": "t",
+        }))
+        .unwrap();
+        assert!(bare.body.is_none());
+        let filed: super::NewIssueReq = serde_json::from_value(serde_json::json!({
+            "project": "demo", "title": "t", "tags": ["intake", "idea"],
+            "body": "t\n\nwhy this matters",
+        }))
+        .unwrap();
+        assert_eq!(filed.body.as_deref(), Some("t\n\nwhy this matters"));
+        assert!(
+            serde_json::from_value::<super::NewIssueReq>(serde_json::json!({
+                "project": "demo", "title": "t", "by": "operator",
+            }))
+            .is_err()
+        );
     }
 }

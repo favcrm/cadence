@@ -173,6 +173,23 @@ interface Props {
   onAgents: () => void;
 }
 
+/**
+ * What the create form files: a plain task, or a report — a
+ * question, feedback, idea or bug (CAD-140). Reports file with the
+ * `intake` + kind system tags, exactly like `cadence report`, so the
+ * idea pipeline and the intake triage see them; an idea filed here
+ * triggers research and a plan draft like one filed from the CLI.
+ */
+type NewIssueKind = "task" | "question" | "feedback" | "idea" | "bug";
+
+const KIND_OPTIONS: { value: NewIssueKind; label: string }[] = [
+  { value: "task", label: "Task" },
+  { value: "question", label: "Question" },
+  { value: "feedback", label: "Feedback" },
+  { value: "idea", label: "Idea" },
+  { value: "bug", label: "Bug" },
+];
+
 /** One create form for both list and board views. The draft survives a failed write. */
 function NewIssueForm({
   projects,
@@ -192,6 +209,8 @@ function NewIssueForm({
   writeReason: string | null;
 }) {
   const [title, setTitle] = useState("");
+  const [kind, setKind] = useState<NewIssueKind>("task");
+  const [details, setDetails] = useState("");
   const [priority, setPriority] = useState("P2");
   const [selProject, setSelProject] = useState(() => project === "all" ? projects[0]?.key ?? "" : project);
   const [busy, setBusy] = useState(false);
@@ -200,6 +219,8 @@ function NewIssueForm({
   const fieldId = useId();
   const projectId = useId();
   const priorityId = useId();
+  const kindId = useId();
+  const detailsId = useId();
   const projectKey = project === "all" ? selProject : project;
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -208,8 +229,27 @@ function NewIssueForm({
     pending.current = true;
     setError(null);
     setBusy(true);
-    api
-      .create({ project: projectKey, title: t, priority })
+    const detailsText = details.trim();
+    // CAD-140: reports file through the canonical intake endpoint
+    // (`POST /api/reports` → `report::file`) — never a bare create.
+    // Ideas land on this board; every other kind routes to the
+    // `cadence` project server-side, like `cadence report`.
+    const req =
+      kind === "task"
+        ? api.create({
+            project: projectKey,
+            title: t,
+            priority,
+            ...(detailsText ? { body: `${t}\n\n${detailsText}` } : {}),
+          })
+        : api.report({
+            kind,
+            project: projectKey,
+            title: t,
+            priority,
+            ...(detailsText ? { body: detailsText } : {}),
+          });
+    req
       .then((resp) => {
         onCreated(resp, `${resp.card.id} created`);
         onCancel();
@@ -256,10 +296,26 @@ function NewIssueForm({
           <Select id={priorityId} full value={priority} onChange={setPriority} disabled={busy || readOnly} options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))} />
         </div>
       </div>
+      <div className="grid gap-3 sm:grid-cols-[minmax(9rem,14rem)_minmax(0,1fr)] items-start mt-3">
+        <div className="min-w-0">
+          <label className="slabel block mb-1" htmlFor={kindId}>Kind</label>
+          <Select id={kindId} full value={kind} onChange={(v) => { const k = v as NewIssueKind; setKind(k); setPriority(k === "task" || k === "bug" ? "P2" : "P3"); }} disabled={busy || readOnly} options={KIND_OPTIONS} />
+          {kind === "idea" && (
+            <p className="text-micro text-ink-500 mt-1">Files into {projectKey || "this project"} and triggers research + a plan draft.</p>
+          )}
+          {kind !== "task" && kind !== "idea" && (
+            <p className="text-micro text-ink-500 mt-1">Files into the cadence project for triage.</p>
+          )}
+        </div>
+        <div className="min-w-0">
+          <label className="slabel block mb-1" htmlFor={detailsId}>Details <span className="text-ink-500">(optional)</span></label>
+          <textarea id={detailsId} rows={3} maxLength={32768} value={details} onChange={(event) => setDetails(event.target.value)} disabled={busy || readOnly} className="field w-full !h-auto py-2 text-secondary" placeholder={kind === "task" ? "Acceptance, context, links…" : "What happened, what you expected, what you tried…"} />
+        </div>
+      </div>
       {error && <p className="text-label text-fail mt-3" role="alert">Could not create issue: {error}</p>}
       {readOnly && <p className="text-label text-ink-400 mt-3" role="status">Draft saved. {writeReason ?? "Writes are unavailable."}</p>}
       <div className="flex justify-end mt-3">
-        <Button variant="primary" type="submit" loading={busy} disabled={readOnly || !title.trim() || !projectKey}>Create issue</Button>
+        <Button variant="primary" type="submit" loading={busy} disabled={readOnly || !title.trim() || !projectKey}>{kind === "task" ? "Create issue" : `File ${kind}`}</Button>
       </div>
     </form>
   );

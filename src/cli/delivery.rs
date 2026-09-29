@@ -50,9 +50,10 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         watch: Option<u64>,
     },
-    /// Merge a PASSed ticket: enqueue its PR in the merge queue pinned
-    /// to the reviewed head (`gh pr merge --auto --squash
-    /// --match-head-commit`). Operator only.
+    /// Merge a PASSed ticket: approve the reviewed head and land it —
+    /// the daemon's approve-and-land transaction records the approval
+    /// object, voids a moved head, and enqueues pinned to it
+    /// (CAD-140). Operator only.
     Merge {
         /// The ticket id.
         issue: String,
@@ -147,7 +148,23 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
             },
         },
-        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue, delivery::GH)?,
+        // CAD-140: the merge is the daemon's approve-and-land
+        // transaction — the CLI names the reviewed head it approves
+        // (from `authorize`, the standing PASS) and the daemon voids
+        // a moved one. Neither the CLI nor the board shells `gh`.
+        DeliveryAction::Merge { issue } => {
+            let auth = client::rpc(
+                state_dir,
+                "delivery_merge",
+                json!({"issue": issue, "phase": "authorize"}),
+            )?;
+            let sha = auth["sha"].as_str().unwrap_or_default().to_string();
+            client::rpc(
+                state_dir,
+                "delivery_approve",
+                json!({"issue": issue, "sha": sha}),
+            )?
+        }
         DeliveryAction::ReviewEvidence { request_file } => {
             let request: serde_json::Value = serde_json::from_slice(&std::fs::read(request_file)?)
                 .map_err(|e| Error::rejected(format!("invalid evidence request JSON: {e}")))?;

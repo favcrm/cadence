@@ -1118,12 +1118,39 @@ pub fn set_fields(
     actor: &str,
     force: Option<&str>,
 ) -> Result<Value> {
+    set_fields_if_rev(pm, ids, pairs, actor, force, None)
+}
+
+/// [`set_fields`] bound to the revision shown — the compare half of
+/// compare-and-swap. The check runs inside the tracker lock, at the
+/// point of write, so a revision move between read and write refuses
+/// instead of landing. A mismatch answers `Ok` with a `conflict`
+/// payload (the route maps it, like `patch_issue`'s); only callers
+/// passing `if_rev` ever see one.
+pub fn set_fields_if_rev(
+    pm: &Pm,
+    ids: &[String],
+    pairs: &[String],
+    actor: &str,
+    force: Option<&str>,
+    if_rev: Option<&str>,
+) -> Result<Value> {
     if ids.is_empty() || pairs.is_empty() {
         return Err(Error::rejected(
             "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
         ));
     }
     let _lock = pm.lock()?;
+    if let Some(want) = if_rev {
+        for id in ids {
+            let (_, dir) = issue_dir(pm, id)?;
+            if let Some(conflict) = check_rev(&dir, Some(want))? {
+                let mut out = conflict;
+                out["id"] = serde_json::json!(id);
+                return Ok(out);
+            }
+        }
+    }
     let mut changed = Vec::new();
     let mut forced: Option<String> = None;
     let staged = stage(pm, ids, |project, front| {

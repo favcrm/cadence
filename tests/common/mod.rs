@@ -1091,6 +1091,9 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // without `test-seam` sees `false` and the daemon refuses to
         // serve.
         test_seam: cfg!(feature = "test-seam"),
+        // CAD-140: no delivery gh — a daemon that shells `gh` in a
+        // test does so only when the test injects one (LoopFixture).
+        delivery_gh: None,
     }
 }
 
@@ -4428,8 +4431,8 @@ pub const LOOP_PR: &str = "https://github.com/acme/app/pull/7";
 /// The loop's fixture: a routed tracker + daemon, the master, a managed
 /// worker `w1`, managed reviewers `r1` and `r2` (launch role `reviewer`;
 /// `r1` wins by alias, and `r2` takes the ticket when `r1` is excluded),
-/// and a fake `gh` only the
-/// operator's process has on its PATH.
+/// and a fake `gh` the daemon takes at boot plus the operator's
+/// processes have on PATH.
 pub struct LoopFixture {
     pub f: PlanFixture,
     pub m: ManagedWorker,
@@ -4437,6 +4440,7 @@ pub struct LoopFixture {
     pub r1: ManagedWorker,
     pub r2: ManagedWorker,
     pub gh_dir: PathBuf,
+    _gh_tmp: TempDir,
 }
 
 impl LoopFixture {
@@ -4457,7 +4461,18 @@ impl LoopFixture {
         )
     }
 
-    pub fn dispatched_plan_with(plan_md: &str, opts: daemon::ServeOptions) -> LoopFixture {
+    pub fn dispatched_plan_with(plan_md: &str, mut opts: daemon::ServeOptions) -> LoopFixture {
+        // CAD-140: the fake `gh` exists before the daemon spawns — the
+        // daemon's approve-and-land transaction shells it, so the
+        // daemon takes it at boot, not off a shared PATH.
+        let gh_tmp = TempDir::new().unwrap();
+        let gh_dir = gh_tmp.path().join("ghbin");
+        std::fs::create_dir_all(&gh_dir).unwrap();
+        let gh = gh_dir.join("gh");
+        std::fs::write(&gh, FAKE_GH_PY).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        opts.delivery_gh = Some(gh);
         let f = PlanFixture::start_with(opts);
         let yaml = f.pm_dir.join("demo/project.yaml");
         let text = std::fs::read_to_string(&yaml).unwrap();
@@ -4490,12 +4505,6 @@ impl LoopFixture {
             .unwrap();
         let (ok, sent) = f.as_master(&mut m, "master dispatch D-2");
         assert!(ok, "{sent}");
-        let gh_dir = f.tmp.path().join("ghbin");
-        std::fs::create_dir_all(&gh_dir).unwrap();
-        let gh = gh_dir.join("gh");
-        std::fs::write(&gh, FAKE_GH_PY).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let lf = LoopFixture {
             f,
             m,
@@ -4503,6 +4512,7 @@ impl LoopFixture {
             r1,
             r2,
             gh_dir,
+            _gh_tmp: gh_tmp,
         };
         lf.set_gh(&"0".repeat(40), "OPEN", false, false);
         assert_eq!(lf.rec()["state"], "working", "{}", lf.rec());

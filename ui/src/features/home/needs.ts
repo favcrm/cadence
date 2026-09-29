@@ -34,6 +34,12 @@ export type NeedAction =
       reviewer: string | null;
       verdict: string | null;
     }
+  | {
+      /** CAD-140: a researched idea waiting on the operator's
+       *  approve/reject/park (the idea pipeline stops here). */
+      type: "idea";
+      issue: string;
+    }
   | { type: "command"; command: string }
   | {
       type: "permission";
@@ -94,6 +100,7 @@ const LABEL: Record<string, string> = {
   master_permission: "permission",
   merge: "merge",
   merge_decision: "merge",
+  idea_plan: "idea",
 };
 
 /** One needs row → a rail item. */
@@ -171,6 +178,14 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
           : command,
     };
   }
+  if (row.kind === "idea_plan") {
+    const issue = row.subject?.kind === "issue" ? row.subject.id : null;
+    return {
+      ...base,
+      owner: row.owner ?? "operator",
+      action: issue && ID.test(issue) ? { type: "idea", issue } : command,
+    };
+  }
   if (row.kind === "master_permission") {
     const p = extra.permission ?? {};
     const id = str(p.id);
@@ -216,9 +231,10 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
   return { ...base, owner: row.owner ?? "operator", action: command };
 }
 
-/** The rail: operator rows, plans and questions first, oldest first within. */
+/** The rail: operator rows, plans and ideas first, then questions, oldest first within. */
 export function homeNeeds(rows: NeedsMe[] | null | undefined): HomeNeed[] {
-  const rank = (n: HomeNeed) => (n.kind === "plan" ? 0 : n.kind === "question" ? 1 : 2);
+  const rank = (n: HomeNeed) =>
+    n.kind === "plan" || n.kind === "idea_plan" ? 0 : n.kind === "question" ? 1 : 2;
   return (rows ?? [])
     .map((row, i) => [row, i] as const)
     .filter(([row]) => forOperator(row))
@@ -268,6 +284,7 @@ const PR_KINDS: ReadonlySet<string> = new Set([
 /** Kinds that are the operator's call on an agent or a ticket. */
 const DECISION_KINDS: ReadonlySet<string> = new Set([
   "plan",
+  "idea_plan",
   "question",
   "approval",
   "approval_menu",

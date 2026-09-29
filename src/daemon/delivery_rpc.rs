@@ -28,7 +28,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{check_values, optional_str, optional_strs, required_str, Shared, DAEMON_ALIAS};
+use super::{
+    check_values, optional_str, optional_strs, request_actor, required_str, Shared,
+    APPROVAL_RECORDED_VIA, DAEMON_ALIAS,
+};
 use crate::delivery::{self, Candidate, Observed, Record, State, TicketDone, VerdictRec};
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
@@ -1228,6 +1231,159 @@ impl Shared {
         }
     }
 
+    /// `delivery_approve` (CAD-140) — the operator's merge approval as
+    /// one single-writer transaction under `delivery_lock`: re-read the
+    /// PR, compare-and-swap the shown head against the live one,
+    /// record the approval object, and enqueue pinned to it. `sha` is
+    /// REQUIRED — the head the approval was made against; a moved head
+    /// voids the decision (`head_moved`) before anything is recorded.
+    /// The approval carries the deciding actor (`request_actor`,
+    /// attribution only — authority is this connection). Neither the
+    /// board nor the CLI shells `gh` for a merge anymore; the daemon
+    /// shells it only here, bound to the recorded approval. A refused
+    /// approval writes nothing: no record, no observation, no enqueue.
+    pub(super) fn rpc_delivery_approve(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("delivery approve", params, peer_pid)?;
+        let id = required_str(params, "issue")?;
+        let want = params
+            .get("sha")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::rejected("delivery approve names the approved head: {\"sha\"} is required")
+            })?;
+        if want.len() != 40
+            || !want
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::rejected(
+                "approved head must be the full 40-character lowercase hexadecimal SHA",
+            ));
+        }
+        let actor = request_actor(params)?;
+        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = delivery::load(&self.state_dir)?;
+        let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
+        if rec.state != State::Passed {
+            return Err(Error::rejected(format!(
+                "{id} has no standing PASS to approve (it is {})",
+                rec.state.as_str()
+            )));
+        }
+        let pr_url = rec.pr.clone().unwrap_or_default();
+        let (slug, number) = task_report::parse_pr_url(&pr_url)
+            .map_err(|e| Error::rejected(format!("{id} links no pull request ({e})")))?;
+        // The compare basis is read fresh, under the lock — whatever
+        // this call returns was true now, not at the last sync.
+        let read_at = now();
+        let gh_bin = self.delivery_gh.to_string_lossy().to_string();
+        let view = delivery::pr_view(&gh_bin, &slug, number).map_err(|e| {
+            Error::rejected(format!(
+                "{id}: reading the PR failed, nothing was approved — {e}"
+            ))
+        })?;
+        let rollup = view["statusCheckRollup"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let live = view["headRefOid"].as_str().unwrap_or_default().to_string();
+        if want != live {
+            return Err(Error::invalid(
+                "head_moved",
+                format!(
+                    "{id}: the PR head moved since it was shown (shown {}…, now {}…) — re-review before approving",
+                    &want[..12],
+                    live.chars().take(12).collect::<String>(),
+                ),
+            ));
+        }
+        rec.observed = Some(Observed {
+            head: live.clone(),
+            pr_state: view["state"].as_str().unwrap_or_default().to_string(),
+            ci_green: crate::overview::checks_green_pub(&rollup),
+            auto_merge: !view["autoMergeRequest"].is_null(),
+            additions: view["additions"].as_u64().unwrap_or(0),
+            deletions: view["deletions"].as_u64().unwrap_or(0),
+            files: view["changedFiles"].as_u64().unwrap_or(0),
+            at: now(),
+            read_at,
+        });
+        if !rec.merge_ready() {
+            let why = match &rec.observed {
+                None => "GitHub has not been read for it yet".to_string(),
+                Some(o) if o.pr_state != "OPEN" => format!("the PR is {}", o.pr_state),
+                Some(_) => "its CI is not green".to_string(),
+            };
+            return Err(Error::rejected(format!(
+                "{id} is not ready to merge: {why}"
+            )));
+        }
+        let sha = live;
+        // The approval object first: a failed enqueue retries cleanly
+        // (same evidence dedupes to the same id), and audit never sees
+        // a merge without its approval.
+        let (_, approval_id) = self.store.record_approval(
+            &store::NewApproval {
+                id: None,
+                source: &actor,
+                action: "merge",
+                head_sha: &sha,
+                repo: &slug,
+                pr: number,
+            },
+            APPROVAL_RECORDED_VIA,
+        )?;
+        if let Err(e) = delivery::gh(
+            &gh_bin,
+            &[
+                "pr",
+                "merge",
+                &number.to_string(),
+                "-R",
+                &slug,
+                "--auto",
+                "--squash",
+                "--match-head-commit",
+                &sha,
+            ],
+        ) {
+            return Err(Error::rejected(format!(
+                "{id}: the merge did not enqueue ({e}) — approval {approval_id} stands; retry the approval"
+            )));
+        }
+        rec.enter(State::Enqueued, now());
+        let mut out = rec.to_json();
+        out["approval_id"] = serde_json::json!(approval_id);
+        out["approved_by"] = serde_json::json!(actor);
+        delivery::save(&self.state_dir, &all)?;
+        if let Ok(pm) = self.pm() {
+            let _ = issue::write::add_comment(
+                &pm,
+                id,
+                &format!(
+                    "Merge approved by {actor} and enqueued: {pr_url}, pinned to {sha} (approval {approval_id})."
+                ),
+                Some("operator"),
+                Some("review"),
+                None,
+                "operator",
+            );
+        }
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "merge_enqueued",
+            serde_json::json!({"issue": id, "sha": sha, "pr": pr_url, "approval_id": approval_id}),
+        );
+        self.wake();
+        Ok(out)
+    }
+
     /// `delivery_decline` — the operator declines the merge decision
     /// (or an escalated or unstaffed review) with a reason.
     pub(super) fn rpc_delivery_decline(
@@ -1244,6 +1400,10 @@ impl Shared {
             )));
         }
         crate::secret::guard(&format!("{id}: decline"), reason)?;
+        // CAD-140: who declined — the record, the comment and the
+        // event carry the deciding actor (attribution only; authority
+        // is this connection, gated above).
+        let actor = request_actor(params)?;
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -1257,6 +1417,7 @@ impl Shared {
             rec.disable_auto = true;
         }
         rec.note = Some(reason.to_string());
+        rec.declined_by = Some(actor.clone());
         rec.enter(State::Declined, now());
         let out = rec.to_json();
         let ended = rec.clone();
@@ -1266,7 +1427,7 @@ impl Shared {
             let _ = issue::write::add_comment(
                 &pm,
                 id,
-                &format!("Merge declined by the operator: {reason}"),
+                &format!("Merge declined by {actor}: {reason}"),
                 Some("operator"),
                 Some("review"),
                 None,
@@ -1276,7 +1437,7 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "merge_declined",
-            json!({"issue": id, "reason": reason}),
+            json!({"issue": id, "reason": reason, "actor": actor}),
         );
         self.wake();
         Ok(out)

@@ -1867,6 +1867,7 @@ fn route_classes_are_enforced_for_an_agent_caller() {
             "POST /api/issues/*/links",
             "POST /api/issues/*/refs",
             "POST /api/monitors/*/alerts/*/ack",
+            "POST /api/reports",
             "POST /api/wiki/mkdir",
             "POST /api/wiki/mv",
             "POST /api/wiki/rm",
