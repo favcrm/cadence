@@ -602,8 +602,18 @@ impl Shared {
     /// about slots at all: any connection with a slot identity, or the
     /// proven operator. Receipts carry no credential (never a token).
     pub(super) fn rpc_slot_runner(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        if self.slot_identity(peer_pid)?.is_none() {
-            self.proven_operator("slot runner", peer_pid)?;
+        // CAD-422: the one caller verifier decides — a derived agent or
+        // the proven operator reads a receipt; an unproven connection
+        // is refused.
+        match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator | caller_rule::Who::Agent(_) => {}
+            caller_rule::Who::Unproven(why) => {
+                return Err(Error::rejected(format!(
+                    "slot runner is an operator or registered-agent read — this \
+                     connection derives no agent identity and is not provably \
+                     the operator: {why} (caller rule, CAD-422)"
+                )));
+            }
         }
         let id = required_str(params, "runner_id")?;
         let receipt = crate::runner::read_receipt(&self.state_dir, id)?;

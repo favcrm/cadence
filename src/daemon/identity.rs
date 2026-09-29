@@ -555,6 +555,9 @@ impl Shared {
                             .ok_or_else(|| Error::rejected(format!("Unknown message '{id}'")))?
                             .alias
                     }
+                    Target::Job | Target::Task => {
+                        return Err(Error::internal("OnAgent targets an agent"))
+                    }
                 };
                 let agent = self.store.agent(&alias)?;
                 facts.target = Some((alias, self.effective_pm(&agent)?));
@@ -562,7 +565,20 @@ impl Shared {
             (Rule::Shutdown, Who::Agent(_)) => {
                 facts.lease_holder = crate::rollout::granted_lease_holder(&self.state_dir)?;
             }
-            (Rule::Shutdown | Rule::OnAgent(..), Who::Unproven(_)) => {
+            (Rule::OnJob(target), Who::Agent(_)) => {
+                let job = match target {
+                    Target::Job => self.store.job(required_str(params, "job")?)?,
+                    Target::Task => {
+                        let task = self.store.task(required_str(params, "task")?)?;
+                        self.store.job(&task.job_id)?
+                    }
+                    Target::Alias | Target::Message => {
+                        return Err(Error::internal("OnJob targets a job or task"))
+                    }
+                };
+                facts.job = Some((job.id.clone(), job.pm_alias.clone(), self.job_pm(&job)?));
+            }
+            (Rule::Shutdown | Rule::OnAgent(..) | Rule::OnJob(..), Who::Unproven(_)) => {
                 facts.sandbox_outsider = self.sandbox_outsider(peer_pid);
             }
             _ => {}
@@ -686,6 +702,19 @@ impl Shared {
             .store
             .agent_opt(pm)?
             .filter(|row| row.created <= target.created)
+            .map(|row| row.alias))
+    }
+
+    /// The PM entitled to act on `job`: the registered row its
+    /// `pm_alias` names, only when that registration predates the job.
+    /// A PM removed and re-registered under the same alias is newer
+    /// than the job and inherits nothing (CAD-422); a job whose PM row
+    /// is gone answers to the operator alone.
+    pub(super) fn job_pm(&self, job: &crate::store::Job) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .agent_opt(&job.pm_alias)?
+            .filter(|row| row.created <= job.created)
             .map(|row| row.alias))
     }
 

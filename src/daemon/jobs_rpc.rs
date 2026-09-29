@@ -8,8 +8,24 @@ impl Shared {
     /// `job new` — bookkeeping, not spawning. Requires a registered PM
     /// (an inbox alias is a legitimate PM — notifications drain through
     /// `cadence inbox`) and a readable spec the caller already hashed.
-    pub(super) fn rpc_job_new(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_job_new(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_identity_fields(params, "job new")?;
+        // CAD-422: a job binds the caller — the operator, or the agent
+        // the job names as its PM creating its own job. A peer PM-ing a
+        // job to another alias is refused. The caller is proved before
+        // the alias resolves, so a refused caller learns nothing about
+        // the registry.
+        let caller = self.agent_caller(peer_pid, "job new")?;
         let pm = self.resolve_alias(required_str(params, "pm")?)?;
+        if let AgentCaller::Agent(alias) = &caller {
+            if *alias != pm {
+                return Err(Error::rejected(format!(
+                    "job new refused: agent '{alias}' may create jobs only under its \
+                     own PM alias (this job names '{pm}') — the operator creates \
+                     jobs for others (caller rule, CAD-422)"
+                )));
+            }
+        }
         let spec = required_str(params, "spec")?;
         let spec_sha256 = required_str(params, "spec_sha256")?;
         let id = optional_str(params, "job")
@@ -417,26 +433,20 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        reject_identity_fields(params, "job task reopen")?;
+        // No `reject_identity_fields` here: the OnJob caller rule stamps
+        // `by` for admitted callers, and the gate already refused any
+        // agent-supplied identity field upstream.
         let task_id = required_str(params, "task")?;
         let caller = self.agent_caller(peer_pid, "job task reopen")?;
         if let AgentCaller::Agent(alias) = &caller {
+            // The caller rule already bound the caller to the job's PM
+            // (CAD-422); the assignee never reopens its own task.
             let task = self.store.task(task_id)?;
-            let job = self.store.job(&task.job_id)?;
-            let why = if task.assignee.as_deref() == Some(alias.as_str()) {
-                Some(format!("agent '{alias}' is the task's assignee"))
-            } else if job.pm_alias != *alias {
-                Some(format!(
-                    "agent '{alias}' is not job '{}''s PM ('{}')",
-                    job.id, job.pm_alias
-                ))
-            } else {
-                None
-            };
-            if let Some(why) = why {
+            if task.assignee.as_deref() == Some(alias.as_str()) {
                 return Err(Error::rejected(format!(
-                    "job task reopen refused: {why} — a task is reopened only by \
-                     the operator or its job's own PM (caller rule, CAD-373)"
+                    "job task reopen refused: agent '{alias}' is the task's \
+                     assignee — a task is reopened only by the operator or its \
+                     job's own PM (caller rule, CAD-373)"
                 )));
             }
         }
