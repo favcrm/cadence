@@ -860,3 +860,337 @@ fn cad779_cli_csv_preview_and_import_roundtrip() {
         1
     );
 }
+
+struct Board {
+    root: tempfile::TempDir,
+    pm_dir: PathBuf,
+    daemon: TestDaemon,
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    install: String,
+    context_id: String,
+}
+
+impl Board {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let pm_dir = pm.dir.clone();
+        let mut opts = daemon_opts();
+        opts.test_seam = false;
+        opts.provider_env
+            .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+        let daemon = TestDaemon::start_opts(opts);
+        Records::copy_source(&root.path().join("source"), "blog-post");
+        let installed = daemon
+            .operator_rpc(
+                "app_workspace_install",
+                json!({"source": root.path().join("source")}),
+            )
+            .unwrap();
+        let install = installed["install_id"].as_str().unwrap().to_owned();
+        let context = daemon
+            .operator_rpc(
+                "app_context_create",
+                json!({"install_id": install, "label": "Client", "input_defaults": {}, "request_id": "ctx-csv-1"}),
+            )
+            .unwrap()["context"]
+            .clone();
+        let context_id = context["id"].as_str().unwrap().to_owned();
+        let port = (3110..3200)
+            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+            .unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut board = Self {
+            root,
+            pm_dir,
+            daemon,
+            port,
+            stop,
+            thread: None,
+            install,
+            context_id,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "csv board startup deadline exhausted"
+            );
+            let (startup, ready) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port: board.port,
+                stop: Some(board.stop.clone()),
+                startup: Some(startup),
+                test_seam: false,
+                ..Default::default()
+            };
+            let state = board.daemon.state.clone();
+            let pm_dir = board.pm_dir.clone();
+            board.thread = Some(std::thread::spawn(move || {
+                cadence_agent::ui::serve(&state, &pm_dir, &opts)
+            }));
+            let notification = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => ready.recv_timeout(remaining),
+                _ => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            };
+            if matches!(notification, Ok(Ok(()))) {
+                return board;
+            }
+            board.stop.store(true, Ordering::SeqCst);
+            let result = board.thread.take().unwrap().join();
+            if matches!(notification, Ok(Err(std::io::ErrorKind::AddrInUse))) {
+                match result {
+                    Ok(Err(error)) => eprintln!("csv board startup contention: {error}"),
+                    unexpected => panic!("csv board bind failure returned {unexpected:?}"),
+                }
+                board.port = board
+                    .port
+                    .checked_add(1)
+                    .filter(|port| *port < 3200)
+                    .expect("csv board startup exhausted permitted ports");
+                board.stop.store(false, Ordering::SeqCst);
+            } else {
+                panic!("csv board startup notification {notification:?}; worker {result:?}");
+            }
+        }
+    }
+
+    fn base(&self) -> String {
+        format!(
+            "/api/app-installations/{}/contexts/{}/records",
+            self.install, self.context_id
+        )
+    }
+
+    fn operator(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        let session =
+            common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &self.daemon.state, self.port);
+        let (code, _, body) = common::op::raw(self.port, &session.request(method, path, body));
+        (code, body)
+    }
+
+    fn value(&self, method: &str, path: &str, body: Value) -> Value {
+        let encoded = body.to_string();
+        let (code, result) = self.operator(method, path, &encoded);
+        assert_eq!(code, 200, "operator csv request {method} {path}: {result}");
+        serde_json::from_str(&result).unwrap()
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if std::thread::panicking() {
+                if !matches!(&result, Ok(Ok(()))) {
+                    eprintln!("csv board worker cleanup after primary panic: {result:?}");
+                }
+            } else {
+                result.unwrap().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn cad779_http_csv_preview_import_roundtrip_matches_rpc() {
+    let b = Board::new();
+    let base = b.base();
+    let csv = "record_id,display_name,email,tags,consent_email\ncustomer-9,Chidi Anagonye,chidi@example.com,newcomer,granted\n";
+    let previewed = b.value(
+        "POST",
+        &format!("{base}/csv-preview"),
+        json!({"csv_text": csv}),
+    );
+    let token = previewed["preview_token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("sha256:"));
+    assert_eq!(previewed["summary"]["create"], 1);
+
+    let imported = b.value(
+        "POST",
+        &format!("{base}/csv-import"),
+        json!({"csv_text": csv, "preview_token": token, "request_id": "req-http"}),
+    );
+    assert_eq!(
+        imported["summary"],
+        json!({"applied": 1, "skipped": 0, "failed": 0})
+    );
+    // The HTTP receipt matches the daemon RPC receipt exactly.
+    let via_rpc = b
+        .daemon
+        .operator_rpc(
+            "app_record_show",
+            json!({"install_id": b.install, "context_id": b.context_id, "record_id": "customer-9"}),
+        )
+        .unwrap();
+    assert_eq!(
+        via_rpc["record"]["profile"]["display_name"],
+        "Chidi Anagonye"
+    );
+    // Search over HTTP narrows like RPC.
+    let (code, text) = b.operator("GET", &base, "");
+    assert_eq!(code, 200);
+    let listed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(listed["records"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn cad779_http_csv_forged_verb_and_fields_refuse_without_leak() {
+    let b = Board::new();
+    let base = b.base();
+    let marker = "cad779-private-http-marker";
+    // A row error over HTTP names the code, never the cell value.
+    let csv = format!("record_id,display_name,email\ncustomer-9,{marker},not-an-email\n");
+    let (code, text) = b.operator(
+        "POST",
+        &format!("{base}/csv-preview"),
+        &json!({"csv_text": csv}).to_string(),
+    );
+    assert_eq!(code, 200, "csv preview refused a row-error plan: {text}");
+    let previewed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(previewed["rows"][0]["decision"], "error");
+    assert!(
+        !text.contains(marker),
+        "preview echoed customer content: {text}"
+    );
+
+    // Forged body fields are refused by the exact transport grammar.
+    for body in [
+        json!({"csv_text": csv, "by": "operator"}),
+        json!({"csv_text": csv, "actor": "operator"}),
+        json!({"csv_text": csv, "project": "client"}),
+        json!({"csv_text": csv, "install_id": b.install}),
+        json!({"csv_text": csv, "context_id": b.context_id}),
+        json!({"csv_text": csv, "record_id": "customer-9"}),
+    ] {
+        let (code, _) = b.operator("POST", &format!("{base}/csv-preview"), &body.to_string());
+        assert_eq!(code, 400, "forged preview body accepted: {body}");
+    }
+    for body in [
+        json!({"csv_text": csv, "preview_token": "sha256:x", "request_id": "req-f", "workspace": "default"}),
+        json!({"csv_text": csv, "preview_token": "sha256:x", "request_id": "req-f", "project_link": "client"}),
+    ] {
+        let (code, _) = b.operator("POST", &format!("{base}/csv-import"), &body.to_string());
+        assert_eq!(code, 400, "forged import body accepted: {body}");
+    }
+    // Reads stay reads: GET on the CSV routes is 405, queries are 400.
+    assert_eq!(b.operator("GET", &format!("{base}/csv-preview"), "").0, 405);
+    assert_eq!(b.operator("GET", &format!("{base}/csv-import"), "").0, 405);
+    let (code, _) = b.operator("POST", &format!("{base}/csv-preview?x=1"), "{}");
+    assert_eq!(code, 400, "query-bearing preview accepted");
+    // Nothing above created a record.
+    assert_eq!(b.operator("GET", &format!("{base}/customer-9"), "").0, 409);
+}
+
+#[test]
+fn cad779_http_csv_cross_scope_and_unproven_callers_refuse() {
+    let b = Board::new();
+    let base = b.base();
+    let csv = "record_id,display_name,email\ncustomer-9,Chidi Anagonye,chidi@example.com\n";
+    let previewed = b.value(
+        "POST",
+        &format!("{base}/csv-preview"),
+        json!({"csv_text": csv}),
+    );
+    let token = previewed["preview_token"].as_str().unwrap().to_string();
+
+    // A second installation with its own context.
+    let second_source = b.root.path().join("second");
+    for name in [
+        "app.md",
+        "workflows/blog-post.md",
+        "rubrics/blog.md",
+        "templates/brief.md",
+        "templates/post.md",
+    ] {
+        let destination = second_source.join(name);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/blog-post")
+                .join(name),
+            &destination,
+        )
+        .unwrap();
+    }
+    let manifest = second_source.join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        manifest,
+        text.replace("app: blog-post", "app: blog-post-two"),
+    )
+    .unwrap();
+    let second = b
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source": second_source}))
+        .unwrap();
+    let install_b = second["install_id"].as_str().unwrap().to_string();
+    let ctx_b = b
+        .daemon
+        .operator_rpc(
+            "app_context_create",
+            json!({"install_id": install_b, "label": "Client B", "input_defaults": {}, "request_id": "ctx-csv-b"}),
+        )
+        .unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Cross-install imports fail over HTTP exactly like RPC.
+    let other_import =
+        format!("/api/app-installations/{install_b}/contexts/{ctx_b}/records/csv-import");
+    let (code, _) = b.operator(
+        "POST",
+        &other_import,
+        &json!({"csv_text": csv, "preview_token": token, "request_id": "req-x"}).to_string(),
+    );
+    assert_ne!(code, 200, "cross-install HTTP import admitted");
+    // Forged scopes fail closed.
+    let forged = format!(
+        "/api/app-installations/no-such-install/contexts/{}/records/csv-preview",
+        b.context_id
+    );
+    assert_ne!(
+        b.operator("POST", &forged, &json!({"csv_text": csv}).to_string())
+            .0,
+        200
+    );
+
+    // An agent replay without caller assertion is refused over HTTP.
+    let mut lane = LaneShell::spawn(b.root.path());
+    plant_member_pane(&b.daemon, "csv-http-worker", "claude", None, lane.pid());
+    let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &b.daemon.state, b.port);
+    let wire = stolen.request_as(
+        "POST",
+        &format!("{base}/csv-preview"),
+        &json!({"csv_text": csv}).to_string(),
+        "",
+    );
+    assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
+    let file = lane.dir.path().join("csv-request.txt");
+    std::fs::write(&file, wire).unwrap();
+    let (rc, response) = lane.run(&format!("python3 -c 'import socket,sys;s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {} {}", b.port, file.display()));
+    assert_eq!(rc, 0);
+    assert!(
+        response.contains(" 403 "),
+        "unasserted HTTP preview admitted: {response}"
+    );
+    // A sessionless import is refused too.
+    let host = common::op::board_host(b.port);
+    let body =
+        json!({"csv_text": csv, "preview_token": token, "request_id": "req-bare"}).to_string();
+    let bare = format!(
+        "POST {base}/csv-import HTTP/1.0\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (code, _, _) = common::op::raw(b.port, &bare);
+    assert_eq!(code, 403, "sessionless import admitted");
+    // Nothing above imported a row.
+    assert_eq!(b.operator("GET", &format!("{base}/customer-9"), "").0, 409);
+}
