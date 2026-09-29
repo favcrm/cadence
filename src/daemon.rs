@@ -3837,6 +3837,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // unconfigured daemon leaves it unregistered and fails closed.
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
+    // CAD-798: the production publish transport registers only under
+    // explicit config (URL + 0600 credential file); default-off leaves
+    // the daemon without a sender and dispatch stays processing.
+    crate::platform::agenticos_external::publish_sender::attach_publish_sender(
+        state_dir, &mut opts,
+    )?;
     let lease = crate::lease::acquire_with_endpoint(
         state_dir,
         &hosted,
