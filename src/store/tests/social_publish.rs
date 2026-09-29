@@ -1,0 +1,334 @@
+//! CAD-771 slice-2 adversarial tests: durable scheduled-intent lifecycle.
+//!
+//! Vectors: forged fields, concurrent claimants, restart reopen, stale and
+//! unknown identities. Every refusal leaves state unchanged; exactly one
+//! claimant wins dispatch; a restart loses nothing and duplicates nothing.
+
+use super::*;
+use crate::store::social_publish::NewSocialPublish;
+
+fn digest(byte: u8) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest([byte])
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn cap_digest() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| digest(1))
+}
+
+fn img_digest() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| digest(9))
+}
+
+fn intent(request: &str) -> NewSocialPublish<'_> {
+    NewSocialPublish {
+        request_id: request,
+        install_id: "install-harbour",
+        context_id: None,
+        run_id: "cad_run_01",
+        effect_id: "cad_fx_01",
+        connection_id: "con_harbour_ig",
+        destination_id: "17841400008460056",
+        toolkit: "instagram",
+        caption_digest: cap_digest(),
+        image_digest: Some(img_digest()),
+        media_key: None,
+        grant_id: "dpq_synthetic_grant_01",
+        approval_id: "cad_approval_01",
+        due_epoch: 1_750_000_000,
+        timezone: "Asia/Hong_Kong",
+    }
+}
+
+#[test]
+fn cad771_schedule_freezes_exact_intent_and_replays_same_request() {
+    let (_dir, s) = store();
+    let first = s.social_publish_schedule(&intent("req-1")).unwrap();
+    assert_eq!(first["intent"]["state"], "queued");
+    assert_eq!(
+        first["intent"]["frozen"]["destination_id"],
+        "17841400008460056"
+    );
+    let digest = first["intent"]["frozen_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Same request + same frozen content replays the same intent.
+    let replay = s.social_publish_schedule(&intent("req-1")).unwrap();
+    assert_eq!(replay["intent"]["intent_id"], first["intent"]["intent_id"]);
+    assert_eq!(replay["intent"]["frozen_digest"], digest);
+    // Same request + changed content fails instead of forking the key.
+    let mut changed = intent("req-1");
+    changed.destination_id = "999999999999999";
+    assert!(s.social_publish_schedule(&changed).is_err());
+    assert_eq!(
+        s.social_publish_show(first["intent"]["intent_id"].as_str().unwrap())
+            .unwrap()["intent"]["state"],
+        "queued"
+    );
+}
+
+#[test]
+fn cad771_schedule_refuses_forged_and_mismatched_shapes() {
+    let (_dir, s) = store();
+    // Forged destination: empty.
+    let mut bad = intent("req-bad-dest");
+    bad.destination_id = "";
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Forged digests: non-hex / wrong length.
+    let mut bad = intent("req-bad-digest");
+    bad.caption_digest = "not-a-digest";
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Instagram without an image digest cannot be scheduled.
+    let mut bad = intent("req-no-image");
+    bad.image_digest = None;
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Unknown toolkit.
+    let mut bad = intent("req-bad-toolkit");
+    bad.toolkit = "tiktok";
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Empty approval is not a human decision.
+    let mut bad = intent("req-no-approval");
+    bad.approval_id = "";
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Bad timezone and non-positive due time.
+    let mut bad = intent("req-bad-tz");
+    bad.timezone = "";
+    assert!(s.social_publish_schedule(&bad).is_err());
+    let mut bad = intent("req-bad-due");
+    bad.due_epoch = 0;
+    assert!(s.social_publish_schedule(&bad).is_err());
+    // Nothing was stored.
+    assert_eq!(
+        s.social_publish_list(Some("install-harbour"), None)
+            .unwrap()["intents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn cad771_cancel_only_before_dispatch() {
+    let (_dir, s) = store();
+    let staged = s.social_publish_schedule(&intent("req-cancel")).unwrap();
+    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+    let cancelled = s.social_publish_cancel(&id).unwrap();
+    assert_eq!(cancelled["intent"]["state"], "cancelled");
+    // A cancelled intent cannot be cancelled again or claimed.
+    assert!(s.social_publish_cancel(&id).is_err());
+    assert!(s
+        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .is_none());
+    // Unknown intent ids are refused, never created.
+    assert!(s.social_publish_cancel("spub-nope").is_err());
+    assert!(s.social_publish_show("spub-nope").is_err());
+}
+
+#[test]
+fn cad771_claim_due_picks_only_due_queued_and_holds_on_stale_authority() {
+    let (_dir, s) = store();
+    s.social_publish_schedule(&intent("req-early")).unwrap();
+    let mut late = intent("req-late");
+    late.due_epoch = 1_900_000_000;
+    s.social_publish_schedule(&late).unwrap();
+    // Not yet due: nothing claimable.
+    assert!(s
+        .social_publish_claim_due(1_700_000_000, |_, _| Ok(true))
+        .unwrap()
+        .is_none());
+    // Stale authority at dispatch holds for a new human decision: the row
+    // stays queued, nothing is claimed.
+    assert!(s
+        .social_publish_claim_due(1_800_000_000, |_, _| Ok(false))
+        .unwrap()
+        .is_none());
+    // Current authority claims the early intent only.
+    let claimed = s
+        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed["intent"]["state"], "processing");
+    assert_eq!(
+        claimed["intent"]["frozen"]["destination_id"],
+        "17841400008460056"
+    );
+    // A second claim finds nothing due-and-queued (late is future-dated).
+    assert!(s
+        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn cad771_concurrent_claimants_have_exactly_one_winner() {
+    use std::sync::{Arc, Barrier};
+    let (_dir, s) = store();
+    s.social_publish_schedule(&intent("req-race")).unwrap();
+    let s = Arc::new(s);
+    let barrier = Arc::new(Barrier::new(8));
+    let wins = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let (s, barrier, wins) = (Arc::clone(&s), Arc::clone(&barrier), Arc::clone(&wins));
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            if s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+                .unwrap()
+                .is_some()
+            {
+                wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(wins.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cad771_report_needs_verified_receipt_and_never_bare_success() {
+    let (_dir, s) = store();
+    let staged = s.social_publish_schedule(&intent("req-report")).unwrap();
+    let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+    // Reporting before claim is refused: nothing is processing.
+    assert!(s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/",
+                "destination_id": "17841400008460056",
+                "caption_digest": digest(1),
+                "provider_ids": ["provider-post-1"],
+                "provider_payload": {"id": "provider-post-1"}})
+        )
+        .is_err());
+    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    // A bare success string is insufficient proof.
+    assert!(s
+        .social_publish_report(&id, "posted", &json!("posted"))
+        .is_err());
+    assert!(s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/"})
+        )
+        .is_err());
+    // Unknown decisions are refused.
+    assert!(s
+        .social_publish_report(&id, "maybe", &json!({"reason": "x"}))
+        .is_err());
+    // The verified receipt closes the intent as posted.
+    let posted = s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/",
+                "destination_id": "17841400008460056",
+                "caption_digest": digest(1),
+                "provider_ids": ["provider-post-1"],
+                "provider_payload": {"id": "provider-post-1"}}),
+        )
+        .unwrap();
+    assert_eq!(posted["intent"]["state"], "posted");
+    assert_eq!(
+        posted["intent"]["receipt"]["permalink"],
+        "https://www.instagram.com/p/ABC/"
+    );
+    // Terminal: no second report, no re-claim.
+    assert!(s
+        .social_publish_report(
+            &id,
+            "posted",
+            &json!({"permalink": "https://www.instagram.com/p/ABC/",
+                "destination_id": "17841400008460056",
+                "caption_digest": digest(1),
+                "provider_ids": ["provider-post-1"],
+                "provider_payload": {"id": "provider-post-1"}})
+        )
+        .is_err());
+}
+
+#[test]
+fn cad771_refused_and_held_are_terminal_for_dispatch() {
+    let (_dir, s) = store();
+    for (request, decision, receipt) in [
+        ("req-ref", "refused", json!({"error": "grant_revoked"})),
+        (
+            "req-held",
+            "held",
+            json!({"reason": "binding rotated; needs a new human decision"}),
+        ),
+    ] {
+        let staged = s.social_publish_schedule(&intent(request)).unwrap();
+        let id = staged["intent"]["intent_id"].as_str().unwrap().to_owned();
+        s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+            .unwrap()
+            .unwrap();
+        let done = s.social_publish_report(&id, decision, &receipt).unwrap();
+        assert_eq!(done["intent"]["state"], decision);
+        // Neither can be claimed again; held never silently republishes.
+        assert!(s
+            .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn cad771_restart_loses_nothing_and_duplicates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.sqlite3");
+    let id = {
+        let s = Store::open(&path).unwrap();
+        let staged = s.social_publish_schedule(&intent("req-restart")).unwrap();
+        staged["intent"]["intent_id"].as_str().unwrap().to_owned()
+    };
+    // Reopen: the queued intent survives and is claimable exactly once.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "queued"
+    );
+    s.social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .unwrap();
+    drop(s);
+    // Reopen mid-processing: still processing, never auto-duplicated.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "processing"
+    );
+    assert!(s
+        .social_publish_claim_due(1_800_000_000, |_, _| Ok(true))
+        .unwrap()
+        .is_none());
+    // Reconcile by explicit report, then the receipt is durable too.
+    s.social_publish_report(
+        &id,
+        "posted",
+        &json!({"permalink": "https://www.instagram.com/p/ABC/",
+            "destination_id": "17841400008460056",
+            "caption_digest": digest(1),
+            "provider_ids": ["provider-post-1"],
+            "provider_payload": {"id": "provider-post-1"}}),
+    )
+    .unwrap();
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    let shown = s.social_publish_show(&id).unwrap();
+    assert_eq!(shown["intent"]["state"], "posted");
+    assert!(shown["intent"]["receipt"]["permalink"].is_string());
+}

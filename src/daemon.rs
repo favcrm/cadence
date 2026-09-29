@@ -52,6 +52,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_publish_rpc;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
@@ -2746,6 +2747,12 @@ impl Shared {
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
+            "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_cancel" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_show" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_list" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_claim_due" => self.rpc_social_publish(method, params, peer_pid),
+            "social_publish_report" => self.rpc_social_publish(method, params, peer_pid),
             "app_context_create" => self.rpc_app_context(method, params, peer_pid),
             "app_context_list" => self.rpc_app_context(method, params, peer_pid),
             "app_context_show" => self.rpc_app_context(method, params, peer_pid),

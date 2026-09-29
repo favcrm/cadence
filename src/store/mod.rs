@@ -68,6 +68,7 @@ pub mod app_effects;
 pub mod app_records;
 pub mod app_runs;
 mod plans;
+pub mod social_publish;
 pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
