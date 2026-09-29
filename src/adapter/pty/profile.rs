@@ -165,3 +165,80 @@ pub trait TuiProfile: Send + Sync {
     /// the pane. An empty list asserts the TUI has no such hazard.
     fn forbidden_prefixes(&self) -> &'static [char];
 }
+
+/// Default bound on a TUI acquiring its native session after launch.
+/// `CADENCE_PTY_OPEN_DEADLINE_SECS` overrides it in every profile —
+/// tests shrink it through `in_own_process` (process env is shared
+/// across parallel tests, so in-process mutation is forbidden); an
+/// unset var keeps the default, anything else outside `[1, 300]`s or
+/// not a number warns on stderr and keeps the default.
+pub const OPEN_DEADLINE_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Open-deadline override bounds. The floor keeps a slow TUI's session
+/// proof from becoming a tight failure loop; the ceiling keeps a typo
+/// from parking opens for minutes.
+const OPEN_DEADLINE_MIN_SECS: f64 = 1.0;
+
+const OPEN_DEADLINE_MAX_SECS: f64 = 300.0;
+
+fn parse_open_deadline_secs(raw: Option<&str>) -> std::result::Result<Duration, String> {
+    let Some(raw) = raw else {
+        return Ok(OPEN_DEADLINE_DEFAULT);
+    };
+    let secs: f64 = raw.trim().parse().map_err(|_| {
+        format!("CADENCE_PTY_OPEN_DEADLINE_SECS={raw:?} is not a number of seconds")
+    })?;
+    if !(OPEN_DEADLINE_MIN_SECS..=OPEN_DEADLINE_MAX_SECS).contains(&secs) {
+        return Err(format!(
+            "CADENCE_PTY_OPEN_DEADLINE_SECS={raw:?} is outside [{OPEN_DEADLINE_MIN_SECS}, {OPEN_DEADLINE_MAX_SECS}]s"
+        ));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// This process's open-deadline override: `None` is unset (every
+/// profile keeps its default) or refused (warned, default kept).
+pub fn open_deadline_override() -> Option<Duration> {
+    let raw = std::env::var("CADENCE_PTY_OPEN_DEADLINE_SECS").ok()?;
+    match parse_open_deadline_secs(Some(raw.as_str())) {
+        Ok(d) => Some(d),
+        Err(reason) => {
+            eprintln!("pty open deadline: {reason}; using the default {OPEN_DEADLINE_DEFAULT:?}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn open_deadline_defaults_to_thirty_seconds() {
+        assert_eq!(parse_open_deadline_secs(None), Ok(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn open_deadline_accepts_seconds_inside_the_bounds() {
+        assert_eq!(
+            parse_open_deadline_secs(Some("1")),
+            Ok(Duration::from_secs(1))
+        );
+        assert_eq!(
+            parse_open_deadline_secs(Some(" 2.5 ")),
+            Ok(Duration::from_secs_f64(2.5))
+        );
+        assert_eq!(
+            parse_open_deadline_secs(Some("300")),
+            Ok(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn open_deadline_refuses_values_outside_the_bounds_or_not_numbers() {
+        for raw in ["0", "0.5", "-1", "301", "3600", "soon", "", "NaN", "inf"] {
+            let got = parse_open_deadline_secs(Some(raw));
+            assert!(got.is_err(), "{raw:?} accepted as {got:?}");
+        }
+    }
+}

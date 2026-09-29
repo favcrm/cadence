@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
-use super::profile::{DraftView, TuiProfile};
+use super::profile::{open_deadline_override, DraftView, TuiProfile};
 use super::{descends_from, lock_holders, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Devin TUI to take a native session lock.
@@ -534,7 +534,7 @@ impl TuiProfile for DevinProfile {
     }
 
     fn open_deadline(&self) -> Duration {
-        OPEN_DEADLINE
+        open_deadline_override().unwrap_or(OPEN_DEADLINE)
     }
 
     /// Devin's idle placeholder is verified against the live TUI —

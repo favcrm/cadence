@@ -42,6 +42,50 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const HANDSHAKE_BOUND: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Test override for [`HANDSHAKE_BOUND`], paired with
+/// [`connect_deadline`]: `CADENCE_WS_HANDSHAKE_SECS` in `[1, 30]`s.
+/// The loop deadline alone cannot cut a helper-thread join short, so
+/// shrinking only the deadline still pays one full attempt bound.
+fn handshake_bound() -> Duration {
+    const MIN_SECS: f64 = 1.0;
+    const MAX_SECS: f64 = 30.0;
+    let Some(raw) = std::env::var("CADENCE_WS_HANDSHAKE_SECS").ok() else {
+        return HANDSHAKE_BOUND;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if (MIN_SECS..=MAX_SECS).contains(&secs) => Duration::from_secs_f64(secs),
+        _ => {
+            eprintln!(
+                "ws handshake: CADENCE_WS_HANDSHAKE_SECS={raw:?} is not in [{MIN_SECS}, {MAX_SECS}]s; using the default {HANDSHAKE_BOUND:?}"
+            );
+            HANDSHAKE_BOUND
+        }
+    }
+}
+
+/// Test override for [`CONNECT_DEADLINE`]: `CADENCE_WS_CONNECT_SECS`
+/// in `[1, 30]`s is used as is (tests shrink it through
+/// `in_own_process` — process env is shared across parallel tests);
+/// unset keeps the default, anything else warns and keeps it. The
+/// deadline's value is production tuning; the contract is a bounded
+/// startup plus child cleanup, which any deadline exercises.
+fn connect_deadline() -> Duration {
+    const MIN_SECS: f64 = 1.0;
+    const MAX_SECS: f64 = 30.0;
+    let Some(raw) = std::env::var("CADENCE_WS_CONNECT_SECS").ok() else {
+        return CONNECT_DEADLINE;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if (MIN_SECS..=MAX_SECS).contains(&secs) => Duration::from_secs_f64(secs),
+        _ => {
+            eprintln!(
+                "ws connect: CADENCE_WS_CONNECT_SECS={raw:?} is not in [{MIN_SECS}, {MAX_SECS}]s; using the default {CONNECT_DEADLINE:?}"
+            );
+            CONNECT_DEADLINE
+        }
+    }
+}
 /// The I/O loop's read tick: also the upper bound on send latency.
 const READ_POLL: Duration = Duration::from_millis(50);
 
@@ -172,7 +216,7 @@ impl WsAdapter {
             .strip_prefix("ws://")
             .and_then(|a| a.parse().ok())
             .ok_or_else(|| Error::internal("endpoint address did not parse"))?;
-        let deadline = Instant::now() + CONNECT_DEADLINE;
+        let deadline = Instant::now() + connect_deadline();
         loop {
             {
                 let mut inner = self.inner.lock().unwrap();
@@ -214,7 +258,7 @@ impl WsAdapter {
         thread::spawn(move || {
             let _ = tx.send(tungstenite::client(url, stream).map(|(ws, _)| ws));
         });
-        match rx.recv_timeout(HANDSHAKE_BOUND) {
+        match rx.recv_timeout(handshake_bound()) {
             Ok(Ok(ws)) => {
                 // Bounded read tick lets the I/O owner drain outbound
                 // work; writes remain bounded by the socket timeout.

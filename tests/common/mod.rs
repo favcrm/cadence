@@ -2615,6 +2615,36 @@ impl FakeGh {
 
 // ---------- CAD-52: stall detection ----------
 
+/// Wait until the mock pane's screen has been captured `want_more` times
+/// past `from` (one `captures` row per ticker sample), then return.
+/// Absence proofs (`turn_silent_end` fires once, no second reminder)
+/// wait on observed sweeps this way instead of a fixed sleep: the proof
+/// is bound to scheduler iterations, so a stalled scheduler cannot pass
+/// it vacuously, and the happy path pays exactly the sweeps observed,
+/// not a conservative sleep. `secs` bounds failure only.
+pub fn wait_capture_advance(
+    captures_file: &std::path::PathBuf,
+    from: usize,
+    want_more: usize,
+    secs: u64,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let len = std::fs::read_to_string(captures_file)
+            .unwrap_or_default()
+            .len();
+        if len >= from + want_more {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "captures advanced {} of {want_more} in {secs}s",
+            len.saturating_sub(from)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
 /// Poll until `alias` has at least `want` events of `kind`.
 pub fn wait_event_count(
     d: &TestDaemon,
