@@ -1,10 +1,12 @@
 """Bounded automatic staging selector: eligibility, baseline, dedup and receipts."""
 import importlib.util
+import io
 import json
 import re
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/auto-stage.py"
@@ -202,6 +204,58 @@ class StagingStateTests(unittest.TestCase):
         self.assertEqual(state["inflight"], [])
         # Non-staging events never reach the artifact fetch either.
         self.assertEqual(len(calls), 1)
+
+    def receipt_zip(self, receipt):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("candidate/candidate.json", "{}")
+            if receipt is not None:
+                archive.writestr("staging-receipt.json", json.dumps(receipt))
+            archive.writestr("baseline/candidate.json", "{}")
+        return buffer.getvalue()
+
+    def fetch_with_zip(self, zip_bytes):
+        artifacts = [{"id": 70, "name": "staging-receipt-7-1",
+                      "expired": False, "created_at": "2026-09-29T16:38:00Z"}]
+        run = self.staging_run(7, event="schedule", status="completed")
+
+        def fake_api(*args):
+            if args[0].endswith("/artifacts"):
+                return json.dumps({"artifacts": artifacts}).encode()
+            return json.dumps({"workflow_runs": [run]}).encode()
+
+        def fake_check_output(command, **kwargs):
+            if command[:2] == ["gh", "api"] and command[2].endswith("/zip"):
+                return zip_bytes
+            raise AssertionError(f"unexpected command: {command}")
+
+        original_api, original_output = mod.gh_api, mod.subprocess.check_output
+        mod.gh_api = fake_api
+        mod.subprocess.check_output = fake_check_output
+        try:
+            return mod.fetch_staging_state("favcrm/cadence", 10, 5, 999)
+        finally:
+            mod.gh_api = original_api
+            mod.subprocess.check_output = original_output
+
+    def test_receipt_zip_with_other_members_still_parses(self):
+        receipt = {"decision": "staged", "staging_run_id": 7,
+                   "candidate": {"ci_run_id": 42, "ci_run_attempt": 1,
+                                 "source_sha": GOOD_SHA, "sha256": "d" * 64}}
+        state = self.fetch_with_zip(self.receipt_zip(receipt))
+        self.assertEqual(len(state["receipts"]), 1)
+        self.assertEqual(state["receipts"][0]["staging_run_id"], 7)
+        decision, _, _, _ = mod.classify(
+            {"ci_run_id": 42, "ci_run_attempt": 1}, baseline(), state, 999)
+        self.assertEqual(decision, "duplicate")
+        decision, _, supersedes, _ = mod.classify(
+            {"ci_run_id": 43, "ci_run_attempt": 1}, baseline(), state, 999)
+        self.assertEqual(decision, "stage")
+        self.assertEqual(supersedes[0]["ci_run_id"], 42)
+
+    def test_zip_without_receipt_member_yields_no_receipt(self):
+        state = self.fetch_with_zip(self.receipt_zip(None))
+        self.assertEqual(state["receipts"], [])
 
 
 class WorkflowTriggerTests(unittest.TestCase):
