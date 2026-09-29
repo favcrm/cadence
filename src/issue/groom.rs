@@ -788,60 +788,72 @@ mod tests {
         assert!(front.tags.iter().any(|t| t == TRIAGE_TAG));
     }
 
-    /// The sibling evidence AND its close-time clock are re-derived
-    /// under the lock: a sibling committed `done` between the advisory
-    /// snapshot and the locked re-judge is seen *and* dated, so `a` is
-    /// judged `superseded` — not missed by a stale view or a stale clock.
+    /// Commit `id`'s `issue.md` at a backdated commit time — the
+    /// LineTimes fixture pattern (`status_at` reads the commit's author
+    /// date). The issue dir is `<pm>/<project>/<id>`; the pathspec is
+    /// its project-relative tail.
+    fn commit_issue_at(pm: &Pm, id: &str, at: i64) {
+        let (_project, dir) = issue_dir(pm, id).unwrap();
+        let rel = dir.strip_prefix(&pm.dir).unwrap().to_path_buf();
+        let date = format!("@{at} +0000");
+        Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["add", &rel.to_string_lossy()])
+            .output()
+            .unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-q", "-m", id])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    /// Write `id`'s `issue.md` directly (no commit) — a sibling that
+    /// enters tracker history only when a test commits it.
+    fn write_issue(pm: &Pm, id: &str, status: &str, paths: &[&str]) {
+        let dir = pm.dir.join("cadence").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths_yaml = paths
+            .iter()
+            .map(|p| format!("\n  - {p}"))
+            .collect::<String>();
+        std::fs::write(
+            dir.join("issue.md"),
+            format!(
+                "---\nid: {id}\ntitle: {id}\nstatus: {status}\npriority: P2\
+                 \ncreated: {}\npaths:{paths_yaml}\n---\n\nbody\n",
+                time::iso(time::now_epoch() - (GROOM_GRACE_SECS + 86_400))
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The clock reads the sibling's committed close: a `done` sibling
+    /// overlapping the same `paths:` whose close lands inside the
+    /// freshness window drives `superseded`. `status_at` is the git
+    /// commit clock — the close must be *committed*; an uncommitted
+    /// `status: done` write leaves no close time and cannot count.
     #[test]
-    fn sibling_close_racing_snapshot_is_recognised_under_lock() {
+    fn committed_done_sibling_supersedes() {
         let (tmp, pm) = tracker();
+        let a_created = time::now_epoch() - (GROOM_GRACE_SECS + 86_400);
+        // `b` overlaps `a`'s path — its `status:` line enters history
+        // backdated before `a.created`.
+        write_issue(&pm, "CAD-9", "backlog", &["shared.rs"]);
+        commit_issue_at(&pm, "CAD-9", a_created - 3600);
         let a = mk(&pm, tmp.path(), "a");
-        let b = mk(&pm, tmp.path(), "b");
         dormant(&pm, &a, &["shared.rs"]);
-        edit(&pm, &b, |f| f.paths = vec!["shared.rs".to_string()]);
-        // Commit the tracker so `LineTimes` has history to read, then
-        // `b` is still open at the advisory snapshot. The writer closes
-        // `b` (a real commit, so status_at can date it) before `a`'s
-        // locked re-judge.
-        let (_p, pmdir) = issue_dir(&pm, &a).unwrap();
-        let _ =
-            crate::issue::write::commit(&pm, &[pmdir.join("issue.md")], "seed", &[a.as_str()], "t");
-        let out = std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let writer_pm = &pm;
-            let writer_id = b.clone();
-            let writer = scope.spawn(move || {
-                rx.recv().unwrap();
-                let _w = writer_pm.lock().unwrap();
-                edit(writer_pm, &writer_id, |f| f.status = "done".to_string());
-                // Commit the close so LineTimes records a close time.
-                let (_p, bdir) = issue_dir(writer_pm, &writer_id).unwrap();
-                let (f, body) = load_front(&bdir).unwrap();
-                let prev = f.clone();
-                crate::issue::write::commit(
-                    writer_pm,
-                    &[bdir.join("issue.md")],
-                    "close b",
-                    &[writer_id.as_str()],
-                    "t",
-                )
-                .unwrap();
-                let _ = (prev, body);
-            });
-            groom_with_hooks(
-                &pm,
-                None,
-                GROOM_GRACE_SECS,
-                true, // dry-run — observe the verdict, write nothing
-                "t",
-                || {
-                    tx.send(()).unwrap();
-                    writer.join().unwrap();
-                },
-                || {},
-            )
-            .unwrap()
-        });
+        // `b` closes, committed — its close `status_at` lands inside
+        // `a`'s freshness window, so `a` reads as covered.
+        edit(&pm, "CAD-9", |f| f.status = "done".to_string());
+        commit_issue_at(&pm, "CAD-9", time::now_epoch());
+        let out = groom(&pm, None, GROOM_GRACE_SECS, true, "t").unwrap();
         let verdict = out["verdicts"]
             .as_array()
             .unwrap()
@@ -852,7 +864,32 @@ mod tests {
         assert_eq!(
             verdict["verdict"].as_str(),
             Some("superseded"),
-            "sibling closed under lock must drive superseded: {out}"
+            "a committed done sibling on the same path must supersede: {out}"
+        );
+    }
+
+    /// A sibling still `open` — its `status_at` predates `a.created` —
+    /// cannot supersede; the ticket is only `stale`, not covered.
+    #[test]
+    fn open_sibling_does_not_supersede() {
+        let (tmp, pm) = tracker();
+        let a_created = time::now_epoch() - (GROOM_GRACE_SECS + 86_400);
+        write_issue(&pm, "CAD-9", "backlog", &["shared.rs"]);
+        commit_issue_at(&pm, "CAD-9", a_created - 3600);
+        let a = mk(&pm, tmp.path(), "a");
+        dormant(&pm, &a, &["shared.rs"]);
+        let out = groom(&pm, None, GROOM_GRACE_SECS, true, "t").unwrap();
+        let verdict = out["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_str() == Some(a.as_str()))
+            .cloned()
+            .unwrap_or(json!(null));
+        assert_ne!(
+            verdict["verdict"].as_str(),
+            Some("superseded"),
+            "an open sibling whose status_at predates a.created cannot supersede: {out}"
         );
     }
 
