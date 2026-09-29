@@ -25,8 +25,10 @@ measured result is recorded (see "Acceptance measurement").
 ## Proposed `build.recipes` entry
 
 Recipe name: `focused-confinement-kickoff`. The operator adds this
-verbatim under `build: recipes:` in the `cadence` project's
-`project.yaml`, filling in only `<HOST SUITE LOCK>` with the host's
+verbatim as a top-level `build:` block in the `cadence` project's
+`project.yaml` — merging only the `focused-confinement-kickoff:`
+mapping under an existing `build: recipes:` when one is already
+present — filling in only `<HOST SUITE LOCK>` with the host's
 designated suite-lock path:
 
 ```yaml
@@ -89,7 +91,7 @@ with the recipe's exit code. Variants:
   later with `cadence build-slot runner <id>`.
 - `--worktree` must be a checkout of a repo registered to project
   `cadence` (a lane worktree qualifies). Always pass it alongside an
-explicit `--project cadence`: in that case the CLI does not forward
+  explicit `--project cadence`: in that case the CLI does not forward
   the cwd, and the runner would otherwise default to the project's
   first registered checkout instead of the intended lane.
 - `--wait-secs <n>` bounds only the slot queue (default 600); a queue
