@@ -213,6 +213,8 @@ jobs:
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
       - name: Test scope selection and execution contracts
         run: python3 tests/scripts/test_ci_test_plan.py
+      - name: Test suite-shard partition contracts
+        run: python3 tests/scripts/test_ci_rust_tests.py
       - run: rustup toolchain install stable --profile minimal
         if: steps.scope.outputs.mode != 'docs'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
