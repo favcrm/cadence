@@ -438,13 +438,25 @@ fn cad771_e2e_forged_freeze_inputs_fail_closed() {
         .daemon
         .operator_rpc("social_publish_schedule", mixed)
         .is_err());
-    // Unproven agent-shaped callers cannot schedule at all: operator only.
-    assert!(h
-        .daemon
-        .unproven_rpc("social_publish_schedule", base)
-        .unwrap_err()
-        .to_string()
-        .contains("operator"));
+    // Unproven agent-shaped callers cannot reach any of the six methods:
+    // the operator gate refuses before any field is read.
+    for method in [
+        "social_publish_schedule",
+        "social_publish_cancel",
+        "social_publish_show",
+        "social_publish_list",
+        "social_publish_claim_due",
+        "social_publish_report",
+    ] {
+        assert!(
+            h.daemon
+                .unproven_rpc(method, json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("operator"),
+            "{method}"
+        );
+    }
 }
 
 #[test]
