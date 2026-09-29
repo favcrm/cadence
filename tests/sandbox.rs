@@ -669,6 +669,138 @@ fn sandbox_down_and_reset_kill_the_panes_the_daemon_left() {
     assert!(!fake.join(&socket).exists());
 }
 
+/// CAD-817: `ui start` on a port a FOREIGN listener already serves
+/// must refuse — an HTTP 200 from that listener is not this board's
+/// readiness. Before the fix the start reported `started`, wrote
+/// `ui.pid` for a child that had already died on `Address already in
+/// use`, and left the port's real server answering for the state dir.
+#[test]
+fn ui_start_refuses_a_port_another_board_already_serves() {
+    let host = Host::new();
+    let state = host.tmp.path().join("victim-state");
+    std::fs::create_dir_all(&state).unwrap();
+    // A fenced port the foreign listener holds: exactly the collision
+    // a parallel board creates for a sandbox's pick-to-bind gap. Scan
+    // for one that is both fenceable and bindable right now.
+    let (port, _fence, foreign_listener) = fenced_bindable_port("adversary");
+    let _foreign = serve_health_200(foreign_listener);
+    // Sanity: the port answers 200 while belonging to another listener.
+    assert_eq!(http_status(port, "/api/health"), Some(200));
+    let st = state.to_str().unwrap();
+    let out = host.run(
+        &[
+            "--state-dir",
+            st,
+            "ui",
+            "start",
+            "--port",
+            &port.to_string(),
+        ],
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "ui start adopted a foreign listener: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains(&port.to_string()),
+        "refusal must name the port in use: {}",
+        text(&out)
+    );
+    assert!(
+        !state.join("ui.pid").exists(),
+        "a refused start leaves no pid file"
+    );
+    // The foreign listener is untouched — `ui stop` on the victim must
+    // not even try to kill it (there is no pid to act on).
+    assert_eq!(http_status(port, "/api/health"), Some(200));
+}
+
+/// CAD-817 companion — fence hygiene. `fence_port` is what the
+/// lifecycle test holds across `down`: a second opener of the same
+/// lock file must lose the `flock`, or a parallel pick could take the
+/// port in the window where the sandbox board is down. The `claim`
+/// written into the file lets a later `up` for the same sandbox
+/// recognise the hold as its own.
+#[test]
+fn a_fenced_port_stays_exclusive_while_held() {
+    use std::os::fd::AsRawFd;
+    let (port, lock, _listener) = fenced_bindable_port("fence-check");
+    // A second opener is a different open-file-description: the hold
+    // contends like another process's, so the flock must fail.
+    let again = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/tmp/cadence-test-ports/{port}.lock"))
+        .unwrap();
+    assert_ne!(
+        unsafe { libc::flock(again.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "a held fence was re-taken"
+    );
+    // The claim a suite member wrote names the sandbox it protects.
+    assert_eq!(
+        std::fs::read_to_string(format!("/tmp/cadence-test-ports/{port}.lock"))
+            .unwrap()
+            .trim(),
+        cadence_agent::sandbox::port_claim("fence-check")
+    );
+    drop(lock);
+}
+
+/// Pick a port in 3110-3199 that is free right now, fence it through
+/// the suite's lock dir (`fence_port`'s own shape), and return the
+/// port, the held `flock`, and a bound listener — the foreign board
+/// shape a collision needs.
+fn fenced_bindable_port(claim: &str) -> (u16, std::fs::File, TcpListener) {
+    use std::os::fd::AsRawFd;
+    let dir = std::path::Path::new("/tmp/cadence-test-ports");
+    std::fs::create_dir_all(dir).unwrap();
+    let start = std::process::id() as usize % 90;
+    for i in 0..90usize {
+        let port = 3110 + ((start + i) % 90) as u16;
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{port}.lock")))
+        else {
+            continue;
+        };
+        // SAFETY: plain syscall on a descriptor this function owns.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            let mut l = &lock;
+            let _ = l.set_len(0);
+            let _ = l.write_all(cadence_agent::sandbox::port_claim(claim).as_bytes());
+            return (port, lock, listener);
+        }
+    }
+    panic!("no fenceable + bindable port in 3110-3199");
+}
+
+/// A minimal HTTP server that answers `GET /api/health` with 200 —
+/// the stand-in for a foreign board that owns a port while its own
+/// `ui start` is being attempted.
+fn serve_health_200(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 2048];
+            if s.read(&mut buf).is_err() {
+                continue;
+            }
+            // Closing with unread request bytes RSTs the peer; answer
+            // then shutdown the write side so `read_to_string` sees EOF.
+            let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}" as &[u8]);
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let _ = s.read(&mut buf);
+        }
+    })
+}
+
 /// The marker is a hand-writable file: `<x>/state` symlinked onto
 /// production's state dir beside a forged `<x>/.cadence-sandbox` must
 /// not run production's database as a lease-exempt sandbox.
