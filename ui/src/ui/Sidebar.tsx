@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
+import type { AppMenu } from "../features/app-shell/CrmOutlet";
 import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project, Meta } from "../lib/types";
@@ -32,6 +33,11 @@ interface Props {
   /** CAD-313: this browser's operator session — null while unknown. */
   signedIn?: boolean | null;
   sessionUser?: NonNullable<Meta["session"]>["user"];
+  /** Nested submenu for the verified active installation, or null
+   *  when no installation workspace is on screen. Host-owned App
+   *  menu (CAD-784): sections arrive as data with real hrefs — the
+   *  sidebar never invents entries from the bare route. */
+  appMenu?: AppMenu | null;
 }
 
 const NAV_ICONS: Record<string, ReactNode> = {
@@ -44,7 +50,7 @@ const NAV_ICONS: Record<string, ReactNode> = {
   settings: <IconSettings />,
 };
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, sessionUser }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, sessionUser, appMenu = null }: Props) {
   // "…" until the cards load; a stale list keeps its numbers.
   const count = (key: string) => {
     if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
@@ -75,6 +81,25 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
           </Link>
         ))}
       </nav>
+      {appMenu && (
+        <>
+          <div className="slabel mx-[11px] mt-[22px] mb-[7px]">
+            <span className="truncate" title={appMenu.title}>{appMenu.title}</span>
+          </div>
+          <nav aria-label={`${appMenu.title} sections`} className="grid gap-[2px] ml-[10px] border-l border-ink-700 pl-[6px]">
+            {appMenu.sections.map((s) => (
+              <Link
+                key={s.label}
+                href={s.href}
+                className="navlink"
+                aria-current={s.current ? "page" : undefined}
+              >
+                {s.label}
+              </Link>
+            ))}
+          </nav>
+        </>
+      )}
       <div className="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]">
         <span>Projects</span>
         <span className="text-[10px]">~/pm</span>

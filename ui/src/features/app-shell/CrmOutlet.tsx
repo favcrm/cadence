@@ -12,6 +12,43 @@ export type OutletView = "list" | "new";
 /** CRM nested sections under Apps → CRM (CAD-784). */
 export type CrmSection = "customers" | "segments" | "campaigns";
 
+/** The CRM submenu in host display order. Shared by the outlet
+ *  shortcuts and the board-level App menu. */
+export const CRM_SECTIONS: [CrmSection, string][] = [
+  ["customers", "Customers"],
+  ["segments", "Segments"],
+  ["campaigns", "Campaigns"],
+];
+
+export interface AppMenuSection {
+  label: string;
+  href: string;
+  current: boolean;
+}
+
+export interface AppMenu {
+  /** Verified installation title, e.g. "CRM". */
+  title: string;
+  sections: AppMenuSection[];
+}
+
+/**
+ * Board-level App menu data for an active CRM installation. Pure —
+ * unit-tested. Callers must only feed it verified installation
+ * detail (never the bare route): AppShell reports kind/title from
+ * its HTTP receipt, and App.tsx matches the installId to the route.
+ */
+export function crmAppMenu(href: string, title: string, active: CrmSection): AppMenu {
+  return {
+    title,
+    sections: CRM_SECTIONS.map(([key, label]) => ({
+      label,
+      href: crmSectionHref(href, key),
+      current: active === key,
+    })),
+  };
+}
+
 /**
  * Section links for the host-owned CRM submenu. They keep the selected
  * context (and any other host params), drop the record view and any
@@ -75,13 +112,7 @@ export default function CrmOutlet({
         <SectionTabs
           bare
           label="CRM"
-          tabs={(
-            [
-              ["customers", "Customers"],
-              ["segments", "Segments"],
-              ["campaigns", "Campaigns"],
-            ] as [CrmSection, string][]
-          ).map(([key, label]) => ({
+          tabs={CRM_SECTIONS.map(([key, label]) => ({
             label,
             href: crmSectionHref(href, key),
             on: active === key,

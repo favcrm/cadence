@@ -46,15 +46,29 @@ import "./app-shell.css";
  * selector internally, so the shell shows none there and never a
  * second, divergent one. No App-provided JavaScript runs here.
  */
+/** Verified installation identity for the board-level App menu.
+ *  Reported only from the shell's HTTP receipt — never the bare
+ *  route — so a forged installId cannot conjure menu entries. */
+export interface ActiveInstallation {
+  installId: string;
+  kind: string;
+  title: string;
+}
+
 export default function AppShell({
   installId,
   viewer,
   children,
+  onInstallation,
 }: {
   installId: string;
   viewer: Viewer;
   /** Social-content's existing screen; other Apps use the generic outlet. */
   children?: React.ReactNode;
+  /** Board menu wiring: receives the verified installation (or null
+   *  while loading, failed, or switched away). The parent matches
+   *  installId to its route and compares values before storing. */
+  onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
@@ -159,6 +173,25 @@ export default function AppShell({
       });
     return () => controller.abort();
   }, [installId, viewer.operator]);
+
+  // Board-level App menu identity: report the verified receipt (or
+  // null while it is loading, failed, or belongs to another install)
+  // so the shared sidebar/phone menu can nest this installation's
+  // sections. Clearing on cleanup keeps a departed installation from
+  // lingering in host navigation.
+  useEffect(() => {
+    if (!onInstallation) return;
+    if (installation && installation.install_id === installId) {
+      onInstallation({
+        installId,
+        kind: installation.name,
+        title: installation.title || installation.name,
+      });
+    } else {
+      onInstallation(null);
+    }
+    return () => onInstallation(null);
+  }, [installId, installation, onInstallation]);
 
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
