@@ -1664,7 +1664,7 @@ pub(crate) fn report_result_text(
     let body = read_body_capped(None, Some(path), task_report::BODY_MAX as u64)?;
     let pm = cadence_agent::issue::Pm::open_default()?;
     let prepared = task_report::prepare(&pm, &body, None, None)?;
-    let check = client::rpc(
+    let check = client::rpc_relay(
         state_dir,
         "message_report",
         json!({"message": message, "token": token, "kind": "result",
@@ -1752,21 +1752,21 @@ pub(crate) fn send_message(
     // silently on endpoints where readiness claims don't exist. The
     // claim is attributed to CADENCE_ALIAS when sent from inside a pane.
     if ready {
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+        let show = client::rpc_relay(state_dir, "agent_show", json!({"alias": alias}))?;
         let agent = &show["agent"];
         if registry::ready_gate(
             agent["provider"].as_str().unwrap_or_default(),
             agent["endpoint_kind"].as_str().unwrap_or_default(),
         ) {
             let by = std::env::var("CADENCE_ALIAS").ok();
-            client::rpc(
+            client::rpc_relay(
                 state_dir,
                 "agent_ready",
                 json!({"alias": alias, "by": by, "force": force}),
             )?;
         }
     }
-    let receipt = client::rpc(
+    let receipt = client::rpc_relay(
         state_dir,
         "agent_send",
         json!({"alias": alias, "text": body,

@@ -1002,6 +1002,27 @@ impl Store {
             .filter(|v| !v.is_empty())
     }
 
+    /// Every adoption candidate `recover()` kept, alias → the
+    /// (message, turn) pairs. Read at boot so the daemon can park a
+    /// report that arrives while the pane is still being re-proven
+    /// (CAD-508).
+    pub fn adoption_snapshot(&self) -> std::collections::HashMap<String, Vec<(String, String)>> {
+        self.adoptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(alias, entries)| {
+                (
+                    alias.clone(),
+                    entries
+                        .iter()
+                        .map(|e| (e.message_id.clone(), e.turn_id.clone()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     /// The endpoint facts a hot restart needs per pty alias — recorded
     /// generation, pane pid, native session — read while the endpoint
     /// is still live on the agent row (before detach clears them).

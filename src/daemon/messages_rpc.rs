@@ -865,7 +865,7 @@ impl Shared {
                 ));
             }
         }
-        let agent = self.store.agent(&message.alias)?;
+        let mut agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token) {
             return Err(Error::rejected(
                 "Token does not match the message's submission token",
@@ -877,9 +877,30 @@ impl Shared {
             agent.generation.as_deref(),
             token,
         ) {
-            return Err(Error::rejected(
-                "Submission token belongs to a stale endpoint generation",
-            ));
+            // CAD-508: a restart clears the generation until the pane
+            // proof settles — a report arriving in that window reads
+            // "stale" though its turn may adopt. When the marker still
+            // names this exact message+token, park for the probe's
+            // bounded span, then re-judge the settled row.
+            if self.adoption_pending(&message.alias, id, token) {
+                self.wait_for_adoption(
+                    &message.alias,
+                    id,
+                    token,
+                    Instant::now() + Duration::from_secs(20),
+                );
+                agent = self.store.agent(&message.alias)?;
+            }
+            if !registry::turn_token_current(
+                &agent.provider,
+                &agent.endpoint_kind,
+                agent.generation.as_deref(),
+                token,
+            ) {
+                return Err(Error::rejected(
+                    "Submission token belongs to a stale endpoint generation",
+                ));
+            }
         }
         if kind == "result" && registry::reports_turn_result(&agent.provider, &agent.endpoint_kind)
         {

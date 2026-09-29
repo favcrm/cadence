@@ -331,6 +331,13 @@ pub struct Shared {
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
     open_attach: Mutex<HashMap<String, &'static str>>,
+    /// CAD-508: hot-restart adoptions whose pane proof is still in
+    /// flight — alias → the (message, turn) pairs the marker recorded.
+    /// A report naming one waits out the probe, bounded, rather than
+    /// taking the stale-generation refusal while adoption is pending;
+    /// `adoptions_notify` wakes the waiter at the settle write.
+    adoptions_pending: Mutex<HashMap<String, Vec<(String, String)>>>,
+    adoptions_notify: Notify,
     /// Provider launch overrides for this daemon instance.
     provider_env: ProviderEnv,
     /// Unix epoch seconds when this daemon process came up — the
@@ -536,6 +543,12 @@ impl Shared {
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
+        // The store's candidates and this in-flight copy part ways at
+        // `take_adoption`: the store's entry leaves when the actor
+        // claims it, this one only when the pane proof settles
+        // (adopted, refused, or the alias is skipped at relaunch) —
+        // the whole span a report can beat.
+        let adoptions_pending = store.adoption_snapshot();
         let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
@@ -557,6 +570,8 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
+            adoptions_pending: Mutex::new(adoptions_pending),
+            adoptions_notify: Notify::new(),
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
@@ -647,6 +662,47 @@ impl Shared {
         }
         self.start_actor_locked(&mut lc, alias, false)?;
         Ok(())
+    }
+
+    /// CAD-508: the hot-restart marker still has `message`/`token`
+    /// awaiting the pane proof for `alias` — a report for it is early,
+    /// not stale.
+    fn adoption_pending(&self, alias: &str, message: &str, token: &str) -> bool {
+        self.adoptions_pending
+            .lock()
+            .unwrap()
+            .get(alias)
+            .is_some_and(|entries| entries.iter().any(|(m, t)| m == message && t == token))
+    }
+
+    /// The pane proof for `alias` is final — adopted, refused, or the
+    /// alias is never relaunched. Pending reports wake and re-judge.
+    pub(super) fn adoptions_settle(&self, alias: &str) {
+        if self
+            .adoptions_pending
+            .lock()
+            .unwrap()
+            .remove(alias)
+            .is_some()
+        {
+            self.adoptions_notify.notify_all();
+        }
+    }
+
+    /// Park the caller while `alias`'s pane proof is in flight, waking
+    /// on the settle or `deadline`. Returns once no adoption for
+    /// `message`/`token` is pending (or the bound passed) — the caller
+    /// then re-reads the settled state.
+    fn wait_for_adoption(&self, alias: &str, message: &str, token: &str, deadline: Instant) {
+        while self.adoption_pending(alias, message, token) {
+            let ticket = self.adoptions_notify.ticket();
+            if !self.adoption_pending(alias, message, token) {
+                break;
+            }
+            if !self.adoptions_notify.wait_if_unchanged(ticket, deadline) {
+                break;
+            }
+        }
     }
 
     /// Fence check, enable, state write, spawn and insert — all while the
@@ -1340,6 +1396,7 @@ impl Shared {
                                    "reason": reason}),
                         );
                     }
+                    self.adoptions_settle(alias);
                     return Err(error);
                 }
             },
@@ -1355,12 +1412,17 @@ impl Shared {
                 .insert(alias.to_string(), attach);
         }
         match &adoption {
-            Some(entries) => self.store.set_identity_adopted_with_quota(
-                alias,
-                &identity,
-                entries,
-                adapter.quota_snapshot(),
-            )?,
+            Some(entries) => {
+                self.store.set_identity_adopted_with_quota(
+                    alias,
+                    &identity,
+                    entries,
+                    adapter.quota_snapshot(),
+                )?;
+                // The adopted generation is committed — reports parked
+                // on this turn re-validate against it now (CAD-508).
+                self.adoptions_settle(alias);
+            }
             None => {
                 self.store
                     .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?;
@@ -3829,6 +3891,14 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
         eprintln!("warning: operator secret unavailable, board logins refused: {e}");
     }
+    // CAD-508: relaunch — including hot-restart adoption — finishes
+    // before any socket opens. A caller that connects can only ever
+    // see post-adoption state: a `message result` arriving while an
+    // adopted turn's generation is still being restored is otherwise
+    // refused as stale, and a client retry would be a second report.
+    // While relaunch runs, connects simply fail and `rpc_relay`
+    // callers ride out the gap.
+    relaunch_agents(&shared)?;
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
             Some((path, gid)) => (path.clone(), *gid, true),
@@ -3854,7 +3924,6 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    relaunch_agents(&shared)?;
     // Signal-driven shutdown: set the same flag as the rpc.
     {
         let shared = Arc::clone(&shared);

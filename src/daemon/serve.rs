@@ -572,6 +572,9 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
         if !agent.enabled || !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            // No actor will ever prove these panes — a report parked
+            // on one releases to the settled state now (CAD-508).
+            shared.adoptions_settle(&agent.alias);
             continue;
         }
         // A fenced agent stays registered but must never churn on a
@@ -603,6 +606,10 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                     );
                 }
             }
+            // The fence above is the adoption's final answer — a
+            // report parked on one of these turns re-judges against
+            // `unknown` now (CAD-508).
+            shared.adoptions_settle(&agent.alias);
             let (reason, error) = if unknown {
                 (
                     "unknown messages await reconcile",

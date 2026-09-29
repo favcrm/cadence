@@ -5,7 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -318,7 +318,7 @@ pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
 /// show.
 pub fn route_answer(state_dir: &Path, issue: &str, report: &str) -> Value {
     let params = serde_json::json!({"issue": issue, "report": report});
-    match rpc_timeout(state_dir, "answer_route", params, Duration::from_secs(10)) {
+    match rpc_relay_timeout(state_dir, "answer_route", params, Duration::from_secs(10)) {
         Ok(v) => v,
         Err(e) => serde_json::json!({"sent": false, "error": e.to_string()}),
     }
@@ -384,6 +384,79 @@ pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Resul
     )?))
 }
 
+/// CAD-508: the window a restart leaves — socket file gone or still
+/// refusing while the replacement migrates — is covered by connect
+/// retries up to this budget, long enough for a slow boot, bounded so
+/// a genuinely down daemon still fails the verb.
+const RELAY_BUDGET: Duration = Duration::from_secs(60);
+/// First wait between connect attempts; doubles to [`RELAY_STEP_MAX`].
+const RELAY_STEP: Duration = Duration::from_millis(50);
+const RELAY_STEP_MAX: Duration = Duration::from_millis(500);
+
+/// `rpc` for a verb whose loss costs work — `message result`, `send`,
+/// `inbox`, a verdict (CAD-508). While the daemon is between sockets
+/// the connect retries with backoff until [`RELAY_BUDGET`] passes.
+///
+/// Only the connect is retried, on the two kinds that mean "no
+/// listener" (`NotFound`, `ConnectionRefused`): once a stream is
+/// accepted the request is single-shot, so a non-idempotent verb can
+/// never replay, and the daemon's own refusal inside the frame comes
+/// back unanswered. Lifecycle and probe calls stay on [`rpc`] — a
+/// `shutdown` replayed after the window would kill the replacement.
+pub fn rpc_relay(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    rpc_relay_timeout(state_dir, method, params, Duration::from_secs(700))
+}
+
+/// [`rpc_relay`] with a caller-chosen read bound, like [`rpc_timeout`].
+pub(crate) fn rpc_relay_timeout(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    proto::unwrap(rpc_frame_relay(
+        state_dir,
+        method,
+        params,
+        timeout,
+        RELAY_BUDGET,
+    )?)
+}
+
+/// The relay's connect loop: retry the window-shaped failures until
+/// `budget` runs out, then hand the established stream to
+/// [`rpc_exchange`] exactly once.
+fn rpc_frame_relay(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    budget: Duration,
+) -> Result<Value> {
+    let socket = rpc_socket_path(state_dir)?;
+    let deadline = Instant::now() + budget;
+    let mut step = RELAY_STEP;
+    loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => return rpc_exchange(stream, state_dir, method, params, timeout),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(daemon_unreachable(&socket));
+                }
+                std::thread::sleep(step.min(left));
+                step = (step * 2).min(RELAY_STEP_MAX);
+            }
+            Err(_) => return Err(daemon_unreachable(&socket)),
+        }
+    }
+}
+
 /// One request/response frame over the daemon socket.
 fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let socket = rpc_socket_path(state_dir)?;
@@ -397,12 +470,25 @@ fn rpc_frame_on(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket).map_err(|_| {
-        Error::internal(format!(
-            "Daemon is not reachable at {} — start it with `cadence daemon start`",
-            socket.display()
-        ))
-    })?;
+    let stream = UnixStream::connect(socket).map_err(|_| daemon_unreachable(socket))?;
+    rpc_exchange(stream, state_dir, method, params, timeout)
+}
+
+fn daemon_unreachable(socket: &Path) -> Error {
+    Error::internal(format!(
+        "Daemon is not reachable at {} — start it with `cadence daemon start`",
+        socket.display()
+    ))
+}
+
+/// The single-shot request/response on an already-connected stream.
+fn rpc_exchange(
+    mut stream: UnixStream,
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     stream.set_read_timeout(Some(timeout))?;
     let mut request = proto::request(method, params);
     // CAD-482: a test-seam caller asserts its identity on the frame —
@@ -466,6 +552,169 @@ mod tests {
         );
         let status = child.try_wait().unwrap().expect("reaped");
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// A minimal daemon stand-in for relay tests: after `delay`, bind
+    /// `socket` and answer `n` connections, each with the same frame.
+    /// Returns the number of connections actually served.
+    fn serve_later(
+        socket: PathBuf,
+        delay: Duration,
+        n: usize,
+        frame: Value,
+    ) -> std::thread::JoinHandle<usize> {
+        use std::os::unix::net::UnixListener;
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut served = 0;
+            for _ in 0..n {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                served += 1;
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                let _ = writeln!(&stream, "{frame}");
+            }
+            served
+        })
+    }
+
+    #[test]
+    fn a_relay_connects_once_the_socket_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("cadence.sock");
+        let server = serve_later(
+            socket,
+            Duration::from_millis(200),
+            1,
+            proto::ok(Value::Null),
+        );
+        let start = Instant::now();
+        let out = rpc_frame_relay(
+            dir.path(),
+            "health",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "the relay returned before any listener existed"
+        );
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_relay_retries_a_refused_stale_socket() {
+        // A listener that bound then died leaves the socket file:
+        // connects refuse until the replacement removes and rebinds it.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("cadence.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let stale = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::remove_file(&stale).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            writeln!(&stream, "{}", proto::ok(Value::Null)).unwrap();
+        });
+        let out = rpc_frame_relay(
+            dir.path(),
+            "health",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_relay_returns_the_first_answer_without_retrying() {
+        // The daemon's own refusal is an answer, not the window: it
+        // comes straight back and the relay never reconnects — the
+        // elapsed bound is what proves no retry loop ran.
+        let dir = tempfile::tempdir().unwrap();
+        let refused = serde_json::json!({"ok": false,
+            "error": {"kind": "rejected", "message": "nope"}});
+        let server = serve_later(
+            dir.path().join("cadence.sock"),
+            Duration::ZERO,
+            1,
+            refused.clone(),
+        );
+        let start = Instant::now();
+        let out = rpc_frame_relay(
+            dir.path(),
+            "shutdown",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(out, refused);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an answered request was retried"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_relay_gives_up_when_nothing_ever_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let err = rpc_frame_relay(
+            dir.path(),
+            "agent_send",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Daemon is not reachable"), "{err}");
+        let spent = start.elapsed();
+        assert!(
+            spent >= Duration::from_millis(300) && spent < Duration::from_secs(10),
+            "budget {spent:?} neither honored nor bounded"
+        );
+    }
+
+    #[test]
+    fn concurrent_relays_each_connect_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = serve_later(
+            dir.path().join("cadence.sock"),
+            Duration::from_millis(200),
+            4,
+            proto::ok(Value::Null),
+        );
+        let callers: Vec<_> = (0..4)
+            .map(|i| {
+                let state = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    rpc_frame_relay(
+                        &state,
+                        "agent_send",
+                        serde_json::json!({"i": i}),
+                        Duration::from_secs(5),
+                        Duration::from_secs(30),
+                    )
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap().unwrap()["ok"], true);
+        }
+        assert_eq!(server.join().unwrap(), 4, "a caller connected twice");
     }
 
     #[test]
