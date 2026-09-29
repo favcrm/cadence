@@ -232,14 +232,28 @@ fn cad782_http_content_roundtrip_matches_rpc() {
         .unwrap()
         .contains("Hello Amina"));
 
+    // A verified sender binding backs preparations over HTTP too.
+    let binding = b.value(
+        "POST",
+        &format!("{base}/sender-bindings"),
+        json!({"binding_id": "bind-1", "sender_name": "News", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub"}),
+    );
+    assert_eq!(binding["binding"]["preview_only"], false);
+    let bound = b.value("GET", &format!("{base}/sender-bindings/bind-1"), json!({}));
+    assert_eq!(bound["binding"], binding["binding"]);
+    let listed = b.value("GET", &format!("{base}/sender-bindings/list"), json!({}));
+    assert_eq!(listed["bindings"].as_array().unwrap().len(), 1);
+
     // Proposal propose/apply over HTTP with Apply/Discard semantics.
+    // Operator-submitted drafts read as operator work.
     let proposed = b.value(
         "POST",
         &format!("{base}/proposals"),
         json!({"campaign_id": "launch-1", "proposal_id": "prop-1", "subject": "Spring launch, new", "blocks": blocks()}),
     );
     assert_eq!(proposed["proposal"]["state"], "pending");
-    assert_eq!(proposed["proposal"]["actor"], "assistant");
+    assert_eq!(proposed["proposal"]["actor"], "operator");
+    assert_eq!(proposed["proposal"]["origin"], "operator-direct");
     let applied = b.value(
         "POST",
         &format!("{base}/proposals/prop-1/apply"),
@@ -253,22 +267,44 @@ fn cad782_http_content_roundtrip_matches_rpc() {
     );
     assert_eq!(approved["content"]["approval"]["valid"], true);
 
-    // Test-send and final-send preparation share the content hash.
+    // Send preparation without a binding refuses at the transport.
+    assert_ne!(
+        b.operator(
+            "POST",
+            &format!("{base}/campaigns/launch-1/send-prepare"),
+            &json!({}).to_string()
+        )
+        .0,
+        200,
+        "binding-less send-prepare admitted"
+    );
+    // Test-send and final-send preparation share the content hash
+    // behind the same verified binding.
     let test = b.value(
         "POST",
         &format!("{base}/campaigns/launch-1/test-prepare"),
-        json!({"to_email": "op@example.com"}),
+        json!({"to_email": "op@example.com", "binding_id": "bind-1"}),
     );
     let send = b.value(
         "POST",
         &format!("{base}/campaigns/launch-1/send-prepare"),
-        json!({}),
+        json!({"binding_id": "bind-1"}),
     );
     assert_eq!(
         test["test_send"]["content_digest"],
         send["send"]["content_digest"]
     );
     assert_eq!(test["test_send"]["html"], send["send"]["html"]);
+    assert_eq!(send["send"]["send_ready"], true);
+    // Render over HTTP matches RPC render byte for byte, including
+    // the binding snapshot.
+    let rendered_bound = b.value(
+        "POST",
+        &format!("{base}/campaigns/launch-1/render"),
+        json!({"binding_id": "bind-1"}),
+    );
+    assert_eq!(rendered_bound["render"]["preview_only"], false);
+    assert_eq!(rendered_bound["render"]["send_ready"], false);
 }
 
 #[test]
@@ -308,6 +344,46 @@ fn cad782_http_forged_bodies_refuse_without_mutation_or_leak() {
     );
     assert_eq!(code, 409, "unsafe content accepted: {text}");
     assert!(!text.contains(marker), "content leaked: {text}");
+    // Receipt-shaped fields refuse at the transport on every body
+    // that could carry one — no receipt exists yet, so any present
+    // receipt is forged.
+    for (path, body) in [
+        (
+            format!("{base}/campaigns"),
+            json!({"campaign_id": "launch-2", "subject": "X", "blocks": blocks(), "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+        (
+            format!("{base}/proposals"),
+            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "turn_id": "t-1"}),
+        ),
+        (
+            format!("{base}/proposals"),
+            json!({"campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "X", "blocks": blocks(), "nonce": "n-1"}),
+        ),
+        (
+            format!("{base}/sender-bindings"),
+            json!({"binding_id": "bind-x", "sender_name": "N", "sender_address": "n@example.com", "unsubscribe_base": "https://example.com/u", "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+        (
+            format!("{base}/campaigns/launch-1/send-prepare"),
+            json!({"binding_id": "bind-1", "turn_id": "t-1"}),
+        ),
+    ] {
+        let (code, _) = b.operator("POST", &path, &body.to_string());
+        assert_eq!(code, 400, "forged receipt body accepted: {body}");
+    }
+    // Sender binding bodies refuse forged identity/scope fields too.
+    for body in [
+        json!({"binding_id": "bind-2", "sender_name": "N", "sender_address": "n@example.com", "unsubscribe_base": "https://example.com/u", "actor": "operator"}),
+        json!({"binding_id": "bind-2", "sender_name": "N", "sender_address": "n@example.com", "unsubscribe_base": "https://example.com/u", "install_id": b.install}),
+    ] {
+        let (code, _) = b.operator(
+            "POST",
+            &format!("{base}/sender-bindings"),
+            &body.to_string(),
+        );
+        assert_eq!(code, 400, "forged binding body accepted: {body}");
+    }
     // Query strings never carry authority.
     for path in [
         format!("{base}/campaigns/list?context_id=other"),
@@ -509,8 +585,15 @@ fn cad782_http_agent_and_detached_refuse_without_mutation() {
         (
             "POST",
             format!("{show_path}/send-prepare"),
-            json!({}).to_string(),
+            json!({"binding_id": "bind-1"}).to_string(),
         ),
+        (
+            "POST",
+            format!("{base}/sender-bindings"),
+            json!({"binding_id": "bind-evil", "sender_name": "Evil", "sender_address": "evil@example.com", "unsubscribe_base": "https://example.com/u"})
+                .to_string(),
+        ),
+        ("GET", format!("{base}/sender-bindings/list"), String::new()),
     ];
     let mut failures = Vec::new();
     for prefix in ["", "setsid "] {
@@ -585,6 +668,15 @@ fn cad782_http_verb_path_matrix() {
         b.operator("GET", &format!("{base}/proposals/list"), "").0,
         200
     );
+    assert_eq!(
+        b.operator("GET", &format!("{base}/sender-bindings"), "").0,
+        405
+    );
+    assert_eq!(
+        b.operator("GET", &format!("{base}/sender-bindings/list"), "")
+            .0,
+        200
+    );
     // Content-shaped paths outside the contract 404.
     for (method, path, body) in [
         (
@@ -600,6 +692,11 @@ fn cad782_http_verb_path_matrix() {
         (
             "GET",
             format!("{base}/proposals/prop-1/extra"),
+            String::new(),
+        ),
+        (
+            "GET",
+            format!("{base}/sender-bindings/bind-1/extra"),
             String::new(),
         ),
         ("GET", "/api/app-content".to_string(), String::new()),

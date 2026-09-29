@@ -119,6 +119,15 @@ impl Content {
             )
             .unwrap()
     }
+
+    fn bind(&self, install: &str, context: &str, binding: &str) -> Value {
+        self.daemon
+            .operator_rpc(
+                "app_sender_binding_save",
+                json!({"install_id": install, "context_id": context, "binding_id": binding, "sender_name": "News", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub", "connection_id": "conn-smtp-1"}),
+            )
+            .unwrap()
+    }
 }
 
 #[test]
@@ -183,7 +192,10 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
         )
         .unwrap();
     assert_eq!(proposed["proposal"]["state"], "pending");
-    assert_eq!(proposed["proposal"]["actor"], "assistant");
+    // Honest attribution: operator-submitted, never assistant output.
+    assert_eq!(proposed["proposal"]["actor"], "operator");
+    assert_eq!(proposed["proposal"]["origin"], "operator-direct");
+    assert_eq!(proposed["proposal"]["assistant_receipt"], Value::Null);
     assert_eq!(
         w.show(install, context_id, "launch-1")["content"],
         created["content"]
@@ -223,18 +235,30 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
         )
         .unwrap();
     assert_eq!(approved["content"]["approval"]["valid"], true);
+    // A verified sender binding backs preparations; unbound and
+    // preview-only send preparation refuses.
+    w.bind(install, context_id, "bind-1");
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_content_send_prepare",
+                json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1"}),
+            )
+            .is_err(),
+        "send prepared without a binding"
+    );
     let test = w
         .daemon
         .operator_rpc(
             "app_content_test_prepare",
-            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "to_email": "op@example.com"}),
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "to_email": "op@example.com", "binding_id": "bind-1"}),
         )
         .unwrap();
     let send = w
         .daemon
         .operator_rpc(
             "app_content_send_prepare",
-            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1"}),
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-1"}),
         )
         .unwrap();
     assert_eq!(
@@ -243,6 +267,35 @@ fn cad782_operator_content_roundtrip_with_proposal_and_approval() {
     );
     assert_eq!(test["test_send"]["html"], send["send"]["html"]);
     assert_eq!(test["test_send"]["text"], send["send"]["text"]);
+    assert_eq!(send["send"]["send_ready"], true);
+    assert_eq!(send["send"]["preview_only"], false);
+    // Rotating the binding invalidates the prepared send digest
+    // while the content digest and content-only approval stand.
+    w.daemon
+        .operator_rpc(
+            "app_sender_binding_save",
+            json!({"install_id": install, "context_id": context_id, "binding_id": "bind-1", "sender_name": "News v2", "sender_address": "news@example.com", "unsubscribe_base": "https://example.com/unsub", "expected_revision": 1}),
+        )
+        .unwrap();
+    let rotated = w
+        .daemon
+        .operator_rpc(
+            "app_content_send_prepare",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-1"}),
+        )
+        .unwrap();
+    assert_ne!(
+        rotated["send"]["payload_digest"],
+        send["send"]["payload_digest"]
+    );
+    assert_eq!(
+        rotated["send"]["content_digest"],
+        send["send"]["content_digest"]
+    );
+    assert_eq!(
+        w.show(install, context_id, "launch-1")["content"]["approval"]["valid"],
+        true
+    );
 }
 
 #[test]
@@ -425,6 +478,18 @@ fn cad782_agent_forged_and_detached_callers_cannot_touch_content() {
     plant_member_pane(&w.daemon, "content-worker", "claude", None, lane.pid());
     let calls: Vec<(&str, Value)> = vec![
         (
+            "app_sender_binding_save",
+            json!({"install_id": install, "context_id": context_id, "binding_id": "bind-evil", "sender_name": "Evil", "sender_address": "evil@example.com", "unsubscribe_base": "https://example.com/unsub"}),
+        ),
+        (
+            "app_sender_binding_show",
+            json!({"install_id": install, "context_id": context_id, "binding_id": "bind-1"}),
+        ),
+        (
+            "app_sender_binding_list",
+            json!({"install_id": install, "context_id": context_id}),
+        ),
+        (
             "app_content_save",
             json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-evil", "subject": "Evil", "blocks": blocks()}),
         ),
@@ -470,7 +535,7 @@ fn cad782_agent_forged_and_detached_callers_cannot_touch_content() {
         ),
         (
             "app_content_send_prepare",
-            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1"}),
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "binding_id": "bind-1"}),
         ),
     ];
     for (method, params) in &calls {
@@ -611,5 +676,148 @@ fn cad782_operator_forged_fields_refuse_with_valid_control() {
             )
             .is_err(),
         "unapproved token accepted"
+    );
+}
+
+#[test]
+fn cad782_forged_receipt_fields_refuse_and_unproven_reads_operator() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-content-7");
+    let context_id = context["id"].as_str().unwrap();
+    w.save(install, context_id, "launch-1", None);
+
+    // Receipt-shaped fields refuse on every content method — no
+    // chat receipt exists yet, so any present receipt is forged.
+    // The valid control (same shape, no receipt) is accepted.
+    let control = w
+        .daemon
+        .operator_rpc(
+            "app_content_propose",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "proposal_id": "prop-ctl", "subject": "S", "blocks": blocks()}),
+        )
+        .unwrap();
+    assert_eq!(control["proposal"]["actor"], "operator");
+    for (method, params) in [
+        (
+            "app_content_propose",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "S", "blocks": blocks(), "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+        (
+            "app_content_propose",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "S", "blocks": blocks(), "turn_id": "t-1"}),
+        ),
+        (
+            "app_content_propose",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "proposal_id": "prop-x", "subject": "S", "blocks": blocks(), "nonce": "n-1"}),
+        ),
+        (
+            "app_content_save",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-2", "subject": "S", "blocks": blocks(), "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+        (
+            "app_content_render",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1", "turn_id": "t-1"}),
+        ),
+        (
+            "app_content_proposal_apply",
+            json!({"install_id": install, "context_id": context_id, "proposal_id": "prop-ctl", "nonce": "n-1"}),
+        ),
+        (
+            "app_sender_binding_save",
+            json!({"install_id": install, "context_id": context_id, "binding_id": "bind-x", "sender_name": "N", "sender_address": "n@example.com", "unsubscribe_base": "https://example.com/u", "assistant_receipt": {"turn_id": "t-1"}}),
+        ),
+    ] {
+        assert!(
+            w.daemon.operator_rpc(method, params).is_err(),
+            "forged receipt field accepted by {method}"
+        );
+    }
+    // The control proposal is untouched and reads operator — an
+    // unproven submission never reads as assistant.
+    let shown = w
+        .daemon
+        .operator_rpc(
+            "app_content_proposal_show",
+            json!({"install_id": install, "context_id": context_id, "proposal_id": "prop-ctl"}),
+        )
+        .unwrap();
+    assert_eq!(shown["proposal"]["actor"], "operator");
+    assert_ne!(shown["proposal"]["actor"], "assistant");
+}
+
+#[test]
+fn cad782_cross_scope_proposals_and_bindings_refuse() {
+    let w = Content::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context_a = w.context(install, "Client A", "ctx-content-8a");
+    let context_a_id = context_a["id"].as_str().unwrap();
+    let context_b = w.context(install, "Client B", "ctx-content-8b");
+    let context_b_id = context_b["id"].as_str().unwrap();
+    w.save(install, context_a_id, "launch-1", None);
+    w.save(install, context_b_id, "launch-1", None);
+    w.bind(install, context_a_id, "bind-a");
+    // A proposal from context B cannot apply into context A, and a
+    // binding from context B cannot back a send in context A.
+    w.daemon
+        .operator_rpc(
+            "app_content_propose",
+            json!({"install_id": install, "context_id": context_b_id, "campaign_id": "launch-1", "proposal_id": "prop-b", "subject": "B draft", "blocks": blocks()}),
+        )
+        .unwrap();
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_content_proposal_apply",
+                json!({"install_id": install, "context_id": context_a_id, "proposal_id": "prop-b"}),
+            )
+            .is_err(),
+        "cross-context proposal applied"
+    );
+    assert!(
+        w.daemon
+            .operator_rpc(
+                "app_content_send_prepare",
+                json!({"install_id": install, "context_id": context_b_id, "campaign_id": "launch-1", "binding_id": "bind-a"}),
+            )
+            .is_err(),
+        "cross-context binding prepared a send"
+    );
+    // Both scopes are untouched.
+    assert_eq!(
+        w.show(install, context_a_id, "launch-1")["content"]["revision"],
+        1
+    );
+    assert_eq!(
+        w.show(install, context_b_id, "launch-1")["content"]["revision"],
+        1
+    );
+}
+
+#[test]
+fn cad782_content_handler_is_source_pinned_to_operator_connection() {
+    // Guard-removal tripwire: the whole content surface routes
+    // through one handler whose first act is the operator gate. If
+    // the gate call is removed or renamed, this fails without
+    // running any daemon.
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/daemon/app_content_rpc.rs"),
+    )
+    .unwrap();
+    let handler = source
+        .split_once("pub(super) fn rpc_app_content")
+        .expect("content handler moved")
+        .1;
+    assert!(
+        handler
+            .contains("self.operator_connection(\"app content management\", params, peer_pid)?;"),
+        "operator gate removed or reworded in rpc_app_content"
+    );
+    assert_eq!(
+        handler.matches("operator_connection").count(),
+        1,
+        "content handler grew a second gate or a bypass"
     );
 }

@@ -1,16 +1,18 @@
-//! Versioned campaign email content and assistant proposals; every
-//! route requires operator proof (CAD-782).
+//! Versioned campaign email content, sender bindings and operator
+//! proposals; every route requires operator proof (CAD-782).
 //!
-//! The board relays the daemon's `app_content_*` actions with the
-//! URL's installation, context, campaign and proposal IDs as
-//! authority — body fields can never claim identity (`by`, `actor`),
-//! routing (`workspace`) or discovery links (`project`,
-//! `project_link`), nor smuggle the URL IDs themselves. Subjects,
-//! blocks, tokens and button URLs are forwarded as typed JSON for
-//! the daemon's allowlisted grammar; no HTML is ever built here.
-//! Errors are bounded generics that never echo content; renders stay
-//! bounded server-side, and full customer data never leaves the
-//! daemon at all.
+//! The board relays the daemon's `app_content_*` and
+//! `app_sender_binding_*` actions with the URL's installation,
+//! context, campaign, proposal and binding IDs as authority — body
+//! fields can never claim identity (`by`, `actor`), receipt
+//! (`assistant_receipt`, `turn_id`, `nonce`), routing (`workspace`)
+//! or discovery links (`project`, `project_link`), nor smuggle the
+//! URL IDs themselves. Subjects, blocks, tokens, button URLs and
+//! sender material are forwarded as typed JSON for the daemon's
+//! allowlisted grammar; no HTML is ever built here. Errors are
+//! bounded generics that never echo content; renders stay bounded
+//! server-side, and full customer data never leaves the daemon at
+//! all.
 use super::{err_response, json_response, read_body, HttpResp};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,9 @@ pub(super) enum Route<'a> {
     ProposalShow(&'a str, &'a str, &'a str),
     ProposalApply(&'a str, &'a str, &'a str),
     ProposalDiscard(&'a str, &'a str, &'a str),
+    BindingSave(&'a str, &'a str),
+    BindingList(&'a str, &'a str),
+    BindingShow(&'a str, &'a str, &'a str),
 }
 
 fn segment(id: &str) -> bool {
@@ -87,6 +92,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         ("proposals", [id, "discard"]) if segment(id) => {
             Some(Route::ProposalDiscard(install, context, id))
         }
+        ("sender-bindings", []) => Some(Route::BindingSave(install, context)),
+        ("sender-bindings", ["list"]) => Some(Route::BindingList(install, context)),
+        ("sender-bindings", [id]) if segment(id) => Some(Route::BindingShow(install, context, id)),
         _ => None,
     }
 }
@@ -99,6 +107,8 @@ impl Route<'_> {
                 | Self::CampaignShow(..)
                 | Self::ProposalList(..)
                 | Self::ProposalShow(..)
+                | Self::BindingList(..)
+                | Self::BindingShow(..)
         )
     }
 }
@@ -122,6 +132,8 @@ struct ContentRender {
     revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sample_first_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -134,13 +146,29 @@ struct ContentApprove {
 #[serde(deny_unknown_fields)]
 struct ContentTestPrepare {
     to_email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ContentSendPrepare {
+    binding_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audience_freeze_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BindingSave {
+    binding_id: String,
+    sender_name: String,
+    sender_address: String,
+    unsubscribe_base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -234,6 +262,9 @@ pub(super) fn handle(
             if let Some(sample) = body.sample_first_name {
                 params["sample_first_name"] = Value::String(sample);
             }
+            if let Some(binding) = body.binding_id {
+                params["binding_id"] = Value::String(binding);
+            }
             ("app_content_render", params)
         }
         Route::Approve(install, context, id) => {
@@ -255,23 +286,53 @@ pub(super) fn handle(
                 Ok(body) => body,
                 Err(response) => return response,
             };
-            (
-                "app_content_test_prepare",
-                json!({"install_id": install, "context_id": context, "campaign_id": id, "to_email": body.to_email}),
-            )
+            let mut params = json!({"install_id": install, "context_id": context, "campaign_id": id, "to_email": body.to_email});
+            if let Some(binding) = body.binding_id {
+                params["binding_id"] = Value::String(binding);
+            }
+            ("app_content_test_prepare", params)
         }
         Route::SendPrepare(install, context, id) => {
             let body: ContentSendPrepare = match typed(request) {
                 Ok(body) => body,
                 Err(response) => return response,
             };
-            let mut params =
-                json!({"install_id": install, "context_id": context, "campaign_id": id});
+            let mut params = json!({"install_id": install, "context_id": context, "campaign_id": id, "binding_id": body.binding_id});
             if let Some(freeze) = body.audience_freeze_id {
                 params["audience_freeze_id"] = Value::String(freeze);
             }
             ("app_content_send_prepare", params)
         }
+        Route::BindingSave(install, context) => {
+            let body: BindingSave = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let mut params = json!({
+                "install_id": install, "context_id": context,
+                "binding_id": body.binding_id, "sender_name": body.sender_name,
+                "sender_address": body.sender_address,
+                "unsubscribe_base": body.unsubscribe_base,
+            });
+            if let Some(connection) = body.connection_id {
+                params["connection_id"] = Value::String(connection);
+            }
+            if let Some(expected) = body.expected_revision {
+                params["expected_revision"] = match revision(expected) {
+                    Ok(value) => value.into(),
+                    Err(response) => return response,
+                };
+            }
+            ("app_sender_binding_save", params)
+        }
+        Route::BindingList(install, context) if !write => (
+            "app_sender_binding_list",
+            json!({"install_id": install, "context_id": context}),
+        ),
+        Route::BindingShow(install, context, id) if !write => (
+            "app_sender_binding_show",
+            json!({"install_id": install, "context_id": context, "binding_id": id}),
+        ),
         Route::ProposalPropose(install, context) => {
             let body: ProposalPropose = match typed(request) {
                 Ok(body) => body,
@@ -413,6 +474,18 @@ mod tests {
             route("/api/app-installations/i/contexts/c/content/proposals/prop-1/discard"),
             Some(Route::ProposalDiscard("i", "c", "prop-1"))
         ));
+        assert!(matches!(
+            route("/api/app-installations/i/contexts/c/content/sender-bindings"),
+            Some(Route::BindingSave("i", "c"))
+        ));
+        assert!(matches!(
+            route("/api/app-installations/i/contexts/c/content/sender-bindings/list"),
+            Some(Route::BindingList("i", "c"))
+        ));
+        assert!(matches!(
+            route("/api/app-installations/i/contexts/c/content/sender-bindings/bind-1"),
+            Some(Route::BindingShow("i", "c", "bind-1"))
+        ));
         // Collection saves and verb routes are writes; list/show are reads.
         assert!(
             !route("/api/app-installations/i/contexts/c/content/campaigns")
@@ -439,6 +512,16 @@ mod tests {
                 .unwrap()
                 .is_read()
         );
+        assert!(
+            !route("/api/app-installations/i/contexts/c/content/sender-bindings")
+                .unwrap()
+                .is_read()
+        );
+        assert!(
+            route("/api/app-installations/i/contexts/c/content/sender-bindings/list")
+                .unwrap()
+                .is_read()
+        );
         for path in [
             "/api/app-installations/i/contexts/c/content",
             "/api/app-installations/i/contexts/c/content/campaigns/",
@@ -447,6 +530,8 @@ mod tests {
             "/api/app-installations/i/contexts/c/content/campaigns/launch-1/render/extra",
             "/api/app-installations/i/contexts/c/content/proposals/prop-1/extra",
             "/api/app-installations/i/contexts/c/content/proposals/prop-1/apply/extra",
+            "/api/app-installations/i/contexts/c/content/sender-bindings/list/extra",
+            "/api/app-installations/i/contexts/c/content/sender-bindings/bind-1/extra",
             "/api/app-installations/i/contexts/c/segments",
             "/api/app-installations/../contexts",
         ] {
@@ -487,5 +572,46 @@ mod tests {
             r#"{"to_email":"op@example.com","actor":"op"}"#
         )
         .is_err());
+        // Send preparation requires the binding: the transport
+        // refuses a binding-less body before the daemon is reached.
+        assert!(serde_json::from_str::<ContentSendPrepare>(r#"{"binding_id":"bind-1"}"#).is_ok());
+        assert!(serde_json::from_str::<ContentSendPrepare>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<ContentSendPrepare>(
+            r#"{"binding_id":"bind-1","actor":"op"}"#
+        )
+        .is_err());
+        // Receipt-shaped fields never ride any content body.
+        assert!(serde_json::from_str::<ProposalPropose>(
+            r#"{"campaign_id":"launch-1","proposal_id":"prop-1","subject":"Hi","blocks":[],"assistant_receipt":{"turn_id":"t"}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ContentSave>(
+            r#"{"campaign_id":"launch-1","subject":"Hi","blocks":[],"turn_id":"t"}"#
+        )
+        .is_err());
+        // Sender bindings carry sender material only — never
+        // identity, routing or receipt fields.
+        assert!(serde_json::from_str::<BindingSave>(
+            r#"{"binding_id":"bind-1","sender_name":"News","sender_address":"news@example.com","unsubscribe_base":"https://example.com/unsub"}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"binding_id":"bind-1","sender_name":"News","sender_address":"news@example.com","unsubscribe_base":"https://example.com/unsub","actor":"op"}"#,
+            r#"{"binding_id":"bind-1","sender_name":"News","sender_address":"news@example.com","unsubscribe_base":"https://example.com/unsub","turn_id":"t"}"#,
+            r#"{"binding_id":"bind-1","sender_name":"News","sender_address":"news@example.com"}"#,
+            r#"{"binding_id":"preview","sender_name":"News","sender_address":"news@example.com","unsubscribe_base":"https://example.com/unsub"}"#,
+        ] {
+            // The reserved preview ID passes the transport grammar
+            // (the daemon owns the reservation); every other body
+            // above refuses here.
+            if body.contains("\"binding_id\":\"preview\"") {
+                assert!(serde_json::from_str::<BindingSave>(body).is_ok());
+            } else {
+                assert!(
+                    serde_json::from_str::<BindingSave>(body).is_err(),
+                    "binding save admitted {body}"
+                );
+            }
+        }
     }
 }

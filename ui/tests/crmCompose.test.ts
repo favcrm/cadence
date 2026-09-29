@@ -64,6 +64,21 @@ async function main() {
     "/api/app-installations/install-a/contexts/ctx-b/content/proposals/prop-1/discard",
     "discard path binds the proposal",
   );
+  equal(
+    contentPaths.bindingSavePath(scope),
+    "/api/app-installations/install-a/contexts/ctx-b/content/sender-bindings",
+    "binding save path binds the URL scope",
+  );
+  equal(
+    contentPaths.bindingListPath(scope),
+    "/api/app-installations/install-a/contexts/ctx-b/content/sender-bindings/list",
+    "binding list path binds the URL scope",
+  );
+  equal(
+    contentPaths.bindingPath(scope, "bind-1"),
+    "/api/app-installations/install-a/contexts/ctx-b/content/sender-bindings/bind-1",
+    "binding path binds the binding",
+  );
   // No identity, routing or discovery-link key may travel from the browser.
   for (const key of [
     "by",

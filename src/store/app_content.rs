@@ -9,21 +9,31 @@
 //! HTML, script, unsafe paste and malformed data without mutation.
 //!
 //! The same exact revision renders deterministic sanitized
-//! email-compatible HTML and a plain-text alternative; sender
-//! identity, unsubscribe route and footer are host-owned constants
-//! locked into every render and frozen payload, never editable
-//! blocks. Revisions are CAS (expected-revision) with immutable
-//! attribution; test-send and final-send preparation share the
-//! content hash and renderer (actual SMTP submission is CAD-785/786).
+//! email-compatible HTML and a plain-text alternative. Sender
+//! identity and unsubscribe material come from a typed host-owned
+//! sender binding bound into the payload digest — never editable
+//! blocks. Until a verified binding exists, renders and test
+//! preparations carry explicitly labelled preview-only `.invalid`
+//! placeholders that final-send preparation refuses. Revisions are
+//! CAS (expected-revision) with immutable attribution; content
+//! revision stays independent of sender/audience material (actual
+//! SMTP submission is CAD-785/786, which consume the binding seam).
+//! Approval pins content only; a rotated binding changes the send
+//! digest while content approval stands, and must be re-prepared.
 //!
-//! The left-chat assistant may propose subject/preheader/blocks from
-//! the verified installation/context/campaign. A proposal is bounded,
-//! attributed, bound to its source revision, and inert until the
-//! operator explicitly applies it (new revision, approval
-//! invalidated) or discards it (no change). There is no
-//! agent-origin edit/approve/send path: every RPC in
-//! `daemon::app_content_rpc` requires the operator connection, so an
-//! agent caller or detached child is refused before any file opens.
+//! Drafts reach the proposal flow through operator submission and
+//! are recorded `actor='operator'` with `origin='operator-direct'`:
+//! the operator connection proves the operator was present, never
+//! that an assistant produced the text. `assistant` attribution is
+//! reserved for CAD-784 chat-receipt-backed writes; receipt-shaped
+//! fields (`assistant_receipt`, `turn_id`, `nonce`) are refused
+//! until that seam exists. A proposal is bounded, bound to its
+//! source revision, and inert until the operator explicitly applies
+//! it (new revision, approval invalidated) or discards it (no
+//! change). There is no agent-origin edit/approve/send path: every
+//! RPC in `daemon::app_content_rpc` requires the operator
+//! connection, so an agent caller or detached child is refused
+//! before any file opens.
 
 use super::app_records::{email_shape_valid, RecordStore};
 use super::app_runs::material_digest;
@@ -49,13 +59,28 @@ pub const SAMPLE_NAME_BYTES: usize = 40;
 /// Campaign/proposal listing ceiling.
 pub const CONTENT_LIST_MAX: usize = 100;
 
-/// Host-owned sender identity and unsubscribe/footer material. These
-/// are locked into every render and frozen payload and are never
-/// editable blocks, never operator input, never agent input.
+/// Preview-only sender identity and unsubscribe/footer material. These
+/// `.invalid` bytes are render placeholders so previews never look
+/// send-ready: they are labelled `preview_only` everywhere they
+/// appear, and final-send preparation refuses them. Verified sender
+/// material arrives as typed host-owned sender bindings (CAD-785
+/// owns the SMTP connection behind them); per-recipient unsubscribe
+/// tokens arrive with CAD-786. Preview material is never editable
+/// blocks, never operator input, never agent input.
 pub const SENDER_NAME: &str = "Cadence CRM";
 pub const SENDER_ADDRESS: &str = "noreply@cadence.invalid";
 pub const UNSUBSCRIBE_BASE: &str = "https://cadence.invalid/unsubscribe";
 pub const FOOTER_NOTE: &str = "You received this because you subscribed via Cadence CRM.";
+/// Reserved binding ID for the built-in preview binding. Saved
+/// bindings can never take this ID; final-send preparation never
+/// accepts it.
+pub const PREVIEW_BINDING_ID: &str = "preview";
+/// Sender binding field bounds.
+pub const BINDING_NAME_BYTES: usize = 80;
+pub const UNSUBSCRIBE_BASE_BYTES: usize = 500;
+pub const CONNECTION_ID_BYTES: usize = 128;
+/// Sender binding listing ceiling.
+pub const BINDING_LIST_MAX: usize = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -412,10 +437,122 @@ fn personalize(text: &str, sample: Option<&str>) -> String {
     }
 }
 
+/// Sender material a render or payload is built with: either the
+/// built-in preview placeholders or one saved binding revision.
+/// The per-recipient token stays the literal `RECIPIENT` marker —
+/// CAD-786 substitutes real tokens at send time inside its own
+/// digest, never by editing frozen bytes here.
+#[derive(Clone, Debug)]
+pub struct BindingView {
+    pub sender_name: String,
+    pub sender_address: String,
+    pub unsubscribe_base: String,
+}
+
+fn preview_binding_view() -> BindingView {
+    BindingView {
+        sender_name: SENDER_NAME.to_string(),
+        sender_address: SENDER_ADDRESS.to_string(),
+        unsubscribe_base: UNSUBSCRIBE_BASE.to_string(),
+    }
+}
+
+fn sender_line(binding: &BindingView) -> String {
+    format!(
+        "Sent by {} <{}>",
+        binding.sender_name, binding.sender_address
+    )
+}
+
+fn unsubscribe_url(binding: &BindingView) -> String {
+    format!("{}?token=RECIPIENT", binding.unsubscribe_base)
+}
+
+/// A binding is preview-only when either its sender domain or its
+/// unsubscribe host is a reserved `.invalid` placeholder. Verified
+/// bindings (CAD-785) use real domains; the check is suffix-exact
+/// so `notinvalid.example.com` never counts.
+fn binding_preview_only(sender_address: &str, unsubscribe_base: &str) -> bool {
+    let sender_invalid = sender_address
+        .rsplit('@')
+        .next()
+        .is_some_and(|domain| domain.to_lowercase().ends_with(".invalid"));
+    let host_invalid = unsubscribe_host(unsubscribe_base)
+        .is_some_and(|host| host.to_lowercase().ends_with(".invalid"));
+    sender_invalid || host_invalid
+}
+
+fn unsubscribe_host(base: &str) -> Option<&str> {
+    let rest = base.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Strict operator-typed email: the shared shape plus a
+/// markup/paste refusal. Shared by test recipients and sender
+/// addresses so neither can smuggle HTML.
+fn strict_email(address: &str) -> bool {
+    email_shape_valid(address)
+        && !address.contains(['<', '>', '(', ')', '[', ']', '\\', '"', '\'', ';', ',', '`'])
+}
+
+fn reject_sender_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > BINDING_NAME_BYTES || name.trim() != name {
+        return Err(Error::rejected(
+            "email sender name exceeds its supported shape or bounds",
+        ));
+    }
+    reject_text(name, BINDING_NAME_BYTES, false)
+}
+
+fn reject_unsubscribe_base(base: &str) -> Result<()> {
+    const REFUSED: &str = "email unsubscribe base exceeds its supported shape or bounds";
+    if base.is_empty() || base.len() > UNSUBSCRIBE_BASE_BYTES {
+        return Err(Error::rejected(REFUSED));
+    }
+    if base.chars().any(char::is_control) || base.chars().any(char::is_whitespace) {
+        return Err(Error::rejected(REFUSED));
+    }
+    let rest = base
+        .strip_prefix("https://")
+        .ok_or_else(|| Error::rejected(REFUSED))?;
+    let host = unsubscribe_host(base).ok_or_else(|| Error::rejected(REFUSED))?;
+    if host.is_empty() || !host.contains('.') || host.contains('@') || host.contains(':') {
+        return Err(Error::rejected(REFUSED));
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    {
+        return Err(Error::rejected(REFUSED));
+    }
+    let _ = rest;
+    if base.contains(['<', '>', '"', '\'', '`', '\\', '{', '}']) {
+        return Err(Error::rejected(REFUSED));
+    }
+    Ok(())
+}
+
+fn reject_connection_id(connection: &str) -> Result<()> {
+    // Forward reference to a CAD-585 connection; bounded opaque text
+    // until that ticket types it. Never markup, never blank.
+    if connection.is_empty()
+        || connection.len() > CONNECTION_ID_BYTES
+        || connection.chars().any(char::is_control)
+        || connection.chars().any(char::is_whitespace)
+        || connection.contains(['<', '>', '"', '\'', '`', '\\', '{', '}'])
+    {
+        return Err(Error::rejected(
+            "email sender connection exceeds its supported shape or bounds",
+        ));
+    }
+    Ok(())
+}
+
 /// Deterministic email-compatible HTML from one exact revision.
-/// Fixed table layout, inline styles, escaped text, host-owned
-/// sender/unsubscribe/footer locked at the end.
-fn render_html(draft: &Draft, sample: Option<&str>) -> String {
+/// Fixed table layout, inline styles, escaped text, sender/unsubscribe
+/// material from the given binding locked at the end.
+fn render_html(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> String {
     let mut out = String::new();
     out.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>");
     out.push_str(&html_escape(&personalize(&draft.subject, sample)));
@@ -450,20 +587,17 @@ fn render_html(draft: &Draft, sample: Option<&str>) -> String {
         }
     }
     out.push_str("<hr style=\"border:none;border-top:1px solid #dddddd;margin:24px 0;\"><p style=\"margin:0 0 8px;font-size:12px;color:#666666;\">");
-    out.push_str(&html_escape(SENDER_LINE));
+    out.push_str(&html_escape(&sender_line(binding)));
     out.push_str("</p><p style=\"margin:0;font-size:12px;color:#666666;\"><a href=\"");
-    out.push_str(&html_escape(UNSUBSCRIBE_PLACEHOLDER));
+    out.push_str(&html_escape(&unsubscribe_url(binding)));
     out.push_str("\">Unsubscribe</a> &middot; ");
     out.push_str(&html_escape(FOOTER_NOTE));
     out.push_str("</p></td></tr></table></td></tr></table></body></html>");
     out
 }
 
-const SENDER_LINE: &str = "Sent by Cadence CRM <noreply@cadence.invalid>";
-const UNSUBSCRIBE_PLACEHOLDER: &str = "https://cadence.invalid/unsubscribe?token=RECIPIENT";
-
 /// Deterministic plain-text alternative from the same revision.
-fn render_text(draft: &Draft, sample: Option<&str>) -> String {
+fn render_text(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> String {
     let mut out = String::new();
     out.push_str(&personalize(&draft.subject, sample));
     out.push('\n');
@@ -491,10 +625,10 @@ fn render_text(draft: &Draft, sample: Option<&str>) -> String {
         }
     }
     out.push_str("---\n");
-    out.push_str(SENDER_LINE);
+    out.push_str(&sender_line(binding));
     out.push('\n');
     out.push_str("Unsubscribe: ");
-    out.push_str(UNSUBSCRIBE_PLACEHOLDER);
+    out.push_str(&unsubscribe_url(binding));
     out.push('\n');
     out.push_str(FOOTER_NOTE);
     out.push('\n');
@@ -561,6 +695,69 @@ struct ProposalRow {
     decided: Option<f64>,
 }
 
+/// Validated sender material for a binding save. The store
+/// validates every field; the RPC layer only parses transport types.
+pub struct BindingDraft<'a> {
+    pub sender_name: &'a str,
+    pub sender_address: &'a str,
+    pub unsubscribe_base: &'a str,
+    pub connection_id: Option<&'a str>,
+}
+
+/// One saved binding row.
+struct BindingRecord {
+    binding_id: String,
+    revision: i64,
+    sender_name: String,
+    sender_address: String,
+    unsubscribe_base: String,
+    connection_id: Option<String>,
+    digest: String,
+}
+
+/// Send-preparation scope: content selection plus frozen attachments.
+struct SendPrep<'a> {
+    context: &'a str,
+    campaign: &'a str,
+    kind: &'a str,
+    to_email: Option<&'a str>,
+    audience_freeze_id: Option<&'a str>,
+    binding: &'a ResolvedBinding,
+}
+
+fn binding_digest(
+    install: &str,
+    context: &str,
+    binding: &str,
+    revision: i64,
+    draft: &BindingDraft,
+) -> String {
+    material_digest(&json!({
+        "domain": "cadence-app-sender-binding-v1",
+        "install_id": install,
+        "context_id": context,
+        "binding_id": binding,
+        "revision": revision,
+        "sender_name": draft.sender_name,
+        "sender_address": draft.sender_address,
+        "unsubscribe_base": draft.unsubscribe_base,
+        "connection_id": draft.connection_id,
+    }))
+}
+
+/// A resolved sender binding: saved revision material plus its
+/// derived preview state. The built-in preview binding resolves
+/// without a row; every other ID must name a saved row in this
+/// installation and context.
+struct ResolvedBinding {
+    binding_id: String,
+    revision: i64,
+    digest: String,
+    connection_id: Option<String>,
+    preview_only: bool,
+    view: BindingView,
+}
+
 impl RecordStore {
     fn content_row(
         &self,
@@ -607,6 +804,7 @@ impl RecordStore {
                 "revision": row.approval_revision,
                 "digest": row.approval_digest,
                 "valid": valid,
+                "scope": "content-only",
             },
         })
     }
@@ -796,15 +994,239 @@ impl RecordStore {
         ))
     }
 
+    /// Resolve a sender binding: the reserved preview ID resolves to
+    /// the built-in placeholders without a row; any other ID must
+    /// name a saved binding in this installation and context.
+    fn resolve_binding(
+        &self,
+        conn: &Connection,
+        context: &str,
+        binding_id: Option<&str>,
+    ) -> Result<ResolvedBinding> {
+        let Some(id) = binding_id else {
+            let preview = BindingDraft {
+                sender_name: SENDER_NAME,
+                sender_address: SENDER_ADDRESS,
+                unsubscribe_base: UNSUBSCRIBE_BASE,
+                connection_id: None,
+            };
+            return Ok(ResolvedBinding {
+                binding_id: PREVIEW_BINDING_ID.to_string(),
+                revision: 0,
+                digest: binding_digest(self.install(), context, PREVIEW_BINDING_ID, 0, &preview),
+                connection_id: None,
+                preview_only: true,
+                view: preview_binding_view(),
+            });
+        };
+        let record = self.binding_record(conn, context, id)?;
+        Ok(ResolvedBinding {
+            binding_id: id.to_string(),
+            revision: record.revision,
+            digest: record.digest.clone(),
+            connection_id: record.connection_id.clone(),
+            preview_only: binding_preview_only(&record.sender_address, &record.unsubscribe_base),
+            view: BindingView {
+                sender_name: record.sender_name.clone(),
+                sender_address: record.sender_address.clone(),
+                unsubscribe_base: record.unsubscribe_base.clone(),
+            },
+        })
+    }
+
+    fn binding_record(
+        &self,
+        conn: &Connection,
+        context: &str,
+        binding_id: &str,
+    ) -> Result<BindingRecord> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(binding_id, "sender binding ID")?;
+        let (revision, name, address, base, connection, digest): (
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest FROM app_sender_bindings WHERE context_id=? AND binding_id=?",
+                params![context, binding_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Error::rejected(
+                    "email sender binding is unavailable for this installation and context",
+                )
+            })?;
+        Ok(BindingRecord {
+            binding_id: binding_id.to_string(),
+            revision,
+            sender_name: name,
+            sender_address: address,
+            unsubscribe_base: base,
+            connection_id: connection,
+            digest,
+        })
+    }
+
+    fn binding_json(&self, context: &str, record: &BindingRecord) -> Value {
+        json!({
+            "binding_id": record.binding_id,
+            "install_id": self.install(),
+            "context_id": context,
+            "revision": record.revision,
+            "sender": {"name": record.sender_name, "address": record.sender_address},
+            "unsubscribe_base": record.unsubscribe_base,
+            "connection_id": record.connection_id,
+            "preview_only": binding_preview_only(&record.sender_address, &record.unsubscribe_base),
+            "binding_digest": record.digest,
+        })
+    }
+
+    /// Save a typed host-owned sender binding with CAS. The binding
+    /// carries the verified sender identity (CAD-785) and the
+    /// unsubscribe authority (CAD-786); `.invalid` material resolves
+    /// `preview_only` and can never back a final send. The reserved
+    /// preview ID is unaddressable here.
+    pub fn app_sender_binding_save(
+        &self,
+        context: &str,
+        binding_id: &str,
+        expected_revision: Option<i64>,
+        draft: &BindingDraft,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(binding_id, "sender binding ID")?;
+        if binding_id == PREVIEW_BINDING_ID {
+            return Err(Error::rejected(
+                "email sender binding ID is reserved for previews",
+            ));
+        }
+        reject_sender_name(draft.sender_name)?;
+        if !strict_email(draft.sender_address) {
+            return Err(Error::rejected(
+                "email sender address exceeds its supported shape or bounds",
+            ));
+        }
+        reject_unsubscribe_base(draft.unsubscribe_base)?;
+        if let Some(connection) = draft.connection_id {
+            reject_connection_id(connection)?;
+        }
+        let conn = self.conn();
+        // IMMEDIATE: a racing saver blocks on the write lock first,
+        // so exactly one revision wins and the loser is stale.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM app_sender_bindings WHERE context_id=? AND binding_id=?",
+                params![context, binding_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let revision = match (current, expected_revision) {
+            (None, None) => 1,
+            (None, Some(_)) => {
+                return Err(Error::rejected(
+                    "email sender binding is unknown; save without an expected revision",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(Error::rejected(
+                    "email sender binding already exists; name the observed revision",
+                ));
+            }
+            (Some(current), Some(expected)) => {
+                if current != expected {
+                    return Err(Error::rejected("email sender binding revision is stale"));
+                }
+                current
+                    .checked_add(1)
+                    .ok_or_else(|| Error::rejected("email sender binding revision exhausted"))?
+            }
+        };
+        let digest = binding_digest(self.install(), context, binding_id, revision, draft);
+        if current.is_none() {
+            tx.execute(
+                "INSERT INTO app_sender_bindings(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), now()],
+            )
+            .map_err(|e| Error::internal(e.to_string()))?;
+        } else {
+            let changed = tx
+                .execute(
+                    "UPDATE app_sender_bindings SET revision=?,sender_name=?,sender_address=?,unsubscribe_base=?,connection_id=?,binding_digest=?,updated=? WHERE context_id=? AND binding_id=? AND revision=?",
+                    params![revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now(), context, binding_id, current],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if changed != 1 {
+                return Err(Error::rejected("email sender binding revision is stale"));
+            }
+        }
+        tx.execute(
+            "INSERT INTO app_sender_binding_revisions(context_id,binding_id,revision,sender_name,sender_address,unsubscribe_base,connection_id,binding_digest,actor,at) VALUES(?,?,?,?,?,?,?,?,'operator',?)",
+            params![context, binding_id, revision, draft.sender_name, draft.sender_address, draft.unsubscribe_base, draft.connection_id, digest, now()],
+        )
+        .map_err(|e| Error::internal(e.to_string()))?;
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        Ok(json!({"binding": self.app_sender_binding_show(context, binding_id)?["binding"]}))
+    }
+
+    pub fn app_sender_binding_show(&self, context: &str, binding_id: &str) -> Result<Value> {
+        let conn = self.conn();
+        let record = self.binding_record(&conn, context, binding_id)?;
+        Ok(json!({"binding": self.binding_json(context, &record)}))
+    }
+
+    pub fn app_sender_binding_list(&self, context: &str) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT binding_id FROM app_sender_bindings WHERE context_id=? ORDER BY binding_id LIMIT ?")
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let found = stmt
+            .query_map(params![context, BINDING_LIST_MAX as i64 + 1], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut ids = Vec::new();
+        for row in found {
+            ids.push(row.map_err(|e| Error::internal(e.to_string()))?);
+            if ids.len() > BINDING_LIST_MAX {
+                return Err(Error::internal(
+                    "email sender binding listing exceeds its bound",
+                ));
+            }
+        }
+        drop(stmt);
+        drop(conn);
+        let mut bindings = Vec::with_capacity(ids.len());
+        for id in &ids {
+            bindings.push(self.app_sender_binding_show(context, id)?["binding"].clone());
+        }
+        Ok(json!({"bindings": bindings}))
+    }
+
     /// Render deterministic sanitized HTML and plain text from one
     /// exact revision (current when unnamed), with sample
-    /// personalization. Sender/unsubscribe/footer are host-locked.
+    /// personalization and sender material from the named binding
+    /// (preview placeholders when unnamed). Renders are labelled
+    /// `preview_only`/`send_ready: false` and are never send-ready
+    /// output, even behind a verified binding.
     pub fn app_content_render(
         &self,
         context: &str,
         campaign: &str,
         revision: Option<i64>,
         sample_first_name: Option<&str>,
+        binding_id: Option<&str>,
     ) -> Result<Value> {
         if let Some(name) = sample_first_name {
             if !sample_name_valid(name) {
@@ -819,15 +1241,18 @@ impl RecordStore {
             }
         }
         let conn = self.conn();
+        let binding = self.resolve_binding(&conn, context, binding_id)?;
         let (resolved, draft, digest) = self.draft_at(&conn, context, campaign, revision)?;
-        let html = render_html(&draft, sample_first_name);
-        let text = render_text(&draft, sample_first_name);
+        let html = render_html(&draft, sample_first_name, &binding.view);
+        let text = render_text(&draft, sample_first_name, &binding.view);
         let render_digest = material_digest(&json!({
             "domain": "cadence-app-content-render-v1",
             "content_digest": digest,
+            "binding_digest": binding.digest,
             "html": html,
             "text": text,
         }));
+        let unsubscribe = unsubscribe_url(&binding.view);
         Ok(json!({
             "render": {
                 "campaign_id": campaign,
@@ -836,8 +1261,16 @@ impl RecordStore {
                 "revision": resolved,
                 "content_digest": digest,
                 "sample_first_name": sample_first_name,
-                "sender": {"name": SENDER_NAME, "address": SENDER_ADDRESS},
-                "unsubscribe_url": UNSUBSCRIBE_PLACEHOLDER,
+                "binding": {
+                    "binding_id": binding.binding_id,
+                    "revision": binding.revision,
+                    "digest": binding.digest,
+                    "preview_only": binding.preview_only,
+                },
+                "preview_only": binding.preview_only,
+                "send_ready": false,
+                "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
+                "unsubscribe_url": unsubscribe,
                 "html": html,
                 "text": text,
                 "render_digest": render_digest,
@@ -845,10 +1278,15 @@ impl RecordStore {
         }))
     }
 
-    /// Record a bounded attributed assistant proposal. Inert: the
+    /// Record a bounded operator-submitted proposal draft. Inert: the
     /// draft does not change, approval does not change, nothing
     /// sends. Bound to the observed source revision; a proposal ID
-    /// replays only behind identical bytes.
+    /// replays only behind identical bytes. Attribution is honestly
+    /// `operator` with `origin: operator-direct`: the operator
+    /// connection proves the operator submitted it, never that an
+    /// assistant produced it. `assistant` stays reserved for
+    /// CAD-784 receipt-backed writes; receipt-shaped fields are
+    /// refused by the RPC allowlist until that seam exists.
     pub fn app_content_propose(
         &self,
         context: &str,
@@ -889,7 +1327,7 @@ impl RecordStore {
             return Err(Error::rejected("email proposal ID is already used"));
         }
         conn.execute(
-            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','pending',?,NULL)",
+            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'operator','operator-direct','pending',?,NULL)",
             params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, now()],
         )
         .map_err(|e| Error::internal(e.to_string()))?;
@@ -943,7 +1381,9 @@ impl RecordStore {
             "preheader": row.preheader,
             "blocks": raw,
             "content_digest": row.digest,
-            "actor": "assistant",
+            "actor": "operator",
+            "origin": "operator-direct",
+            "assistant_receipt": null,
             "state": row.state,
             "created": row.created,
             "decided": row.decided,
@@ -1120,9 +1560,12 @@ impl RecordStore {
         self.app_content_proposal_show(context, proposal_id)
     }
 
-    /// Operator approval pins the exact current revision and digest.
-    /// Any later save or apply clears the pin, so a stale approval
-    /// never reads as current.
+    /// Operator approval pins the exact current content revision and
+    /// digest — content only. Audience freezes and sender bindings
+    /// are named explicitly at send-preparation time and digest-bound
+    /// there; rotating either changes the send digest while this
+    /// approval stands. Any later save or apply clears the pin, so a
+    /// stale approval never reads as current.
     pub fn app_content_approve(
         &self,
         context: &str,
@@ -1154,19 +1597,15 @@ impl RecordStore {
         self.app_content_show(context, campaign)
     }
 
-    fn send_payload(
-        &self,
-        conn: &Connection,
-        context: &str,
-        campaign: &str,
-        kind: &str,
-        to_email: Option<&str>,
-        audience_freeze_id: Option<&str>,
-    ) -> Result<Value> {
+    fn send_payload(&self, conn: &Connection, prep: &SendPrep) -> Result<Value> {
+        let context = prep.context;
+        let campaign = prep.campaign;
+        let kind = prep.kind;
+        let binding = prep.binding;
         let (revision, draft, digest) = self.draft_at(conn, context, campaign, None)?;
-        let html = render_html(&draft, None);
-        let text = render_text(&draft, None);
-        let audience_digest = match audience_freeze_id {
+        let html = render_html(&draft, None, &binding.view);
+        let text = render_text(&draft, None, &binding.view);
+        let audience_digest = match prep.audience_freeze_id {
             None => Value::Null,
             Some(freeze) => {
                 crate::proto::identifier(freeze, "freeze ID")?;
@@ -1186,8 +1625,14 @@ impl RecordStore {
                 Value::String(frozen)
             }
         };
+        let unsubscribe = unsubscribe_url(&binding.view);
         // Test and final preparation share this exact shape and the
-        // same renderer: equal revisions always carry equal hashes.
+        // same renderer. The binding digest is frozen into the
+        // payload: rotating the sender binding changes the send
+        // digest while the content digest — and content approval —
+        // stand independent. Substituting frozen bytes outside this
+        // digest (a different sender, a real unsubscribe token) is a
+        // different payload, never a silent edit.
         let payload = json!({
             "kind": kind,
             "campaign_id": campaign,
@@ -1195,15 +1640,24 @@ impl RecordStore {
             "context_id": context,
             "content_revision": revision,
             "content_digest": digest,
-            "audience_freeze_id": audience_freeze_id,
+            "audience_freeze_id": prep.audience_freeze_id,
             "audience_digest": audience_digest,
-            "sender": {"name": SENDER_NAME, "address": SENDER_ADDRESS},
-            "unsubscribe_url": UNSUBSCRIBE_PLACEHOLDER,
+            "sender_binding": {
+                "binding_id": binding.binding_id,
+                "revision": binding.revision,
+                "digest": binding.digest,
+                "connection_id": binding.connection_id,
+                "preview_only": binding.preview_only,
+            },
+            "preview_only": binding.preview_only,
+            "send_ready": kind == "final" && !binding.preview_only,
+            "sender": {"name": binding.view.sender_name, "address": binding.view.sender_address},
+            "unsubscribe_url": unsubscribe,
             "headers": {
-                "List-Unsubscribe": format!("<{UNSUBSCRIBE_PLACEHOLDER}>"),
+                "List-Unsubscribe": format!("<{unsubscribe}>"),
                 "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
             },
-            "to_email": to_email,
+            "to_email": prep.to_email,
             "html": html,
             "text": text,
             "payload_digest": material_digest(&json!({
@@ -1214,7 +1668,8 @@ impl RecordStore {
                 "campaign_id": campaign,
                 "content_digest": digest,
                 "audience_digest": audience_digest,
-                "to_email": to_email,
+                "binding_digest": binding.digest,
+                "to_email": prep.to_email,
                 "html": html,
                 "text": text,
             })),
@@ -1223,40 +1678,51 @@ impl RecordStore {
     }
 
     /// Test-send preparation for one operator address: frozen content
-    /// hash, locked sender/unsubscribe, same renderer as final send.
-    /// No SMTP submission happens here (CAD-785/786 own delivery).
+    /// hash, same renderer as final send, sender material from the
+    /// named binding (preview placeholders when unnamed, labelled
+    /// `preview_only`, never send-ready). No SMTP submission happens
+    /// here (CAD-785/786 own delivery).
     pub fn app_content_test_prepare(
         &self,
         context: &str,
         campaign: &str,
         to_email: &str,
+        binding_id: Option<&str>,
     ) -> Result<Value> {
-        // The shared shape check plus a markup/paste refusal: test
-        // recipients are operator-typed, never pasted HTML.
-        if !email_shape_valid(to_email)
-            || to_email.contains(['<', '>', '(', ')', '[', ']', '\\', '"', '\'', ';', ',', '`'])
-        {
+        // Operator-typed recipients are never pasted HTML.
+        if !strict_email(to_email) {
             return Err(Error::rejected(
                 "email test recipient exceeds its supported shape or bounds",
             ));
         }
         let conn = self.conn();
+        let binding = self.resolve_binding(&conn, context, binding_id)?;
         Ok(
-            json!({"test_send": self.send_payload(&conn, context, campaign, "test", Some(to_email), None)?}),
+            json!({"test_send": self.send_payload(&conn, &SendPrep { context, campaign, kind: "test", to_email: Some(to_email), audience_freeze_id: None, binding: &binding })?}),
         )
     }
 
-    /// Final-send preparation freezes the same content hash (plus the
-    /// optional audience freeze digest). Still no SMTP submission.
+    /// Final-send preparation freezes the content hash plus the
+    /// audience freeze digest plus the sender binding digest. The
+    /// binding is required and must be verified: unknown bindings
+    /// and preview-only placeholders refuse — `.invalid` bytes can
+    /// never be frozen as send-ready. Still no SMTP submission.
     pub fn app_content_send_prepare(
         &self,
         context: &str,
         campaign: &str,
+        binding_id: &str,
         audience_freeze_id: Option<&str>,
     ) -> Result<Value> {
         let conn = self.conn();
+        let binding = self.resolve_binding(&conn, context, Some(binding_id))?;
+        if binding.preview_only {
+            return Err(Error::rejected(
+                "email sender binding is preview-only; bind a verified sender before preparing a send",
+            ));
+        }
         Ok(
-            json!({"send": self.send_payload(&conn, context, campaign, "final", None, audience_freeze_id)?}),
+            json!({"send": self.send_payload(&conn, &SendPrep { context, campaign, kind: "final", to_email: None, audience_freeze_id, binding: &binding })?}),
         )
     }
 }

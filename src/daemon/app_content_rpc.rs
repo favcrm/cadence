@@ -7,14 +7,21 @@
 //! archived or foreign context refuses before any file opens, and
 //! only then opens the installation's record file. The payload
 //! grammar is exact: identity-shaped (`by`, `actor`),
+//! receipt-shaped (`assistant_receipt`, `turn_id`, `nonce`),
 //! discovery-link (`project`, `project_link`) and routing
 //! (`workspace`) fields are unsupported and refused, as are the
 //! URL-scoped IDs themselves when they appear in a body. Subjects,
 //! blocks, tokens and button URLs are validated by the store's
 //! allowlisted grammar; no HTML is ever stored or rendered except
-//! the host's own fixed template. There is no agent-origin
-//! edit/approve/send path: the assistant's proposal, its Apply and
-//! its Discard all require the operator connection, so an agent
+//! the host's own fixed template. Proposals submitted here are
+//! recorded `actor='operator'`: the connection proves the operator
+//! submitted the draft, never that an assistant produced it —
+//! `assistant` attribution stays reserved for CAD-784
+//! receipt-backed writes. Sender material renders only through
+//! typed host-owned bindings; final-send preparation requires a
+//! verified (non-preview) binding. There is no agent-origin
+//! edit/approve/send path: proposals, Apply, Discard, approval and
+//! send preparation all require the operator connection, so an agent
 //! caller or detached child is refused without mutation. The board
 //! peer lives in `src/ui/app_content.rs` under this ticket; it
 //! follows the CAD-768 strict-peer contract (URL IDs are authority,
@@ -66,6 +73,14 @@ fn content_revision(params: &Value) -> Result<i64> {
         .ok_or_else(|| Error::rejected("expected revision must be a positive integer"))
 }
 
+fn content_binding(params: &Value) -> Result<Option<&str>> {
+    match params.get("binding_id") {
+        None => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.as_str())),
+        Some(_) => Err(Error::rejected("sender binding ID must be a string")),
+    }
+}
+
 fn content_render_scope(params: &Value) -> Result<(Option<i64>, Option<String>)> {
     let revision = match params.get("revision") {
         None => None,
@@ -98,7 +113,32 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("app content management", params, peer_pid)?;
+        // Receipt-shaped fields are refused everywhere: assistant
+        // attribution requires a CAD-784 chat receipt, and no such
+        // receipt exists yet, so any present receipt is forged.
+        if let Some(fields) = params.as_object() {
+            if fields
+                .keys()
+                .any(|key| matches!(key.as_str(), "assistant_receipt" | "turn_id" | "nonce"))
+            {
+                return Err(Error::rejected(
+                    "app content payload has unsupported fields",
+                ));
+            }
+        }
         let allowed: &[&str] = match method {
+            "app_sender_binding_save" => &[
+                "install_id",
+                "context_id",
+                "binding_id",
+                "sender_name",
+                "sender_address",
+                "unsubscribe_base",
+                "connection_id",
+                "expected_revision",
+            ],
+            "app_sender_binding_show" => &["install_id", "context_id", "binding_id"],
+            "app_sender_binding_list" => &["install_id", "context_id"],
             "app_content_save" => &[
                 "install_id",
                 "context_id",
@@ -116,6 +156,7 @@ impl Shared {
                 "campaign_id",
                 "revision",
                 "sample_first_name",
+                "binding_id",
             ],
             "app_content_propose" => &[
                 "install_id",
@@ -141,11 +182,18 @@ impl Shared {
                 "campaign_id",
                 "expected_revision",
             ],
-            "app_content_test_prepare" => &["install_id", "context_id", "campaign_id", "to_email"],
+            "app_content_test_prepare" => &[
+                "install_id",
+                "context_id",
+                "campaign_id",
+                "to_email",
+                "binding_id",
+            ],
             "app_content_send_prepare" => &[
                 "install_id",
                 "context_id",
                 "campaign_id",
+                "binding_id",
                 "audience_freeze_id",
             ],
             _ => return Err(Error::rejected("unknown app content method")),
@@ -192,6 +240,31 @@ impl Shared {
                 records.app_content_show(context, required_str(params, "campaign_id")?)
             }
             "app_content_list" => records.app_content_list(context),
+            "app_sender_binding_save" => {
+                let connection = match params.get("connection_id") {
+                    None => None,
+                    Some(Value::String(id)) => Some(id.as_str()),
+                    Some(_) => {
+                        return Err(Error::rejected("sender connection ID must be a string"));
+                    }
+                };
+                let draft = crate::store::app_content::BindingDraft {
+                    sender_name: required_str(params, "sender_name")?,
+                    sender_address: required_str(params, "sender_address")?,
+                    unsubscribe_base: required_str(params, "unsubscribe_base")?,
+                    connection_id: connection,
+                };
+                records.app_sender_binding_save(
+                    context,
+                    required_str(params, "binding_id")?,
+                    content_expected(params)?,
+                    &draft,
+                )
+            }
+            "app_sender_binding_show" => {
+                records.app_sender_binding_show(context, required_str(params, "binding_id")?)
+            }
+            "app_sender_binding_list" => records.app_sender_binding_list(context),
             "app_content_render" => {
                 let (revision, sample) = content_render_scope(params)?;
                 records.app_content_render(
@@ -199,6 +272,7 @@ impl Shared {
                     required_str(params, "campaign_id")?,
                     revision,
                     sample.as_deref(),
+                    content_binding(params)?,
                 )
             }
             "app_content_propose" => records.app_content_propose(
@@ -237,6 +311,7 @@ impl Shared {
                 context,
                 required_str(params, "campaign_id")?,
                 required_str(params, "to_email")?,
+                content_binding(params)?,
             ),
             "app_content_send_prepare" => {
                 let freeze = match params.get("audience_freeze_id") {
@@ -252,6 +327,7 @@ impl Shared {
                 records.app_content_send_prepare(
                     context,
                     required_str(params, "campaign_id")?,
+                    required_str(params, "binding_id")?,
                     freeze,
                 )
             }
@@ -260,8 +336,13 @@ impl Shared {
         if write {
             // Best-effort audit on core; digests only, never content.
             let digest = result
-                .get("content")
-                .and_then(|doc| doc.get("content_digest"))
+                .get("binding")
+                .and_then(|binding| binding.get("binding_digest"))
+                .or_else(|| {
+                    result
+                        .get("content")
+                        .and_then(|doc| doc.get("content_digest"))
+                })
                 .or_else(|| {
                     result
                         .get("proposal")

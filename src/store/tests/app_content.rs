@@ -180,10 +180,10 @@ fn cad782_render_is_deterministic_and_personalized() {
     let store = content_file(&dir, "install-a");
     save_basic(&store);
     let first = store
-        .app_content_render("ctx-1", "launch-1", None, Some("Amina"))
+        .app_content_render("ctx-1", "launch-1", None, Some("Amina"), None)
         .unwrap();
     let second = store
-        .app_content_render("ctx-1", "launch-1", Some(1), Some("Amina"))
+        .app_content_render("ctx-1", "launch-1", Some(1), Some("Amina"), None)
         .unwrap();
     assert_eq!(first["render"], second["render"]);
     let html = first["render"]["html"].as_str().unwrap();
@@ -192,17 +192,49 @@ fn cad782_render_is_deterministic_and_personalized() {
     assert!(html.contains("Hello Amina"));
     assert!(!html.contains("friend"));
     assert!(text.contains("Hello Amina"));
-    // The button URL survives escaped; the locked footer is present.
+    // The button URL survives escaped; the preview sender material
+    // is present and labelled preview-only, never send-ready.
     assert!(html.contains("https://example.com/posts/welcome"));
     assert!(html.contains("noreply@cadence.invalid"));
     assert!(html.contains("Unsubscribe"));
     assert!(text.contains("noreply@cadence.invalid"));
     assert!(text.contains("Unsubscribe:"));
+    assert_eq!(first["render"]["preview_only"], true);
+    assert_eq!(first["render"]["send_ready"], false);
+    assert_eq!(first["render"]["binding"]["binding_id"], "preview");
+    // A verified binding renders its own sender material with a
+    // distinct render digest; the content digest stays identical.
+    save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
+    let verified = store
+        .app_content_render("ctx-1", "launch-1", None, Some("Amina"), Some("bind-1"))
+        .unwrap();
+    assert_eq!(verified["render"]["preview_only"], false);
+    assert_eq!(verified["render"]["send_ready"], false);
+    assert!(verified["render"]["html"]
+        .as_str()
+        .unwrap()
+        .contains("news@example.com"));
+    assert_eq!(
+        verified["render"]["content_digest"],
+        first["render"]["content_digest"]
+    );
+    assert_ne!(
+        verified["render"]["render_digest"],
+        first["render"]["render_digest"]
+    );
+    assert!(store
+        .app_content_render("ctx-1", "launch-1", None, None, Some("bind-missing"))
+        .is_err());
     // No editable content can inject markup: angle brackets are escaped.
     assert!(!html.contains("<script"));
     // Fallback rendering uses the declared fallback.
     let fallback = store
-        .app_content_render("ctx-1", "launch-1", None, None)
+        .app_content_render("ctx-1", "launch-1", None, None, None)
         .unwrap();
     assert!(fallback["render"]["html"]
         .as_str()
@@ -214,13 +246,13 @@ fn cad782_render_is_deterministic_and_personalized() {
     );
     // Unknown revisions and bad sample names refuse.
     assert!(store
-        .app_content_render("ctx-1", "launch-1", Some(9), None)
+        .app_content_render("ctx-1", "launch-1", Some(9), None, None)
         .is_err());
     assert!(store
-        .app_content_render("ctx-1", "launch-1", None, Some("<b>x</b>"))
+        .app_content_render("ctx-1", "launch-1", None, Some("<b>x</b>"), None)
         .is_err());
     assert!(store
-        .app_content_render("ctx-1", "missing", None, None)
+        .app_content_render("ctx-1", "missing", None, None, None)
         .is_err());
 }
 
@@ -240,7 +272,12 @@ fn cad782_proposal_apply_discard_semantics() {
         )
         .unwrap();
     assert_eq!(proposed["proposal"]["state"], "pending");
-    assert_eq!(proposed["proposal"]["actor"], "assistant");
+    // Honest attribution: the operator submitted this draft, so it
+    // reads as operator work — never as assistant output. Assistant
+    // attribution stays reserved for receipt-backed writes.
+    assert_eq!(proposed["proposal"]["actor"], "operator");
+    assert_eq!(proposed["proposal"]["origin"], "operator-direct");
+    assert_eq!(proposed["proposal"]["assistant_receipt"], Value::Null);
     assert_eq!(proposed["proposal"]["source_revision"], 1);
     assert_eq!(
         store.app_content_show("ctx-1", "launch-1").unwrap()["content"],
@@ -313,6 +350,289 @@ fn cad782_proposal_apply_discard_semantics() {
         .is_err());
 }
 
+fn binding_draft<'a>(
+    name: &'a str,
+    address: &'a str,
+    base: &'a str,
+    connection: Option<&'a str>,
+) -> super::super::app_content::BindingDraft<'a> {
+    super::super::app_content::BindingDraft {
+        sender_name: name,
+        sender_address: address,
+        unsubscribe_base: base,
+        connection_id: connection,
+    }
+}
+
+fn save_binding(store: &RecordStore, binding: &str, address: &str, base: &str) -> Value {
+    store
+        .app_sender_binding_save(
+            "ctx-1",
+            binding,
+            None,
+            &binding_draft("News", address, base, Some("conn-smtp-1")),
+        )
+        .unwrap()
+}
+
+#[test]
+fn cad782_sender_binding_round_trip_with_cas() {
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    let created = save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
+    assert_eq!(created["binding"]["revision"], 1);
+    assert_eq!(created["binding"]["preview_only"], false);
+    assert!(created["binding"]["binding_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    let shown = store.app_sender_binding_show("ctx-1", "bind-1").unwrap();
+    assert_eq!(shown["binding"], created["binding"]);
+    let listed = store.app_sender_binding_list("ctx-1").unwrap();
+    assert_eq!(listed["bindings"].as_array().unwrap().len(), 1);
+    // `.invalid` material resolves preview-only, on either side.
+    let preview_sender = save_binding(
+        &store,
+        "bind-prev-a",
+        "news@cadence.invalid",
+        "https://example.com/unsub",
+    );
+    assert_eq!(preview_sender["binding"]["preview_only"], true);
+    let preview_unsub = save_binding(
+        &store,
+        "bind-prev-b",
+        "news@example.com",
+        "https://cadence.invalid/unsub",
+    );
+    assert_eq!(preview_unsub["binding"]["preview_only"], true);
+    // Blind, stale and reserved-ID saves refuse without mutation.
+    assert!(store
+        .app_sender_binding_save(
+            "ctx-1",
+            "bind-1",
+            None,
+            &binding_draft(
+                "News",
+                "news@example.com",
+                "https://example.com/unsub",
+                None
+            )
+        )
+        .is_err());
+    assert!(store
+        .app_sender_binding_save(
+            "ctx-1",
+            "bind-1",
+            Some(7),
+            &binding_draft(
+                "News",
+                "news@example.com",
+                "https://example.com/unsub",
+                None
+            )
+        )
+        .is_err());
+    assert!(store
+        .app_sender_binding_save(
+            "ctx-1",
+            "preview",
+            None,
+            &binding_draft(
+                "News",
+                "news@example.com",
+                "https://example.com/unsub",
+                None
+            )
+        )
+        .is_err());
+    let updated = store
+        .app_sender_binding_save(
+            "ctx-1",
+            "bind-1",
+            Some(1),
+            &binding_draft(
+                "News v2",
+                "news@example.com",
+                "https://example.com/unsub",
+                None,
+            ),
+        )
+        .unwrap();
+    assert_eq!(updated["binding"]["revision"], 2);
+    assert_eq!(updated["binding"]["sender"]["name"], "News v2");
+    // Invalid sender material refuses: bad address, bad base,
+    // bad connection, bad name, unknown binding reads.
+    for (name, address, base, connection) in [
+        ("News", "not-an-email", "https://example.com/unsub", None),
+        (
+            "News",
+            "news@example.com<script>",
+            "https://example.com/unsub",
+            None,
+        ),
+        ("News", "news@example.com", "http://example.com/unsub", None),
+        (
+            "News",
+            "news@example.com",
+            "https://no-dot-host/unsub",
+            None,
+        ),
+        ("News", "news@example.com", "javascript:alert(1)", None),
+        (
+            "News",
+            "news@example.com",
+            "https://example.com/unsub",
+            Some("bad conn!"),
+        ),
+        ("", "news@example.com", "https://example.com/unsub", None),
+        (
+            "<b>News</b>",
+            "news@example.com",
+            "https://example.com/unsub",
+            None,
+        ),
+    ] {
+        assert!(
+            store
+                .app_sender_binding_save(
+                    "ctx-1",
+                    "bind-bad",
+                    None,
+                    &binding_draft(name, address, base, connection)
+                )
+                .is_err(),
+            "invalid binding admitted: {address} {base}"
+        );
+    }
+    assert!(store
+        .app_sender_binding_show("ctx-1", "bind-missing")
+        .is_err());
+    // Nothing above mutated the revision-2 row.
+    assert_eq!(
+        store.app_sender_binding_show("ctx-1", "bind-1").unwrap()["binding"],
+        updated["binding"]
+    );
+}
+
+#[test]
+fn cad782_send_prepare_refuses_until_verified_binding() {
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
+    save_binding(
+        &store,
+        "bind-prev",
+        "news@cadence.invalid",
+        "https://cadence.invalid/unsub",
+    );
+    // Unknown bindings, the reserved preview ID and preview-only
+    // rows all refuse final-send preparation: `.invalid` bytes can
+    // never freeze as send-ready.
+    for binding in ["bind-missing", "preview", "bind-prev"] {
+        assert!(
+            store
+                .app_content_send_prepare("ctx-1", "launch-1", binding, None)
+                .is_err(),
+            "send prepared behind {binding}"
+        );
+    }
+    // A verified binding prepares a send-ready payload whose sender
+    // material is the binding's — not the preview placeholders.
+    let send = store
+        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
+        .unwrap()["send"]
+        .clone();
+    assert_eq!(send["send_ready"], true);
+    assert_eq!(send["preview_only"], false);
+    assert_eq!(
+        send["sender"],
+        json!({"name": "News", "address": "news@example.com"})
+    );
+    assert!(send["html"].as_str().unwrap().contains("news@example.com"));
+    assert!(!send["html"].as_str().unwrap().contains(".invalid"));
+    // Test preparation defaults to labelled preview placeholders
+    // and is never send-ready — even behind a verified binding.
+    let test = store
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", None)
+        .unwrap()["test_send"]
+        .clone();
+    assert_eq!(test["preview_only"], true);
+    assert_eq!(test["send_ready"], false);
+    assert!(test["html"].as_str().unwrap().contains(".invalid"));
+    let test_verified = store
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
+        .unwrap()["test_send"]
+        .clone();
+    assert_eq!(test_verified["send_ready"], false);
+    assert_eq!(test_verified["html"], send["html"]);
+    assert_eq!(test_verified["content_digest"], send["content_digest"]);
+    // The test recipient shapes refuse; nothing sends here — the
+    // payload is preparation only, with no SMTP credential or call.
+    assert!(store
+        .app_content_test_prepare("ctx-1", "launch-1", "not-an-email", None)
+        .is_err());
+    assert!(store
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com<script>", None)
+        .is_err());
+}
+
+#[test]
+fn cad782_binding_rotation_invalidates_send_not_content_approval() {
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
+    store.app_content_approve("ctx-1", "launch-1", 1).unwrap();
+    let first = store
+        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
+        .unwrap()["send"]
+        .clone();
+    // Rotating the binding changes the send digest while the
+    // content digest — and the content-only approval — stand.
+    store
+        .app_sender_binding_save(
+            "ctx-1",
+            "bind-1",
+            Some(1),
+            &binding_draft(
+                "News v2",
+                "news@example.com",
+                "https://example.com/unsub",
+                None,
+            ),
+        )
+        .unwrap();
+    let second = store
+        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
+        .unwrap()["send"]
+        .clone();
+    assert_ne!(first["payload_digest"], second["payload_digest"]);
+    assert_eq!(first["content_digest"], second["content_digest"]);
+    assert_eq!(
+        second["sender_binding"]["revision"], 2,
+        "send did not pin the rotated binding"
+    );
+    let shown = store.app_content_show("ctx-1", "launch-1").unwrap();
+    assert_eq!(shown["content"]["approval"]["valid"], true);
+    assert_eq!(shown["content"]["approval"]["scope"], "content-only");
+}
+
 #[test]
 fn cad782_approval_lifecycle_and_send_parity() {
     let dir = TempDir::new().unwrap();
@@ -338,13 +658,19 @@ fn cad782_approval_lifecycle_and_send_parity() {
         store.app_content_show("ctx-1", "launch-1").unwrap()["content"]["approval"]["valid"],
         false
     );
-    // Test-send and final-send preparation share the content hash,
-    // renderer output and locked sender/unsubscribe material.
+    // Test-send (preview binding) and final-send (verified binding)
+    // share the content hash; sender material follows the binding.
+    save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
     let test = store
-        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com")
+        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com", Some("bind-1"))
         .unwrap();
     let send = store
-        .app_content_send_prepare("ctx-1", "launch-1", None)
+        .app_content_send_prepare("ctx-1", "launch-1", "bind-1", None)
         .unwrap();
     assert_eq!(
         test["test_send"]["content_digest"],
@@ -352,22 +678,10 @@ fn cad782_approval_lifecycle_and_send_parity() {
     );
     assert_eq!(test["test_send"]["html"], send["send"]["html"]);
     assert_eq!(test["test_send"]["text"], send["send"]["text"]);
-    assert_eq!(
-        test["test_send"]["sender"],
-        json!({"name": "Cadence CRM", "address": "noreply@cadence.invalid"})
-    );
     assert!(test["test_send"]["headers"]["List-Unsubscribe"]
         .as_str()
         .unwrap()
-        .contains("unsubscribe"));
-    // The test recipient shapes refuse; nothing sends here — the
-    // payload is preparation only, with no SMTP credential or call.
-    assert!(store
-        .app_content_test_prepare("ctx-1", "launch-1", "not-an-email")
-        .is_err());
-    assert!(store
-        .app_content_test_prepare("ctx-1", "launch-1", "op@example.com<script>")
-        .is_err());
+        .contains("https://example.com/unsub"));
 }
 
 #[test]
@@ -413,7 +727,7 @@ fn cad782_contexts_and_installs_are_isolated() {
     // A sibling context sees nothing of ctx-1.
     assert!(store.app_content_show("ctx-2", "launch-1").is_err());
     assert!(store
-        .app_content_render("ctx-2", "launch-1", None, None)
+        .app_content_render("ctx-2", "launch-1", None, None, None)
         .is_err());
     assert_eq!(
         store.app_content_list("ctx-2").unwrap()["contents"],
@@ -439,10 +753,63 @@ fn cad782_contexts_and_installs_are_isolated() {
     // A sibling installation file is independent too.
     let other = content_file(&dir, "install-b");
     assert!(other.app_content_show("ctx-1", "launch-1").is_err());
+    // Sender bindings are scoped the same way: ctx-1's binding is
+    // unusable from ctx-2 and vice versa.
+    save_binding(
+        &store,
+        "bind-1",
+        "news@example.com",
+        "https://example.com/unsub",
+    );
+    assert!(store
+        .app_content_send_prepare("ctx-2", "launch-1", "bind-1", None)
+        .is_err());
+    assert!(store.app_sender_binding_show("ctx-2", "bind-1").is_err());
+    assert_eq!(
+        store.app_sender_binding_list("ctx-2").unwrap()["bindings"],
+        Value::Array(vec![])
+    );
+    assert!(other.app_sender_binding_show("ctx-1", "bind-1").is_err());
     // Malformed identifiers refuse before any file read.
     for bad in ["", "UPPER", "has space", "a/b", "x".repeat(200).as_str()] {
         assert!(store.app_content_show("ctx-1", bad).is_err());
     }
+}
+
+#[test]
+fn cad782_origin_column_migrates_older_files() {
+    use super::super::app_records::record_db_path;
+    let dir = TempDir::new().unwrap();
+    let store = content_file(&dir, "install-a");
+    save_basic(&store);
+    store
+        .app_content_propose("ctx-1", "launch-1", "prop-1", &draft("Old", blocks_basic()))
+        .unwrap();
+    drop(store);
+    // Simulate a file from between the two landings: proposals
+    // without the origin column. Reopen must backfill exactly the
+    // one value those rows can carry, without touching content.
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("ALTER TABLE app_content_proposals DROP COLUMN origin")
+        .unwrap();
+    drop(conn);
+    let store = content_file(&dir, "install-a");
+    let shown = store.app_content_proposal_show("ctx-1", "prop-1").unwrap();
+    assert_eq!(shown["proposal"]["origin"], "operator-direct");
+    assert_eq!(shown["proposal"]["actor"], "operator");
+    assert_eq!(
+        store.app_content_show("ctx-1", "launch-1").unwrap()["content"]["revision"],
+        1
+    );
+    // New writes carry the column after migration.
+    store
+        .app_content_propose("ctx-1", "launch-1", "prop-2", &draft("New", blocks_basic()))
+        .unwrap();
+    assert_eq!(
+        store.app_content_proposal_show("ctx-1", "prop-2").unwrap()["proposal"]["origin"],
+        "operator-direct"
+    );
 }
 
 #[test]

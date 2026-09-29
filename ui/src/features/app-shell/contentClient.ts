@@ -9,11 +9,14 @@ import { sessionHeaders } from "../../lib/sessionKey";
  * field, a chat message or a stored draft. Request bodies carry only
  * the operator-checked grammar the HTTP peer accepts; anything else
  * throws client-side before a byte is sent, and the server's
- * `deny_unknown_fields` refuses it again. No actor claims, HTML,
- * SMTP secrets or project links ever enter this client. Authority
- * stays server-checked; the assistant's proposal is inert until the
- * operator explicitly applies it, and the sender/unsubscribe/footer
- * material is host-locked — never an editable field here.
+ * `deny_unknown_fields` refuses it again. No actor claims, receipt
+ * claims (`assistant_receipt`, `turn_id`, `nonce`), HTML, SMTP
+ * secrets or project links ever enter this client. Authority stays
+ * server-checked; drafts submitted here are recorded as operator
+ * work and stay inert until the operator explicitly applies them.
+ * Sender/unsubscribe material travels only as typed host-owned
+ * bindings; previews render explicitly labelled preview-only
+ * placeholders that final-send preparation refuses.
  */
 
 /** URL-bound scope: the only identity this client will use. */
@@ -35,10 +38,18 @@ const SAVE_KEYS = [
   "blocks",
   "expected_revision",
 ] as const;
-const RENDER_KEYS = ["revision", "sample_first_name"] as const;
+const RENDER_KEYS = ["revision", "sample_first_name", "binding_id"] as const;
 const APPROVE_KEYS = ["expected_revision"] as const;
-const TEST_PREPARE_KEYS = ["to_email"] as const;
-const SEND_PREPARE_KEYS = ["audience_freeze_id"] as const;
+const TEST_PREPARE_KEYS = ["to_email", "binding_id"] as const;
+const SEND_PREPARE_KEYS = ["binding_id", "audience_freeze_id"] as const;
+const BINDING_SAVE_KEYS = [
+  "binding_id",
+  "sender_name",
+  "sender_address",
+  "unsubscribe_base",
+  "connection_id",
+  "expected_revision",
+] as const;
 const PROPOSE_KEYS = [
   "campaign_id",
   "proposal_id",
@@ -109,6 +120,10 @@ export const contentPaths = {
     `${scopePath(scope)}/proposals/${proposalId}/apply`,
   proposalDiscardPath: (scope: ContentScope, proposalId: string) =>
     `${scopePath(scope)}/proposals/${proposalId}/discard`,
+  bindingSavePath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings`,
+  bindingListPath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings/list`,
+  bindingPath: (scope: ContentScope, bindingId: string) =>
+    `${scopePath(scope)}/sender-bindings/${bindingId}`,
 };
 
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
@@ -169,11 +184,12 @@ export const contentClient = {
   render(
     scope: ContentScope,
     campaignId: string,
-    opts?: { revision?: number; sampleFirstName?: string },
+    opts?: { revision?: number; sampleFirstName?: string; bindingId?: string },
   ): Promise<unknown> {
     const body: Record<string, unknown> = {};
     if (opts?.revision !== undefined) body.revision = opts.revision;
     if (opts?.sampleFirstName !== undefined) body.sample_first_name = opts.sampleFirstName;
+    if (opts?.bindingId !== undefined) body.binding_id = opts.bindingId;
     assertClean(body, RENDER_KEYS, "render");
     return post(contentPaths.renderPath(scope, campaignId), body);
   },
@@ -182,20 +198,63 @@ export const contentClient = {
     assertClean(body, APPROVE_KEYS, "approve");
     return post(contentPaths.approvePath(scope, campaignId), body);
   },
-  testPrepare(scope: ContentScope, campaignId: string, toEmail: string): Promise<unknown> {
+  testPrepare(
+    scope: ContentScope,
+    campaignId: string,
+    toEmail: string,
+    bindingId?: string,
+  ): Promise<unknown> {
     const body: Record<string, unknown> = { to_email: toEmail };
+    if (bindingId !== undefined) body.binding_id = bindingId;
     assertClean(body, TEST_PREPARE_KEYS, "test-prepare");
     return post(contentPaths.testPreparePath(scope, campaignId), body);
   },
   sendPrepare(
     scope: ContentScope,
     campaignId: string,
+    bindingId: string,
     audienceFreezeId?: string,
   ): Promise<unknown> {
-    const body: Record<string, unknown> = {};
+    const body: Record<string, unknown> = { binding_id: bindingId };
     if (audienceFreezeId !== undefined) body.audience_freeze_id = audienceFreezeId;
     assertClean(body, SEND_PREPARE_KEYS, "send-prepare");
     return post(contentPaths.sendPreparePath(scope, campaignId), body);
+  },
+  bindingSave(
+    scope: ContentScope,
+    input: {
+      bindingId: string;
+      senderName: string;
+      senderAddress: string;
+      unsubscribeBase: string;
+      connectionId?: string;
+      expectedRevision?: number;
+    },
+  ): Promise<unknown> {
+    assertInputClean(input as unknown as Record<string, unknown>, [
+      "bindingId",
+      "senderName",
+      "senderAddress",
+      "unsubscribeBase",
+      "connectionId",
+      "expectedRevision",
+    ], "binding-save");
+    const body: Record<string, unknown> = {
+      binding_id: input.bindingId,
+      sender_name: input.senderName,
+      sender_address: input.senderAddress,
+      unsubscribe_base: input.unsubscribeBase,
+    };
+    if (input.connectionId !== undefined) body.connection_id = input.connectionId;
+    if (input.expectedRevision !== undefined) body.expected_revision = input.expectedRevision;
+    assertClean(body, BINDING_SAVE_KEYS, "binding-save");
+    return post(contentPaths.bindingSavePath(scope), body);
+  },
+  bindingShow(scope: ContentScope, bindingId: string): Promise<unknown> {
+    return get(contentPaths.bindingPath(scope, bindingId));
+  },
+  bindingList(scope: ContentScope): Promise<unknown> {
+    return get(contentPaths.bindingListPath(scope));
   },
   propose(scope: ContentScope, input: ProposalInput): Promise<unknown> {
     assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "proposalId", "subject", "preheader", "blocks"], "propose");

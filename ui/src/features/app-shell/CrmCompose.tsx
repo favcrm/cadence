@@ -4,20 +4,21 @@ import { contentClient, type ContentBlock, type ContentScope } from "./contentCl
 
 /**
  * Campaign email composer (CAD-782). Independent of CAD-781's
- * customer screens: this file touches no shared outlet, shell or
- * record-client file.
+ * customer screens and CAD-784's editor/chat wiring: this file
+ * touches no shared outlet, shell or record-client file.
  *
  * The operator drafts subject/preheader and bounded heading,
  * paragraph and button blocks; a sample name previews the approved
- * first-name token; HTML/text tabs render the exact saved revision;
- * an attributed assistant proposal offers explicit Apply (new
- * revision, approval invalidated) or Discard (no change). The
- * assistant never edits silently, and sender/unsubscribe/footer stay
- * host-locked — they render but are never editable here.
+ * first-name token; HTML/text tabs render the exact saved revision
+ * with sender material from the named binding (preview-only
+ * placeholders when unnamed, bannered as such — never send-ready).
+ * A submitted draft offers explicit Apply (new revision, approval
+ * invalidated) or Discard (no change); submissions are recorded as
+ * operator work, and the assistant never edits silently.
  *
- * MOUNT CONTRACT (deferred until CAD-781's head merges to avoid
- * editing its `CrmOutlet.tsx` mid-QA): the campaign route renders
- * `<CrmCompose scope campaignId />` beside the persistent left chat.
+ * MOUNT CONTRACT (CAD-784 owns visible wiring): the campaign route
+ * renders `<CrmCompose scope campaignId />` beside the persistent
+ * left chat.
  */
 
 export default function CrmCompose({
@@ -31,8 +32,10 @@ export default function CrmCompose({
   const [preheader, setPreheader] = useState("");
   const [blocksText, setBlocksText] = useState("[]");
   const [sampleName, setSampleName] = useState("");
+  const [bindingId, setBindingId] = useState("");
   const [previewTab, setPreviewTab] = useState<"html" | "text">("html");
   const [preview, setPreview] = useState("");
+  const [previewOnly, setPreviewOnly] = useState(true);
   const [proposal, setProposal] = useState<null | {
     proposal_id: string;
     subject: string;
@@ -105,12 +108,14 @@ export default function CrmCompose({
                 () =>
                   contentClient.render(scope, campaignId, {
                     ...(sampleName ? { sampleFirstName: sampleName } : {}),
+                    ...(bindingId ? { bindingId } : {}),
                   }),
                 (value) => {
                   setPreview(
                     previewTab === "html" ? value.render.html : value.render.text,
                   );
                   setRevision(value.render.revision as number);
+                  setPreviewOnly(value.render.preview_only as boolean);
                 },
               )
             }
@@ -118,6 +123,19 @@ export default function CrmCompose({
             Preview
           </button>
         </div>
+        <label>
+          Sender binding (verified sender; empty previews placeholders)
+          <input
+            value={bindingId}
+            onChange={(e) => setBindingId(e.target.value)}
+            maxLength={64}
+          />
+        </label>
+        {previewOnly && (
+          <p role="note">
+            Preview-only sender placeholders — final-send preparation refuses them.
+          </p>
+        )}
         <label>
           Sample first name
           <input
@@ -148,11 +166,11 @@ export default function CrmCompose({
       </section>
 
       {proposal && (
-        <section aria-label="Assistant proposal">
-          <h3>Assistant proposal</h3>
+        <section aria-label="Submitted proposal">
+          <h3>Submitted proposal</h3>
           <p>
-            {proposal.proposal_id} · {proposal.subject} · {proposal.state} · attributed to the
-            assistant, bound to its source revision.
+            {proposal.proposal_id} · {proposal.subject} · {proposal.state} · submitted by the
+            operator, bound to its source revision.
           </p>
           <button
             type="button"
