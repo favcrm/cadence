@@ -100,7 +100,7 @@ async function main() {
   assert(text().includes("fixture000") && text().includes("never counts"), "Posted shows the verified receipt, never a bare string");
   assert(text().includes("no uses left"), "Refused names the grant cause");
   assert(text().includes("read this as uncertain") && text().includes("Never duplicate"), "Processing carries the uncertain reading with reconcile-before-retry");
-  assert(text().includes("validity window") && text().includes("Needs a human decision"), "Held names the cause and the human, never a reconnect state");
+  assert(text().includes("validity window") && text().includes("Needs a human decision") && text().includes("reconnect_needed is a separate layer"), "Held names the cause and the human; ledger reconnect_needed stays separate");
   assert(text().includes("Processing"), "Processing state renders");
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "x".repeat(121) });
   assert(text().includes("grant_approval") && button("Post now")?.disabled, "Oversize approval gates with its contract code");
