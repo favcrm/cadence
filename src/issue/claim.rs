@@ -491,7 +491,9 @@ pub fn liveness_sweep(
     let issues = crate::issue::board::load_all(&pm.dir, None)?;
     let claimed: Vec<String> = issues
         .iter()
-        .filter(|i| i.front.claim.is_some())
+        .filter(|i| {
+            i.front.claim.is_some() && !matches!(i.front.status.as_str(), "done" | "dropped")
+        })
         .map(|i| i.front.id.clone())
         .collect();
     if claimed.is_empty() {
@@ -500,6 +502,11 @@ pub fn liveness_sweep(
     let _lock = pm.lock()?;
     let mut healed_ids = HashSet::new();
     let staged = write::stage(pm, &claimed, |_project, front| {
+        // Recheck under the PM lock: the initial board snapshot can race
+        // a human completing or dropping the issue.
+        if matches!(front.status.as_str(), "done" | "dropped") {
+            return Ok(false);
+        }
         let Some(c) = front.claim.as_mut() else {
             return Ok(false);
         };
@@ -803,6 +810,29 @@ mod tests {
             json(&front_of(&pm, &id), now + 302)["session"],
             json!("session-2")
         );
+    }
+
+    #[test]
+    fn terminal_claims_are_not_rewritten_by_liveness_checks() {
+        let (tmp, pm) = tracker();
+        for status in ["done", "dropped"] {
+            let id = issue(&pm, tmp.path(), status, None);
+            claim(&pm, &id, Some("w1"), None, None, "t").unwrap();
+            write::set_fields(
+                &pm,
+                std::slice::from_ref(&id),
+                &[format!("status={status}")],
+                "t",
+            )
+            .unwrap();
+            let before = front_of(&pm, &id).claim.unwrap();
+            let now = time::now_epoch();
+            let live = HashMap::from([("w1".to_string(), Some("session-1".to_string()))]);
+            let out =
+                liveness_sweep(&pm, &HashMap::new(), &live, STALE_GRACE, now, "daemon").unwrap();
+            assert_eq!(out["refreshed"], json!([]), "{status}: {out}");
+            assert_eq!(front_of(&pm, &id).claim.unwrap(), before);
+        }
     }
 
     /// CAD-755: the whole check chain — a stale-claimed doing issue is
