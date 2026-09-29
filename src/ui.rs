@@ -4133,25 +4133,6 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             },
         )?;
     }
-    // CAD-777: same handoff for the device trust pin — the daemon
-    // verifies the presented grant against this file at mint time, so
-    // a socket caller can never choose the issuer, the workspace, or
-    // mint for a subject off the operator's allowlist. When device
-    // login is not configured, any stale pin is removed so an old
-    // file cannot mint after the operator turned the flow off.
-    if let Some(login) = opts
-        .device_login
-        .as_ref()
-        .map(|login| crate::device_login::DevicePin {
-            issuer: login.config.issuer().to_string(),
-            org: login.config.org().to_string(),
-            subjects: login.subjects.clone(),
-        })
-    {
-        crate::device_login::write_pin(state_dir, &login)?;
-    } else {
-        crate::device_login::clear_pin(state_dir)?;
-    }
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();
@@ -4170,6 +4151,18 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         }
         Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
     })?;
+    // CAD-777: same handoff for the device trust pin — the daemon
+    // verifies the presented grant against this file at mint time, so
+    // a socket caller can never choose the issuer, the workspace, or
+    // mint for a subject off the operator's allowlist. When device
+    // login is not configured, any stale pin is removed so an old
+    // file cannot mint after the operator turned the flow off.
+    //
+    // Written ONLY here: after the bind succeeded (a process that
+    // loses the port touches nothing) and while no OTHER live UI owns
+    // this state dir — a second `ui run` must not rewrite or delete
+    // the pin out from under the running board (review r3).
+    pin_device_login(state_dir, &opts)?;
     // CAD-446: merge decisions appear without a terminal — this process
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
@@ -4275,6 +4268,34 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
             // Alive check — a stale pidfile is cleaned, not trusted.
             unsafe { libc::kill(*pid, 0) == 0 }
         })
+}
+
+/// Write or clear the daemon's device trust pin for this board
+/// (`opts.device_login` ⇔ the pin file). Refuses when ANOTHER live UI
+/// owns this state dir: `ui.pid` names the detached server's pid
+/// (`start_inner` writes it after spawn), `read_pid` drops stale
+/// pids, and our own pid passes — `ui start`'s `ui run` child may
+/// read the file its parent already recorded for it.
+fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    if let Some(pid) = read_pid(state_dir).filter(|pid| *pid != std::process::id() as i32) {
+        return Err(Error::rejected(format!(
+            "a UI is already running for this state dir (pid {pid}) — \
+             stop it before changing device login"
+        )));
+    }
+    if let Some(login) = opts
+        .device_login
+        .as_ref()
+        .map(|login| crate::device_login::DevicePin {
+            issuer: login.config.issuer().to_string(),
+            org: login.config.org().to_string(),
+            subjects: login.subjects.clone(),
+        })
+    {
+        crate::device_login::write_pin(state_dir, &login)
+    } else {
+        crate::device_login::clear_pin(state_dir)
+    }
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client

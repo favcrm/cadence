@@ -2032,3 +2032,87 @@ fn device_meta_advertises_sign_in_only_when_configured() {
         "{body}"
     );
 }
+
+/// A second `ui run` against the same state dir must not touch the
+/// daemon's device trust pin while a board is live: bare flags would
+/// clear it, re-pointing flags would replace it, and a run that loses
+/// the bind must not leave a re-pointed pin behind (review r3).
+#[test]
+fn device_pin_survives_a_second_ui_run_while_a_board_is_live() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let (issuer, _stub) = device_stub("approve");
+    let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+    let pin = state.path().join("operator").join("device-login.json");
+    let before = std::fs::read(&pin).unwrap();
+
+    // ui.pid naming a live process that is NOT this one stands in for
+    // a foreign board (a detached `ui start` server).
+    let mut foreign = Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::write(state.path().join("ui.pid"), foreign.id().to_string()).unwrap();
+
+    // run_cli answers Err quickly on a refusal; if the refusal is lost
+    // the run SERVES instead — the channel never answers, which is a
+    // failure either way.
+    let run = |flags: ui::UiFlags| -> bool {
+        let state = state.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(ui::run_cli(&state, &ui::UiAction::Run { flags }));
+        });
+        matches!(rx.recv_timeout(Duration::from_secs(10)), Ok(Err(_)))
+    };
+
+    // (i) bare flags — no ui.json, so device login resolves off and
+    // would clear the pin.
+    let errored = run(ui::UiFlags {
+        port: Some(free_port()),
+        ..Default::default()
+    });
+    assert!(
+        errored,
+        "a second `ui run` must refuse while a board owns the state dir"
+    );
+    assert_eq!(
+        std::fs::read(&pin).unwrap(),
+        before,
+        "bare run rewrote the pin"
+    );
+
+    // (ii) re-pointing flags — would replace the pin.
+    let errored = run(ui::UiFlags {
+        port: Some(free_port()),
+        device_login_issuer: Some("http://127.0.0.1:1".into()),
+        device_login_org: Some("ws_company".into()),
+        device_login_subject: vec!["op_evil".into()],
+        ..Default::default()
+    });
+    assert!(errored, "a re-pointing `ui run` must refuse");
+    assert_eq!(
+        std::fs::read(&pin).unwrap(),
+        before,
+        "re-pointing run rewrote the pin"
+    );
+
+    // (iii) no ui.pid at all, but the board's own port is taken: the
+    // bind loss must happen before the pin is touched.
+    std::fs::remove_file(state.path().join("ui.pid")).unwrap();
+    let errored = run(ui::UiFlags {
+        port: Some(port),
+        device_login_issuer: Some("http://127.0.0.1:1".into()),
+        device_login_org: Some("ws_company".into()),
+        device_login_subject: vec!["op_evil".into()],
+        ..Default::default()
+    });
+    assert!(errored, "a run that loses the bind must fail");
+    assert_eq!(
+        std::fs::read(&pin).unwrap(),
+        before,
+        "a lost bind rewrote the pin"
+    );
+
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+}

@@ -129,7 +129,7 @@ pub fn validate_subjects(subjects: &[String]) -> Result<()> {
     }
     if subjects.len() > MAX_SUBJECTS {
         return Err(rejected(
-            "Device login allows at most 16 subjects — name the few operators who sign in remotely",
+            &format!("Device login allows at most {MAX_SUBJECTS} subjects — name the few operators who sign in remotely"),
         ));
     }
     for (i, subject) in subjects.iter().enumerate() {

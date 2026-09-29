@@ -373,6 +373,7 @@ tests = [
     "device_subject_off_the_allowlist_is_refused",
     "device_code_does_not_stall_unrelated_writes",
     "device_meta_advertises_sign_in_only_when_configured",
+    "device_pin_survives_a_second_ui_run_while_a_board_is_live",
 ]
 helpers = [
     "jwks_stub",
