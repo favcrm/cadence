@@ -37,18 +37,27 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   `ui/package.json`, `cadence-review.toml`, `src/review.rs`,
   `docs/roles/**` and this file. Most gates on a PR run from the PR's
   own workflow files, so review is the only control on a change to them.
-  The operator, or an agent the operator designates, gives this
-  approval. It never comes from the PR's author.
+  The operator decides. An agent the operator designates may prepare
+  and relay the decision; the PR's author never does. Before enqueue,
+  record the decision from an operator connection (not an agent pane or
+  endpoint):
+  `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
+  A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
 
 Record the evidence so that every merge can be audited:
 - The PR title carries the issue id (`CAD-123: …`). A PR without a
   ticket does not merge.
-- Each review files one verdict note in the notes dir with `Type:
-  verdict`. The note names the PR number and the full head SHA, says
-  `pass` or `revise`, and lists the gates run and what was read. Link it
-  from the ticket.
-- Before you enqueue, post one ticket comment that lists every required
-  verdict note and the green CI run, all for the head you enqueue.
+- Each review files one verdict note in the notes dir, in the form
+  `cadence audit` and the ticket view recognise:
+  - the file is named `<UTC>-<slug>-verdict.md`;
+  - the first line is `# Verdict: <ID> — pass` (or `— revise`);
+  - it has an `Issue: <ID>` header, the PR as `#<n>`, and a line
+    `head <full-sha>`;
+  - it lists the gates run and what was read.
+  Link the note from the ticket.
+- Before you enqueue, post one ticket comment for the head you enqueue.
+  It lists every required verdict note, the green CI run and, for a
+  `human`-class PR, the approval id.
 - A new head voids every verdict on the old head.
 
 Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
