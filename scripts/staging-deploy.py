@@ -14,6 +14,7 @@ invokes `tailscale` or sudo — it only drives the cadence CLI.
 """
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -128,11 +129,36 @@ def health_ok(http_get):
         return False
 
 
-def ensure_release(run, sha, run_id, base):
-    dest = base / "releases" / sha
-    if (dest / "candidate.json").is_file():
-        return dest
-    partial = base / "releases" / f"{sha}.partial-{os.getpid()}"
+def verified_binary(release_dir):
+    """The release's cadence binary, only while it still proves what
+    prepare attested: candidate.json identifies the source/run/attempt
+    and the file's live sha256 matches it. Re-hashed on every call —
+    before every execution, including rollback."""
+    try:
+        candidate = json.loads((release_dir / "candidate.json").read_text())
+        binary = release_dir / "cadence"
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+    if not all(candidate.get(k) for k in ("source_sha", "ci_run_id", "ci_run_attempt")):
+        return None
+    if candidate.get("sha256") != digest:
+        return None
+    return str(binary)
+
+
+def ensure_release(run, rel_id, run_id, base):
+    """releases/<sha>-<run_id>-<attempt>: reuse only a still-verified
+    directory, otherwise run `prepare` — a CI rerun's artifacts land in
+    a new dir."""
+    dest = base / "releases" / rel_id
+    if dest.is_dir():
+        if verified_binary(dest):
+            return dest
+        raise Refused(
+            f"cached release {rel_id} failed verification — not executing it"
+        )
+    partial = base / "releases" / f"{rel_id}.partial-{os.getpid()}"
     try:
         run_ok(
             run,
@@ -149,8 +175,9 @@ def ensure_release(run, sha, run_id, base):
         partial.rename(dest)
     finally:
         if partial.exists():
-            import shutil
             shutil.rmtree(partial, ignore_errors=True)
+    if not verified_binary(dest):
+        raise Refused(f"prepared release {rel_id} failed verification")
     return dest
 
 
@@ -209,7 +236,9 @@ def tailnet(run, cadence, env):
 def prune(base, keep_shas):
     releases = sorted(
         (p for p in (base / "releases").iterdir()
-         if p.is_dir() and re.fullmatch(r"[0-9a-f]{40}", p.name)),
+         # New ids carry run+attempt; a bare-sha dir is a pre-migration
+        # release and prunes the same way.
+        if p.is_dir() and re.fullmatch(r"[0-9a-f]{40}(-\d+-\d+)?", p.name)),
         key=lambda p: p.stat().st_mtime,
     )
     for old in releases[:-KEEP]:
@@ -245,44 +274,108 @@ def _tick_locked(run, http_get, base, run_id):
             run,
             ["gh", "run", "list", "-R", REPO, "--workflow", "ci.yml",
              "--branch", "main", "--event", "push", "--status", "success",
-             "--limit", "1", "--json", "databaseId,headSha"],
+             "--limit", "1", "--json", "databaseId,headSha,attempt"],
             os.environ.copy(),
         )
         candidate = json.loads(out)[0]
         run_id, sha = candidate["databaseId"], candidate["headSha"]
+        attempt = candidate["attempt"]
     else:
         out = run_ok(
             run,
             ["gh", "api", f"repos/{REPO}/actions/runs/{run_id}"],
             os.environ.copy(),
         )
-        sha = json.loads(out)["head_sha"]
+        run_info = json.loads(out)
+        sha, attempt = run_info["head_sha"], run_info["run_attempt"]
+    # A rerun for the same source is a different release — the dir id
+    # carries run and attempt, so a rerun never reuses stale artifacts.
+    rel_id = f"{sha}-{run_id}-{attempt}"
 
-    # An auto-selected candidate that already failed once is never
-    # retried — each attempt bounces the live board. `--run-id` pins
-    # are the operator's call and bypass the skip.
-    if not pinned and sha == status.get("failed_sha"):
-        log_line(base, f"tick: skipping known-bad {sha[:12]}")
-        return 0
+    # An auto-selected release that already failed once is skipped —
+    # each attempt bounces the live board. `--run-id` pins are the
+    # operator's call and bypass this. Skip only while staging is
+    # verifiably alive: if the board is down or on the wrong build,
+    # recover the previous verified release when there is one, else
+    # retry the candidate (staging is down anyway — nothing to bounce).
+    if not pinned and rel_id == status.get("failed_release"):
+        live = health_ok(http_get)
+        if status.get("deployed_release") and live == status.get("deployed_sha"):
+            log_line(base, f"tick: skipping known-bad {rel_id[:12]}")
+            return 0
+        prev_rel = status.get("previous_release")
+        prev_bin = (
+            verified_binary(base / "releases" / prev_rel) if prev_rel else None
+        )
+        if prev_rel and prev_rel != rel_id and prev_bin:
+            log_line(base, f"tick: known-bad {rel_id[:12]} — recovering {prev_rel[:12]}")
+            try:
+                sandbox_down(run, prev_bin)
+                run_ok(
+                    run,
+                    [prev_bin, "sandbox", "up", NAME, "--port", str(PORT)],
+                    child_env(),
+                )
+                live = health_ok(http_get)
+                prev_sha = status.get("previous_sha")
+                if live != prev_sha:
+                    raise Refused(
+                        f"recovered board reports build_commit={live!r}, want {prev_sha}"
+                    )
+            except Exception as e:
+                status["last_error"] = f"recovery to {prev_rel} failed: {e}"
+                status_path.write_text(json.dumps(status, indent=2) + "\n")
+                log_line(base, f"tick: recovery failed: {e}")
+                return 1
+            status.update({
+                "deployed_release": prev_rel,
+                "deployed_sha": prev_sha,
+                "last_error": status.get("last_error"),
+            })
+            status_path.write_text(json.dumps(status, indent=2) + "\n")
+            log_line(base, f"tick: recovered on {prev_rel[:12]}")
+            return 0
+        # Nothing verified to recover: fall through to a normal retry.
 
     deployed = health_ok(http_get)
-    if sha == status.get("deployed_sha") and deployed == sha:
-        log_line(base, f"tick: no-op — {sha[:12]} already live")
+    if rel_id == status.get("deployed_release") and deployed == sha:
+        log_line(base, f"tick: no-op — {rel_id[:12]} already live")
         return 0
 
-    release = ensure_release(run, sha, run_id, base)
-    cadence = str(release / "cadence")
+    release = ensure_release(run, rel_id, run_id, base)
+    cadence = verified_binary(release)
+    if cadence is None:  # cannot happen after ensure_release — belt and braces
+        raise Refused(f"release {rel_id} produced no verified binary")
     env = child_env()
 
+    previous_release = status.get("deployed_release")
     previous_sha = status.get("deployed_sha")
-    log_line(base, f"deploying {sha} (run {run_id}, previous {previous_sha})")
+    log_line(base, f"deploying {rel_id} (previous {previous_release})")
     sandbox_down(run, cadence)
 
     try:
         run_ok(run, [cadence, "sandbox", "up", NAME, "--port", str(PORT)], env)
-        if not (base / "seeded").exists():
-            seed(run, cadence, sandbox_env(run, cadence), base)
+        try:
+            if not (base / "seeded").exists():
+                seed(run, cadence, sandbox_env(run, cadence), base)
+        except Exception as e:
+            # A partial seed leaves projects in the tracker and the seed
+            # then refuses every retry — reset the sandbox (never when
+            # the seeded marker exists) so the next tick starts clean.
+            run([cadence, "sandbox", "reset", NAME], env=child_env())
+            raise Refused(f"seed failed ({e}); staging sandbox reset")
         tailnet_state = tailnet(run, cadence, sandbox_env(run, cadence))
+        # Non-fatal reachability probe through the tailnet URL itself.
+        tailnet_health = None
+        if tailnet_state.startswith("sharing"):
+            try:
+                code, _ = http_get(
+                    f"{URL_TAILNET}/api/health",
+                    "ip-172-31-1-32.tail9fcf30.ts.net:9460",
+                )
+                tailnet_health = "ok" if code == 200 else f"http {code}"
+            except Exception as e:
+                tailnet_health = str(e)[:200]
         healthy = health_ok(http_get)
         if healthy != sha:
             raise Refused(
@@ -290,16 +383,16 @@ def _tick_locked(run, http_get, base, run_id):
             )
     except Exception as e:
         last_error = str(e)
-        log_line(base, f"deploy {sha[:12]} failed: {last_error} — rolling back")
+        log_line(base, f"deploy {rel_id[:12]} failed: {last_error} — rolling back")
         rolled_back = False
-        if previous_sha:
-            prev = base / "releases" / previous_sha / "cadence"
-            if prev.exists():
+        if previous_release:
+            prev_bin = verified_binary(base / "releases" / previous_release)
+            if prev_bin:
                 try:
-                    sandbox_down(run, str(prev))
+                    sandbox_down(run, prev_bin)
                     run_ok(
                         run,
-                        [str(prev), "sandbox", "up", NAME, "--port", str(PORT)],
+                        [prev_bin, "sandbox", "up", NAME, "--port", str(PORT)],
                         env,
                     )
                     rolled_back = True
@@ -307,30 +400,36 @@ def _tick_locked(run, http_get, base, run_id):
                     last_error += f"; rollback also failed: {rb}"
         status.update({
             "last_error": last_error,
-            "failed_sha": sha,
+            "failed_release": rel_id,
+            "previous_release": previous_release,
             "previous_sha": previous_sha,
             "tailnet": status.get("tailnet"),
         })
         if not rolled_back:
             # Nothing verifiably live: the no-op check must not claim
-            # the old sha is still deployed.
+            # the old release is still deployed.
+            status["deployed_release"] = None
             status["deployed_sha"] = None
         status_path.write_text(json.dumps(status, indent=2) + "\n")
         return 1
 
     status = {
+        "deployed_release": rel_id,
         "deployed_sha": sha,
         "ci_run_id": run_id,
+        "ci_run_attempt": attempt,
         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "previous_release": previous_release,
         "previous_sha": previous_sha,
         "tailnet": tailnet_state,
+        "tailnet_health": tailnet_health,
         "last_error": None,
         "url_loopback": URL_LOOPBACK,
         "url_tailnet": URL_TAILNET,
     }
     status_path.write_text(json.dumps(status, indent=2) + "\n")
-    prune(base, {sha, previous_sha})
-    log_line(base, f"deployed {sha} on :{PORT}; tailnet: {tailnet_state}")
+    prune(base, {rel_id, previous_release})
+    log_line(base, f"deployed {rel_id} on :{PORT}; tailnet: {tailnet_state}")
     return 0
 
 

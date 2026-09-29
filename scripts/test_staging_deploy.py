@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for staging-deploy.py — runner and HTTP fully mocked."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,19 +18,23 @@ _spec.loader.exec_module(sd)
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+REL_A = f"{SHA_A}-4242-1"
+REL_B = f"{SHA_B}-1-1"
 
 
 class FakeRunner:
-    """Records (argv, env) and answers by argv shape."""
+    """Records (argv, env, cwd) and answers by argv shape."""
 
-    def __init__(self, base, sha=SHA_A, run_id=4242):
+    def __init__(self, base, sha=SHA_A, run_id=4242, attempt=1):
         self.base = Path(base)
         self.sha = sha
         self.run_id = run_id
+        self.attempt = attempt
         self.calls = []
         self.tailscale_rc = 0
         # Substring of the cadence binary path whose `sandbox up` fails.
         self.fail_up_for = None
+        self.seed_rc = 0
         self.pm_dir = self.base / "sandbox" / "staging" / "pm"
         self.state_dir = self.base / "sandbox" / "staging" / "state"
 
@@ -39,19 +44,28 @@ class FakeRunner:
         joined = " ".join(argv)
         if argv[:2] == ["gh", "run"]:
             return 0, json.dumps(
-                [{"databaseId": self.run_id, "headSha": self.sha}]
+                [{"databaseId": self.run_id, "headSha": self.sha,
+                  "attempt": self.attempt}]
             ), ""
         if argv[:2] == ["gh", "api"]:
-            return 0, json.dumps({"head_sha": self.sha}), ""
+            return 0, json.dumps(
+                {"head_sha": self.sha, "run_attempt": self.attempt}
+            ), ""
         if "delivery-candidate.py" in joined:
             dest = Path(argv[argv.index("--dest") + 1])
             dest.mkdir(parents=True)
-            (dest / "candidate.json").write_text(json.dumps({"source_sha": self.sha}))
-            (dest / "cadence").write_text("binary")
+            blob = b"binary-" + dest.name.encode()
+            (dest / "cadence").write_bytes(blob)
+            (dest / "candidate.json").write_text(json.dumps({
+                "source_sha": self.sha,
+                "ci_run_id": self.run_id,
+                "ci_run_attempt": self.attempt,
+                "sha256": hashlib.sha256(blob).hexdigest(),
+            }))
             return 0, "{}", ""
-        if argv[-3:-1] == ["sandbox", "down"] or joined.endswith("sandbox down staging"):
-            if not (self.state_dir).exists():
-                return 1, "", f"no sandbox '{sd.NAME}' at {self.base}/sandbox/{sd.NAME}"
+        if "sandbox reset" in joined:
+            return 0, "{}", ""
+        if "sandbox down" in joined:
             return 0, "{}", ""
         if "sandbox up" in joined:
             if self.fail_up_for and self.fail_up_for in argv[0]:
@@ -66,6 +80,8 @@ class FakeRunner:
                 f"export CADENCE_PROFILE='sandbox:staging'\n"
             ), ""
         if "seed-pm.sh" in joined:
+            if self.seed_rc:
+                return self.seed_rc, "", "seed: failed mid-way"
             pm = Path(argv[-1])
             pm.mkdir(parents=True, exist_ok=True)
             (pm / "pm.yaml").write_text("seeded")
@@ -107,6 +123,21 @@ def http_down(url, host):
     raise OSError("connection refused")
 
 
+def make_release(base, rel, sha, run_id, attempt, tamper=False):
+    d = Path(base) / "releases" / rel
+    d.mkdir(parents=True)
+    blob = b"binary-" + rel.encode()
+    (d / "cadence").write_bytes(blob)
+    (d / "candidate.json").write_text(json.dumps({
+        "source_sha": sha, "ci_run_id": run_id,
+        "ci_run_attempt": attempt,
+        "sha256": hashlib.sha256(blob).hexdigest(),
+    }))
+    if tamper:
+        (d / "cadence").write_bytes(b"tampered")
+    return d
+
+
 class TickTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -129,9 +160,11 @@ class TickTest(unittest.TestCase):
         rc = self.deploy(r, http_ok(SHA_A))
         self.assertEqual(rc, 0)
         status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], REL_A)
         self.assertEqual(status["deployed_sha"], SHA_A)
         self.assertEqual(status["ci_run_id"], 4242)
-        self.assertIsNone(status["previous_sha"])
+        self.assertEqual(status["ci_run_attempt"], 1)
+        self.assertIsNone(status["previous_release"])
         self.assertIsNone(status["last_error"])
         self.assertEqual(status["url_loopback"], "http://cadence-3020.localhost:3020")
         self.assertIn("9460", status["url_tailnet"])
@@ -145,24 +178,55 @@ class TickTest(unittest.TestCase):
         self.assertEqual(seed_call[1]["SEED_REPO_ROOT"], str(self.base / "repos"))
         self.assertEqual(len(r.argvs("agent register")), 2)
         # The verified release binary, never anything else, is executed.
-        cadence = str(self.base / "releases" / SHA_A / "cadence")
+        cadence = str(self.base / "releases" / REL_A / "cadence")
         self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
 
-    def test_noop_when_sha_matches_and_healthy(self):
-        (self.base / "status.json").write_text(json.dumps({"deployed_sha": SHA_A}))
+    def test_noop_when_release_matches_and_healthy(self):
+        (self.base / "status.json").write_text(json.dumps(
+            {"deployed_release": REL_A, "deployed_sha": SHA_A}))
         r = FakeRunner(self.base)
         rc = self.deploy(r, http_ok(SHA_A))
         self.assertEqual(rc, 0)
         self.assertFalse(r.argvs("sandbox up"))
         self.assertFalse(r.argvs("delivery-candidate.py"))
 
+    def test_rerun_same_sha_new_attempt_is_a_new_release(self):
+        # First deploy at attempt 1.
+        r = FakeRunner(self.base, attempt=1)
+        self.assertEqual(self.deploy(r, http_ok(SHA_A)), 0)
+        # CI reruns the same sha: attempt 2 → a fresh prepare into a
+        # new release dir; the old one survives for rollback.
+        r2 = FakeRunner(self.base, attempt=2)
+        rc = self.deploy(r2, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        rel2 = f"{SHA_A}-4242-2"
+        self.assertTrue((self.base / "releases" / REL_A).is_dir())
+        self.assertTrue((self.base / "releases" / rel2).is_dir())
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], rel2)
+        self.assertEqual(status["previous_release"], REL_A)
+
+    def test_tampered_cached_release_is_refused(self):
+        rel = REL_A
+        make_release(self.base, rel, SHA_A, 4242, 1, tamper=True)
+        r = FakeRunner(self.base)
+        with self.assertRaises(sd.Refused):
+            self.deploy(r, http_down)
+        # The tampered binary was never executed.
+        for argv, _, _ in r.calls:
+            self.assertNotEqual(argv[0], str(self.base / "releases" / rel / "cadence"))
+        self.assertFalse(r.argvs("sandbox up"))
+
     def test_run_id_override_pins_the_run(self):
-        r = FakeRunner(self.base, sha=SHA_B, run_id=999)
+        r = FakeRunner(self.base, sha=SHA_B, run_id=999, attempt=3)
         rc = self.deploy(r, http_ok(SHA_B), run_id=999)
         self.assertEqual(rc, 0)
         self.assertFalse(r.argvs("gh run list"))
         self.assertTrue(r.argvs("gh api"))
         self.assertTrue(r.argvs("--run-id 999"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], f"{SHA_B}-999-3")
+        self.assertEqual(status["ci_run_attempt"], 3)
 
     def test_child_env_is_scrubbed_and_sandboxed(self):
         r = FakeRunner(self.base)
@@ -192,6 +256,24 @@ class TickTest(unittest.TestCase):
         status = json.loads((self.base / "status.json").read_text())
         self.assertIn("escapes", status["last_error"])
 
+    def test_seed_failure_resets_the_sandbox_once(self):
+        r = FakeRunner(self.base)
+        r.seed_rc = 1
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 1)
+        self.assertTrue(r.argvs("sandbox reset staging"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertIn("staging sandbox reset", status["last_error"])
+        self.assertEqual(status["failed_release"], REL_A)
+        self.assertIsNone(status["deployed_sha"])
+
+    def test_no_reset_once_seeded(self):
+        (self.base / "seeded").touch()
+        r = FakeRunner(self.base)
+        self.assertEqual(self.deploy(r, http_ok(SHA_A)), 0)
+        self.assertFalse(r.argvs("sandbox reset"))
+        self.assertFalse(r.argvs("seed-pm.sh"))
+
     def test_tailnet_refusal_is_nonfatal(self):
         r = FakeRunner(self.base)
         r.tailscale_rc = 1
@@ -199,68 +281,54 @@ class TickTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         status = json.loads((self.base / "status.json").read_text())
         self.assertIn("refused", status["tailnet"])
+        self.assertIsNone(status["tailnet_health"])
         self.assertEqual(status["deployed_sha"], SHA_A)
 
+    def test_tailnet_health_recorded_when_sharing(self):
+        r = FakeRunner(self.base)  # tailscale_rc=0 → sharing
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["tailnet_health"], "ok")
+
     def test_failed_health_rolls_back_to_previous(self):
-        (self.base / "status.json").write_text(
-            json.dumps({"deployed_sha": SHA_B, "ci_run_id": 1})
-        )
-        old = self.base / "releases" / SHA_B
-        old.mkdir(parents=True)
-        (old / "cadence").write_text("old")
-        (old / "candidate.json").write_text("{}")
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_B, "deployed_sha": SHA_B,
+            "ci_run_id": 1}))
+        make_release(self.base, REL_B, SHA_B, 1, 1)
         r = FakeRunner(self.base)
         rc = self.deploy(r, http_down)  # health never answers
         self.assertEqual(rc, 1)
         status = json.loads((self.base / "status.json").read_text())
         self.assertIn("health check failed", status["last_error"])
-        prev = str(old / "cadence")
+        self.assertEqual(status["failed_release"], REL_A)
+        prev = str(self.base / "releases" / REL_B / "cadence")
         self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        # Rolled back: deployed still names the live release.
+        self.assertEqual(status["deployed_release"], REL_B)
         # Never `sandbox reset` on its own.
         self.assertFalse(r.argvs("sandbox reset"))
 
-    def test_prune_keeps_current_and_previous(self):
-        (self.base / "status.json").write_text(
-            json.dumps({"deployed_sha": SHA_B})
-        )
-        for i in range(8):
-            d = self.base / "releases" / (f"{i:040d}")
-            d.mkdir(parents=True)
-            (d / "candidate.json").write_text("{}")
-            os.utime(d, (i, i))
-        (self.base / "releases" / SHA_B).mkdir(exist_ok=True)
-        (self.base / "releases" / SHA_B / "candidate.json").write_text("{}")
-        r = FakeRunner(self.base)
-        self.assertEqual(self.deploy(r, http_ok(SHA_A)), 0)
-        names = {p.name for p in (self.base / "releases").iterdir()}
-        self.assertIn(SHA_A, names)
-        self.assertIn(SHA_B, names)
-        self.assertLessEqual(len(names), sd.KEEP)
-
     def test_failed_up_rolls_back(self):
-        (self.base / "status.json").write_text(
-            json.dumps({"deployed_sha": SHA_B, "ci_run_id": 1})
-        )
-        old = self.base / "releases" / SHA_B
-        old.mkdir(parents=True)
-        (old / "cadence").write_text("old")
-        (old / "candidate.json").write_text("{}")
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_B, "deployed_sha": SHA_B,
+            "ci_run_id": 1}))
+        make_release(self.base, REL_B, SHA_B, 1, 1)
         r = FakeRunner(self.base)
-        r.fail_up_for = SHA_A
+        r.fail_up_for = REL_A
         rc = self.deploy(r, http_down)
         self.assertEqual(rc, 1)
         status = json.loads((self.base / "status.json").read_text())
         self.assertIn("daemon start refused", status["last_error"])
-        self.assertEqual(status["failed_sha"], SHA_A)
-        # Rolled back onto the previous release binary — the sandbox is
-        # not left down.
-        prev = str(old / "cadence")
+        self.assertEqual(status["failed_release"], REL_A)
+        prev = str(self.base / "releases" / REL_B / "cadence")
         self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        self.assertEqual(status["deployed_release"], REL_B)
 
-    def test_known_bad_sha_is_skipped_but_pin_bypasses(self):
-        (self.base / "status.json").write_text(
-            json.dumps({"deployed_sha": SHA_B, "failed_sha": SHA_A})
-        )
+    def test_known_bad_skip_only_while_live(self):
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_B, "deployed_sha": SHA_B,
+            "failed_release": REL_A}))
         r = FakeRunner(self.base)
         rc = self.deploy(r, http_ok(SHA_B))
         self.assertEqual(rc, 0)
@@ -272,8 +340,50 @@ class TickTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(r2.argvs("sandbox up"))
         status = json.loads((self.base / "status.json").read_text())
-        self.assertNotIn("failed_sha", status)
+        self.assertNotIn("failed_release", status)
         self.assertEqual(status["deployed_sha"], SHA_A)
+
+    def test_known_bad_recovers_previous_when_board_dead(self):
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "failed_release": REL_A,
+            "previous_release": REL_B, "previous_sha": SHA_B}))
+        make_release(self.base, REL_B, SHA_B, 1, 1)
+        r = FakeRunner(self.base)
+        rc = self.deploy(r, http_ok(SHA_B))  # board runs SHA_B after recovery
+        self.assertEqual(rc, 0)
+        prev = str(self.base / "releases" / REL_B / "cadence")
+        self.assertTrue(r.argvs(f"{prev} sandbox up staging --port 3020"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], REL_B)
+        self.assertEqual(status["deployed_sha"], SHA_B)
+
+    def test_known_bad_retries_when_nothing_to_recover(self):
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": None, "deployed_sha": None,
+            "failed_release": REL_A}))
+        r = FakeRunner(self.base)
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        self.assertTrue(r.argvs("sandbox up staging --port 3020"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], REL_A)
+
+    def test_prune_keeps_current_and_previous(self):
+        (self.base / "status.json").write_text(json.dumps(
+            {"deployed_release": REL_B, "deployed_sha": SHA_B}))
+        for i in range(8):
+            d = self.base / "releases" / f"{i:040d}-{i}-1"
+            d.mkdir(parents=True)
+            (d / "candidate.json").write_text("{}")
+            os.utime(d, (i, i))
+        make_release(self.base, REL_B, SHA_B, 1, 1)
+        r = FakeRunner(self.base)
+        self.assertEqual(self.deploy(r, http_ok(SHA_A)), 0)
+        names = {p.name for p in (self.base / "releases").iterdir()}
+        self.assertIn(REL_A, names)
+        self.assertIn(REL_B, names)
+        self.assertLessEqual(len(names), sd.KEEP)
 
     def test_port_3010_is_refused(self):
         old = sd.PORT
