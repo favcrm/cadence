@@ -586,7 +586,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            29,
+            30,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -665,6 +665,103 @@
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has("social_publish_intents"));
+    }
+
+    #[test]
+    fn migration_v29_to_v30_adds_smtp_links_and_keeps_connections() {
+        // v30 adds the CAD-785 sender-link table only:
+        // `crm_smtp_links` — one live `(install_id, context_id)`
+        // binding keyed by the pair, pinning the credential
+        // (authorization) revision. `IF NOT EXISTS`, so a v29 store
+        // migrates in place and a half-applied v30 converges; the
+        // pre-v30 connection custody records are preserved.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO platform_credentials(platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) \
+                     VALUES ('smtp','test-sender','[\"email:send\"]','fingerprint-test','file','smtp',42,'operator','conn-test-1',3);",
+                )
+                .unwrap();
+            let record = s
+                .platform_credential("smtp", "test-sender")
+                .unwrap()
+                .expect("seeded credential row missing");
+            assert_eq!(record.connection_id, "conn-test-1");
+            assert_eq!(record.credential_revision, 3);
+        }
+        // A genuine v29: everything but the links table.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE crm_smtp_links;
+                 UPDATE schema_version SET version=29;",
+            )
+            .unwrap();
+        let has = |table: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("crm_smtp_links"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("crm_smtp_links"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // The migrated store keeps its pre-v30 connection data
+            // and agent rows; the new links table starts empty.
+            let record = s
+                .platform_credential("smtp", "test-sender")
+                .unwrap()
+                .expect("credential row lost across v29→v30");
+            assert_eq!(record.connection_id, "conn-test-1");
+            assert_eq!(record.credential_revision, 3);
+            assert_eq!(record.exchange, "smtp");
+            assert!(s.agent("a1").is_ok());
+            assert!(
+                s.crm_smtp_link("install-1", "ctx-1")
+                    .unwrap()
+                    .is_none(),
+                "fresh links table must hold no phantom binding"
+            );
+        }
+        // Half-applied: table dropped, version rolled back — the
+        // reopen converges without touching connection rows.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE crm_smtp_links;
+                 UPDATE schema_version SET version=29;",
+            )
+            .unwrap();
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("crm_smtp_links"));
+            assert!(
+                s.platform_credential("smtp", "test-sender")
+                    .unwrap()
+                    .is_some(),
+                "credential row lost across half-applied v30 converge"
+            );
+        }
     }
 
     #[test]

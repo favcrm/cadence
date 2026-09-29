@@ -2104,6 +2104,63 @@ impl RecordStore {
         )
     }
 
+    /// Verified test-send bytes for CAD-785: the exact current
+    /// revision rendered through the same deterministic
+    /// HTML/text renderer, but with the host-custodied verified
+    /// sender — never the `.invalid` preview placeholders. The
+    /// unsubscribe material stays the preview base: CAD-786 owns
+    /// unsubscribe authority and per-recipient tokens, so the
+    /// receipt labels it accordingly. No SMTP submission happens
+    /// here; the CAD-785 daemon RPC performs it under the live
+    /// installation/context link's authority.
+    pub fn app_content_verified_test_bytes(
+        &self,
+        context: &str,
+        campaign: &str,
+        sender_name: &str,
+        sender_address: &str,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let (revision, draft, digest) = self.draft_at(&conn, context, campaign, None)?;
+        let view = BindingView {
+            sender_name: sender_name.to_string(),
+            sender_address: sender_address.to_string(),
+            unsubscribe_base: UNSUBSCRIBE_BASE.to_string(),
+        };
+        let html = render_html(&draft, None, &view);
+        let text = render_text(&draft, None, &view);
+        let binding_digest = material_digest(&json!({
+            "domain": "cadence-crm-smtp-sender-v1",
+            "install_id": self.install(),
+            "context_id": context,
+            "sender_name": sender_name,
+            "sender_address": sender_address,
+        }));
+        let payload_digest = material_digest(&json!({
+            "domain": "cadence-app-content-send-v1",
+            "kind": "test",
+            "install_id": self.install(),
+            "context_id": context,
+            "campaign_id": campaign,
+            "content_digest": digest,
+            "audience_digest": Value::Null,
+            "binding_digest": binding_digest,
+            "to_email": Value::Null,
+            "html": html,
+            "text": text,
+        }));
+        Ok(json!({
+            "subject": draft.subject,
+            "content_revision": revision,
+            "content_digest": digest,
+            "binding_digest": binding_digest,
+            "payload_digest": payload_digest,
+            "html": html,
+            "text": text,
+            "unsubscribe_url": unsubscribe_url(&view),
+        }))
+    }
+
     /// Final-send preparation always refuses in this ticket: no
     /// verified sender binding exists yet. A named saved binding only
     /// proves the operator typed sender bytes — never a host-custodied

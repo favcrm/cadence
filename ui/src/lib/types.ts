@@ -1400,6 +1400,19 @@ export interface Connection {
   revision: number | null;
   registration_digest: string | null;
   scopes: string[];
+  /**
+   * Non-secret SMTP sender projection (CAD-785): transport and
+   * verified sender from host custody. Absent for other providers —
+   * and never carrying the secret on any provider.
+   */
+  smtp?: {
+    host: string;
+    port: number;
+    tls_mode: string;
+    username: string;
+    sender: string;
+    sender_name: string;
+  } | null;
   status: {
     adapter_registered: boolean;
     descriptor_available: boolean;

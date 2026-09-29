@@ -679,6 +679,11 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("connection_create", Rule::Handler("rpc_connection")),
     ("connection_rotate", Rule::Handler("rpc_connection")),
     ("connection_revoke", Rule::Handler("rpc_connection")),
+    ("crm_smtp_bind", Rule::Handler("rpc_crm_smtp")),
+    ("crm_smtp_rebind", Rule::Handler("rpc_crm_smtp")),
+    ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
+    ("crm_smtp_show", Rule::Handler("rpc_crm_smtp")),
+    ("crm_smtp_test_send", Rule::Handler("rpc_crm_smtp")),
     ("platform_accounts", Rule::Read),
     ("platform_defaults", Rule::Read),
     (

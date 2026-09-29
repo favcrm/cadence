@@ -173,16 +173,23 @@ impl Shared {
         let enrollment: Enrollment = match optional_str(params, "shape").unwrap_or("token") {
             "token" => platform::enroll_token(params, &declared)?,
             "consent" => platform::enroll_consent(&platform, &account, &declared, params)?,
+            // CAD-785: the typed SMTP sender enrolls only through
+            // the provider-neutral connection path — the legacy
+            // platform verbs have no typed transport grammar and
+            // must not mint sender custody.
+            "smtp" if allowed_scopes.is_some() => {
+                platform::enroll_smtp(params, &declared)?
+            }
             other => {
                 return Err(Error::rejected(format!(
-                    "unknown exchange shape '{other}' — 'token' or 'consent'"
+                    "unknown exchange shape '{other}' — 'token', 'consent', or 'smtp' via connection management"
                 )))
             }
         };
         platform::refuse_leak(
             "platform enrollment metadata",
             &json!({"platform":platform,"account":account,"scopes":enrollment.scopes}).to_string(),
-            &enrollment.bytes,
+            enrollment.screen_bytes(),
         )?;
         let fingerprint = crate::secret::fingerprint(&enrollment.bytes);
         let record = CredentialRecord {
@@ -202,7 +209,7 @@ impl Shared {
                 .unwrap_or(1),
             platform,
             account,
-            scopes: enrollment.scopes,
+            scopes: enrollment.scopes.clone(),
             fingerprint,
             custody: self.platform_custody.tag().to_string(),
             exchange: enrollment.exchange.to_string(),
@@ -212,14 +219,14 @@ impl Shared {
         platform::refuse_leak(
             "platform credential metadata",
             &record.to_json().to_string(),
-            &enrollment.bytes,
+            enrollment.screen_bytes(),
         )?;
-        platform::refuse_leak("platform credential audit",&json!({"record":record.to_json(),"old":existing.as_ref().map(CredentialRecord::to_json),"rotated":rotate,"custody_risk_accepted":risk,"response":{"state":"enrolled","account":record.to_json()},"event_kinds":["platform_connected","credential_revoked","platform_disconnected"],"stream":"audit:platforms"}).to_string(),&enrollment.bytes)?;
+        platform::refuse_leak("platform credential audit",&json!({"record":record.to_json(),"old":existing.as_ref().map(CredentialRecord::to_json),"rotated":rotate,"custody_risk_accepted":risk,"response":{"state":"enrolled","account":record.to_json()},"event_kinds":["platform_connected","credential_revoked","platform_disconnected"],"stream":"audit:platforms"}).to_string(),enrollment.screen_bytes())?;
         if let Some(project) = metadata_projection {
             platform::refuse_leak(
                 "connection metadata",
                 &project(&record)?.to_string(),
-                &enrollment.bytes,
+                enrollment.screen_bytes(),
             )?;
         }
         let key = custody::Key {
@@ -259,7 +266,7 @@ impl Shared {
         platform::refuse_leak(
             "platform enroll result",
             &result.to_string(),
-            &enrollment.bytes,
+            enrollment.screen_bytes(),
         )?;
         Ok(json!({"state": "enrolled", "account": result}))
     }

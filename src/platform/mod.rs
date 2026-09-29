@@ -14,6 +14,7 @@ pub mod connections;
 pub mod custody;
 pub mod deployments;
 pub mod local;
+pub mod smtp;
 
 pub use adapter::{AppArtifactError, PlatformAdapter};
 
@@ -124,6 +125,20 @@ pub struct Enrollment {
     pub scopes: Vec<String>,
     /// `token` or `consent` — the exchange shape that produced it.
     pub exchange: &'static str,
+    /// The exact bytes the leak screens hold outputs against.
+    /// Opaque exchanges screen the whole credential; structured
+    /// custody (CAD-785 SMTP) screens only the password — the
+    /// transport fields and sender are legitimately projected into
+    /// operator metadata, so screening the whole document would trip
+    /// on shared JSON framing instead of real leaks.
+    pub screen: Option<Vec<u8>>,
+}
+
+impl Enrollment {
+    /// Bytes the `refuse_leak` screens must hold outputs against.
+    pub fn screen_bytes(&self) -> &[u8] {
+        self.screen.as_deref().unwrap_or(&self.bytes)
+    }
 }
 
 // ---------- enrollment ----------
@@ -155,6 +170,32 @@ pub fn enroll_token(params: &Value, declared: &[String]) -> Result<Enrollment> {
         bytes: token.as_bytes().to_vec(),
         scopes: declared.to_vec(),
         exchange: "token",
+        screen: None,
+    })
+}
+
+/// CAD-785, exchange shape `smtp` — the operator-typed SMTP sender:
+/// host, port, TLS mode, username, secret and verified sender
+/// identity. The transport fields and sender ride custody bytes
+/// with the secret (never App SQLite, never an opaque token); the
+/// record keeps the fingerprint and the `smtp` exchange name. The
+/// declared scopes must be exactly the reviewed `email:send` scope.
+pub fn enroll_smtp(params: &Value, declared: &[String]) -> Result<Enrollment> {
+    // `declared` arrives validated by the custody path — inherited
+    // from the live record on rotate — so only the reviewed scope
+    // set enrolls, on either verb.
+    if declared != [smtp::SCOPE_EMAIL_SEND] {
+        return Err(Error::rejected(
+            "SMTP enrollment carries exactly the reviewed email:send scope",
+        ));
+    }
+    let enrollment = smtp::parse_enrollment(params)?;
+    let bytes = smtp::custody_bytes(&enrollment)?;
+    Ok(Enrollment {
+        screen: Some(enrollment.secret.clone()),
+        bytes,
+        scopes: declared.to_vec(),
+        exchange: "smtp",
     })
 }
 
@@ -238,6 +279,7 @@ pub fn enroll_consent(
         bytes: outcome.credential,
         scopes,
         exchange: "consent",
+        screen: None,
     })
 }
 

@@ -46,6 +46,7 @@ mod app_release;
 mod app_runs;
 mod apps;
 mod connections;
+mod crm_smtp;
 pub mod delivery_sync;
 mod home;
 mod lane;
@@ -2382,6 +2383,18 @@ fn write_route(
             return;
         }
         let response = connections::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
+    // CAD-785: every CRM SMTP route is operator-proof POST-only —
+    // there is no read section, so even `show` requires the full
+    // operator session, exactly like the daemon RPC it relays.
+    if let Some(route) = crm_smtp::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = crm_smtp::handle(&mut request, state_dir, route);
         send(request, response);
         return;
     }

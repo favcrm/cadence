@@ -31,6 +31,7 @@ mod area_rpc;
 mod caller_rule;
 mod checkup;
 mod connections_rpc;
+mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
@@ -455,6 +456,13 @@ pub struct Shared {
     /// `platform_outbox` lists. Set by `platform::local::register`
     /// alongside the adapter so the read serves what the write lands.
     outbox_dir: Option<PathBuf>,
+    /// CAD-785: extra TLS trust anchors (DER/PEM bytes) for the
+    /// isolated synthetic SMTP rig only. Set verbatim by in-process
+    /// fixtures; production leaves it unset and verifies against the
+    /// platform roots alone. Never sourced from RPC, PM or env — it
+    /// is operator test configuration, not a caller-controlled
+    /// bypass: certificate verification still runs on every send.
+    smtp_test_ca: Option<Vec<u8>>,
     /// CAD-538: the hosted lease this daemon holds when `hosted.lease`
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
@@ -632,6 +640,7 @@ impl Shared {
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
+            smtp_test_ca: opts.smtp_test_ca_pem.clone(),
             lease,
             lease_heartbeat_stop: AtomicBool::new(false),
             seam,
@@ -2921,6 +2930,11 @@ impl Shared {
             "connection_create" => self.rpc_connection(method, params, peer_pid),
             "connection_rotate" => self.rpc_connection(method, params, peer_pid),
             "connection_revoke" => self.rpc_connection(method, params, peer_pid),
+            "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
+            "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
+            "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
+            "crm_smtp_show" => self.rpc_crm_smtp(method, params, peer_pid),
+            "crm_smtp_test_send" => self.rpc_crm_smtp(method, params, peer_pid),
             "platform_enroll" => self.rpc_platform_enroll(params, peer_pid),
             "platform_rotate" => self.rpc_platform_rotate(params, peer_pid),
             "platform_revoke" => self.rpc_platform_revoke(params, peer_pid),
@@ -4038,6 +4052,12 @@ pub struct ServeOptions {
     /// with the adapter; a daemon without the `local` platform leaves
     /// it `None` and the read refuses.
     pub outbox_dir: Option<PathBuf>,
+    /// CAD-785: extra TLS trust anchors for the isolated synthetic
+    /// SMTP rig (PEM bytes of the test CA). In-process fixtures set
+    /// this verbatim; production leaves it `None` and verifies SMTP
+    /// certificates against the platform roots alone. Never read
+    /// from RPC, PM or the environment.
+    pub smtp_test_ca_pem: Option<Vec<u8>>,
     /// CAD-538: the hosted lifecycle — `Some` is verbatim (a `Hosted`
     /// with `lease` unset is explicitly off, which is how tests pin
     /// it); `None` reads the tracker's `hosted:` table in pm.yaml.
@@ -4076,6 +4096,12 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // daemon — no network, no credential; its `publish` send still
     // stages and presses like every other adapter's.
     crate::platform::local::register(state_dir, &mut opts);
+    // CAD-785: the SMTP sender provider rides the production daemon
+    // like `local` — the adapter holds no credential and opens no
+    // socket. Enrollment is the operator's explicit act; a daemon
+    // without one fails every SMTP send closed. In-process fixture
+    // daemons stay hermetic and register it only when the test asks.
+    crate::platform::smtp::attach(&mut opts);
     serve_with(state_dir, opts)
 }
 

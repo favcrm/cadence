@@ -65,9 +65,53 @@ export function connectionCapabilities(
   return found ? capabilityWords(found) : null;
 }
 
-/** Can this provider enroll a token — the only shape the wizard offers. */
+/** Can this provider enroll a token — one shape the wizard offers. */
 export function acceptsToken(provider: ConnectionProvider): boolean {
   return (provider.descriptor?.enrollment_shapes ?? []).includes("token");
+}
+
+/** Can this provider enroll a typed SMTP sender (CAD-785). */
+export function acceptsSmtp(provider: ConnectionProvider): boolean {
+  return (provider.descriptor?.enrollment_shapes ?? []).includes("smtp");
+}
+
+/** The wizard's enrollment shapes for one provider, in stable order. */
+export function enrollmentShapes(provider: ConnectionProvider): string[] {
+  const shapes = provider.descriptor?.enrollment_shapes ?? [];
+  return shapes.filter((s) => s === "token" || s === "smtp");
+}
+
+/** One enrolled SMTP sender in plain words — transport and verified sender, never the secret. */
+export function smtpSummary(row: Connection): string | null {
+  const smtp = row.smtp ?? null;
+  if (!smtp) return null;
+  const mode = smtp.tls_mode === "implicit" ? "implicit TLS" : "STARTTLS";
+  const name = smtp.sender_name ? `"${smtp.sender_name}" ` : "";
+  return `${smtp.host}:${smtp.port} · ${mode} · ${name}<${smtp.sender}> · login ${smtp.username}`;
+}
+
+/**
+ * Mirrors the daemon's `validate_port_tls` (src/platform/smtp.rs):
+ * a public host submits on exactly (465, implicit) or (587, starttls);
+ * the isolated-test host `localhost` may bind any port — the rig uses
+ * ephemeral loopback ports — but the TLS mode stays mandatory either
+ * way. There is no plaintext mode on any host or port.
+ */
+export function smtpPortTlsError(host: string, port: string, tlsMode: string): string | null {
+  if (tlsMode !== "implicit" && tlsMode !== "starttls") {
+    return "SMTP submission requires implicit TLS or mandatory STARTTLS.";
+  }
+  if (!/^\d+$/.test(port)) {
+    return "SMTP port is a number between 1 and 65535.";
+  }
+  const n = Number(port);
+  if (n < 1 || n > 65535) {
+    return "SMTP port is a number between 1 and 65535.";
+  }
+  const normalized = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (normalized === "localhost") return null;
+  if ((n === 465 && tlsMode === "implicit") || (n === 587 && tlsMode === "starttls")) return null;
+  return "Port 465 pairs with implicit TLS; port 587 pairs with STARTTLS.";
 }
 
 /** The wizard's scope hint: the union of the reviewed capability scopes. */

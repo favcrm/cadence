@@ -7,14 +7,18 @@ import Button from "../../ui/Button";
 import { ResourceGate } from "../../ui/ResourceStatus";
 import { IconRefresh } from "../../ui/icons";
 import {
+  acceptsSmtp,
   acceptsToken,
   canManage,
   capabilityWords,
   connectionCapabilities,
+  enrollmentShapes,
   isAvailable,
   pinWord,
   readinessText,
   scopeHint,
+  smtpPortTlsError,
+  smtpSummary,
 } from "./connectionsView";
 import { connectionLabel } from "../../lib/connections";
 
@@ -191,7 +195,7 @@ export default function Connections({
                             ? "no reviewed descriptor — unavailable"
                             : (capabilityWords(p) ?? "no reviewed capabilities")}
                           {p.descriptor_available &&
-                            ` · ${acceptsToken(p) ? "token enrollment" : "no enrollment"}`}
+                            ` · ${enrollmentText(p)}`}
                         </span>
                         <span className="block text-micro text-ink-500 mt-0.5 break-words">
                           {pinWord({ manifest_status: p.manifest_status })} ·{" "}
@@ -284,6 +288,12 @@ function ConnectionDetail({
             <dd className="num text-ink-200 break-words">{row.scopes.join(", ")}</dd>
           </div>
         )}
+        {smtpSummary(row) && (
+          <div className="flex flex-wrap gap-x-2 min-w-0">
+            <dt className="text-ink-500">Sender</dt>
+            <dd className="text-ink-200 break-words">{smtpSummary(row)}</dd>
+          </div>
+        )}
         {capabilities && (
           <div className="flex flex-wrap gap-x-2 min-w-0">
             <dt className="text-ink-500">Capabilities</dt>
@@ -352,6 +362,15 @@ function ConnectionDetail({
   );
 }
 
+/** Plain words for one provider's reviewed enrollment shapes. */
+function enrollmentText(p: ConnectionProvider): string {
+  const shapes = enrollmentShapes(p);
+  if (shapes.length === 0) return "no enrollment";
+  return shapes
+    .map((s) => (s === "smtp" ? "SMTP sender enrollment" : "token enrollment"))
+    .join(" + ");
+}
+
 /** Replace an enrolled credential. The token clears the moment the request settles. */
 function RotateForm({
   row,
@@ -368,17 +387,40 @@ function RotateForm({
   const [scopes, setScopes] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // SMTP senders rotate the password under the same identity; blank
+  // transport fields inherit the live custody values.
+  const isSmtp = (row.smtp ?? null) !== null;
+  const [smtp, setSmtp] = useState({ host: "", port: "", tls_mode: "", username: "", sender: "", sender_name: "" });
 
   const submit = () => {
-    if (busy || token.trim() === "") return;
+    if (busy) return;
+    const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    const base = wanted.length > 0 ? { scopes: wanted } : {};
+    if (isSmtp && smtp.port.trim() !== "" && !/^\d+$/.test(smtp.port.trim())) {
+      setError("The SMTP port is digits only — 465 for implicit TLS, 587 for STARTTLS.");
+      return;
+    }
+    const body = isSmtp
+      ? {
+          ...base,
+          secret: token.trim(),
+          ...(smtp.host.trim() ? { host: smtp.host.trim() } : {}),
+          ...(smtp.port.trim() ? { port: Number(smtp.port.trim()) } : {}),
+          ...(smtp.tls_mode ? { tls_mode: smtp.tls_mode } : {}),
+          ...(smtp.username.trim() ? { username: smtp.username.trim() } : {}),
+          ...(smtp.sender.trim() ? { sender: smtp.sender.trim() } : {}),
+          ...(smtp.sender_name.trim() ? { sender_name: smtp.sender_name.trim() } : {}),
+        }
+      : { ...base, token: token.trim() };
+    if (!isSmtp && token.trim() === "") return;
+    if (isSmtp && token.trim() === "") {
+      setError("Enter the fresh SMTP password — rotation always replaces it.");
+      return;
+    }
     setBusy(true);
     setError(null);
-    const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     api
-      .connectionRotate(row.id, {
-        token: token.trim(),
-        ...(wanted.length > 0 ? { scopes: wanted } : {}),
-      })
+      .connectionRotate(row.id, body)
       .then(() => {
         onDone();
         onClose();
@@ -404,10 +446,14 @@ function RotateForm({
       <p className="text-label text-ink-300 break-words">
         Replace the credential. The connection keeps its identity and moves to a new revision;
         re-enrolling the same account later creates a new connection instead.
+        {isSmtp && (
+          <> Rotating an SMTP sender invalidates its installation bindings until the
+          operator rebinds them.</>
+        )}
       </p>
       <div>
         <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-          New token
+          {isSmtp ? "New SMTP password" : "New token"}
         </label>
         <input
           id={tokenId}
@@ -420,6 +466,31 @@ function RotateForm({
           disabled={busy}
         />
       </div>
+      {isSmtp && row.smtp && (
+        <fieldset className="space-y-2">
+          <legend className="text-label font-medium text-ink-200">
+            Sender fields <span className="text-ink-500 font-normal">(optional — blank inherits the live values)</span>
+          </legend>
+          {["host", "port", "tls_mode", "username", "sender", "sender_name"].map((field) => (
+            <div key={field}>
+              <label htmlFor={`${scopesId}-${field}`} className="text-label text-ink-300">
+                {field}
+              </label>
+              <input
+                id={`${scopesId}-${field}`}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={smtp[field as keyof typeof smtp]}
+                onChange={(e) => setSmtp((cur) => ({ ...cur, [field]: e.target.value }))}
+                placeholder={String(row.smtp?.[field as keyof typeof row.smtp] ?? "")}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+            </div>
+          ))}
+        </fieldset>
+      )}
       <div>
         <label htmlFor={scopesId} className="text-label font-medium text-ink-200">
           Scopes <span className="text-ink-500 font-normal">(optional — blank keeps the current scopes)</span>
@@ -531,7 +602,9 @@ function AddConnection({
   const accountId = useId();
   const scopesId = useId();
   const tokenId = useId();
-  const candidates = providers.filter((p) => p.descriptor_available && acceptsToken(p));
+  const candidates = providers.filter(
+    (p) => p.descriptor_available && (acceptsToken(p) || acceptsSmtp(p)),
+  );
   // The providers load behind the resource: the selection follows the
   // first candidate until the operator picks one explicitly.
   const [explicit, setExplicit] = useState<string | null>(null);
@@ -544,12 +617,62 @@ function AddConnection({
   const [error, setError] = useState<string | null>(null);
   const chosen = providers.find((p) => p.provider === provider) ?? null;
   const hint = chosen ? scopeHint(chosen) : [];
+  // SMTP senders enroll typed transport material instead of an
+  // opaque token; the shape follows the chosen provider.
+  const smtpShape = (chosen && acceptsSmtp(chosen) && !acceptsToken(chosen)) || false;
+  const [smtp, setSmtp] = useState({ host: "", port: "465", tls_mode: "implicit", username: "", sender: "", sender_name: "" });
 
   const submit = () => {
     if (busy) return;
     const cleanedAccount = account.trim();
     const wanted = scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-    if (!provider || cleanedAccount === "" || wanted.length === 0 || token.trim() === "") {
+    if (!provider || cleanedAccount === "" || wanted.length === 0) {
+      setError("Choose a provider and fill in the account and at least one scope.");
+      return;
+    }
+    if (smtpShape) {
+      const port = smtp.port.trim();
+      if (
+        smtp.host.trim() === "" || port === "" || !/^\d+$/.test(port) ||
+        smtp.username.trim() === "" || token.trim() === "" || smtp.sender.trim() === ""
+      ) {
+        setError("Fill in the host, port, login, password and verified sender for the SMTP sender.");
+        return;
+      }
+      const portTlsError = smtpPortTlsError(smtp.host.trim(), port, smtp.tls_mode);
+      if (portTlsError) {
+        setError(portTlsError);
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      api
+        .connectionCreate({
+          provider,
+          account: cleanedAccount,
+          shape: "smtp",
+          host: smtp.host.trim(),
+          port: Number(port),
+          tls_mode: smtp.tls_mode,
+          username: smtp.username.trim(),
+          secret: token.trim(),
+          sender: smtp.sender.trim(),
+          ...(smtp.sender_name.trim() ? { sender_name: smtp.sender_name.trim() } : {}),
+          scopes: wanted,
+          ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
+        })
+        .then((out) => onAdded(out.connection.id))
+        .catch((e: ApiError) => setError(e.message ?? String(e)))
+        .finally(() => {
+          // The password crossed this one request into daemon
+          // custody. It must not survive in the form, whatever the
+          // outcome.
+          setToken("");
+          setBusy(false);
+        });
+      return;
+    }
+    if (token.trim() === "") {
       setError("Choose a provider and fill in the account, at least one scope and the token.");
       return;
     }
@@ -579,7 +702,7 @@ function AddConnection({
       <h2 className="text-cardtitle font-medium text-ink-100">Add connection</h2>
       {candidates.length === 0 ? (
         <p className="text-label text-ink-400 mt-2 break-words">
-          No provider currently offers token enrollment. {existing.length > 0 && (
+          No provider currently offers enrollment. {existing.length > 0 && (
             <>Existing connections are listed below.</>
           )}
         </p>
@@ -654,25 +777,95 @@ function AddConnection({
               </p>
             )}
           </div>
-          <div>
-            <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
-              Token
-            </label>
-            <input
-              id={tokenId}
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              className="field w-full mt-1"
-              disabled={busy}
-            />
-            <p className="text-micro text-ink-500 mt-1 break-words">
-              The token travels inside this one request to daemon custody and is cleared from
-              this form afterwards. Never paste a credential anywhere else on this board.
-            </p>
-          </div>
+          {smtpShape ? (
+            <fieldset className="space-y-2">
+              <legend className="text-label font-medium text-ink-200">
+                SMTP sender — authenticated encrypted submission only
+              </legend>
+              <p className="text-micro text-ink-500 break-words">
+                Port 465 with implicit TLS, or port 587 with mandatory STARTTLS. The
+                daemon verifies the certificate and refuses plaintext, downgrades and
+                unverifiable hosts before sending.
+              </p>
+              {["host", "port", "username", "sender", "sender_name"].map((field) => (
+                <div key={field}>
+                  <label htmlFor={`${tokenId}-${field}`} className="text-label text-ink-300">
+                    {field === "sender" ? "verified sender address" : field === "sender_name" ? "sender name (optional)" : field}
+                  </label>
+                  <input
+                    id={`${tokenId}-${field}`}
+                    type="text"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={smtp[field as keyof typeof smtp]}
+                    onChange={(e) => setSmtp((cur) => ({ ...cur, [field]: e.target.value }))}
+                    placeholder={field === "host" ? "mail.example.com" : field === "sender" ? "news@example.com" : ""}
+                    className="field w-full mt-1"
+                    disabled={busy}
+                  />
+                </div>
+              ))}
+              <div>
+                <label htmlFor={`${tokenId}-tls`} className="text-label text-ink-300">
+                  TLS mode
+                </label>
+                <select
+                  id={`${tokenId}-tls`}
+                  value={smtp.tls_mode}
+                  onChange={(e) => setSmtp((cur) => ({
+                    ...cur,
+                    tls_mode: e.target.value,
+                    port: e.target.value === "implicit" ? "465" : "587",
+                  }))}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                >
+                  <option value="implicit">implicit TLS (port 465)</option>
+                  <option value="starttls">STARTTLS (port 587)</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
+                  SMTP password
+                </label>
+                <input
+                  id={tokenId}
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                  className="field w-full mt-1"
+                  disabled={busy}
+                />
+                <p className="text-micro text-ink-500 mt-1 break-words">
+                  The password travels inside this one request to daemon custody and is
+                  cleared from this form afterwards. Never paste a credential anywhere else
+                  on this board.
+                </p>
+              </div>
+            </fieldset>
+          ) : (
+            <div>
+              <label htmlFor={tokenId} className="text-label font-medium text-ink-200">
+                Token
+              </label>
+              <input
+                id={tokenId}
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                className="field w-full mt-1"
+                disabled={busy}
+              />
+              <p className="text-micro text-ink-500 mt-1 break-words">
+                The token travels inside this one request to daemon custody and is cleared from
+                this form afterwards. Never paste a credential anywhere else on this board.
+              </p>
+            </div>
+          )}
           <details className="text-label">
             <summary className="cursor-pointer select-none text-ink-400">
               Advanced: custody risk acceptance
