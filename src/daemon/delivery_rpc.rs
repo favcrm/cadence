@@ -603,6 +603,10 @@ impl Shared {
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
         let before = rec.state;
+        // CAD-776: readiness before this observation — the wake fires
+        // on the transition into merge-ready, never on merely being
+        // there.
+        let was_ready = rec.merge_ready();
         let mut moved = rec.head.as_deref() != Some(head.as_str());
         // CAD-564: an observation whose read began before the record's
         // last head change (the done report's `head_at`) saw the head
@@ -645,6 +649,11 @@ impl Shared {
         let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
         rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
+        // CAD-776: count the transition into merge-ready here, under
+        // `delivery_lock`, so the epoch persists atomically with the
+        // observation that caused it — every later wake attempt reads
+        // the same saved key.
+        rec.advance_ready_epoch(was_ready);
         let mut out = json!({
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
@@ -677,6 +686,14 @@ impl Shared {
             self.wake_on_delivery_end(&rec, wake_guard);
         } else {
             drop(wake_guard);
+        }
+        // CAD-776: the observation made the delivery merge-ready — one
+        // durable hint to the master per readiness streak. A loop that
+        // just ended is terminal, never merge-ready, so the two wakes
+        // cannot fire together. The key comes from the saved record
+        // alone, so concurrent observers converge on it.
+        if let Some(ready) = all.get(id).filter(|r| r.merge_ready()) {
+            self.wake_on_merge_ready(ready);
         }
         self.post_notices(&pm, notices);
         if rec_state_changed(&out, was_disable) {
