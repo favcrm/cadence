@@ -4286,11 +4286,13 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
 /// operator dir next to the pin.
 const DEVICE_PIN_LOCK: &str = "device-login.lock";
 
-/// Try to take [`DEVICE_PIN_LOCK`]. Retries up to 5 s so a restart's
-/// old-board/new-child handoff (`ui tailscale start`, `ui start`
-/// after `ui stop`) does not race the exiting holder. `Ok(Some)` —
+/// Try to take [`DEVICE_PIN_LOCK`]. `wait` retries up to 5 s so a
+/// restart's old-board/new-child handoff (`ui tailscale start`,
+/// `ui start` after `ui stop`) does not race the exiting holder;
+/// `!wait` is a single non-blocking attempt — an unconfigured board
+/// never stalls on a lock it does not need (review r6). `Ok(Some)` —
 /// this board owns the pin; `Ok(None)` — another live board does.
-fn device_pin_lock(state_dir: &Path) -> Result<Option<std::fs::File>> {
+fn device_pin_lock(state_dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let dir = crate::operator_auth::checked_dir(state_dir)?;
@@ -4310,7 +4312,7 @@ fn device_pin_lock(state_dir: &Path) -> Result<Option<std::fs::File>> {
         if error.kind() != std::io::ErrorKind::WouldBlock {
             return Err(Error::internal(format!("device pin lock: {error}")));
         }
-        if Instant::now() >= deadline {
+        if !wait || Instant::now() >= deadline {
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -4325,7 +4327,10 @@ fn device_pin_lock(state_dir: &Path) -> Result<Option<std::fs::File>> {
 /// but never clears the pin (two unconfigured boards on one state
 /// dir keeps working as before).
 fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs::File>> {
-    let lock = device_pin_lock(state_dir)?;
+    // Only a board that would WRITE the pin waits out the handoff —
+    // a board with no device login takes one non-blocking look: on
+    // success it clears a stale pin, and either way it serves at once.
+    let lock = device_pin_lock(state_dir, opts.device_login.is_some())?;
     if let Some(login) = opts
         .device_login
         .as_ref()

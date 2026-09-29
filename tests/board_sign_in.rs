@@ -1489,6 +1489,16 @@ mod device {
         assert_eq!(code, 200, "live routes untouched by the refused reset");
         std::fs::remove_file(state.path().join("ui.pid")).unwrap();
         drop(board);
+        // BoardStop only signals — wait for the serve thread (and its
+        // device pin lock) to be gone before the restart probes it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped board's port never closed"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
 
         // Restarted without the pair: pin gone, routes dead.
         let (port2, _board2) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
