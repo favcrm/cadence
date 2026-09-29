@@ -504,6 +504,10 @@ pub enum IssueAction {
         /// Limit the pass to one project (all projects when omitted).
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
+        /// Emit the verdicts as JSON (the verb already prints JSON — the
+        /// flag is accepted for consistency with `issue ls --json`).
+        #[arg(long)]
+        json: bool,
         /// Seconds a `backlog`/`ready` leaf may sit before the pass
         /// judges it — inside the window the ticket is its own evidence
         /// [default: 1209600 (14d)].
@@ -1769,6 +1773,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         IssueAction::Groom {
             dry_run,
             project,
+            json: _,
             grace,
         } => {
             let pm = open_pm()?;

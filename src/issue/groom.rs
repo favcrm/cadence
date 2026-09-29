@@ -415,9 +415,6 @@ fn groom_with_hooks(
         })
         .map(|v| v.issue.front.id.clone())
         .collect();
-    // The git-history clock for `superseded` close-times — cached per
-    // tracker HEAD; absent history it is simply not counted.
-    let times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
     after_advisory_snapshot();
 
     let mut flagged: Vec<Value> = Vec::new();
@@ -437,6 +434,11 @@ fn groom_with_hooks(
             continue; // dropped or renamed between snapshot and lock
         };
         after_locked_snapshot();
+        // The close-time clock rides the same locked snapshot as the
+        // sibling set: a `done` committed during the race must appear in
+        // `live` AND have a `status_at` time, or `superseded` would be
+        // judged against a close the clock cannot yet date.
+        let times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
         let front = &v.issue.front;
         // Recheck under the lock: a competing writer can move it off
         // backlog/ready, mark it intake, or make it a container after the
@@ -786,9 +788,10 @@ mod tests {
         assert!(front.tags.iter().any(|t| t == TRIAGE_TAG));
     }
 
-    /// The sibling evidence is re-derived under the lock: a sibling that
-    /// closes between the advisory snapshot and the locked re-judge is
-    /// counted, not missed by a stale view.
+    /// The sibling evidence AND its close-time clock are re-derived
+    /// under the lock: a sibling committed `done` between the advisory
+    /// snapshot and the locked re-judge is seen *and* dated, so `a` is
+    /// judged `superseded` — not missed by a stale view or a stale clock.
     #[test]
     fn sibling_close_racing_snapshot_is_recognised_under_lock() {
         let (tmp, pm) = tracker();
@@ -796,10 +799,13 @@ mod tests {
         let b = mk(&pm, tmp.path(), "b");
         dormant(&pm, &a, &["shared.rs"]);
         edit(&pm, &b, |f| f.paths = vec!["shared.rs".to_string()]);
-        // The sibling `b` is still open at the advisory snapshot; the
-        // writer closes it before `a`'s locked re-judge. With only the
-        // advisory sibling set, `a` would miss the superseded signal and
-        // commit an outdated verdict.
+        // Commit the tracker so `LineTimes` has history to read, then
+        // `b` is still open at the advisory snapshot. The writer closes
+        // `b` (a real commit, so status_at can date it) before `a`'s
+        // locked re-judge.
+        let (_p, pmdir) = issue_dir(&pm, &a).unwrap();
+        let _ =
+            crate::issue::write::commit(&pm, &[pmdir.join("issue.md")], "seed", &[a.as_str()], "t");
         let out = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();
             let writer_pm = &pm;
@@ -808,6 +814,19 @@ mod tests {
                 rx.recv().unwrap();
                 let _w = writer_pm.lock().unwrap();
                 edit(writer_pm, &writer_id, |f| f.status = "done".to_string());
+                // Commit the close so LineTimes records a close time.
+                let (_p, bdir) = issue_dir(writer_pm, &writer_id).unwrap();
+                let (f, body) = load_front(&bdir).unwrap();
+                let prev = f.clone();
+                crate::issue::write::commit(
+                    writer_pm,
+                    &[bdir.join("issue.md")],
+                    "close b",
+                    &[writer_id.as_str()],
+                    "t",
+                )
+                .unwrap();
+                let _ = (prev, body);
             });
             groom_with_hooks(
                 &pm,
@@ -823,18 +842,17 @@ mod tests {
             )
             .unwrap()
         });
-        // `a` is judged against the locked sibling view: `b` now shows
-        // `done`, and `a`'s verdict reflects it (superseded — the LineTimes
-        // clock is absent on a file-only fixture, so the stronger signal
-        // the locked reload proves is that `a` is still correctly judged
-        // rather than misjudged on a stale sibling set).
-        assert!(
-            out["verdicts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["id"].as_str() == Some(a.as_str())),
-            "{out}"
+        let verdict = out["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_str() == Some(a.as_str()))
+            .cloned()
+            .unwrap_or(json!(null));
+        assert_eq!(
+            verdict["verdict"].as_str(),
+            Some("superseded"),
+            "sibling closed under lock must drive superseded: {out}"
         );
     }
 
