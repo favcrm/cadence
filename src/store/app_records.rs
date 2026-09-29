@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS app_record_revisions(
  PRIMARY KEY(context_id, record_id, revision));
 CREATE TABLE IF NOT EXISTS app_record_csv_imports(
  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
- preview_token TEXT NOT NULL, result TEXT NOT NULL, at REAL NOT NULL);
+ preview_token TEXT NOT NULL, result TEXT NOT NULL,
+ state TEXT NOT NULL, at REAL NOT NULL);
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -167,13 +168,27 @@ impl RecordStore {
             // CAD-779 CSV import receipts: a table added after FILE_SCHEMA
             // 1 files already exist. The version stays 1 — backup manifests
             // bind it per file — and this idempotent create migrates older
-            // files forward without touching their rows.
+            // files forward without touching their rows. The pending/completed
+            // state arrived later still: files whose receipts predate it keep
+            // working, with every pre-existing row treated as completed —
+            // only the current binary ever wrote those rows, and it wrote
+            // final receipts exclusively.
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS app_record_csv_imports(\
                  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,\
-                 preview_token TEXT NOT NULL, result TEXT NOT NULL, at REAL NOT NULL)",
+                 preview_token TEXT NOT NULL, result TEXT NOT NULL,\
+                 state TEXT NOT NULL, at REAL NOT NULL)",
             )
             .map_err(|e| Error::internal(e.to_string()))?;
+            let needs_state = conn
+                .prepare("SELECT state FROM app_record_csv_imports LIMIT 0")
+                .is_err();
+            if needs_state {
+                conn.execute_batch(
+                    "ALTER TABLE app_record_csv_imports ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'",
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            }
         }
         Ok(Self {
             install_id: install_id.to_string(),
@@ -663,11 +678,17 @@ impl CustomerProfile {
 ///
 /// Preview parses bounded CSV text into per-row create/update/skip
 /// decisions without mutating anything; the returned preview token
-/// binds the exact bytes. Import replays the same plan, applies
-/// each row in its own expected-revision transaction, and stores
-/// the per-row receipt under an operator request id so retries are
-/// idempotent. Consent is never inferred: absent consent cells
-/// arrive as unknown. Row refusals name a code, never the cell.
+/// binds the exact bytes. Import reserves the operator request id as
+/// a pending receipt before any row mutates, applies each row in its
+/// own expected-revision transaction, then completes the receipt with
+/// the per-row outcome — so a receipt failure can never leave rows
+/// behind, and retries replay the stored receipt. A pending receipt
+/// means a sibling is applying: same bytes wait for completion via
+/// retry, different bytes refuse at once. Recovery after a stuck
+/// pending row is a fresh request id, whose re-plan converges on
+/// skips for already-applied rows. Consent is never inferred: absent
+/// consent cells arrive as unknown. Row refusals name a code, never
+/// the cell.
 pub const CSV_TEXT_BYTES: usize = 256 * 1024;
 pub const CSV_ROWS_MAX: usize = 500;
 const CSV_COLUMNS: &[&str] = &[
@@ -890,14 +911,39 @@ impl RecordStore {
     fn import_receipt_in(
         conn: &Connection,
         request_id: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<(String, String, String, String)>> {
         conn.query_row(
-            "SELECT context_id,preview_token,result FROM app_record_csv_imports WHERE request_id=?",
+            "SELECT context_id,preview_token,result,state FROM app_record_csv_imports WHERE request_id=?",
             [request_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    /// Settle a request id against its stored receipt: a completed
+    /// receipt with matching bytes replays verbatim; a pending row
+    /// with matching bytes means a sibling is applying now, so refuse
+    /// and let the caller retry into the completed receipt — rows are
+    /// never applied twice under one id. Any id reuse behind different
+    /// bytes refuses before a single row mutates.
+    fn replay_or_refuse(
+        stored: (String, String, String, String),
+        context: &str,
+        preview_token: &str,
+    ) -> Result<Value> {
+        if stored.0 == context && stored.1 == preview_token {
+            if stored.3.as_str() == "complete" {
+                let mut result: Value = serde_json::from_str(&stored.2)
+                    .map_err(|_| Error::rejected("customer CSV receipt is unavailable"))?;
+                result["replayed"] = Value::Bool(true);
+                return Ok(result);
+            }
+            return Err(Error::rejected(
+                "customer CSV import is already in progress",
+            ));
+        }
+        Err(Error::rejected("customer CSV request id is already used"))
     }
 
     /// Parse bounded CSV text into a bound preview token plus one
@@ -1226,11 +1272,14 @@ impl RecordStore {
     }
 
     /// Explicit import of a previewed CSV. The token must bind these
-    /// exact bytes; `request_id` makes retries idempotent — a repeat
-    /// returns the stored receipt, a reused id behind different bytes
-    /// refuses. Each row commits in its own transaction, so malformed
-    /// rows and stale writes can never lose an existing record; the
-    /// per-row receipt persists as the recoverable record.
+    /// exact bytes; `request_id` is reserved as a pending receipt before
+    /// any row mutates. A repeat with the same bytes replays the stored
+    /// receipt; a pending same-bytes sibling refuses as in progress so
+    /// the caller retries into completion; a reused id behind different
+    /// bytes refuses before any row mutates. Each row commits in its own
+    /// transaction, so malformed rows and stale writes can never lose an
+    /// existing record; the completed per-row receipt is the recoverable
+    /// record.
     pub fn app_record_csv_import(
         &self,
         context: &str,
@@ -1269,17 +1318,12 @@ impl RecordStore {
                 list
             }
         };
-        // A completed request id replays its stored receipt.
+        // A known request id settles against its stored receipt
+        // before anything is planned or mutated.
         {
             let conn = self.conn();
             if let Some(stored) = Self::import_receipt_in(&conn, request_id)? {
-                if stored.0 == context && stored.1 == preview_token {
-                    let mut result: Value = serde_json::from_str(&stored.2)
-                        .map_err(|_| Error::rejected("customer CSV receipt is unavailable"))?;
-                    result["replayed"] = Value::Bool(true);
-                    return Ok(result);
-                }
-                return Err(Error::rejected("customer CSV request id is already used"));
+                return Self::replay_or_refuse(stored, context, preview_token);
             }
         }
         let (token, plan) = {
@@ -1360,6 +1404,33 @@ impl RecordStore {
             };
             applies.push(apply);
         }
+        // Validate every decision before reserving the id: a malformed
+        // request must not leave a pending receipt that blocks a retry.
+        // Then reserve before any row mutates. A lost reservation race
+        // settles against the winner's row: completed replays, pending
+        // or foreign refuses; a genuine write failure leaves rows untouched.
+        {
+            let conn = self.conn();
+            match conn.execute(
+                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,state,at) VALUES(?,?,?,?,?,?)",
+                params![request_id, context, token, "", "pending", now()],
+            ) {
+                Ok(_) => {}
+                Err(_) => match Self::import_receipt_in(&conn, request_id)? {
+                    Some(winner) if winner.0 == context && winner.1 == preview_token => {
+                        return Self::replay_or_refuse(winner, context, preview_token);
+                    }
+                    Some(_) => {
+                        return Err(Error::rejected(
+                            "customer CSV request id is already used",
+                        ));
+                    }
+                    None => {
+                        return Err(Error::internal("customer CSV receipt write refused"));
+                    }
+                },
+            }
+        }
         // Per-row transactions: a failure records its row, never the file.
         let refused = |error: &Error| -> &'static str {
             let text = error.to_string();
@@ -1420,31 +1491,21 @@ impl RecordStore {
             "summary": {"applied": applied, "skipped": skipped, "failed": failed},
             "rows": outcomes,
         });
+        // Complete the reserved receipt with the per-row outcome.
+        // Rows are committed; only their attribution was pending.
         {
             let conn = self.conn();
             let stored = result.to_string();
-            match conn.execute(
-                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,at) VALUES(?,?,?,?,?)",
-                params![request_id, context, token, stored, now()],
-            ) {
-                Ok(_) => {}
-                Err(_) => {
-                    // A sibling won this request id while these rows
-                    // applied — per-row CAS kept the file exact, so
-                    // replay the winner's receipt verbatim.
-                    if let Some(winner) = Self::import_receipt_in(&conn, request_id)? {
-                        if winner.0 == context && winner.1 == preview_token {
-                            let mut receipt: Value = serde_json::from_str(&winner.2).map_err(|_| {
-                                Error::rejected("customer CSV receipt is unavailable")
-                            })?;
-                            receipt["replayed"] = Value::Bool(true);
-                            return Ok(receipt);
-                        }
-                    }
-                    return Err(Error::rejected(
-                        "customer CSV request id is already used",
-                    ));
-                }
+            let completed = conn
+                .execute(
+                    "UPDATE app_record_csv_imports SET result=?, state='complete', at=? WHERE request_id=? AND state='pending'",
+                    params![stored, now(), request_id],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if completed != 1 {
+                // The reservation vanished mid-import: rows stand but
+                // unattributable. Fail loudly, never silently.
+                return Err(Error::internal("customer CSV receipt write refused"));
             }
         }
         Ok(result)

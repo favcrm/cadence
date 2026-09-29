@@ -1,4 +1,6 @@
-use super::super::app_records::{record_db_path, CustomerProfile, RecordStore};
+use super::super::app_records::{
+    record_db_path, CsvAction, CsvDecision, CustomerProfile, RecordStore,
+};
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -400,4 +402,68 @@ fn cad779_receipt_write_failure_cannot_leave_imported_rows() {
         0,
         "an import planted rows before its receipt could be saved: {listed}"
     );
+}
+
+#[test]
+fn cad779_csv_receipt_state_column_migrates_older_files() {
+    let dir = TempDir::new().unwrap();
+    // A file whose receipts predate the pending/completed state,
+    // crafted by hand: only the current binary's migration may add
+    // the column, and all pre-existing rows are completed receipts.
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let setup = rusqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "CREATE TABLE record_schema(version INTEGER NOT NULL);
+             INSERT INTO record_schema(version) VALUES(1);
+             CREATE TABLE record_identity(install_id TEXT PRIMARY KEY, created REAL NOT NULL);
+             INSERT INTO record_identity(install_id, created) VALUES('install-a', 0.0);
+             CREATE TABLE app_records(context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, body_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, PRIMARY KEY(context_id, id));
+             CREATE TABLE app_record_revisions(context_id TEXT NOT NULL, record_id TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, body_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(context_id, record_id, revision));
+             CREATE TABLE app_record_csv_imports(request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, preview_token TEXT NOT NULL, result TEXT NOT NULL, at REAL NOT NULL);",
+        )
+        .unwrap();
+    drop(setup);
+    let store = RecordStore::open(dir.path(), "install-a").unwrap();
+    let csv = "record_id,display_name,email\ncustomer-a,A,a@example.com\n";
+    let preview = store.app_record_csv_preview("ctx-1", csv).unwrap();
+    let token = preview["preview_token"].as_str().unwrap();
+    let imported = store
+        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None)
+        .unwrap();
+    assert_eq!(
+        imported["summary"],
+        json!({"applied": 1, "skipped": 0, "failed": 0})
+    );
+    let replayed = store
+        .app_record_csv_import("ctx-1", csv, token, "req-migrated", None)
+        .unwrap();
+    assert_eq!(replayed["replayed"], true);
+}
+
+#[test]
+fn cad779_invalid_csv_decision_does_not_reserve_request_id() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    let csv = "record_id,display_name,email\ncustomer-a,A,a@example.com\n";
+    let preview = store.app_record_csv_preview("ctx-1", csv).unwrap();
+    let token = preview["preview_token"].as_str().unwrap();
+    assert!(store
+        .app_record_csv_import(
+            "ctx-1",
+            csv,
+            token,
+            "req-decision",
+            Some(vec![CsvDecision {
+                row: 1,
+                action: CsvAction::Update,
+                expected_revision: Some(1),
+            }]),
+        )
+        .is_err());
+    let imported = store
+        .app_record_csv_import("ctx-1", csv, token, "req-decision", None)
+        .unwrap();
+    assert_eq!(imported["summary"]["applied"], 1);
 }

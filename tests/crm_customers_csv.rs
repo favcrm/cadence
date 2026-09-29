@@ -680,10 +680,11 @@ fn cad779_customer_search_pagination_and_extended_profile() {
     // Consent history attributes each channel transition.
     let history = shown["record"]["consent_history"].as_array().unwrap();
     assert!(!history.is_empty(), "consent history missing: {shown}");
+    let consent_change = json!({"schema": 1, "display_name": "Chidi Anagonye", "email": "chidi@example.com", "phone": "+1 555-0100", "tags": ["newcomer"], "source": "csv-import", "consent": {"email": "granted"}});
     w.daemon
         .operator_rpc(
             "app_record_update",
-            json!({"install_id": install, "context_id": context_id, "record_id": "customer-3", "expected_revision": 1, "profile": Records::profile(PROFILE_A)}),
+            json!({"install_id": install, "context_id": context_id, "record_id": "customer-3", "expected_revision": 1, "profile": consent_change}),
         )
         .unwrap();
     let after = w.show(install, context_id, "customer-3");
