@@ -66,6 +66,10 @@ pub enum RouteClass {
     Session,
     /// Never over HTTP (memory curation needs a native agent endpoint).
     Refused,
+    /// The recipient's one-click unsubscribe (CAD-786): the token in
+    /// the path is the only credential — no session, no Origin
+    /// check; the handler owns the gate.
+    RecipientToken,
 }
 
 /// One write route: method, path pattern (`*` is one non-empty
@@ -332,6 +336,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // session. Agent peers are refused without side effects.
     route("POST", "/api/session/device/code", RouteClass::Session),
     route("POST", "/api/session/device/poll", RouteClass::Session),
+    // CAD-786: the token in the path is the credential — the
+    // recipient's browser holds no board session.
+    route("POST", "/unsubscribe/*", RouteClass::RecipientToken),
 ];
 
 fn matches(pattern: &str, path: &str) -> bool {
@@ -381,7 +388,10 @@ pub(super) fn admit(
     opts: &ServeOpts,
 ) -> Result<Option<Caller>, HttpResp> {
     let class = route_class(method, path);
-    if matches!(class, RouteClass::Session | RouteClass::Refused) {
+    if matches!(
+        class,
+        RouteClass::Session | RouteClass::Refused | RouteClass::RecipientToken
+    ) {
         return Ok(None);
     }
     if opts.read_only {

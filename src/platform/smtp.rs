@@ -607,6 +607,10 @@ pub struct SmtpMessage {
     pub html: String,
     pub text: String,
     pub unsubscribe_url: String,
+    /// CAD-786: the durable per-recipient key a campaign delivery
+    /// stamps as `Message-ID: <key@cadence.invalid>`; `None` mints an
+    /// ephemeral id on the envelope host (test sends).
+    pub idempotency_key: Option<String>,
 }
 
 /// What the receipt records: SMTP acceptance or refusal — never
@@ -724,7 +728,22 @@ pub fn assemble_message(
         &crate::platform::connections::registration_digest(content_digest)[7..39]
     );
     let date = crate::issue::time::now_epoch();
-    let message_id = format!("<{}@{}>", uuid::Uuid::new_v4().simple(), envelope.host);
+    let message_id = match &message.idempotency_key {
+        Some(key) => {
+            // The durable key is a sha256 digest; its `sha256:` tag
+            // stays out of the header's local part.
+            let key = key.strip_prefix("sha256:").unwrap_or(key);
+            if key.len() > 128
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(Error::rejected("SMTP idempotency key exceeds its bounds"));
+            }
+            format!("<{key}@cadence.invalid>")
+        }
+        None => format!("<{}@{}>", uuid::Uuid::new_v4().simple(), envelope.host),
+    };
     let mut out = String::new();
     out.push_str(&format!(
         "From: {}\r\n",
@@ -742,7 +761,24 @@ pub fn assemble_message(
         "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n"
     ));
     if !message.unsubscribe_url.is_empty() {
-        if message.unsubscribe_url.len() > 2000 || !message.unsubscribe_url.starts_with("https://")
+        // https anywhere, or loopback http for the isolated rigs —
+        // the same shape the daemon's origin check enforces.
+        let loopback = message
+            .unsubscribe_url
+            .strip_prefix("http://")
+            .is_some_and(|rest| {
+                matches!(
+                    rest.split(['/', '?', '#'])
+                        .next()
+                        .unwrap_or_default()
+                        .split(':')
+                        .next()
+                        .unwrap_or_default(),
+                    "localhost" | "127.0.0.1" | "[::1]"
+                )
+            });
+        if message.unsubscribe_url.len() > 2000
+            || !(message.unsubscribe_url.starts_with("https://") || loopback)
         {
             return Err(Error::rejected(
                 "SMTP unsubscribe URL exceeds its supported shape",
@@ -934,38 +970,106 @@ impl SmtpSession {
         }
     }
 
-    fn command(&mut self, text: &str, expect: &[u16]) -> Result<SmtpLine> {
+    /// One command + reply. The failure carries its shape for CAD-786
+    /// outcome classification: an answered refusal keeps its code,
+    /// a silent wire keeps the same refusal text CAD-785 produced.
+    fn command(&mut self, text: &str, expect: &[u16]) -> std::result::Result<SmtpLine, Fail> {
         if text.contains(['\r', '\n']) {
-            return Err(Error::internal("SMTP command carries a line break"));
+            return Err(Fail::Io("SMTP command carries a line break".to_string()));
         }
         self.writer()
             .write_all(format!("{text}\r\n").as_bytes())
-            .map_err(|_| Error::rejected("SMTP transport failed"))?;
+            .map_err(|_| Fail::Io("SMTP transport failed".to_string()))?;
         self.writer()
             .flush()
-            .map_err(|_| Error::rejected("SMTP transport failed"))?;
-        let reply = self.read_reply()?;
+            .map_err(|_| Fail::Io("SMTP transport failed".to_string()))?;
+        let reply = self.read_reply().map_err(|e| Fail::Io(e.to_string()))?;
         if !expect.contains(&reply.code) {
-            return Err(Error::rejected(format!(
-                "SMTP server refused the command with code {}",
-                reply.code
-            )));
+            return Err(Fail::Refused(
+                reply.code,
+                format!("SMTP server refused the command with code {}", reply.code),
+            ));
         }
         Ok(reply)
     }
 }
 
-/// Submit one message. `extra_ca_pem` is the isolated-test CA the
-/// fixture daemon pins — `None` in production, where only the
-/// platform roots verify. There is no plaintext path: port 587
-/// without a STARTTLS advertisement refuses before AUTH, and port
-/// 465 handshakes TLS before the SMTP greeting is even read.
-pub fn send(
+/// How one submission ended, classified for the delivery ledger
+/// (CAD-786). The test-send path maps it back to its old
+/// accepted/refused shape; the campaign worker translates it into
+/// durable row states. `message`/`code` carry the server's answer —
+/// bounded and secret-screened before they land anywhere.
+pub enum SmtpOutcome {
+    /// 250 after end-of-data: the server took the message.
+    Accepted { code: u16, message: String },
+    /// 4xx at any stage — not accepted, safe to retry later.
+    Deferred { code: u16, message: String },
+    /// 5xx — permanent.
+    Rejected { code: u16, message: String },
+    /// The exchange failed before the end-of-data `.` was written —
+    /// the server provably never saw a complete message; retry is safe.
+    NotSubmitted { message: String },
+    /// The wire broke after the `.` terminator was written but
+    /// before a reply was read — acceptance is unknowable, so the
+    /// row is NEVER retried; the operator resolves it.
+    Uncertain { message: String },
+}
+
+/// Where a dialog step failed.
+enum Fail {
+    /// The server answered with a code outside the expected set;
+    /// the text is the same refusal CAD-785 produced.
+    Refused(u16, String),
+    /// The exchange broke before a reply was read — connect, TLS,
+    /// IO or a malformed/absent reply.
+    Io(String),
+}
+
+fn refused_outcome(code: u16, message: String) -> SmtpOutcome {
+    if (400..500).contains(&code) {
+        SmtpOutcome::Deferred { code, message }
+    } else {
+        SmtpOutcome::Rejected { code, message }
+    }
+}
+
+fn fail_outcome(fail: Fail, data_written: bool) -> SmtpOutcome {
+    match fail {
+        Fail::Refused(code, message) => refused_outcome(code, message),
+        Fail::Io(message) => {
+            if data_written {
+                SmtpOutcome::Uncertain { message }
+            } else {
+                SmtpOutcome::NotSubmitted { message }
+            }
+        }
+    }
+}
+
+/// Screen any server-supplied text against the secret before it
+/// becomes a receipt, a row value, an error, or a log line. A hit
+/// withholds the text, never the verdict.
+fn screened(text: &str, secret: &[u8]) -> String {
+    if carries_secret(text, secret) {
+        return "SMTP submission refused".to_string();
+    }
+    let mut excerpt: String = text.chars().take(RECEIPT_TEXT_CAP).collect();
+    if excerpt.len() != text.len() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+/// Submit one message, returning the classified outcome (CAD-786).
+/// `Err` is only for local grammar failures — enrollment validation,
+/// message assembly — never a wire result. Every `Ok` variant's
+/// text is already secret-screened.
+pub fn send_outcome(
     envelope: &SmtpEnvelope,
     message: &SmtpMessage,
     content_digest: &str,
     extra_ca_pem: Option<&[u8]>,
-) -> Result<SmtpReceipt> {
+) -> Result<SmtpOutcome> {
     validate_port_tls(&envelope.host, envelope.port, &envelope.tls_mode)?;
     if envelope.secret.iter().any(|b| *b == b'\r' || *b == b'\n') {
         return Err(Error::rejected(
@@ -977,37 +1081,53 @@ pub fn send(
     let body = assemble_message(envelope, message, content_digest)?;
     let tls = tls_config(extra_ca_pem)?;
     let outcome = send_inner(envelope, message, &body, &tls, secret_text);
-    // Whatever the server said — acceptance or refusal — screen it
-    // against the secret before it becomes a receipt, an error, or
-    // a log line. A hit withholds the text, never the verdict.
-    match outcome {
-        Ok(receipt) => {
-            let screened = screen_secret(&receipt.message, &envelope.secret);
-            Ok(SmtpReceipt {
-                accepted: receipt.accepted,
-                code: receipt.code,
-                message: screened,
-            })
-        }
-        Err(error) => {
-            let text = error.to_string();
-            if carries_secret(&text, &envelope.secret) {
-                return Err(Error::rejected("SMTP submission refused"));
-            }
-            Err(error)
-        }
-    }
+    Ok(match outcome {
+        Ok(receipt) => SmtpOutcome::Accepted {
+            code: receipt.code,
+            message: screened(&receipt.message, &envelope.secret),
+        },
+        Err(SmtpOutcome::Accepted { code, message }) => SmtpOutcome::Accepted {
+            code,
+            message: screened(&message, &envelope.secret),
+        },
+        Err(SmtpOutcome::Deferred { code, message }) => SmtpOutcome::Deferred {
+            code,
+            message: screened(&message, &envelope.secret),
+        },
+        Err(SmtpOutcome::Rejected { code, message }) => SmtpOutcome::Rejected {
+            code,
+            message: screened(&message, &envelope.secret),
+        },
+        Err(SmtpOutcome::NotSubmitted { message }) => SmtpOutcome::NotSubmitted {
+            message: screened(&message, &envelope.secret),
+        },
+        Err(SmtpOutcome::Uncertain { message }) => SmtpOutcome::Uncertain {
+            message: screened(&message, &envelope.secret),
+        },
+    })
 }
 
-fn screen_secret(text: &str, secret: &[u8]) -> String {
-    if carries_secret(text, secret) {
-        return "SMTP server reply withheld: it reflected credential material".to_string();
+/// Submit one message (CAD-785 test-send shape kept verbatim):
+/// `Ok` is an SMTP-accepted receipt; every other outcome is the
+/// same `rejected` refusal text the old pipeline produced, screened
+/// against the secret exactly as before.
+pub fn send(
+    envelope: &SmtpEnvelope,
+    message: &SmtpMessage,
+    content_digest: &str,
+    extra_ca_pem: Option<&[u8]>,
+) -> Result<SmtpReceipt> {
+    match send_outcome(envelope, message, content_digest, extra_ca_pem)? {
+        SmtpOutcome::Accepted { code, message } => Ok(SmtpReceipt {
+            accepted: true,
+            code,
+            message,
+        }),
+        SmtpOutcome::Deferred { message, .. }
+        | SmtpOutcome::Rejected { message, .. }
+        | SmtpOutcome::NotSubmitted { message }
+        | SmtpOutcome::Uncertain { message } => Err(Error::rejected(message)),
     }
-    let mut excerpt: String = text.chars().take(RECEIPT_TEXT_CAP).collect();
-    if excerpt.len() != text.len() {
-        excerpt.push('…');
-    }
-    excerpt
 }
 
 fn carries_secret(text: &str, secret: &[u8]) -> bool {
@@ -1030,7 +1150,7 @@ fn send_inner(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
-) -> Result<SmtpReceipt> {
+) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
     if envelope.tls_mode == TLS_IMPLICIT {
         send_implicit_tls(envelope, message, body, tls, secret)
     } else {
@@ -1047,21 +1167,32 @@ fn send_implicit_tls(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
-) -> Result<SmtpReceipt> {
+) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
     // TLS first: the handshake (with certificate verification)
     // completes on first I/O, before the SMTP greeting is read —
     // a server that talks plaintext here errors, never downgrades.
-    let stream = SmtpSession::dial(&envelope.host, envelope.port)?;
-    let mut session = SmtpSession::tls(stream, &envelope.host, tls)
-        .map_err(|_| Error::rejected("SMTP TLS negotiation failed"))?;
+    let stream = SmtpSession::dial(&envelope.host, envelope.port).map_err(|e| {
+        SmtpOutcome::NotSubmitted {
+            message: e.to_string(),
+        }
+    })?;
+    let mut session =
+        SmtpSession::tls(stream, &envelope.host, tls).map_err(|_| SmtpOutcome::NotSubmitted {
+            message: "SMTP TLS negotiation failed".to_string(),
+        })?;
     // The first read completes the handshake with certificate
     // verification: a rogue certificate or a plaintext speaker
     // fails here as a TLS refusal, never as a downgrade.
     let greeting = session
         .read_reply()
-        .map_err(|_| Error::rejected("SMTP TLS negotiation failed"))?;
+        .map_err(|_| SmtpOutcome::NotSubmitted {
+            message: "SMTP TLS negotiation failed".to_string(),
+        })?;
     if greeting.code != 220 {
-        return Err(Error::rejected("SMTP server greeting refused"));
+        return Err(refused_outcome(
+            greeting.code,
+            "SMTP server greeting refused".to_string(),
+        ));
     }
     dialog_authenticated(&mut session, envelope, message, body, secret)
 }
@@ -1075,30 +1206,54 @@ fn send_starttls(
     body: &str,
     tls: &Arc<rustls::ClientConfig>,
     secret: &str,
-) -> Result<SmtpReceipt> {
-    let stream = SmtpSession::dial(&envelope.host, envelope.port)?;
+) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
+    let stream = SmtpSession::dial(&envelope.host, envelope.port).map_err(|e| {
+        SmtpOutcome::NotSubmitted {
+            message: e.to_string(),
+        }
+    })?;
     let mut session = SmtpSession::plain(stream);
-    let greeting = session.read_reply()?;
+    let greeting = session
+        .read_reply()
+        .map_err(|e| SmtpOutcome::NotSubmitted {
+            message: e.to_string(),
+        })?;
     if greeting.code != 220 {
-        return Err(Error::rejected("SMTP server greeting refused"));
-    }
-    let ehlo = session.command(&format!("EHLO {EHLO_NAME}"), &[250])?;
-    if !advertises(&ehlo.text, "STARTTLS") {
-        return Err(Error::rejected(
-            "SMTP server does not offer STARTTLS — plaintext submission refused",
+        return Err(refused_outcome(
+            greeting.code,
+            "SMTP server greeting refused".to_string(),
         ));
     }
-    session.command("STARTTLS", &[220])?;
+    let ehlo = session
+        .command(&format!("EHLO {EHLO_NAME}"), &[250])
+        .map_err(|f| fail_outcome(f, false))?;
+    if !advertises(&ehlo.text, "STARTTLS") {
+        return Err(SmtpOutcome::NotSubmitted {
+            message: "SMTP server does not offer STARTTLS — plaintext submission refused"
+                .to_string(),
+        });
+    }
+    session
+        .command("STARTTLS", &[220])
+        .map_err(|f| fail_outcome(f, false))?;
     // RFC 3207: the plaintext session is gone here; everything
     // below — including the second EHLO — runs inside the tunnel.
     // The post-upgrade EHLO completes the handshake first: a rogue
     // certificate fails here as a TLS refusal, before AUTH.
-    let mut session = session
-        .upgrade_tls(&envelope.host, tls)
-        .map_err(|_| Error::rejected("SMTP TLS negotiation failed"))?;
+    let mut session =
+        session
+            .upgrade_tls(&envelope.host, tls)
+            .map_err(|_| SmtpOutcome::NotSubmitted {
+                message: "SMTP TLS negotiation failed".to_string(),
+            })?;
     session
         .command(&format!("EHLO {EHLO_NAME}"), &[250])
-        .map_err(|_| Error::rejected("SMTP TLS negotiation failed"))?;
+        .map_err(|f| match f {
+            Fail::Io(_) => SmtpOutcome::NotSubmitted {
+                message: "SMTP TLS negotiation failed".to_string(),
+            },
+            Fail::Refused(code, message) => refused_outcome(code, message),
+        })?;
     dialog_authenticated(&mut session, envelope, message, body, secret)
 }
 
@@ -1109,36 +1264,50 @@ const EHLO_NAME: &str = "cadence-smtp";
 /// Post-handshake dialog shared by both ports: EHLO, mandatory
 /// AUTH, one message, QUIT — all inside the verified tunnel. AUTH
 /// LOGIN is attempted first (widest server support), then PLAIN on
-/// a 5xx refusal. No credential ever crosses before this point.
+/// a 5xx refusal. No credential ever crosses before this point. The
+/// moment the `.` terminator is written the outcome can no longer
+/// be `NotSubmitted` — a break after it is `Uncertain`.
 fn dialog_authenticated(
     session: &mut SmtpSession,
     envelope: &SmtpEnvelope,
     message: &SmtpMessage,
     body: &str,
     secret: &str,
-) -> Result<SmtpReceipt> {
-    let ehlo = session.command(&format!("EHLO {EHLO_NAME}"), &[250])?;
+) -> std::result::Result<SmtpReceipt, SmtpOutcome> {
+    let ehlo = session
+        .command(&format!("EHLO {EHLO_NAME}"), &[250])
+        .map_err(|f| fail_outcome(f, false))?;
     let mechanisms = auth_mechanisms(&ehlo.text);
     if mechanisms.is_empty() {
-        return Err(Error::rejected(
-            "SMTP server offers no authentication — unauthenticated submission refused",
-        ));
+        return Err(SmtpOutcome::NotSubmitted {
+            message: "SMTP server offers no authentication — unauthenticated submission refused"
+                .to_string(),
+        });
     }
     let mut authenticated = false;
     if mechanisms.iter().any(|name| name == "LOGIN") {
-        authenticated = try_auth_login(session, &envelope.username, secret)?;
+        authenticated = try_auth_login(session, &envelope.username, secret)
+            .map_err(|f| fail_outcome(f, false))?;
     }
     if !authenticated && mechanisms.iter().any(|name| name == "PLAIN") {
-        authenticated = try_auth_plain(session, &envelope.username, secret)?;
+        authenticated = try_auth_plain(session, &envelope.username, secret)
+            .map_err(|f| fail_outcome(f, false))?;
     }
     if !authenticated {
-        return Err(Error::rejected(
-            "SMTP server offers no supported authentication — submission refused",
-        ));
+        return Err(SmtpOutcome::NotSubmitted {
+            message: "SMTP server offers no supported authentication — submission refused"
+                .to_string(),
+        });
     }
-    session.command(&format!("MAIL FROM:<{}>", envelope.sender), &[250])?;
-    session.command(&format!("RCPT TO:<{}>", message.to), &[250, 251])?;
-    session.command("DATA", &[354])?;
+    session
+        .command(&format!("MAIL FROM:<{}>", envelope.sender), &[250])
+        .map_err(|f| fail_outcome(f, false))?;
+    session
+        .command(&format!("RCPT TO:<{}>", message.to), &[250, 251])
+        .map_err(|f| fail_outcome(f, false))?;
+    session
+        .command("DATA", &[354])
+        .map_err(|f| fail_outcome(f, false))?;
     // Dot-stuff per RFC 5321 §4.5.2, then the terminator. The
     // assembled body is CRLF throughout.
     let mut data = String::with_capacity(body.len() + 16);
@@ -1153,17 +1322,28 @@ fn dialog_authenticated(
     session
         .writer()
         .write_all(data.as_bytes())
-        .map_err(|_| Error::rejected("SMTP transport failed"))?;
+        .map_err(|_| SmtpOutcome::NotSubmitted {
+            message: "SMTP transport failed".to_string(),
+        })?;
     session
         .writer()
         .flush()
-        .map_err(|_| Error::rejected("SMTP transport failed"))?;
-    let accepted = session.read_reply()?;
+        .map_err(|_| SmtpOutcome::NotSubmitted {
+            message: "SMTP transport failed".to_string(),
+        })?;
+    // The `.` terminator is on the wire: from here the server may
+    // have accepted. Any further transport failure is `Uncertain`.
+    let accepted = session.read_reply().map_err(|e| SmtpOutcome::Uncertain {
+        message: e.to_string(),
+    })?;
     if accepted.code != 250 {
-        return Err(Error::rejected(format!(
-            "SMTP server refused the message with code {}",
-            accepted.code
-        )));
+        return Err(refused_outcome(
+            accepted.code,
+            format!(
+                "SMTP server refused the message with code {}",
+                accepted.code
+            ),
+        ));
     }
     // QUIT is courtesy after acceptance: a failure here never
     // un-accepts the message, so it is best-effort.
@@ -1175,7 +1355,11 @@ fn dialog_authenticated(
     })
 }
 
-fn try_auth_login(session: &mut SmtpSession, username: &str, secret: &str) -> Result<bool> {
+fn try_auth_login(
+    session: &mut SmtpSession,
+    username: &str,
+    secret: &str,
+) -> std::result::Result<bool, Fail> {
     let challenge = session.command("AUTH LOGIN", &[234, 235, 334, 500, 502, 504, 535])?;
     if challenge.code == 235 {
         return Ok(true);
@@ -1188,17 +1372,30 @@ fn try_auth_login(session: &mut SmtpSession, username: &str, secret: &str) -> Re
         return Ok(true);
     }
     if user.code != 334 {
-        return Err(Error::rejected("SMTP authentication refused"));
+        return Err(Fail::Refused(
+            user.code,
+            "SMTP authentication refused".to_string(),
+        ));
     }
     let pass = session.command(&base64_encode(secret.as_bytes()), &[235, 535])?;
     match pass.code {
         235 => Ok(true),
-        535 => Err(Error::rejected("SMTP authentication refused")),
-        _ => Err(Error::rejected("SMTP authentication refused")),
+        535 => Err(Fail::Refused(
+            535,
+            "SMTP authentication refused".to_string(),
+        )),
+        code => Err(Fail::Refused(
+            code,
+            "SMTP authentication refused".to_string(),
+        )),
     }
 }
 
-fn try_auth_plain(session: &mut SmtpSession, username: &str, secret: &str) -> Result<bool> {
+fn try_auth_plain(
+    session: &mut SmtpSession,
+    username: &str,
+    secret: &str,
+) -> std::result::Result<bool, Fail> {
     let mut combined = Vec::with_capacity(username.len() + secret.len() + 2);
     combined.push(0u8);
     combined.extend_from_slice(username.as_bytes());
@@ -1210,7 +1407,10 @@ fn try_auth_plain(session: &mut SmtpSession, username: &str, secret: &str) -> Re
     )?;
     match reply.code {
         235 => Ok(true),
-        535 => Err(Error::rejected("SMTP authentication refused")),
+        535 => Err(Fail::Refused(
+            535,
+            "SMTP authentication refused".to_string(),
+        )),
         _ => Ok(false),
     }
 }

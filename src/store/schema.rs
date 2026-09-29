@@ -770,6 +770,15 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=30", [])?;
             tx.commit()?;
         }
+        if version < 31 {
+            // CAD-786: the PII-free send intent (`crm_sends`, crash
+            // reconciliation only) and the hash-only unsubscribe
+            // index. Recipient rows never live in core.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(super::crm_sends::SCHEMA)?;
+            tx.execute("UPDATE schema_version SET version=31", [])?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

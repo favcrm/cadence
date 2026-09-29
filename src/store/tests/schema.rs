@@ -586,7 +586,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            30,
+            31,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -761,6 +761,91 @@
                     .is_some(),
                 "credential row lost across half-applied v30 converge"
             );
+        }
+    }
+
+    #[test]
+    fn migration_v30_to_v31_adds_send_intent_and_token_index() {
+        // v31 adds the CAD-786 send tables only: `crm_sends` (the
+        // PII-free durable intent) and `crm_unsubscribe_index`
+        // (hash-only token→file map). `IF NOT EXISTS`, so a v30
+        // store migrates in place and a half-applied v31 converges;
+        // pre-v31 rows are preserved.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO crm_smtp_links(install_id,context_id,connection_id,auth_revision,link_revision,state,digest,request_id,created,updated) \
+                     VALUES ('i1','c1','conn-1',2,3,'live','digest-x','req-1',1,1);",
+                )
+                .unwrap();
+        }
+        // A genuine v30: everything but the two v31 tables.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE crm_sends;
+                 DROP TABLE crm_unsubscribe_index;
+                 UPDATE schema_version SET version=30;",
+            )
+            .unwrap();
+        let has = |table: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("crm_sends"));
+        assert!(!has("crm_unsubscribe_index"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("crm_sends"));
+            assert!(has("crm_unsubscribe_index"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // Pre-v31 rows survive and the tables work.
+            assert!(s.agent("a1").is_ok());
+            s.crm_send_open("i1", "c1", "send-1").unwrap();
+            assert_eq!(s.crm_sends_sending().unwrap().len(), 1);
+            s.crm_send_transition("i1", "c1", "send-1", "completed")
+                .unwrap();
+            assert!(s.crm_sends_sending().unwrap().is_empty());
+            s.crm_unsubscribe_index_add("hash-1", "i1", "c1").unwrap();
+            assert_eq!(
+                s.crm_unsubscribe_index_lookup("hash-1").unwrap(),
+                Some(("i1".to_string(), "c1".to_string()))
+            );
+            assert!(s.crm_unsubscribe_index_lookup("hash-2").unwrap().is_none());
+        }
+        // Half-applied: one table dropped, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE crm_unsubscribe_index;
+                 UPDATE schema_version SET version=30;",
+            )
+            .unwrap();
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("crm_unsubscribe_index"));
+            s.crm_unsubscribe_index_add("hash-3", "i1", "c1").unwrap();
         }
     }
 

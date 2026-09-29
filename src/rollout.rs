@@ -42,7 +42,7 @@ use crate::store::{self, Store};
 /// CAD-753 keeps app record data in per-installation SQLite files;
 /// this version tracks core tables only.
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 30;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
