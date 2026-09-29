@@ -114,6 +114,9 @@ struct FakeDoor {
     expected_destination: Arc<Mutex<Option<String>>>,
     /// Adversarial hook: when set, ok responses omit the binding echo.
     omit_binding: Arc<std::sync::atomic::AtomicBool>,
+    /// Adversarial hook: when set, ok responses carry a mismatched
+    /// binding (different destination/caption) under the same key.
+    corrupt_binding: Arc<std::sync::atomic::AtomicBool>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -127,12 +130,14 @@ impl FakeDoor {
         let calls = Arc::new(Mutex::new(0u64));
         let expected_destination = Arc::new(Mutex::new(None));
         let omit_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let corrupt_binding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_grants = Arc::clone(&grants);
         let worker_ledger = Arc::clone(&ledger);
         let worker_calls = Arc::clone(&calls);
         let worker_expected = Arc::clone(&expected_destination);
         let worker_omit = Arc::clone(&omit_binding);
+        let worker_corrupt = Arc::clone(&corrupt_binding);
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             while !worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -148,6 +153,7 @@ impl FakeDoor {
                     &worker_ledger,
                     &worker_expected,
                     &worker_omit,
+                    &worker_corrupt,
                     request.url(),
                     &value,
                 );
@@ -161,6 +167,7 @@ impl FakeDoor {
             calls,
             expected_destination,
             omit_binding,
+            corrupt_binding,
             stop,
             worker: Some(worker),
         }
@@ -169,6 +176,11 @@ impl FakeDoor {
     fn omit_binding_echo(&self, omit: bool) {
         self.omit_binding
             .store(omit, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn corrupt_binding_echo(&self, corrupt: bool) {
+        self.corrupt_binding
+            .store(corrupt, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn expect_destination(&self, destination_id: &str) {
@@ -182,6 +194,7 @@ impl FakeDoor {
         ledger: &FakePublishLedger,
         expected: &Mutex<Option<String>>,
         omit_binding: &std::sync::atomic::AtomicBool,
+        corrupt_binding: &std::sync::atomic::AtomicBool,
         url: &str,
         value: &Value,
     ) -> Value {
@@ -259,6 +272,21 @@ impl FakeDoor {
                         for field in ["destination_id", "caption_digest", "image_digest"] {
                             reply.as_object_mut().unwrap().remove(field);
                         }
+                    }
+                    if corrupt_binding.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Adversarial hook: same key, foreign binding.
+                        let forged = reply.as_object_mut().unwrap();
+                        forged.insert(
+                            "destination_id".into(),
+                            Value::String("999999999999999".into()),
+                        );
+                        forged.insert(
+                            "caption_digest".into(),
+                            Value::String(
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                    .into(),
+                            ),
+                        );
                     }
                     reply
                 }
@@ -1491,4 +1519,51 @@ fn cad771_e2e_cross_key_evidence_confusion_fails_closed() {
         "processing"
     );
     assert_eq!(door.ledger.provider_calls(), 2);
+}
+
+#[test]
+fn cad771_e2e_corrupt_status_binding_fails_closed_at_claim() {
+    // RPC/HTTP level: a status/exec reply for the same key carrying a
+    // foreign destination/caption must fail the dispatch claim itself —
+    // nothing persists, processing is retained, no silent fill.
+    let door = FakeDoor::start();
+    door.grants.lock().unwrap().issue(GRANT_FB, 3);
+    let (h, _sender) = e2e_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "corrupt");
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            freeze_params(
+                &context,
+                &run,
+                &bundle_digest,
+                &install_id,
+                "cad771-e2e-corrupt",
+                "cad_fx_corrupt_01",
+                epoch_now(),
+            ),
+        )
+        .unwrap()["intent"]
+        .clone();
+    door.corrupt_binding_echo(true);
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_claim_due",
+            json!({"now_epoch": epoch_now() + 5, "recheck": recheck_for(&intent)}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match the frozen intent"), "{err}");
+    let shown = h
+        .daemon
+        .operator_rpc(
+            "social_publish_show",
+            json!({"intent_id": intent["intent_id"]}),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(shown["state"], "processing");
+    assert!(shown["upstream"].is_null());
 }
