@@ -1194,3 +1194,118 @@ fn cad779_http_csv_cross_scope_and_unproven_callers_refuse() {
     // Nothing above imported a row.
     assert_eq!(b.operator("GET", &format!("{base}/customer-9"), "").0, 409);
 }
+
+#[test]
+fn cad779_csv_concurrent_imports_conflict_on_email_without_second_row() {
+    let w = Records::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1");
+    let context_id = context["id"].as_str().unwrap();
+    // Two different imports plan a create for two different record
+    // IDs behind one address. Both previews run before either import
+    // commits, so both plans say create: the apply-time guard must
+    // still leave exactly one live row.
+    let csv_a = "record_id,display_name,email\ncustomer-race-a,Racer A,race@example.com\n";
+    let csv_b = "record_id,display_name,email\ncustomer-race-b,Racer B,race@example.com\n";
+    let token_a = w.preview(install, context_id, csv_a)["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token_b = w.preview(install, context_id, csv_b)["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let barrier = std::sync::Barrier::new(2);
+    let (left, right) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            w.daemon.operator_rpc(
+                "app_record_csv_import",
+                json!({"install_id": install, "context_id": context_id, "csv_text": csv_a, "preview_token": token_a, "request_id": "req-race-a"}),
+            )
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            w.daemon.operator_rpc(
+                "app_record_csv_import",
+                json!({"install_id": install, "context_id": context_id, "csv_text": csv_b, "preview_token": token_b, "request_id": "req-race-b"}),
+            )
+        });
+        (
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        )
+    });
+    // Exactly one create wins across both receipts; the loser records
+    // a recoverable duplicate outcome instead of a second live row.
+    let applied = left["summary"]["applied"].as_i64().unwrap()
+        + right["summary"]["applied"].as_i64().unwrap();
+    assert_eq!(applied, 1, "email race planted two rows: {left} {right}");
+    let duplicates = [&left, &right]
+        .iter()
+        .flat_map(|result| result["rows"].as_array().unwrap().clone())
+        .filter(|row| row["outcome"] == "failed" && row["reason"] == "duplicate email")
+        .count();
+    assert_eq!(
+        duplicates, 1,
+        "loser left no duplicate receipt: {left} {right}"
+    );
+    let listed = w
+        .daemon
+        .operator_rpc(
+            "app_record_list",
+            json!({"install_id": install, "context_id": context_id}),
+        )
+        .unwrap();
+    let records = listed["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "second live row survived: {listed}");
+    assert_eq!(
+        records[0]["profile"]["email"], "race@example.com",
+        "winner row corrupted: {listed}"
+    );
+}
+
+#[test]
+fn cad779_csv_blank_record_id_is_a_row_error() {
+    let w = Records::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1");
+    let context_id = context["id"].as_str().unwrap();
+    // A blank ID is refused as a row error — never derived, never
+    // persisted — while the valid sibling still plans a create.
+    let csv = "record_id,display_name,email\n,No Id,noid@example.com\ncustomer-8,Has Id,hasid@example.com\n";
+    let preview = w.preview(install, context_id, csv);
+    let blank = row(&preview, 1);
+    assert_eq!(blank["decision"], "error");
+    assert!(
+        blank["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "record id"),
+        "blank id refused without its code: {preview}"
+    );
+    assert_eq!(row(&preview, 2)["decision"], "create");
+    let token = preview["preview_token"].as_str().unwrap().to_string();
+    let imported = w.import(install, context_id, csv, &token, "req-blank");
+    assert_eq!(
+        imported["summary"],
+        json!({"applied": 1, "skipped": 1, "failed": 0})
+    );
+    let listed = w
+        .daemon
+        .operator_rpc(
+            "app_record_list",
+            json!({"install_id": install, "context_id": context_id}),
+        )
+        .unwrap();
+    let ids: Vec<&str> = listed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["customer-8"], "derived id persisted: {listed}");
+}
