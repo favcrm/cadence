@@ -387,8 +387,12 @@ pub fn derive_status(
     })
 }
 
-/// Job, then notes, then the file field — `notes` runs only when no
-/// job decides, so a caller holding a [`notes::index`] skips the read.
+/// Job, then a terminal file status, then notes, then the file field.
+/// A file `done`/`dropped` is merge evidence (reconcile, CAD-754, or
+/// `mark_done_on_merge`, CAD-449) or the operator's word — no note can
+/// reopen it, and no note can reach it (`verdict` derives `review`,
+/// CAD-823). `notes` runs only when no job decides, so a caller
+/// holding a [`notes::index`] skips the read.
 fn derive_leaf(
     file_status: &str,
     job: Option<JobOutcome>,
@@ -396,6 +400,9 @@ fn derive_leaf(
 ) -> (String, &'static str) {
     if let Some(JobOutcome::Status(status)) = job {
         return (status.to_string(), "job");
+    }
+    if matches!(file_status, "done" | "dropped") {
+        return (file_status.to_string(), "file");
     }
     if let Some(status) = notes() {
         return (status.to_string(), "notes");
@@ -1041,8 +1048,11 @@ mod tests {
         assert_eq!(v.chain.len(), 1);
     }
 
+    /// CAD-823: a passing verdict is a review outcome — the file
+    /// field carries `done` (merge evidence or an explicit set), and
+    /// a terminal file status outranks any note.
     #[test]
-    fn verdict_pass_marks_done() {
+    fn verdict_pass_is_review_until_the_file_is_done() {
         let notes = tempfile::TempDir::new().unwrap();
         std::fs::write(
             notes.path().join("20260917-120000-abc-x-kickoff.md"),
@@ -1056,7 +1066,62 @@ mod tests {
         .unwrap();
         let i = issue("CAD-1", "doing");
         let vs = views(notes.path(), vec![i]);
-        assert_eq!(view_of(&vs, "CAD-1").status, "done");
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!((v.status.as_str(), v.status_source), ("review", "notes"));
+
+        // File `done` + the PASS note → done, sourced from the file.
+        let i = issue("CAD-1", "done");
+        let vs = views(notes.path(), vec![i]);
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!((v.status.as_str(), v.status_source), ("done", "file"));
+
+        // File `done` + a LATER kickoff note still reads done.
+        std::fs::write(
+            notes.path().join("20260917-160000-abc-x-kickoff.md"),
+            "# Kickoff\n> Issue: `CAD-1`\n",
+        )
+        .unwrap();
+        let i = issue("CAD-1", "done");
+        let vs = views(notes.path(), vec![i]);
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!((v.status.as_str(), v.status_source), ("done", "file"));
+
+        // `dropped` is terminal the same way.
+        let i = issue("CAD-1", "dropped");
+        let vs = views(notes.path(), vec![i]);
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!((v.status.as_str(), v.status_source), ("dropped", "file"));
+    }
+
+    /// `derive_leaf`'s precedence, directly: job → terminal file →
+    /// notes → file.
+    #[test]
+    fn derive_leaf_terminal_file_outranks_notes() {
+        let notes_review = || Some("review");
+        assert_eq!(
+            derive_leaf("done", None, notes_review),
+            ("done".to_string(), "file")
+        );
+        assert_eq!(
+            derive_leaf("dropped", None, || Some("doing")),
+            ("dropped".to_string(), "file")
+        );
+        // A non-terminal file still yields to notes…
+        assert_eq!(
+            derive_leaf("doing", None, notes_review),
+            ("review".to_string(), "notes")
+        );
+        // …and no notes leaves the file value.
+        assert_eq!(
+            derive_leaf("ready", None, || None),
+            ("ready".to_string(), "file")
+        );
+        // A live job still decides over a file `done` — CAD-244's
+        // precedence is untouched.
+        assert_eq!(
+            derive_leaf("done", Some(JobOutcome::Status("doing")), notes_review),
+            ("doing".to_string(), "job")
+        );
     }
 
     #[test]

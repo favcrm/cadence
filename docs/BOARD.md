@@ -64,7 +64,9 @@ local surface.
 ---
 id: CAD-16                  # must equal the folder name
 title: claude provider: managed stream-json endpoint
-status: backlog             # file status; notes/rollup can override it
+status: backlog             # file status; notes/rollup/job can override it —
+                            # but a file `done`/`dropped` is terminal: notes
+                            # never outrank it
 priority: P1                # P0..P3
 owner: cookie-cesium        # optional — the lane doing the work
 claim:                      # optional (CAD-383) — who holds the issue while
@@ -91,7 +93,7 @@ created: 2026-09-17T16:01:23Z
 
 | Field | Rule |
 |---|---|
-| `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` and `verified` → `review`, `done` → `done`, `blocked` only flags `blocked_reason`); else the latest note carrying `Issue: <id>`; else the file. `verified` stays `review` until `job accept`. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
+| `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` and `verified` → `review`, `done` → `done`, `blocked` only flags `blocked_reason`); else a terminal file status (`done`/`dropped` — merge evidence or an explicit set, which no note can reopen); else the latest note carrying `Issue: <id>` (`-kickoff` → `doing`, `-qa` → `review`, `-verdict` → `review` — a verdict is a review outcome, pass or not; `done` comes only from the file, set by reconcile/`mark_done_on_merge` on merge evidence or by hand); else the file. `verified` stays `review` until `job accept`. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
 | `blocks` / `duplicates` | Inverses of `blocked_by` / `duplicate_of`, computed at read time. |
 | `ready` | Leaf issue, status `ready`, nothing unfinished in `blocked_by`. |
 | `blocked` | Any `blocked_by` target not `done`. |
