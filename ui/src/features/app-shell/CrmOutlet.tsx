@@ -15,6 +15,7 @@ export type OutletView = "list" | "new";
 export default function CrmOutlet({
   scope,
   installationTitle,
+  appKind,
   view,
   recordId,
   viewer,
@@ -23,6 +24,8 @@ export default function CrmOutlet({
 }: {
   scope: HostScope;
   installationTitle: string;
+  /** CRM names its forthcoming records; every other App stays neutral. */
+  appKind: "crm" | "generic";
   view: OutletView;
   recordId: string | null;
   viewer: Viewer;
@@ -66,8 +69,9 @@ export default function CrmOutlet({
           <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="records" role="status">
             <p className="font-medium text-ink-200">No records yet in {installationTitle}</p>
             <p className="mt-1">
-              Customer records arrive with CAD-781. This outlet stays empty until the server returns real rows —
-              nothing here is sample data.
+              {appKind === "crm"
+                ? "Customer records arrive with CAD-781. This outlet stays empty until the server returns real rows — nothing here is sample data."
+                : "This App's record screens are not installed yet. This outlet stays empty until the server returns real rows — nothing here is sample data."}
             </p>
             <p className="num text-micro text-ink-500 mt-2">
               Installation {scope.installId} · Context {scope.contextId || "none"}
@@ -83,7 +87,7 @@ export default function CrmOutlet({
           </h3>
           {!canWrite ? (
             <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-              Read-only view. A verified operator creates records once CAD-781 lands.
+              Read-only view. A verified operator creates records once this App's screens land.
             </p>
           ) : (
             <form
@@ -103,10 +107,10 @@ export default function CrmOutlet({
                 placeholder="Unsaved draft — CAD-781 wires this to the server"
               />
               <p className="text-micro text-ink-500">
-                Saving is disabled until CAD-781 provides the customer form. This draft never leaves the browser.
+                Saving is disabled until this App's form lands{appKind === "crm" ? " (CAD-781 provides the customer form)" : ""}. This draft never leaves the browser.
               </p>
               <div>
-                <Button type="submit" variant="primary" disabled title="Record creation arrives with CAD-781">
+                <Button type="submit" variant="primary" disabled title="Record creation arrives with this App's screens">
                   Save (coming soon)
                 </Button>
               </div>
@@ -129,7 +133,7 @@ export default function CrmOutlet({
             </Button>
           </div>
           <p className="text-secondary text-ink-400">
-            Record <span className="num">{recordId}</span> has no reader yet — CAD-781 provides the detail drawer.
+            Record <span className="num">{recordId}</span> has no reader yet{appKind === "crm" ? " — CAD-781 provides the detail drawer" : ""}.
             The selection stays in the URL so a refresh or pasted link keeps it.
           </p>
           <p className="mt-2">

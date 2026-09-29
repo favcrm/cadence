@@ -3192,6 +3192,53 @@ fn thread_refs(value: &Value) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
+/// CAD-802: `thread_send`'s `app` — the shell chat's current App.
+/// Exactly `{install_id, context_id}`; both resolve against the
+/// daemon's own store (`app_context_proof` proves the installation
+/// exists and the context is active). The normalized binding carries
+/// daemon-computed `verified`, revision and digest — a browser
+/// `verified` key refuses like any extra field, and the stamp is
+/// part of the retry's content comparison, never authority.
+fn thread_app(value: &Value, store: &Store) -> Result<Value> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::rejected("app must be an {\"install_id\":…, \"context_id\":…} object")
+    })?;
+    if let Some(key) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "install_id" | "context_id"))
+    {
+        return Err(Error::rejected(format!(
+            "app takes install_id and context_id only; field '{key}' is not accepted"
+        )));
+    }
+    for key in ["install_id", "context_id"] {
+        let id = obj.get(key).and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(Error::rejected(format!(
+                "bad app {key} — 1-128 [A-Za-z0-9_-] chars"
+            )));
+        }
+    }
+    let install = obj["install_id"].as_str().unwrap();
+    let context = obj["context_id"].as_str().unwrap();
+    // Server proof: the installation exists and the context is
+    // active in it — an unknown install, an unknown context, or an
+    // archived one refuses here, before anything is queued.
+    let (_, proof) = store.app_context_proof(install, context)?;
+    Ok(json!({
+        "install_id": proof.install_id,
+        "context_id": proof.id,
+        "verified": true,
+        "context_revision": proof.revision,
+        "context_digest": proof.digest,
+    }))
+}
+
 /// Every `values` member in `valid` — a wire peer is untrusted, so the
 /// daemon re-checks the vocabulary the CLI already checked.
 fn check_values(field: &str, values: &[String], valid: &[&str]) -> Result<()> {

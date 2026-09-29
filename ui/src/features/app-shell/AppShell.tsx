@@ -19,25 +19,32 @@ import {
 } from "../home/thread";
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
-import { initialContext, rememberContext } from "../workspace-apps/contextSelection";
+import { initialContext, rememberedContext, rememberContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type OutletView } from "./CrmOutlet";
-import type { HostScope } from "./hostActions";
+import { assertRecordId, type HostScope } from "./hostActions";
 import "./app-shell.css";
 
 /**
  * The trusted shared App shell (CAD-802): host-owned board surface for
  * every installed App. The board keeps its header/sidebar (App.tsx); the
  * shell adds nested Apps → installed-App navigation, the persistent
- * master conversation on the left (the real thread store, not a copy)
- * with an accessible left drawer at narrow widths, and a generic
- * list/detail/new outlet on the right.
+ * master conversation on the left with an accessible left drawer at
+ * narrow widths, and a generic list/detail/new outlet on the right.
+ *
+ * One ChatPane instance lives for the shell's lifetime — desktop pane
+ * and narrow drawer are one node restyled by CSS, so there is exactly
+ * one draft and one SSE subscription, and closing the drawer (which
+ * hides it from the tab order via `visibility`) never loses the draft.
+ * The shell stays mounted across installation switches, so the chat
+ * survives navigation while outlet state resets.
  *
  * Installation and context come from the trusted route plus verified
- * HTTP receipts. The selected record is chat context only — never an
- * authorization claim. Switching installation or context clears the
- * selection and unsaved drafts. No App-provided JavaScript runs here;
- * social-content keeps its existing WorkspaceApp as the outlet, other
- * Apps get the generic outlet until their screens land (CAD-781).
+ * HTTP receipts; record links are context-bound (`ctx` + `record`).
+ * The selected record is chat context only — never an authorization
+ * claim. Switching installation or context clears the selection, the
+ * New view and unsaved drafts. Social-content owns its context
+ * selector internally, so the shell shows none there and never a
+ * second, divergent one. No App-provided JavaScript runs here.
  */
 export default function AppShell({
   installId,
@@ -55,26 +62,36 @@ export default function AppShell({
   const [contexts, setContexts] = useState<AppContext[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [contextId, setContextId] = useState(() => {
-    try {
-      return window.sessionStorage.getItem(`cadence.workspace-app.context.${installId}`) ?? "";
-    } catch {
-      return "";
-    }
-  });
-  // Outlet state: the view and the selected record. Both live in the URL
-  // (`appview`, `record`) so direct links and browser back keep scope.
-  // Unknown params survive `locationHref`, so these persist across board
-  // navigation that carries the query.
+  const [contextId, setContextId] = useState("");
+  const [linkNotice, setLinkNotice] = useState<string | null>(null);
+  // Outlet state lives in the URL (`ctx`, `appview`, `record`) so
+  // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
   const [chatOpen, setChatOpen] = useState(false);
-  const chatCloseRef = useRef<HTMLButtonElement | null>(null);
+  const chatPaneRef = useRef<HTMLDivElement | null>(null);
   const chatOpenRef = useRef<HTMLButtonElement | null>(null);
+  // Installation switches reset outlet state but keep the chat: the
+  // first mount preserves direct links, later switches strip them.
+  const firstInstall = useRef(installId);
+  const handledQuery = useRef<string | undefined>(undefined);
 
-  const setQuery = useCallback(
-    (patch: { appview?: OutletView | null; record?: string | null }) => {
-      const q = new URLSearchParams(href.split("?")[1] ?? "");
+  // Every internal query write marks the resulting key as handled, so
+  // the adoption effect below only answers external URL changes
+  // (direct links, browser back/forward) — never our own writes.
+  const queryKey = (ctx: string | null, record: string | null, appview: string | null) =>
+    `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}`;
+  const writeQuery = useCallback(
+    (
+      patch: { ctx?: string | null; appview?: OutletView | null; record?: string | null },
+      opts?: { replace?: boolean },
+    ) => {
+      const [path, search] = href.split("?");
+      const q = new URLSearchParams(search ?? "");
+      if (patch.ctx !== undefined) {
+        if (patch.ctx === null || patch.ctx === "") q.delete("ctx");
+        else q.set("ctx", patch.ctx);
+      }
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
@@ -83,10 +100,11 @@ export default function AppShell({
         if (patch.record === null) q.delete("record");
         else q.set("record", patch.record);
       }
+      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"));
       const s = q.toString();
-      navigate(href.split("?")[0] + (s ? `?${s}` : ""), { replace: false });
+      navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
-    [href],
+    [href, installId],
   );
 
   // Verified installation/context receipts. An operator-only read: an
@@ -107,11 +125,6 @@ export default function AppShell({
         if (controller.signal.aborted) return;
         setInstallation(next);
         setContexts(nextContexts);
-        const selected = initialContext(
-          installId,
-          nextContexts.filter((c) => c.state === "active").map((c) => c.id),
-        );
-        setContextId(selected);
       })
       .catch((e: unknown) => {
         if (!controller.signal.aborted) {
@@ -124,31 +137,89 @@ export default function AppShell({
     return () => controller.abort();
   }, [installId, viewer.operator]);
 
-  // A new installation resets everything: stale selection and drafts
-  // must never follow the operator across an install boundary.
+  // Installation switch: stale outlet state must never follow the
+  // operator across the boundary. The first mount keeps direct links.
   useEffect(() => {
+    if (firstInstall.current === installId) return;
+    firstInstall.current = installId;
+    handledQuery.current = undefined;
     setInstallation(null);
     setContexts([]);
     setLoadError(null);
+    setLinkNotice(null);
+    setContextId("");
+    writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installId]);
+
+  const activeIds = useMemo(
+    () => contexts.filter((c) => c.state === "active").map((c) => c.id),
+    [contexts],
+  );
+
+  // Adopt the URL's context once contexts load, and on later external
+  // URL changes (browser back). A linked context must be active here;
+  // a stale, inactive or ambiguous link clears the selection with a
+  // notice instead of guessing. Malformed record ids are stripped.
+  useEffect(() => {
+    if (loading || installation === null) return;
+    const urlCtx = query.get("ctx");
+    const urlRecord = query.get("record");
+    const urlView = query.get("appview");
+    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView)) return;
+    handledQuery.current = queryKey(urlCtx, urlRecord, urlView);
+    if (urlRecord !== null) {
+      try {
+        assertRecordId(urlRecord);
+      } catch {
+        writeQuery({ record: null }, { replace: true });
+        return;
+      }
+    }
+    if (urlCtx !== null && !activeIds.includes(urlCtx)) {
+      setContextId(initialContext(installId, activeIds));
+      setLinkNotice(
+        "The linked context is not active in this installation — the selection was cleared.",
+      );
+      writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
+      return;
+    }
+    if (urlCtx !== null) {
+      setContextId(urlCtx);
+      rememberContext(installId, urlCtx);
+      setLinkNotice(null);
+      return;
+    }
+    // No linked context: a record link without scope is ambiguous.
+    if (urlRecord !== null) {
+      setLinkNotice("The record link names no context — the selection was cleared.");
+      setContextId(initialContext(installId, activeIds));
+      writeQuery({ record: null }, { replace: true });
+      return;
+    }
+    setContextId(initialContext(installId, activeIds));
+  }, [loading, installation, activeIds, query, installId, writeQuery]);
 
   const pickContext = useCallback(
     (next: string) => {
       if (next === contextId) return;
       setContextId(next);
       rememberContext(installId, next);
+      setLinkNotice(null);
       // Context switch clears the selected record and returns the
-      // outlet to the list — drafts live in the outlet and unmount
-      // with it, so nothing unsaved survives the switch.
-      setQuery({ appview: null, record: null });
+      // outlet to the list — the outlet remounts on the scope key, so
+      // no unsaved draft survives the switch.
+      writeQuery({ ctx: next === "" ? null : next, appview: null, record: null });
     },
-    [contextId, installId, setQuery],
+    [contextId, installId, writeQuery],
   );
 
-  // Escape closes the narrow chat drawer and returns focus to its trigger.
+  // Narrow drawer focus: opening moves into the pane, closing returns
+  // to the trigger. The closed drawer is `visibility: hidden`, so it
+  // stays out of the tab order with the draft intact.
   useEffect(() => {
     if (!chatOpen) return;
-    chatCloseRef.current?.focus();
+    chatPaneRef.current?.querySelector("textarea")?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setChatOpen(false);
     };
@@ -159,6 +230,14 @@ export default function AppShell({
     };
   }, [chatOpen]);
 
+  // The App binding for chat sends: install plus the concrete context
+  // the shell owns (generic outlet) or the workspace screen owns
+  // (social, via its own remembered selection). Empty context sends
+  // plain chat — there is no App scope to bind.
+  const chatApp =
+    installation?.name === "social-content"
+      ? rememberedOrNull(installId)
+      : contextId || null;
   const scope: HostScope = { installId, contextId };
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
@@ -181,7 +260,7 @@ export default function AppShell({
           type="button"
           className="btn btn-secondary btn-sm app-shell-chat-toggle"
           aria-expanded={chatOpen}
-          aria-controls="app-shell-chat-drawer"
+          aria-controls="app-shell-chat"
           onClick={() => setChatOpen((o) => !o)}
         >
           Assistant chat
@@ -189,8 +268,30 @@ export default function AppShell({
       </div>
 
       <div className="app-shell-grid">
-        <div className="app-shell-chat" aria-label="Assistant chat">
-          <ChatPane viewer={viewer} contextLabel={contextLabel(contexts, contextId)} />
+        <div
+          id="app-shell-chat"
+          ref={chatPaneRef}
+          className="app-shell-chat"
+          aria-label="Assistant chat"
+          data-open={chatOpen || undefined}
+        >
+          <div className="app-shell-chat-head">
+            <strong className="text-cardtitle text-ink-100">Assistant</strong>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm app-shell-chat-close"
+              onClick={() => setChatOpen(false)}
+            >
+              Close chat
+            </button>
+          </div>
+          <ChatPane
+            viewer={viewer}
+            contextLabel={isSocial ? null : contextLabel(contexts, contextId)}
+            appScope={
+              chatApp ? { install_id: installId, context_id: chatApp } : null
+            }
+          />
         </div>
         <section className="app-shell-outlet" aria-label={`${title} workspace`}>
           {loading && (
@@ -223,35 +324,48 @@ export default function AppShell({
           )}
           {installation && (
             <>
-              <div className="app-shell-context">
-                <Select
-                  value={contextId}
-                  onChange={pickContext}
-                  options={[
-                    { value: "", label: "No context" },
-                    ...contexts
-                      .filter((c) => c.state === "active")
-                      .map((c) => ({ value: c.id, label: c.config.label })),
-                  ]}
-                  aria-label="App context"
-                  disabled={!viewer.operator || viewer.readOnly}
-                  full
-                />
-                <p className="num text-micro text-ink-500" title="Verified installation digest">
-                  {installId} · {installation.version}
+              {isSocial ? (
+                <p className="num text-micro text-ink-500">
+                  {installId} · {installation.version} · context is managed inside the workspace screen
                 </p>
-              </div>
+              ) : (
+                <div className="app-shell-context">
+                  <Select
+                    value={contextId}
+                    onChange={pickContext}
+                    options={[
+                      { value: "", label: "No context" },
+                      ...contexts
+                        .filter((c) => c.state === "active")
+                        .map((c) => ({ value: c.id, label: c.config.label })),
+                    ]}
+                    aria-label="App context"
+                    disabled={!viewer.operator || viewer.readOnly}
+                    full
+                  />
+                  <p className="num text-micro text-ink-500" title="Verified installation digest">
+                    {installId} · {installation.version}
+                  </p>
+                </div>
+              )}
+              {linkNotice && (
+                <p className="card px-4 py-3 text-label text-warn border-warn/40" role="alert">
+                  {linkNotice}
+                </p>
+              )}
               {isSocial && children ? (
                 children
               ) : (
                 <CrmOutlet
+                  key={`${installId}:${contextId}`}
                   scope={scope}
                   installationTitle={title}
+                  appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
                   recordId={recordId}
                   viewer={viewer}
-                  onView={(v) => setQuery({ appview: v === "list" ? null : v })}
-                  onSelect={(id) => setQuery({ record: id })}
+                  onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
+                  onSelect={(id) => writeQuery({ record: id })}
                 />
               )}
             </>
@@ -262,29 +376,12 @@ export default function AppShell({
       {chatOpen && (
         <div className="app-shell-scrim" onClick={() => setChatOpen(false)} aria-hidden="true" />
       )}
-      <div
-        id="app-shell-chat-drawer"
-        className="app-shell-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Assistant chat"
-        data-open={chatOpen || undefined}
-      >
-        <div className="app-shell-drawer-head">
-          <strong className="text-cardtitle text-ink-100">Assistant</strong>
-          <button
-            ref={chatCloseRef}
-            type="button"
-            className="btn btn-secondary btn-sm"
-            onClick={() => setChatOpen(false)}
-          >
-            Close chat
-          </button>
-        </div>
-        <ChatPane viewer={viewer} contextLabel={contextLabel(contexts, contextId)} />
-      </div>
     </div>
   );
+}
+
+function rememberedOrNull(installId: string): string | null {
+  return rememberedContext(installId) || null;
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
@@ -292,13 +389,39 @@ function contextLabel(contexts: AppContext[], contextId: string): string | null 
   return contexts.find((c) => c.id === contextId)?.config.label ?? null;
 }
 
+/** The daemon-stamped App binding on an entry's payload, if verified. */
+export function entryApp(payload: unknown): {
+  install_id: string;
+  context_id: string;
+} | null {
+  const app = (payload as { app?: unknown } | null)?.app;
+  if (!app || typeof app !== "object") return null;
+  const row = app as Record<string, unknown>;
+  if (row.verified !== true || typeof row.install_id !== "string" || typeof row.context_id !== "string") {
+    return null;
+  }
+  return { install_id: row.install_id, context_id: row.context_id };
+}
+
 /**
  * The actual master conversation in compact form: the same
  * `resources.masterThread` store Home reads and writes, streamed live
  * from `/api/threads/master/stream`. Whatever the operator says here
  * lands in the same thread Home shows — one conversation, two panes.
+ * Sends carry the shell's current installation/context; the daemon
+ * proves both against its store and stamps the verified binding on
+ * the entry — the chip below renders only that read-back stamp, never
+ * what was sent.
  */
-function ChatPane({ viewer, contextLabel }: { viewer: Viewer; contextLabel: string | null }) {
+function ChatPane({
+  viewer,
+  contextLabel,
+  appScope,
+}: {
+  viewer: Viewer;
+  contextLabel: string | null;
+  appScope: { install_id: string; context_id: string } | null;
+}) {
   const thread = useQuery(resources.masterThread);
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState<string | null>(null);
@@ -329,14 +452,15 @@ function ChatPane({ viewer, contextLabel }: { viewer: Viewer; contextLabel: stri
     setSendError(null);
     resources.masterThread.write((s) => addPending(s, message, body, Date.now()));
     api
-      .threadSend(MASTER, body, message)
+      .threadSend(MASTER, body, message, undefined, appScope ?? undefined)
       .then(() => {
         resources.masterThread.write((s) => settlePending(s, message, { ok: true }));
         void resources.masterState.refresh();
       })
-      .catch((e: ApiError) =>
-        resources.masterThread.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) })),
-      );
+      .catch((e: ApiError) => {
+        setSendError(e.message ?? String(e));
+        resources.masterThread.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
+      });
     setDraft("");
   };
 
@@ -412,9 +536,15 @@ function ChatPane({ viewer, contextLabel }: { viewer: Viewer; contextLabel: stri
 function ChatRow({ item }: { item: ReturnType<typeof threadItems>[number] }) {
   if (item.type === "operator" || item.type === "pending") {
     const text = item.type === "operator" ? item.entry.text : item.pending.text;
+    const bound = item.type === "operator" ? entryApp(item.entry.payload) : null;
     return (
       <p>
         <strong className="text-ink-200">You:</strong> {text}
+        {bound && (
+          <span className="chip ml-2" title={`Server-verified App context: ${bound.install_id}`}>
+            ✓ {bound.context_id}
+          </span>
+        )}
       </p>
     );
   }

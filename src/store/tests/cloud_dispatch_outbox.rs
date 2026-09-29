@@ -68,6 +68,7 @@ fn ordinary_local_plain_dispatch_never_creates_cloud_candidate() {
             &Sender::Unattributed,
             &Steer::NONE,
             None,
+            None,
         )
         .unwrap();
     assert!(!duplicate);
@@ -85,6 +86,7 @@ fn ordinary_local_plain_dispatch_never_creates_cloud_candidate() {
             Some(cwd.to_str().unwrap()),
             &Sender::Unattributed,
             &Steer::NONE,
+            None,
             None,
         )
         .unwrap();

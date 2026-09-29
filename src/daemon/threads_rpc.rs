@@ -85,10 +85,10 @@ impl Shared {
         if let Some(obj) = params.as_object() {
             if let Some(field) = obj
                 .keys()
-                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message" | "refs"))
+                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message" | "refs" | "app"))
             {
                 return Err(Error::rejected(format!(
-                    "thread send takes alias, text, message and refs only; field \
+                    "thread send takes alias, text, message, refs and app only; field \
                      '{field}' is not accepted"
                 )));
             }
@@ -113,6 +113,9 @@ impl Shared {
             }
         }
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-802: a raw `app` binding rides through; `send_as`
+        // proves it against the store and stamps the normalized form
+        // on the entry — one proving place for every caller.
         let mut send = params.clone();
         send["alias"] = json!(alias);
         send["source"] = json!("operator");

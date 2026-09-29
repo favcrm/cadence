@@ -331,6 +331,7 @@ fn message_entry<'a>(
     body: &'a str,
     id: &'a str,
     refs: Option<&Value>,
+    app: Option<&Value>,
 ) -> NewEntry<'a> {
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
@@ -339,6 +340,11 @@ fn message_entry<'a>(
     };
     if let Some(refs) = refs {
         payload["refs"] = refs.clone();
+    }
+    // CAD-802: the daemon-stamped App binding — verified server-side
+    // at send time, read back by the board and the master turn.
+    if let Some(app) = app {
+        payload["app"] = app.clone();
     }
     NewEntry {
         role,
@@ -568,6 +574,7 @@ impl Store {
     }
 
     /// The operator/system entry for a freshly queued message.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn thread_note_enqueued(
         tx: &Connection,
         alias: &str,
@@ -576,18 +583,37 @@ impl Store {
         body: &str,
         id: &str,
         refs: Option<&Value>,
+        app: Option<&Value>,
     ) -> Result<()> {
         if *sender == Sender::OperatorChat {
             Self::ensure_thread_in(tx, alias)?;
         }
-        Self::thread_append_in(tx, alias, message_entry(sender, source, body, id, refs))?;
+        Self::thread_append_in(
+            tx,
+            alias,
+            message_entry(sender, source, body, id, refs, app),
+        )?;
         Ok(())
+    }
+
+    /// The verified App binding the enqueue note for `id` recorded
+    /// (CAD-802), `None` when its payload carries none — the stored
+    /// side of the retry's content comparison.
+    pub(super) fn entry_app_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "app")
     }
 
     /// The refs the enqueue note for `id` recorded (CAD-574), `None`
     /// when its payload carries none — the stored side of the retry's
     /// content comparison.
     pub(super) fn entry_refs_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "refs")
+    }
+
+    /// One named field of the enqueue note's payload for `id`, `None`
+    /// when the payload carries none — the stored side of the retry's
+    /// content comparison.
+    fn entry_payload_field_in(tx: &Connection, id: &str, field: &str) -> Result<Option<Value>> {
         let first: Option<Option<String>> = tx
             .query_row(
                 "SELECT payload FROM thread_entries WHERE message_id=? \
@@ -599,7 +625,7 @@ impl Store {
         Ok(first
             .flatten()
             .and_then(|p| serde_json::from_str::<Value>(&p).ok())
-            .and_then(|v| v.get("refs").filter(|r| !r.is_null()).cloned()))
+            .and_then(|v| v.get(field).filter(|r| !r.is_null()).cloned()))
     }
 
     /// The `turn_result` entry for a finished message. The payload is

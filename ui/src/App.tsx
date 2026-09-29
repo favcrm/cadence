@@ -881,7 +881,7 @@ export default function App() {
           <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }}>
+          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }}>
             <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}

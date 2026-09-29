@@ -10,8 +10,11 @@
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
-//! - `POST /api/threads/<alias>/messages` `{"text", "message"?}` — the
-//!   operator's message, queued to the agent like `cadence send`.
+//! - `POST /api/threads/<alias>/messages` `{"text", "message"?, "app"?}` —
+//!   the operator's message, queued to the agent like `cadence send`.
+//!   `app` (`{install_id, context_id}`, CAD-802) is never authority:
+//!   the daemon proves both against its store and stamps the verified
+//!   binding on the entry.
 //!
 //! The POST instructs an agent. It passes the board's write guards, and
 //! a caller the board attributes to an agent (a pane, or a managed
@@ -43,6 +46,11 @@ struct ThreadMessageReq {
     text: String,
     /// Client-chosen id: a retried POST is the same message, not two.
     message: Option<String>,
+    /// CAD-802: the shell chat's current installation/context. Never
+    /// authority — the daemon resolves both against its store and
+    /// refuses unknown installs, unknown/archived contexts and any
+    /// extra key (including a browser-stamped `verified`).
+    app: Option<ThreadApp>,
     /// CAD-574: needs-me subjects the message cites (the rail's "Ask
     /// master"). The daemon's `thread_refs` is the strict side — this
     /// field only carries `{kind,id}` pairs through the relay.
@@ -54,6 +62,16 @@ struct ThreadMessageReq {
 struct ThreadRef {
     kind: String,
     id: String,
+}
+
+/// CAD-802: the shell chat's current App. The shape alone travels
+/// here — the daemon proves the installation and context against its
+/// own store and stamps the verified binding on the entry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadApp {
+    install_id: String,
+    context_id: String,
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one
@@ -271,6 +289,9 @@ pub(super) fn post_message(
             .iter()
             .map(|r| json!({"kind": r.kind, "id": r.id}))
             .collect::<Vec<_>>());
+    }
+    if let Some(app) = req.app {
+        params["app"] = json!({"install_id": app.install_id, "context_id": app.context_id});
     }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),

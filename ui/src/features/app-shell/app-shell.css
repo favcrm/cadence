@@ -1,4 +1,9 @@
-/* CAD-802 trusted shared App shell. Canonical board tokens only. */
+/* CAD-802 trusted shared App shell. Canonical board tokens only.
+ *
+ * One chat node serves both panes: the desktop left column and the
+ * narrow left drawer are one element restyled by breakpoint. The
+ * closed narrow drawer is `visibility: hidden`, so it leaves the tab
+ * order with the draft intact — no second pane, no second stream. */
 
 .app-shell {
   padding: 1rem 1rem 2.25rem;
@@ -34,16 +39,64 @@
   }
 }
 
-/* Desktop chat pane; the drawer carries narrow widths. */
+/* The single chat node: static left column on desktop, fixed left
+   sheet at narrow widths. */
 .app-shell-chat {
-  display: none;
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(22rem, 88dvw);
+  z-index: 50;
+  background: var(--color-ink-900);
+  border-right: 1px solid var(--color-ink-700);
+  padding: 0.9rem;
+  overflow-y: auto;
+  transform: translateX(-105%);
+  visibility: hidden;
+  transition: transform 0.2s ease, visibility 0.2s;
+}
+
+.app-shell-chat[data-open] {
+  transform: translateX(0);
+  visibility: visible;
 }
 
 @media (min-width: 1024px) {
   .app-shell-chat {
-    display: block;
     position: sticky;
     top: 4.5rem;
+    width: auto;
+    z-index: auto;
+    background: transparent;
+    border-right: 0;
+    padding: 0;
+    overflow-y: visible;
+    transform: none;
+    visibility: visible;
+    transition: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-shell-chat {
+    transition: none;
+  }
+}
+
+/* Drawer chrome exists only at narrow widths; the desktop pane is
+   labelled by the pane itself. */
+.app-shell-chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+@media (min-width: 1024px) {
+  .app-shell-chat-head {
+    display: none;
   }
 }
 
@@ -53,6 +106,19 @@
 
 @media (min-width: 1024px) {
   .app-shell-chat-toggle {
+    display: none;
+  }
+}
+
+.app-shell-scrim {
+  position: fixed;
+  inset: 0;
+  background: var(--color-scrim);
+  z-index: 40;
+}
+
+@media (min-width: 1024px) {
+  .app-shell-scrim {
     display: none;
   }
 }
@@ -161,59 +227,6 @@
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.5rem;
-}
-
-/* Narrow-width chat drawer: fixed left sheet with scrim. */
-.app-shell-scrim {
-  position: fixed;
-  inset: 0;
-  background: var(--color-scrim);
-  z-index: 40;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-scrim {
-    display: none;
-  }
-}
-
-.app-shell-drawer {
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: min(22rem, 88dvw);
-  z-index: 50;
-  background: var(--color-ink-900);
-  border-right: 1px solid var(--color-ink-700);
-  padding: 0.9rem;
-  overflow-y: auto;
-  transform: translateX(-105%);
-  transition: transform 0.2s ease;
-}
-
-.app-shell-drawer[data-open] {
-  transform: translateX(0);
-}
-
-@media (min-width: 1024px) {
-  .app-shell-drawer {
-    display: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .app-shell-drawer {
-    transition: none;
-  }
-}
-
-.app-shell-drawer-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
 }
 
 .sr-only {
