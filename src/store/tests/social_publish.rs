@@ -494,6 +494,20 @@ fn cad771_posted_receipt_must_match_frozen_intent() {
         s.social_publish_show(&id).unwrap()["intent"]["state"],
         "processing"
     );
+    // Copied payload with forged permalink/IDs still fails: full
+    // receipt-to-outcome equality, not payload-only.
+    let mut copied = good.clone();
+    copied["permalink"] = json!("https://www.instagram.com/p/FORGED/");
+    copied["provider_ids"] = json!(["provider-post-9"]);
+    assert!(s
+        .social_publish_report(&id, "posted", &copied)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match trusted upstream evidence"));
+    assert_eq!(
+        s.social_publish_show(&id).unwrap()["intent"]["state"],
+        "processing"
+    );
     // The matching receipt posts.
     let posted = s.social_publish_report(&id, "posted", &good).unwrap();
     assert_eq!(posted["intent"]["state"], "posted");

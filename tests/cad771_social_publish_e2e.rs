@@ -664,6 +664,26 @@ fn cad771_e2e_forged_matching_receipt_fails_closed_without_trusted_evidence() {
         "processing"
     );
     assert_eq!(door.ledger.provider_calls(), 1);
+    // Copied evidence bytes with forged permalink and IDs still fail:
+    // full receipt-to-outcome equality against daemon-observed evidence.
+    let copied = h
+        .daemon
+        .operator_rpc(
+            "social_publish_report",
+            json!({"intent_id": claimed["intent"]["intent_id"], "decision": "posted",
+                "receipt": {"permalink": "https://www.instagram.com/p/FORGED/",
+                    "destination_id": intent["frozen"]["destination_id"],
+                    "caption_digest": intent["frozen"]["caption_digest"],
+                    "image_digest": intent["frozen"]["image_digest"],
+                    "provider_ids": ["provider-post-9"],
+                    "provider_payload": claimed["intent"]["upstream"]["provider_payload"]}}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        copied.contains("does not match trusted upstream evidence"),
+        "{copied}"
+    );
     // The true evidence bytes post.
     let evidence = &claimed["intent"]["upstream"];
     h.daemon

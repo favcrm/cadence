@@ -561,7 +561,15 @@ impl Store {
                         "no trusted upstream evidence; reconcile before reporting posted",
                     )
                 })?;
+            // Full receipt-to-outcome equality: payload-only comparison
+            // lets a copied payload with forged permalink or IDs pass.
+            // Every reported field must equal the daemon-observed outcome.
             if upstream["state"] != "posted"
+                || receipt["permalink"] != upstream["permalink"]
+                || receipt["provider_ids"] != upstream["provider_ids"]
+                || receipt_digest("destination_id") != frozen_digest("destination_id")
+                || receipt_digest("caption_digest") != frozen_digest("caption_digest")
+                || receipt_digest("image_digest") != frozen_digest("image_digest")
                 || receipt["provider_payload"].as_str() != upstream["provider_payload"].as_str()
                 || upstream["provider_payload"]
                     .as_str()
