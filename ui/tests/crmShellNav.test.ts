@@ -182,6 +182,12 @@ assert(/max-width:\s*100%/.test(block("\\.crm-table-wrap")), "wrap never exceeds
 assert(/overflow-wrap:\s*anywhere/.test(block("\\.crm-table th,\\s*\\.crm-table td")), "unbreakable tokens wrap in table cells");
 assert(/flex-wrap:\s*wrap/.test(block("\\.app-outlet-tabs")), "section tabs wrap at narrow widths");
 assert(/flex-wrap:\s*wrap/.test(block("\\.crm-pager")), "pager wraps at narrow widths");
+// CAD-784: the campaign preview source scrolls inside its own box
+// instead of pushing the document past narrow viewports, and the
+// scriptless visual frame never exceeds its column.
+assert(/max-width:\s*100%/.test(block("\\.crm-preview")), "preview source never exceeds its column");
+assert(/overflow:\s*auto/.test(block("\\.crm-preview")), "preview source scrolls internally");
+assert(/width:\s*100%/.test(block("\\.crm-preview-frame")), "visual frame fills but never exceeds its column");
 
 console.log("crm shell nav checks passed");
 }

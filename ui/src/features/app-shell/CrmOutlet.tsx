@@ -7,6 +7,9 @@ import type { HostScope } from "./hostActions";
 
 export type OutletView = "list" | "new";
 
+/** CRM nested sections under Apps → CRM (CAD-784). */
+export type CrmSection = "customers" | "segments" | "campaigns";
+
 /**
  * The installed-App outlet (CAD-802 shell, CAD-781 CRM Customers).
  * CRM installations render the real customer list/new/detail drawer;
@@ -19,9 +22,11 @@ export default function CrmOutlet({
   appKind,
   view,
   recordId,
+  section,
   viewer,
   onView,
   onSelect,
+  onSection,
   onRecordCreated,
 }: {
   scope: HostScope;
@@ -30,9 +35,12 @@ export default function CrmOutlet({
   appKind: "crm" | "generic";
   view: OutletView;
   recordId: string | null;
+  /** Nested CRM section from the route; generic Apps ignore it. */
+  section?: CrmSection;
   viewer: Viewer;
   onView: (view: OutletView) => void;
   onSelect: (recordId: string | null) => void;
+  onSection?: (section: CrmSection) => void;
   /** Atomic created-record landing (list + details in one URL write). */
   onRecordCreated?: (recordId: string) => void;
 }) {
@@ -43,8 +51,10 @@ export default function CrmOutlet({
         viewer={viewer}
         view={view}
         recordId={recordId}
+        section={section ?? "customers"}
         onView={onView}
         onSelect={onSelect}
+        onSection={onSection ?? (() => undefined)}
         onRecordCreated={onRecordCreated}
       />
     );

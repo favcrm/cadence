@@ -20,7 +20,7 @@ import {
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
-import CrmOutlet, { type OutletView } from "./CrmOutlet";
+import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import { assertRecordId, type HostScope } from "./hostActions";
 import "./app-shell.css";
 
@@ -72,6 +72,12 @@ export default function AppShell({
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
+  // CRM nested sections (CAD-784): Apps → CRM → Customers/Segments/
+  // Campaigns. Only the CRM outlet reads this — every other App keeps
+  // its generic list/detail/new shape untouched.
+  const rawSection = query.get("crm");
+  const crmSection: CrmSection =
+    rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   const [chatOpen, setChatOpen] = useState(false);
   const chatPaneRef = useRef<HTMLDivElement | null>(null);
   const chatOpenRef = useRef<HTMLButtonElement | null>(null);
@@ -83,11 +89,20 @@ export default function AppShell({
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
   // (direct links, browser back/forward) — never our own writes.
-  const queryKey = (ctx: string | null, record: string | null, appview: string | null) =>
-    `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}`;
+  const queryKey = (
+    ctx: string | null,
+    record: string | null,
+    appview: string | null,
+    crm: string | null,
+  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
   const writeQuery = useCallback(
     (
-      patch: { ctx?: string | null; appview?: OutletView | null; record?: string | null },
+      patch: {
+        ctx?: string | null;
+        appview?: OutletView | null;
+        record?: string | null;
+        crm?: CrmSection | null;
+      },
       opts?: { replace?: boolean },
     ) => {
       const [path, search] = href.split("?");
@@ -104,7 +119,11 @@ export default function AppShell({
         if (patch.record === null) q.delete("record");
         else q.set("record", patch.record);
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"));
+      if (patch.crm !== undefined) {
+        if (patch.crm === null || patch.crm === "customers") q.delete("crm");
+        else q.set("crm", patch.crm);
+      }
+      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
@@ -159,7 +178,7 @@ export default function AppShell({
     setLoadError(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, crm: null }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -188,8 +207,15 @@ export default function AppShell({
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView);
+    const urlCrm = query.get("crm");
+    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
+    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    // An unknown CRM section never renders: strip it back to the
+    // default instead of guessing a section.
+    if (urlCrm !== null && urlCrm !== "segments" && urlCrm !== "campaigns") {
+      writeQuery({ crm: null }, { replace: true });
+      return;
+    }
     if (urlRecord !== null) {
       try {
         assertRecordId(urlRecord);
@@ -392,9 +418,20 @@ export default function AppShell({
                   appKind={installation.name === "crm" ? "crm" : "generic"}
                   view={view}
                   recordId={recordId}
+                  section={crmSection}
                   viewer={viewer}
                   onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
                   onSelect={(id) => writeQuery({ record: id })}
+                  // Section switches clear the record view and drafts:
+                  // a customer drawer must never follow the operator
+                  // into Segments or Campaigns.
+                  onSection={(s) =>
+                    writeQuery({
+                      crm: s === "customers" ? null : s,
+                      appview: null,
+                      record: null,
+                    })
+                  }
                   // Created records land on list + details in ONE query
                   // write. Two sequential writes would each start from the
                   // stale render's href, so the second would re-apply the

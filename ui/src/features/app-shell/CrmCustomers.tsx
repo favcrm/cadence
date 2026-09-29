@@ -4,6 +4,9 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
+import CrmCampaigns from "./CrmCampaigns";
+import type { CrmSection } from "./CrmOutlet";
+import CrmSegments from "./CrmSegments";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -18,58 +21,42 @@ import {
 } from "./customerProfile";
 import { hostActions, type HostRecord, type HostScope } from "./hostActions";
 
-export type CrmSection = "customers" | "segments" | "campaigns";
-
 /**
- * The CRM workspace inside the trusted shared App shell (CAD-781).
- * Customers is the first real surface: server rows only, searchable
- * and paginated, with a separate New page and a right detail drawer.
- * Segments and Campaigns stay truthful placeholders until their
- * tickets land. The outlet remounts on every install/context switch
- * (the shell keys it on scope), so no search text, page cursor or
- * unsaved draft survives the boundary. Search text lives in component
- * state only — the route URL keeps scope (`ctx`, `record`) and never
- * customer content.
+ * The CRM workspace inside the trusted shared App shell (CAD-781
+ * Customers, CAD-784 Segments and Campaigns). Every section renders
+ * server rows only, with a separate New page and direct detail
+ * routes — no sample rows anywhere. The outlet remounts on every
+ * install/context switch (the shell keys it on scope), so no search
+ * text, page cursor or unsaved draft survives the boundary. The
+ * nested section itself lives in the route (`crm=`), so direct links
+ * and browser back keep it; switching sections clears the record
+ * view in the shell. Search text lives in component state only — the
+ * route URL keeps scope (`ctx`, `record`) and never record content.
  */
 export default function CrmShell({
   scope,
   viewer,
   view,
   recordId,
+  section,
   onView,
   onSelect,
+  onSection,
   onRecordCreated,
 }: {
   scope: HostScope;
   viewer: Viewer;
   view: "list" | "new";
   recordId: string | null;
+  section: CrmSection;
   onView: (view: "list" | "new") => void;
   onSelect: (recordId: string | null) => void;
+  onSection: (section: CrmSection) => void;
   onRecordCreated?: (recordId: string) => void;
 }) {
-  const [section, setSection] = useState<CrmSection>("customers");
   const canWrite = viewer.operator && !viewer.readOnly;
   return (
     <div className="app-outlet crm" data-outlet="crm">
-      <nav className="crm-crumb" aria-label="Breadcrumb">
-        <Link href="/apps" className="lnk text-label">
-          Apps
-        </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-300">CRM</span>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="text-label text-ink-100" aria-current="page">
-          {section === "customers" ? "Customers" : section === "segments" ? "Segments" : "Campaigns"}
-          {section === "customers" && view === "new" ? " / New" : ""}
-          {section === "customers" && recordId !== null ? " / Details" : ""}
-        </span>
-      </nav>
-
       <div className="app-outlet-tabs" role="tablist" aria-label="CRM sections">
         {(
           [
@@ -85,7 +72,7 @@ export default function CrmShell({
             aria-selected={section === key}
             className="app-outlet-tab"
             data-on={section === key || undefined}
-            onClick={() => setSection(key)}
+            onClick={() => onSection(key)}
           >
             {label}
           </button>
@@ -93,24 +80,47 @@ export default function CrmShell({
       </div>
 
       {section === "segments" && (
-        <section aria-label="Segments" className="card px-4 py-5" data-empty="segments">
-          <p className="font-medium text-ink-200">Segments arrive in a later ticket</p>
-          <p className="text-secondary text-ink-400 mt-1">
-            Saved-rule audiences and their current matches are outside this slice. This panel stays
-            empty until the server returns real rows — nothing here is sample data.
-          </p>
-        </section>
+        <CrmSegments
+          scope={scope}
+          viewer={viewer}
+          view={view}
+          recordId={recordId}
+          onView={onView}
+          onSelect={onSelect}
+          onRecordCreated={onRecordCreated}
+        />
       )}
       {section === "campaigns" && (
-        <section aria-label="Campaigns" className="card px-4 py-5" data-empty="campaigns">
-          <p className="font-medium text-ink-200">Campaigns arrive in a later ticket</p>
-          <p className="text-secondary text-ink-400 mt-1">
-            The campaign composer and SMTP sending are outside this slice. This panel stays empty
-            until the server returns real rows — nothing here is sample data.
-          </p>
-        </section>
+        <CrmCampaigns
+          scope={scope}
+          viewer={viewer}
+          view={view}
+          recordId={recordId}
+          onView={onView}
+          onSelect={onSelect}
+          onRecordCreated={onRecordCreated}
+        />
       )}
 
+      {section === "customers" && (
+        <nav className="crm-crumb" aria-label="Breadcrumb">
+          <Link href="/apps" className="lnk text-label">
+            Apps
+          </Link>
+          <span aria-hidden="true" className="text-ink-600">
+            /
+          </span>
+          <span className="text-label text-ink-300">CRM</span>
+          <span aria-hidden="true" className="text-ink-600">
+            /
+          </span>
+          <span className="text-label text-ink-100" aria-current="page">
+            Customers
+            {view === "new" ? " / New" : ""}
+            {recordId !== null ? " / Details" : ""}
+          </span>
+        </nav>
+      )}
       {section === "customers" && view === "list" && (
         <CustomerList
           scope={scope}

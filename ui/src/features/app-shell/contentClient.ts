@@ -133,14 +133,39 @@ async function post<T>(path: string, body: Record<string, unknown>): Promise<T> 
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
     body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-  return (await resp.json()) as T;
+  // Writes surface the host refusal verbatim: a stale revision or a
+  // refused draft must read as the server's reason, never a bare
+  // status. The receipt is validated below; a missing body 502s.
+  const value = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    const serverError = (value as { error?: unknown } | null)?.error;
+    throw new ApiError(
+      typeof serverError === "string" && serverError !== ""
+        ? serverError
+        : `${resp.status} ${resp.statusText}`.trim(),
+      resp.status,
+    );
+  }
+  if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
+  return value as T;
 }
 
 async function get<T>(path: string): Promise<T> {
   const resp = await fetch(path, { headers: { ...sessionHeaders() } });
-  if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-  return (await resp.json()) as T;
+  // Reads surface the host refusal verbatim (an unknown, foreign or
+  // stale ID must read as the server's reason, never a bare status).
+  const value = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    const serverError = (value as { error?: unknown } | null)?.error;
+    throw new ApiError(
+      typeof serverError === "string" && serverError !== ""
+        ? serverError
+        : `${resp.status} ${resp.statusText}`.trim(),
+      resp.status,
+    );
+  }
+  if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
+  return value as T;
 }
 
 export interface ContentDraftInput {
