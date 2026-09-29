@@ -94,6 +94,29 @@ const PASTE_SETTLE: Duration = Duration::from_millis(300);
 /// — a saturated host renders late — which is why a task message lands
 /// `unknown` (uncertainty discipline) rather than `failed`.
 const RENDER_DEADLINE: Duration = Duration::from_secs(4);
+
+/// Test override for [`RENDER_DEADLINE`]: `CADENCE_PTY_RENDER_DEADLINE_SECS`
+/// in `[1, 30]`s is used as is (tests shrink it through `in_own_process`
+/// — process env is shared across parallel tests); unset keeps the
+/// default, anything else warns and keeps it. The bound's value is
+/// production tuning against saturated hosts; the contract is the
+/// miss count/flags/park that follow, which any bound exercises.
+fn render_deadline() -> Duration {
+    const MIN_SECS: f64 = 1.0;
+    const MAX_SECS: f64 = 30.0;
+    let Some(raw) = std::env::var("CADENCE_PTY_RENDER_DEADLINE_SECS").ok() else {
+        return RENDER_DEADLINE;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if (MIN_SECS..=MAX_SECS).contains(&secs) => Duration::from_secs_f64(secs),
+        _ => {
+            eprintln!(
+                "pty render: CADENCE_PTY_RENDER_DEADLINE_SECS={raw:?} is not in [{MIN_SECS}, {MAX_SECS}]s; using the default {RENDER_DEADLINE:?}"
+            );
+            RENDER_DEADLINE
+        }
+    }
+}
 /// Slice of the pasted body used for the differential render check.
 /// The tail is what stays visible: a long input scrolls horizontally
 /// to the cursor, and a wrapped transcript ends with it.
@@ -1602,7 +1625,7 @@ impl ProviderAdapter for PtyAdapter {
         // A miss inside the bound is evidence of a dropped paste, never
         // proof; the daemon decides per message kind what a miss means.
         let render_started = Instant::now();
-        let mut render_decision = RenderDecision::new(RENDER_DEADLINE);
+        let mut render_decision = RenderDecision::new(render_deadline());
         loop {
             let styled = self.capture_visible_styled()?;
             let screen = sgr::strip(&styled);
@@ -2397,5 +2420,17 @@ mod tests {
         assert!(!briefing_available(&source, &exposed, Some(&helper)));
         std::fs::write(&helper, b"#!/bin/sh\nexit 2\n").unwrap();
         assert!(!briefing_available(&source, &exposed, Some(&helper)));
+    }
+}
+
+#[cfg(test)]
+mod render_deadline_tests {
+    use super::render_deadline;
+    use super::{Duration, RENDER_DEADLINE};
+
+    #[test]
+    fn render_deadline_defaults_to_four_seconds() {
+        assert_eq!(render_deadline(), RENDER_DEADLINE);
+        assert_eq!(RENDER_DEADLINE, Duration::from_secs(4));
     }
 }
