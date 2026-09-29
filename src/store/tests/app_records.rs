@@ -255,3 +255,59 @@ fn cad753_record_profile_validation_never_echoes_content() {
         );
     }
 }
+
+#[test]
+fn cad779_concurrent_creates_conflict_on_normalized_email() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    // Two writers enter together with two IDs behind one address
+    // (mixed case proves the fold). No preview layer stands between
+    // the calls: the write boundary itself must admit exactly one
+    // live row.
+    let barrier = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            store.app_record_create(
+                "ctx-1",
+                "customer-a",
+                &customer("Racer A", "Racer@Example.com"),
+            )
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            store.app_record_create(
+                "ctx-1",
+                "customer-b",
+                &customer("Racer B", "racer@example.com"),
+            )
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    // Exactly one create wins; the loser names the conflict without
+    // echoing the address.
+    let wins = [&first, &second].iter().filter(|done| done.is_ok()).count();
+    assert_eq!(wins, 1, "email race planted two live rows");
+    let refused = match (&first, &second) {
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => error.to_string(),
+        _ => unreachable!("wins == 1 proves exactly one loser"),
+    };
+    assert!(
+        refused.contains("another record"),
+        "loser refused unclearly: {refused}"
+    );
+    assert!(
+        !refused.contains("Racer@") && !refused.contains("racer@"),
+        "address leaked in refusal: {refused}"
+    );
+    let listed = store.app_record_list("ctx-1").unwrap();
+    let records = listed["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "second live row survived");
+    assert_eq!(
+        records[0]["profile"]["email"]
+            .as_str()
+            .unwrap()
+            .to_lowercase(),
+        "racer@example.com"
+    );
+}

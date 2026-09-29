@@ -1237,20 +1237,26 @@ fn cad779_csv_concurrent_imports_conflict_on_email_without_second_row() {
             second.join().unwrap().unwrap(),
         )
     });
-    // Exactly one create wins across both receipts; the loser records
-    // a recoverable duplicate outcome instead of a second live row.
+    // Exactly one create wins across both receipts. The loser either
+    // fails at apply time with a duplicate receipt (its plan predates
+    // the winner's commit) or skips conservatively at plan time (its
+    // plan already sees the winner): the contract guarantees one live
+    // row and a recoverable loser receipt either way.
     let applied = left["summary"]["applied"].as_i64().unwrap()
         + right["summary"]["applied"].as_i64().unwrap();
     assert_eq!(applied, 1, "email race planted two rows: {left} {right}");
-    let duplicates = [&left, &right]
-        .iter()
-        .flat_map(|result| result["rows"].as_array().unwrap().clone())
-        .filter(|row| row["outcome"] == "failed" && row["reason"] == "duplicate email")
-        .count();
-    assert_eq!(
-        duplicates, 1,
-        "loser left no duplicate receipt: {left} {right}"
-    );
+    for result in [&left, &right] {
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "receipt lost its row: {result}");
+        if result["summary"]["applied"].as_i64().unwrap() == 0 {
+            let outcome = rows[0]["outcome"].as_str().unwrap();
+            assert!(
+                (outcome == "failed" && rows[0]["reason"] == "duplicate email")
+                    || outcome == "skipped",
+                "loser left no recoverable receipt: {result}"
+            );
+        }
+    }
     let listed = w
         .daemon
         .operator_rpc(
