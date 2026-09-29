@@ -1,11 +1,11 @@
 # External agents doing social management
 
 An operator-provisioned person or AI agent off-host can do Social
-Content work through Cadence: draft quoted runs the operator
-reviews, while every send stays a human approval. This guide is the
-one written path; inventing another access shape (shared
-credentials, the operator secret, a pasted provider token) is not a
-shortcut.
+Content work through Cadence: the operator creates quoted runs the
+agent executes, the operator reviews receipts, and every send stays
+a human approval. This guide is the one written path; inventing
+another access shape (shared credentials, the operator secret, a
+pasted provider token) is not a shortcut.
 
 ## Prerequisites
 
@@ -51,32 +51,37 @@ cadence agent register <reviewer> --provider <p> --endpoint <k> \
 ```
 
 ```sh
+# The operator creates the run; the team rides the inputs and is
+# validated at create time against one owner group.
 cadence app run create <install> --workflow instagram \
   --inputs ./inputs.json --request-id <unique> --owner-pm <pm>
 ```
 
 Create refuses workers outside the owner group, non-distinct
 writer/reviewer, and unenrolled providers (PTY and remote endpoints
-are unsupported for runs). `app catalog approve` approves local
-capabilities; it does not derive team grants. (`app set-team` and
-`app approve` with grant derivation are the legacy project-app
-verbs — different syntax, different path.) Writer and reviewer must
-differ; the same alias never holds both roles on one run. Agents get
-no admin verbs: no `connection create/rotate/revoke`, no approvals,
-no grant widening.
+are unsupported for runs). The agent never creates runs — it executes
+its assigned produce/review steps from the kickoff it is sent.
+`app catalog approve` approves local capabilities; it does not derive
+team grants. (`app set-team` and `app approve` with grant derivation
+are the legacy project-app verbs — different syntax, different path.)
+Writer and reviewer must differ; the same alias never holds both roles
+on one run. Agents get no admin verbs: no `connection
+create/rotate/revoke`, no approvals, no grant widening.
 
 ## Allowed vs forbidden
 
-An agent may: create quoted runs, produce drafts, fetch its assigned
-receipts and retained artifacts, report results.
+An agent may: execute its assigned produce/review steps (including
+assigned-turn artifact and capability reads with its message and turn
+token), report results.
 
-An agent may never: approve its own (or any) run, release a send,
-select or alter a destination, mint a session, rotate/revoke
-anything, or approve a schedule. Connection, catalog and install
-reads need operator proof — they are the operator's checks, not the
-agent's. Sends execute only after the operator's digest-pinned
-approval in the board (CAD-771); revocation closes affected waiting
-effects with reason `grant_revoked` through the custody lifecycle.
+An agent may never: create a run, approve its own (or any) run,
+release a send, select or alter a destination, mint a session,
+rotate/revoke anything, or approve a schedule. Run creation,
+connection, catalog and install reads, and receipt fetches need
+operator proof — they are the operator's checks, not the agent's.
+Sends execute only after the operator's digest-pinned approval in the
+board (CAD-771); revocation closes affected waiting effects with
+reason `grant_revoked` through the custody lifecycle.
 
 ## Pre-flight: prove attribution before first work
 
@@ -111,5 +116,6 @@ tests — this guide's agents are interactive CLI users.
 
 Remove the alias (or its group membership), revoke affected
 approvals, close its access. Verify as the operator: its sessions
-are gone from `cadence ui sessions`, its pendings settle expired,
-and its next call is refused as an unknown/ungranted caller.
+are gone from `cadence ui sessions`, its waiting effects close with
+reason `grant_revoked`, and its next call is refused as an
+unknown/ungranted caller.
