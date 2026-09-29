@@ -26,12 +26,13 @@ on:
         description: Main CI artifact for the previous production release (migration rehearsal)
         required: true
         type: string
-  # CAD-770 bounded release train: every 15 minutes the selector picks at
-  # most the newest eligible attested main candidate and pins its identity.
+  # CAD-770 bounded release train: every 15 minutes, offset from the hour
+  # boundary to reduce GitHub schedule delays/drops under high load, the
+  # selector picks at most the newest eligible attested main candidate.
   # Ticks coalesce: an in-flight staging run or an unchanged candidate
   # skips without work, and refusal (no baseline, no candidate) stays green.
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '7,22,37,52 * * * *'
 
 permissions:
   contents: read
