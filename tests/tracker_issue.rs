@@ -209,12 +209,14 @@ fn issue_start_job_opens_scoped_task() {
     // The tracker's pre-commit hook runs `cadence` from PATH — the
     // just-built binary must come first.
     let cli = |state: &Path, args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(state)
-            .args(args)
+        // `operator_output` (CAD-482): `issue start --job` reaches
+        // `job_new`, whose caller rule refuses a daemon descendant —
+        // and every child of this in-process fixture descends from
+        // "the daemon". The seam carries the operator assertion; on a
+        // build without it the call detaches like a real operator
+        // shell.
+        let out = cadence_at_cmd(&home, state, args)
             .env("CADENCE_PM_DIR", &pm)
-            .env("HOME", &home)
             .env(
                 "PATH",
                 format!(
@@ -223,8 +225,7 @@ fn issue_start_job_opens_scoped_task() {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
-            .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()

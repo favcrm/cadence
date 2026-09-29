@@ -52,17 +52,19 @@ impl Shared {
                 )));
             }
         }
-        let actor = match self.slot_identity(peer_pid)? {
-            Some(who) => who.lane().to_string(),
-            None => match self.operator_evidence(peer_pid) {
-                Ok(()) => "operator".to_string(),
-                Err(why) => {
-                    return Err(Error::rejected(format!(
-                        "plan propose needs an attributable caller — a pane agent, an \
-                         enrolled managed endpoint or the proven operator: {why}"
-                    )))
-                }
-            },
+        // CAD-422: the one caller verifier attributes the actor — a
+        // derived agent names itself; the proven operator is "operator";
+        // an ambiguous or unproven connection refuses rather than
+        // falling back to a weaker signal.
+        let actor = match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Agent(alias) => alias,
+            caller_rule::Who::Operator => "operator".to_string(),
+            caller_rule::Who::Unproven(why) => {
+                return Err(Error::rejected(format!(
+                    "plan propose needs an attributable caller — a pane agent, an \
+                     enrolled managed endpoint or the proven operator: {why}"
+                )))
+            }
         };
         let project = required_str(params, "project")?;
         // `project` joins the pm dir on the workflow path — it is a key,
@@ -350,17 +352,16 @@ impl Shared {
                 )?;
                 return Ok("operator".to_string());
             }
-            match self.slot_identity(peer_pid)? {
-                Some(who) => Ok(who.lane().to_string()),
-                None => self
-                    .operator_evidence(peer_pid)
-                    .map(|()| "operator".to_string())
-                    .map_err(|why| {
-                        Error::rejected(format!(
-                            "stage move needs an attributable caller — a pane agent, an \
-                             enrolled managed endpoint or the proven operator: {why}"
-                        ))
-                    }),
+            // CAD-422: the one caller verifier attributes the mover —
+            // a derived agent names itself; the proven operator is
+            // "operator"; an ambiguous or unproven connection refuses.
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Agent(alias) => Ok(alias),
+                caller_rule::Who::Operator => Ok("operator".to_string()),
+                caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
+                    "stage move needs an attributable caller — a pane agent, an \
+                     enrolled managed endpoint or the proven operator: {why}"
+                ))),
             }
         })?;
         let _ = self

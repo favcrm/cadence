@@ -3951,23 +3951,27 @@ fn task_reopen_is_the_operator_or_the_jobs_pm() {
     plant_pane(&d, "pm2", other_pm.pid());
 
     let reopen = json!({"task": "j1-a"});
+    // CAD-422: the caller rule binds job/task verbs to the job's PM, so
+    // every non-PM agent — assignee included — is refused at the gate
+    // with the PM refusal; the assignee check remains for the one case
+    // the gate admits: a PM assigned to its own task.
     for (shell, who, rule) in [
-        (&mut worker, "assignee", "is the task's assignee"),
-        (&mut peer, "peer", "is not job 'j1''s PM"),
-        (&mut other_pm, "other PM", "is not job 'j1''s PM"),
+        (&mut worker, "assignee", "is not job 'j1's PM"),
+        (&mut peer, "peer", "is not job 'j1's PM"),
+        (&mut other_pm, "other PM", "is not job 'j1's PM"),
     ] {
         let r = shell.rpc(&d.state, "task_reopen", reopen.clone());
-        assert_refused(&r, "job task reopen", rule, who);
+        assert_refused(&r, "task reopen", rule, who);
         for (field, value) in FORGED_IDENTITY
             .iter()
             .chain(&[("by", "pm"), ("pane", "pm")])
         {
             let r = shell.rpc(&d.state, "task_reopen", forged(&reopen, field, value));
-            // Refused either for the field itself or, for a field the
-            // gate does not list (`owner`), by the caller rule.
+            // Refused by the caller rule — an agent forging any
+            // identity field is "attributed to itself".
             assert_refused(
                 &r,
-                "job task reopen",
+                "task reopen",
                 "",
                 &format!("{who} forging {field}={value}"),
             );
@@ -3975,11 +3979,17 @@ fn task_reopen_is_the_operator_or_the_jobs_pm() {
     }
     // The PM itself cannot name someone else either.
     let r = pm.rpc(&d.state, "task_reopen", forged(&reopen, "by", "operator"));
+    assert_refused(&r, "task reopen", "attributed to itself", "pm forging by");
+    // And a PM assigned to its own task still hits the handler's
+    // assignee refusal — the gate admits it as the job's PM, so this
+    // is the one caller the assignee check still sees (CAD-373).
+    d.task_new_ac("j1", "j1-c", "pm", "ok").unwrap();
+    let r = pm.rpc(&d.state, "task_reopen", json!({"task": "j1-c"}));
     assert_refused(
         &r,
         "job task reopen",
-        "'by' is not accepted",
-        "pm forging by",
+        "is the task's assignee",
+        "pm assigned to its own task",
     );
     assert_eq!(d.task_state("j1-a"), "blocked");
 
@@ -4855,4 +4865,492 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
     let jobs = jobs["jobs"].as_array().unwrap();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0]["issue"], "D-2", "{jobs:?}");
+}
+
+// ==================== CAD-422: the remaining ungated authority paths ====================
+//
+// `job_new` and `monitor_heartbeat` were `Unguarded`; `task_new`,
+// `task_dispatch`, `task_accept`, `task_sha`, `task_fail`,
+// `task_reopen`, `task_cancel`, `job_cancel` and `job_close` were
+// `Attributed` — any registered agent could run them. All are now bound
+// to the job's PM (`Rule::OnJob`, a registration that predates the job)
+// or to a handler that names its own proof. These tests assert an agent
+// caller, a detached/unproven caller, concurrent callers and a forged
+// `by` field — the seam asserts identities in-band, identically in a
+// pane and in CI (CAD-482).
+
+/// `job_new`: an agent creates a job only under its own PM alias;
+/// the operator creates jobs for anyone; a detached caller and a
+/// forged identity field are refused.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_job_new_binds_the_calling_agent() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("w1");
+    let (spec, sha) = d.spec_file("spec.md", "agent-authored job");
+
+    // The PM creates its own job.
+    let own = d.agent_rpc(
+        "pm",
+        "job_new",
+        json!({"pm": "pm", "job": "j-own", "spec": spec, "spec_sha256": sha}),
+    );
+    assert!(own.is_ok(), "a PM creates its own job: {own:?}");
+    assert_eq!(own.unwrap()["job"]["pm"], "pm");
+
+    // The same agent cannot create a job naming another PM — that
+    // would bind a stranger to work the caller chose.
+    let err = d
+        .agent_rpc(
+            "pm",
+            "job_new",
+            json!({"pm": "w1", "job": "j-other", "spec": spec, "spec_sha256": sha}),
+        )
+        .expect_err("an agent may not PM a job to another alias");
+    assert!(
+        err.to_string().contains("only under its own PM alias"),
+        "{err}"
+    );
+    assert!(d.rpc("job_show", json!({"job": "j-other"})).is_err());
+
+    // A forged `by` field is refused, not stamped over.
+    let err = d
+        .agent_rpc(
+            "pm",
+            "job_new",
+            json!({"pm": "pm", "job": "j-forged", "spec": spec,
+                   "spec_sha256": sha, "by": "operator"}),
+        )
+        .expect_err("a forged identity field must refuse");
+    assert!(err.to_string().contains("caller identity"), "{err}");
+
+    // A detached, unproven caller creates nothing.
+    let err = d
+        .unproven_rpc(
+            "job_new",
+            json!({"pm": "pm", "job": "j-unproven", "spec": spec,
+                   "spec_sha256": sha}),
+        )
+        .expect_err("an unproven caller must be refused");
+    assert!(
+        err.to_string().contains("not provably the operator"),
+        "{err}"
+    );
+
+    // The operator still creates a job for any registered PM.
+    let op = d.operator_rpc(
+        "job_new",
+        json!({"pm": "w1", "job": "j-op", "spec": spec, "spec_sha256": sha}),
+    );
+    assert!(op.is_ok(), "the operator creates jobs for others: {op:?}");
+}
+
+/// The job/task verbs bind the job's recorded PM: a stranger agent, a
+/// peer PM and a detached caller are refused at the caller rule; the
+/// job's own PM and the operator pass. `task` params resolve through
+/// the owning job.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_job_task_verbs_bind_the_job_pm() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("pm2");
+    d.register_member("w1", "pm");
+    let (spec, sha) = d.spec_file("spec.md", "bind job verbs");
+    d.operator_rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha}),
+    )
+    .unwrap();
+
+    // A worker of the job's group is still a stranger to the job's
+    // authority — the PM alone runs its verbs.
+    for (method, params) in [
+        ("task_sha", json!({"task": "j1-t1", "sha": "abc123"})),
+        ("task_dispatch", json!({"task": "j1-t1"})),
+        (
+            "task_new",
+            json!({"job": "j1", "task": "j1-x", "assignee": "w1"}),
+        ),
+        ("job_cancel", json!({"job": "j1"})),
+        ("job_close", json!({"job": "j1"})),
+    ] {
+        let err = d
+            .agent_rpc("w1", method, params)
+            .expect_err("{method}: the assignee is not the job's PM");
+        assert!(
+            err.to_string().contains("is not job 'j1's PM"),
+            "{method}: {err}"
+        );
+    }
+    // A peer group's PM is equally a stranger to this job.
+    let err = d
+        .agent_rpc("pm2", "task_dispatch", json!({"task": "j1-t1"}))
+        .expect_err("a peer PM may not run another job's task_dispatch");
+    assert!(err.to_string().contains("is not job 'j1's PM"), "{err}");
+
+    // A detached caller (setsid'd child, env it cannot prove) is
+    // refused on the same verbs.
+    let err = d
+        .unproven_rpc("job_cancel", json!({"job": "j1"}))
+        .expect_err("unproven callers never reach a job verb");
+    assert!(
+        err.to_string().contains("not provably the operator"),
+        "{err}"
+    );
+
+    // A forged `by` names another agent: refused before the stamp.
+    let err = d
+        .agent_rpc(
+            "pm",
+            "task_sha",
+            json!({"task": "j1-t1", "sha": "abc123", "by": "pm2"}),
+        )
+        .expect_err("a forged `by` must refuse");
+    assert!(err.to_string().contains("attributed to itself"), "{err}");
+
+    // An unknown job or task names no binding at all — refused.
+    assert!(
+        d.agent_rpc("pm", "job_cancel", json!({"job": "ghost"}))
+            .is_err(),
+        "an unknown job refuses"
+    );
+    assert!(
+        d.agent_rpc("pm", "task_sha", json!({"task": "ghost", "sha": "abc123"}))
+            .is_err(),
+        "an unknown task refuses"
+    );
+
+    // The job's own PM runs its verbs — `task_new` and `task_cancel`
+    // succeed end to end.
+    let created = d.agent_rpc(
+        "pm",
+        "task_new",
+        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
+                   "acceptance": "ok"}),
+    );
+    assert!(created.is_ok(), "the job's PM adds a task: {created:?}");
+    let cancelled = d.agent_rpc("pm", "task_cancel", json!({"task": "j1-t2"}));
+    assert!(
+        cancelled.is_ok(),
+        "the job's PM cancels a task: {cancelled:?}"
+    );
+
+    // The operator runs them too — `job_cancel` abandons a job with
+    // open tasks (`job_close` requires them done).
+    let cancelled = d.operator_rpc("job_cancel", json!({"job": "j1"}));
+    assert!(
+        cancelled.is_ok(),
+        "the operator cancels a job: {cancelled:?}"
+    );
+}
+
+/// A PM's authority is bound to a registration that predates the job:
+/// remove and re-register the alias and it inherits nothing — the new
+/// row postdates the job, so its verbs refuse; a job created after the
+/// re-registration binds it normally.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_reregistered_pm_inherits_nothing() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    let (spec, sha) = d.spec_file("spec.md", "re-registration bind");
+    d.operator_rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j-old", "spec": spec, "spec_sha256": sha}),
+    )
+    .unwrap();
+    // Sanity: the live registration runs the job's verbs.
+    assert!(d
+        .agent_rpc(
+            "pm",
+            "task_new",
+            json!({"job": "j-old", "task": "j-old-t9",
+                                           "assignee": "pm"})
+        )
+        .is_ok());
+
+    // The operator stops, removes and re-registers the alias — a new
+    // row, a later `created`.
+    d.operator_rpc("agent_stop", json!({"alias": "pm"}))
+        .unwrap();
+    d.wait_agent("pm", "stopped", 15);
+    d.operator_rpc("agent_remove", json!({"alias": "pm", "force": true}))
+        .unwrap();
+    d.register("pm");
+
+    let err = d
+        .agent_rpc("pm", "job_close", json!({"job": "j-old"}))
+        .expect_err("a re-registered alias inherits nothing");
+    assert!(
+        err.to_string().contains("names no registration predating"),
+        "{err}"
+    );
+    let err = d
+        .agent_rpc(
+            "pm",
+            "task_new",
+            json!({"job": "j-old", "task": "j-old-t10", "assignee": "pm"}),
+        )
+        .expect_err("task_new on the old job refuses too");
+    assert!(
+        err.to_string().contains("names no registration predating"),
+        "{err}"
+    );
+
+    // A job created after the re-registration binds the new row.
+    d.operator_rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j-new", "spec": spec, "spec_sha256": sha}),
+    )
+    .unwrap();
+    assert!(
+        d.agent_rpc(
+            "pm",
+            "task_new",
+            json!({"job": "j-new", "task": "j-new-t9", "assignee": "pm"}),
+        )
+        .is_ok(),
+        "the fresh registration runs jobs created after it"
+    );
+}
+
+/// `monitor_register`: an agent may register coverage (its `owner` is
+/// stamped) but may never arm `dispatch_enabled` or
+/// `auto_dispatch_enabled` — those bypass the operator-only
+/// `monitor_dispatch` gate. `monitor_heartbeat` is the operator's or
+/// the bound owner's.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_monitor_dispatch_flags_and_heartbeat() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("w1");
+    let (spec, sha) = d.spec_file("spec.md", "monitor gating");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.operator_rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "mj", "spec": spec, "spec_sha256": sha,
+               "repo": project}),
+    )
+    .unwrap();
+    // `job_new` minted the default task `mj-t1`; the monitor covers it.
+
+    // An agent cannot arm either dispatch flag.
+    for flag in ["dispatch_enabled", "auto_dispatch_enabled"] {
+        let err = d
+            .agent_rpc(
+                "pm",
+                "monitor_register",
+                json!({"monitor": format!("armed-{flag}"), "project": project,
+                       "tasks": ["mj-t1"], "interval_secs": 60, flag: true}),
+            )
+            .expect_err("{flag}: an agent may not arm dispatch");
+        assert!(
+            err.to_string().contains("may not enable dispatch flags"),
+            "{flag}: {err}"
+        );
+    }
+
+    // Without the flags the agent registers coverage; the caller rule
+    // stamps `owner` to the calling alias.
+    let registered = d
+        .agent_rpc(
+            "pm",
+            "monitor_register",
+            json!({"monitor": "m1", "project": project, "owner": "pm",
+                   "tasks": ["mj-t1"], "interval_secs": 60}),
+        )
+        .unwrap();
+    assert_eq!(registered["monitor"]["owner"], "pm");
+    assert_eq!(registered["monitor"]["dispatch_enabled"], false);
+
+    // Heartbeat: the owner passes, a stranger agent and a detached
+    // caller are refused, the operator passes.
+    let err = d
+        .agent_rpc("w1", "monitor_heartbeat", json!({"monitor": "m1"}))
+        .expect_err("a stranger may not ping another's monitor");
+    assert!(
+        err.to_string().contains("is not monitor 'm1's owner"),
+        "{err}"
+    );
+    assert!(d
+        .agent_rpc("pm", "monitor_heartbeat", json!({"monitor": "m1"}))
+        .is_ok());
+    assert!(d
+        .operator_rpc("monitor_heartbeat", json!({"monitor": "m1"}))
+        .is_ok());
+    let err = d
+        .unproven_rpc("monitor_heartbeat", json!({"monitor": "m1"}))
+        .expect_err("an unproven caller never heartbeats");
+    assert!(
+        err.to_string().contains("not provably the operator"),
+        "{err}"
+    );
+
+    // Re-registered owner: the new row postdates the monitor.
+    d.operator_rpc("agent_stop", json!({"alias": "pm"}))
+        .unwrap();
+    d.wait_agent("pm", "stopped", 15);
+    d.operator_rpc("agent_remove", json!({"alias": "pm", "force": true}))
+        .unwrap();
+    d.register("pm");
+    let err = d
+        .agent_rpc("pm", "monitor_heartbeat", json!({"monitor": "m1"}))
+        .expect_err("a re-registered owner inherits nothing");
+    assert!(
+        err.to_string().contains("is not monitor 'm1's owner"),
+        "{err}"
+    );
+}
+
+/// Three callers racing the same gated verb get each their own answer:
+/// the job's PM admitted, a stranger refused with the PM refusal, an
+/// unproven caller refused with the unattributed refusal — never a
+/// neighbor's fate.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_concurrent_callers_get_their_own_answers() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    let (spec, sha) = d.spec_file("spec.md", "racing the job gate");
+    d.operator_rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "jrace", "spec": spec, "spec_sha256": sha}),
+    )
+    .unwrap();
+
+    let state = d.state.clone();
+    let barrier = Arc::new(Barrier::new(3));
+    let run = move |who: &'static str, slug: &'static str, ok: Option<&'static str>| {
+        let (state, barrier) = (state.clone(), barrier.clone());
+        std::thread::spawn(move || {
+            for i in 0..6 {
+                barrier.wait();
+                let params = json!({"job": "jrace",
+                                    "task": format!("jrace-{slug}-{i}"),
+                                    "assignee": "w1"});
+                let r = client_rpc_as(&state, who, "task_new", params);
+                match ok {
+                    None => assert!(r.is_ok(), "{who} refused: {r:?}"),
+                    Some(want) => {
+                        let err = r.expect_err("{who} must refuse");
+                        assert!(err.to_string().contains(want), "{who}: {err} (want {want})");
+                    }
+                }
+            }
+        })
+    };
+    let pm = run("agent:pm", "pm", None);
+    let w1 = run("agent:w1", "w1", Some("is not job 'jrace's PM"));
+    let un = run("unproven", "un", Some("not provably the operator"));
+    pm.join().unwrap();
+    w1.join().unwrap();
+    un.join().unwrap();
+}
+
+/// One asserted identity per call through the seam — the in-band
+/// `test_caller` frame shape (CAD-482), so concurrent callers' answers
+/// can never cross.
+#[cfg(feature = "test-seam")]
+fn client_rpc_as(
+    state: &Path,
+    as_who: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, cadence_agent::Error> {
+    let asserted = match as_who {
+        "unproven" => cadence_agent::test_seam::Asserted::Unproven,
+        "operator" => cadence_agent::test_seam::Asserted::Operator,
+        a if a.starts_with("agent:") => {
+            cadence_agent::test_seam::Asserted::Agent(a["agent:".len()..].to_string())
+        }
+        other => panic!("bad asserted identity '{other}'"),
+    };
+    cadence_agent::test_seam::scoped(asserted, || {
+        cadence_agent::client::rpc(state, method, params)
+    })
+}
+
+/// CAD-422: `slot_runner`, `plan_propose` and the epic stage mover all
+/// decide on the one `connection_caller` verifier — an asserted agent
+/// is an attributable caller (the old `slot_identity` path saw nothing
+/// for a seam-asserted frame), a detached caller is refused, and a
+/// forged attribution field never reaches it.
+#[cfg(feature = "test-seam")]
+#[test]
+fn cad422_converged_verbs_use_the_one_verifier() {
+    let d = TestDaemon::start();
+    d.register("w1");
+
+    // slot_runner: an agent caller is attributable — it fails on the
+    // unknown runner, never on the auth check; unproven refuses.
+    let err = d
+        .agent_rpc("w1", "slot_runner", json!({"runner_id": "no-such"}))
+        .expect_err("an unknown runner id errors past the auth check");
+    assert!(
+        !err.to_string().contains("not provably the operator"),
+        "an agent reads the runner path, auth passed: {err}"
+    );
+    let err = d
+        .unproven_rpc("slot_runner", json!({"runner_id": "no-such"}))
+        .expect_err("an unproven caller never reads a receipt");
+    assert!(
+        err.to_string().contains("not provably the operator"),
+        "{err}"
+    );
+
+    // plan_propose: the asserted agent is attributed — it fails on the
+    // proposal's own validation, not on "attributable caller"; the
+    // operator gets the same non-auth refusal; unproven gets the auth
+    // refusal. A forged `actor` field is refused before either.
+    let agent_err = d
+        .agent_rpc(
+            "w1",
+            "plan_propose",
+            json!({"project": "demo", "workflow": "none/x"}),
+        )
+        .expect_err("an unknown project errors past the auth check");
+    assert!(
+        !agent_err.to_string().contains("attributable caller"),
+        "the agent was attributed (got past auth): {agent_err}"
+    );
+    let op_err = d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "none/x"}),
+        )
+        .expect_err("the operator meets the same validation");
+    assert!(
+        !op_err.to_string().contains("attributable caller"),
+        "{op_err}"
+    );
+    let err = d
+        .unproven_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "none/x"}),
+        )
+        .expect_err("an unproven caller proposes nothing");
+    assert!(err.to_string().contains("attributable caller"), "{err}");
+    let err = d
+        .agent_rpc(
+            "w1",
+            "plan_propose",
+            json!({"project": "demo", "workflow": "none/x",
+                   "actor": "operator"}),
+        )
+        .expect_err("a forged attribution field must refuse");
+    assert!(err.to_string().contains("connection-bound"), "{err}");
+
+    // The same for the epic stage mover's request fields.
+    let err = d
+        .agent_rpc(
+            "w1",
+            "epic_stage",
+            json!({"epic": "CAD-1", "stage": "build", "by": "operator"}),
+        )
+        .expect_err("a forged attribution field must refuse");
+    assert!(err.to_string().contains("connection-bound"), "{err}");
 }

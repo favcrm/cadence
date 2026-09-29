@@ -896,6 +896,12 @@ tests = [
     "dispatch_warns_on_empty_acceptance",
     "dispatch_refuses_criteria_past_the_pty_ceiling",
     "dispatch_job_precheck_measures_the_issues_existing_lane",
+    "cad422_converged_verbs_use_the_one_verifier",
+    "cad422_concurrent_callers_get_their_own_answers",
+    "cad422_job_new_binds_the_calling_agent",
+    "cad422_job_task_verbs_bind_the_job_pm",
+    "cad422_monitor_dispatch_flags_and_heartbeat",
+    "cad422_reregistered_pm_inherits_nothing",
 ]
 helpers = [
     "seed_provider_quota",
