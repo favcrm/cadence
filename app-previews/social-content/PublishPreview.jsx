@@ -44,6 +44,9 @@ export default function PublishPreview({ readonly = false }) {
   );
   const [dispatch, setDispatch] = useState(null);
   const [held, setHeld] = useState(false);
+  // No stored uncertain state: a lost response keeps state processing and
+  // shows the uncertain reading (reconcile first). See the reading tile.
+  const [lostResponse, setLostResponse] = useState(false);
   const [notice, setNotice] = useState("");
 
   const frozen = publishFrozen;
@@ -51,30 +54,42 @@ export default function PublishPreview({ readonly = false }) {
 
   function simulatePostNow() {
     setDispatch("processing");
+    setLostResponse(false);
     setNotice("Simulated send accepted into processing. " + flowNote);
   }
   function simulateSchedule() {
     setDispatch("queued");
+    setLostResponse(false);
     setNotice(
       `Simulated schedule queued for ${scheduleAt || "no time chosen"} · ${fixtureTimeZone}. ` +
         flowNote,
     );
   }
   function resolveAs(outcome) {
+    if (outcome === "uncertain") {
+      // Uncertain reads as processing: state stays processing, the reading
+      // orders reconcile-before-retry with no second send.
+      setDispatch("processing");
+      setLostResponse(true);
+      setNotice(
+        "Simulated lost response after accept — reads as uncertain while state stays processing. Reconcile before any retry. Nothing duplicated. " +
+          flowNote,
+      );
+      return;
+    }
     setDispatch(outcome);
+    setLostResponse(false);
     setNotice(
       outcome === "posted"
         ? "Simulated verified receipt pinned to r3. " + flowNote
-        : outcome === "uncertain"
-          ? "Simulated lost response — reconcile before any retry. Nothing duplicated. " +
-            flowNote
-          : "Simulated refusal — nothing was published. " + flowNote,
+        : "Simulated refusal — nothing was published. " + flowNote,
     );
   }
   function resetFlow(message) {
     setApproved(false);
     setDispatch(null);
     setHeld(false);
+    setLostResponse(false);
     setNotice(message);
   }
 
@@ -279,19 +294,19 @@ export default function PublishPreview({ readonly = false }) {
                   <p className="notice" role="status">
                     {dispatch === "queued" &&
                       `Simulated queued for ${scheduleAt} · ${fixtureTimeZone} · key ${frozen.idempotencyKey}.`}
-                    {dispatch === "processing" &&
+                    {dispatch === "processing" && !lostResponse &&
                       "Simulated provider call in flight — reconcile before any retry."}
+                    {dispatch === "processing" && lostResponse &&
+                      "Simulated lost response after accept — reads as uncertain while state stays processing. Reconcile the upstream ledger before any retry; a recheck mismatch would store held."}
                     {dispatch === "posted" &&
                       "Simulated posted · permalink https://www.instagram.com/p/fixture000/ · receipt bound to r3."}
                     {dispatch === "refused" &&
                       "Simulated refusal — nothing was published."}
-                    {dispatch === "uncertain" &&
-                      "Simulated uncertain: response lost after accept — reconcile the upstream ledger before any retry."}
                     {dispatch === "cancelled" &&
                       "Simulated cancellation before dispatch — nothing was sent."}
                   </p>
                   <div className="row">
-                    {(dispatch === "queued" || dispatch === "processing") && (
+                    {dispatch === "queued" && (
                       <button
                         className="btn"
                         onClick={() => resolveAs("cancelled")}
@@ -299,7 +314,7 @@ export default function PublishPreview({ readonly = false }) {
                         Simulate cancel
                       </button>
                     )}
-                    {dispatch === "processing" && (
+                    {dispatch === "processing" && !lostResponse && (
                       <>
                         <button
                           className="btn btn-primary"
@@ -320,7 +335,7 @@ export default function PublishPreview({ readonly = false }) {
                     )}
                     {(dispatch === "posted" ||
                       dispatch === "refused" ||
-                      dispatch === "uncertain" ||
+                      (dispatch === "processing" && lostResponse) ||
                       dispatch === "cancelled") && (
                       <button
                         className="btn btn-sm"
@@ -373,15 +388,16 @@ export default function PublishPreview({ readonly = false }) {
 
       <h3 style={{ marginTop: 20 }}>All dispatch states</h3>
       <p className="muted">
-        Every terminal and uncertain state the product UI must render — same
-        tokens, same card components.
+        Every stored state the product UI must render, plus the uncertain
+        reading (processing-or-held, never stored) — same tokens, same card
+        components.
       </p>
       <div className="source-grid">
         {publishStates.map((state) => (
           <article className="card pad" key={state.id}>
             <div className="row">
               <h3 style={{ marginRight: "auto" }}>{state.title}</h3>
-              <span className={`badge ${state.tone}`.trim()}>{state.id}</span>
+              <span className={`badge ${state.tone}`.trim()}>{state.badge ?? state.id}</span>
             </div>
             <p className="muted">{state.copy}</p>
             <div className="row">

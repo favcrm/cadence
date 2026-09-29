@@ -79,6 +79,12 @@ try {
       check(`posted-${viewport.width}`, (await flow.innerText()).includes("permalink"));
       await flow.getByRole("button", { name: "Back to review" }).click();
       check(`relock-${viewport.width}`, await flow.getByRole("button", { name: "Simulate Post now" }).isDisabled());
+      await flow.locator('input[aria-label="Approve the exact destination and content digests"]').click();
+      await flow.getByRole("button", { name: "Simulate Post now" }).click();
+      await flow.getByRole("button", { name: "Simulate lost response" }).click();
+      await flow.getByText("Simulated lost response after accept").first().waitFor({ timeout: 5000 });
+      check(`uncertain-reading-${viewport.width}`, (await flow.innerText()).includes("state stays processing"));
+      await flow.getByRole("button", { name: "Back to review" }).click();
       await flow.locator('input[value="schedule"]').click();
       await flow.locator('input[aria-label="Approve the exact destination and content digests"]').click();
       await flow.getByRole("button", { name: "Simulate Schedule" }).click();
@@ -92,8 +98,8 @@ try {
       await flow.getByText("Held:").waitFor({ timeout: 5000 });
       await flow.getByRole("button", { name: "Simulate reconnect" }).click();
       await flow.getByText("Simulated reconnect complete").waitFor({ timeout: 5000 });
-      check(`held-reconnect-${viewport.width}`, true);
-      for (const id of ["queued", "processing", "posted", "refused", "uncertain", "cancelled", "held"])
+      check(`held-needs-human-${viewport.width}`, true);
+      for (const id of ["queued", "processing", "posted", "refused", "reading", "cancelled", "held"])
         check(`state-${id}-${viewport.width}`, (await page.locator(".badge", { hasText: id }).count()) >= 1);
       if (narrow) {
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);

@@ -133,12 +133,13 @@ test("publish preview gates post-now/schedule on exact approval and covers all d
     await click("Simulate reconnect");
     assert.match(host.textContent, /re-approve/);
     assert.ok(button("Simulate Schedule").disabled);
-    // Uncertain path names reconcile-before-retry.
+    // Lost response reads as uncertain while state stays processing.
     const nowRadio = host.querySelector('input[value="now"]');
     await act(() => nowRadio.click());
     await act(() => approve.click());
     await click("Simulate Post now");
     await click("Simulate lost response");
+    assert.match(host.textContent, /reads as uncertain/);
     assert.match(host.textContent, /reconcile/i);
     // Every required dispatch state is illustrated.
     for (const id of [
@@ -146,7 +147,7 @@ test("publish preview gates post-now/schedule on exact approval and covers all d
       "processing",
       "posted",
       "refused",
-      "uncertain",
+      "reading",
       "cancelled",
       "held",
     ]) {

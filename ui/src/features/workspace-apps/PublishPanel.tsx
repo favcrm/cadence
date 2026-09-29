@@ -10,6 +10,7 @@ import {
   parseDueEpoch,
   publishStateText,
   publishStateTone,
+  reconcileReading,
   refusalCopy,
   socialPublish,
   type PublishIntent,
@@ -148,7 +149,9 @@ export default function PublishPanel({
     }
   };
 
-  const card = (intent: PublishIntent) => (
+  const card = (intent: PublishIntent) => {
+    const reading = reconcileReading(intent.state);
+    return (
     <article key={intent.intent_id} className="wa-panel wa-stack">
       <div className="wa-row">
         <h3>{intent.destination_handle}</h3>
@@ -180,16 +183,11 @@ export default function PublishPanel({
           . A bare success string never counts.
         </p>
       )}
-      {(intent.state === "refused" ||
-        intent.state === "uncertain" ||
-        intent.state === "held") &&
-        intent.refusal && <p className="wa-alert">{refusalCopy(intent.refusal)}</p>}
-      {intent.state === "uncertain" && (
-        <p className="wa-muted">
-          The response was lost after accept — reconcile the upstream ledger
-          before any retry. Never duplicate a provider post.
-        </p>
-      )}
+      {(intent.state === "refused" || intent.state === "held") &&
+        intent.refusal && (
+          <p className="wa-alert">{refusalCopy(intent.refusal)}</p>
+        )}
+      {reading && <p className="wa-muted">{reading}</p>}
       {canCancel(intent.state) && (
         <div className="wa-row">
           {confirmCancel === intent.intent_id ? (
@@ -223,7 +221,8 @@ export default function PublishPanel({
         </div>
       )}
     </article>
-  );
+    );
+  };
 
   return (
     <div className="wa-stack">

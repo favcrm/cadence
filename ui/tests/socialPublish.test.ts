@@ -50,19 +50,25 @@ async function main() {
   const cancelled = await store.socialPublish.cancel("intent-a");
   assert(cancelled.intent.state === "cancelled", "Cancel closes the intent");
   assert(calls.length > 0 && calls.every(call => call.url.startsWith("/api/") && !call.url.includes("http")), "Every client call stays same-origin — no external provider reachable");
-  const states = ["queued", "processing", "posted", "refused", "uncertain", "cancelled", "held"] as const;
-  assert(states.every(state => store.publishStateText(state).length > 0), "All seven dispatch states have operator text");
+  const states = ["queued", "processing", "posted", "refused", "cancelled", "held"] as const;
+  assert(states.every(state => store.publishStateText(state).length > 0), "All six store states have operator text");
   assert(store.publishStateTone("posted") === "ok" && store.publishStateTone("refused") === "fail"
-    && store.publishStateTone("uncertain") === "warn" && store.publishStateTone("held") === "warn"
-    && store.publishStateTone("queued") === "muted", "State tones match the approved language");
-  for (const code of ["send_disabled", "grant_bounds", "grant_exhausted", "grant_revoked", "grant_mismatch", "grant_window", "grant_approval", "bad_caption_digest", "bad_image_digest", "bad_destination", "wrong_destination", "wrong_connection", "wrong_toolkit", "not_publishable", "bad_key", "bad_grant", "image_required"]) {
+    && store.publishStateTone("held") === "warn"
+    && store.publishStateTone("queued") === "muted" && store.publishStateTone("processing") === "muted", "State tones match the approved language");
+  assert(store.publishStateText("held").includes("human") && !store.publishStateText("held").includes("reconnect"), "Held names the human, not a reconnect state");
+  assert(store.reconcileReading("processing")?.includes("uncertain") && store.reconcileReading("held")?.includes("human")
+    && store.reconcileReading("posted") === null && store.reconcileReading("queued") === null, "Uncertain reads as processing-or-held only");
+  const vocabulary = ["bad_key", "bad_connection", "bad_destination", "bad_caption_digest", "bad_image_digest", "bad_run", "bad_effect", "bad_grant", "bad_intent", "bad_revision", "bad_timezone", "cancel_closed", "cross_workspace", "grant_mismatch", "binding_mismatch", "grant_revoked", "grant_exhausted", "grant_window", "grant_approval", "grant_bounds", "image_required", "key_conflict", "not_publishable", "wrong_connection", "wrong_destination", "wrong_toolkit", "unknown_key", "send_disabled"];
+  assert(vocabulary.length === 28, "Refusal vocabulary is exactly the 28-code list");
+  for (const code of vocabulary) {
     const copy = store.refusalCopy({ code, message: "" }).toLowerCase();
-    assert(copy.includes("nothing was published") || copy.includes("nothing was stored") || copy.includes("no provider was called"), `Refusal ${code} stays explicit`);
+    assert(copy.includes("nothing was published") || copy.includes("nothing was stored") || copy.includes("no provider was called") || copy.includes("fails instead") || copy.includes("nothing to reconcile") || copy.includes("already left queued") || copy.includes("refused"), `Refusal ${code} stays explicit`);
   }
+  assert(store.refusalCopy({ code: "send_disabled", message: "" }).includes("not a state"), "send_disabled is a refusal code, not a state");
   assert(store.refusalCopy({ code: "future_code", message: "raw" }).includes("future_code") && store.refusalCopy({ code: "future_code", message: "raw" }).includes("raw"), "Unknown codes stay visible with raw message");
   assert(store.isApprovalIdUsable("op-a") && !store.isApprovalIdUsable("") && !store.isApprovalIdUsable("x".repeat(121)) && store.isApprovalIdUsable("x".repeat(120)), "Approval bound is 1..=120 characters");
   assert(store.refusalCopy({ code: "send_disabled", message: "" }).includes("changed nothing"), "Disabled gate names validate-all/mutate-nothing");
-  assert(store.canCancel("queued") && store.canCancel("processing") && !store.canCancel("posted") && !store.canCancel("cancelled"), "Only pre-dispatch intents cancel");
+  assert(store.canCancel("queued") && !store.canCancel("processing") && !store.canCancel("posted") && !store.canCancel("cancelled"), "Only queued intents cancel (cancel_closed past queued)");
   const label = store.dueLabel(1790601000, "Asia/Hong_Kong");
   assert(label.includes("Asia/Hong_Kong") && label.includes("1790601000"), "Due label always shows timezone and epoch");
   assert(store.parseDueEpoch("2026-09-30T18:30") !== null && store.parseDueEpoch("") === null && store.parseDueEpoch("tomorrow") === null, "Incomplete due values keep Schedule gated");

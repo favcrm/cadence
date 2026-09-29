@@ -3,8 +3,10 @@
 // Everything here is a hard-coded illustration: the exact pilot destination,
 // one reviewed caption with its retained image, the separated cost quote and
 // the full catalogue of dispatch states. No provider, credential, receipt or
-// send exists. Product UI (after owner design acceptance) must bind these
-// slots to the AOS-94 exact-destination preflight/execution shapes instead.
+// send exists. Product UI binds these slots to the CAD-771 store states
+// (queued/cancelled/processing/posted/refused/held) and the exact 28-code
+// refusal vocabulary — there is no pending, uncertain or held-reconnect
+// state, and no preflight call.
 
 export const publishDestination = {
   channel: "Instagram",
@@ -46,6 +48,7 @@ export const publishCost = {
 
 // Every dispatch state the product UI must render, each with the copy and the
 // next actions the operator gets. `tone` maps to the approved badge classes.
+// The uncertain entry is a reading tile (`badge: "reading"`), not a state.
 export const publishStates = [
   {
     id: "queued",
@@ -76,10 +79,11 @@ export const publishStates = [
     actions: ["Inspect reason", "Return to approval"],
   },
   {
-    id: "uncertain",
-    title: "Uncertain · reconcile",
+    id: "uncertain-reading",
+    badge: "reading",
+    title: "Uncertain reading",
     tone: "b-warn",
-    copy: "Lost response after accept: the post may exist upstream. Check the ledger before any retry — never duplicate.",
+    copy: "No stored uncertain state: a processing intent with a lost response reads as uncertain — reconcile the upstream ledger before any retry, never duplicate. A recheck mismatch stores held instead, which needs a human.",
     actions: ["Reconcile upstream ledger", "Hold for a human decision"],
   },
   {
@@ -91,9 +95,9 @@ export const publishStates = [
   },
   {
     id: "held",
-    title: "Held · reconnect",
+    title: "Held · needs human",
     tone: "b-warn",
-    copy: "Authority expired or changed at dispatch (grant, binding, app or context). Held for a new human decision — never silently published.",
+    copy: "Authority expired or changed at dispatch (grant, binding, app or context). The intent is held for a new human decision — never silently published, never auto-resumed. Provider reconnect_needed is a separate layer.",
     actions: ["Reconnect account", "Re-approve after reconnect"],
   },
 ];

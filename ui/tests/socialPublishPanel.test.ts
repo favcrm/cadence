@@ -78,27 +78,29 @@ async function main() {
   await React.act(async () => { host.querySelector('input[value="schedule"]')?.dispatchEvent(new win.MouseEvent("click", { bubbles: true })); });
   await flush();
   assert(button("Schedule")?.disabled, "Schedule without a due time stays gated");
-  // Cancel takes two explicit presses and never sends.
+  // Cancel takes two explicit presses from queued only (cancel_closed past queued).
+  assert(!button("Cancel before dispatch"), "Processing intent offers no cancel");
+  intents = [{ ...intents[0], intent_id: "intent-q", state: "queued" }];
+  await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
   assert(button("Cancel before dispatch"), "Queued intent offers cancel");
   await React.act(async () => { button("Cancel before dispatch")?.click(); });
   await flush();
   assert(button("Confirm cancel"), "Cancel needs an explicit second press");
   await React.act(async () => { button("Confirm cancel")?.click(); });
   await flush(); await flush();
-  assert(cancelled.includes("intent-0") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
+  assert(cancelled.includes("intent-q") && text().includes("Nothing was sent"), "Cancel closes the intent without a send");
   // Every state renders its operator copy.
   intents = [
     { ...intents[0], intent_id: "i-posted", state: "posted", permalink: "https://www.instagram.com/p/fixture000/", receipt: { ok: true } },
     { ...intents[0], intent_id: "i-refused", state: "refused", refusal: { code: "grant_exhausted", message: "raw" } },
-    { ...intents[0], intent_id: "i-uncertain", state: "uncertain", refusal: { code: "lost_response", message: "upstream timeout" } },
-    { ...intents[0], intent_id: "i-held", state: "held", refusal: { code: "send_disabled", message: "" } },
     { ...intents[0], intent_id: "i-processing", state: "processing" },
+    { ...intents[0], intent_id: "i-held", state: "held", refusal: { code: "grant_window", message: "" } },
   ];
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "op-a" });
   assert(text().includes("fixture000") && text().includes("never counts"), "Posted shows the verified receipt, never a bare string");
   assert(text().includes("no uses left"), "Refused names the grant cause");
-  assert(text().includes("Never duplicate"), "Uncertain orders reconcile-before-retry");
-  assert(text().includes("changed nothing"), "Disabled gate names validate-all/mutate-nothing");
+  assert(text().includes("read this as uncertain") && text().includes("Never duplicate"), "Processing carries the uncertain reading with reconcile-before-retry");
+  assert(text().includes("validity window") && text().includes("Needs a human decision"), "Held names the cause and the human, never a reconnect state");
   assert(text().includes("Processing"), "Processing state renders");
   await render({ candidates: [candidate], grantId: "grant-a", approvalId: "x".repeat(121) });
   assert(text().includes("grant_approval") && button("Post now")?.disabled, "Oversize approval gates with its contract code");

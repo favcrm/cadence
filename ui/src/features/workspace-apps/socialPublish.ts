@@ -1,11 +1,13 @@
 /** CAD-787 product client for the publish decision surface.
  *
  * Binds the approved preview flow to the CAD-771/AOS-94 exact-destination
- * states (landed staging 3d6ced85): the board relays operator-only HTTP
- * under `/api/social-publishes` to the daemon `social_publish_*` RPC, which
- * mirrors the versioned device preflight/execution contract (discovery,
- * `publish.send` grant with maxUses 1..=10, media import, byte-exact
- * status, default-off dispatch gate).
+ * surface (landed staging 3d6ced85, UI-binding confirmation from 771): the
+ * board relays operator-only HTTP under `/api/social-publishes` to the
+ * daemon `social_publish_*` RPC. Schedule validates synchronously and the
+ * approval IS the schedule-with-approval-identity; recheck plus material
+ * re-proof run at claim (daemon-side, never a UI call). There is no
+ * preflight RPC — this client never calls one. Handle-to-id mapping is
+ * backend discovery-owned: the UI displays the pilot pair, never infers it.
  *
  * The relay does not exist yet (771 backend unmerged) — this module states
  * the exact HTTP shape the relay must serve so UI, tests and the relay
@@ -13,24 +15,22 @@
  * reach an external provider. No live post in any test: tests stub fetch.
  */
 
-/** Operator-facing dispatch states.
+/** Operator-facing dispatch states — exactly the store rows
+ *  (queued/cancelled/processing/posted/refused/held). There is no
+ *  pending, no uncertain and no held-reconnect state. `send_disabled` is
+ *  a refusal code, not a state.
  *
- * Mapping to the backend (771 @ aa2c2ca8 vs landed AOS-94 3d6ced85):
- * - Store rows: queued/cancelled/processing/posted/refused/held.
- * - Device byte-exact enum: posted/processing/refused only.
- * - `uncertain` is DERIVED, never stored: a processing intent whose
- *   response was lost after accept. The operator reconciles via the
- *   status query before any retry — never a second provider call.
- * - `held` is stored at dispatch recheck when grant, binding, app/context
- *   or digests mismatch (recheck-then-hold); the binding pins
- *   digest-form and the raw caption re-resolves from the run at dispatch.
+ * Uncertain READS as processing-or-held (never stored): a processing
+ * intent with a lost response is unconfirmed — reconcile via the status
+ * query before any retry, never a second provider call; a recheck
+ * mismatch stores held, which needs a human. The binding pins
+ * digest-form and the raw caption re-resolves from the run at dispatch.
  */
 export type PublishState =
   | "queued"
   | "processing"
   | "posted"
   | "refused"
-  | "uncertain"
   | "cancelled"
   | "held";
 
@@ -146,9 +146,8 @@ export function publishStateText(state: PublishState): string {
     case "processing": return "Processing";
     case "posted": return "Posted · verified";
     case "refused": return "Refused";
-    case "uncertain": return "Uncertain · reconcile";
     case "cancelled": return "Cancelled";
-    case "held": return "Held · reconnect";
+    case "held": return "Held · needs human";
   }
 }
 
@@ -157,17 +156,35 @@ export function publishStateTone(
 ): "ok" | "warn" | "fail" | "muted" {
   if (state === "posted") return "ok";
   if (state === "refused") return "fail";
-  if (state === "uncertain" || state === "held") return "warn";
+  if (state === "held") return "warn";
   return "muted";
 }
 
-/** Operator copy for the exact refusal codes the contract returns (mirror
- *  `SendBinding::validate`, `SendGrant::authorize`, `check_destination`).
- *  Unknown codes stay visible with their raw message, never silent. */
+/** Uncertain reading for the two states it can mean. Processing is
+ *  unconfirmed: a lost response after accept reads as uncertain, so the
+ *  operator reconciles the upstream ledger before any retry. Held needs
+ *  a human decision (intent held vs provider reconnect_needed are
+ *  different layers — the intent never auto-resumes). */
+export function reconcileReading(state: PublishState): string | null {
+  if (state === "processing")
+    return "Unconfirmed: if the response was lost after accept, read this as uncertain — reconcile the upstream ledger before any retry. Never duplicate a provider post.";
+  if (state === "held")
+    return "Needs a human decision: the intent is held after a recheck mismatch (provider reconnect_needed is a separate layer). Reconnect, then re-approve — never auto-resume.";
+  return null;
+}
+
+/** Operator copy for the exact 28-code refusal vocabulary (771
+ *  UI-binding confirmation): bad_key/connection/destination/
+ *  caption_digest/image_digest/run/effect/grant/intent/revision/timezone,
+ *  cancel_closed, cross_workspace, grant_mismatch/binding_mismatch/
+ *  revoked/exhausted/window/approval/bounds, image_required, key_conflict,
+ *  not_publishable, wrong_connection/destination/toolkit, unknown_key,
+ *  send_disabled. Unknown codes stay visible with their raw message.
+ */
 export function refusalCopy(refusal: PublishRefusal): string {
   switch (refusal.code) {
     case "send_disabled":
-      return "Send dispatch is not enabled. The intent validated and changed nothing — no provider was called.";
+      return "Send dispatch is not enabled (refusal code, not a state). The intent validated and changed nothing — no provider was called.";
     case "grant_bounds":
       return "The send grant allows 1 to 10 uses. This grant is outside that bound — nothing was published.";
     case "grant_exhausted":
@@ -176,6 +193,8 @@ export function refusalCopy(refusal: PublishRefusal): string {
       return "The send grant was revoked. Nothing was published.";
     case "grant_mismatch":
       return "The grant id does not match this binding. Nothing was published.";
+    case "binding_mismatch":
+      return "The binding does not match this grant and destination. Nothing was published.";
     case "grant_window":
       return "The send grant is outside its validity window. Nothing was published.";
     case "grant_approval":
@@ -195,10 +214,21 @@ export function refusalCopy(refusal: PublishRefusal): string {
       return "The destination is not active, linked and open. Nothing was published.";
     case "bad_key":
       return "The idempotency key shape is invalid. Nothing was stored.";
+    case "key_conflict":
+      return "The same key carries changed content or destination — it fails instead of sending twice.";
+    case "unknown_key":
+      return "No intent or ledger row matches that key. Nothing to reconcile.";
+    case "cancel_closed":
+      return "Only a queued intent can cancel — this one already left queued.";
+    case "cross_workspace":
+      return "The credential workspace does not match. Cross-workspace sends are refused.";
     case "bad_connection":
     case "bad_grant":
     case "bad_run":
     case "bad_effect":
+    case "bad_intent":
+    case "bad_revision":
+    case "bad_timezone":
       return `An identity shape is invalid (${refusal.code}). Nothing was stored.`;
     case "image_required":
       return "Instagram needs a reviewed provider-accessible image. Nothing was published.";
@@ -216,8 +246,10 @@ export function isApprovalIdUsable(approvalId: string): boolean {
   return approvalId.length > 0 && approvalId.length <= 120;
 }
 
+/** Only a queued intent can cancel — past queued the contract answers
+ *  `cancel_closed`. */
 export function canCancel(state: PublishState): boolean {
-  return state === "queued" || state === "processing";
+  return state === "queued";
 }
 
 /** `2026-09-30 18:30 Asia/Hong_Kong (epoch …)` — timezone always shown. */
