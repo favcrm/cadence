@@ -1362,3 +1362,475 @@ fn cad410_export_carries_no_body_of_a_truncated_private_key() {
     }
     assert!(contains(&bytes, "[redacted:private-key]"));
 }
+
+// ---- CAD-767: per-installation app record backup and restore ----
+
+use crate::store::app_contexts::ContextConfig;
+use crate::store::app_records::{RecordStore, FILE_SCHEMA, RECORDS_DIR};
+use std::collections::BTreeMap;
+
+fn profile_a() -> serde_json::Value {
+    serde_json::from_str(r#"{"schema":1,"display_name":"Amina Diallo","email":"amina@example.com","tags":["vip"],"consent":{"email":"granted"}}"#).unwrap()
+}
+
+fn profile_b() -> serde_json::Value {
+    serde_json::from_str(r#"{"schema":1,"display_name":"Boris Feld","email":"boris@example.com","tags":[],"consent":{"email":"denied"}}"#).unwrap()
+}
+
+fn parsed_profile(body: &serde_json::Value) -> crate::store::app_records::CustomerProfile {
+    crate::store::app_records::CustomerProfile::parse(body).unwrap()
+}
+
+/// A live state with core contexts for two installations and one record
+/// file each holding the same record ID with different bodies.
+/// Returns (state, ctx_a, ctx_b).
+fn two_install_state(root: &Path, name: &str) -> (PathBuf, String, String) {
+    let state = fresh_state(root, name);
+    let store = Store::open(&live(&state)).unwrap();
+    let cfg_a = ContextConfig::new("Client A", BTreeMap::new()).unwrap();
+    let cfg_b = ContextConfig::new("Client B", BTreeMap::new()).unwrap();
+    let ctx_a = store
+        .app_context_create("install-a", &cfg_a, "req-a")
+        .unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ctx_b = store
+        .app_context_create("install-b", &cfg_b, "req-b")
+        .unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(store);
+    let rec_a = RecordStore::open(&state, "install-a").unwrap();
+    rec_a
+        .app_record_create(&ctx_a, "customer-1", &parsed_profile(&profile_a()))
+        .unwrap();
+    let rec_b = RecordStore::open(&state, "install-b").unwrap();
+    rec_b
+        .app_record_create(&ctx_b, "customer-1", &parsed_profile(&profile_b()))
+        .unwrap();
+    (state, ctx_a, ctx_b)
+}
+
+fn record_body(state: &Path, install: &str, context: &str, record: &str) -> Value {
+    RecordStore::open(state, install)
+        .unwrap()
+        .app_record_show(context, record)
+        .unwrap()
+}
+
+#[test]
+fn cad767_two_installations_survive_backup_restore_with_isolation() {
+    let root = TempDir::new().unwrap();
+    let (state, ctx_a, ctx_b) = two_install_state(root.path(), "state");
+    let before_a = record_body(&state, "install-a", &ctx_a, "customer-1");
+    let before_b = record_body(&state, "install-b", &ctx_b, "customer-1");
+    assert_ne!(before_a["record"]["digest"], before_b["record"]["digest"]);
+
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    let m = read_json(&manifest_path);
+    assert_eq!(m["app_records"].as_array().unwrap().len(), 2);
+    // Manifest binds installation ID, file schema, digest/size — and never
+    // a record body.
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(!text.contains("Amina Diallo") && !text.contains("Boris Feld"));
+    for entry in m["app_records"].as_array().unwrap() {
+        assert_eq!(entry["file_schema"], FILE_SCHEMA);
+        assert!(!entry["sha256"].as_str().unwrap().is_empty());
+        assert!(entry["bytes"].as_u64().unwrap() > 0);
+    }
+
+    let target = root.path().join("restored");
+    let out = restore(&manifest_path, &target, &RestoreOptions::default()).unwrap();
+    assert_eq!(out["app_records"].as_array().unwrap().len(), 2);
+
+    // Same contents, same contexts, same revisions — no crossing scopes.
+    assert_eq!(
+        record_body(&target, "install-a", &ctx_a, "customer-1")["record"],
+        before_a["record"]
+    );
+    assert_eq!(
+        record_body(&target, "install-b", &ctx_b, "customer-1")["record"],
+        before_b["record"]
+    );
+    // Core contexts survived with the files.
+    let core = Connection::open(live(&target)).unwrap();
+    let count: i64 = core
+        .query_row("SELECT count(*) FROM app_contexts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    // Restore-reopen: both stores open cleanly on the restored state.
+    drop(Store::open(&live(&target)).unwrap());
+    drop(RecordStore::open(&target, "install-a").unwrap());
+    drop(RecordStore::open(&target, "install-b").unwrap());
+}
+
+#[test]
+fn cad767_wal_contents_ride_the_backup() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let store = Store::open(&live(&state)).unwrap();
+    let cfg = ContextConfig::new("Client", BTreeMap::new()).unwrap();
+    let ctx = store
+        .app_context_create("install-a", &cfg, "req-a")
+        .unwrap()["context"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(store);
+    // Hold the writer open with uncheckpointed WAL frames, as a live
+    // daemon would: the backup reader must still see the rows.
+    let rec = RecordStore::open(&state, "install-a").unwrap();
+    rec.app_record_create(&ctx, "customer-1", &parsed_profile(&profile_a()))
+        .unwrap();
+    rec.app_record_create(&ctx, "customer-2", &parsed_profile(&profile_b()))
+        .unwrap();
+    // Precondition: WAL sidecars exist (uncheckpointed).
+    assert!(
+        state
+            .join(RECORDS_DIR)
+            .join("install-a.sqlite3-wal")
+            .exists()
+            || state.join(RECORDS_DIR).join("install-a.sqlite3").exists()
+    );
+
+    let taken = backup(&state, &root.path().join("b"), DEFAULT_KEEP, "manual").unwrap();
+    drop(rec);
+    let target = root.path().join("restored");
+    restore(
+        Path::new(taken["manifest"].as_str().unwrap()),
+        &target,
+        &RestoreOptions::default(),
+    )
+    .unwrap();
+    let shown = RecordStore::open(&target, "install-a")
+        .unwrap()
+        .app_record_list(&ctx)
+        .unwrap();
+    assert_eq!(shown["records"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn cad767_corrupt_record_refuses_backup_without_partial() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    // Corrupt one file behind the store's back.
+    std::fs::write(
+        state.join(RECORDS_DIR).join("install-b.sqlite3"),
+        b"not sqlite at all",
+    )
+    .unwrap();
+    let dir = root.path().join("backups");
+
+    let err = backup(&state, &dir, DEFAULT_KEEP, "manual")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("install-b") || err.contains("corrupt"),
+        "{err}"
+    );
+    assert!(!err.contains("Boris Feld"), "record body leaked: {err}");
+    // A failed partial backup never appears complete: no manifest, no
+    // core copy, no record copies.
+    assert!(fs::read_dir(&dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true));
+}
+
+#[test]
+fn cad767_orphan_filename_refuses_backup() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    std::fs::write(state.join(RECORDS_DIR).join("Has Caps.sqlite3"), b"x").unwrap();
+    let dir = root.path().join("backups");
+
+    let err = backup(&state, &dir, DEFAULT_KEEP, "manual")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("orphaned"), "{err}");
+    assert!(fs::read_dir(&dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true));
+}
+
+#[test]
+fn cad767_orphan_symlink_refuses_backup() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let link = state.join(RECORDS_DIR).join("install-c.sqlite3");
+    std::os::unix::fs::symlink(state.join(RECORDS_DIR).join("install-a.sqlite3"), &link).unwrap();
+    let dir = root.path().join("backups");
+
+    let err = backup(&state, &dir, DEFAULT_KEEP, "manual")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("orphaned"), "{err}");
+}
+
+#[test]
+fn cad767_concurrent_creation_refuses_backup() {
+    // Guard proof without a timing race: snapshot with a stale inventory
+    // (a file created after it) must refuse rather than report complete.
+    let root = TempDir::new().unwrap();
+    let (state, ctx_a, _) = two_install_state(root.path(), "state");
+    let stale = inventory_app_records(&state).unwrap();
+    assert_eq!(stale, vec!["install-a", "install-b"]);
+    // Concurrently created after the inventory.
+    let rec = RecordStore::open(&state, "install-c").unwrap();
+    rec.app_record_create(&ctx_a, "customer-9", &parsed_profile(&profile_a()))
+        .unwrap_or_default();
+    let dir = root.path().join("backups");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let err = snapshot_app_records(&state, &dir, "cadence-manual-stem-deadbeef", &stale)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("changed during backup"), "{err}");
+    assert!(fs::read_dir(&dir).unwrap().next().is_none());
+}
+
+#[test]
+fn cad767_restore_wrong_identity_refuses_without_mutation() {
+    let root = TempDir::new().unwrap();
+    let (state, ctx_a, _) = two_install_state(root.path(), "state");
+    let before = record_body(&state, "install-a", &ctx_a, "customer-1");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    // Swap file B's bytes over file A's slot and re-hash the manifest so
+    // the sha matches but the identity row does not: the wrong-identity
+    // guard must refuse.
+    let mut m = read_json(&manifest_path);
+    let entries = m["app_records"].as_array().unwrap().clone();
+    let (a_file, b_file) = (
+        entries[0]["db_file"].as_str().unwrap().to_string(),
+        entries[1]["db_file"].as_str().unwrap().to_string(),
+    );
+    std::fs::copy(dir.join(&b_file), dir.join(&a_file)).unwrap();
+    m["app_records"][0]["sha256"] = sha256_file(&dir.join(&a_file)).into();
+    m["app_records"][0]["bytes"] = std::fs::metadata(dir.join(&a_file)).unwrap().len().into();
+    std::fs::write(&manifest_path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+    let target = root.path().join("target");
+    let err = restore(&manifest_path, &target, &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("identity") || err.contains("install-a"),
+        "{err}"
+    );
+    assert!(!target.join("cadence.sqlite3").exists());
+    assert!(!target.join(RECORDS_DIR).join("install-a.sqlite3").exists());
+    // The source state is untouched.
+    assert_eq!(
+        record_body(&state, "install-a", &ctx_a, "customer-1")["record"],
+        before["record"]
+    );
+}
+
+#[test]
+fn cad767_restore_truncated_copy_refuses_without_mutation() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    let m = read_json(&manifest_path);
+    let app_file = m["app_records"][0]["db_file"].as_str().unwrap().to_string();
+    let bytes = std::fs::read(dir.join(&app_file)).unwrap();
+    std::fs::write(dir.join(&app_file), &bytes[..bytes.len() / 2]).unwrap();
+
+    let target = root.path().join("target");
+    let err = restore(&manifest_path, &target, &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("sha256") || err.contains("match"), "{err}");
+    assert!(!target.join("cadence.sqlite3").exists());
+}
+
+#[test]
+fn cad767_restore_without_force_refuses_over_healthy_target() {
+    let root = TempDir::new().unwrap();
+    let (source, ctx_a, _) = two_install_state(root.path(), "source");
+    let dir = root.path().join("backups");
+    let taken = backup(&source, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    // A healthy target with its own current files.
+    let (target, target_ctx, _) = two_install_state(root.path(), "target");
+    let target_before = record_body(&target, "install-a", &target_ctx, "customer-1");
+
+    let err = restore(&manifest_path, &target, &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("--force"), "{err}");
+    assert_eq!(
+        record_body(&target, "install-a", &target_ctx, "customer-1")["record"],
+        target_before["record"]
+    );
+    // With force, the snapshot activates and the replaced store was
+    // backed up first.
+    let out = restore(
+        &manifest_path,
+        &target,
+        &RestoreOptions {
+            force: true,
+            repos: vec![],
+        },
+    )
+    .unwrap();
+    assert!(out["pre_restore_backup"].is_string());
+    assert_eq!(
+        record_body(&target, "install-a", &ctx_a, "customer-1")["record"]["profile"]
+            ["display_name"],
+        "Amina Diallo"
+    );
+}
+
+#[test]
+fn cad767_core_only_backup_restores_and_leaves_apps_compatible() {
+    let root = TempDir::new().unwrap();
+    // No app-records/ at all.
+    let state = fresh_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    let m = read_json(&manifest_path);
+    assert!(m.get("app_records").is_none() || m["app_records"].as_array().unwrap().is_empty());
+
+    let target = root.path().join("restored");
+    let out = restore(&manifest_path, &target, &RestoreOptions::default()).unwrap();
+    assert_eq!(out["app_records"].as_array().unwrap().len(), 0);
+    drop(Store::open(&live(&target)).unwrap());
+
+    // A core-only restore over a state that already has record files
+    // leaves them alone.
+    let (with_apps, ctx_a, _) = two_install_state(root.path(), "with-apps");
+    let before = record_body(&with_apps, "install-a", &ctx_a, "customer-1");
+    restore(
+        &manifest_path,
+        &with_apps,
+        &RestoreOptions {
+            force: true,
+            repos: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        record_body(&with_apps, "install-a", &ctx_a, "customer-1")["record"],
+        before["record"]
+    );
+}
+
+#[test]
+fn cad767_legacy_manifest_without_app_records_field_verifies() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    // Rewrite as a pre-767 manifest: drop the field entirely.
+    let mut m = read_json(&manifest_path);
+    m.as_object_mut().unwrap().remove("app_records");
+    // Drop the record copies too: a legacy backup has core only.
+    for entry in taken["app_records"].as_array().unwrap() {
+        std::fs::remove_file(dir.join(entry["db_file"].as_str().unwrap())).unwrap();
+    }
+    std::fs::write(&manifest_path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+    let (manifest, _) = verify(&manifest_path).unwrap();
+    assert!(manifest.app_records.is_empty());
+    let target = root.path().join("restored");
+    restore(&manifest_path, &target, &RestoreOptions::default()).unwrap();
+    drop(Store::open(&live(&target)).unwrap());
+}
+
+#[test]
+fn cad767_record_bodies_stay_out_of_manifest_and_logs() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_text = std::fs::read_to_string(taken["manifest"].as_str().unwrap()).unwrap();
+    for secret in ["Amina Diallo", "Boris Feld", "amina@example.com"] {
+        assert!(!manifest_text.contains(secret), "{secret} in manifest");
+    }
+    // A refusal names the installation, never the body.
+    std::fs::write(
+        state.join(RECORDS_DIR).join("install-a.sqlite3"),
+        b"garbage",
+    )
+    .unwrap();
+    let err = backup(&state, &root.path().join("b2"), DEFAULT_KEEP, "manual")
+        .unwrap_err()
+        .to_string();
+    for secret in ["Amina Diallo", "amina@example.com"] {
+        assert!(!err.contains(secret), "{secret} leaked: {err}");
+    }
+}
+
+#[test]
+fn cad767_interrupted_record_asides_refuse_restore_and_start() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let taken = backup(&state, &dir, DEFAULT_KEEP, "manual").unwrap();
+    let manifest_path = PathBuf::from(taken["manifest"].as_str().unwrap());
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let aside = target
+        .join(RECORDS_DIR)
+        .join("install-a.sqlite3.replaced-20260923T000000Z-deadbeef");
+    std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+    std::fs::write(&aside, b"previous record file").unwrap();
+    assert_eq!(interrupted_restore_leftovers(&target), vec![aside.clone()]);
+
+    for force in [false, true] {
+        let err = restore(
+            &manifest_path,
+            &target,
+            &RestoreOptions {
+                force,
+                repos: vec![],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("interrupted"), "{err}");
+    }
+    let err = refuse_interrupted_restore(&target).unwrap_err().to_string();
+    assert!(err.contains("install-a.sqlite3"), "{err}");
+    assert!(aside.exists());
+}
+
+#[test]
+fn cad767_prune_removes_record_copies_with_the_manifest() {
+    let root = TempDir::new().unwrap();
+    let (state, _, _) = two_install_state(root.path(), "state");
+    let dir = root.path().join("backups");
+    let first = backup(&state, &dir, 1, "manual").unwrap();
+    let first_apps: Vec<PathBuf> = first["app_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| dir.join(e["db_file"].as_str().unwrap()))
+        .collect();
+    assert_eq!(first_apps.len(), 2);
+
+    backup(&state, &dir, 1, "manual").unwrap();
+
+    assert!(!PathBuf::from(first["manifest"].as_str().unwrap()).exists());
+    assert!(!PathBuf::from(first["db"].as_str().unwrap()).exists());
+    for path in &first_apps {
+        assert!(!path.exists(), "old record copy survived pruning: {path:?}");
+    }
+}
