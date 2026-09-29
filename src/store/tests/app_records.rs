@@ -371,3 +371,33 @@ fn cad779_corrupt_existing_profile_closes_email_create() {
         .unwrap();
     assert_eq!(count, 1, "a new row was committed past a corrupt profile");
 }
+
+#[test]
+fn cad779_receipt_write_failure_cannot_leave_imported_rows() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    let csv = "record_id,display_name,email\ncustomer-a,A,first@example.com\n";
+    let preview = store.app_record_csv_preview("ctx-1", csv).unwrap();
+    let token = preview["preview_token"].as_str().unwrap();
+    let path = record_db_path(dir.path(), "install-a").unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER block_receipt BEFORE INSERT ON app_record_csv_imports \
+         BEGIN SELECT RAISE(ABORT, 'receipt blocked'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(
+        store
+            .app_record_csv_import("ctx-1", csv, token, "req-receipt-failure", None)
+            .is_err(),
+        "an import without a durable receipt was accepted"
+    );
+    let listed = store.app_record_list("ctx-1").unwrap();
+    assert_eq!(
+        listed["records"].as_array().unwrap().len(),
+        0,
+        "an import planted rows before its receipt could be saved: {listed}"
+    );
+}
