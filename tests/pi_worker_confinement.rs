@@ -918,11 +918,11 @@ fn persisted_confined_devin_row_cannot_receive_a_dispatched_turn() {
     d.register_inbox("pm-in");
     d.register_pi(
         "stale",
-        json!({"confine": false, "model": "devin/swe-2-high"}),
+        json!({"confine": false, "model": "devin/swe-2-high", "upstream": "pm-in"}),
     );
     d.register_pi(
         "unconfined",
-        json!({"confine": false, "model": "devin/swe-2-high"}),
+        json!({"confine": false, "model": "devin/swe-2-high", "upstream": "pm-in"}),
     );
     d.wait_agent("stale", "idle", 20);
     d.wait_agent("unconfined", "idle", 20);
