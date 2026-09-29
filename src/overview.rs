@@ -2766,6 +2766,30 @@ fn overview_from(
                     .since(clock.since(v)),
                 );
             }
+            // CAD-812: a `backlog`/`ready` leaf the groom pass flagged
+            // `needs-triage` — the requirement may have drifted. Surfaces
+            // under `blocked_ready` (a flag, not a pick gate): oldest
+            // first, for the owner to re-confirm or re-scope.
+            if matches!(v.status.as_str(), "backlog" | "ready")
+                && v.issue.front.tags.iter().any(|t| t == "needs-triage")
+            {
+                let since = v.issue.front.last_groomed_at.as_deref().and_then(parse_iso);
+                needs.push(
+                    item(
+                        82,
+                        "backlog_stale",
+                        &format!("{id} needs-triage — groom flagged drift"),
+                        age,
+                        project,
+                        None,
+                        &cmd_issue_show(id),
+                    )
+                    .about("issue", id)
+                    .for_agent(owner)
+                    .owned_by(Some(owner))
+                    .since(since),
+                );
+            }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
             // (notes-derived counts too) is what clears it.

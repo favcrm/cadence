@@ -475,6 +475,14 @@ impl Shared {
             ) {
                 tracing::warn!(event = "blocked_sweep_failed", error = e.to_string());
             }
+            // CAD-812: groom dormant backlog/ready work — advisory
+            // (flag + comment, never a status move). Best-effort: a
+            // groom failure must not starve the report scan.
+            if let Err(e) =
+                issue::groom::groom(&pm, None, issue::groom::GROOM_GRACE_SECS, false, "daemon")
+            {
+                tracing::warn!(event = "backlog_groom_failed", error = e.to_string());
+            }
         }
         for project in issue::project::list(pm_dir)? {
             let Ok(entries) = std::fs::read_dir(pm_dir.join(&project.key)) else {

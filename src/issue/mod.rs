@@ -16,6 +16,7 @@ pub mod context;
 pub mod dispatch;
 pub mod doctor;
 pub mod finish;
+pub mod groom;
 pub mod history;
 pub mod hooks;
 pub mod idea;
