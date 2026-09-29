@@ -3712,3 +3712,55 @@ fn cad692_legacy_adapter_without_typed_app_hook_refuses_without_legacy_execute()
     );
     assert!(h.items().as_array().unwrap().is_empty());
 }
+
+/// CAD-796 operator workflow: revoking a bound Connection withdraws the
+/// installation's approval so execution stays closed, and operator
+/// re-approval reopens it. The daemon RPC is the authority — the board
+/// HTTP peer only relays it (covered by the existing CAD-692 stolen-session
+/// binding proofs, cited not mirrored).
+#[test]
+fn cad796_binding_revoke_withdraws_install_approval_until_reapproved() {
+    let h = Release::new();
+    let context = h.context("Client A", A, "cad796-revoke-context");
+    let binding = h.bind(&context, "cad796-revoke-binding");
+    // Baseline: an approved install with a live binding creates runs.
+    h.create(&context, "cad796-run-before");
+    h.daemon
+        .operator_rpc(
+            "app_binding_revoke",
+            json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
+        )
+        .unwrap();
+    // Execution stays closed: new runs refuse on the withdrawn approval.
+    let create = |request: &str| {
+        h.daemon.operator_rpc(
+            "app_run_create",
+            json!({"install_id":h.install["install_id"],"context_id":context["id"],"workflow":"draft",
+                "inputs":{"subject":"Context draft","writer":WRITER,"reviewer":REVIEWER},
+                "request_id":request,"owner_pm":OWNER}),
+        )
+    };
+    let refused = create("cad796-run-gated").unwrap_err();
+    assert!(
+        refused.to_string().contains("approval"),
+        "revoke left execution open: {refused}"
+    );
+    // A racing stale revision never lands on the revoked binding.
+    assert!(
+        h.daemon
+            .operator_rpc(
+                "app_binding_revoke",
+                json!({"install_id":h.install["install_id"],"binding_id":binding["id"],"expected_revision":binding["revision"]}),
+            )
+            .is_err(),
+        "stale revoke accepted"
+    );
+    // Operator re-approves the changed story: execution reopens.
+    h.daemon
+        .operator_rpc(
+            "app_local_install_approve",
+            json!({"install_id":h.install["install_id"],"digest":h.install["digest"]}),
+        )
+        .unwrap();
+    create("cad796-run-after").unwrap();
+}
