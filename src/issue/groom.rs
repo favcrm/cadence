@@ -893,6 +893,62 @@ mod tests {
         );
     }
 
+    /// The regression proof for the locked clock: `b`'s `backlog` line
+    /// enters history committed BEFORE `a.created`, then its `done`
+    /// close is committed between the advisory snapshot and `a`'s locked
+    /// re-judge (`after_advisory_snapshot` fires the writer). The locked
+    /// `live` view sees `b` done; only a `LineTimes` reloaded inside the
+    /// lock dates that close at `now` — inside `a`'s window — so `a` is
+    /// `superseded`. A clock read from the advisory snapshot would still
+    /// answer `b`'s pre-window `backlog` time and miss the supersede.
+    #[test]
+    fn close_between_snapshot_and_lock_drives_superseded() {
+        let (tmp, pm) = tracker();
+        let a_created = time::now_epoch() - (GROOM_GRACE_SECS + 86_400);
+        // `b` committed `backlog` before `a` is filed — status_at is old.
+        write_issue(&pm, "CAD-9", "backlog", &["shared.rs"]);
+        commit_issue_at(&pm, "CAD-9", a_created - 3600);
+        let a = mk(&pm, tmp.path(), "a");
+        dormant(&pm, &a, &["shared.rs"]);
+        let out = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let writer_pm = &pm;
+            let writer = scope.spawn(move || {
+                rx.recv().unwrap();
+                let _w = writer_pm.lock().unwrap();
+                // `b` commits `done` NOW — after the advisory snapshot,
+                // before `a`'s locked re-judge.
+                edit(writer_pm, "CAD-9", |f| f.status = "done".to_string());
+                commit_issue_at(writer_pm, "CAD-9", time::now_epoch());
+            });
+            groom_with_hooks(
+                &pm,
+                None,
+                GROOM_GRACE_SECS,
+                true, // dry-run — observe the verdict, write nothing
+                "t",
+                || {
+                    tx.send(()).unwrap();
+                    writer.join().unwrap();
+                },
+                || {},
+            )
+            .unwrap()
+        });
+        let verdict = out["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_str() == Some(a.as_str()))
+            .cloned()
+            .unwrap_or(json!(null));
+        assert_eq!(
+            verdict["verdict"].as_str(),
+            Some("superseded"),
+            "a sibling committed done between snapshot and lock must supersede: {out}"
+        );
+    }
+
     /// `intake` items are skipped — already under the triage SLA.
     #[test]
     fn intake_items_are_skipped() {
