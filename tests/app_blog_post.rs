@@ -233,8 +233,10 @@ fn init_repo(home: &Path) -> PathBuf {
 
 /// Merge a ticket branch into the demo repo's main — what the PR merge
 /// does in the real flow. Runs as the operator's git; the sandbox has
-/// no `gh`, so the merge is local.
-fn merge(home: &Path, repo: &Path, branch: &str, id: &str) {
+/// no `gh`, so the merge is local. Returns the merge commit sha so
+/// callers can record it as done-evidence (CAD-756 gates
+/// `status=done` on a recorded ref).
+fn merge(home: &Path, repo: &Path, branch: &str, id: &str) -> String {
     say(&format!(
         "$ (operator) git merge {branch}   # the merged PR"
     ));
@@ -245,6 +247,14 @@ fn merge(home: &Path, repo: &Path, branch: &str, id: &str) {
         .output()
         .unwrap();
     assert!(out.status.success(), "merge {id}: {}", text(&out));
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rev-parse {id}: {}", text(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// The run of one workflow ticket: dispatch to `agent`, let its lane
@@ -296,7 +306,14 @@ fn run_ticket(
     assert_eq!(rc, 0, "{agent} report file {id}: {out}");
     say(&format!("    {agent} filed the done report on {id}"));
 
-    merge(&host.home(), repo, &branch, id);
+    let sha = merge(&host.home(), repo, &branch, id);
+    // CAD-756: closing needs merge evidence — record the merge commit
+    // the test just created before marking done.
+    op(
+        &host.home(),
+        &d.state,
+        &["issue", "ref", id, "commit", &sha],
+    );
     op(&host.home(), &d.state, &["issue", "set", id, "status=done"]);
     (wt, branch)
 }
@@ -716,7 +733,14 @@ fn blog_post_app_demo() {
         ),
     );
     assert_eq!(rc, 0, "{out}");
-    merge(&host.home(), &repo, &pub_branch, &tickets[4]);
+    let sha = merge(&host.home(), &repo, &pub_branch, &tickets[4]);
+    // CAD-756: closing needs merge evidence — record the merge commit
+    // the test just created before marking done.
+    op(
+        &host.home(),
+        &state,
+        &["issue", "ref", &tickets[4], "commit", &sha],
+    );
     op(
         &host.home(),
         &state,
