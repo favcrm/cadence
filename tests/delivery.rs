@@ -4241,7 +4241,20 @@ fn cad776_concurrent_observe_wakes_once() {
     });
     lf.f.wait_thread("[wake] D-2 is ready to merge", 10);
     thread::sleep(Duration::from_millis(2_000));
-    assert_eq!(ready_wakes(&lf.f).len(), 1, "{:#?}", ready_wakes(&lf.f));
+    // One wake, and under the first-epoch key: concurrent transitions
+    // converge on the record-persisted epoch, never one key each.
+    assert_eq!(
+        ready_wakes(&lf.f)
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(cadence_agent::master::wake_id(
+            "merge_ready",
+            &format!("D-2/{a}@1")
+        ))],
+        "{:#?}",
+        ready_wakes(&lf.f)
+    );
     assert_eq!(ready_woken_events(&lf).len(), 1);
 }
 

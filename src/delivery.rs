@@ -227,6 +227,13 @@ pub struct Record {
     /// CAD-449: what the merge did to the ticket's status.
     #[serde(default)]
     pub ticket_done: Option<TicketDone>,
+    /// CAD-776: how often the record has become merge-ready. Bumped
+    /// under `delivery_lock` on the transition into merge-ready, saved
+    /// with the observation, so the wake key derives from persisted
+    /// record state only — concurrent observers converge on one key
+    /// and the message id dedupes them to one wake.
+    #[serde(default)]
+    pub ready_epoch: u32,
 }
 
 impl Record {
@@ -251,6 +258,7 @@ impl Record {
             note: None,
             excluded: vec![],
             ticket_done: None,
+            ready_epoch: 0,
         }
     }
 
@@ -267,6 +275,32 @@ impl Record {
             .as_ref()
             .filter(|v| v.verdict == "pass")
             .map(|v| v.sha.as_str())
+    }
+
+    /// CAD-776: after an observation is applied, count the transition
+    /// into merge-ready. Runs under `delivery_lock` before the save,
+    /// so the epoch persists atomically with the observation that
+    /// caused it; a steady observation bumps nothing.
+    pub fn advance_ready_epoch(&mut self, was_ready: bool) {
+        if !was_ready && self.merge_ready() {
+            self.ready_epoch = self.ready_epoch.saturating_add(1);
+        }
+    }
+
+    /// CAD-776: the wake key for the current readiness streak —
+    /// `{issue}/{reviewed sha}@{epoch}` — when merge-ready now. A
+    /// replay recomputes the same key, a regression then recovery
+    /// bumps the epoch, and a moved head keys under its own sha.
+    pub fn ready_key(&self) -> Option<String> {
+        if !self.merge_ready() {
+            return None;
+        }
+        Some(format!(
+            "{}/{}@{}",
+            self.issue,
+            self.passed_sha()?,
+            self.ready_epoch
+        ))
     }
 
     /// The merge decision is ready: a PASS, and the operator's process
@@ -983,6 +1017,83 @@ mod tests {
         let k = review_kickoff("D-2", 1, "u", &sha, "w1", Some(&long), note, 4000);
         assert!(!k.contains(&long));
         assert!(k.contains("/pm/demo/D-2/issue.md"), "{k}");
+    }
+
+    /// CAD-776, deterministic concurrency proof: two observers that
+    /// both load the same pre-transition record and both apply the
+    /// ready-making observation converge on one epoch and one key —
+    /// the wake's message id therefore dedupes them to one wake no
+    /// matter how the lock interleaves them. A steady re-application
+    /// bumps nothing and recomputes the same key.
+    #[test]
+    fn ready_epoch_converges_for_concurrent_transitions() {
+        let sha = "a".repeat(40);
+        let mut base = Record::new("D-2", "demo", "w1", 0);
+        base.state = State::Passed;
+        base.verdict = Some(VerdictRec {
+            verdict: "pass".into(),
+            sha: sha.clone(),
+            reviewer: "r1".into(),
+            summary: "ok".into(),
+            report: "D-2/reports/x.md".into(),
+            at: 0,
+        });
+        let green = Observed {
+            head: sha.clone(),
+            pr_state: "OPEN".into(),
+            ci_green: true,
+            ..Observed::default()
+        };
+        // Both observers load the same not-ready record.
+        assert!(!base.merge_ready());
+        assert_eq!(base.ready_key(), None);
+        // Observer A transitions; observer B's stale load transitions
+        // identically — same epoch, same key, one message id.
+        let mut a = base.clone();
+        let mut b = base.clone();
+        for r in [&mut a, &mut b] {
+            let was = r.merge_ready();
+            r.observed = Some(green.clone());
+            r.advance_ready_epoch(was);
+        }
+        assert_eq!(a.ready_epoch, 1);
+        assert_eq!(b.ready_epoch, 1);
+        assert_eq!(a.ready_key(), b.ready_key());
+        // Whoever saves last still leaves epoch 1: B's bump of its
+        // stale copy converges rather than stacking.
+        let mut merged = a.clone();
+        merged.ready_epoch = b.ready_epoch;
+        assert_eq!(merged.ready_epoch, 1);
+        // A steady observation bumps nothing and reuses the key.
+        let mut steady = a.clone();
+        let was = steady.merge_ready();
+        steady.observed = Some(green.clone());
+        steady.advance_ready_epoch(was);
+        assert_eq!(steady.ready_epoch, 1);
+        assert_eq!(steady.ready_key(), a.ready_key());
+        // Regression then recovery is a new streak: red observes to no
+        // key, green again bumps to a new one.
+        let mut red = a.clone();
+        red.observed = Some(Observed {
+            ci_green: false,
+            ..green.clone()
+        });
+        assert!(!red.merge_ready());
+        assert_eq!(red.ready_key(), None);
+        let was = red.merge_ready();
+        red.observed = Some(green);
+        red.advance_ready_epoch(was);
+        assert_eq!(red.ready_epoch, 2);
+        assert_ne!(red.ready_key(), a.ready_key());
+        // A moved head never re-presents the old review: no key.
+        red.observed = Some(Observed {
+            head: "b".repeat(40),
+            pr_state: "OPEN".into(),
+            ci_green: true,
+            ..Observed::default()
+        });
+        assert!(!red.merge_ready());
+        assert_eq!(red.ready_key(), None);
     }
 
     #[test]

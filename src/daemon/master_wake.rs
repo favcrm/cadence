@@ -111,14 +111,6 @@ struct WakeState {
     /// under.
     #[serde(default)]
     announced: BTreeMap<String, String>,
-    /// CAD-776: per `{issue}/{sha}` streak, how often the daemon saw it
-    /// become merge-ready. The wake key is `{issue}/{sha}@{epoch}`: a
-    /// replayed observation recomputes the same key (the message id
-    /// dedupes it), a regression then recovery bumps the epoch (a new
-    /// wake), and a moved head keys under its own sha — never the old
-    /// review.
-    #[serde(default)]
-    ready_epochs: BTreeMap<String, u32>,
     /// Wake ids found held by another message — reported once (an event
     /// each router pass would only be noise), never counted as sent.
     #[serde(default)]
@@ -379,18 +371,20 @@ impl Shared {
     }
 
     /// CAD-776: the operator's observation just landed for `rec`
-    /// (`was_ready` before it; called after the record is saved). When
-    /// the record is merge-ready now, wake the master once per
-    /// readiness streak: a transition bumps the streak's epoch, a
-    /// replay recomputes the same key and the message id dedupes it.
-    /// The text comes from the daemon's record alone — no caller field
-    /// flows into it. A failure is logged, never returned: the
-    /// observation already stands, and an unwoken streak is retried by
-    /// the next observation (the epoch is only saved with the wake).
-    pub(super) fn wake_on_merge_ready(self: &Arc<Self>, rec: &Record, was_ready: bool) {
-        if !rec.merge_ready() {
+    /// (called after the record is saved). When the record is
+    /// merge-ready now, wake the master under the record's own
+    /// [`Record::ready_key`]: the epoch was bumped under
+    /// `delivery_lock` on the transition and saved with the
+    /// observation, so every attempt — the transition and every
+    /// steady replay — uses the same persisted key and the message id
+    /// dedupes them to one wake. The text comes from the daemon's
+    /// record alone — no caller field flows into it. A failure is
+    /// logged, never returned: the observation already stands, and
+    /// the next observation retries the same key.
+    pub(super) fn wake_on_merge_ready(self: &Arc<Self>, rec: &Record) {
+        let Some(key) = rec.ready_key() else {
             return;
-        }
+        };
         let Some(text) = merge_ready_text(rec) else {
             tracing::warn!(
                 "merge-ready wake for {} refused: the ready record lacks its PR or PASS",
@@ -398,25 +392,7 @@ impl Shared {
             );
             return;
         };
-        let _g = self.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut st = match WakeState::load(&self.state_dir) {
-            Ok(st) => st,
-            Err(e) => {
-                tracing::warn!("master wakes: {e}");
-                return;
-            }
-        };
-        let streak = format!("{}/{}", rec.issue, rec.passed_sha().unwrap_or_default());
-        if !was_ready {
-            *st.ready_epochs.entry(streak.clone()).or_insert(0) += 1;
-        }
-        let epoch = st.ready_epochs.get(&streak).copied().unwrap_or(0);
-        let key = format!("{streak}@{epoch}");
-        if self.wake_master("merge_ready", &rec.issue, &key, &text) && !was_ready {
-            if let Err(e) = st.save(&self.state_dir) {
-                tracing::warn!("master wakes: {e}");
-            }
-        }
+        self.wake_master("merge_ready", &rec.issue, &key, &text);
     }
 
     /// Every issue of the tracker; `None` when it cannot be read.

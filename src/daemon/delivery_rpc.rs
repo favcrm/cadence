@@ -649,6 +649,11 @@ impl Shared {
         let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
         rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
+        // CAD-776: count the transition into merge-ready here, under
+        // `delivery_lock`, so the epoch persists atomically with the
+        // observation that caused it — every later wake attempt reads
+        // the same saved key.
+        rec.advance_ready_epoch(was_ready);
         let mut out = json!({
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
@@ -685,9 +690,10 @@ impl Shared {
         // CAD-776: the observation made the delivery merge-ready — one
         // durable hint to the master per readiness streak. A loop that
         // just ended is terminal, never merge-ready, so the two wakes
-        // cannot fire together. Computed from the saved record alone.
+        // cannot fire together. The key comes from the saved record
+        // alone, so concurrent observers converge on it.
         if let Some(ready) = all.get(id).filter(|r| r.merge_ready()) {
-            self.wake_on_merge_ready(ready, was_ready);
+            self.wake_on_merge_ready(ready);
         }
         self.post_notices(&pm, notices);
         if rec_state_changed(&out, was_disable) {
