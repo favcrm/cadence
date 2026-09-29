@@ -451,7 +451,61 @@
 }
 
 /* The test-send panel reads apart from every save/preview control:
-   preparing a payload is not sending it. */
+   one operator address, SMTP acceptance only — not a campaign send. */
 .crm-test {
   border-color: var(--color-info);
+}
+
+/* The final-send panel reads as the irreversible section: warning
+   chrome, a prepared material view and a typed-count confirm — never
+   visually confusable with the test send above it. */
+.crm-send {
+  border-color: var(--color-warn);
+}
+
+/* Send state chips: prepared/sending read informational; completed
+   and accepted read ok; closed/failed/uncertain read as failures the
+   operator must reconcile. */
+.crm-send-chip[data-state="sending"],
+.crm-send-chip[data-state="submitting"],
+.crm-send-chip[data-state="queued"] {
+  border-color: var(--color-info);
+  color: var(--color-info);
+}
+.crm-send-chip[data-state="completed"],
+.crm-send-chip[data-state="accepted"] {
+  border-color: var(--color-ok);
+  color: var(--color-ok);
+}
+.crm-send-chip[data-state="closed"],
+.crm-send-chip[data-state="failed"],
+.crm-send-chip[data-state="uncertain"] {
+  border-color: var(--color-fail);
+  color: var(--color-fail);
+}
+
+/* The typed-count confirm dialog: modal over the campaign, compact,
+   centred. The count input is the gate — Cancel/Approve stay paired. */
+.crm-confirm-wrap {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+.crm-confirm-scrim {
+  position: absolute;
+  inset: 0;
+  background: var(--color-scrim);
+}
+.crm-confirm {
+  position: relative;
+  width: min(26rem, 100%);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  padding: 1rem;
+}
+.crm-confirm .field {
+  max-width: 10rem;
 }

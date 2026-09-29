@@ -521,6 +521,42 @@ async function mountedFlow() {
       suppressions.push({ kind: "email", key: body.email as string, reason: body.reason as string });
       return json({ suppression: suppressions.at(-1) });
     }
+    // CAD-785/786: the flat send routes — a live binding is always
+    // bound, the test send accepts, and no sends exist yet.
+    if (method === "POST" && url.pathname === "/api/crm-smtp/show") {
+      return json({ binding: {
+        install_id: "install-crm", context_id: "ctx-a",
+        connection_id: "conn-smtp-1", auth_revision: 1, link_revision: 1,
+        state: "live", digest: "sha256:linkdigest1",
+        sender: { name: "CRM News", address: "news@example.com" },
+        transport: { host: "smtp.example.com", port: 465, tls_mode: "implicit", username: "smtp-user" },
+      } });
+    }
+    if (method === "POST" && url.pathname === "/api/crm-smtp/test-send") {
+      const body = JSON.parse(String(init!.body));
+      const doc = contents[body.campaign_id];
+      if (!doc) return refused("email content is unavailable for this installation and context", 404);
+      return json({ receipt: {
+        test_send: true, kind: "test", campaign_id: body.campaign_id,
+        to_email: body.to_email, accepted: true, smtp_code: 250, smtp_message: "accepted",
+        content_revision: doc.revision, content_digest: doc.content_digest,
+        link_digest: "sha256:linkdigest1", delivery_claim: "smtp-acceptance-only",
+      } });
+    }
+    if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
+    if (url.pathname === "/api/crm-send/origin") {
+      if (method === "POST") {
+        const body = JSON.parse(String(init!.body));
+        return json({ unsubscribe_origin: body.unsubscribe_origin });
+      }
+      return json({ unsubscribe_origin: "https://cadence.invalid", stored: false });
+    }
+    if (path === "/api/connections") return json({ connections: [{
+      id: "conn-smtp-1", provider: "smtp", account: "isolated", kind: "enrolled",
+      revision: 1, registration_digest: "sha256:reg1", scopes: ["email:send"],
+      smtp: { host: "smtp.example.com", port: 465, tls_mode: "implicit", username: "smtp-user", sender: "news@example.com", sender_name: "CRM News" },
+      status: { adapter_registered: true, descriptor_available: true, custody_available: true, manifest_status: "matched", reviewed_pin: null, reported_pin: null, execution_authority: true, network_checked: true },
+    }] });
     if (path === "/api/app-installations/install-crm") return json(install);
     if (path === "/api/app-installations/install-crm/contexts") return json({ contexts: [
       { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -667,7 +703,7 @@ async function mountedFlow() {
   await flush();
   assert((host.querySelector('pre[data-preview="text"]')?.textContent ?? "").includes("TEXT form"), "text tab shows the host text form");
   assert(text().includes("noreply@cadence.invalid"), "preview-only sender material renders");
-  assert(text().includes("locked until CAD-785/786"), "final send stays visibly locked");
+  assert(!text().includes("locked until"), "no send control is locked-copy anymore");
 
   // Approval is content-only; proposals Apply (new revision, approval
   // invalidated) or Discard (non-mutating) with honest attribution.
@@ -784,10 +820,17 @@ async function mountedFlow() {
   );
 
 
-  // Test-send is a distinct prepared-only affordance.
+  // Test-send is a real one-recipient SMTP send — the fixture's
+  // sender binding is live, so the button is armed and the receipt
+  // records SMTP acceptance only.
   await fillInput("#cmp-test-email", "qa@example.com");
-  await click(byText("button", "Prepare test send"));
-  await settle(() => assert(text().includes("qa@example.com") && text().includes("no SMTP"), "test receipt reports prepared-only"));
+  await click(byText("button", "Send test"));
+  await settle(() =>
+    assert(
+      text().includes("qa@example.com") && text().includes("not proof of inbox delivery"),
+      "test receipt reports SMTP acceptance only",
+    ),
+  );
 
   // Open the full detail directly: frozen audience validity rechecks.
   await click(byText("button", "Open campaign detail →"));
