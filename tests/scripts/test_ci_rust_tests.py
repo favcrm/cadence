@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise test-suite sharding: partition args and phase gating."""
+"""Exercise test-suite sharding: partition args and phase gating.
+
+The partition travels as an explicit CLI argument, never ambient env:
+exact-command contract tests broke twice on env leaking across steps.
+"""
 import importlib.util
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,12 +41,11 @@ class PartitionArgs(unittest.TestCase):
 
 
 class PhaseGating(unittest.TestCase):
-    def run_phase(self, phase, partition):
+    def run_phase(self, phase, partition=""):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.dict("os.environ", {"CADENCE_TEST_PARTITION": partition}):
-                with patch("subprocess.run") as run:
-                    runner.run(root, FULL, phase)
+            with patch.object(runner.subprocess, "run") as run:
+                runner.run(root, FULL, phase, partition)
         return run.call_args.args[0]
 
     def test_tests_phase_partitions(self):
@@ -52,19 +54,21 @@ class PhaseGating(unittest.TestCase):
         self.assertIn("hash:3/8", command)
 
     def test_tests_phase_without_partition(self):
-        command = self.run_phase("tests", "")
+        command = self.run_phase("tests")
         self.assertNotIn("--partition", command)
 
-    def test_inventory_never_partitions(self):
-        command = self.run_phase("inventory", "3/8")
-        self.assertNotIn("--partition", command)
+    def test_inventory_rejects_partition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(runner.subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    runner.run(Path(tmp), FULL, "inventory", "3/8")
+        run.assert_not_called()
 
     def test_bad_partition_fails_before_running(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict("os.environ", {"CADENCE_TEST_PARTITION": "bogus"}):
-                with patch("subprocess.run") as run:
-                    with self.assertRaises(ValueError):
-                        runner.run(Path(tmp), FULL, "tests")
+            with patch.object(runner.subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    runner.run(Path(tmp), FULL, "tests", "bogus")
         run.assert_not_called()
 
 

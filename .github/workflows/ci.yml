@@ -332,10 +332,7 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-          # Partition applies to the tests phase only: inventory must
-          # always list every test, and no other step invokes the runner.
-          CADENCE_TEST_PARTITION: ${{ matrix.shard }}/8
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/8"
       # Observational timings come from the same run, including failed tests.
       # The recorded scope artifact distinguishes selected from full timings.
       - name: Summarize Rust test costs

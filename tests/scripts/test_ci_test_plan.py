@@ -2,7 +2,6 @@
 """Exercise selection fallbacks and the pinned runner without compiling Rust."""
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -90,11 +89,8 @@ fn review_docs_have_owner() {
             plan = policy.make_plan(root, "pull_request", event)
 
             with patch.object(runner.subprocess, "run") as run:
-                # Exact-command assertions below assume no sharding: pin
-                # the ambient partition empty (CI sets it per shard step).
-                with patch.dict(os.environ, {"CADENCE_TEST_PARTITION": ""}):
-                    runner.run(root, plan, "inventory")
-                    runner.run(root, plan, "tests")
+                runner.run(root, plan, "inventory")
+                runner.run(root, plan, "tests")
                 commands = [call.args[0] for call in run.call_args_list]
             self.assertEqual(
                 (plan["mode"], plan["changes"], commands),
@@ -153,14 +149,13 @@ class Execution(unittest.TestCase):
             report.write_text("stale")
             plan = {"schema": 1, "mode": "selected", "targets": ["foo"]}
             with patch.object(runner.subprocess, "run") as run:
-                with patch.dict(os.environ, {"CADENCE_TEST_PARTITION": ""}):
-                    runner.run(root, plan, "inventory")
-                    self.assertEqual(run.call_args.args[0][1:], ["selected", "--lib", "--bins", "--test", "foo", "--features", "test-seam"])
-                    run.side_effect = subprocess.CalledProcessError(100, "nextest")
-                    with self.assertRaises(subprocess.CalledProcessError):
-                        runner.run(root, plan, "tests")
-                    self.assertEqual(run.call_args.args[0][1:], ["--lib", "--bins", "--test", "foo", "--locked", "--features", "test-seam"])
-                    self.assertFalse(report.exists())
+                runner.run(root, plan, "inventory")
+                self.assertEqual(run.call_args.args[0][1:], ["selected", "--lib", "--bins", "--test", "foo", "--features", "test-seam"])
+                run.side_effect = subprocess.CalledProcessError(100, "nextest")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    runner.run(root, plan, "tests")
+                self.assertEqual(run.call_args.args[0][1:], ["--lib", "--bins", "--test", "foo", "--locked", "--features", "test-seam"])
+                self.assertFalse(report.exists())
 
 
 if __name__ == "__main__":
