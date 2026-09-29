@@ -143,7 +143,7 @@ impl Records {
     }
 }
 
-fn row<'a>(preview: &'a Value, number: i64) -> &'a Value {
+fn row(preview: &Value, number: i64) -> &Value {
     preview["rows"]
         .as_array()
         .unwrap()
@@ -564,8 +564,8 @@ fn cad779_csv_concurrent_import_with_one_request_id_applies_once() {
                             "app_record_csv_import",
                             json!({"install_id": install, "context_id": context_id, "csv_text": csv, "preview_token": w.daemon.operator_rpc("app_record_csv_preview", json!({"install_id": install, "context_id": context_id, "csv_text": csv})).unwrap()["preview_token"], "request_id": "req-race"}),
                         );
-                        if outcome.is_ok() {
-                            return outcome.unwrap();
+                        if let Ok(settled) = outcome {
+                            return settled;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
