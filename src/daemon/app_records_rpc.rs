@@ -109,7 +109,7 @@ fn csv_decisions(params: &Value) -> Result<Option<Vec<CsvDecision>>> {
                 number
                     .as_u64()
                     .and_then(|value| i64::try_from(value).ok())
-                    .filter(|value| value > 0)
+                    .filter(|value| *value > 0)
                     .ok_or_else(|| Error::rejected("expected record revision must be positive"))?,
             ),
             Some(_) => return Err(Error::rejected("expected record revision must be positive")),
