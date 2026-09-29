@@ -3,6 +3,7 @@
 //! A token stays in custody; the upstream door derives its company from it.
 mod image;
 pub mod publish;
+pub mod publish_sender;
 mod source;
 
 use std::collections::BTreeMap;
