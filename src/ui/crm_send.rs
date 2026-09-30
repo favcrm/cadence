@@ -14,7 +14,7 @@ use crate::client;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
-use tiny_http::{Request, Response};
+use tiny_http::{Header, Request, Response};
 
 const BODY_CAP: u64 = 48 * 1024;
 
@@ -239,7 +239,9 @@ pub(super) fn unsubscribe_page(token: &str) -> HttpResp {
          </form></body></html>",
         html_escape(token)
     );
-    Response::from_string(page).with_status_code(200)
+    let mut resp = Response::from_string(page).with_status_code(200);
+    resp.add_header(Header::from_bytes("Content-Type", "text/html").unwrap());
+    resp
 }
 
 /// POST: the one-click suppression — the same constant answer
@@ -250,5 +252,7 @@ pub(super) fn unsubscribe_redeem(token: &str, state_dir: &Path) -> HttpResp {
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Unsubscribed</title></head>\
                 <body style=\"font-family:sans-serif;max-width:480px;margin:64px auto;\">\
                 <h1>Unsubscribed</h1><p>You will not receive further messages.</p></body></html>";
-    Response::from_string(page).with_status_code(200)
+    let mut resp = Response::from_string(page.to_string()).with_status_code(200);
+    resp.add_header(Header::from_bytes("Content-Type", "text/html").unwrap());
+    resp
 }

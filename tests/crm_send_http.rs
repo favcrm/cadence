@@ -546,8 +546,13 @@ fn cad786_unsubscribe_route_answers_without_session() {
         None,
         "",
     );
-    let (code, _, body) = common::op::raw(board.port, &request);
+    let (code, head, body) = common::op::raw(board.port, &request);
     assert_eq!(code, 200, "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "the confirmation page must render, not display as text: {head}"
+    );
     assert!(body.contains("Unsubscribe"));
     // A non-token path refuses.
     let request = common::op::request(
@@ -569,8 +574,13 @@ fn cad786_unsubscribe_route_answers_without_session() {
         None,
         "",
     );
-    let (code, _, body) = common::op::raw(board.port, &request);
+    let (code, head, body) = common::op::raw(board.port, &request);
     assert_eq!(code, 200, "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/html"),
+        "the redeemed page must render, not display as text: {head}"
+    );
     assert!(body.contains("Unsubscribed"));
 }
 
