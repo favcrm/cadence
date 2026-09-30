@@ -2026,14 +2026,11 @@ fn report_ls_uses_derived_status() {
         format!("# Close-out\n> Issue: `{id}`\n\n## Verdict\npass\n"),
     )
     .unwrap();
-    // A PASS verdict derives `review` — still an open report. And a
-    // derived status refuses `issue set`, so the note comes off before
-    // the file field moves.
+    // A PASS verdict derives `review` — still an open report.
     let (_, out) = s.cli(&["report", "ls"]);
     assert_eq!(out["count"], 1, "{out}");
-    std::fs::remove_file(s.notes_dir.join("20260101-000000-t-verdict.md")).unwrap();
     // `done` needs the file field (merge evidence or an explicit set);
-    // `ls` follows it.
+    // the lingering PASS note cannot outrank it once the file moves.
     let (ok, out) = s.cli(&["issue", "set", &id, "status=done", "--force", "close out"]);
     assert!(ok, "{out}");
     let (_, out) = s.cli(&["report", "ls"]);
