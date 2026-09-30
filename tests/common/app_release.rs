@@ -43,8 +43,25 @@ impl Release {
     ) {
         Self::with_capability_required(Some("image"))
     }
+    pub(crate) fn with_slow_capability() -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        Self::with_capability_delay(None, Duration::from_secs(18))
+    }
     fn with_capability_required(
         required_asset_slot: Option<&'static str>,
+    ) -> (
+        Self,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        Self::with_capability_delay(required_asset_slot, Duration::ZERO)
+    }
+    fn with_capability_delay(
+        required_asset_slot: Option<&'static str>,
+        delay: Duration,
     ) -> (
         Self,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -56,7 +73,7 @@ impl Release {
         let observed_price = price.clone();
         let h = Self::with_options_and_bundle(
             move |opts, _| {
-                capability::wrap(opts, calls, price);
+                capability::wrap(opts, calls, price, delay);
             },
             true,
             required_asset_slot,

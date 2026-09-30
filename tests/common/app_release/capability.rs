@@ -9,18 +9,21 @@ use cadence_agent::platform::{
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 struct SourceAdapter {
     inner: Arc<dyn PlatformAdapter>,
     table: ToolTable,
     calls: Arc<AtomicUsize>,
     price: Arc<AtomicUsize>,
+    delay: Duration,
 }
 
 pub(crate) fn wrap(
     opts: &mut cadence_agent::daemon::ServeOptions,
     calls: Arc<AtomicUsize>,
     price: Arc<AtomicUsize>,
+    delay: Duration,
 ) {
     let inner = opts.platforms.get("local").unwrap().clone();
     let mut table = inner.table().clone();
@@ -37,6 +40,7 @@ pub(crate) fn wrap(
             table,
             calls,
             price,
+            delay,
         }),
     );
 }
@@ -152,6 +156,8 @@ impl PlatformAdapter for SourceAdapter {
             return Err("source request differs from frozen run resource".into());
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
+        // Simulate a slow external capability, through the real call-site locks.
+        std::thread::sleep(self.delay);
         Ok(AppCapabilityOutput {
             result: json!({"posts":[{"id":"post-1","caption":format!("{source}\nSecond line"),
                 "permalink":"https://example.invalid/post-1","taken_at":"2026-09-28T00:00:00Z"}]}),

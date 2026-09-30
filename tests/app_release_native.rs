@@ -505,6 +505,70 @@ fn cad714_required_asset_refuses_receipt_from_another_declared_slot() {
 }
 
 #[test]
+fn cad856_slow_capability_keeps_approval_and_records_its_receipt() {
+    let (h, calls, _) = Release::with_slow_capability();
+    let context = h.context("Slow capability", A, "cad856-context");
+    h.daemon
+        .operator_rpc(
+            "app_binding_create",
+            json!({
+                "install_id":h.install["install_id"],"context_id":context["id"],
+                "slot":"source","connection_id":h.connection,"request_id":"cad856-binding"
+            }),
+        )
+        .unwrap();
+    let run = h.create(&context, "cad856-run");
+    std::fs::write(
+        h.daemon.state.join(format!(
+            "app-capability-probe-{}.json",
+            run["id"].as_str().unwrap()
+        )),
+        json!({"source":A,"context_id":context["id"],"install_id":h.install["install_id"],
+            "slow_single_call":true})
+        .to_string(),
+    )
+    .unwrap();
+    h.dispatch(&run);
+
+    // Observe the public lifecycle while the real managed caller waits on the
+    // external-capability fixture. In particular, no busy background validator
+    // may revoke approval while a legitimate call is still in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        let current = h
+            .daemon
+            .operator_rpc("app_run_show", json!({"run_id":run["id"]}))
+            .unwrap();
+        assert_eq!(
+            current["approved_digest"], run["snapshot_digest"],
+            "temporary contention revoked an unchanged run: {current}"
+        );
+        if current["state"] == "succeeded" {
+            break;
+        }
+        assert_eq!(current["state"], "running", "{current}");
+        assert!(std::time::Instant::now() < deadline, "{current}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let results = h
+        .daemon
+        .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
+        .unwrap();
+    assert_eq!(results["results"].as_array().unwrap().len(), 1);
+    assert_eq!(results["results"][0]["slot"], "source");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let asset = h
+        .daemon
+        .operator_rpc(
+            "app_run_capability_asset",
+            json!({"receipt_id":results["results"][0]["id"]}),
+        )
+        .unwrap();
+    assert_eq!(asset["digest"], results["results"][0]["asset"]["digest"]);
+    assert!(h.items().as_array().unwrap().is_empty());
+}
+
+#[test]
 fn cad632_actual_turn_read_is_once_scoped_and_selected_post_is_frozen() {
     let (h, calls, price) = Release::with_capability();
     let a = h.context("Client A", A, "source-context-a");
