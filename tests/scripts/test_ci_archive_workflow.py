@@ -88,6 +88,16 @@ class PinnedRuntime(unittest.TestCase):
             self.assertNotIn('ci-test-runtime-bootstrap', job_block(name))
 
 
+    def test_container_artifact_paths_use_measured_temp_not_host_expression(self):
+        for name in ('test-build', 'test-shard'):
+            block = job_block(name)
+            with self.subTest(job=name):
+                self.assertIn('id: runtime', block)
+                self.assertIn('temp=%s', block)
+                self.assertNotIn('runner.temp', block)
+                self.assertIn('steps.runtime.outputs.temp', block)
+
+
 class ProducerJob(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -194,7 +204,7 @@ class ShardConsumer(unittest.TestCase):
         self.assertIn('--out "$RUNNER_TEMP/bundle-reference.json"', select)
         download = step_named(self.shard, PINNED_DOWNLOAD)
         self.assertIn("artifact-ids: ${{ steps.select.outputs.artifact_id }}", download)
-        self.assertIn("path: ${{ runner.temp }}/nextest-bundle", download)
+        self.assertIn("path: ${{ steps.runtime.outputs.temp }}/nextest-bundle", download)
 
     def test_expected_context_is_independent_of_bundle_bytes(self):
         step = step_named(self.shard, "ci-nextest-bundle.py expect")
@@ -228,7 +238,7 @@ class ShardConsumer(unittest.TestCase):
 
     def test_cost_artifact_reads_the_bundle_plan(self):
         step = step_named(self.shard, "nextest-costs-")
-        self.assertIn("${{ runner.temp }}/nextest-bundle/ci-test-plan.json", step)
+        self.assertIn("${{ steps.runtime.outputs.temp }}/nextest-bundle/ci-test-plan.json", step)
         self.assertNotIn("${{ runner.temp }}/ci-test-plan.json", step)
 
     def test_shared_contract_checks_remain_required_without_pinning_cad854_placement(self):

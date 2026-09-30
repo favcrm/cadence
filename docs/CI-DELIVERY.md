@@ -138,7 +138,7 @@ needed, rather than guessing a latest artifact or overwriting its name.
 
 Producer and shards use the identical source-pinned official Rust 1.98.1
 Bookworm Linux/amd64 image manifest, with signed Debian snapshot repositories
-for Python/zstd/procps bootstrap. `.config/ci-test-runtime.env` records the
+for Python/zstd/procps/jq bootstrap. `.config/ci-test-runtime.env` records the
 image, snapshot, distro and compiler; refreshed pins require review and fresh
 runtime acceptance. Both jobs independently measure os-release, installed
 package versions and x86_64 ELF bytes for libc/libstdc++/the loader. Missing,

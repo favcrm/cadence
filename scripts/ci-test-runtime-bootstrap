@@ -25,7 +25,7 @@ case "$CI_TEST_OS_VERSION" in
   *) echo 'unsupported runtime distro' >&2; exit 1 ;;
 esac
 if [[ "${1:-}" == --plan && $# == 1 ]]; then
-  printf 'image=%s\nsnapshot=%s\nsuite=%s\npackages=python3 zstd procps\nuid=1001\n' "$CI_TEST_IMAGE" "$CI_TEST_SNAPSHOT" "$suite"
+  printf 'image=%s\nsnapshot=%s\nsuite=%s\npackages=python3 zstd procps jq\nuid=1001\n' "$CI_TEST_IMAGE" "$CI_TEST_SNAPSHOT" "$suite"
   exit 0
 fi
 [[ $# == 0 && ${GITHUB_ACTIONS:-} == true && -f /.dockerenv && $(id -u) == 0 && ${CADENCE_TEST_CONTAINER_IMAGE:-} == "$CI_TEST_IMAGE" ]] || { echo 'bootstrap requires the pinned root CI job container' >&2; exit 1; }
@@ -42,7 +42,7 @@ printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s
   "$CI_TEST_SNAPSHOT" "$suite" "$CI_TEST_SNAPSHOT" "$suite" "$CI_TEST_SNAPSHOT" "$suite" > /etc/apt/sources.list
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Check-Valid-Until=false update
-apt-get install -y --no-install-recommends python3 zstd procps
+apt-get install -y --no-install-recommends python3 zstd procps jq
 # Shell steps retain the hosted runner's non-root uid; privileged bootstrap
 # is the exception, not a change to permission/refusal test semantics.
 if ! getent group 1001 >/dev/null; then groupadd --gid 1001 ci-runner; fi

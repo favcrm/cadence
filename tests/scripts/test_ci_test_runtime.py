@@ -49,7 +49,7 @@ class RuntimeCLI(unittest.TestCase):
             bootstrap.write_bytes((ROOT / 'scripts/ci-test-runtime-bootstrap').read_bytes())
             result = subprocess.run(['bash', str(bootstrap), '--plan'], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, 'image=' + IMAGE + '\nsnapshot=20260901T000000Z\nsuite=bookworm\npackages=python3 zstd procps\nuid=1001\n')
+            self.assertEqual(result.stdout, 'image=' + IMAGE + '\nsnapshot=20260901T000000Z\nsuite=bookworm\npackages=python3 zstd procps jq\nuid=1001\n')
             self.assertEqual(sorted(path.name for path in root.iterdir()), ['.config', 'scripts'])
             rejected = subprocess.run(['bash', str(bootstrap)],
                                       env=dict(os.environ, GITHUB_ACTIONS='false'), capture_output=True, text=True)
