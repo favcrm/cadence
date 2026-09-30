@@ -135,7 +135,7 @@ class TestOnceJob(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text()
         self.shard = job_body(self.workflow, "test-shard")
-        self.refusal = job_body(self.workflow, "test-once")
+        self.once = job_body(self.workflow, "test-once")
         self.aggregate = job_body(self.workflow, "test")
 
     def test_shard_body_has_no_refusal_compile(self):
@@ -158,14 +158,14 @@ class TestOnceJob(unittest.TestCase):
         self.assertNotIn("cargo test --doc", self.shard)
 
     def test_once_job_runs_doctests(self):
-        self.assertIn("cargo test --doc --locked", self.refusal)
+        self.assertIn("cargo test --doc --locked", self.once)
 
-    def test_refusal_job_runs_one_locked_default_feature_invocation(self):
-        self.assertIn("run: scripts/cadence-nextest --test test_seam --locked", self.refusal)
-        self.assertNotIn("--features test-seam", self.refusal)
-        self.assertNotIn("steps.scope", self.refusal)
+    def test_once_job_runs_one_locked_default_feature_invocation(self):
+        self.assertIn("run: scripts/cadence-nextest --test test_seam --locked", self.once)
+        self.assertNotIn("--features test-seam", self.once)
+        self.assertNotIn("steps.scope", self.once)
 
-    def test_aggregate_needs_shards_and_refusal(self):
+    def test_aggregate_needs_shards_and_once(self):
         needs = re.search(r"needs: \[([^\]]+)\]", self.aggregate)[1]
         self.assertIn("test-shard", needs)
         self.assertIn("test-once", needs)
@@ -183,11 +183,11 @@ class TestOnceJob(unittest.TestCase):
         script = textwrap.dedent(block)
         results = ["success", "failure", "cancelled", "skipped", ""]
         for shard in results:
-            for refusal in results:
-                with self.subTest(shard=shard, refusal=refusal):
+            for once in results:
+                with self.subTest(shard=shard, once=once):
                     substituted = (
                         script.replace("${{ needs.test-shard.result }}", shard)
-                        .replace("${{ needs.test-once.result }}", refusal)
+                        .replace("${{ needs.test-once.result }}", once)
                     )
                     # Actions `run:` steps execute as `bash -eo pipefail`;
                     # without -e a failed early check is masked by the last.
@@ -195,7 +195,7 @@ class TestOnceJob(unittest.TestCase):
                         ["bash", "-eo", "pipefail", "-c", substituted],
                         capture_output=True,
                     )
-                    if shard == "success" and refusal == "success":
+                    if shard == "success" and once == "success":
                         self.assertEqual(run.returncode, 0)
                     else:
                         self.assertNotEqual(run.returncode, 0)

@@ -12,6 +12,7 @@ tests at or above MIN_SECONDS are weighted; anything else falls back to
 the runner's default weight at assignment time.
 """
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -23,21 +24,43 @@ SHARD_DIR = re.compile(r"^nextest-costs-\d+-(\d+)-shard-\d+$")
 
 def weights_from(costs_dir):
     """{key: seconds} for one run, highest attempt per shard."""
+    # Attempt is numeric — lexicographic order would rank 10 below 9.
+    # A directory that doesn't match the artifact naming fails loud
+    # rather than being silently skipped.
+    reports = {}
+    for entry in Path(costs_dir).iterdir():
+        if not entry.is_dir():
+            continue
+        match = SHARD_DIR.match(entry.name)
+        if not match:
+            raise ValueError(f"{costs_dir}: unparseable artifact dir {entry.name!r}")
+        shard = int(entry.name.rsplit("-shard-", 1)[1])
+        attempt = int(match.group(1))
+        report = entry / "nextest-costs.json"
+        if report.is_file() and attempt > reports.get(shard, (0, None))[0]:
+            reports[shard] = (attempt, report)
     weights = {}
-    # Sorted dir order puts attempt 1 before 2; later overwrites, so the
-    # highest attempt's measurement wins per shard.
-    for shard_dir in sorted(Path(costs_dir).iterdir()):
-        if not SHARD_DIR.match(shard_dir.name):
-            continue
-        report = shard_dir / "nextest-costs.json"
-        if not report.is_file():
-            continue
+    for _, report in sorted(reports.values()):
         data = json.loads(report.read_text())
         for entry in data.get("slowest", []):
-            suite, name = entry["suite"], entry["name"]
+            try:
+                suite, name = entry["suite"], entry["name"]
+                seconds = entry["duration_s"]
+            except (KeyError, TypeError):
+                raise ValueError(
+                    f"{report}: malformed slowest entry: {entry!r}"
+                ) from None
+            if not isinstance(suite, str) or not isinstance(name, str):
+                raise ValueError(f"{report}: non-string id in {entry!r}")
             if " " in suite or " " in name:
                 raise ValueError(f"{report}: id contains a space: {suite!r} {name!r}")
-            weights[f"{suite} {name}"] = entry["duration_s"]
+            if (
+                not isinstance(seconds, (int, float))
+                or isinstance(seconds, bool)
+                or not math.isfinite(seconds)
+            ):
+                raise ValueError(f"{report}: non-numeric duration_s: {entry!r}")
+            weights[f"{suite} {name}"] = seconds
     return weights
 
 

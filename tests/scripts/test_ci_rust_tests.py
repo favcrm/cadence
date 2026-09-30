@@ -4,8 +4,11 @@
 The partition travels as an explicit CLI argument, never ambient env:
 exact-command contract tests broke twice on env leaking across steps.
 """
+import importlib.machinery
 import importlib.util
 import json
+import subprocess
+import sys
 import re
 import tempfile
 import unittest
@@ -130,6 +133,11 @@ class Assign(unittest.TestCase):
         shards = runner.assign([("b", "only")], {}, 8)
         self.assertEqual(len([s for s in shards if s]), 1)
 
+    def test_bad_weight_refused_directly(self):
+        for bad in [-1.0, float("nan"), float("inf")]:
+            with self.assertRaises(ValueError, msg=bad):
+                runner.assign([("b", "t")], {"b t": bad}, 1)
+
 
 class Filterset(unittest.TestCase):
     def test_ids_with_special_characters(self):
@@ -175,6 +183,17 @@ class LoadWeights(unittest.TestCase):
                 runner.load_weights(self.write(tmp, {"schema": 1, "weights": {"a t": "x"}}))
             with self.assertRaises(ValueError):
                 runner.load_weights(self.write(tmp, {"schema": 1, "weights": {"a t": True}}))
+
+    def test_non_finite_or_negative_weight(self):
+        # json.loads accepts NaN/Infinity; the gate must not.
+        for bad in [-1, float("nan"), float("inf"), float("-inf")]:
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError, msg=bad):
+                runner.load_weights(self.write(tmp, {"schema": 1, "weights": {"a t": bad}}))
+
+    def test_zero_and_positive_weights_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = runner.load_weights(self.write(tmp, {"schema": 1, "weights": {"a t": 0, "b u": 3.5}}))
+            self.assertEqual(w, {"a t": 0.0, "b u": 3.5})
 
 
 def case(ignored=False, status="matches"):
@@ -277,6 +296,95 @@ class PartitionedRun(unittest.TestCase):
             assignment = json.loads(out.read_text())
             self.assertEqual(assignment["inventory"], [])
             self.assertEqual(assignment["tests"], [])
+
+
+def load_script(name, filename):
+    # Extensionless scripts need an explicit SourceFileLoader.
+    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / "scripts" / filename))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+weights_gen = load_script("shard_weights", "shard-weights")
+
+
+def costs_dir(root, attempt, shard, tests):
+    d = Path(root) / f"nextest-costs-42-{attempt}-shard-{shard}"
+    d.mkdir(parents=True)
+    (d / "nextest-costs.json").write_text(json.dumps({
+        "schema": "cadence.nextest-costs/1",
+        "slowest": [{"suite": s, "name": n, "status": "passed", "duration_s": dsec}
+                    for s, n, dsec in tests],
+    }))
+
+
+class ShardWeightsGen(unittest.TestCase):
+    def test_highest_attempt_wins_numerically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for attempt, secs in [(1, 5.0), (9, 6.0), (10, 7.0)]:
+                costs_dir(tmp, attempt, 1, [("b", "t", secs)])
+            weights = weights_gen.weights_from(tmp)
+            self.assertEqual(weights, {"b t": 7.0})
+
+    def test_unparseable_dir_fails_loud(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "nextest-costs-42-shard-1").mkdir()
+            with self.assertRaises(ValueError):
+                weights_gen.weights_from(tmp)
+
+
+class ShardWeightsGenExtended(unittest.TestCase):
+    """Generator contract through the real script entry point."""
+
+    def run_gen(self, *dirs):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "shard-weights"), *dirs],
+            capture_output=True, text=True,
+        )
+
+    def test_newest_input_dir_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "costs-old"; new = Path(tmp) / "costs-new"
+            costs_dir(old, 1, 1, [("b", "t", 9.9)])
+            costs_dir(new, 1, 1, [("b", "t", 6.0)])
+            r = self.run_gen(new, old)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout)["weights"]["b t"], 6.0)
+
+    def test_min_seconds_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            costs_dir(tmp, 1, 1, [("b", "slow", 5.0), ("b", "fast", 4.9)])
+            r = self.run_gen(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            weights = json.loads(r.stdout)["weights"]
+            self.assertNotIn("b fast", weights)
+            # Exactly at the threshold counts (>= min_seconds).
+            self.assertIn("b slow", weights)
+
+    def test_output_is_deterministic_and_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            costs_dir(tmp, 1, 1, [("b", "zz", 9.0), ("b", "aa", 8.0), ("a", "t", 7.0)])
+            one, two = self.run_gen(tmp).stdout, self.run_gen(tmp).stdout
+            self.assertEqual(one, two)
+            keys = list(json.loads(one)["weights"])
+            self.assertEqual(keys, sorted(keys))
+
+    def test_malformed_report_fails_loud(self):
+        for entry in [
+            {"suite": "b", "name": "t"},                       # missing duration
+            {"suite": "b", "name": "t", "duration_s": "x"},    # non-numeric
+            {"suite": "b b", "name": "t", "duration_s": 6.0},  # space in id
+        ]:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(entry=entry):
+                report_dir = Path(tmp) / "nextest-costs-42-1-shard-1"
+                report_dir.mkdir()
+                report = report_dir / "nextest-costs.json"
+                report.write_text(json.dumps({"slowest": [entry]}))
+                r = self.run_gen(tmp)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("nextest-costs.json", r.stderr)
 
 
 if __name__ == "__main__":
