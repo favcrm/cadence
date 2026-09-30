@@ -372,6 +372,7 @@ tests = [
     "device_login_clear_from_a_detached_child_is_refused",
     "device_login_verbs_need_the_operator_secret_and_clean_fields",
     "device_login_config_is_thin_show_is_gated",
+    "device_login_set_event_never_names_a_subject",
     "device_poll_from_a_detached_child_is_refused_and_spares_the_grant",
     "device_poll_mints_exactly_once_under_concurrent_polls",
     "device_rpc_mints_the_issuers_subject_not_forged_fields",
@@ -385,6 +386,7 @@ tests = [
     "a_verify_in_flight_mints_nothing_when_the_config_rotates",
     "a_poll_in_flight_mints_nothing_when_the_config_rotates",
     "device_start_flags_push_the_flag_subjects_not_env",
+    "device_run_push_waits_for_the_bind",
 ]
 helpers = [
     "jwks_stub",

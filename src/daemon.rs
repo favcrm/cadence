@@ -3854,6 +3854,8 @@ const OPERATOR_FIELDS: &[&str] = &[
     "pane",
     "recorded_via",
     "attribution",
+    "as",
+    "sub",
 ];
 
 fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {

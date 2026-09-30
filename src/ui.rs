@@ -501,6 +501,13 @@ pub struct ServeOpts {
     /// board never owns configuration. Never set from the command
     /// line — tests inject a fake issuer transport.
     pub device_login: DeviceLogin,
+    /// CAD-841: a resolved `--device-login-*` triple `serve` pushes to
+    /// the daemon — only AFTER the port is bound, so a failed start
+    /// never replaces live sign-in settings on other boards of this
+    /// state dir (review r1). `ui run` fills it from its flags;
+    /// `ui start`'s parent pushes itself post-spawn (the detached
+    /// child cannot prove operator), and tests leave it `None`.
+    pub device_login_push: Option<DeviceLoginOpts>,
     /// CAD-482: arm the test-only caller seam — the board honors
     /// `X-Cadence-Test-As`/`X-Cadence-Test-Token` request headers and
     /// its daemon calls carry the asserted identity. Honored only in
@@ -731,6 +738,12 @@ fn push_device_login(state_dir: &Path, flags: &UiFlags) -> Result<()> {
     let Some(triple) = resolve_device_login(flags)? else {
         return Ok(());
     };
+    push_device_login_config(state_dir, &triple)
+}
+
+/// The RPC half of [`push_device_login`]: `operator_device_login_set`
+/// with the already-resolved triple.
+fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpts) -> Result<()> {
     let secret = crate::operator_auth::read_secret(state_dir)?;
     crate::client::rpc(
         state_dir,
@@ -895,8 +908,10 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // CAD-841: the board's half of device login is only the
         // pending map + issuer transport — configuration lives in the
         // daemon store and is read per request, so a `device-login
-        // set`/`clear` applies to a running board at once.
+        // set`/`clear` applies to a running board at once. The
+        // flag-push payload is `run`'s business, not resolved options'.
         device_login: DeviceLogin::default(),
+        device_login_push: None,
         // CAD-482: `ui run`/`ui start`'s fixture child arms from its
         // environment; in-process fixtures set the field directly.
         test_seam: crate::test_seam::env_armed(),
@@ -4529,10 +4544,13 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
     })?;
     // CAD-841: the daemon owns the device-login config — no pin file,
-    // no lock, nothing for a board process to write or clear at bind.
-    // The operator's `device-login set`/`clear` (or the `--device-
-    // login-*` thin client) is the only authority, and it applies to
-    // this running board at once because routes read it per request.
+    // no lock, nothing else for a board process to write or clear. A
+    // `ui run --device-login-*` push lands only now, bound port in
+    // hand: a failed start never replaced the live settings other
+    // boards of this state dir serve (review r1).
+    if let Some(triple) = &opts.device_login_push {
+        push_device_login_config(state_dir, triple)?;
+    }
     // CAD-446: merge decisions appear without a terminal — this process
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
@@ -4719,12 +4737,14 @@ pub(crate) fn http_get(
 /// never rewrite them: `ui start` owns persistence.
 fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     let persisted = load_opts(state_dir);
-    let (_eff, so) = resolve_opts(flags, &persisted)?;
-    // CAD-841: `--device-login-*` is a thin client — push the triple to
-    // the daemon before serving (operator proof + secret; a detached
-    // child resolves no flags and never reaches this). Absent flags
-    // leave the daemon's own store untouched.
-    push_device_login(state_dir, flags)?;
+    let (_eff, mut so) = resolve_opts(flags, &persisted)?;
+    // CAD-841: `--device-login-*` is a thin client — resolve now so a
+    // partial triple still fails before any bind, but push only once
+    // `serve` owns the port: a failed start must not have already
+    // replaced the live config on this state dir's boards (r1). A
+    // detached `ui start` child resolves no flags and a scrubbed env,
+    // so it never re-pushes.
+    so.device_login_push = resolve_device_login(flags)?;
     serve(state_dir, &crate::issue::default_dir()?, &so)?;
     Ok(0)
 }
@@ -4811,19 +4831,18 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
             }
         }
     }
-    // CAD-841: `--device-login-*` is a thin client of
-    // `operator_device_login_set` — push in THIS process (it carries
-    // the operator secret; the detached child could never prove
-    // itself). Running board or not, the daemon's store is the truth
-    // and routes read it live, so this is also how the config changes
-    // on an already-running board.
-    push_device_login(state_dir, flags)?;
     save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
     // A previous start's marker must not satisfy this one's wait —
     // clear it before any `running`/`spawn` path can read it.
     let _ = std::fs::remove_file(ready_file(state_dir));
     if let Some(pid) = running {
+        // CAD-841: `--device-login-*` is a thin client of
+        // `operator_device_login_set` — pushed from THIS process (it
+        // carries the operator secret; a detached child could never
+        // prove itself). The board is already up: routes read the
+        // daemon's store per request, so this is a live reconfigure.
+        push_device_login(state_dir, flags)?;
         let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             .unwrap_or((0, String::new()));
         if !quiet {
@@ -4919,6 +4938,12 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                 http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             {
                 let _ = std::fs::remove_file(ready_file(state_dir));
+                // CAD-841: only now that the child provably bound and
+                // serves does a `--device-login-*` triple reach the
+                // daemon — a failed spawn changes no live config
+                // (review r1). The child can never push: it is
+                // detached, so this process does it.
+                push_device_login(state_dir, flags)?;
                 if !quiet {
                     println!(
                         "{}",

@@ -1956,6 +1956,28 @@ mod device {
             err.contains("connection-bound") && err.contains("'alias'"),
             "forged field passed: {err}"
         );
+        // `as` and `sub` are identity-shaped too — refused the same way
+        // even though no gated verb would ever read them (r1).
+        for forged in ["as", "sub"] {
+            let err = d
+                .operator_rpc(
+                    "operator_device_login_set",
+                    json!({
+                        "secret": cadence_agent::operator_auth::read_secret(state.path())
+                            .unwrap(),
+                        "issuer": issuer.clone(),
+                        "org": "ws_company",
+                        "subjects": ["op_9"],
+                        forged: "operator"
+                    }),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("connection-bound") && err.contains(&format!("'{forged}'")),
+                "forged field '{forged}' passed: {err}"
+            );
+        }
         assert_eq!(
             std::fs::read(&config).unwrap(),
             before,
@@ -2018,6 +2040,54 @@ mod device {
             )
             .unwrap();
         assert_eq!(full["subjects"], json!(["op_9", "op_2"]), "{full}");
+    }
+
+    /// `agent_events` is an open read — the public event a `set` emits
+    /// must corroborate the write without publishing the allowlist, or
+    /// any socket caller could recover the subjects the thin view
+    /// deliberately hides (r1).
+    #[test]
+    fn device_login_set_event_never_names_a_subject() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let secret = cadence_agent::operator_auth::read_secret(state.path()).unwrap();
+        d.operator_rpc(
+            "operator_device_login_set",
+            json!({
+                "secret": secret,
+                "issuer": issuer,
+                "org": "ws_company",
+                "subjects": ["op_secret_1", "op_secret_2"]
+            }),
+        )
+        .unwrap();
+        // Any caller — no secret — reads the daemon's public events.
+        let events = d
+            .rpc_opt("agent_events", json!({"alias": "daemon"}))
+            .unwrap();
+        let blob = events.to_string();
+        assert!(
+            blob.contains("operator_device_login_set"),
+            "the set event itself is missing: {blob}"
+        );
+        assert!(
+            !blob.contains("op_secret"),
+            "public event leaked the allowlist: {blob}"
+        );
+        // The gated show still answers the real allowlist — the gate,
+        // not the event log, is who may know it.
+        let full = d
+            .operator_rpc(
+                "operator_device_login_show",
+                json!({"secret": cadence_agent::operator_auth::read_secret(state.path()).unwrap()}),
+            )
+            .unwrap();
+        assert_eq!(
+            full["subjects"],
+            json!(["op_secret_1", "op_secret_2"]),
+            "{full}"
+        );
     }
 
     /// The HTTP twin: a detached pane child polling spends nothing — the
@@ -2742,5 +2812,43 @@ mod device {
         assert_eq!(shown["org"], json!("ws_company"), "{shown}");
         let (ok, _, _) = op::operator_cli(bin(), state.path(), &["ui", "stop"]);
         assert!(ok, "ui stop failed");
+    }
+
+    /// r1: `ui run --device-login-*` pushes the triple only once the
+    /// port is bound — a board that loses the bind changes no live
+    /// config on the state dir's other boards.
+    #[test]
+    fn device_run_push_waits_for_the_bind() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
+        // Squat the port so `ui run` can never bind it.
+        let port = free_port();
+        let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let port_s = port.to_string();
+        let pm_s = pm.path().display().to_string();
+        let (ok, out, err) = op::operator_cli_env(
+            bin(),
+            state.path(),
+            &[
+                "ui",
+                "run",
+                "--port",
+                &port_s,
+                "--device-login-issuer",
+                &issuer,
+                "--device-login-org",
+                "ws_company",
+                "--device-login-subject",
+                "op_new",
+            ],
+            &[("CADENCE_PM_DIR", pm_s.as_str())],
+        );
+        assert!(!ok, "ui run on an occupied port should fail: {out}{err}");
+        // The push never landed — the daemon's store is untouched.
+        let shown = d.rpc_opt("device_login_config", json!({})).unwrap();
+        assert_eq!(shown["configured"], json!(false), "{shown}");
     }
 }

@@ -220,10 +220,12 @@ impl Shared {
         // timeout, and authority can retire inside that window — the
         // operator's `device-login clear`/`set` lands between verify and
         // mint. The re-check runs under the session mutex immediately
-        // before the mint it protects, so no further wait can intervene
-        // between re-validation and `open_device`; an unchanged config
-        // means the allowlist check below still applies the operator's
-        // current list.
+        // before the mint it protects, and the config writers hold the
+        // same mutex for their file mutation (CAD-841 r1): the write is
+        // ordered either before this re-read — and the mint refuses —
+        // or after `open_device` finished under the then-live
+        // authority. An unchanged config means the allowlist check
+        // below still applies the operator's current list.
         let mut auth = self.operator_auth();
         let authority_now = match crate::device_login::read_config(&self.state_dir) {
             Ok(a) => a,
@@ -345,12 +347,22 @@ impl Shared {
             org: normalized.org().to_string(),
             subjects,
         };
+        // The write runs under the session mutex — the mint path's
+        // post-verify re-check holds the same guard, so a set/clear
+        // linearizes against it: either the write lands before that
+        // re-read (the mint refuses) or after the mint completed under
+        // the then-live authority. Without the shared guard a clear
+        // could return between the re-read and `open_device` and a
+        // session would mint under already-retired authority (r1).
+        let _auth = self.operator_auth();
         crate::device_login::write_config(&self.state_dir, &config)?;
+        // `agent_events` is an open read — the allowlist never enters
+        // the event log, only that a set happened and how many names.
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_login_set",
             json!({"issuer": config.issuer, "org": config.org,
-                   "subjects": config.subjects}),
+                   "subject_count": config.subjects.len()}),
         );
         Ok(json!({"configured": true, "issuer": config.issuer, "org": config.org}))
     }
@@ -365,6 +377,9 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_with_secret("ui device-login clear", params, peer_pid)?;
+        // Same session mutex as `set` — the retirement linearizes
+        // against the mint path's post-verify re-check (r1).
+        let _auth = self.operator_auth();
         crate::device_login::clear_config(&self.state_dir)?;
         let _ = self
             .store

@@ -1076,7 +1076,8 @@ AgenticOS device grant, CAD-777/841 — issuer + org + at least one
 allowlisted subject, or none; the flags are a thin client that pushes
 the triple to the daemon's store through the operator-secret RPC, so
 they apply live to a running board and never persist in `ui.json`;
-default off).
+`ui start --reset` does not touch the daemon store either — only
+`cadence ui device-login clear` turns the flow off; default off).
 
 **Signing in (CAD-313, ADR 0004).** Board writes need the operator's
 session. `cadence ui login`, run from your own shell, prints a link —

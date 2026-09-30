@@ -73,17 +73,21 @@ const CONFIG_FILE: &str = "device-login.json";
 /// no longer exist in this design. [`migrate`] deletes it on sight.
 const LEGACY_LOCK: &str = "device-login.lock";
 
-/// One-time move off the board-written pin (CAD-841): a
-/// `device-login.json` that fails the new strict schema — the legacy
-/// pin carried `board_pid`, which `deny_unknown_fields` rejects — was
-/// board-written trust state, so it is removed rather than parsed,
-/// and the lock file always goes. A file the daemon itself wrote
-/// survives untouched. Best-effort: a filesystem failure only logs.
+/// One-time move off the board-written pin (CAD-841): the legacy pin
+/// always carried `board_pid`, so its presence positively identifies
+/// board-written trust state — only that file is removed, never a
+/// daemon-written config that merely fails the schema (a damaged file
+/// stays on disk for repair; `read_config` still fails closed on it,
+/// so nothing can mint either way). The lock file always goes.
+/// Best-effort: a filesystem failure only logs.
 pub fn migrate(state_dir: &std::path::Path) {
     let dir = crate::operator_auth::dir(state_dir);
     let _ = std::fs::remove_file(dir.join(LEGACY_LOCK));
     if let Ok(bytes) = std::fs::read(dir.join(CONFIG_FILE)) {
-        if serde_json::from_slice::<DeviceLoginConfig>(&bytes).is_err() {
+        let is_legacy_pin = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .is_some_and(|v| v.get("board_pid").is_some());
+        if is_legacy_pin {
             let _ = std::fs::remove_file(dir.join(CONFIG_FILE));
         }
     }
@@ -933,6 +937,18 @@ mod tests {
         migrate(dir.path());
         assert_eq!(read_config(dir.path()).unwrap(), config);
         assert!(!lock.exists());
+        // r1: a file that fails the schema WITHOUT the legacy
+        // `board_pid` marker — damaged, or written by something else —
+        // is not "board state": migrate leaves it for repair, and
+        // `read_config` still fails closed on it.
+        std::fs::write(&file, br#"{"issuer":42,"subjects":[]}"#).unwrap();
+        migrate(dir.path());
+        assert!(file.exists());
+        assert!(read_config(dir.path()).is_err());
+        std::fs::write(&file, b"not json").unwrap();
+        migrate(dir.path());
+        assert!(file.exists());
+        assert!(read_config(dir.path()).is_err());
     }
 
     /// The subject allowlist is a list of 1–16 workspace-style ids,
