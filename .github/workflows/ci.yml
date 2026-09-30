@@ -416,6 +416,17 @@ jobs:
       # exact archive into a fresh target and never compiles the suite.
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
+      # The pinned rust container ships no Node.js, but pnpm/action-setup
+      # runs pnpm's npm `preinstall` (`node install.js`) — and the pinned
+      # `@pnpm/exe` standalone package runs the same script — so a
+      # Node-free pnpm install path does not exist. This uncached
+      # setup-node provides `node` first; `cache: pnpm` cannot be used
+      # here because its store-path resolution shells out to pnpm, which
+      # does not exist yet.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.test-build.outputs.mode != 'docs'
+        with:
+          node-version: 22
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         if: needs.test-build.outputs.mode != 'docs'
         with:

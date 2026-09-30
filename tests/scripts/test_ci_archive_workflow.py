@@ -232,6 +232,57 @@ class ShardConsumer(unittest.TestCase):
         self.assertIn("overwrite: true", step)
         self.assertIn("if-no-files-found: error", step)
 
+    def test_uncached_node_precedes_pnpm_then_cached_node(self):
+        # The pinned rust container ships no Node.js, and both packages the
+        # pinned pnpm/action-setup can install (`pnpm` and `@pnpm/exe`)
+        # carry `preinstall: node install.js` — verified against the
+        # action's installer source and `npm view` — so `node` must be on
+        # PATH before pnpm/action-setup runs (`sh: 1: node: not found`,
+        # run 36693222956). setup-node's own `cache: pnpm` cannot fill
+        # that first slot: its store-path resolution shells out to pnpm,
+        # which does not exist yet. The working order is therefore:
+        # uncached setup-node -> pnpm/action-setup -> cached setup-node
+        # -> pnpm install.
+        steps = step_blocks(self.shard)
+        def index_of(fragment, start=0):
+            for i, step in enumerate(steps):
+                if i >= start and fragment in step:
+                    return i
+            raise AssertionError(f"no step containing {fragment!r} from index {start}")
+        first_node = index_of("actions/setup-node@")
+        pnpm = index_of("pnpm/action-setup@")
+        cached_node = index_of("actions/setup-node@", pnpm)
+        install = index_of("pnpm install --frozen-lockfile")
+        self.assertLess(first_node, pnpm)
+        self.assertLess(pnpm, cached_node)
+        self.assertLess(cached_node, install)
+        # The early step may only provide the runtime — a `cache:` input
+        # there reintroduces the chicken-and-egg pnpm lookup.
+        self.assertIn("node-version: 22", steps[first_node])
+        self.assertNotIn("cache:", steps[first_node])
+        # pnpm/action-setup keeps the reviewed stock install; no
+        # speculative standalone flag (the exe package preinstalls node
+        # install.js the same way).
+        self.assertNotIn("standalone:", steps[pnpm])
+        self.assertIn("cache: pnpm", steps[cached_node])
+        self.assertIn("cache-dependency-path: ui/pnpm-lock.yaml", steps[cached_node])
+        for step in (steps[first_node], steps[pnpm], steps[cached_node]):
+            self.assertIn("needs.test-build.outputs.mode != 'docs'", step)
+
+    def test_no_step_may_claim_node_before_setup_node_runs(self):
+        # Anything resolving `node` or a Node-only npm lifecycle script
+        # before the first setup-node completes reintroduces the shard
+        # failure.
+        node_index = self.shard.index("uses: actions/setup-node@")
+        before = self.shard[:node_index]
+        self.assertNotIn("uses: pnpm/action-setup", before)
+        self.assertNotIn("pnpm install --frozen-lockfile", before)
+        self.assertNotIn("pnpm build", before)
+        for match in re.finditer(r"^\s*run:", before, re.M):
+            line = before[match.start():].splitlines()[0]
+            self.assertNotIn("node ", line)
+            self.assertNotIn("pnpm ", line)
+
     def test_docs_gating_follows_producer_mode(self):
         self.assertIn("needs.test-build.outputs.mode != 'docs'", self.shard)
         self.assertNotIn("steps.scope.outputs.mode", self.shard)
