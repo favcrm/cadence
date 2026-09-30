@@ -522,31 +522,17 @@ fn cad786_ui_send_controls_e2e() {
 }
 
 fn copy_source(into: &Path) {
-    for name in [
-        "app.md",
-        "workflows/blog-post.md",
-        "rubrics/blog.md",
-        "templates/brief.md",
-        "templates/post.md",
-    ] {
+    // The board renders the CRM screens for the installation whose app
+    // is named `crm`; the seeded source is the real CRM bundle.
+    for name in ["app.md", "workflows/email-brief.md", "rubrics/email.md"] {
         let destination = into.join(name);
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::copy(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("apps/blog-post")
+                .join("workspace-apps/crm")
                 .join(name),
             &destination,
         )
         .unwrap();
     }
-    // The board renders the CRM screens for the installation whose app
-    // is named `crm`; the seeded source borrows blog-post's shape.
-    let manifest = into.join("app.md");
-    let text = std::fs::read_to_string(&manifest).unwrap();
-    std::fs::write(
-        manifest,
-        text.replace("app: blog-post", "app: crm")
-            .replace("title: Blog post", "title: CRM"),
-    )
-    .unwrap();
 }
