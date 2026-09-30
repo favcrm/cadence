@@ -23,12 +23,17 @@ The default is two distinct independent reviewers (Standards and
 Spec/security must come from different people). On a project where the
 author is the only registered reviewer-capable identity — a solo-operator
 lane — a **single** independent reviewer (never the author) may cover both
-axes, but only when the operator records `OPERATOR APPROVED #<pr> at <full
-sha>` on the ticket for that head. The operator approval stands in for the
-*second reviewer*, not for independence. It is a per-project declaration,
-not a per-PR waiver; it does not relax any other `human` trigger, and it
-never lowers Browser QA, the `qa-verdict` status binding, or the risk
-class itself. A change to *this* rule is class `human` (trigger 7) and can
+axes, but only when the operator approves that head through
+`cadence audit approve --pr <n> --head <full sha> --action merge`. That
+verb is operator-connection-only and writes an `approval_recorded` event
+on the dedicated `audit:approvals` stream bound to the head — a ticket
+comment or note is not approval evidence and never satisfies this clause.
+The operator approval stands in for the *second reviewer*, not for
+independence. Whether a project is a solo-operator lane is declared in its
+`delivery:` policy (which identities are registered reviewers), not ad-hoc
+per PR; the clause does not relax any other `human` trigger, and it never
+lowers Browser QA, the `qa-verdict` status binding, or the risk class
+itself. A change to *this* rule is class `human` (trigger 7) and can
 never approve itself.
 
 ## After an auto merge

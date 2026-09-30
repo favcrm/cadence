@@ -33,13 +33,16 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     reviewers. When the project runs a solo-operator lane — the author is
     the only registered reviewer-capable identity on the project — a
     single independent registered-identity reviewer (not the author) may
-    satisfy both axes only if the operator records an explicit
-    `OPERATOR APPROVED #<pr> at <full sha>` on the ticket for that head.
-    The operator approval substitutes for the second reviewer, not for
-    independence: the single reviewer still must not be the author.
-    Solo-operator scaling is declared per project, not per PR; it does
-    not apply to any `human` trigger other than reviewer count, and it
-    never lowers the Browser QA, qa-verdict-status, or risk-class gates.
+    satisfy both axes only if the operator approves that head through the
+    operator-connection-bound `cadence audit approve --pr <n> --head <full
+    sha> --action merge` event on `audit:approvals` (the same channel every
+    human-class approval uses). A ticket comment or note is not approval
+    evidence. The operator approval substitutes for the second reviewer,
+    not for independence: the single reviewer still must not be the author.
+    Solo-operator scaling is declared per project in the `delivery:`
+    policy, not per PR; it does not apply to any `human` trigger other
+    than reviewer count, and it never lowers the Browser QA,
+    qa-verdict-status, or risk-class gates.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in
