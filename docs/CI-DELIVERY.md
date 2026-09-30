@@ -117,6 +117,23 @@ and a full merge-group run when estimating a landing. Do not describe
 replay timings as measurements of a production-code PR: those changes
 currently receive the full fallback.
 
+## Shared CI contracts
+
+The required `fmt` job runs the shared scope/runner, shard-coverage,
+nextest-cost, delivery/staging/review-observation contracts and doctor/host
+split-map check once. Their failures still block the required gate and
+release evidence. They no longer repeat in every Rust test shard.
+`tests/scripts/test_ci_shared_checks.py` checks that each command remains
+once-only and blocking, including early failures in multi-command steps.
+
+The producer selects the scope once. Each shard verifies the sealed archive
+and inventory, builds its SPA, executes its assigned tests and uploads
+assignment/cost artifacts. The required `test` aggregate still verifies complete, disjoint
+coverage. Default-feature refusal proofs and doctests remain in `test-once`.
+Exact-SHA main queue-evidence reuse is unchanged. This deduplicates eight
+shared commands from eight copies to one on a full gate run; it does not
+claim measured wall-time savings. Build-once distribution is described below.
+
 ## Compile-once Rust test archives (CAD-858)
 
 The `test-build` job selects the scope using the PR base policy, proves the
@@ -193,8 +210,9 @@ eight downloads took 39–332 seconds each. Archive verification and exact
 assignment of all 3,615 tests passed, but seven shards failed actual test
 bodies: Bookworm Git lacked `--merge-base`, an offline Cargo call lacked
 registry data, and permission/provider lifecycle tests failed. The runtime
-correction targets those causes; full CI must verify the ownership and
-reaping hypotheses before accepting this revision.
+correction passed all eight shards and the required aggregate in run
+36746748151; its receipts cover all 3,615 tests exactly. A changed integration
+head still needs its own full CI and independent reviews.
 No measured speedup is implied. Producer scheduling, upload/download, preflight/extraction,
 UI setup and other required builds can outweigh saved compilation. Require
 current-head full/selected archive execution and eight-shard coverage evidence;

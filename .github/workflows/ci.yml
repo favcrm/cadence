@@ -159,6 +159,28 @@ jobs:
           python3 tests/scripts/test_ci_archive_safety.py
           python3 tests/scripts/test_ci_test_runtime.py
 
+      # CAD-854: shared contracts execute once in the required fmt gate.
+      - name: Test scope selection and execution contracts
+        run: python3 tests/scripts/test_ci_test_plan.py
+      - name: Test suite-shard partition contracts
+        run: python3 tests/scripts/test_ci_rust_tests.py
+      - name: Test shard-assignment coverage gate
+        run: python3 tests/scripts/test_ci_shard_check.py
+      - name: Test nextest cost reporting
+        run: python3 tests/scripts/test_nextest_cost_report.py
+      - name: Test delivery candidate and mutation validation
+        run: |
+          python3 tests/scripts/test_delivery_candidate.py
+          python3 tests/scripts/test_auto_stage.py
+          python3 tests/scripts/test_native_review_observation.py
+      # CAD-562: keep the generated tree and its manifest consistent,
+      # including each declared item and every #[test] fn.
+      - name: Verify doctor/host split-map consistency
+        run: scripts/split-doctor-host --check
+      - name: Test shared CI checks remain required and run once
+        run: python3 tests/scripts/test_ci_shared_checks.py
+
+
   clippy:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
@@ -394,17 +416,6 @@ jobs:
         run: |
           bash scripts/ci-test-runtime-bootstrap
           printf 'temp=%s\n' "$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
-      - name: Test scope selection and execution contracts
-        run: python3 tests/scripts/test_ci_test_plan.py
-      - name: Test suite-shard partition contracts
-        run: python3 tests/scripts/test_ci_rust_tests.py
-      - name: Test shard-assignment coverage gate
-        run: python3 tests/scripts/test_ci_shard_check.py
-      # The producer's needs JSON crosses jobs only through an env var and
-      # a file write — never text interpolation into a run block, so a
-      # crafted output cannot inject shell. The bundle carries no target
-      # cache and nothing here restores one; unknown target contents are
-      # never deleted to make room.
       - name: Record producer job evidence
         env:
           PRODUCER_JSON: ${{ toJSON(needs.test-build) }}
@@ -456,16 +467,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
         if: needs.test-build.outputs.mode != 'docs'
         working-directory: ui
-      - name: Test nextest cost reporting
-        run: python3 tests/scripts/test_nextest_cost_report.py
-      - name: Test delivery candidate and mutation validation
-        run: |
-          python3 tests/scripts/test_delivery_candidate.py
-          python3 tests/scripts/test_auto_stage.py
-          python3 tests/scripts/test_native_review_observation.py
-      # PR93 is an explicit dependency of this CI follow-up. Its installer
-      # and wrapper verify the reviewed archive/binary, force retries=0, and
-      # force --no-tests fail; no tool is installed into PATH or the repo.
       - name: Install pinned cargo-nextest (PR93 dependency)
         env:
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ steps.runtime.outputs.temp }}/cadence-nextest-0.9.145
@@ -484,11 +485,6 @@ jobs:
       # CAD-562: the CAD-536 generated tree must stay consistent with its
       # manifest — every declared item and every #[test] fn accounted
       # for (tests/split_map_inventory.rs is the suite-side twin check).
-      - name: Verify doctor/host split-map consistency
-        run: scripts/split-doctor-host --check
-      # CAD-771: board-surface Rust tests serve the real SPA build
-      # through `ui/dist`. The ui job cannot hand files to this job
-      # without artifact transfer, so build here before nextest (non-docs).
       - name: Build SPA for board-surface Rust tests
         if: needs.test-build.outputs.mode != 'docs'
         run: pnpm build
