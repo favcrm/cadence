@@ -314,14 +314,13 @@ export function newImportRequestId(): string {
   return `csv-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** Strict positive-integer parse: a full decimal string, no signs,
- *  whitespace, exponents, decimals or leading junk — the same shape the
- *  daemon's `as_u64`/`>0` check demands. `undefined` when malformed. */
+/** Strict positive-integer parse: the whole string must be one or
+ *  more decimal digits — no signs, whitespace, exponents, decimals or
+ *  any leading/trailing character — matching the daemon's
+ *  `as_u64`/`>0` check which never trims. `undefined` when malformed. */
 export function parseRevision(text: string | undefined): number | undefined {
-  if (text === undefined) return undefined;
-  const trimmed = text.trim();
-  if (!/^[0-9]+$/.test(trimmed)) return undefined;
-  const value = Number(trimmed);
+  if (text === undefined || !/^[0-9]+$/.test(text)) return undefined;
+  const value = Number(text);
   if (!Number.isSafeInteger(value) || value < 1) return undefined;
   return value;
 }

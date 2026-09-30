@@ -99,6 +99,8 @@ export default function CustomerCsvImport({
     if (!file) return;
     const seq = ++pickSeq.current;
     if (file.size > CSV_MAX_BYTES) {
+      // Clear the input so re-picking the same file re-fires onChange.
+      if (fileRef.current) fileRef.current.value = "";
       setError(`The selected file exceeds the 256 KiB bound (${Math.round(file.size / 1024)} KiB).`);
       return;
     }
@@ -430,11 +432,17 @@ export default function CustomerCsvImport({
             <Button
               variant="primary"
               loading={pending === "import"}
-              disabled={pending !== null || !csvDecisionsReady(preview.rows, choices, revisions)}
+              disabled={
+                pending !== null ||
+                preview.summary.error === preview.rowCount ||
+                !csvDecisionsReady(preview.rows, choices, revisions)
+              }
               title={
-                csvDecisionsReady(preview.rows, choices, revisions)
-                  ? "Commit the approved rows under this exact preview"
-                  : "Every row marked for update needs its expected revision"
+                preview.summary.error === preview.rowCount
+                  ? "No row is importable — every row refused in the preview"
+                  : csvDecisionsReady(preview.rows, choices, revisions)
+                    ? "Commit the approved rows under this exact preview"
+                    : "Every row marked for update needs its expected revision"
               }
               onClick={runImport}
             >
