@@ -148,6 +148,12 @@ fn hosted_media_transport_assertion_refuses_malformed_or_mismatched_composition(
             "transport",
             serde_json::json!({"mode":"hosted-media-lease@1"}),
         ),
+        (
+            "transport",
+            serde_json::json!({"hosted-media-lease@1":null}),
+        ),
+        ("transport", serde_json::json!(["hosted-media-lease@1"])),
+        ("origin", serde_json::json!(null)),
         ("provider", serde_json::json!("agenticos")),
         ("provider", serde_json::json!("other")),
         (
@@ -229,6 +235,38 @@ fn hosted_media_attach_without_external_url_exposes_only_builtin_media() {
         ..Default::default()
     };
     // No daemon, credential enrollment, root-owned file access or network call.
+    for config in [
+        CONFIG,
+        r#"{"schema":1,"providers":[]}"#,
+        r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2"}]}"#,
+    ] {
+        let metadata = DeploymentMetadata::parse(config.as_bytes()).unwrap();
+        assert!(metadata.hosted_media().is_none());
+        let mut absent = crate::daemon::ServeOptions {
+            provider_deployments: Some(metadata),
+            ..Default::default()
+        };
+        crate::platform::agenticos_external::attach(&mut absent).unwrap();
+        assert!(!absent.platforms.contains_key("agenticos_external"));
+    }
+    let mut conflicted = opts.clone();
+    crate::platform::agenticos_external::register_with_deployment_pin(
+        &mut conflicted,
+        "https://external.example.test",
+        None,
+    )
+    .unwrap();
+    assert!(crate::platform::agenticos_external::attach(&mut conflicted).is_err());
+    assert!(!conflicted.platforms["agenticos_external"].app_credentialless_account("hosted"));
+    // Existing trusted pre-registration still wins when metadata asserts no host mode.
+    conflicted.provider_deployments = Some(DeploymentMetadata::parse(CONFIG.as_bytes()).unwrap());
+    let registration = conflicted.platforms["agenticos_external"].connection_registration();
+    crate::platform::agenticos_external::attach(&mut conflicted).unwrap();
+    assert_eq!(
+        conflicted.platforms["agenticos_external"].connection_registration(),
+        registration
+    );
+    crate::platform::agenticos_external::attach(&mut opts).unwrap();
     crate::platform::agenticos_external::attach(&mut opts).unwrap();
     assert_eq!(opts.platforms.len(), 1);
     let adapter = opts
@@ -285,6 +323,54 @@ fn hosted_media_attach_without_external_url_exposes_only_builtin_media() {
             None
         )
         .is_err());
+}
+
+#[test]
+fn hosted_media_and_publisher_assertions_remain_independent() {
+    let mut combined: serde_json::Value = serde_json::from_str(HOSTED_MEDIA_CONFIG).unwrap();
+    let publisher: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+    combined["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(publisher["providers"][0].clone());
+    let metadata = DeploymentMetadata::parse(&serde_json::to_vec(&combined).unwrap()).unwrap();
+    assert!(metadata.hosted_media().is_some());
+    assert_eq!(
+        metadata.pin("agenticos", "http://api.internal"),
+        Some("agenticos-manifest@1/publish_post@2")
+    );
+    let metadata = DeploymentMetadata::parse(CONFIG.as_bytes()).unwrap();
+    assert!(metadata.hosted_media().is_none());
+}
+
+#[test]
+fn hosted_media_attach_refuses_every_external_url_composition() {
+    const ISOLATED: &str = "CADENCE_TEST_CAD868_URL_CONFLICT";
+    if std::env::var_os(ISOLATED).is_none() {
+        for url in ["https://external.example.test", "http://api.internal", ""] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::deployments::tests::hosted_media_attach_refuses_every_external_url_composition", "--test-threads", "1", "--nocapture"])
+                .env(ISOLATED, "1")
+                .env("CADENCE_AGENTICOS_EXTERNAL_URL", url)
+                .output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{url:?}: {text}");
+            assert!(text.contains("1 passed"), "{text}");
+        }
+        return;
+    }
+    let mut opts = crate::daemon::ServeOptions {
+        provider_deployments: Some(
+            DeploymentMetadata::parse(HOSTED_MEDIA_CONFIG.as_bytes()).unwrap(),
+        ),
+        ..Default::default()
+    };
+    assert!(crate::platform::agenticos_external::attach(&mut opts).is_err());
+    assert!(!opts.platforms.contains_key("agenticos_external"));
 }
 
 #[test]

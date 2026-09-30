@@ -1,6 +1,7 @@
 //! The AgenticOS external provider door, separate from its hosted publisher.
 //! Only app-run capability authority may execute these fixed, reviewed tools.
-//! A token stays in custody; the upstream door derives its company from it.
+//! External tokens stay in custody; the upstream door derives their company.
+//! Trusted hosted media instead uses the fixed lease-owned door with no bearer.
 mod image;
 pub mod publish;
 pub mod publish_sender;
@@ -60,8 +61,15 @@ const TABLE_JSON: &str = r#"{
     ]
 }"#;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    ExternalBearer,
+    HostedMediaLease,
+}
+
 pub struct AgenticosExternalAdapter {
     table: ToolTable,
+    transport: Transport,
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
@@ -75,16 +83,34 @@ impl AgenticosExternalAdapter {
     /// The pin is an image-owner assertion about this exact deployed origin,
     /// never a claim made by an app, connection credential or HTTP response.
     pub fn with_deployment_pin(base: &str, deployment_pin: Option<&str>) -> Result<Self> {
-        let base = valid_base(base)?;
+        Self::new(valid_base(base)?, deployment_pin, Transport::ExternalBearer)
+    }
+
+    pub(crate) fn hosted_media(
+        _admission: super::deployments::HostedMediaAdmission,
+    ) -> Result<Self> {
+        Self::new(
+            "http://api.internal".into(),
+            Some(MANIFEST_PIN),
+            Transport::HostedMediaLease,
+        )
+    }
+
+    fn new(base: String, deployment_pin: Option<&str>, transport: Transport) -> Result<Self> {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
-        let table = ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
-            .expect("reviewed tool table");
+        let mut table =
+            ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
+                .expect("reviewed tool table");
+        if transport == Transport::HostedMediaLease {
+            table.tools.retain(|tool| tool.tool == IMAGE_TOOL);
+        }
         let adapter = Self {
             table,
+            transport,
             base,
             deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
@@ -116,21 +142,44 @@ impl AgenticosExternalAdapter {
         MEDIA_POLL_DEADLINE
     }
 
-    /// Bearer-authenticated media GET with the response capped and no
+    /// Hosted custody is empty and the bound account is actually builtin.
+    /// This runs before every price/submit request, independent of the broker.
+    fn media_token<'a>(
+        &self,
+        credential: &'a [u8],
+        config: &Value,
+    ) -> std::result::Result<Option<&'a str>, String> {
+        match self.transport {
+            Transport::ExternalBearer => bearer_token(credential).map(Some),
+            Transport::HostedMediaLease => {
+                if !credential.is_empty()
+                    || config["account"] != "hosted"
+                    || config["connection_kind"] != "builtin"
+                {
+                    return Err(
+                        "hosted media requires the credentialless builtin hosted account".into(),
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Media GET with the response capped and no
     /// redirects. Transport, oversize and non-JSON failures all map to `err`.
     fn get_media(
         &self,
         url: &str,
-        token: &str,
+        token: Option<&str>,
         cap: u64,
         err: &'static str,
     ) -> std::result::Result<(u16, Value), String> {
-        let mut response = self
-            .http
-            .get(url)
-            .header("authorization", &format!("Bearer {token}"))
-            .call()
-            .map_err(|_| err.to_owned())?;
+        let request = self.http.get(url);
+        let request = match token {
+            Some(token) => request.header("authorization", &format!("Bearer {token}")),
+            None => request,
+        };
+        let mut response = request.call().map_err(|_| err.to_owned())?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
@@ -147,6 +196,9 @@ impl AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<(u64, String), String> {
+        if self.transport == Transport::HostedMediaLease {
+            return Err("hosted media does not expose source actions".into());
+        }
         let config = &binding["config"];
         let mapping = &config["mapping"];
         if config["provider"] != PLATFORM
@@ -215,6 +267,9 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<Value, String> {
+        if self.transport == Transport::HostedMediaLease {
+            return Err("hosted media does not expose source actions".into());
+        }
         let handle = validate_source_authority(authority, input)?;
         let token = std::str::from_utf8(credential)
             .map_err(|_| "AgenticOS provider credential is invalid UTF-8")?;
@@ -321,7 +376,7 @@ impl AgenticosExternalAdapter {
         {
             return Err("provider quote names an unreviewed action".into());
         }
-        let token = bearer_token(credential)?;
+        let token = self.media_token(credential, config)?;
         let (status, envelope) = self.get_media(
             &format!("{}{MEDIA_PRICE_PATH}", self.base),
             token,
@@ -403,14 +458,16 @@ impl AgenticosExternalAdapter {
         // The frozen quote still proves shape (schema/currency/units); its
         // amount is recorded, never enforced as a charge ceiling.
         let quoted = frozen_charge_ceiling(authority)?;
-        let token = bearer_token(credential)?;
+        let token = self.media_token(credential, &authority["binding"]["config"])?;
         if !valid_caller_key(idempotency_key) {
             return Err("provider idempotency key is invalid".into());
         }
-        let mut response = self
-            .http
-            .post(format!("{}{MEDIA_SUBMIT_PATH}", self.base))
-            .header("authorization", &format!("Bearer {token}"))
+        let request = self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base));
+        let request = match token {
+            Some(token) => request.header("authorization", &format!("Bearer {token}")),
+            None => request,
+        };
+        let mut response = request
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "model": IMAGE_MODEL,
@@ -523,10 +580,14 @@ impl AgenticosExternalAdapter {
         {
             return Err("AgenticOS media artifact descriptor is malformed".into());
         }
-        let mut response = self
+        let request = self
             .http
-            .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base))
-            .header("authorization", &format!("Bearer {token}"))
+            .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
+        let request = match token {
+            Some(token) => request.header("authorization", &format!("Bearer {token}")),
+            None => request,
+        };
+        let mut response = request
             .call()
             .map_err(|_| "AgenticOS media artifact read failed")?;
         if response.status().as_u16() != 200 {
@@ -824,9 +885,33 @@ fn register_with_deployment(
     Ok(())
 }
 
-/// External access is opt-in per daemon. Only trusted deployment metadata
-/// can attest a current reviewed manifest; absent metadata keeps calls shut.
+/// Trusted hosted metadata alone admits the credentialless media door.
+/// Otherwise external access remains opt-in per daemon. Caller URL settings
+/// and conflicting pre-registration cannot replace a hosted transport.
 pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+    let metadata = match &opts.provider_deployments {
+        Some(value) => Some(value.clone()),
+        None => super::deployments::load()?,
+    };
+    if let Some(admission) = metadata.as_ref().and_then(|value| value.hosted_media()) {
+        if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {
+            return Err(Error::rejected(
+                "hosted media conflicts with external URL composition",
+            ));
+        }
+        let adapter = AgenticosExternalAdapter::hosted_media(admission)?;
+        if let Some(existing) = opts.platforms.get(PLATFORM) {
+            if existing.connection_registration() != adapter.connection_registration() {
+                return Err(Error::rejected(
+                    "hosted media conflicts with registered provider transport",
+                ));
+            }
+        } else {
+            opts.platforms
+                .insert(PLATFORM.into(), std::sync::Arc::new(adapter));
+        }
+        return Ok(());
+    }
     if opts.platforms.contains_key(PLATFORM) {
         return Ok(());
     }
@@ -834,10 +919,6 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
         return Ok(());
     };
     let base = valid_base(&base)?;
-    let metadata = match &opts.provider_deployments {
-        Some(value) => Some(value.clone()),
-        None => super::deployments::load()?,
-    };
     let pin = metadata
         .as_ref()
         .and_then(|value| value.pin(PLATFORM, &base));
@@ -886,7 +967,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
     }
 
     fn connection_descriptor(&self) -> Option<ProviderDescriptor> {
-        Some(ProviderDescriptor {
+        let mut descriptor = ProviderDescriptor {
             schema: 1,
             provider: PLATFORM.into(),
             revision: "agenticos-external-connections/1".into(),
@@ -936,10 +1017,34 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                     output_contract: "media.image.asset@1".into(),
                 },
             ],
-        })
+        };
+        if self.transport == Transport::HostedMediaLease {
+            descriptor.revision = "agenticos-hosted-media-connections/1".into();
+            descriptor.enrollment_shapes.clear();
+            descriptor.builtin_accounts = vec!["hosted".into()];
+            descriptor
+                .capabilities
+                .retain(|capability| capability.id == "media.generate");
+            descriptor
+                .action_mappings
+                .retain(|mapping| mapping.capability == "media.generate");
+        }
+        Some(descriptor)
+    }
+
+    fn app_credentialless_account(&self, account: &str) -> bool {
+        self.transport == Transport::HostedMediaLease && account == "hosted"
     }
 
     fn connection_registration(&self) -> Option<String> {
+        if self.transport == Transport::HostedMediaLease {
+            return Some(super::connections::registration_digest(&format!(
+                "{PLATFORM}:hosted-media-lease@1:{}:{:?}:{}",
+                self.base,
+                self.deployment_pin,
+                serde_json::to_string(&self.connection_descriptor()).expect("reviewed descriptor")
+            )));
+        }
         Some(super::connections::registration_digest(&format!(
             "{PLATFORM}:{}:{:?}",
             self.base, self.deployment_pin
@@ -1286,6 +1391,151 @@ mod tests {
         image_proof(Value::Null)["binding"].clone()
     }
 
+    fn hosted_adapter() -> AgenticosExternalAdapter {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#).unwrap();
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
+    }
+
+    fn hosted_image_proof() -> Value {
+        let mut proof = image_proof(media_quote());
+        proof["binding"]["config"]["account"] = json!("hosted");
+        proof["binding"]["config"]["connection_kind"] = json!("builtin");
+        proof
+    }
+
+    #[test]
+    fn cad868_modes_keep_external_identity_and_confine_internal_http() {
+        let host = hosted_adapter();
+        assert_eq!(host.base, "http://api.internal");
+        assert_eq!(host.poll_interval(), Duration::from_secs(10));
+        assert_eq!(host.poll_deadline(), Duration::from_secs(120));
+        assert!(host.app_credentialless_account("hosted"));
+        assert!(!host.app_credentialless_account("company1"));
+        assert!(!crate::platform::is_builtin(PLATFORM, "hosted"));
+        let external = image_adapter("https://api.example.test");
+        assert!(!external.app_credentialless_account("hosted"));
+        assert_eq!(
+            external.connection_descriptor().unwrap().revision,
+            "agenticos-external-connections/1"
+        );
+        assert_eq!(
+            external.connection_descriptor().unwrap().enrollment_shapes,
+            vec!["token"]
+        );
+        assert!(external
+            .connection_descriptor()
+            .unwrap()
+            .builtin_accounts
+            .is_empty());
+        assert_eq!(
+            external.connection_descriptor().unwrap().capabilities.len(),
+            2
+        );
+        assert_eq!(
+            external.connection_registration(),
+            Some(super::super::connections::registration_digest(&format!(
+                "{PLATFORM}:https://api.example.test:{:?}",
+                Some(MANIFEST_PIN)
+            )))
+        );
+        assert_ne!(
+            host.connection_registration(),
+            external.connection_registration()
+        );
+        for origin in [
+            "http://api.internal",
+            "http://api.internal:80",
+            "http://other.internal",
+            "http://api.internal/",
+        ] {
+            assert!(
+                AgenticosExternalAdapter::with_deployment_pin(origin, Some(MANIFEST_PIN)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cad868_hosted_and_external_misselection_refuse_before_traffic() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let mut host = hosted_adapter();
+        // Private unit fixture only: admission still comes from validated
+        // metadata. No production origin override or new feature seam.
+        host.base = base.clone();
+        let proof = hosted_image_proof();
+        for credential in [b"fake-bearer".as_slice(), b"\xff".as_slice()] {
+            assert!(host
+                .quote_app_capability(credential, &proof["binding"])
+                .is_err());
+            assert!(host
+                .execute_app_capability(credential, &proof, &json!({}), "app-call-868")
+                .is_err());
+        }
+        for (field, value) in [
+            ("account", json!("company1")),
+            ("account", Value::Null),
+            ("connection_kind", json!("enrolled")),
+            ("connection_kind", Value::Null),
+            ("provider", json!("agenticos")),
+            ("connection_id", Value::Null),
+        ] {
+            let mut forged = proof.clone();
+            forged["binding"]["config"][field] = value;
+            assert!(host.quote_app_capability(b"", &forged["binding"]).is_err());
+            assert!(host
+                .execute_app_capability(b"", &forged, &json!({}), "app-call-868")
+                .is_err());
+        }
+        for field in [
+            "capability",
+            "version",
+            "action",
+            "resource_kind",
+            "tool",
+            "effect",
+        ] {
+            let mut forged = proof.clone();
+            forged["binding"]["config"]["mapping"][field] = Value::Null;
+            assert!(host.quote_app_capability(b"", &forged["binding"]).is_err());
+            assert!(host
+                .execute_app_capability(b"", &forged, &json!({}), "app-call-868")
+                .is_err());
+        }
+        assert!(host
+            .quote_app_capability(b"", &authority()["binding"])
+            .is_err());
+        assert!(host
+            .execute_app_capability(b"", &authority(), &json!({}), "app-call-868")
+            .is_err());
+        assert!(host
+            .execute(b"", IMAGE_TOOL, &json!({}), "app-call-868", None)
+            .is_err());
+        assert!(host
+            .execute_app_artifact(b"", IMAGE_TOOL, &json!({}), "app-call-868", None)
+            .is_err());
+        let external = image_adapter(&base);
+        // Even a public token account named hosted never gains lease authority.
+        assert!(external
+            .quote_app_capability(b"", &proof["binding"])
+            .is_err());
+        assert!(external
+            .execute_app_capability(b"", &proof, &json!({}), "app-call-868")
+            .is_err());
+        for input in [
+            json!({"transport":"hosted-media-lease@1"}),
+            json!({"account":"hosted"}),
+            json!({"prompt":"caller selected"}),
+        ] {
+            assert!(host
+                .execute_app_capability(b"", &proof, &input, "app-call-868")
+                .is_err());
+        }
+        assert!(server
+            .recv_timeout(Duration::from_millis(20))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn cad816_image_quote_reads_the_media_price_view() {
         let (base, seen, worker) = media_door(|request| {
@@ -1623,6 +1873,91 @@ mod tests {
             adapter.test_poll_interval = Some(Duration::from_millis(5));
             adapter.test_poll_deadline = Some(Duration::from_millis(500));
             adapter
+        }
+
+        #[test]
+        fn cad868_media_headers_match_mode_for_price_submit_job_and_artifact() {
+            for hosted in [true, false] {
+                let png = test_png();
+                let artifact = artifact_entry("med_job868", &png);
+                let bytes = png.clone();
+                let (base, seen, worker) = media_door(move |request| {
+                    assert_eq!(
+                        request.auth.as_deref(),
+                        if hosted {
+                            None
+                        } else {
+                            Some("Bearer test-token")
+                        }
+                    );
+                    match (request.method.as_str(), request.url.as_str()) {
+                        ("GET", MEDIA_PRICE_PATH) => json_response(200, price_view(31_500, "v1")),
+                        ("POST", MEDIA_SUBMIT_PATH) => {
+                            assert_eq!(request.idem.as_deref(), Some("app-call-868"));
+                            assert_eq!(request.body.as_object().unwrap().len(), 3);
+                            json_response(
+                                201,
+                                json!({"ok":true,"data":{"job":job_view("med_job868", "queued", json!([]), false, 40_000)}}),
+                            )
+                        }
+                        ("GET", "/v1/runtime/media/jobs/med_job868") => json_response(
+                            200,
+                            json!({"ok":true,"data":{"job":job_view("med_job868", "succeeded", json!([artifact.clone()]), false, 40_000)}}),
+                        ),
+                        ("GET", path) if path.starts_with(MEDIA_ARTIFACTS_PATH) => {
+                            artifact_response(&bytes)
+                        }
+                        _ => panic!(
+                            "unexpected media request {} {}",
+                            request.method, request.url
+                        ),
+                    }
+                });
+                let mut adapter = if hosted {
+                    hosted_adapter()
+                } else {
+                    image_adapter(&base)
+                };
+                // Reuse the existing CAD-816 fixture clock and private unit
+                // transport injection; neither exists in production config.
+                adapter.base = base;
+                adapter.test_poll_interval = Some(Duration::from_millis(5));
+                adapter.test_poll_deadline = Some(Duration::from_millis(500));
+                let credential = if hosted {
+                    b"".as_slice()
+                } else {
+                    b"test-token".as_slice()
+                };
+                let mut proof = if hosted {
+                    hosted_image_proof()
+                } else {
+                    image_proof(media_quote())
+                };
+                let quote = adapter
+                    .quote_app_capability(credential, &proof["binding"])
+                    .unwrap();
+                assert_eq!(quote.total_price_micros, 31_500);
+                proof["quote"] = json!(quote);
+                let output = adapter
+                    .execute_app_capability(credential, &proof, &json!({}), "app-call-868")
+                    .unwrap();
+                assert_eq!(output.result["charge"]["amount"], "0.040000");
+                assert_eq!(output.result["quoted_micros"], 31_500);
+                assert_eq!(
+                    output.result["asset_sha256"],
+                    format!("sha256:{:x}", Sha256::digest(&png))
+                );
+                assert_eq!(output.asset.unwrap().bytes, png);
+                worker.join().unwrap();
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 4);
+                assert_eq!(
+                    seen.iter()
+                        .filter(|request| request.method == "POST")
+                        .count(),
+                    1
+                );
+            }
         }
 
         #[test]
