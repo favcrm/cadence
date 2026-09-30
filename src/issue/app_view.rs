@@ -134,7 +134,11 @@ fn expect_string<'a>(v: &'a Value, path: &str, max: usize) -> Result<&'a str> {
     if s.is_empty() {
         return Err(fail(path, "expected a non-empty string"));
     }
-    if s.chars().count() > max {
+    // Parity with contract.ts `v.length`: JavaScript counts UTF-16 code
+    // units — an astral character is two — so Rust must not count
+    // `chars()` (Unicode scalars) or the gate admits what the consumer
+    // refuses.
+    if s.encode_utf16().count() > max {
         return Err(fail(
             path,
             format!("string is longer than {max} characters"),
