@@ -965,6 +965,23 @@ fn reset(sb: &Sandbox) -> Result<Value> {
         )));
     }
     removable(sb)?;
+    // A persisted share outlives `down` — remove it while its record
+    // still exists, or refuse so reset cannot orphan a live mapping
+    // onto a port another service may take.
+    if persisted_share(sb)? {
+        if !std::env::var(ALLOW_GLOBAL_ENV).is_ok_and(|v| v == "1") {
+            return Err(Error::rejected(format!(
+                "sandbox '{}' still has a persisted tailnet share — reset \
+                 would orphan the live mapping. Stop it under the opt-in \
+                 first: `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui \
+                 tailscale stop`, or re-run reset with `{ALLOW_GLOBAL_ENV}=1`",
+                sb.name,
+                sb.state_dir().display()
+            )));
+        }
+        let exe = std::env::current_exe()?;
+        run_child(sb, &exe, &["ui", "tailscale", "stop"])?;
+    }
     let stopped = down(sb)?;
     removable(sb)?;
     std::fs::remove_dir_all(&sb.root)?;

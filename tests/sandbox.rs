@@ -1158,9 +1158,16 @@ fn sandbox_up_serializes_a_grant_change() {
             &["sandbox", "up", "sb"],
             &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")],
         )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let b = host.cmd(&["sandbox", "up", "sb"], &[]).spawn().unwrap();
+    let b = host
+        .cmd(&["sandbox", "up", "sb"], &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let oa = a.wait_with_output().unwrap();
     let ob = b.wait_with_output().unwrap();
 
@@ -1191,5 +1198,57 @@ fn sandbox_up_serializes_a_grant_change() {
     assert_eq!(
         board_granted, granted_won,
         "live board env disagrees with the marker"
+    );
+}
+
+/// A persisted share outlives `down`; `reset` must stop it under the
+/// opt-in — or refuse — so the live mapping is never orphaned by
+/// deleting its record.
+#[test]
+fn sandbox_reset_removes_a_persisted_share() {
+    let mut host = Host::new();
+    let fake = fake_tailscale(host.tmp.path());
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let v = host.up_free("sb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+
+    // The share `ui tailscale start` would have persisted, plus its
+    // fake serve mapping.
+    let ui_json = state.join("ui.json");
+    let mut opts: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ui_json).unwrap()).unwrap();
+    let port = opts["port"].as_u64().unwrap();
+    opts["tailscale"] = json!({
+        "dns_name": SANDBOX_TS_DNS,
+        "https_port": 9460,
+        "target": format!("http://127.0.0.1:{port}"),
+    });
+    std::fs::write(&ui_json, opts.to_string()).unwrap();
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{SANDBOX_TS_DNS}:9460\thttp://127.0.0.1:{port}\n"),
+    )
+    .unwrap();
+
+    // Without the opt-in reset refuses before deleting the record.
+    let out = host.run(&["sandbox", "reset", "sb"], &[]);
+    refused(&out, "still has a persisted tailnet share");
+    assert!(host.base().join("sb").exists(), "root must survive");
+
+    // With it the share is stopped, then the root goes.
+    let out = host.run(
+        &["sandbox", "reset", "sb"],
+        &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1"), ("PATH", &path)],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!host.base().join("sb").exists(), "root deleted");
+    assert!(
+        ts_calls(&fake).contains("off"),
+        "mapping removal ran: {}",
+        ts_calls(&fake)
     );
 }

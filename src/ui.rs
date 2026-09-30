@@ -522,6 +522,10 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
             )));
         }
         let ui_port = eff.port.unwrap_or(3010);
+        // Before any mapping write: a sandbox must never publish a
+        // target onto the production port — `serve_opts` would refuse
+        // it later, after the mapping already existed.
+        crate::sandbox::refuse_production_port(ui_port)?;
         let target = format!("http://127.0.0.1:{ui_port}");
         let me = ts_self()?;
         ensure_mapping(https_port, &target)?;
@@ -4644,6 +4648,9 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);
+    // Same ordering rule as `ui start --tailscale`: refuse a sandbox's
+    // production-port target before the mapping exists, not after.
+    crate::sandbox::refuse_production_port(ui_port)?;
     let target = format!("http://127.0.0.1:{ui_port}");
     let created = ensure_mapping(https_port, &target)?;
     opts.tailscale = Some(TailscaleOpts {
