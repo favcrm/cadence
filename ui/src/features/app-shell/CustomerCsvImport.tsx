@@ -4,12 +4,15 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
 import {
+  CSV_MAX_BYTES,
+  buildCsvDecisions,
   csvActions,
+  csvDecisionsReady,
+  csvPlanChoice,
   newImportRequestId,
   type CsvImportReceipt,
-  type CsvPlanRow,
   type CsvPreview,
-  type CsvRowDecision,
+  type CsvRowChoice,
 } from "./csvClient";
 import { friendlyError, viewProfile } from "./customerProfile";
 import type { HostScope } from "./hostActions";
@@ -33,68 +36,7 @@ import type { HostScope } from "./hostActions";
 const CSV_HINT =
   "record_id,display_name,email,phone,tags,source,consent_email,consent_sms,expected_revision";
 
-type RowChoice = "apply" | "skip";
 
-function planChoice(row: CsvPlanRow): RowChoice {
-  return row.decision === "error" || row.decision === "skip" ? "skip" : "apply";
-}
-
-/** The decision list the import verb accepts: apply keeps the plan's
- *  action (`update` needs the confirmed revision), `skip` drops the row
- *  whatever the plan said. */
-export function buildDecisions(
-  rows: CsvPlanRow[],
-  choices: Map<number, RowChoice>,
-  revisions: Map<number, string>,
-): CsvRowDecision[] {
-  const decisions: CsvRowDecision[] = [];
-  for (const row of rows) {
-    const choice = choices.get(row.row) ?? planChoice(row);
-    if (choice === "skip") {
-      decisions.push({ row: row.row, action: "skip" });
-      continue;
-    }
-    switch (row.decision) {
-      case "create":
-        decisions.push({ row: row.row, action: "create" });
-        break;
-      case "update":
-        decisions.push({
-          row: row.row,
-          action: "update",
-          expectedRevision: row.expectedRevision ?? undefined,
-        });
-        break;
-      case "needs_revision": {
-        const revision = Number.parseInt(revisions.get(row.row) ?? "", 10);
-        decisions.push({ row: row.row, action: "update", expectedRevision: revision });
-        break;
-      }
-      case "error":
-        // Unreachable — error rows default to and stay on skip.
-        decisions.push({ row: row.row, action: "skip" });
-        break;
-      default:
-        break;
-    }
-  }
-  return decisions;
-}
-
-/** Whether the current choices can be sent: every applied
- *  `needs_revision` row needs a positive integer revision. */
-export function decisionsReady(
-  rows: CsvPlanRow[],
-  choices: Map<number, RowChoice>,
-  revisions: Map<number, string>,
-): boolean {
-  return rows.every((row) => {
-    if (row.decision !== "needs_revision") return true;
-    if ((choices.get(row.row) ?? "apply") !== "apply") return true;
-    const revision = Number.parseInt(revisions.get(row.row) ?? "", 10);
-    return Number.isInteger(revision) && revision >= 1;
-  });
-}
 
 const OUTCOME_LABEL: Record<string, string> = {
   created: "created",
@@ -123,10 +65,12 @@ export default function CustomerCsvImport({
   const [csvText, setCsvText] = useState("");
   const [preview, setPreview] = useState<CsvPreview | null>(null);
   const [receipt, setReceipt] = useState<CsvImportReceipt | null>(null);
-  const [choices, setChoices] = useState<Map<number, RowChoice>>(new Map());
+  const [choices, setChoices] = useState<Map<number, CsvRowChoice>>(new Map());
   const [revisions, setRevisions] = useState<Map<number, string>>(new Map());
   const [pending, setPending] = useState<"preview" | "import" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A monotonic pick sequence — the newest file pick or manual paste
+  // wins over every in-flight read.
   // The request id is minted once per preview and rides every commit of
   // that preview — a retry after an uncertain answer replays the stored
   // receipt rather than double-applying.
@@ -145,16 +89,29 @@ export default function CustomerCsvImport({
     };
   }, []);
 
+  // The selected file's byte size is checked before the read — a file
+  // over the daemon's 256 KiB bound is refused without ever being read.
+  // A monotonically increasing pick id makes the newest pick win: a slow
+  // read landing after a newer pick (or a manual paste) can never
+  // overwrite it.
+  const pickSeq = useRef(0);
   const pickFile = (file: File | undefined) => {
     if (!file) return;
+    const seq = ++pickSeq.current;
+    if (file.size > CSV_MAX_BYTES) {
+      setError(`The selected file exceeds the 256 KiB bound (${Math.round(file.size / 1024)} KiB).`);
+      return;
+    }
     setError(null);
     const scopeKey = live.current.scope;
     file
       .text()
       .then((text) => {
-        // A read that lands after a scope change or unmount is dropped.
-        if (!live.current.mounted || live.current.scope !== scopeKey) return;
-        // New bytes invalidate any preview and receipt of older bytes.
+        // A read that lands after a scope change, unmount or a newer
+        // pick is dropped — never overwrites newer bytes.
+        if (!live.current.mounted || live.current.scope !== scopeKey || seq !== pickSeq.current) {
+          return;
+        }
         setCsvText(text);
         setPreview(null);
         setReceipt(null);
@@ -162,13 +119,15 @@ export default function CustomerCsvImport({
         setRevisions(new Map());
       })
       .catch(() => {
-        if (live.current.mounted && live.current.scope === scopeKey) {
+        if (live.current.mounted && live.current.scope === scopeKey && seq === pickSeq.current) {
           setError("The selected file could not be read.");
         }
       });
   };
 
   const editText = (text: string) => {
+    // A manual paste is a newer edit than any in-flight file read.
+    pickSeq.current += 1;
     setCsvText(text);
     if (preview !== null) {
       // The token binds these exact bytes — a keystroke invalidates it.
@@ -191,7 +150,7 @@ export default function CustomerCsvImport({
         if (!live.current.mounted || live.current.scope !== scopeKey) return;
         setPreview(plan);
         setRequestId(newImportRequestId());
-        setChoices(new Map(plan.rows.map((row) => [row.row, planChoice(row)])));
+        setChoices(new Map(plan.rows.map((row) => [row.row, csvPlanChoice(row)])));
         setRevisions(
           new Map(
             plan.rows
@@ -218,7 +177,7 @@ export default function CustomerCsvImport({
     setPending("import");
     setError(null);
     const scopeKey = live.current.scope;
-    const decisions = buildDecisions(preview.rows, choices, revisions);
+    const decisions = buildCsvDecisions(preview.rows, choices, revisions);
     void csvActions
       .import(scope, csvText, preview.previewToken, requestId, decisions)
       .then((result) => {
@@ -379,7 +338,7 @@ export default function CustomerCsvImport({
               </thead>
               <tbody>
                 {preview.rows.map((row) => {
-                  const choice = choices.get(row.row) ?? planChoice(row);
+                  const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   const view = row.profile !== null ? viewProfile(row.profile) : null;
                   return (
                     <tr key={row.row} data-plan-row={row.row}>
@@ -471,9 +430,9 @@ export default function CustomerCsvImport({
             <Button
               variant="primary"
               loading={pending === "import"}
-              disabled={pending !== null || !decisionsReady(preview.rows, choices, revisions)}
+              disabled={pending !== null || !csvDecisionsReady(preview.rows, choices, revisions)}
               title={
-                decisionsReady(preview.rows, choices, revisions)
+                csvDecisionsReady(preview.rows, choices, revisions)
                   ? "Commit the approved rows under this exact preview"
                   : "Every row marked for update needs its expected revision"
               }

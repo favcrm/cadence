@@ -144,6 +144,42 @@ async function main() {
     (e) => e instanceof ApiError,
     "a zero revision refuses",
   );
+
+  // buildCsvDecisions omits error rows entirely — the daemon refuses a
+  // decision that targets an error row, so "skip" must never be sent.
+  const { buildCsvDecisions, parseRevision } = require(
+    "../src/features/app-shell/csvClient",
+  ) as typeof import("../src/features/app-shell/csvClient");
+  const mixed: import("../src/features/app-shell/csvClient").CsvPlanRow[] = [
+    { row: 1, recordId: "a", decision: "create", expectedRevision: null, currentRevision: null, profile: null, errors: [], reason: null, duplicateOf: null },
+    { row: 2, recordId: "b", decision: "needs_revision", expectedRevision: null, currentRevision: 4, profile: null, errors: [], reason: null, duplicateOf: null },
+    { row: 3, recordId: "c", decision: "error", expectedRevision: null, currentRevision: null, profile: null, errors: ["invalid email"], reason: null, duplicateOf: null },
+  ];
+  equal(
+    buildCsvDecisions(mixed, new Map(), new Map([[2, "4"]])),
+    [
+      { row: 1, action: "create" },
+      { row: 2, action: "update", expectedRevision: 4 },
+    ],
+    "the error row is omitted — never an explicit skip",
+  );
+  // strict revision grammar: signs, decimals, whitespace-trimmed and
+  // junk suffixes all refuse; only a full positive decimal wins.
+  for (const [input, expected] of [
+    ["2", 2],
+    ["42", 42],
+    [" 7 ", 7],
+    ["2abc", undefined],
+    ["2.5", undefined],
+    ["+2", undefined],
+    ["-3", undefined],
+    ["0", undefined],
+    ["", undefined],
+    ["1e3", undefined],
+    ["abc", undefined],
+  ] as [string, number | undefined][]) {
+    equal(parseRevision(input), expected, `parseRevision(${JSON.stringify(input)})`);
+  }
   await rejected(
     () => csvActions.preview({ installId: "install crm", contextId: "ctx-a" }, CSV),
     (e) => e instanceof ApiError,
