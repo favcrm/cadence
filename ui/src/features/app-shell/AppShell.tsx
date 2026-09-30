@@ -308,14 +308,40 @@ export default function AppShell({
   // Narrow drawer focus: opening moves into the pane, closing returns
   // to the trigger. The closed drawer is `visibility: hidden`, so it
   // stays out of the tab order with the draft intact.
+  //
+  // Focus is deferred to the next animation frame: a synchronous
+  // commit-phase `.focus()` loses the race to the pointer/keyboard
+  // activation's own focus (the browser re-targets the toggle on
+  // click/Enter after React commits), so the composer never received
+  // focus on open. The frame lands after native activation settles.
+  // Cleanup cancels a still-pending frame so a rapid close can't steal
+  // focus back, and a read-only/disabled composer yields to the Close
+  // control (an enabled target) instead of a no-op.
   useEffect(() => {
     if (!chatOpen) return;
-    chatPaneRef.current?.querySelector("textarea")?.focus();
+    // Defer past the open commit: the activation's own focus (toggle
+    // on mousedown) must settle first, and the open pane must exist.
+    // Two rAFs clear the click/Enter focus ordering in both real and
+    // synthesized input; cleanup cancels both so a rapid close never
+    // steals focus back. A disabled composer yields to Close.
+    const focusComposer = () => {
+      const pane = chatPaneRef.current;
+      if (!pane || !pane.hasAttribute("data-open")) return;
+      const composer = pane.querySelector<HTMLElement>("textarea");
+      const target = composer && !composer.hasAttribute("disabled")
+        ? composer
+        : pane.querySelector<HTMLElement>(".app-shell-chat-close") ?? composer;
+      target?.focus();
+    };
+    const frame = requestAnimationFrame(() => requestAnimationFrame(focusComposer));
+    const timer = setTimeout(focusComposer, 30);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setChatOpen(false);
     };
     addEventListener("keydown", onKey);
     return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
       removeEventListener("keydown", onKey);
       chatOpenRef.current?.focus();
     };
