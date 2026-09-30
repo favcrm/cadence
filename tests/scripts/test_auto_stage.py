@@ -18,7 +18,10 @@ def load():
 
 
 mod = load()
-NOW = mod.utcnow()
+# Fixed reference instant: fixture `created` timestamps are literals, so a
+# wall-clock now would age every fixture out of the 24h train window and the
+# suite would go red a day after it was written.
+NOW = mod.parse_time("2026-09-29T12:00:00Z")
 GOOD_SHA = "a" * 40
 
 
