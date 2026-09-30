@@ -1,7 +1,8 @@
 //! Agent-notes integration: a note whose header block carries
 //! `Issue: <ID>` is tagged to that issue. The newest tagged note
 //! derives status (`-kickoff` → doing, `-qa` → review, `-verdict` →
-//! done on pass else review); the full set forms the issue's notes
+//! review — a verdict is a review outcome; `done` is the file field's,
+//! set on merge evidence); the full set forms the issue's notes
 //! chain in the drawer.
 
 use std::collections::HashMap;
@@ -93,12 +94,6 @@ pub(crate) fn verdict_outcome(text: &str) -> Option<bool> {
         }
     }
     None
-}
-
-/// Boolean form of [`verdict_outcome`]: absent or unparseable verdict
-/// counts as not-pass, matching the original caller semantics.
-pub(crate) fn verdict_passes(text: &str) -> bool {
-    verdict_outcome(text) == Some(true)
 }
 
 fn word_pass(line: &str) -> bool {
@@ -210,18 +205,14 @@ pub fn derive(notes_dir: &Path, id: &str) -> Option<(&'static str, Note)> {
 }
 
 /// The status one newest note derives — `None` for a plain note.
+/// A verdict is a review outcome (`review`), pass or not: `done`
+/// needs merge evidence, which reconcile (CAD-754) and
+/// `mark_done_on_merge` (CAD-449) write to the file field.
 pub fn derive_from(latest: &Note) -> Option<&'static str> {
     Some(match latest.kind.as_str() {
         "kickoff" => "doing",
         "qa" => "review",
-        "verdict" => {
-            let text = std::fs::read_to_string(&latest.path).unwrap_or_default();
-            if verdict_passes(&text) {
-                "done"
-            } else {
-                "review"
-            }
-        }
+        "verdict" => "review",
         _ => return None,
     })
 }
@@ -244,14 +235,47 @@ mod tests {
         assert_eq!(header_issue("# t\n\nIssue: SPL-4\n").as_deref(), None);
     }
 
+    /// CAD-823: a verdict note is a review outcome, never delivery —
+    /// pass or not it derives `review`; `done` is the file field's,
+    /// set by reconcile/mark-done-on-merge on merge evidence.
     #[test]
-    fn verdict_words() {
-        let pass = "# Verdict: x\n> Session: `s`\n\n## Verdict\n**Pass.** Ship it.\n";
-        assert!(verdict_passes(pass));
-        let dropped = "# Verdict: x\n\n## Verdict\n**Dropped.** No.\n";
-        assert!(!verdict_passes(dropped));
-        let inline = "# v\n> Verdict: pass\n";
-        assert!(verdict_passes(inline));
+    fn derive_from_maps_note_kinds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let note = |kind: &str, name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "## Verdict\n**Pass.**\n").unwrap();
+            Note {
+                name: name.to_string(),
+                path,
+                kind: kind.to_string(),
+                at: String::new(),
+                title: String::new(),
+            }
+        };
+        assert_eq!(derive_from(&note("kickoff", "a-kickoff.md")), Some("doing"));
+        assert_eq!(derive_from(&note("qa", "b-qa.md")), Some("review"));
+        assert_eq!(
+            derive_from(&note("verdict", "c-verdict.md")),
+            Some("review"),
+            "a PASS verdict is passed review, not delivered"
+        );
+        assert_eq!(derive_from(&note("note", "d-note.md")), None);
+    }
+
+    /// A not-passing verdict derives `review` the same.
+    #[test]
+    fn derive_from_revise_verdict_is_review() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("20260929-120000-x-verdict.md");
+        std::fs::write(&path, "# Verdict: x\n\n## Verdict\n**Revise.**\n").unwrap();
+        let note = Note {
+            name: "20260929-120000-x-verdict.md".to_string(),
+            path,
+            kind: "verdict".to_string(),
+            at: String::new(),
+            title: String::new(),
+        };
+        assert_eq!(derive_from(&note), Some("review"));
     }
 
     #[test]

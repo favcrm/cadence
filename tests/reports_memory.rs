@@ -2012,9 +2012,9 @@ fn report_kind_survives_extra_tags() {
     assert!(stored.contains("kind: bug"), "{stored}");
 }
 
-/// Round 2: `report ls` reads the derived status — a verdict note
-/// derives `done` while frontmatter still says `backlog`, and `ls`
-/// agrees with the overview.
+/// Round 2: `report ls` reads the derived status — since CAD-823 a
+/// verdict note derives `review` (passed review, not delivered), so
+/// the report stays listed until the file field says `done`.
 #[test]
 fn report_ls_uses_derived_status() {
     let s = ReportFx::new();
@@ -2026,11 +2026,27 @@ fn report_ls_uses_derived_status() {
         format!("# Close-out\n> Issue: `{id}`\n\n## Verdict\npass\n"),
     )
     .unwrap();
+    // A PASS verdict derives `review` — still an open report. The
+    // row's `review` is the notes-derived status: the file still says
+    // `backlog`, so a file-only read could never produce it.
     let (_, out) = s.cli(&["report", "ls"]);
-    assert_eq!(out["count"], 0, "{out}");
-    // The file still says backlog — `ls` followed the derived status.
+    assert_eq!(out["count"], 1, "{out}");
+    let row = &out["reports"][0];
+    assert_eq!(
+        (row["id"].as_str(), row["status"].as_str()),
+        (Some(id.as_str()), Some("review")),
+        "{out}"
+    );
     let stored = s.issue_body("cadence", &id);
     assert!(stored.contains("status: backlog"), "{stored}");
+    // `done` needs the file field (merge evidence or an explicit set);
+    // the lingering PASS note cannot outrank it once the file moves.
+    let (ok, out) = s.cli(&["issue", "set", &id, "status=done", "--force", "close out"]);
+    assert!(ok, "{out}");
+    let (_, out) = s.cli(&["report", "ls"]);
+    assert_eq!(out["count"], 0, "{out}");
+    let stored = s.issue_body("cadence", &id);
+    assert!(stored.contains("status: done"), "{stored}");
 }
 
 /// Round 2: `needs_me` caps intake rows at NEEDS_ME_CAP plus one
