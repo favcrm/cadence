@@ -510,7 +510,130 @@ const secondPost = posts.find((p) => p.path === "/api/threads/master/messages");
 assert(secondPost, "second install send posted");
 equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-only" }, "install switch clears stale social scope");
 
+// Cold deep links (CAD-863, browser blocker): a fresh mount of the
+// real URL — no manual selection, no same-key navigation — must adopt
+// the authored scope exactly once receipts land. Fresh mounts exercise
+// the async detail→contexts→adopt path a first-render adoption never
+// sees. The viewer.operator false→true transition is covered at the
+// end of the block.
+// The long-lived root above ends on install-second; unmount it so the
+// cold mounts below are the only live shell and carry no install-
+// switch or remembered-scope residue from the earlier flow.
 await React.act(async () => { root.unmount(); });
+win.sessionStorage.clear();
+async function mountColdCold(url: string, install: string) {
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", url);
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: install, viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((hostEl.textContent ?? "").includes("Reports"), `cold mount renders: ${url}`));
+  await flush(); await flush();
+  return { hostEl, cold };
+}
+
+// Canonical link: every authored param survives and the scope binds.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=customers&record=rec-1",
+    "install-shell",
+  );
+  // The adopted label "<label> · version" distinguishes adoption from
+  // the un-adopted scope picker (which also prints context labels as
+  // link text). Assert the bound label, not the picker's options.
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "cold ctx+record link adopts the authored context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "cold ctx+record link does not fall back to the scope picker");
+  assert((hostEl.textContent ?? "").includes("Record details"), "cold ctx+record link opens the record");
+  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-1"), "cold link params survive adoption");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Explicit default section: `crm=customers` is already canonical — it
+// must not be rewritten, and the ctx must adopt alongside it.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=customers",
+    "install-shell",
+  );
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "explicit crm=customers cold link adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "explicit crm=customers does not fall back to the scope picker");
+  assert(location.search.includes("ctx=ctx-a"), "explicit crm=customers keeps the ctx");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Unknown section: only `crm` normalizes — the authored ctx and
+// record still adopt, and no record from another scope can be
+// displayed under this URL (the ctx-bound drawer keys the load).
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-a&crm=bogus&record=rec-2",
+    "install-shell",
+  );
+  assert(!location.search.includes("crm="), "unknown crm section is stripped");
+  assert(location.search.includes("ctx=ctx-a"), "unknown crm keeps the authored ctx");
+  assert(location.search.includes("record=rec-2"), "unknown crm keeps the authored record");
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "unknown crm still adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "unknown crm does not fall back to the scope picker");
+  assert((hostEl.textContent ?? "").includes("Record details"), "unknown crm keeps the ctx-bound record");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Malformed record: only the record is stripped — the authored ctx
+// adopts rather than dropping the whole link.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-b&record=../escape",
+    "install-shell",
+  );
+  assert(!location.search.includes("record="), "malformed record id is stripped");
+  assert(location.search.includes("ctx=ctx-b"), "malformed record keeps the authored ctx");
+  assert((hostEl.textContent ?? "").includes("Beta · 0.1.0"), "malformed record still adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "malformed record does not fall back to the scope picker");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// Stale linked context on a cold mount still refuses cleanly.
+{
+  const { hostEl, cold } = await mountColdCold(
+    "/app-installations/install-shell?ctx=ctx-gone&record=rec-9",
+    "install-shell",
+  );
+  assert(!location.search.includes("ctx=") && !location.search.includes("record="), "stale cold link clears scope and record");
+  assert((hostEl.textContent ?? "").includes("not active"), "stale cold link explains itself");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// The real cold-open path (browser finding): the viewer proves
+// operator asynchronously, so receipts land on the false→true
+// transition, not the first render. Adoption must follow.
+{
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-3");
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: false, readOnly: false } }));
+  });
+  await flush();
+  assert((hostEl.textContent ?? "").includes("Sign in as the operator"), "unproven viewer sees the sign-in note, never records");
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((hostEl.textContent ?? "").includes("Record details"), "operator false→true cold link opens the record"));
+  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "operator false→true cold link adopts the context");
+  assert(!(hostEl.textContent ?? "").includes("No context ·"), "operator transition does not fall back to the scope picker");
+  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-3"), "operator transition keeps the authored link");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
 console.log("app shell checks passed");
 }
 void main();
