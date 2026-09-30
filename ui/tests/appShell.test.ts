@@ -301,6 +301,36 @@ const newTab2 = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) =
 await click(newTab2);
 equal((host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value, "", "unsaved draft dies with the context switch");
 
+// A genuine ctx *change* clears a record carried across it: editing
+// `?ctx-a&record=rec-1` to `?ctx-b&record=rec-1` must not keep ctx-a's
+// record open under ctx-b. The write strips record+appview together.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-1"); });
+await flush(); await flush();
+assert(location.search.includes("record=rec-1"), "deep link lands its record");
+assert(text().includes("Record details"), "record drawer opens on the deep link");
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&record=rec-1"); });
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-b"), "the context change binds ctx-b");
+assert(!location.search.includes("record="), "context change clears the carried record");
+assert(!text().includes("Record details"), "record drawer closes with the scope");
+
+// Scoped entry: an unselected multi-context install offers one
+// `?ctx=` link per active context — explicit, never a silent default.
+// Clear the remembered preference so the multi-context install lands
+// genuinely unscoped, like a fresh browser.
+win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
+await React.act(async () => { navigate("/app-installations/install-shell"); });
+await flush(); await flush();
+assert(location.search === "" || !location.search.includes("ctx="), "no silent context is picked");
+const scopeLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(scopeLinks.length, 2, "one scoped-entry link per active context");
+assert(scopeLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "every entry is a real ?ctx= link");
+const acmeEntry = scopeLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-a");
+assert(acmeEntry, "scoped entry exists for ctx-a");
+await click(acmeEntry);
+assert(location.search.includes("ctx=ctx-a"), "scoped entry lands its context in the URL");
+assert(!host.querySelector("[data-scope-link]"), "entry links go away once a scope is bound");
+
 // A context-bound direct link restores scope; browser back keeps it.
 history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-9");
 await React.act(async () => { win.dispatchEvent(new win.PopStateEvent("popstate")); });

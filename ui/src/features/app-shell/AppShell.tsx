@@ -104,6 +104,14 @@ export default function AppShell({
   // first mount preserves direct links, later switches strip them.
   const firstInstall = useRef(installId);
   const handledQuery = useRef<string | undefined>(undefined);
+  // The scope the shell last bound: which ctx, and which record was
+  // open under it. `undefined` until first adoption. On a ctx change
+  // a *carried* record — the same record still open from the old ctx —
+  // is stale and is cleared; a *new* record arriving with the ctx (a
+  // deep link authored for it, or a history entry) is intentional and
+  // is preserved.
+  const boundCtx = useRef<string | undefined>(undefined);
+  const boundRecord = useRef<string | null>(null);
 
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
@@ -276,12 +284,28 @@ export default function AppShell({
       return;
     }
     if (urlCtx !== null) {
+      // On a ctx change, the record/appview carried over from the old
+      // scope is stale: it names the previous context's drawer/draft.
+      // A record that *differs* from the one bound under the old ctx —
+      // or a first adoption — is an intentional deep link and stays.
+      const switching = boundCtx.current !== undefined && boundCtx.current !== urlCtx;
+      const carriedRecord = switching && urlRecord !== null && urlRecord === boundRecord.current;
+      const carriedView = switching && urlView !== null;
+      boundCtx.current = urlCtx;
+      // Track the record now bound under this ctx: a carried record is
+      // being cleared (→ null); otherwise the arriving record stands.
+      boundRecord.current = carriedRecord ? null : urlRecord;
       setContextId(urlCtx);
       rememberContext(installId, urlCtx);
       setLinkNotice(null);
+      if (carriedRecord || carriedView) {
+        writeQuery({ appview: null, record: null }, { replace: true });
+      }
       return;
     }
     // No linked context: a record link without scope is ambiguous.
+    boundCtx.current = undefined;
+    boundRecord.current = null;
     if (urlRecord !== null) {
       setLinkNotice("The record link names no context — the selection was cleared.");
       setContextId(fallbackContext());
@@ -437,6 +461,33 @@ export default function AppShell({
                   {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
                 </p>
               )}
+              {/* Scoped entry: a multi-context install with no linked
+                  or remembered scope stays unselected rather than
+                  silently picking a client. Each context is an explicit
+                  `?ctx=` link — a real URL write, deep-linkable, never a
+                  hidden default. The removed header picker stays gone. */}
+              {!isSocial && contextId === "" && activeIds.length > 1 && (
+                <nav className="app-shell-scope card px-4 py-4" aria-label="Choose a context">
+                  <p className="text-label text-ink-300">
+                    Choose a context to open {title}'s records.
+                  </p>
+                  <ul className="app-shell-scope-list">
+                    {contexts
+                      .filter((c) => c.state === "active")
+                      .map((c) => (
+                        <li key={c.id}>
+                          <Link
+                            href={scopedEntryHref(href, c.id)}
+                            className="lnk text-label"
+                            data-scope-link={c.id}
+                          >
+                            {c.config.label}
+                          </Link>
+                        </li>
+                      ))}
+                  </ul>
+                </nav>
+              )}
               {linkNotice && (
                 <p className="card px-4 py-3 text-label text-warn border-warn/40" role="alert">
                   {linkNotice}
@@ -516,6 +567,19 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
   if (!contextId) return null;
   return contexts.find((c) => c.id === contextId)?.config.label ?? null;
+}
+
+/** A scoped-entry link: sets `ctx` and clears any carried record /
+ *  new-view / section state so entering a scope never lands on the
+ *  prior scope's drawer or draft. Pure — unit-tested via the shell. */
+export function scopedEntryHref(href: string, contextId: string): string {
+  const [path, search] = href.split("?");
+  const q = new URLSearchParams(search ?? "");
+  q.set("ctx", contextId);
+  q.delete("record");
+  q.delete("appview");
+  const s = q.toString();
+  return path + (s ? `?${s}` : "");
 }
 
 /** The daemon-stamped App binding on an entry's payload, if verified. */
