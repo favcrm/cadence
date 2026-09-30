@@ -35,8 +35,13 @@ Modes (argv[1]):
   /model gate's verification exists to catch (CAD-551's set_model is
   held to open()'s rule).
 - `catalog-missing-model`: get_state echoes the requested provider/id
-  but get_available_models does NOT list it — the cold-cache fabricated
-  custom-model shape CAD-601 exists to catch; the id was never real.
+  (with execution fields) but get_available_models does NOT list it —
+  the cold-cache fabricated custom-model shape CAD-601 exists to
+  catch; the id was never real.
+- `catalog-missing-minimal`: the same absent catalog entry, but the
+  reported model is the minimal `{id,name,provider}` echo with no
+  execution fields — catalog membership is still mandatory, so the
+  open refuses; a guard that waived unlisted bare reports fails this.
 - `catalog-mismatch-model`: the catalog lists the id, but the reported
   thinkingLevelMap resolves `--effort` onto the paid claude-opus-5
   family — the fabricated entry a name-only get_state check accepts.
@@ -254,6 +259,18 @@ MODELS = [
     # the CAD-559 gate tests.
     {"id": "demo-1", "name": "Acme Demo", "provider": "acme",
      "contextWindow": 200000},
+    # The finite, legitimately-allowlisted test ids positive tests
+    # launch on (CAD-601): a bare `--model <id>` echoes provider `fake`
+    # through get_state, a `provider/id` echoes its own namespace. Once
+    # the open cross-checks get_available_models, each configured model
+    # must be a real catalog entry — these are the known-valid entries,
+    # never an echo of whatever was requested.
+    {"id": "pi-base", "name": "Pi Base", "provider": "fake",
+     "contextWindow": 200000},
+    {"id": "pi-qa-model", "name": "Pi QA", "provider": "fake",
+     "contextWindow": 200000},
+    {"id": "swe-2-high", "name": "SWE 2 High", "provider": "devin",
+     "contextWindow": 200000},
 ]
 
 # ---- CAD-601: the cold-cache fabricated-model shapes ----
@@ -306,6 +323,17 @@ if MODE == "catalog-missing-model":
     # fabricated it.
     MODELS = [catalog_entry("fake", "model-1")]
     state["model"] = reported_with(thinkingLevelMap=PAID_MAP)
+elif MODE == "catalog-missing-minimal":
+    # The adversarial case for the removed exception: the reported
+    # model carries NO execution fields — the minimal
+    # `{id,name,provider}` shape — yet the catalog still does not list
+    # it. Membership is mandatory, so a bare-but-unlisted report must
+    # refuse exactly like a resolved-but-unlisted one.
+    MODELS = [catalog_entry("fake", "model-1")]
+    # Only the namespace/id echo — no api/baseUrl/thinkingLevelMap/
+    # reasoning — so a guard that accepts an unlisted bare report fails.
+    state["model"] = {"id": "demo-1", "name": "acme/demo-1",
+                      "provider": "acme"}
 elif MODE == "catalog-mismatch-model":
     # The principal case: id listed, every field intact except the
     # thinkingLevelMap — the paid-family effort swap itself.

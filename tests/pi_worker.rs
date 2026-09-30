@@ -889,6 +889,10 @@ fn forged_worker_open_never_prompts(mode: &str, alias: &str, requested: &str) {
 fn worker_open_refuses_a_fabricated_or_unverifiable_model() {
     for (mode, alias) in [
         ("catalog-missing-model", "w-missing"),
+        // Minimal-report missing entry: the echoed model carries no
+        // execution fields yet the catalog does not list it — the
+        // membership requirement (not field shape) is what refuses it.
+        ("catalog-missing-minimal", "w-missing-min"),
         ("catalog-mismatch-model", "w-map"),
         ("catalog-mismatch-api", "w-api"),
         ("catalog-mismatch-baseurl", "w-url"),
