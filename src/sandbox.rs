@@ -724,6 +724,64 @@ fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
 /// fails only inside the detached daemon, so `up` checks it first.
 const SOCKET_PATH_MAX: usize = 107;
 
+/// One `up` at a time per sandbox: the grant is recorded before the
+/// children start, and a concurrent caller must wait to see that
+/// marker — an unlocked window let two `up`s with opposite grants both
+/// pass the change check, leaving the winner's live processes under a
+/// marker the loser overwrote.
+fn up_lock(sb: &Sandbox) -> Result<std::fs::File> {
+    std::fs::create_dir_all(&sb.base).map_err(|e| {
+        Error::rejected(format!(
+            "cannot create sandbox base {}: {e}",
+            sb.base.display()
+        ))
+    })?;
+    let path = sb.base.join(format!(".up-{}.lock", sb.name));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| Error::rejected(format!("cannot open {}: {e}", path.display())))?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on a descriptor this function owns; the
+    // returned guard's drop releases it.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Error::rejected(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(lock)
+}
+
+/// The sandbox's persisted `ui.json` still holds a tailnet share — an
+/// ungranted `up` would refuse it at `ui start`, after the daemon is
+/// already running and the marker revoked.
+fn persisted_share(sb: &Sandbox) -> Result<bool> {
+    let path = sb.state_dir().join("ui.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let opts: crate::ui::UiOpts = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::rejected(format!(
+            "{} is not valid JSON — `cadence sandbox reset {}` starts \
+             the sandbox over: {e}",
+            path.display(),
+            sb.name
+        ))
+    })?;
+    Ok(opts.tailscale.is_some())
+}
+
 fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
     refuse_production(sb)?;
     let socket = client::socket_path(&sb.state_dir());
@@ -735,6 +793,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
             socket.display()
         )));
     }
+    let _up_lock = up_lock(sb)?;
     let existing = read_marker(sb)?;
     match std::fs::read_dir(&sb.root) {
         Ok(mut entries) => {
@@ -786,6 +845,21 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
              with the grant you want",
             sb.name,
             if recorded { "granted" } else { "not granted" },
+            sb.name
+        )));
+    }
+    // Refuse before the marker is written and the daemon started: a
+    // persisted tailnet share under a revoked (or never granted) opt-in
+    // makes `ui start` fail, leaving a half-up sandbox.
+    if !allow_global && persisted_share(sb)? {
+        return Err(Error::rejected(format!(
+            "sandbox '{}' still has a persisted tailnet share — an \
+             ungranted `up` would refuse it at `ui start` with the \
+             daemon already running. Stop sharing under the grant first: \
+             `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale \
+             stop`, or `cadence sandbox reset {}` starts over",
+            sb.name,
+            sb.state_dir().display(),
             sb.name
         )));
     }

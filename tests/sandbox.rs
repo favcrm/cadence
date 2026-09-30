@@ -1099,3 +1099,97 @@ fn sandbox_env_exports_the_recorded_opt_in() {
         "{env_file}"
     );
 }
+
+/// `down` leaves the tailnet block in `ui.json`; an ungranted `up`
+/// must refuse before the marker or the daemon move — not half-start
+/// and fail at `ui start`.
+#[test]
+fn sandbox_up_refuses_revocation_while_a_share_is_persisted() {
+    let mut host = Host::new();
+    let v = host.up_free("sb", &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let root = host.base().join("sb");
+    let out = host.run(&["sandbox", "down", "sb"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // The share a granted `ui tailscale start` would have persisted.
+    let port = free_port();
+    std::fs::write(
+        state.join("ui.json"),
+        json!({
+            "port": port,
+            "tailscale": {
+                "dns_name": "sandbox.ts.net",
+                "https_port": 9460,
+                "target": format!("http://127.0.0.1:{port}"),
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = host.run(&["sandbox", "up", "sb"], &[]);
+    refused(&out, "still has a persisted tailnet share");
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(marker["allow_global"], true, "marker untouched: {marker}");
+    assert!(
+        !state.join("ui.pid").exists() && !daemon_answers(&state),
+        "nothing started"
+    );
+
+    // With the share stopped the same `up` revokes cleanly.
+    std::fs::write(state.join("ui.json"), json!({ "port": port }).to_string()).unwrap();
+    host.up_free("sb", &[]);
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(marker["allow_global"], false, "{marker}");
+}
+
+/// Concurrent `up`s with opposite opt-ins must never leave live
+/// processes whose grant disagrees with the marker.
+#[test]
+fn sandbox_up_serializes_a_grant_change() {
+    let mut host = Host::new();
+    host.started.push("sb".to_string());
+    let a = host
+        .cmd(
+            &["sandbox", "up", "sb"],
+            &[("CADENCE_SANDBOX_ALLOW_GLOBAL", "1")],
+        )
+        .spawn()
+        .unwrap();
+    let b = host.cmd(&["sandbox", "up", "sb"], &[]).spawn().unwrap();
+    let oa = a.wait_with_output().unwrap();
+    let ob = b.wait_with_output().unwrap();
+
+    let granted_won = oa.status.success();
+    let (won, lost) = if granted_won { (&oa, &ob) } else { (&ob, &oa) };
+    assert!(won.status.success(), "winner failed: {}", text(won));
+    refused(lost, "sandbox down");
+    let root = host.base().join("sb");
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())
+            .unwrap();
+    assert_eq!(
+        marker["allow_global"], granted_won,
+        "marker follows the winner: {marker}"
+    );
+
+    // The live board's environment is exactly the recorded grant.
+    let state = root.join("state");
+    let pid: i32 = std::fs::read_to_string(state.join("ui.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let board_granted = environ
+        .split(|b| *b == 0)
+        .any(|kv| kv == b"CADENCE_SANDBOX_ALLOW_GLOBAL=1");
+    assert_eq!(
+        board_granted, granted_won,
+        "live board env disagrees with the marker"
+    );
+}
