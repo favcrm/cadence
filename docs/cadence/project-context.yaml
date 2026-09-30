@@ -31,6 +31,12 @@ documents:
     title: Tracker and validation contract
     required: true
     roles: [pm, dev, qa, devops]
+  - id: agent-models
+    kind: validation
+    path: docs/AGENT-MODELS.md
+    title: Pi model selection and refresh
+    required: true
+    roles: [pm, dev, qa, devops]
   - id: release-policy
     kind: release
     path: docs/roles/risk-classes.md
