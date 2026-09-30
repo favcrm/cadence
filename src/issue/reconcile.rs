@@ -461,10 +461,12 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
 }
 
 /// `issue reconcile [--project P] [--dry-run] [--limit N]` — the
-/// sweep. Leaf `doing`/`review` issues whose recorded work merged are
-/// marked done (one commit per issue, `mark_done_on_merge` semantics:
-/// `expect` pins the status it was read at so a mid-sweep reopen is
-/// never overwritten). `held`/`stalled` rows are reported, not moved.
+/// sweep. Leaf issues that look in flight — file `doing`/`review`,
+/// or a non-terminal file whose notes/job derive `doing`/`review`
+/// (CAD-823) — are marked done when their recorded work merged (one
+/// commit per issue, `mark_done_on_merge` semantics: `expect` pins
+/// the status it was read at so a mid-sweep reopen is never
+/// overwritten). `held`/`stalled` rows are reported, not moved.
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
 pub fn run(
@@ -507,9 +509,16 @@ fn run_inner(
     pr_view: PrView<'_>,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
-    let children: HashSet<&str> = issues
+    // Candidacy follows the derived status, not only the file field:
+    // a verdict note no longer fakes `done` (CAD-823), so a ticket
+    // whose file was never moved off backlog/ready — but whose notes
+    // or job derive doing|review — must still reach the probe, else a
+    // merged PR strands it at review forever.
+    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
+    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let children: HashSet<&str> = views
         .iter()
-        .filter_map(|i| i.front.parent.as_deref())
+        .filter_map(|v| v.issue.front.parent.as_deref())
         .collect();
     let mut rows = Vec::new();
     let mut done = Vec::new();
@@ -518,9 +527,11 @@ fn run_inner(
     let mut errors = Vec::new();
     let mut classified = 0usize;
 
-    for issue in &issues {
-        let f = &issue.front;
-        if !matches!(f.status.as_str(), "doing" | "review") {
+    for v in &views {
+        let f = &v.issue.front;
+        if !matches!(f.status.as_str(), "doing" | "review")
+            && !matches!(v.status.as_str(), "doing" | "review")
+        {
             continue;
         }
         if children.contains(f.id.as_str()) || f.item_type.as_deref() == Some("epic") {
@@ -530,7 +541,7 @@ fn run_inner(
             break;
         }
         classified += 1;
-        let p = probe(issue);
+        let p = probe(&v.issue);
         let (verdict, detail) = classify(&p, pr_list, pr_view);
         let mut row = json!({"issue": p.id, "status": p.status});
         row["detail"] = detail;
@@ -633,7 +644,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let t = tmp.path();
         let pm_dir = t.join("pm");
-        let pm = Pm::init(&pm_dir).unwrap();
+        let mut pm = Pm::init(&pm_dir).unwrap();
+        // The sweep derives candidacy through the board views, which
+        // read the notes dir — keep it a throwaway path, never the
+        // default /var/www/agent-notes.
+        pm.config.notes_dir = t.join("notes").display().to_string();
         let key = "cad".to_string();
         let pdir = pm_dir.join(&key);
         fs::create_dir_all(&pdir).unwrap();
@@ -706,6 +721,17 @@ mod tests {
             agent: None,
         });
         write::save_front(&dir, &front, "").unwrap();
+        id
+    }
+
+    /// `put_issue` with a non-`doing` file status — the note-driven
+    /// tickets CAD-823 widened candidacy for.
+    fn put_issue_at(rig: &Rig, n: u32, claim_at: Option<&str>, status: &str) -> String {
+        let id = put_issue(rig, n, claim_at);
+        let dir = rig.pm.dir.join(&rig.key).join(&id);
+        let (mut front, body) = write::load_front(&dir).unwrap();
+        front.status = status.to_string();
+        write::save_front(&dir, &front, &body).unwrap();
         id
     }
 
@@ -919,6 +945,51 @@ mod tests {
         };
         let out = sweep(&rig, false, &no_gh, &pv);
         assert_eq!(status(&rig, &id), "done", "{out}");
+    }
+
+    /// CAD-823 follow-up (Devin Review on #597): a ticket whose file
+    /// never left `backlog` still closes when its notes derive
+    /// `review` and the lane merged — a verdict can no longer fake
+    /// `done`, so candidacy follows the derived status.
+    #[test]
+    fn merged_lane_closes_note_driven_backlog() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 20, None, "backlog");
+        fs::create_dir_all(rig.pm.config.notes_dir()).unwrap();
+        fs::write(
+            rig.pm
+                .config
+                .notes_dir()
+                .join("20260928-120000-x-verdict.md"),
+            format!("# Verdict: x\n> Issue: `{id}`\n\n## Verdict\npass\n"),
+        )
+        .unwrap();
+        lane(&rig.repo, true);
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert!(out["done"].as_array().unwrap().contains(&json!(id)));
+    }
+
+    /// Same shape, nothing merged: the note-derived `review` makes it
+    /// a candidate but no evidence means no write — the file stays
+    /// `backlog`.
+    #[test]
+    fn unmerged_lane_keeps_note_driven_backlog() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 21, None, "backlog");
+        fs::create_dir_all(rig.pm.config.notes_dir()).unwrap();
+        fs::write(
+            rig.pm
+                .config
+                .notes_dir()
+                .join("20260928-120000-x-verdict.md"),
+            format!("# Verdict: x\n> Issue: `{id}`\n\n## Verdict\npass\n"),
+        )
+        .unwrap();
+        lane(&rig.repo, false);
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        assert_eq!(out["rows"][0]["outcome"], "open");
     }
 
     #[test]
