@@ -122,6 +122,7 @@ export default function AppShell({
         appview?: OutletView | null;
         record?: string | null;
         crm?: CrmSection | null;
+        clearContractPreview?: boolean;
       },
       opts?: { replace?: boolean },
     ) => {
@@ -142,6 +143,10 @@ export default function AppShell({
       if (patch.crm !== undefined) {
         if (patch.crm === null || patch.crm === "customers") q.delete("crm");
         else q.set("crm", patch.crm);
+      }
+      if (patch.clearContractPreview) {
+        q.delete("contract-preview");
+        q.delete("contract-preview-view");
       }
       handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
       const s = q.toString();
@@ -217,7 +222,7 @@ export default function AppShell({
     setLoadError(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, crm: null }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, crm: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;

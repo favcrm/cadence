@@ -131,6 +131,34 @@ assert(!executed, "serialization never executes supplied functions");
 refused((v) => parseAppView(v), { value: () => 1 }, "function values refuse");
 refused((v) => parseAppView(v), { value: Infinity }, "non-finite JSON numbers refuse");
 
+// Formatted lists are intentionally unsupported in v1, not a path around
+// scalar format checks. Text lists and tags remain the bounded vocabulary.
+for (const format of ["number", "date", "datetime", "enum"]) {
+  refused((v) => parseAppView(v), {
+    contract: "app-views/v1", app: "demo", title: "Demo", views: [{
+      id: "v", title: "Demo", kind: "detail",
+      fields: [{ id: "f", label: "Field", format, kind: "list", ...(format === "enum" ? { values: ["x"] } : {}) }],
+    }],
+  }, `formatted ${format} lists refuse`);
+}
+function formattedView(format: string) {
+  return parseAppView({ contract: "app-views/v1", app: "demo", title: "Demo", views: [{
+    id: "v", title: "Demo", kind: "detail", fields: [{ id: "f", label: "Field", format }],
+  }] }).views[0];
+}
+for (const value of ["2026-02-31", "2026-02-29", "1900-02-29", "2026-04-31", "2026-00-10", "2026-13-01", "2026-01-00"]) {
+  refused((v) => fixtureRows(formattedView("date"), v), [{ f: value }], `invalid calendar date ${value} refuses`);
+}
+for (const value of ["2026-13-99T25:61:00Z", "2026-02-31T12:00Z", "2026-01-01T24:00Z", "2026-01-01T12:60Z", "2026-01-01T12:00:60Z", "2026-01-01T12:00+24:00", "2026-01-01T12:00+08:60", "2026-01-01T12:00.5Z"]) {
+  refused((v) => fixtureRows(formattedView("datetime"), v), [{ f: value }], `invalid datetime ${value} refuses`);
+}
+for (const value of ["2024-02-29", "2000-02-29", "2026-02-28"]) {
+  equal(fixtureRows(formattedView("date"), [{ f: value }])[0].f, value, `valid calendar date ${value} retained`);
+}
+for (const value of ["2024-02-29T23:59:59.123Z", "2026-01-01T00:00+08:00", "2026-01-01T12:00:01-05:30"]) {
+  equal(fixtureRows(formattedView("datetime"), [{ f: value }])[0].f, value, `valid datetime ${value} retained`);
+}
+
 // --- Fixture rows are strict: unknown keys, bad enums, bad shapes. ---
 const crmTable = appViewExamples.crm.descriptor.views.find((v) => v.id === "customers")!;
 refused((v) => fixtureRows(crmTable, v), [{ name: "Ada", ghost_field: "x" }], "row naming undeclared field refuses");
@@ -274,6 +302,62 @@ assert(text().includes("Summer ramen launch"), "social fixture rows render");
 assert(text().includes("夏日限定"), "zh-HK fixture text renders intact");
 
 await React.act(async () => { root.unmount(); });
+
+// Real shell lifecycle with fixture HTTP receipts: direct preview links and
+// same-installation navigation remain, App-menu installation switches exit.
+let streams = 0;
+Object.defineProperty(globalThis, "EventSource", { configurable: true, value: class {
+  onopen = null; onerror = null;
+  constructor() { streams += 1; }
+  addEventListener() {} removeEventListener() {} close() {}
+} });
+const shellBase = {
+  title: "Reports", name: "reports", version: "0.1.0", digest: "fixture-digest",
+  catalog_generation: "fixture-generation", approved: true, storage_kind: "workspace",
+  files: [], capabilities: null, connection_slots: [],
+};
+globalThis.fetch = (async (input: unknown) => {
+  const url = String(input);
+  const receipt = url.endsWith("/contexts") ? { contexts: [] }
+    : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
+    : url === "/api/app-installations/install-a" ? { ...shellBase, install_id: "install-a" }
+    : url === "/api/app-installations/install-b" ? { ...shellBase, install_id: "install-b", name: "social-content", title: "Social Content" }
+    : null;
+  assert(receipt !== null, `unexpected fixture read ${url}`);
+  return new Response(JSON.stringify(receipt), { status: 200 });
+}) as typeof fetch;
+const AppShell = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { contextNavigationSearch } = require("../src/features/projects/contextRoute") as typeof import("../src/features/projects/contextRoute");
+history.replaceState(null, "", "/app-installations/install-a?contract-preview=crm");
+const shellRoot = createRoot(host);
+const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+await React.act(async () => { shellRoot.render(React.createElement(AppShell, {
+  installId: "install-a", viewer: { operator: true, readOnly: false },
+})); });
+await flush(); await flush(); await flush();
+assert(host.querySelector('[data-contract-preview="crm"]'), "first-mount direct preview link remains");
+await React.act(async () => { navigate("/app-installations/install-a?contract-preview=crm&contract-preview-view=customer-form"); });
+await flush();
+assert(host.querySelector('[data-app-view="customer-form"]'), "same-installation preview navigation remains");
+const { matchRoute } = require("../src/lib/router") as typeof import("../src/lib/router");
+const menuQuery = contextNavigationSearch(
+  matchRoute(location.pathname), matchRoute("/app-installations/install-b"), location.search.slice(1),
+);
+await React.act(async () => {
+  navigate(`/app-installations/install-b?${menuQuery}`);
+  shellRoot.render(React.createElement(AppShell, {
+    installId: "install-b", viewer: { operator: true, readOnly: false },
+    children: React.createElement("p", null, "Social operational outlet"),
+  }));
+});
+await flush(); await flush(); await flush();
+assert(!location.search.includes("contract-preview"), "App menu installation switch clears both preview keys");
+assert(!host.querySelector("[data-contract-preview]"), "new installation never stays behind an old fixture");
+assert(text().includes("Social operational outlet"), "new installation opens its real outlet");
+equal(host.querySelectorAll("[data-chat-pane]").length, 1, "installation switch preserves one chat pane");
+equal(streams, 1, "installation switch preserves the chat stream");
+await React.act(async () => { shellRoot.unmount(); });
 console.log("app view contract checks passed");
 }
 void main().catch((error) => { console.error(error); require("process").exitCode = 1; });

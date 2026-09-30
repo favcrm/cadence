@@ -38,6 +38,12 @@ forbidden otherwise), and `createView` (names a declared `form` view —
 a hint for the host to wire its own create surface, never a route the
 package controls).
 
+In v1, lists support **text and tags only**; numeric, date, datetime
+and enum fields are scalar-only. Calendar values must exist (including
+Gregorian leap-year rules, years 0001–9999). Datetimes require an explicit
+`Z` or signed timezone, hours 00–23 and minutes/seconds 00–59; fractional
+seconds require a seconds component. Leap seconds are not supported.
+
 ## What a descriptor can never carry
 
 Enforced recursively at every object, by both the schema
@@ -99,7 +105,9 @@ tag.
   (`AppViewContractError`); `fixtureRows` validates record-shaped data
   against a parsed view; `AppView` renders one view at a time as React
   text; `AppViewContractPreview` mounts the worked examples behind
-  `?contract-preview=crm|social-content`, dev-only.
+  `?contract-preview=crm|social-content`, dev-only. Direct first-mount links
+  and same-installation view changes preserve preview state; changing the
+  installation clears both preview query keys and opens its normal outlet.
 - **Tests**: `ui/tests/appViewContract.test.ts` parses the schema-side
   examples, checks full parity with the renderer descriptors, asserts
   malformed/forbidden/oversized and non-JSON descriptors refuse, and

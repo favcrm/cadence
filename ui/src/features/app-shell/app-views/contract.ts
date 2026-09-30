@@ -132,8 +132,27 @@ const MAX_SERIALIZED_BYTES = 64 * 1024;
 /** Identifier grammar shared by field ids, view ids and app names:
  *  lowercase, starts with a letter, then letters/digits/`-`/`_`. */
 const IDENT = /^[a-z][a-z0-9_-]{0,63}$/;
-const DATE = /^\d{4}-\d{2}-\d{2}$/;
-const DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DATETIME = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-](\d{2}):(\d{2}))$/;
+
+function calendarDate(value: string): boolean {
+  const match = DATE.exec(value);
+  if (!match) return false;
+  const [, y, m, d] = match;
+  const year = Number(y), month = Number(m), day = Number(d);
+  if (year < 1 || month < 1 || month > 12 || day < 1) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= days[month - 1];
+}
+
+function calendarDateTime(value: string): boolean {
+  const match = DATETIME.exec(value);
+  if (!match || !calendarDate(match[1])) return false;
+  return Number(match[2]) < 24 && Number(match[3]) < 60
+    && (match[4] === undefined || Number(match[4]) < 60)
+    && (match[5] === "Z" || (Number(match[6]) < 24 && Number(match[7]) < 60));
+}
 const CONTROL = /[\u0000-\u001f\u007f\u2028\u2029]/;
 const ENUM_FORMATS: readonly AppViewFormat[] = ["enum"];
 const FORMATS: readonly AppViewFormat[] = ["text", "number", "date", "datetime", "enum", "tags"];
@@ -304,8 +323,8 @@ function parseField(raw: unknown, path: string): AppViewField {
   if (format === "tags" && kind !== "list") {
     fail(`${path}.kind`, 'format "tags" must be kind "list"');
   }
-  if (format !== "tags" && kind === "list" && format === "enum") {
-    fail(`${path}.kind`, 'an enum list is not a supported combination');
+  if (kind === "list" && format !== "text" && format !== "tags") {
+    fail(`${path}.kind`, 'v1 lists support only text or tags');
   }
   let createView: string | undefined;
   if (raw.createView !== undefined) {
@@ -470,11 +489,6 @@ export type AppViewRow = Record<string, AppViewCell>;
 function cell(raw: unknown, field: AppViewField, path: string): AppViewCell {
   if (field.kind === "list") {
     const items = stringList(raw, path, MAX_LIST_ITEMS, MAX_ROW_TEXT);
-    for (const item of items) {
-      if (field.format === "enum" && !field.values!.includes(item)) {
-        fail(path, `enum item outside the declared values: ${JSON.stringify(item)}`);
-      }
-    }
     return items;
   }
   if (field.format === "number") {
@@ -489,9 +503,9 @@ function cell(raw: unknown, field: AppViewField, path: string): AppViewCell {
     return s;
   }
   const s = text(raw, path, MAX_ROW_TEXT);
-  if (field.format === "date" && !DATE.test(s)) fail(path, "expected YYYY-MM-DD");
-  if (field.format === "datetime" && !DATETIME.test(s)) {
-    fail(path, "expected an ISO datetime");
+  if (field.format === "date" && !calendarDate(s)) fail(path, "expected a valid YYYY-MM-DD calendar date");
+  if (field.format === "datetime" && !calendarDateTime(s)) {
+    fail(path, "expected a valid ISO calendar datetime with an explicit timezone");
   }
   if (field.format === "enum" && !field.values!.includes(s)) {
     fail(path, `enum value outside the declared values: ${JSON.stringify(s)}`);

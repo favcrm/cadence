@@ -58,7 +58,17 @@
       }
     },
     "field": {
-      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "allOf": [
+        { "$ref": "#/$defs/safeObject" },
+        {
+          "if": { "properties": { "kind": { "const": "list" } }, "required": ["kind"] },
+          "then": { "properties": { "format": { "enum": ["text", "tags"] } } }
+        },
+        {
+          "if": { "properties": { "format": { "const": "tags" } }, "required": ["format"] },
+          "then": { "properties": { "kind": { "const": "list" } }, "required": ["kind"] }
+        }
+      ],
       "type": "object",
       "required": ["id", "label"],
       "additionalProperties": false,
@@ -71,7 +81,8 @@
         },
         "kind": {
           "enum": ["scalar", "list"],
-          "default": "scalar"
+          "default": "scalar",
+          "description": "v1 lists support only text and tags. Numeric, calendar and enum formats are scalar-only."
         },
         "values": {
           "type": "array",
