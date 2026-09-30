@@ -157,13 +157,23 @@ def verified_binary(release_dir):
     return str(binary)
 
 
+def release_identity(dest):
+    """The receipt's `<sha>-<run>-<attempt>` — what prepare actually
+    fetched, or None when unreadable."""
+    try:
+        c = json.loads((dest / "candidate.json").read_text())
+        return f"{c['source_sha']}-{c['ci_run_id']}-{c['ci_run_attempt']}"
+    except Exception:
+        return None
+
+
 def ensure_release(run, rel_id, run_id, base):
     """releases/<sha>-<run_id>-<attempt>: reuse only a still-verified
     directory, otherwise run `prepare` — a CI rerun's artifacts land in
     a new dir."""
     dest = base / "releases" / rel_id
     if dest.is_dir():
-        if verified_binary(dest):
+        if verified_binary(dest) and release_identity(dest) == rel_id:
             return dest
         raise Refused(
             f"cached release {rel_id} failed verification — not executing it"
@@ -188,6 +198,13 @@ def ensure_release(run, rel_id, run_id, base):
             shutil.rmtree(partial, ignore_errors=True)
     if not verified_binary(dest):
         raise Refused(f"prepared release {rel_id} failed verification")
+    # A rerun between run selection and prepare resolves a newer
+    # attempt than rel_id names — refuse rather than record wrong.
+    if release_identity(dest) != rel_id:
+        raise Refused(
+            f"prepare returned {release_identity(dest)}, not the "
+            f"selected {rel_id} — the run's attempt moved mid-tick"
+        )
     return dest
 
 
@@ -241,6 +258,18 @@ def tailnet(run, cadence, env):
         return f"sharing at {URL_TAILNET}"
     except Exception as e:  # never fatal
         return f"error: {e}"
+
+
+def probe_tailnet(http_get):
+    """Non-fatal reachability probe through the tailnet URL itself."""
+    try:
+        code, _ = http_get(
+            f"{URL_TAILNET}/api/health",
+            "ip-172-31-1-32.tail9fcf30.ts.net:9460",
+        )
+        return "ok" if code == 200 else f"http {code}"
+    except Exception as e:
+        return str(e)[:200]
 
 
 def prune(base, keep_shas):
@@ -349,6 +378,22 @@ def _tick_locked(run, http_get, base, run_id):
 
     deployed = health_ok(http_get)
     if rel_id == status.get("deployed_release") and deployed == sha:
+        # Already live — but a refused tailnet publication (e.g. before
+        # the sandbox opt-in landed) must not wait for the next build:
+        # the mapping and the board allowlists are `ts_start`'s, not
+        # `tailscale serve`'s, so retry it here.
+        if not str(status.get("tailnet") or "").startswith("sharing"):
+            cadence = verified_binary(base / "releases" / rel_id)
+            if cadence:
+                status["tailnet"] = tailnet(
+                    run, cadence, sandbox_env(run, cadence)
+                )
+                status["tailnet_health"] = (
+                    probe_tailnet(http_get)
+                    if status["tailnet"].startswith("sharing")
+                    else None
+                )
+                status_path.write_text(json.dumps(status, indent=2) + "\n")
         log_line(base, f"tick: no-op — {rel_id[:12]} already live")
         return 0
 
@@ -383,17 +428,11 @@ def _tick_locked(run, http_get, base, run_id):
                 )
             raise Refused(f"seed failed ({e}); staging sandbox reset")
         tailnet_state = tailnet(run, cadence, sandbox_env(run, cadence))
-        # Non-fatal reachability probe through the tailnet URL itself.
-        tailnet_health = None
-        if tailnet_state.startswith("sharing"):
-            try:
-                code, _ = http_get(
-                    f"{URL_TAILNET}/api/health",
-                    "ip-172-31-1-32.tail9fcf30.ts.net:9460",
-                )
-                tailnet_health = "ok" if code == 200 else f"http {code}"
-            except Exception as e:
-                tailnet_health = str(e)[:200]
+        tailnet_health = (
+            probe_tailnet(http_get)
+            if tailnet_state.startswith("sharing")
+            else None
+        )
         healthy = health_ok(http_get)
         if healthy != sha:
             raise Refused(

@@ -32,6 +32,9 @@ class FakeRunner:
         self.attempt = attempt
         self.calls = []
         self.tailscale_rc = 0
+        # What `prepare` stamps when it differs from the gh answer —
+        # a rerun resolving a newer attempt mid-tick.
+        self.prepare_attempt = None
         # Substring of the cadence binary path whose `sandbox up` fails.
         self.fail_up_for = None
         self.seed_rc = 0
@@ -60,7 +63,7 @@ class FakeRunner:
             (dest / "candidate.json").write_text(json.dumps({
                 "source_sha": self.sha,
                 "ci_run_id": self.run_id,
-                "ci_run_attempt": self.attempt,
+                "ci_run_attempt": self.prepare_attempt or self.attempt,
                 "sha256": hashlib.sha256(blob).hexdigest(),
             }))
             return 0, "{}", ""
@@ -220,6 +223,31 @@ class TickTest(unittest.TestCase):
         cadence = str(self.base / "releases" / REL_A / "cadence")
         self.assertTrue(r.argvs(f"{cadence} sandbox down"))
         self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
+
+    def test_noop_retries_a_refused_tailnet(self):
+        # Staging live but publication previously refused — the next
+        # tick retries `ui tailscale start` without redeploying.
+        (self.base / "status.json").write_text(json.dumps(
+            {"deployed_release": REL_A, "deployed_sha": SHA_A,
+             "tailnet": "refused: opt-in missing"}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        r = FakeRunner(self.base)  # tailscale_rc=0 → sharing
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        self.assertFalse(r.argvs("sandbox up"), "no redeploy on a no-op tick")
+        self.assertTrue(r.argvs("ui tailscale start"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertTrue(status["tailnet"].startswith("sharing"))
+
+    def test_prepare_returning_a_newer_attempt_is_refused(self):
+        # A rerun between selection and prepare must not be deployed
+        # under the old attempt's release id.
+        r = FakeRunner(self.base)  # gh reports attempt 1
+        r.prepare_attempt = 2    # but prepare resolves attempt 2
+        with self.assertRaises(sd.Refused):
+            self.deploy(r, http_ok(SHA_A))
+        self.assertFalse(r.argvs("sandbox up"))
+        self.assertFalse(r.argvs("sandbox down"))
 
     def test_rerun_same_sha_new_attempt_is_a_new_release(self):
         # First deploy at attempt 1.
