@@ -27,7 +27,7 @@ ALIAS = os.environ["CADENCE_ALIAS"]
 
 
 
-def frame(method, params, detached=False):
+def frame(method, params, detached=False, timeout=5):
     wire = json.dumps({"method": method, "params": params})
     if detached:
         # start_new_session performs real setsid; this remains the enrolled
@@ -40,7 +40,7 @@ def frame(method, params, detached=False):
             raise RuntimeError("detached native probe failed")
         return json.loads(child.stdout)
     with socket.socket(socket.AF_UNIX) as connection:
-        connection.settimeout(5)
+        connection.settimeout(timeout)
         connection.connect(str(STATE / "cadence.sock"))
         connection.sendall((wire + "\n").encode())
         return json.loads(connection.makefile("rb").readline())
@@ -205,8 +205,17 @@ def run_prompt(prompt):
             request = {"message": turn["id"], "token": turn["turn_id"],
                        "slot": "source", "request_id": "source-once",
                        "input": {"source": "CONTEXT_SOURCE=" + probe["source"]}}
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                replies = list(pool.map(lambda _: pi_bash_frame("app_run_capability_call", request), range(2)))
+            if probe.get("slow_single_call"):
+                # Real enrolled provider PID and active assigned turn, with no
+                # client timeout masking the PM's 15-second contention window.
+                replies = [frame("app_run_capability_call", request, timeout=40)]
+                if replies[0].get("ok") is True:
+                    # Replay only after completion, still requiring the exact
+                    # same durable receipt and one adapter invocation.
+                    replies.append(frame("app_run_capability_call", request))
+            else:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    replies = list(pool.map(lambda _: pi_bash_frame("app_run_capability_call", request), range(2)))
             if any(reply.get("ok") is not True for reply in replies):
                 raise RuntimeError("valid concurrent capability calls failed: " + str(replies))
             if replies[0]["result"] != replies[1]["result"]:

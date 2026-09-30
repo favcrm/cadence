@@ -6,6 +6,7 @@
 //!   have reached the provider. The outcome must be preserved for review,
 //!   never silently retried.
 //! - [`Error::Internal`]: local runtime failures (I/O, storage, protocol).
+//! - [`Error::busy`]: transient resource contention, not loss of authority.
 
 use std::fmt;
 
@@ -30,7 +31,8 @@ pub struct RenderMiss {
 
 /// A wire error that carries a stable `code` and, for revision
 /// conflicts, the current revision. `kind` stays `rejected` for invalid
-/// input and `conflict` when a caller must reload rather than retry.
+/// input, `conflict` when a caller must reload rather than retry, and `busy`
+/// when an operation could not acquire a transiently occupied resource.
 #[derive(Debug)]
 pub struct Structured {
     pub kind: &'static str,
@@ -85,6 +87,17 @@ impl Error {
     }
     pub fn not_rendered(miss: RenderMiss) -> Self {
         Self::NotRendered(Box::new(miss))
+    }
+    /// Resource contention is not proof that a request or its authority is
+    /// invalid. The operation still fails closed; callers may retry with their
+    /// original idempotency key, never assume a side effect was undone.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "busy",
+            code: "resource_busy".to_string(),
+            message: message.into(),
+            revision: None,
+        })
     }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {

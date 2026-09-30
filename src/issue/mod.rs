@@ -244,7 +244,10 @@ impl Pm {
                 Ok(_) => return Ok(PmLock { path: path.clone() }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if Instant::now() >= deadline {
-                        return Err(Error::rejected(format!(
+                        // A live writer is not evidence that authority changed.
+                        // In particular, app validation must defer rather than
+                        // revoke approval while capability I/O holds this lock.
+                        return Err(Error::busy(format!(
                             "PM dir is locked by another writer ({}); remove it \
                              only if the holder is gone",
                             path.display()
