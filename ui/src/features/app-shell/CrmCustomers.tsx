@@ -8,6 +8,10 @@ import CrmCampaigns from "./CrmCampaigns";
 import type { CrmSection } from "./CrmOutlet";
 import CrmSegments from "./CrmSegments";
 import CustomerCsvImport from "./CustomerCsvImport";
+import Detail from "./shared/Detail";
+import DataTable from "./shared/DataTable";
+import Field from "./shared/Field";
+import { EmptyState, ErrorNotice, Loading, Notice } from "./shared/States";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -278,98 +282,93 @@ function CustomerList({
         )}
       </div>
       {!viewer.operator && (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Sign in as the operator to inspect customer records.
-        </p>
+        <Notice>Sign in as the operator to inspect customer records.</Notice>
       )}
       {viewer.operator && viewer.readOnly && (
-        <p className="card px-4 py-3 text-label text-ink-400" data-state="read-only">
-          Read-only view. Record creation and edits are unavailable.
-        </p>
+        <Notice state="read-only">Read-only view. Record creation and edits are unavailable.</Notice>
       )}
       {scope.contextId === "" && viewer.operator && (
-        <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its customers.
-        </p>
+        <Notice>Pick an App context above to list its customers.</Notice>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
-        <p className="text-secondary text-ink-400" role="status">
-          Reading customers…
-        </p>
+        <Loading>Reading customers…</Loading>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => setRetry((count) => count + 1)}
-          >
-            Retry
-          </button>
-        </p>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && records.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="customers" role="status">
-          <p className="font-medium text-ink-200">
-            {committed === "" ? "No customers yet in this context" : "No customers match this search"}
-          </p>
-          <p className="mt-1">
-            {committed === ""
-              ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
-              : "Clear the search to see every record in this context."}
-          </p>
-        </div>
+        <EmptyState
+          name="customers"
+          title={committed === "" ? "No customers yet in this context" : "No customers match this search"}
+        >
+          {committed === ""
+            ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
+            : "Clear the search to see every record in this context."}
+        </EmptyState>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
         <>
-          <div
-            className="crm-table-wrap"
-            tabIndex={0}
-            role="region"
-            aria-label="Customers table — scroll horizontally to reach every column"
-          >
-            <table className="crm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col">Email</th>
-                  <th scope="col">Tags</th>
-                  <th scope="col">Consent</th>
-                  <th scope="col">Rev</th>
-                  <th scope="col">
-                    <span className="sr-only">Open</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {records.map((record) => {
+          <DataTable<HostRecord>
+            label="Customers table — scroll horizontally to reach every column"
+            wrapClassName="crm-table-wrap"
+            tableClassName="crm-table"
+            rowKey={(record) => record.id}
+            columns={[
+              {
+                key: "name",
+                header: "Name",
+                cellClassName: "text-ink-100",
+                cell: (record) => viewProfile(record.profile).displayName,
+              },
+              {
+                key: "email",
+                header: "Email",
+                cellClassName: "num text-ink-300",
+                cell: (record) => viewProfile(record.profile).email ?? "—",
+              },
+              {
+                key: "tags",
+                header: "Tags",
+                cellClassName: "text-ink-300",
+                cell: (record) => {
                   const view = viewProfile(record.profile);
                   return (
-                    <tr key={record.id}>
-                      <td className="text-ink-100">{view.displayName}</td>
-                      <td className="num text-ink-300">{view.email ?? "—"}</td>
-                      <td className="text-ink-300">
-                        {view.tags.length > 0 ? view.tags.join(", ") : "—"}
-                        {view.source ? <span className="num text-micro text-ink-500"> · {view.source}</span> : null}
-                      </td>
-                      <td>
-                        <span className="chip" title="Email consent">
-                          {view.consentEmail}
-                        </span>
-                      </td>
-                      <td className="num text-ink-500">r{record.revision}</td>
-                      <td>
-                        <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
-                          Open
-                        </button>
-                      </td>
-                    </tr>
+                    <>
+                      {view.tags.length > 0 ? view.tags.join(", ") : "—"}
+                      {view.source ? (
+                        <span className="num text-micro text-ink-500"> · {view.source}</span>
+                      ) : null}
+                    </>
                   );
-                })}
-              </tbody>
-            </table>
-          </div>
+                },
+              },
+              {
+                key: "consent",
+                header: "Consent",
+                cell: (record) => (
+                  <span className="chip" title="Email consent">
+                    {viewProfile(record.profile).consentEmail}
+                  </span>
+                ),
+              },
+              {
+                key: "rev",
+                header: "Rev",
+                cellClassName: "num text-ink-500",
+                cell: (record) => `r${record.revision}`,
+              },
+              {
+                key: "open",
+                header: <span className="sr-only">Open</span>,
+                cell: (record) => (
+                  <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
+                    Open
+                  </button>
+                ),
+              },
+            ]}
+            rows={records}
+          />
           <div className="crm-pager">
             <Button
               size="sm"
@@ -435,113 +434,103 @@ function CustomerForm({
         onSubmit(fields);
       }}
     >
-      <div className="crm-field">
-        <label className="text-label text-ink-300" htmlFor="crm-display-name">
-          Display name (required)
-        </label>
-        <input
-          id="crm-display-name"
-          className="field"
-          value={fields.displayName}
-          onChange={(e) => set({ displayName: e.target.value })}
-          maxLength={120}
-          autoComplete="off"
-          required
-        />
+      <Field label="Display name (required)" id="crm-display-name" required className="crm-field">
+        {(c) => (
+          <input
+            {...c}
+            className="field"
+            value={fields.displayName}
+            onChange={(e) => set({ displayName: e.target.value })}
+            maxLength={120}
+            autoComplete="off"
+          />
+        )}
+      </Field>
+      <div className="crm-field-row">
+        <Field label="Email (optional)" id="crm-email" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              type="email"
+              value={fields.email}
+              onChange={(e) => set({ email: e.target.value })}
+              maxLength={254}
+              autoComplete="off"
+              placeholder="name@example.com"
+            />
+          )}
+        </Field>
+        <Field label="Phone (optional)" id="crm-phone" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              type="tel"
+              value={fields.phone}
+              onChange={(e) => set({ phone: e.target.value })}
+              maxLength={24}
+              autoComplete="off"
+            />
+          )}
+        </Field>
       </div>
       <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-email">
-            Email (optional)
-          </label>
-          <input
-            id="crm-email"
-            className="field"
-            type="email"
-            value={fields.email}
-            onChange={(e) => set({ email: e.target.value })}
-            maxLength={254}
-            autoComplete="off"
-            placeholder="name@example.com"
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-phone">
-            Phone (optional)
-          </label>
-          <input
-            id="crm-phone"
-            className="field"
-            type="tel"
-            value={fields.phone}
-            onChange={(e) => set({ phone: e.target.value })}
-            maxLength={24}
-            autoComplete="off"
-          />
-        </div>
+        <Field label="Tags (optional, comma separated)" id="crm-tags" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              value={fields.tags}
+              onChange={(e) => set({ tags: e.target.value })}
+              maxLength={400}
+              autoComplete="off"
+              placeholder="vip, newsletter"
+            />
+          )}
+        </Field>
+        <Field label="Source (optional)" id="crm-source" className="crm-field">
+          {(c) => (
+            <input
+              {...c}
+              className="field"
+              value={fields.source}
+              onChange={(e) => set({ source: e.target.value })}
+              maxLength={40}
+              autoComplete="off"
+              placeholder="import"
+            />
+          )}
+        </Field>
       </div>
       <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-tags">
-            Tags (optional, comma separated)
-          </label>
-          <input
-            id="crm-tags"
-            className="field"
-            value={fields.tags}
-            onChange={(e) => set({ tags: e.target.value })}
-            maxLength={400}
-            autoComplete="off"
-            placeholder="vip, newsletter"
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-source">
-            Source (optional)
-          </label>
-          <input
-            id="crm-source"
-            className="field"
-            value={fields.source}
-            onChange={(e) => set({ source: e.target.value })}
-            maxLength={40}
-            autoComplete="off"
-            placeholder="import"
-          />
-        </div>
-      </div>
-      <div className="crm-field-row">
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-consent-email">
-            Email consent (explicit)
-          </label>
-          <Select
-            id="crm-consent-email"
-            value={fields.consentEmail}
-            onChange={(value) => isConsentChoice(value) && set({ consentEmail: value })}
-            options={CONSENT_OPTIONS}
-            aria-label="Email consent"
-            full
-          />
-        </div>
-        <div className="crm-field">
-          <label className="text-label text-ink-300" htmlFor="crm-consent-sms">
-            SMS consent (explicit)
-          </label>
-          <Select
-            id="crm-consent-sms"
-            value={fields.consentSms}
-            onChange={(value) => isConsentChoice(value) && set({ consentSms: value })}
-            options={CONSENT_OPTIONS}
-            aria-label="SMS consent"
-            full
-          />
-        </div>
+        <Field label="Email consent (explicit)" id="crm-consent-email" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={fields.consentEmail}
+              onChange={(value) => isConsentChoice(value) && set({ consentEmail: value })}
+              options={CONSENT_OPTIONS}
+              aria-label="Email consent"
+              full
+            />
+          )}
+        </Field>
+        <Field label="SMS consent (explicit)" id="crm-consent-sms" className="crm-field">
+          {(c) => (
+            <Select
+              id={c.id}
+              value={fields.consentSms}
+              onChange={(value) => isConsentChoice(value) && set({ consentSms: value })}
+              options={CONSENT_OPTIONS}
+              aria-label="SMS consent"
+              full
+            />
+          )}
+        </Field>
       </div>
       {(fieldError ?? formError) && (
-        <p className="text-label text-fail" role="alert">
-          {fieldError ?? formError}
-        </p>
+        <ErrorNotice bare>{fieldError ?? formError}</ErrorNotice>
       )}
       <div>
         <Button type="submit" variant="primary" loading={pending} disabled={pending}>
@@ -583,13 +572,11 @@ function CustomerNew({
         · Context {scope.contextId || "none"} — duplicates and stale writes are refused by the server.
       </p>
       {!canWrite ? (
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
+        <Notice className="mt-2" state="read-only">
           Read-only view. A verified operator creates customer records.
-        </p>
+        </Notice>
       ) : scope.contextId === "" ? (
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before creating a customer.
-        </p>
+        <Notice className="mt-2">Pick an App context above before creating a customer.</Notice>
       ) : (
         <div className="mt-2">
           <CustomerForm
@@ -706,68 +693,56 @@ function CustomerDrawer({
         re-proves scope on every send.
       </p>
       {loading && (
-        <p className="text-secondary text-ink-400 mt-2" role="status">
-          Reading the record…
-        </p>
+        <Loading className="mt-2">Reading the record…</Loading>
       )}
       {error !== null && !loading && (
-        <p className="card px-4 py-3 mt-2 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
-          <button
-            type="button"
-            className="lnk"
-            onClick={() => {
-              setError(null);
-              setLoading(true);
-              hostActions
-                .show(scope, recordId)
-                .then(setRecord)
-                .catch((e: unknown) => setError(friendlyError(e)))
-                .finally(() => setLoading(false));
-            }}
-          >
-            Retry
-          </button>
-        </p>
+        <ErrorNotice
+          className="mt-2"
+          onRetry={() => {
+            setError(null);
+            setLoading(true);
+            hostActions
+              .show(scope, recordId)
+              .then(setRecord)
+              .catch((e: unknown) => setError(friendlyError(e)))
+              .finally(() => setLoading(false));
+          }}
+        >
+          {error}
+        </ErrorNotice>
       )}
       {!loading && error === null && record !== null && view !== null && (
         <>
-          <dl className="crm-detail mt-2">
-            <div>
-              <dt>Email</dt>
-              <dd className="num">{view.email ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Phone</dt>
-              <dd className="num">{view.phone ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Tags</dt>
-              <dd>{view.tags.length > 0 ? view.tags.join(", ") : "—"}</dd>
-            </div>
-            <div>
-              <dt>Source</dt>
-              <dd>{view.source ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Email consent</dt>
-              <dd>
-                <span className="chip">{view.consentEmail}</span>
-              </dd>
-            </div>
-            <div>
-              <dt>SMS consent</dt>
-              <dd>
-                <span className="chip">{view.consentSms ?? "unknown"}</span>
-              </dd>
-            </div>
-            <div>
-              <dt>Revision</dt>
-              <dd className="num">
-                r{record.revision} · <span title="Server content digest">{record.digest.slice(0, 18)}…</span>
-              </dd>
-            </div>
-          </dl>
+          <Detail
+            className="crm-detail mt-2"
+            label="Customer fields"
+            items={[
+              { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
+              { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
+              { key: "tags", term: "Tags", value: view.tags.length > 0 ? view.tags.join(", ") : "—" },
+              { key: "source", term: "Source", value: view.source ?? "—" },
+              {
+                key: "consent-email",
+                term: "Email consent",
+                value: <span className="chip">{view.consentEmail}</span>,
+              },
+              {
+                key: "consent-sms",
+                term: "SMS consent",
+                value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
+              },
+              {
+                key: "revision",
+                term: "Revision",
+                value: (
+                  <span className="num">
+                    r{record.revision} ·{" "}
+                    <span title="Server content digest">{record.digest.slice(0, 18)}…</span>
+                  </span>
+                ),
+              },
+            ]}
+          />
           {consentTrail.length > 0 && (
             <section aria-label="Consent history" className="mt-3">
               <h4 className="text-label font-medium text-ink-200">Consent history</h4>
