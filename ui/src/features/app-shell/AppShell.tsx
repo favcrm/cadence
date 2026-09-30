@@ -104,14 +104,6 @@ export default function AppShell({
   // first mount preserves direct links, later switches strip them.
   const firstInstall = useRef(installId);
   const handledQuery = useRef<string | undefined>(undefined);
-  // The scope the shell last bound: which ctx, and which record was
-  // open under it. `undefined` until first adoption. On a ctx change
-  // a *carried* record — the same record still open from the old ctx —
-  // is stale and is cleared; a *new* record arriving with the ctx (a
-  // deep link authored for it, or a history entry) is intentional and
-  // is preserved.
-  const boundCtx = useRef<string | undefined>(undefined);
-  const boundRecord = useRef<string | null>(null);
 
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
@@ -284,28 +276,18 @@ export default function AppShell({
       return;
     }
     if (urlCtx !== null) {
-      // On a ctx change, the record/appview carried over from the old
-      // scope is stale: it names the previous context's drawer/draft.
-      // A record that *differs* from the one bound under the old ctx —
-      // or a first adoption — is an intentional deep link and stays.
-      const switching = boundCtx.current !== undefined && boundCtx.current !== urlCtx;
-      const carriedRecord = switching && urlRecord !== null && urlRecord === boundRecord.current;
-      const carriedView = switching && urlView !== null;
-      boundCtx.current = urlCtx;
-      // Track the record now bound under this ctx: a carried record is
-      // being cleared (→ null); otherwise the arriving record stands.
-      boundRecord.current = carriedRecord ? null : urlRecord;
+      // The URL's ctx+record/appview are adopted verbatim: they were
+      // authored together — a deep link, a scoped-entry link, or a
+      // history entry — never split or cleared here. Stale scope is
+      // prevented at the transition origin (the scoped-entry links
+      // emit a bare `?ctx=` and the section links drop record/appview),
+      // not by guessing which arriving params are intentional.
       setContextId(urlCtx);
       rememberContext(installId, urlCtx);
       setLinkNotice(null);
-      if (carriedRecord || carriedView) {
-        writeQuery({ appview: null, record: null }, { replace: true });
-      }
       return;
     }
     // No linked context: a record link without scope is ambiguous.
-    boundCtx.current = undefined;
-    boundRecord.current = null;
     if (urlRecord !== null) {
       setLinkNotice("The record link names no context — the selection was cleared.");
       setContextId(fallbackContext());

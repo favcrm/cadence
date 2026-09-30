@@ -301,18 +301,34 @@ const newTab2 = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) =
 await click(newTab2);
 equal((host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value, "", "unsaved draft dies with the context switch");
 
-// A genuine ctx *change* clears a record carried across it: editing
-// `?ctx-a&record=rec-1` to `?ctx-b&record=rec-1` must not keep ctx-a's
-// record open under ctx-b. The write strips record+appview together.
+// Authored cross-context links keep their params verbatim: a URL
+// carrying ctx+record together is a deep link for that ctx — record
+// ids are scoped per-context, so the same id may legitimately exist
+// under a different scope. Adoption must not strip it.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-1"); });
 await flush(); await flush();
 assert(location.search.includes("record=rec-1"), "deep link lands its record");
 assert(text().includes("Record details"), "record drawer opens on the deep link");
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&record=rec-1"); });
+// An authored ctx+record link for a different context keeps its record.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&record=rec-2"); });
 await flush(); await flush();
-assert(location.search.includes("ctx=ctx-b"), "the context change binds ctx-b");
-assert(!location.search.includes("record="), "context change clears the carried record");
-assert(!text().includes("Record details"), "record drawer closes with the scope");
+assert(location.search.includes("ctx=ctx-b") && location.search.includes("record=rec-2"), "cross-context record link is preserved");
+assert(text().includes("Record details"), "the new context's record opens");
+// An authored cross-context New-view link keeps its view too.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&appview=new"); });
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "cross-context New view link is preserved");
+assert(host.querySelector("#app-outlet-draft"), "the New form opens for the linked scope");
+// A context-only transition (the scoped-entry link shape: bare ctx,
+// no record/appview) lands clean — the carry state was cleared at the
+// link origin, not guessed at adoption.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
+await flush(); await flush();
+assert(!location.search.includes("record=") && !location.search.includes("appview="), "a bare ctx link carries no stale record/view");
+// Browser back restores the prior authored entry (ctx-a + New view).
+history.back();
+await flush(); await flush();
+assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "browser back restores the authored New-view scope");
 
 // Scoped entry: an unselected multi-context install offers one
 // `?ctx=` link per active context — explicit, never a silent default.
