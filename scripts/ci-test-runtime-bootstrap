@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# CI-only setup inside the fresh source-pinned job container, never the host.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+declare -A seen=()
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" == \#* ]] && continue
+  if [[ ! "$line" =~ ^([A-Z_]+)=\'([a-zA-Z0-9./:@_-]+)\'$ ]]; then
+    echo 'invalid runtime pin' >&2; exit 1
+  fi
+  key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+  case "$key" in
+    CI_TEST_IMAGE|CI_TEST_SNAPSHOT|CI_TEST_OS_ID|CI_TEST_OS_VERSION|CI_TEST_TOOLCHAIN) ;;
+    *) echo 'unknown runtime pin field' >&2; exit 1 ;;
+  esac
+  [[ ! -v "seen[$key]" ]] || { echo 'duplicate runtime pin field' >&2; exit 1; }
+  seen[$key]=1
+  printf -v "$key" '%s' "$value"
+done < "$root/.config/ci-test-runtime.env"
+[[ ${#seen[@]} == 5 && "$CI_TEST_IMAGE" =~ ^docker\.io/library/rust@sha256:[0-9a-f]{64}$ && "$CI_TEST_SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ && "$CI_TEST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'incomplete runtime pin' >&2; exit 1; }
+[[ "$CI_TEST_OS_ID" == debian ]] || exit 1
+case "$CI_TEST_OS_VERSION" in
+  12) suite=bookworm ;;
+  13) suite=trixie ;;
+  *) echo 'unsupported runtime distro' >&2; exit 1 ;;
+esac
+if [[ "${1:-}" == --plan && $# == 1 ]]; then
+  printf 'image=%s\nsnapshot=%s\nsuite=%s\npackages=python3 zstd procps\nuid=1001\n' "$CI_TEST_IMAGE" "$CI_TEST_SNAPSHOT" "$suite"
+  exit 0
+fi
+[[ $# == 0 && ${GITHUB_ACTIONS:-} == true && -f /.dockerenv && $(id -u) == 0 && ${CADENCE_TEST_CONTAINER_IMAGE:-} == "$CI_TEST_IMAGE" ]] || { echo 'bootstrap requires the pinned root CI job container' >&2; exit 1; }
+grep -qx 'ID=debian' /etc/os-release
+grep -qx "VERSION_ID=\"$CI_TEST_OS_VERSION\"" /etc/os-release
+# Snapshot repositories are signed using the image's Debian archive keyring.
+# Disable date expiry, never signature verification. The actual resulting
+# package versions and ELF libraries are compared again on every consumer.
+mkdir -p /etc/apt/sources.list.d
+for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [[ ! -f "$file" ]] || mv -- "$file" "$file.disabled"
+done
+printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s/ %s main\ndeb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s/ %s-updates main\ndeb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/%s/ %s-security main\n' \
+  "$CI_TEST_SNAPSHOT" "$suite" "$CI_TEST_SNAPSHOT" "$suite" "$CI_TEST_SNAPSHOT" "$suite" > /etc/apt/sources.list
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Check-Valid-Until=false update
+apt-get install -y --no-install-recommends python3 zstd procps
+# Shell steps retain the hosted runner's non-root uid; privileged bootstrap
+# is the exception, not a change to permission/refusal test semantics.
+if ! getent group 1001 >/dev/null; then groupadd --gid 1001 ci-runner; fi
+if ! getent passwd 1001 >/dev/null; then useradd --uid 1001 --gid 1001 --create-home ci-runner; fi
+for directory in "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"; do
+  [[ "$directory" == /* && "$directory" != / && -d "$directory" && ! -L "$directory" ]] || exit 1
+  chown -R 1001:1001 -- "$directory"
+done
+/usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups python3 "$root/scripts/ci-test-runtime.py" --root "$root"

@@ -37,6 +37,9 @@ class BundleContracts(unittest.TestCase):
                 'cargo_version': 'cargo 1.98.1', 'target_triple': 'x86_64-unknown-linux-gnu',
                 'rustflags': '-D warnings', 'runner_os': 'Linux', 'runner_arch': 'X64',
                 'image_os': 'ubuntu24', 'image_version': '20260920.314.1',
+                'runtime': {'container_image': 'docker.io/library/rust@sha256:' + 'f' * 64,
+                            'os_release_sha256': 'a' * 64, 'packages_sha256': 'b' * 64,
+                            'abi_sha256': {'libc': 'c' * 64, 'libstdcxx': 'd' * 64, 'loader': 'e' * 64}},
                 'nextest_sha256': 'b' * 64,
                 'config_sha256': {name: 'c' * 64 for name in bundle.CONFIG_FILES},
             },
@@ -77,8 +80,7 @@ class BundleContracts(unittest.TestCase):
         changes = {'target_root': '/other/target', 'profile': 'release',
                    'rustc_version': 'rustc 1.99.0', 'cargo_version': 'cargo 1.99.0',
                    'target_triple': 'aarch64-unknown-linux-gnu', 'rustflags': '',
-                   'runner_os': 'macOS', 'runner_arch': 'ARM64', 'image_os': 'ubuntu22',
-                   'image_version': 'different', 'nextest_sha256': 'd' * 64,
+                   'runner_os': 'macOS', 'runner_arch': 'ARM64', 'nextest_sha256': 'd' * 64,
                    'config_sha256': {name: 'e' * 64 for name in bundle.CONFIG_FILES}}
         for field, value in changes.items():
             with self.subTest(field=field):
@@ -91,6 +93,48 @@ class BundleContracts(unittest.TestCase):
                 finally:
                     self.manifest['build'][field] = original
                     self.store_manifest()
+
+    def test_pinned_runtime_allows_host_image_rollout_without_accepting_abi_drift(self):
+        runtime = {'container_image': 'docker.io/library/rust@sha256:' + 'f' * 64,
+                   'os_release_sha256': 'a' * 64, 'packages_sha256': 'b' * 64,
+                   'abi_sha256': {'libc': 'c' * 64, 'libstdcxx': 'd' * 64, 'loader': 'e' * 64}}
+        self.manifest['build']['runtime'] = json.loads(json.dumps(runtime))
+        self.expected['build']['runtime'] = json.loads(json.dumps(runtime))
+        self.expected['build']['image_version'] = '20260927.320.1'
+        self.store_manifest()
+        self.assertEqual(bundle.verify_bundle(self.root, self.expected), self.root / 'nextest.tar.zst')
+        for field in ('container_image', 'os_release_sha256', 'packages_sha256', 'abi_sha256'):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(runtime))
+                if field == 'container_image':
+                    changed[field] = 'docker.io/library/rust@sha256:' + 'e' * 64
+                elif field == 'abi_sha256':
+                    changed[field]['libc'] = 'e' * 64
+                else:
+                    changed[field] = 'e' * 64
+                self.manifest['build']['runtime'] = changed
+                self.store_manifest()
+                with self.assertRaisesRegex(ValueError, 'build'):
+                    bundle.verify_bundle(self.root, self.expected)
+
+    def test_mutually_equal_missing_or_malformed_runtime_cannot_pass(self):
+        original = json.loads(json.dumps(self.manifest['build']))
+        mutations = [None, {}, dict(original['runtime'], container_image='rust:latest'),
+                     dict(original['runtime'], packages_sha256=True),
+                     dict(original['runtime'], abi_sha256={'libc': 'c' * 64}),
+                     dict(original['runtime'], allow_host_fallback=True)]
+        for mutation in mutations:
+            with self.subTest(runtime=mutation):
+                build = dict(original)
+                if mutation is None:
+                    build.pop('runtime')
+                else:
+                    build['runtime'] = mutation
+                self.manifest['build'] = build
+                self.expected['build'] = build
+                self.store_manifest()
+                with self.assertRaises(ValueError):
+                    bundle.verify_bundle(self.root, self.expected)
 
     def test_corrupted_payloads_refuse(self):
         for name in ('nextest.tar.zst', 'ci-test-plan.json', 'inventory.json', 'bundle.json'):

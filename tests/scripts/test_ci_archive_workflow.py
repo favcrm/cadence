@@ -70,6 +70,24 @@ def step_with_all(block, *fragments):
     raise AssertionError(f"no step containing all of {fragments!r}")
 
 
+class PinnedRuntime(unittest.TestCase):
+    def test_producer_and_shards_use_source_digest_and_nonroot_shell(self):
+        pin = (ROOT / '.config/ci-test-runtime.env').read_text()
+        image = re.search(r"^CI_TEST_IMAGE='([^']+)'$", pin, re.M)[1]
+        self.assertRegex(image, r'^docker\.io/library/rust@sha256:[0-9a-f]{64}$')
+        for name in ('test-build', 'test-shard'):
+            block = job_block(name)
+            with self.subTest(job=name):
+                self.assertIn('image: ' + image, block)
+                self.assertIn('CADENCE_TEST_CONTAINER_IMAGE: ' + image, block)
+                self.assertIn('shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}', block)
+                self.assertIn('bash scripts/ci-test-runtime-bootstrap', block)
+                self.assertNotIn('rustup toolchain install stable', block)
+                self.assertLess(block.index('bash scripts/ci-test-runtime-bootstrap'), block.index('python3 '))
+        for name in ('test-once', 'build', 'ui', 'clippy'):
+            self.assertNotIn('ci-test-runtime-bootstrap', job_block(name))
+
+
 class ProducerJob(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -223,7 +241,7 @@ class ShardConsumer(unittest.TestCase):
         self.assertIn("scripts/split-doctor-host --check", required)
         self.assertIn("pnpm build", self.shard)
         self.assertIn("Install pinned cargo-nextest", self.shard)
-        self.assertIn("rustup toolchain install stable", self.shard)
+        self.assertIn("bash scripts/ci-test-runtime-bootstrap", self.shard)
 
 
 class AggregateAndNeighbors(unittest.TestCase):
@@ -311,6 +329,7 @@ class AggregateAndNeighbors(unittest.TestCase):
         self.assertIn("tests/scripts/test_ci_archive_workflow.py", self.fmt)
         self.assertIn("tests/scripts/test_ci_bundle_producer.py", self.fmt)
         self.assertIn("tests/scripts/test_ci_archive_safety.py", self.fmt)
+        self.assertIn("tests/scripts/test_ci_test_runtime.py", self.fmt)
 
     def test_workflow_env_never_sets_rejected_identity_variables(self):
         # collect_identity refuses nonempty RUSTC/RUSTC_WRAPPER/

@@ -46,6 +46,15 @@ class ProducerCLI(unittest.TestCase):
         for name in list(self.env):
             if name.startswith('CARGO_PROFILE_'):
                 self.env.pop(name)
+        self.runtime = {'container_image': 'docker.io/library/rust@sha256:' + 'f' * 64,
+                        'os_release_sha256': 'a' * 64, 'packages_sha256': 'b' * 64,
+                        'abi_sha256': {'libc': 'c' * 64, 'libstdcxx': 'd' * 64, 'loader': 'e' * 64}}
+        self.runtime_file = Path(self.temp.name) / 'runtime.json'
+        self.runtime_file.write_text(json.dumps(self.runtime))
+        self.env['RUNTIME_FIXTURE'] = str(self.runtime_file)
+        (self.root / '.config/ci-test-runtime.env').write_text("CI_TEST_IMAGE='" + self.runtime['container_image'] + "'\n")
+        self.program(self.root / 'scripts/ci-test-runtime.py',
+                     "if os.environ.get('FAIL_RUNTIME'): sys.exit(74)\nprint(Path(os.environ['RUNTIME_FIXTURE']).read_text())")
         self.git('init', '-q')
         self.git('config', 'user.name', 'Private Test')
         self.git('config', 'user.email', 'test@example.invalid')
@@ -85,6 +94,13 @@ class ProducerCLI(unittest.TestCase):
     def prepare(self):
         return self.invoke('prepare', '--root', str(self.root), '--plan', str(self.plan),
                            '--inventory-runner', str(self.runner), '--directory', str(self.directory))
+
+    def test_context_requires_independent_local_runtime_and_propagates_probe_failure(self):
+        identity = bundle.collect_identity(self.root, self.env)
+        self.assertEqual(identity['build']['runtime'], self.runtime)
+        self.env['FAIL_RUNTIME'] = '1'
+        with self.assertRaises(subprocess.CalledProcessError):
+            bundle.collect_identity(self.root, self.env)
 
     def test_prepare_seals_real_files_and_publishes_outputs_after_parity(self):
         self.builder_fixture()

@@ -24,6 +24,8 @@ CONFIG_FILES = frozenset({
     '.config/cargo-nextest.sha256', 'scripts/cadence-nextest',
     'scripts/nextest-inventory', 'scripts/ci-rust-tests.py',
     'scripts/ci-nextest-bundle.py', 'tests/shard-weights.json',
+    '.config/ci-test-runtime.env', 'scripts/ci-test-runtime.py',
+    'scripts/ci-test-runtime-bootstrap', '.github/workflows/ci.yml',
 })
 FIELDS = frozenset({
     'schema', 'source_sha', 'run_id', 'producer_attempt', 'nextest_version',
@@ -120,7 +122,7 @@ def validate_record(record):
     build = record['build']
     fields = {'target_root', 'profile', 'rustc_version', 'cargo_version', 'target_triple',
               'rustflags', 'runner_os', 'runner_arch', 'image_os', 'image_version',
-              'nextest_sha256', 'config_sha256'}
+              'nextest_sha256', 'config_sha256', 'runtime'}
     if type(build) is not dict or set(build) != fields:
         raise ValueError('build fields missing or unknown')
     if build['target_root'] != root + '/target' or build['profile'] != 'test' or build['rustflags'] != '-D warnings':
@@ -134,6 +136,16 @@ def validate_record(record):
         raise ValueError('rustc identity does not match target')
     if not build['cargo_version'].startswith('cargo '):
         raise ValueError('cargo identity missing')
+    runtime = build['runtime']
+    if type(runtime) is not dict or set(runtime) != {'container_image', 'os_release_sha256', 'packages_sha256', 'abi_sha256'}:
+        raise ValueError('build runtime fields missing or unknown')
+    checked_text(runtime['container_image'], r'docker\.io/library/rust@sha256:[0-9a-f]{64}', 'build container image')
+    for field in ('os_release_sha256', 'packages_sha256'):
+        checked_text(runtime[field], r'[0-9a-f]{64}', 'build runtime ' + field)
+    if type(runtime['abi_sha256']) is not dict or set(runtime['abi_sha256']) != {'libc', 'libstdcxx', 'loader'}:
+        raise ValueError('build runtime ABI set missing or unknown')
+    for name, digest in runtime['abi_sha256'].items():
+        checked_text(digest, r'[0-9a-f]{64}', 'build runtime ABI ' + name)
     checked_text(build['nextest_sha256'], r'[0-9a-f]{64}', 'nextest_sha256')
     configs = build['config_sha256']
     if type(configs) is not dict or set(configs) != CONFIG_FILES:
@@ -160,7 +172,16 @@ def verify_bundle(directory, expected):
     manifest = json.loads(raw, object_pairs_hook=unique_object)
     validate_record(manifest)
     for key in FIELDS:
-        if type(manifest[key]) is not type(expected[key]) or manifest[key] != expected[key]:
+        actual, wanted = manifest[key], expected[key]
+        if key == 'build':
+            # Host image labels remain immutable observations in the sealed
+            # manifest, not the userspace compatibility authority. The exact
+            # pinned container, installed packages, ELF ABI bytes, compiler,
+            # tools, flags, config and paths must still all match.
+            observations = {'image_os', 'image_version'}
+            actual = {name: value for name, value in actual.items() if name not in observations}
+            wanted = {name: value for name, value in wanted.items() if name not in observations}
+        if type(actual) is not type(wanted) or actual != wanted:
             raise ValueError(f'{key} mismatch')
     for filename, field in (
         ('nextest.tar.zst', 'archive_sha256'), ('ci-test-plan.json', 'plan_sha256'),
@@ -359,6 +380,16 @@ def collect_identity(root, env):
     hosts = re.findall(r'(?m)^host: (.+)$', rustc)
     if len(hosts) != 1:
         raise ValueError('rustc host identity missing or ambiguous')
+    runtime_text = command_text(root, [sys.executable, str(root / 'scripts/ci-test-runtime.py'),
+                                      '--root', str(root)], env)
+    if len(runtime_text.encode()) > MAX_MANIFEST_BYTES:
+        raise ValueError('runtime identity too large')
+    runtime = json.loads(runtime_text, object_pairs_hook=unique_object)
+    with regular_file(root / '.config/ci-test-runtime.env') as stream:
+        pin = stream.read(MAX_MANIFEST_BYTES + 1).decode()
+    images = re.findall(r"(?m)^CI_TEST_IMAGE='([^']+)'$", pin)
+    if len(images) != 1 or type(runtime) is not dict or runtime.get('container_image') != images[0]:
+        raise ValueError('local runtime differs from source-pinned container')
     identity = {'schema': 1, 'source_sha': context['source_sha'], 'run_id': context['run_id'],
                 'producer_attempt': context['consumer_attempt'], 'nextest_version': '0.9.145',
                 'features': ['test-seam'], 'workspace_root': str(root),
@@ -366,7 +397,9 @@ def collect_identity(root, env):
                           'rustc_version': rustc, 'cargo_version': command_text(root, ['cargo', '--version'], env),
                           'target_triple': hosts[0], 'rustflags': env.get('RUSTFLAGS'),
                           'runner_os': env.get('RUNNER_OS'), 'runner_arch': env.get('RUNNER_ARCH'),
-                          'image_os': env.get('ImageOS'), 'image_version': env.get('ImageVersion'),
+                          'image_os': env.get('ImageOS') or 'unreported',
+                          'image_version': env.get('ImageVersion') or 'unreported',
+                          'runtime': runtime,
                           'nextest_sha256': tool_sha,
                           'config_sha256': {name: file_digest(root / name) for name in CONFIG_FILES}}}
     validate_record(dict(identity, archive_sha256='0' * 64, plan_sha256='0' * 64, inventory_sha256='0' * 64))

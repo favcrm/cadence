@@ -129,12 +129,30 @@ explicit `docs` plans retain verified empty markers and receipts.
 Eight `test-shard` consumers download the exact immutable artifact ID from
 successful producer job outputs. Source SHA, run, original producer attempt,
 archive/plan/inventory/manifest digests, compiler/tool/config identity, flags,
-runner image and absolute workspace/target layout must match independently
-collected consumer context. The artifact cannot supply its own expected
+container/runtime identity and absolute workspace/target layout must match
+independently collected consumer context. The artifact cannot supply its own expected
 context. Failed-job reruns retain the original successful producer ID and
 attempt; missing/expired artifacts or incompatible contexts fail explicitly.
 Rerun the producer and its dependent consumers when new producer bytes are
 needed, rather than guessing a latest artifact or overwriting its name.
+
+Producer and shards use the identical source-pinned official Rust 1.98.1
+Bookworm Linux/amd64 image manifest, with signed Debian snapshot repositories
+for Python/zstd/procps bootstrap. `.config/ci-test-runtime.env` records the
+image, snapshot, distro and compiler; refreshed pins require review and fresh
+runtime acceptance. Both jobs independently measure os-release, installed
+package versions and x86_64 ELF bytes for libc/libstdc++/the loader. Missing,
+malformed, changed or unproven runtime identity fails closed. Normal shell
+steps run as non-root uid 1001; only fresh-container bootstrap and producer
+cache ownership restoration use root. Consumers still have no target cache.
+Hosted `ImageOS`/`ImageVersion` remain bounded immutable observations in the
+sealed producer manifest, not userspace compatibility authority. Run 36682010782
+attempts 1/2 proved the hosted label can mix image versions, even on failed-only
+reruns; dropping a label check without a pinned and independently measured
+runtime is not this contract. Container jobs share the same container workspace
+path with each other, not the historical host path. Containers do not freeze
+the host kernel; Linux/X64 remains required, kernel details are logged and real
+fixture/syscall/permission behavior still needs full runtime CI acceptance.
 
 Consumers require an absent `target/`, never delete or overwrite a restored
 cache, and preflight GNU tar.zst members before one archive-backed list extracts
@@ -159,7 +177,10 @@ policy is changed.
 
 The historical two-partition archive was 1,523,895,478 bytes. Eight transfers
 would total about 12.2 GB before wrapper overhead; this is arithmetic, not a
-current measurement. Producer scheduling, upload/download, preflight/extraction,
+current measurement. The first current bootstrap run uploaded a 2,493,340,836-byte
+full bundle (~19.95 GB arithmetic for eight downloads); the pinned container's
+compressed image layers total 562,530,953 bytes, before bootstrap/network costs.
+No measured speedup is implied. Producer scheduling, upload/download, preflight/extraction,
 UI setup and other required builds can outweigh saved compilation. Require
 current-head full/selected archive execution and eight-shard coverage evidence;
 contract tests and the historical run are not a measured speedup or current

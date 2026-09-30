@@ -157,6 +157,7 @@ jobs:
           python3 tests/scripts/test_ci_archive_workflow.py
           python3 tests/scripts/test_ci_bundle_producer.py
           python3 tests/scripts/test_ci_archive_safety.py
+          python3 tests/scripts/test_ci_test_runtime.py
 
   clippy:
     needs: [queue-evidence]
@@ -187,6 +188,15 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    # Official Rust 1.98.1/bookworm amd64 manifest, verified via registry.
+    # Hosted runner image versions can roll independently; userspace cannot.
+    container:
+      image: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    env:
+      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    defaults:
+      run:
+        shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}
     timeout-minutes: 30
     outputs:
       source_sha: ${{ steps.prepare.outputs.source_sha }}
@@ -202,6 +212,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Bootstrap source-pinned test userspace
+        shell: bash
+        run: bash scripts/ci-test-runtime-bootstrap
       - name: Select PR test scope from the base policy
         id: scope
         env:
@@ -234,14 +247,19 @@ jobs:
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
           fi
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
-      # The toolchain is unconditional: even a docs pack pins real rustc,
-      # cargo and nextest identity in its manifest so consumers verify the
-      # empty markers against the same provenance shape.
-      - run: rustup toolchain install stable --profile minimal
-      # The producer does the single compile, so it keeps the dependency
-      # cache the shards gave up.
+      # The container pins rustc/cargo even for empty docs marker packs.
+      # The producer keeps the dependency cache the shards gave up, keyed
+      # additionally by runtime pin so old host-built artifacts cannot mix.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.scope.outputs.mode != 'docs'
+        with:
+          key: archive-${{ hashFiles('.config/ci-test-runtime.env') }}
+      - name: Make restored producer cache writable by the test user
+        shell: bash
+        run: |
+          for directory in "$GITHUB_WORKSPACE/target" "$CARGO_HOME"; do
+            if [ -d "$directory" ]; then chown -R 1001:1001 -- "$directory"; fi
+          done
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
@@ -340,6 +358,13 @@ jobs:
     needs: [queue-evidence, test-build]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' && needs.test-build.result == 'success' }}
     runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    env:
+      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    defaults:
+      run:
+        shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}
     timeout-minutes: 20
     strategy:
       # A shard failure must never hide the others' signal (or their
@@ -351,6 +376,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Bootstrap source-pinned test userspace
+        shell: bash
+        run: bash scripts/ci-test-runtime-bootstrap
       - name: Test scope selection and execution contracts
         run: python3 tests/scripts/test_ci_test_plan.py
       - name: Test suite-shard partition contracts
@@ -377,7 +405,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.select.outputs.artifact_id }}
           path: ${{ runner.temp }}/nextest-bundle
-      - run: rustup toolchain install stable --profile minimal
+      # No toolchain update: rustc/cargo are in the exact container image.
       # No Swatinem cache step here: the consumer extracts the producer's
       # exact archive into a fresh target and never compiles the suite.
       # CAD-264: the review's UI typecheck gate is tested against the real
@@ -417,7 +445,9 @@ jobs:
       # out of bundle.json, which cannot vouch for itself. Runs for docs
       # too: the runner verifies the empty-marker bundle against it.
       - name: Capture independent expected bundle context
-        run: python3 scripts/ci-nextest-bundle.py expect --root "$GITHUB_WORKSPACE" --reference "$RUNNER_TEMP/bundle-reference.json" --out "$RUNNER_TEMP/bundle-expected.json"
+        run: |
+          uname -a
+          python3 scripts/ci-nextest-bundle.py expect --root "$GITHUB_WORKSPACE" --reference "$RUNNER_TEMP/bundle-reference.json" --out "$RUNNER_TEMP/bundle-expected.json"
       # CAD-562: the CAD-536 generated tree must stay consistent with its
       # manifest — every declared item and every #[test] fn accounted
       # for (tests/split_map_inventory.rs is the suite-side twin check).
