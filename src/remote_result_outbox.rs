@@ -38,9 +38,12 @@ fn invalid() -> Error {
 fn corrupt() -> Error {
     Error::internal("Offline result custody is invalid; retain it for inspection")
 }
+// Shared AgenticOS hosted id contract: ASCII letters/digits/'_'/'-', 1..=200
+// (packages/contracts/src/hosted-ids.ts). The old 128 cap rejected issued ids.
+const MAX_IDENTIFIER: usize = 200;
 fn identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= MAX_IDENTIFIER
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
@@ -918,6 +921,134 @@ fn verify_header(file: &mut File) -> Result<u32> {
         return Err(corrupt());
     }
     Ok(version)
+}
+
+#[cfg(test)]
+mod hosted_id_boundary_tests {
+    use super::*;
+
+    fn wire(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": VERSION, "commandId": id,
+            "kind": "agent_result", "assignmentId": "assignment-1",
+            "taskId": "task-1", "taskRevision": 1, "turnId": "turn-1",
+            "reportedHeadSha": "a".repeat(40), "text": "finished"
+        })
+    }
+    fn pin() -> DestinationPin {
+        DestinationPin::new(
+            "org-1",
+            "https://gateway.example.invalid",
+            "subject-1",
+            "agent-1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn command_and_pin_ids_obey_the_1_to_200_hosted_contract() {
+        for id in [
+            "a".repeat(128),
+            "a".repeat(129),
+            "a".repeat(200),
+            format!("{}_-", "z".repeat(198)),
+            "0".repeat(200),
+        ] {
+            let command = ResultCommand::parse_json(&wire(&id).to_string())
+                .unwrap_or_else(|_| panic!("{}-char command id was refused", id.len()));
+            assert_eq!(command.command_id, id);
+            assert!(DestinationPin::new(&id, "https://gateway.example.invalid", &id, &id).is_ok());
+        }
+        for id in [
+            "a".repeat(201),
+            "a".repeat(500),
+            String::new(),
+            "has space".to_owned(),
+            "has.dot".to_owned(),
+            "has/slash".to_owned(),
+            "non-ascii-é".to_owned(),
+            "utf8-😀".to_owned(),
+        ] {
+            assert!(
+                ResultCommand::parse_json(&wire(&id).to_string()).is_err(),
+                "invalid command id {id:?} was accepted"
+            );
+            // Each pinned field is checked while the others stay valid.
+            for (org, subject, agent) in [
+                (id.as_str(), "subject-1", "agent-1"),
+                ("org-1", id.as_str(), "agent-1"),
+                ("org-1", "subject-1", id.as_str()),
+            ] {
+                assert!(
+                    DestinationPin::new(org, "https://gateway.example.invalid", subject, agent)
+                        .is_err(),
+                    "pin accepted bad id {id:?} in ({org:?}, {subject:?}, {agent:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_id_custody_retains_reopens_and_reads_back() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("outbox");
+        let id = format!("cmd-{}", "x".repeat(196));
+        assert_eq!(id.len(), 200);
+        let command = ResultCommand::parse_json(&wire(&id).to_string()).unwrap();
+        let destination = pin();
+        let receipt = ResultOutbox::open(&dir)
+            .unwrap()
+            .enqueue(&destination, &command)
+            .unwrap();
+        assert_eq!(receipt.command_id(), id);
+        let reopened = ResultOutbox::open(&dir).unwrap();
+        let row = reopened.get(&id).unwrap();
+        assert_eq!(row.receipt(), &receipt);
+        assert_eq!(row.command(), &command);
+        assert_eq!(reopened.pending_for(&destination).unwrap().len(), 1);
+        // Idempotent retain must not duplicate or conflict on the long id.
+        assert_eq!(reopened.enqueue(&destination, &command).unwrap(), receipt);
+    }
+
+    #[test]
+    fn oversized_lookup_refuses_before_any_custody_read() {
+        let outbox = ResultOutbox {
+            conn: Mutex::new(Connection::open_in_memory().unwrap()),
+        };
+        // Lookup validation happens before SQLite: an oversized or malformed id
+        // must be an invalid-input rejection even though this handle has no
+        // pending_results table at all.
+        for bad in ["a".repeat(201), "has.dot".to_owned(), String::new()] {
+            match outbox.get(&bad) {
+                Err(Error::Rejected(message)) => assert_eq!(
+                    message, "Invalid offline result command or destination",
+                    "{bad:?}"
+                ),
+                other => panic!("{bad:?} lookup reached custody: {other:?}"),
+            }
+        }
+        // A valid id reaches the database and fails on the missing table,
+        // proving the boundary refusal above happened before any custody read.
+        match outbox.get("valid-id") {
+            Err(Error::Internal(_)) => {}
+            other => panic!("valid lookup did not reach custody: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_id_fields_share_the_200_character_boundary() {
+        for field in ["commandId", "assignmentId", "taskId", "turnId"] {
+            for (length, ok) in [(128usize, true), (129, true), (200, true), (201, false)] {
+                let mut value = wire("cmd");
+                value[field] = serde_json::json!("i".repeat(length));
+                assert_eq!(
+                    ResultCommand::parse_json(&value.to_string()).is_ok(),
+                    ok,
+                    "{field} length {length}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
