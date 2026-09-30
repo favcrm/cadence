@@ -198,13 +198,16 @@
 
 /* Generic outlet tabs + detail drawer. */
 .app-outlet {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
-  /* A grid item defaults to min-width: auto: without this, a wide
-     descendant (e.g. a customer table) forces the whole document
-     past narrow viewports instead of scrolling internally (CAD-781 F2). */
+  /* A wide descendant (e.g. a customer table) can force the whole
+     document past narrow viewports; min-width:0 keeps scrolling
+     internal (CAD-781 F2). flex column + min-height:0 let a table
+     view fill the outlet's remaining height. */
   min-width: 0;
+  flex: 1;
+  min-height: 0;
 }
 
 .app-outlet-tabs {
@@ -275,10 +278,16 @@
 }
 
 .crm-list {
-  display: grid;
+  /* Bounded flex column: inside the flex outlet the list fills the
+     remaining height so the customer table below can grow and scroll
+     internally rather than stopping mid-pane. Children keep natural
+     height; only the table wrap grows. */
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
   min-width: 0;
+  flex: 1;
+  min-height: 0;
 }
 
 .crm-toolbar {
@@ -299,7 +308,13 @@
 }
 
 .crm-table-wrap {
+  /* Flex-growing scroll region inside .crm-list: fills leftover
+     height so the customer table reaches the pane bottom, scrolling
+     on both axes inside the wrap instead of growing the document. */
+  flex: 1;
+  min-height: 0;
   overflow-x: auto;
+  overflow-y: auto;
   max-width: 100%;
   /* Paint/layout containment keeps the wide table's ink inside the
      wrap while it scrolls internally; the document never grows past
@@ -555,11 +570,24 @@
   min-height: 2rem;
 }
 
+/* The app-views surface is a bounded flex column so a table view can
+   fill the outlet's remaining height. `flex:1; min-height:0` lets the
+   .av chain grow inside the flex outlet; children keep natural height
+   (align-items:stretch is horizontal) — only .av-table-wrap grows. */
 .av {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
-  align-content: start;
   min-width: 0;
+  flex: 1;
+  min-height: 0;
+}
+
+/* A nested app-views section (the preview's AppView inside the outer
+   .av wrapper) must also grow so its table reaches the wrap's flex. */
+.av .av {
+  flex: 1;
+  min-height: 0;
 }
 
 .av-head {
@@ -589,6 +617,9 @@
 .av-table-wrap {
   overflow: auto;
   max-width: 100%;
+  /* Inside the bounded .av column this is the only flex-growing
+     region: it fills the leftover height and scrolls the table
+     internally instead of letting the document grow past the fold. */
   flex: 1;
   min-height: 0;
   contain: layout paint;
