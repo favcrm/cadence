@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod app_catalog;
+pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;

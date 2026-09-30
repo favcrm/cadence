@@ -1871,34 +1871,36 @@ fn cad864_descriptor_installs_and_rides_the_verified_receipt() {
 #[test]
 fn cad864_malformed_and_forbidden_descriptors_refuse_before_install() {
     let good = Workspace::descriptor_text();
-    // Each case: (descriptor bytes, declare flag) that must refuse.
-    let mut cases: Vec<(String, bool)> = Vec::new();
-    // Undeclared file — present on disk, never declared in app.md.
-    cases.push((good.clone(), false));
-    // Declaration without the file is covered in the next test; here
-    // the file exists but is malformed.
-    cases.push(("not json".to_string(), true));
-    cases.push((good.replace("\"app-views/v1\"", "\"app-views/v2\""), true));
-    // Forbidden keys at the root and nested inside a field.
-    cases.push((
-        good.replace("\"summary\":", "\"install_id\": \"forged\", \"summary\":"),
-        true,
-    ));
     let nested_forbidden = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"detail","fields":[{"id":"f","label":"l","url":"https://evil.test"}]}]}"#
         .to_string();
-    cases.push((nested_forbidden, true));
     // Column naming an undeclared field.
     let bad_column = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"table","fields":[{"id":"f","label":"l"}],"columns":[{"field":"ghost"}]}]}"#
         .to_string();
-    cases.push((bad_column, true));
     // createView naming no declared form view.
     let bad_create_view = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"detail","fields":[{"id":"f","label":"l","createView":"nope"}]}]}"#
         .to_string();
-    cases.push((bad_create_view, true));
-    // `app` provenance must match the manifest.
-    cases.push((good.clone(), true)); // placeholder replaced below
-    let mismatched = good.replace("\"app\": \"blog-post\"", "\"app\": \"other-app\"");
-    *cases.last_mut().unwrap() = (mismatched, true);
+    // Each case: (descriptor bytes, declare flag) that must refuse.
+    let cases: Vec<(String, bool)> = vec![
+        // Undeclared file — present on disk, never declared in app.md.
+        (good.clone(), false),
+        // Declaration without the file is covered in the next test; here
+        // the file exists but is malformed.
+        ("not json".to_string(), true),
+        (good.replace("\"app-views/v1\"", "\"app-views/v2\""), true),
+        // Forbidden keys at the root and nested inside a field.
+        (
+            good.replace("\"summary\":", "\"install_id\": \"forged\", \"summary\":"),
+            true,
+        ),
+        (nested_forbidden, true),
+        (bad_column, true),
+        (bad_create_view, true),
+        // `app` provenance must match the manifest.
+        (
+            good.replace("\"app\": \"blog-post\"", "\"app\": \"other-app\""),
+            true,
+        ),
+    ];
 
     for (i, (descriptor, declare)) in cases.into_iter().enumerate() {
         let w = Workspace::new();
