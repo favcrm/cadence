@@ -19,6 +19,11 @@ import sys
 import tarfile
 
 MAX_MANIFEST_BYTES = 65536
+# The recorded test plan carries every changed {status, path} entry, so a
+# large monorepo diff legitimately exceeds the descriptor budget. The plan
+# payload gets its own explicit bound — still a bounded refusal, never an
+# unbounded read — while every other descriptor stays at MAX_MANIFEST_BYTES.
+MAX_PLAN_BYTES = 16 * 1024 * 1024
 CONFIG_FILES = frozenset({
     'Cargo.toml', 'Cargo.lock', 'build.rs', '.config/nextest.toml',
     '.config/cargo-nextest.sha256', 'scripts/cadence-nextest',
@@ -187,17 +192,30 @@ def verify_bundle(directory, expected):
         ('nextest.tar.zst', 'archive_sha256'), ('ci-test-plan.json', 'plan_sha256'),
         ('inventory.json', 'inventory_sha256'),
     ):
-        if file_digest(directory / filename) != expected[field]:
+        if field == 'plan_sha256':
+            # The plan payload follows the larger plan budget even inside a
+            # verified bundle: an overbudget plan refuses rather than digests.
+            plan_raw = read_json_bytes(directory / filename, MAX_PLAN_BYTES)
+            if hashlib.sha256(plan_raw).hexdigest() != expected[field]:
+                raise ValueError(f'{field} mismatch')
+        elif file_digest(directory / filename) != expected[field]:
             raise ValueError(f'{field} mismatch')
     return directory / 'nextest.tar.zst'
 
 
-def read_context(path):
+def read_json_bytes(path, max_bytes=MAX_MANIFEST_BYTES):
+    """Bounded regular-file bytes: refuse past max_bytes before JSON parse."""
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError('invalid byte budget')
     with regular_file(path) as stream:
-        raw = stream.read(MAX_MANIFEST_BYTES + 1)
-    if len(raw) > MAX_MANIFEST_BYTES:
-        raise ValueError('trusted context is too large')
-    return json.loads(raw, object_pairs_hook=unique_object)
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError('JSON payload is too large')
+    return raw
+
+
+def read_context(path, max_bytes=MAX_MANIFEST_BYTES):
+    return json.loads(read_json_bytes(path, max_bytes), object_pairs_hook=unique_object)
 
 
 class LimitedArchiveReader:
@@ -406,9 +424,9 @@ def collect_identity(root, env):
     return identity
 
 
-def write_json(path, doc):
+def write_json(path, doc, max_bytes=MAX_MANIFEST_BYTES):
     raw = (json.dumps(doc, sort_keys=True, indent=2) + '\n').encode()
-    if len(raw) > MAX_MANIFEST_BYTES:
+    if len(raw) > max_bytes:
         raise ValueError('output descriptor is too large')
     with Path(path).open('xb') as stream:
         stream.write(raw)
@@ -446,7 +464,7 @@ def archive_capable(path):
 def prepare_bundle(root, plan_path, inventory_runner, directory, env):
     root = Path(root).resolve(strict=True)
     identity = collect_identity(root, env)
-    plan = read_context(plan_path)
+    plan = read_context(plan_path, MAX_PLAN_BYTES)
     spec = importlib.util.spec_from_file_location('bundle_scope_runner', Path(__file__).with_name('ci-rust-tests.py'))
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
@@ -461,7 +479,7 @@ def prepare_bundle(root, plan_path, inventory_runner, directory, env):
     if directory.is_relative_to(root / 'target'):
         raise ValueError('bundle destination must be outside target')
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
-    write_json(directory / 'ci-test-plan.json', plan)
+    write_json(directory / 'ci-test-plan.json', plan, max_bytes=MAX_PLAN_BYTES)
     archive = directory / 'nextest.tar.zst'
     if plan['mode'] == 'docs':
         archive.write_bytes(b'')

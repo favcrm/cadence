@@ -133,6 +133,54 @@ class ProducerCLI(unittest.TestCase):
         self.assertIn('base runner lacks archive protocol', recorded['reason'])
         self.assertEqual(recorded['original_plan_sha256'], hashlib.sha256(self.plan.read_bytes()).hexdigest())
 
+    def test_large_changed_path_plans_survive_the_plan_budget(self):
+        # ci-test-plan.make_plan records every {status, path} entry in the
+        # diff, including on full-mode plans. ~1500 realistic paths exceed
+        # the 64 KiB descriptor budget; the plan payload keeps its own
+        # bound and must be retained verbatim through prepare and verify.
+        self.builder_fixture()
+        changes = [{'status': 'M', 'path': f'tests/generated/case_{i:05d}.rs'}
+                   for i in range(1500)]
+        for mode, targets in (('full', []), ('docs', []),
+                              ('selected', ['board'])):
+            with self.subTest(mode=mode):
+                plan_doc = {'schema': 1, 'mode': mode, 'targets': targets,
+                            'reason': mode + ' fixture', 'base_sha': self.sha,
+                            'head_sha': self.sha, 'changes': changes}
+                self.plan.write_text(json.dumps(plan_doc))
+                self.assertGreater(len(self.plan.read_bytes()), bundle.MAX_MANIFEST_BYTES)
+                directory = Path(self.temp.name) / ('bundle-' + mode)
+                result = self.invoke('prepare', '--root', str(self.root), '--plan', str(self.plan),
+                                     '--inventory-runner', str(self.runner), '--directory', str(directory))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                recorded = json.loads((directory / 'ci-test-plan.json').read_text())
+                self.assertEqual(recorded['changes'], changes)
+                self.assertEqual(recorded['mode'], mode)
+                self.assertEqual(recorded['targets'], targets)
+                manifest = json.loads((directory / 'bundle.json').read_text())
+                expected = dict(manifest, manifest_sha256=hashlib.sha256(
+                    (directory / 'bundle.json').read_bytes()).hexdigest())
+                self.assertEqual(bundle.verify_bundle(directory, expected),
+                                 directory / 'nextest.tar.zst')
+                outputs = dict(line.split('=', 1) for line in self.output.read_text().splitlines())
+                self.assertEqual(outputs['mode'], mode)
+                self.assertEqual(outputs['plan_sha256'], hashlib.sha256(
+                    (directory / 'ci-test-plan.json').read_bytes()).hexdigest())
+                self.output.unlink()
+
+    def test_overbudget_plan_refuses_before_nextest_or_publication(self):
+        self.builder_fixture()
+        pad = 'x' * (17 * 1024 * 1024)
+        self.plan.write_text('{"schema": 1, "mode": "full", "targets": [], "pad": "' + pad + '"}')
+        self.assertGreater(len(self.plan.read_bytes()), bundle.MAX_PLAN_BYTES)
+        result = self.prepare()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('large', result.stderr)
+        self.assertFalse(self.directory.exists())
+        self.assertFalse(self.output.exists())
+        trace = Path(self.env['COMMAND_TRACE'])
+        self.assertFalse(trace.exists() and trace.read_text().strip())
+
     def test_explicit_docs_mode_seals_zero_build_markers(self):
         self.builder_fixture()
         self.plan.write_text(json.dumps({'schema': 1, 'mode': 'docs', 'targets': [], 'reason': 'explicit permitted docs'}))

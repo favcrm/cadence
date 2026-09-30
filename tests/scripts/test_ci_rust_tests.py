@@ -671,6 +671,75 @@ class BundleReuse(unittest.TestCase):
                        assignment_out=self.base / "a.json",
                        bundle_dir=self.dir, expected_path=self.authority)
 
+    def record_plan(self, doc):
+        """Write bundle + CLI plan bytes for doc and re-pin the digest."""
+        raw = (json.dumps(doc, sort_keys=True, indent=2) + "\n").encode()
+        (self.dir / "ci-test-plan.json").write_bytes(raw)
+        self.plan.write_bytes(raw)
+        self.expected["plan_sha256"] = hashlib.sha256(raw).hexdigest()
+        self.authority.write_text(json.dumps(self.expected))
+        return raw
+
+    def test_large_full_scope_plan_reuse(self):
+        # A >64 KiB recorded plan (1500 changed paths) must travel through
+        # the bounded plan budget, verify, extract and shard normally.
+        raw = self.record_plan(dict(FULL, changes=[
+            {"status": "M", "path": f"tests/generated/case_{i:05d}.rs"}
+            for i in range(1500)]))
+        self.assertGreater(len(raw), runner.bundle.MAX_MANIFEST_BYTES)
+        self.assertLess(len(raw), runner.bundle.MAX_PLAN_BYTES)
+        verify, check = self.reused(partition="1/8")
+        verify.assert_called_once()
+        check.assert_called_once()
+        self.assertIn("--extract-to", self.calls[0])
+        assignment = json.loads((self.base / "assignment.json").read_text())
+        self.assertEqual(sorted(assignment["inventory"]),
+                         ["b::one t1", "b::two t2"])
+
+    def test_large_docs_plan_reuse_verifies_markers(self):
+        raw = self.record_plan({"schema": 1, "mode": "docs", "targets": [],
+                                "reason": "docs only",
+                                "changes": [{"status": "M", "path": f"docs/page_{i:05d}.md"}
+                                            for i in range(1500)]})
+        self.assertGreater(len(raw), runner.bundle.MAX_MANIFEST_BYTES)
+        (self.dir / "inventory.json").write_text(
+            json.dumps({"rust-suites": {}, "test-count": 0}))
+        (self.dir / "nextest.tar.zst").write_bytes(b"")
+        verify, check = self.reused(partition="1/8", install_stub=False)
+        verify.assert_called_once()
+        check.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_overbudget_or_tampered_bundle_plan_refuses(self):
+        # >16 MiB bundle plan: refusal even though CLI bytes still match.
+        self.record_plan({"schema": 1, "mode": "full", "targets": [],
+                          "reason": "r", "pad": "x" * (17 * 1024 * 1024)})
+        with self.assertRaises(ValueError):
+            self.reused()
+        self.assertEqual(self.calls, [])
+        # Back within budget with bytes that differ from the CLI plan:
+        # the mismatch refusal still applies at the plan size.
+        (self.dir / "ci-test-plan.json").write_bytes(
+            (json.dumps(dict(FULL, changes=[
+                {"status": "M", "path": f"tests/generated/case_{i:05d}.rs"}
+                for i in range(1500)]), sort_keys=True, indent=2) + "\n").encode())
+        self.expected["plan_sha256"] = hashlib.sha256(
+            (self.dir / "ci-test-plan.json").read_bytes()).hexdigest()
+        self.authority.write_text(json.dumps(self.expected))
+        self.plan.write_text(json.dumps(dict(FULL, reason="different")))
+        with self.assertRaises(ValueError):
+            self.reused()
+        self.assertEqual(self.calls, [])
+
+    def test_malformed_large_plan_refuses_before_any_nextest_call(self):
+        raw = b'{"schema": 1, "schema": 2, "pad": "' + b'x' * 70000 + b'"}'
+        self.assertGreater(len(raw), runner.bundle.MAX_MANIFEST_BYTES)
+        (self.dir / "ci-test-plan.json").write_bytes(raw)
+        self.plan.write_bytes(raw)
+        with self.assertRaises(ValueError):
+            self.reused()
+        self.assertEqual(self.calls, [])
+
     def test_missing_version_probe_binary_fails(self):
         # Extraction that never produced target/debug/cadence must fail
         # loud at the version probe, not silently run unverified code.

@@ -198,6 +198,54 @@ class BundleContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'large'):
             bundle.verify_bundle(self.root, self.expected)
 
+    def pin_plan(self, raw):
+        path = self.root / 'ci-test-plan.json'
+        path.write_bytes(raw)
+        self.expected['plan_sha256'] = digest(path)
+        self.manifest['plan_sha256'] = digest(path)
+        self.store_manifest()
+
+    def test_large_recorded_plan_verifies_within_plan_budget(self):
+        # ci-test-plan.make_plan records every changed path; a monorepo diff
+        # legitimately exceeds the 64 KiB descriptor budget without being
+        # malformed. The plan payload has its own larger explicit bound.
+        changes = [{'status': 'M', 'path': f'tests/generated/case_{i:05d}.rs'}
+                   for i in range(1500)]
+        raw = json.dumps({'schema': 1, 'mode': 'full', 'targets': [],
+                          'changes': changes}).encode()
+        self.assertGreater(len(raw), bundle.MAX_MANIFEST_BYTES)
+        self.assertLess(len(raw), bundle.MAX_PLAN_BYTES)
+        self.pin_plan(raw)
+        self.assertEqual(bundle.verify_bundle(self.root, self.expected),
+                         self.root / 'nextest.tar.zst')
+
+    def test_overbudget_recorded_plan_refuses_before_digest_trust(self):
+        # Past the plan budget the bytes refuse even when the pinned digest
+        # would match: a consumer CLI verify must not stream an unbounded plan.
+        raw = b'{"schema": 1, "pad": "' + b'x' * (17 * 1024 * 1024) + b'"}'
+        self.assertGreater(len(raw), bundle.MAX_PLAN_BYTES)
+        self.pin_plan(raw)
+        with self.assertRaisesRegex(ValueError, 'large'):
+            bundle.verify_bundle(self.root, self.expected)
+
+    def test_symlinked_plan_refuses_through_bounded_reader(self):
+        # The plan byte/digest check must keep the regular-file guard: a
+        # symlink escapes to content outside the verified directory.
+        outside = self.root.parent / (self.root.name + '-outside-plan.json')
+        outside.write_text(json.dumps({'schema': 1, 'mode': 'full', 'targets': []}))
+        self.addCleanup(outside.unlink)
+        plan = self.root / 'ci-test-plan.json'
+        plan.unlink()
+        plan.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'regular'):
+            bundle.verify_bundle(self.root, self.expected)
+
+    def test_oversized_expected_context_still_uses_descriptor_budget(self):
+        authority = self.root / 'expected.json'
+        authority.write_text(json.dumps(self.expected) + ' ' * 65537)
+        with self.assertRaisesRegex(ValueError, 'large'):
+            bundle.read_context(authority)
+
     def test_even_mutually_equal_invalid_authority_cannot_pass(self):
         for field, value in (('source_sha', 'main'), ('run_id', '0'), ('producer_attempt', True),
                              ('schema', True), ('workspace_root', '/workspace/../cadence'),
@@ -277,6 +325,19 @@ class BundleContracts(unittest.TestCase):
             context[key] = value
             with self.subTest(field=key), self.assertRaises(ValueError):
                 bundle.select_artifact(context, producer)
+
+    def test_verify_cli_refuses_overbudget_plan_even_with_matching_digest(self):
+        raw = b'{"schema": 1, "pad": "' + b'x' * (17 * 1024 * 1024) + b'"}'
+        self.pin_plan(raw)
+        with tempfile.TemporaryDirectory(prefix='nextest-authority.') as temporary:
+            authority = Path(temporary) / 'expected.json'
+            authority.write_text(json.dumps(self.expected))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/ci-nextest-bundle.py'), 'verify',
+                 '--directory', str(self.root), '--expected', str(authority)],
+                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('large', result.stderr)
 
     def test_cli_without_required_operation_does_not_succeed(self):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/ci-nextest-bundle.py')], capture_output=True, text=True)

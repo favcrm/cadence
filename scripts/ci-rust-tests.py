@@ -312,7 +312,9 @@ def verify_reuse_inputs(root, bundle_dir, expected_path, plan_bytes):
     if expected.get("workspace_root") != str(root):
         raise ValueError("expected workspace_root does not equal the actual root")
     archive = bundle.verify_bundle(bundle_dir, expected)
-    if plan_bytes != (bundle_dir / "ci-test-plan.json").read_bytes():
+    recorded = bundle.read_json_bytes(bundle_dir / "ci-test-plan.json",
+                                      bundle.MAX_PLAN_BYTES)
+    if plan_bytes != recorded:
         raise ValueError("bundle ci-test-plan.json does not equal the CLI plan")
     return expected, archive
 
@@ -336,9 +338,18 @@ def run(root, plan, phase, partition="", weights=None, assignment_out=None,
         raise ValueError("--bundle and --expected are only valid together")
     if bundle_dir is not None and phase != "tests":
         raise ValueError("archive reuse applies to the tests phase only")
+    if bundle_dir is not None and bundle is None:
+        raise ValueError('archive reuse requires the helper beside the head runner')
     plan_bytes = None
     if isinstance(plan, (str, Path)):
-        plan_bytes = Path(plan).read_bytes()
+        # The reuse path must bound the plan read through the helper's plan
+        # budget (a verified recorded plan may legitimately exceed the 64 KiB
+        # descriptor budget); a copied trusted-base runner keeps the plain
+        # unguarded read. Reuse without the helper has already been refused.
+        if bundle_dir is not None:
+            plan_bytes = bundle.read_json_bytes(Path(plan), bundle.MAX_PLAN_BYTES)
+        else:
+            plan_bytes = Path(plan).read_bytes()
         plan = json.loads(plan_bytes)
     args = scope_args(plan)
     shard = partition_args(partition)

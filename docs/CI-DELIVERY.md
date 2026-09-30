@@ -153,6 +153,15 @@ attempt; missing/expired artifacts or incompatible contexts fail explicitly.
 Rerun the producer and its dependent consumers when new producer bytes are
 needed, rather than guessing a latest artifact or overwriting its name.
 
+Trusted descriptors — manifests, producer references, expected contexts and
+selected outputs — are bounded at 64 KiB each. The recorded plan is a
+larger payload class: the base policy lists every changed `{status, path}`
+entry, so a big monorepo or documentation diff legitimately exceeds the
+descriptor budget. Plan reads and writes carry a separate explicit
+16 MiB bound on producer, consumer-reuse and CLI verify paths alike; a
+plan past that bound refuses before any nextest call, never silently
+truncates, and no descriptor limit is raised to accommodate it.
+
 Producer and shards use the identical source-pinned official Rust 1.98.1
 Trixie Linux/amd64 image manifest, with signed Debian snapshot repositories
 for Python/zstd/procps/jq bootstrap. `.config/ci-test-runtime.env` records the
