@@ -6166,3 +6166,106 @@ fn agent_remove_force_notifies_reply_to() {
         "{m}"
     );
 }
+
+/// CAD-508: a report filed while the daemon is between sockets is not
+/// lost — `client::rpc_relay` rides out the window, and the turn it
+/// completes is the one the replacement daemon adopted: same pane,
+/// same turn token, `turn_adopted` recorded instead of a fence.
+#[test]
+fn a_report_filed_during_restart_lands_on_the_adopted_turn() {
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("st1", json!({}));
+    d.wait_agent("st1", "idle", 20);
+    d.send("st1", json!({"text": "work", "message": "m1"}))
+        .unwrap();
+    d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
+        .unwrap();
+    let token = pty_token(&d, "st1", "m1");
+
+    // Operator restart: the socket dies, the stub pane does not.
+    let state = d.state.clone();
+    d.operator_rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    std::mem::forget(d); // the state dir and the pane outlive the daemon
+
+    // The report's daemon call enters the window and stays there.
+    let relay_state = state.clone();
+    let report = thread::spawn(move || {
+        cadence_agent::client::rpc_relay(
+            &relay_state,
+            "message_report",
+            json!({"message": "m1", "token": token,
+                   "kind": "result", "text": "done"}),
+        )
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(!report.is_finished(), "a dead socket answered the report");
+
+    let d = TestDaemon::start_on(state);
+    report.join().unwrap().unwrap();
+    d.wait_message("st1", "m1", &["completed"], 20);
+    let events = d.rpc("agent_events", json!({"alias": "st1"})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "turn_adopted" && e["payload"]["message"] == "m1"),
+        "the running turn was not adopted: {events:?}"
+    );
+    let agent = d.rpc("agent_show", json!({"alias": "st1"})).unwrap()["agent"].clone();
+    assert_ne!(agent["state"].as_str().unwrap(), "attention", "{agent}");
+}
+
+/// CAD-508 twin case: the pane is gone with the daemon — adoption must
+/// refuse, the turn lands `unknown`, and the agent fences instead of
+/// relaunching or silently completing.
+#[test]
+fn a_turn_whose_pane_died_with_the_daemon_fences_unknown() {
+    let mut d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st1", json!({}));
+    d.wait_agent("st1", "idle", 20);
+    d.send("st1", json!({"text": "work", "message": "m1"}))
+        .unwrap();
+    d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
+        .unwrap();
+    let _token = pty_token(&d, "st1", "m1");
+
+    let state = d.state.clone();
+    d.operator_rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    std::mem::forget(d);
+
+    // The pane is gone before the replacement comes up.
+    kill_mock_panes(&mock.dir);
+
+    let d = TestDaemon::start_on(state);
+    let agent = d.wait_agent("st1", "attention", 20);
+    assert!(
+        agent["error"].as_str().unwrap().contains("adoption"),
+        "{agent}"
+    );
+    let m1 = d.rpc("agent_show", json!({"alias": "st1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "m1")
+        .unwrap()
+        .clone();
+    assert_eq!(m1["state"], "unknown", "{m1}");
+    let events = d.rpc("agent_events", json!({"alias": "st1"})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "turn_adopt_refused" && e["payload"]["message"] == "m1"),
+        "no adopt refusal recorded: {events:?}"
+    );
+}

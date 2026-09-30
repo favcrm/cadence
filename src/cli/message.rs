@@ -188,7 +188,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             offset,
             limit,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_read",
                 json!({"message": message, "offset": offset, "limit": limit}),
@@ -200,7 +200,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             token,
             text,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_report",
                 json!({"message": message, "token": token,
@@ -222,7 +222,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
                 None => text,
             };
             (
-                client::rpc(
+                client::rpc_relay(
                     &state_dir,
                     "message_report",
                     json!({"message": message, "token": token,
@@ -237,7 +237,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             note,
             sha,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_reconcile",
                 json!({"message": message, "status": status.as_str(),
@@ -252,7 +252,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             by,
             reason,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_cancel",
                 json!({"message": message, "reason": reason,
@@ -275,21 +275,21 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             // Same flag semantics as send: --ready IS the claim,
             // and the claim probes the pane unless --force.
             if ready {
-                let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+                let show = client::rpc_relay(&state_dir, "agent_show", json!({"alias": alias}))?;
                 let agent = &show["agent"];
                 if registry::ready_gate(
                     agent["provider"].as_str().unwrap_or_default(),
                     agent["endpoint_kind"].as_str().unwrap_or_default(),
                 ) {
                     let by = std::env::var("CADENCE_ALIAS").ok();
-                    client::rpc(
+                    client::rpc_relay(
                         &state_dir,
                         "agent_ready",
                         json!({"alias": alias, "by": by, "force": force}),
                     )?;
                 }
             }
-            let result = client::rpc(
+            let result = client::rpc_relay(
                 &state_dir,
                 "agent_ask",
                 json!({"alias": alias, "text": body,
