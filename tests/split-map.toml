@@ -322,6 +322,8 @@ tests = [
     "cad694_job_tail_keeps_the_newest_window",
     "cad694_restart_ignores_a_historical_latest_refusal",
     "cad694_restart_rejects_a_genuine_new_refusal",
+    "serve_loop_error_still_records_shutdown_evidence",
+    "shutdown_entries_failure_is_an_observable_exit",
     "cad384_no_sandbox_exemption_outside_a_sandbox",
     "cad384_agent_cannot_claim_the_lease_as_the_operator",
     "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",

@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use super::effects;
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
@@ -1117,7 +1118,38 @@ impl Store {
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> Result<Vec<AdoptEntry>> {
-        let conn = self.write_conn()?;
+        // The drain must not lose its adoption evidence to a racing
+        // writer: a rollout/audit commit landing between the in-flight
+        // scan and the event writes fails the write upgrade as BUSY —
+        // including BUSY_SNAPSHOT, which busy_timeout cannot wait out.
+        // Re-run the whole transaction on the busy family; a dead store
+        // fails every attempt just as fast, so nothing else is retried.
+        let mut attempt = 0u32;
+        loop {
+            let result = {
+                let conn = self.write_conn()?;
+                Self::shutdown_entries_tx(&conn, facts)
+            };
+            match result {
+                Ok(entries) => return Ok(entries),
+                Err(e) if attempt < SHUTDOWN_ENTRIES_RETRIES && shutdown_retryable(&e) => {
+                    attempt += 1;
+                    eprintln!(
+                        "store: shutdown entries hit {e}; retrying ({attempt}/{SHUTDOWN_ENTRIES_RETRIES})"
+                    );
+                    std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// One [`Self::shutdown_entries`] transaction, rusqlite-typed so
+    /// the caller can tell retryable lock contention from a dead store.
+    fn shutdown_entries_tx(
+        conn: &Connection,
+        facts: &std::collections::HashMap<String, (String, u32, String)>,
+    ) -> rusqlite::Result<Vec<AdoptEntry>> {
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
@@ -1145,24 +1177,28 @@ impl Store {
                     )
                     .ok();
                 if kind.as_deref() == Some("pty") {
-                    Self::event(
+                    Self::event_scoped_raw(
                         &tx,
                         &alias,
                         "turn_adopt_refused",
-                        json!({"message": message_id, "turn_id": turn_id,
+                        &json!({"message": message_id, "turn_id": turn_id,
                                "reason": "endpoint identity was not provable at shutdown; inspect the pane and do not replay"}),
+                        None,
+                        None,
                     )?;
                 }
                 continue;
             };
             if state == "running" && !Self::turn_token_current_in(&tx, &alias, generation, &turn_id)
             {
-                Self::event(
+                Self::event_scoped_raw(
                     &tx,
                     &alias,
                     "turn_adopt_refused",
-                    json!({"message": message_id, "turn_id": turn_id,
+                    &json!({"message": message_id, "turn_id": turn_id,
                            "reason": "turn token predates endpoint generation"}),
+                    None,
+                    None,
                 )?;
                 continue;
             }
@@ -1179,3 +1215,17 @@ impl Store {
         Ok(entries)
     }
 }
+
+/// sqlite errors worth a fresh shutdown transaction: BUSY — whose
+/// SNAPSHOT variant busy_timeout cannot wait out at all — and LOCKED.
+/// Anything else (I/O, full disk, schema, misuse) is not transient.
+fn shutdown_retryable(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Extra `shutdown_entries` attempts on lock contention — two retries
+/// bound a doomed store's added wait to the busy_timeout it already pays.
+const SHUTDOWN_ENTRIES_RETRIES: u32 = 2;

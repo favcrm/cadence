@@ -3210,7 +3210,11 @@ impl Shared {
     /// `running` without proof. Managed endpoints keep the
     /// interrupt-and-grace path: their provider process dies with the
     /// daemon either way.
-    fn shutdown(&self) {
+    ///
+    /// `Err` is the drain's own failure: no refusal events and no
+    /// shutdown marker were written — a crash-equivalent state dir.
+    /// Callers propagate it so the exit cannot claim clean.
+    fn shutdown(&self) -> Result<()> {
         // Facts come from `begin_closing`, taken before the wake that
         // lets an idle actor detach. Re-reading the agent rows here is
         // the former snapshot and is empty once that detach has run.
@@ -3248,10 +3252,17 @@ impl Shared {
         }
         // LAST: every actor has detached and written its final state,
         // so the message rows are settled — and a marker written here
-        // can only ever describe a clean stop.
-        if let Ok(entries) = self.store.shutdown_entries(&facts) {
-            write_shutdown_marker(&self.state_dir, &self.instance, entries);
-        }
+        // can only ever describe a clean stop. A failed sweep writes no
+        // marker and no refusals — a crash-equivalent exit — so it must
+        // be loud on stderr and in the caller's result, never silent.
+        let entries = self.store.shutdown_entries(&facts).map_err(|e| {
+            eprintln!(
+                "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
+            );
+            Error::internal(format!("shutdown entries failed: {e}"))
+        })?;
+        write_shutdown_marker(&self.state_dir, &self.instance, entries);
+        Ok(())
     }
 }
 
@@ -4102,6 +4113,10 @@ pub struct ServeOptions {
     /// Only code in this process holding the flag can set it, so the
     /// gate is untouched. Production leaves it unset.
     pub stop: Option<Arc<AtomicBool>>,
+    /// Test seam: a one-shot serve-loop failure. Setting the flag makes
+    /// the accept loop take its fatal-error exit — the path that must
+    /// still run the shutdown below. Production leaves it unset.
+    pub serve_loop_fault: Option<Arc<AtomicBool>>,
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
@@ -4182,7 +4197,14 @@ pub struct ServeOptions {
     pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
+/// Cap on the serve loop's transient-accept backoff — bounded so a
+/// stop request is still observed promptly while fd/memory pressure
+/// clears. Doubles from 5ms on each consecutive failure.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
+
 /// Run the daemon in the foreground until `shutdown` or a signal.
+/// A fatal listener or drain failure returns `Err` — but only after
+/// the shutdown below has run: an exit never skips adoption evidence.
 pub fn serve(state_dir: &Path) -> Result<()> {
     // CAD-482: a spawned fixture daemon (`daemon run`/`daemon start`
     // under the test suite) arms the seam from its environment —
@@ -4397,10 +4419,26 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // poster (started right after acquire, CAD-947) runs until after the
     // shutdown flush — stopped and joined only once the flush has
     // completed, then the lease releases.
-    while !shared.closing.load(Ordering::SeqCst) {
+    //
+    // A loop error is a stop, never a skip: `serve_error` is returned
+    // only after the shutdown below has run — the refusals and the
+    // marker it writes are the next start's adoption evidence.
+    let mut serve_error: Option<Error> = None;
+    let mut accept_backoff = Duration::ZERO;
+    while !shared.closing.load(Ordering::SeqCst) && serve_error.is_none() {
         if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
             shared.begin_closing();
             continue;
+        }
+        // Test seam: the loop's fatal-error exit without a real
+        // listener fault. Production leaves it unset.
+        if opts
+            .serve_loop_fault
+            .as_ref()
+            .is_some_and(|fault| fault.swap(false, Ordering::SeqCst))
+        {
+            serve_error = Some(Error::internal("injected serve loop fault"));
+            break;
         }
         let listeners: Vec<&UnixListener> = std::iter::once(&listener)
             .chain(shared_socket.as_ref().map(|socket| &socket.listener))
@@ -4419,13 +4457,38 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
                     ) => {}
-                Err(e) => return Err(e.into()),
+                // Transient pressure (fd table, kernel memory, an
+                // interrupted syscall) clears on its own: retry under a
+                // bounded backoff instead of ending the daemon mid-turn.
+                Err(e) if serve::accept_wait::transient_accept_error(&e) => {
+                    accept_backoff = (accept_backoff * 2)
+                        .max(Duration::from_millis(5))
+                        .min(ACCEPT_BACKOFF_MAX);
+                    eprintln!(
+                        "cadence: listener accept failed ({e}); retrying in {}ms",
+                        accept_backoff.as_millis()
+                    );
+                    std::thread::sleep(accept_backoff);
+                }
+                Err(e) => {
+                    serve_error = Some(e.into());
+                    break;
+                }
             }
         }
-        if !accepted {
-            serve::accept_wait::wait_for_connections(&listeners)?;
+        if accepted {
+            accept_backoff = Duration::ZERO;
+        } else if serve_error.is_none() {
+            if let Err(e) = serve::accept_wait::wait_for_connections(&listeners) {
+                serve_error = Some(e.into());
+            }
         }
     }
+    // A loop that ended on error never observed `closing`: set it now
+    // so the watches and actors drain through the normal stop below.
+    // `begin_closing` is idempotent — a clean exit keeps the facts
+    // snapshot taken when its stop was requested.
+    shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
     // interleaving that used to erase adoption facts.
@@ -4446,7 +4509,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // the query-time fallback still covers a daemon that restarts stale.
     shared.wiki_index.close();
     let _ = wiki_index_worker.join();
-    shared.shutdown();
+    if let Err(e) = shared.shutdown() {
+        // The loop's error still wins — it is why the daemon is leaving.
+        serve_error.get_or_insert(e);
+    }
     // CAD-538: flush before exit — WAL fold + the tracker's staged
     // index — then release the lease LAST: a successor may start the
     // moment it is gone, and this process must have no writes left.
@@ -4469,7 +4535,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let _ = std::fs::remove_file(&socket_path);
     drop(shared_socket);
-    Ok(())
+    match serve_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Fallback detail when an unknown fence has no provider account.

@@ -3198,6 +3198,96 @@ fn cad694_assert_restart_refusal(new_refusal: bool) {
     }
 }
 
+/// CAD-694 follow-up (serve-loop exit): a fatal listener error ended
+/// `serve` before `shutdown()` ran — in-flight turns then fenced on
+/// the next start with no `turn_adopt_refused` and no shutdown marker,
+/// which is exactly the silent signature the restart verdict missed.
+/// An injected loop failure must still drain: the refusal event is
+/// committed, the marker exists, and the serve reports the error.
+#[test]
+fn serve_loop_error_still_records_shutdown_evidence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let fault = Arc::new(AtomicBool::new(false));
+    let opts = daemon::ServeOptions {
+        serve_loop_fault: Some(Arc::clone(&fault)),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    d.register_inbox("unprovable");
+    d.send("unprovable", json!({"text": "mid-turn", "message": "m1"}))
+        .unwrap();
+    // The cad694 shape: a `running` turn on a pty agent with no
+    // endpoint facts is unprovable — `shutdown_entries` must refuse it
+    // WITH its event whenever the daemon leaves, not only on a clean
+    // stop.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='unprovable';
+         UPDATE messages SET state='running',turn_id='fault-turn' WHERE id='m1';",
+    )
+    .unwrap();
+    drop(conn);
+    fault.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_err(),
+        "an injected serve-loop error must surface: {exit:?}"
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='unprovable'
+                AND kind='turn_adopt_refused'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "the loop error must not skip shutdown_entries");
+    assert!(
+        d.state.join("shutdown.json").exists(),
+        "the loop error must not skip the shutdown marker"
+    );
+}
+
+/// CAD-694 follow-up (drain failure): a store error inside
+/// `shutdown_entries` used to be swallowed at the `if let Ok` — no
+/// refusal events, no marker, no log line, and `serve` returned Ok so
+/// a following restart still reported clean. The failure must now be
+/// the daemon's observable exit error, naming the step that failed.
+#[test]
+fn shutdown_entries_failure_is_an_observable_exit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    // Wedge the exact read `shutdown_entries` makes: a renamed table
+    // fails its prepare deterministically, like a store fault during
+    // the drain.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    conn.execute_batch("ALTER TABLE messages RENAME TO messages_moved")
+        .unwrap();
+    drop(conn);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    let err = exit.expect_err("a failed shutdown_entries must not exit clean");
+    assert!(
+        err.to_string().contains("shutdown entries"),
+        "the exit error must name the failed step: {err}"
+    );
+    assert!(
+        !d.state.join("shutdown.json").exists(),
+        "a marker written without its entries would claim a clean stop"
+    );
+}
+
 #[test]
 fn events_default_page_is_newest_with_continue_cursor() {
     let d = TestDaemon::start();
