@@ -217,11 +217,34 @@ impl Shared {
         // fixed strings carrying no issuer content
         // (`refusals_carry_no_issuer_content`).
         .map_err(|e| Error::invalid("device_verification_failed", e.to_string()))?;
+        // CAD-851: the verify above can block for the whole transport
+        // timeout, and authority can retire inside that window — the
+        // board stops (flock released) or a new board pins different
+        // issuer/org/subjects. Re-read the pin and re-prove liveness
+        // before minting, or a call in flight completes under a retired
+        // trust snapshot and its session outlives the board that owned
+        // it. An unchanged pin means the allowlist check below still
+        // applies the operator's current list.
+        let pin_now = crate::device_login::read_pin(&self.state_dir)?;
+        crate::device_login::pin_is_live(&self.state_dir, &pin_now)?;
+        if pin_now != pin {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "operator_device_session_refused",
+                json!({"reason": "authority_changed", "origin": origin.as_str()}),
+            );
+            return Err(Error::invalid(
+                "device_authority_changed",
+                "device sign-in refused: the board's device-login \
+                 configuration changed while the grant was being verified \
+                 — sign in again",
+            ));
+        }
         // The allowlist is the operator's gate (review of #541): a
         // verified workspace member who is not on it gets no session.
         // The refusal echoes the subject id — ids aren't credentials,
         // and naming it is how the operator learns what to allowlist.
-        if !pin.subjects.contains(&verified.subject_id) {
+        if !pin_now.subjects.contains(&verified.subject_id) {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "operator_device_session_refused",
