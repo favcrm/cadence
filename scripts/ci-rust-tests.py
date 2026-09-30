@@ -186,17 +186,6 @@ def list_tests(root, args, extra=None):
     return sorted(tests)
 
 
-def producer_ids(path):
-    """Producer inventory.json (pinned nextest rust-suites JSON) → sorted ids
-    of every recorded testcase, selected or not.
-
-    The extracted tree's first full list is compared against this before
-    any test run: the archive must carry exactly the test inventory the
-    producer recorded.
-    """
-    return sorted(inventory_facts(json.loads(Path(path).read_text())))
-
-
 def inventory_facts(doc):
     """Identity AND run eligibility must agree; matching names alone can omit tests."""
     if not isinstance(doc, dict) or not isinstance(doc.get('rust-suites'), dict):
@@ -416,6 +405,12 @@ def run(root, plan, phase, partition="", weights=None, assignment_out=None,
             raise ValueError('extracted inventory eligibility differs from producer inventory.json')
         inventory = sorted(inventory)
         verify_compiled_source(root, expected["source_sha"])
+        # The consumer never compiles the suite, but unit tests invoke
+        # `cargo` directly (e.g. `cargo tree --locked --offline` in
+        # src/store/tests/app_runs.rs) — that needs the registry index
+        # and sources cached, not target/. `fetch` materializes them
+        # from the same locked Cargo.lock; docs never reaches here.
+        subprocess.run(['cargo', 'fetch', '--locked'], cwd=root, check=True)
     else:
         (root / "target/nextest/cadence/junit.xml").unlink(missing_ok=True)
     command = [str(root / "scripts/cadence-nextest")]

@@ -468,7 +468,7 @@ class BundleReuse(unittest.TestCase):
         verify, check = self.reused()
         verify.assert_called_once_with(self.dir, self.expected)
         check.assert_called_once_with(self.dir / "nextest.tar.zst")
-        extract, probe, selfcheck, run = self.calls
+        extract, probe, fetch, selfcheck, run = self.calls
         self.assertEqual(probe,
                          [str(self.root / "target/debug/cadence"), "--version"])
         self.assertEqual(extract[0], str(self.root / "scripts/cadence-nextest"))
@@ -505,6 +505,12 @@ class BundleReuse(unittest.TestCase):
                            "--features", "--all-targets", "--lib", "--bins",
                            "--test", "--partition"):
                 self.assertNotIn(banned, cmd)
+        # The version probe is followed by the dependency fetch: unit
+        # tests invoke `cargo` directly (cargo tree --locked --offline),
+        # which needs the registry the compile-once archive never carries.
+        # Fetch runs real Cargo with --locked on the checkout — never a
+        # nextest or metadata flag.
+        self.assertEqual(fetch, ["cargo", "fetch", "--locked"])
         self.assertIn("-E", selfcheck)
         self.assertIn("-E", run)
         self.assertEqual(run[-1], selfcheck[-1])  # identical filterset
@@ -541,7 +547,7 @@ class BundleReuse(unittest.TestCase):
                 self.reused()
         finally:
             self.served = original
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 1)  # extraction list only
 
     def test_cli_plan_must_equal_bundle_plan_bytes(self):
         self.plan.write_text(json.dumps(dict(FULL, reason="different")))
@@ -599,6 +605,34 @@ class BundleReuse(unittest.TestCase):
         for cmd in self.calls:  # the compiled-tests run never starts
             self.assertNotEqual(cmd[1:2], ["run"])
 
+    def test_consumer_fetches_locked_deps_for_direct_cargo_calls(self):
+        # CAD-858 follow-up: `cargo tree --locked --offline` inside the
+        # suite resolves the lockfile against the registry cache, which
+        # the compile-once archive does not carry. A real
+        # `cargo fetch --locked` after extraction populates it; a missing
+        # fetch leaves the suite's cargo calls dead — this test fails
+        # pre-fix (4 calls, no fetch) and passes once fetch is wired.
+        _, check = self.reused()
+        check.assert_called_once()
+        fetch_calls = [c for c in self.calls
+                       if c[:3] == ["cargo", "fetch", "--locked"]]
+        self.assertEqual(len(fetch_calls), 1, self.calls)
+        # Fetch happens after extraction and the version probe, before
+        # the self-check list and the run.
+        self.assertLess(self.calls.index(fetch_calls[0]),
+                        len(self.calls) - 2)
+
+    def test_fetch_never_runs_for_docs(self):
+        plan_doc = {"schema": 1, "mode": "docs", "targets": [],
+                    "reason": "docs only"}
+        (self.dir / "ci-test-plan.json").write_text(json.dumps(plan_doc))
+        self.plan.write_bytes((self.dir / "ci-test-plan.json").read_bytes())
+        (self.dir / "inventory.json").write_text(
+            json.dumps({"rust-suites": {}, "test-count": 0}))
+        (self.dir / "nextest.tar.zst").write_bytes(b"")
+        self.reused(partition="1/8", install_stub=False)
+        self.assertNotIn(["cargo", "fetch", "--locked"], self.calls)
+
     def test_bundle_dir_must_not_live_under_root(self):
         inner = self.root / "bundle"
         inner.mkdir()
@@ -611,19 +645,21 @@ class BundleReuse(unittest.TestCase):
     def test_empty_shard_still_extracts_and_verifies_binary(self):
         _, check = self.reused(partition="8/8")
         check.assert_called_once()
-        # Extraction list + version probe happen, but the empty
-        # assignment means no self-check list and no run.
-        self.assertEqual(len(self.calls), 2)
+        # Extraction list + version probe + dependency fetch happen, but
+        # the empty assignment means no self-check list and no run.
+        self.assertEqual(len(self.calls), 3)
         self.assertIn("--extract-to", self.calls[0])
+        self.assertEqual(self.calls[2], ["cargo", "fetch", "--locked"])
         assignment = json.loads((self.base / "assignment.json").read_text())
         self.assertEqual(assignment["tests"], [])
 
     def test_reuse_without_partition_runs_all_selected_metadata_only(self):
         self.reused(partition="")
-        extract, probe, run = self.calls
+        extract, probe, fetch, run = self.calls
         self.assertIn("--extract-to", extract)
         self.assertEqual(probe,
                          [str(self.root / "target/debug/cadence"), "--version"])
+        self.assertEqual(fetch, ["cargo", "fetch", "--locked"])
         self.assertIn("--workspace-remap", run)
         self.assertNotIn("-E", run)
         for banned in ("--locked", "--features", "--all-targets"):
@@ -654,6 +690,7 @@ class BundleReuse(unittest.TestCase):
                                     assignment_out=out)
         verify.assert_called_once()
         check.assert_not_called()
+        # Docs never extracts, probes or fetches — nothing calls out.
         self.assertEqual(self.calls, [])
         self.assertFalse((self.root / "target").exists())
         assignment = json.loads(out.read_text())

@@ -17,6 +17,8 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
+import time
 
 spec = importlib.util.spec_from_file_location('runtime_bundle', Path(__file__).with_name('ci-nextest-bundle.py'))
 bundle = importlib.util.module_from_spec(spec)
@@ -51,6 +53,63 @@ def read_pin(root):
     return pin
 
 
+def git_merge_base_capability(env):
+    """The suite's audit/review tests need `git merge-tree --write-tree
+    --merge-base=X` — Git 2.39 lacks it (the option arrived in 2.40), so a
+    producer/consumer on an older Git fails those tests mid-suite. Probe
+    the actual installed git, not the pinned image version string: create a
+    scratch repo, prove the command line parses and the merge runs.
+    """
+    with tempfile.TemporaryDirectory(prefix='ci-git-probe-') as tmp:
+        base = ['git', '-C', tmp]
+        def run(*args):
+            return subprocess.run(base + list(args), env=env, check=True,
+                                  capture_output=True, text=True, timeout=30)
+        run('init', '-q', '-b', 'main')
+        run('-c', 'user.name=ci', '-c', 'user.email=ci@probe', 'commit', '-q', '--allow-empty', '-m', 'base')
+        base_sha = run('rev-parse', 'HEAD').stdout.strip()
+        run('-c', 'user.name=ci', '-c', 'user.email=ci@probe', 'commit', '-q', '--allow-empty', '-m', 'head')
+        head_sha = run('rev-parse', 'HEAD').stdout.strip()
+        try:
+            run('merge-tree', '--write-tree', '--name-only',
+                f'--merge-base={base_sha}', base_sha, head_sha)
+        except subprocess.CalledProcessError as error:
+            raise ValueError('installed git lacks the required merge-tree --merge-base capability: '
+                             + error.stderr.strip()) from error
+
+
+def orphan_reap_capability():
+    """The suite's mocked tmux provider detaches pane processes, so a CI
+    container without an init at PID 1 (no Docker `--init`) leaves exited
+    orphans as zombies that `kill(pid, 0)` still counts as alive —
+    death/liveness tests then fail. Prove this runtime reaps: double-fork
+    so a grandchild is orphaned to PID 1, then require its /proc entry to
+    disappear after it exits.
+    """
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        grandchild = os.fork()
+        if grandchild == 0:
+            os._exit(0)  # orphaned grandchild exits; PID 1 must reap it
+        os.write(write_fd, str(grandchild).encode())
+        os._exit(0)      # child exits; grandchild reparents to PID 1
+    os.close(write_fd)
+    orphan_pid = int(os.read(read_fd, 64).decode().strip())
+    os.close(read_fd)
+    os.waitpid(child, 0)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            Path(f'/proc/{orphan_pid}/stat').read_text()
+        except FileNotFoundError:
+            return
+        time.sleep(0.05)
+    raise ValueError(
+        'PID 1 does not reap orphaned descendants; the job container needs Docker --init')
+
+
 def identity(root, env):
     pin = read_pin(root)
     if env.get('CADENCE_TEST_CONTAINER_IMAGE') != pin['CI_TEST_IMAGE']:
@@ -71,6 +130,8 @@ def identity(root, env):
     compiler = subprocess.run(['rustc', '--version'], check=True, capture_output=True, text=True, timeout=30).stdout.split()
     if compiler[:2] != ['rustc', pin['CI_TEST_TOOLCHAIN']]:
         raise ValueError('runtime compiler does not match source pin')
+    git_merge_base_capability(env)
+    orphan_reap_capability()
     packages = subprocess.run(['dpkg-query', '-W', '-f=${binary:Package}=${Version}\n'],
                               env=dict(env, LC_ALL='C'), check=True, capture_output=True, timeout=30).stdout
     if not packages or len(packages) > 1048576:

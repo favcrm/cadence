@@ -137,14 +137,19 @@ Rerun the producer and its dependent consumers when new producer bytes are
 needed, rather than guessing a latest artifact or overwriting its name.
 
 Producer and shards use the identical source-pinned official Rust 1.98.1
-Bookworm Linux/amd64 image manifest, with signed Debian snapshot repositories
+Trixie Linux/amd64 image manifest, with signed Debian snapshot repositories
 for Python/zstd/procps/jq bootstrap. `.config/ci-test-runtime.env` records the
 image, snapshot, distro and compiler; refreshed pins require review and fresh
 runtime acceptance. Both jobs independently measure os-release, installed
 package versions and x86_64 ELF bytes for libc/libstdc++/the loader. Missing,
 malformed, changed or unproven runtime identity fails closed. Normal shell
 steps run as non-root uid 1001; only fresh-container bootstrap and producer
-cache ownership restoration use root. Consumers still have no target cache.
+cache and CI-directory ownership restoration use root. The latter validates
+the observed container paths `/github/home`, `/usr/local/cargo` and
+`/__w/_temp` before changing ownership after root Actions. Both containers
+use Docker `--init`; preflight exercises the installed Git
+`merge-tree --merge-base` capability and checks that a known exited orphan
+is reaped. Consumers still have no target cache.
 Hosted `ImageOS`/`ImageVersion` remain bounded immutable observations in the
 sealed producer manifest, not userspace compatibility authority. Run 36682010782
 attempts 1/2 proved the hosted label can mix image versions, even on failed-only
@@ -171,7 +176,10 @@ Producer failures/skips/missing evidence cannot green the aggregate.
 
 `test-once` stays independent for default-feature refusal proofs and doctests.
 Each consumer still installs/builds the SPA and needs real `tsc`; Rust fixture
-Cargo subprocesses remain real. This is not elimination of every Rust build or
+Cargo subprocesses remain real. After archive inventory/source verification,
+the consumer performs one `cargo fetch --locked` to populate the registry
+needed by fixture calls such as `cargo tree --locked --offline`; docs-only
+plans skip it. This fetch does not build the suite. This is not elimination of every Rust build or
 sharing of release/UI-feature binaries. No production deployment or approval
 policy is changed.
 
@@ -180,6 +188,13 @@ would total about 12.2 GB before wrapper overhead; this is arithmetic, not a
 current measurement. The first current bootstrap run uploaded a 2,493,340,836-byte
 full bundle (~19.95 GB arithmetic for eight downloads); the pinned container's
 compressed image layers total 562,530,953 bytes, before bootstrap/network costs.
+Run 36740682630 subsequently uploaded a 2,517,835,247-byte bundle; its
+eight downloads took 39–332 seconds each. Archive verification and exact
+assignment of all 3,615 tests passed, but seven shards failed actual test
+bodies: Bookworm Git lacked `--merge-base`, an offline Cargo call lacked
+registry data, and permission/provider lifecycle tests failed. The runtime
+correction targets those causes; full CI must verify the ownership and
+reaping hypotheses before accepting this revision.
 No measured speedup is implied. Producer scheduling, upload/download, preflight/extraction,
 UI setup and other required builds can outweigh saved compilation. Require
 current-head full/selected archive execution and eight-shard coverage evidence;

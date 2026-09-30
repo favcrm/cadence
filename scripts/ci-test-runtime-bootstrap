@@ -28,6 +28,25 @@ if [[ "${1:-}" == --plan && $# == 1 ]]; then
   printf 'image=%s\nsnapshot=%s\nsuite=%s\npackages=python3 zstd procps jq\nuid=1001\n' "$CI_TEST_IMAGE" "$CI_TEST_SNAPSHOT" "$suite"
   exit 0
 fi
+# Late ownership repair: the bootstrap chown runs before Actions that run
+# as root (checkout, setup-node, rust-cache restore, download-artifact)
+# can recreate tracked paths root-owned. This mode corrects only the
+# fresh CI container's HOME, CARGO_HOME and RUNNER_TEMP after those
+# Actions and before the non-root test phase; it never touches a host
+# path (the pinned-container guard below is the same as the bootstrap's).
+if [[ "${1:-}" == --repair-ownership && $# == 1 ]]; then
+  [[ ${GITHUB_ACTIONS:-} == true && -f /.dockerenv && $(id -u) == 0 && ${CADENCE_TEST_CONTAINER_IMAGE:-} == "$CI_TEST_IMAGE" ]] || { echo 'repair-ownership requires the pinned root CI job container' >&2; exit 1; }
+  [[ "$HOME" == /github/home && "$CARGO_HOME" == /usr/local/cargo && "$RUNNER_TEMP" == /__w/_temp ]] || { echo 'repair-ownership refuses unexpected CI directory paths' >&2; exit 1; }
+  # Validate the entire set before changing any ownership. These are the
+  # paths actually mounted by the Actions container runner, not host paths.
+  for directory in "$HOME" "$CARGO_HOME" "$RUNNER_TEMP"; do
+    [[ -d "$directory" && ! -L "$directory" && $(readlink -f -- "$directory") == "$directory" ]] || { echo 'repair-ownership target must be a canonical directory' >&2; exit 1; }
+  done
+  for directory in "$HOME" "$CARGO_HOME" "$RUNNER_TEMP"; do
+    chown -R 1001:1001 -- "$directory"
+  done
+  exit 0
+fi
 [[ $# == 0 && ${GITHUB_ACTIONS:-} == true && -f /.dockerenv && $(id -u) == 0 && ${CADENCE_TEST_CONTAINER_IMAGE:-} == "$CI_TEST_IMAGE" ]] || { echo 'bootstrap requires the pinned root CI job container' >&2; exit 1; }
 grep -qx 'ID=debian' /etc/os-release
 grep -qx "VERSION_ID=\"$CI_TEST_OS_VERSION\"" /etc/os-release

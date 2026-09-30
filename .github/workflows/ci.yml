@@ -188,12 +188,16 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    # Official Rust 1.98.1/bookworm amd64 manifest, verified via registry.
+    # Official Rust 1.98.1/trixie amd64 manifest, verified via registry.
     # Hosted runner image versions can roll independently; userspace cannot.
+    # --init puts a real reaper at PID 1: the suite's mocked tmux provider
+    # detaches pane processes that reparent to PID 1, and without it they
+    # stay zombies that `kill(pid, 0)` still counts as alive.
     container:
-      image: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+      image: docker.io/library/rust@sha256:f31fa9eaac4e417505e10009786ec0c636558e02dff3fa662cc92c10894ba065
+      options: --init
     env:
-      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:f31fa9eaac4e417505e10009786ec0c636558e02dff3fa662cc92c10894ba065
     defaults:
       run:
         shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}
@@ -257,10 +261,14 @@ jobs:
         if: steps.scope.outputs.mode != 'docs'
         with:
           key: archive-${{ hashFiles('.config/ci-test-runtime.env') }}
-      - name: Make restored producer cache writable by the test user
+      # checkout and rust-cache run as root before this; HOME and
+      # RUNNER_TEMP can carry root-owned leftovers the uid-1001 steps
+      # below must read, alongside the restored target/CARGO_HOME.
+      - name: Make restored producer cache and CI dirs writable by the test user
         shell: bash
         run: |
-          for directory in "$GITHUB_WORKSPACE/target" "$CARGO_HOME"; do
+          bash scripts/ci-test-runtime-bootstrap --repair-ownership
+          for directory in "$GITHUB_WORKSPACE/target"; do
             if [ -d "$directory" ]; then chown -R 1001:1001 -- "$directory"; fi
           done
       # PR93 is an explicit dependency of this CI follow-up. Its installer
@@ -362,9 +370,10 @@ jobs:
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' && needs.test-build.result == 'success' }}
     runs-on: ubuntu-latest
     container:
-      image: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+      image: docker.io/library/rust@sha256:f31fa9eaac4e417505e10009786ec0c636558e02dff3fa662cc92c10894ba065
+      options: --init
     env:
-      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+      CADENCE_TEST_CONTAINER_IMAGE: docker.io/library/rust@sha256:f31fa9eaac4e417505e10009786ec0c636558e02dff3fa662cc92c10894ba065
     defaults:
       run:
         shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}
@@ -437,6 +446,13 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+      # The root actions above (setup-node, pnpm/action-setup and the
+      # download) create files under HOME/RUNNER_TEMP owned by root; the
+      # uid-1001 shell steps below must extend them. Repair
+      # ownership inside the pinned container before pnpm and the suite.
+      - name: Repair CI directory ownership after root actions
+        shell: bash
+        run: bash scripts/ci-test-runtime-bootstrap --repair-ownership
       - run: pnpm install --frozen-lockfile
         if: needs.test-build.outputs.mode != 'docs'
         working-directory: ui

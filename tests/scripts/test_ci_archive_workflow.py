@@ -80,12 +80,26 @@ class PinnedRuntime(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertIn('image: ' + image, block)
                 self.assertIn('CADENCE_TEST_CONTAINER_IMAGE: ' + image, block)
+                # --init puts a reaper at PID 1: the suite's mocked tmux
+                # provider detaches pane processes that orphan to PID 1,
+                # and without an init they stay zombies that kill(pid,0)
+                # still counts as alive — liveness/death tests then fail.
+                self.assertIn('options: --init', block)
                 self.assertIn('shell: /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /bin/bash -e -o pipefail {0}', block)
                 self.assertIn('bash scripts/ci-test-runtime-bootstrap', block)
                 self.assertNotIn('rustup toolchain install stable', block)
                 self.assertLess(block.index('bash scripts/ci-test-runtime-bootstrap'), block.index('python3 '))
         for name in ('test-once', 'build', 'ui', 'clippy'):
             self.assertNotIn('ci-test-runtime-bootstrap', job_block(name))
+
+    def test_runtime_pin_is_trixie_debian_13(self):
+        # Git >= 2.40 (for merge-tree --merge-base) ships only on trixie;
+        # the pin must name Debian 13 and a verified amd64 manifest digest.
+        pin = (ROOT / '.config/ci-test-runtime.env').read_text()
+        self.assertIn("CI_TEST_OS_ID='debian'", pin)
+        self.assertIn("CI_TEST_OS_VERSION='13'", pin)
+        self.assertIn("CI_TEST_TOOLCHAIN='1.98.1'", pin)
+        self.assertIn("CI_TEST_SNAPSHOT='20260920T000000Z'", pin)
 
 
     def test_container_artifact_paths_use_measured_temp_not_host_expression(self):
@@ -179,6 +193,13 @@ class ShardConsumer(unittest.TestCase):
         self.assertNotIn("uses: Swatinem", self.shard)
         self.assertIsNone(re.search(r"rm\s+-[a-zA-Z]*r", self.shard))
         self.assertIsNone(re.search(r"rm\s+[^\n]*target", self.shard))
+
+    def test_consumer_does_not_duplicate_wrapper_dependency_fetch(self):
+        # The runner performs one locked registry fetch after verifying
+        # archive/source identity; the workflow must not fetch it again.
+        self.assertNotIn('cargo fetch --locked', self.shard)
+        runner = (ROOT / 'scripts/ci-rust-tests.py').read_text()
+        self.assertEqual(runner.count("['cargo', 'fetch', '--locked']"), 1)
 
     def test_scope_inventory_and_timings_left_the_shard(self):
         for moved in ("Select PR test scope from the base policy",
@@ -282,6 +303,36 @@ class ShardConsumer(unittest.TestCase):
             line = before[match.start():].splitlines()[0]
             self.assertNotIn("node ", line)
             self.assertNotIn("pnpm ", line)
+
+    def test_ownership_repair_after_root_actions_before_nonroot_steps(self):
+        # `uses:` actions run as root in the job container; they recreate
+        # HOME/.local and RUNNER_TEMP content root-owned, which the
+        # uid-1001 run steps (and the seam's passwd-home refusal) cannot
+        # read. One guarded repair step must sit after the last root
+        # action and before the first plain `run` step that needs them.
+        repair = step_named(self.shard, "--repair-ownership")
+        self.assertIn("shell: bash", repair)
+        self.assertIn("ci-test-runtime-bootstrap --repair-ownership", repair)
+        # No interpolation of expressions into the repair command itself.
+        run = re.search(r"run: (.+)$", repair, re.M)[1]
+        self.assertNotIn("${{", run)
+        steps = step_blocks(self.shard)
+        repair_idx = next(i for i, s in enumerate(steps)
+                          if "--repair-ownership" in s)
+        # It runs after the download/setup-node/pnpm setup actions and
+        # before pnpm install, cargo fetch and the nextest run.
+        first_node = next(i for i, s in enumerate(steps)
+                          if "actions/setup-node@" in s)
+        pnpm_setup = next(i for i, s in enumerate(steps)
+                          if "pnpm/action-setup@" in s)
+        install = next(i for i, s in enumerate(steps)
+                       if "pnpm install --frozen-lockfile" in s)
+        nextest = next(i for i, s in enumerate(steps)
+                       if "python3 scripts/ci-rust-tests.py" in s)
+        self.assertLess(first_node, repair_idx)
+        self.assertLess(pnpm_setup, repair_idx)
+        self.assertLess(repair_idx, install)
+        self.assertLess(repair_idx, nextest)
 
     def test_docs_gating_follows_producer_mode(self):
         self.assertIn("needs.test-build.outputs.mode != 'docs'", self.shard)
