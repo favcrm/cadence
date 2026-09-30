@@ -455,6 +455,10 @@ pub struct BindingView {
     pub sender_name: String,
     pub sender_address: String,
     pub unsubscribe_base: String,
+    /// CAD-786: the exact per-recipient unsubscribe URL when the
+    /// sender owns real token authority — `None` keeps the
+    /// `?token=RECIPIENT` preview marker.
+    pub unsubscribe_url: Option<String>,
 }
 
 fn preview_binding_view() -> BindingView {
@@ -462,6 +466,7 @@ fn preview_binding_view() -> BindingView {
         sender_name: SENDER_NAME.to_string(),
         sender_address: SENDER_ADDRESS.to_string(),
         unsubscribe_base: UNSUBSCRIBE_BASE.to_string(),
+        unsubscribe_url: None,
     }
 }
 
@@ -473,7 +478,10 @@ fn sender_line(binding: &BindingView) -> String {
 }
 
 fn unsubscribe_url(binding: &BindingView) -> String {
-    format!("{}?token=RECIPIENT", binding.unsubscribe_base)
+    binding
+        .unsubscribe_url
+        .clone()
+        .unwrap_or_else(|| format!("{}?token=RECIPIENT", binding.unsubscribe_base))
 }
 
 /// Every binding in this ticket is preview-only: no host verification
@@ -1079,6 +1087,7 @@ impl RecordStore {
                 sender_name: record.sender_name.clone(),
                 sender_address: record.sender_address.clone(),
                 unsubscribe_base: record.unsubscribe_base.clone(),
+                unsubscribe_url: None,
             },
         })
     }
@@ -2126,6 +2135,7 @@ impl RecordStore {
             sender_name: sender_name.to_string(),
             sender_address: sender_address.to_string(),
             unsubscribe_base: UNSUBSCRIBE_BASE.to_string(),
+            unsubscribe_url: None,
         };
         let html = render_html(&draft, None, &view);
         let text = render_text(&draft, None, &view);
@@ -2180,8 +2190,43 @@ impl RecordStore {
         let conn = self.conn();
         let _binding = self.resolve_binding(&conn, context, Some(binding_id))?;
         Err(Error::rejected(
-            "email final-send preparation is unavailable until CAD-785 supplies a verified sender connection and CAD-786 supplies unsubscribe authority",
+            "email final-send preparation moved to the operator `crm_send_prepare` verb — the approved bounded send path owns it",
         ))
+    }
+
+    /// Per-recipient bytes for the CAD-786 worker: the exact current
+    /// revision rendered with the host-custodied verified sender,
+    /// this recipient's first-name token and the real per-recipient
+    /// unsubscribe URL. The caller proves approval separately
+    /// (`app_content_approved`); this render still refuses if the
+    /// revision/digest moved — a stale send renders nothing new.
+    pub fn app_content_send_bytes(
+        &self,
+        context: &str,
+        campaign: &str,
+        sender_name: &str,
+        sender_address: &str,
+        first_name: Option<&str>,
+        unsubscribe_url: &str,
+    ) -> Result<Value> {
+        let conn = self.conn();
+        let (revision, draft, digest) = self.draft_at(&conn, context, campaign, None)?;
+        let view = BindingView {
+            sender_name: sender_name.to_string(),
+            sender_address: sender_address.to_string(),
+            unsubscribe_base: UNSUBSCRIBE_BASE.to_string(),
+            unsubscribe_url: Some(unsubscribe_url.to_string()),
+        };
+        let html = render_html(&draft, first_name, &view);
+        let text = render_text(&draft, first_name, &view);
+        Ok(json!({
+            "subject": personalize(&draft.subject, first_name),
+            "content_revision": revision,
+            "content_digest": digest,
+            "html": html,
+            "text": text,
+            "unsubscribe_url": unsubscribe_url,
+        }))
     }
 }
 

@@ -688,6 +688,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_show", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_test_send", Rule::Handler("rpc_crm_smtp")),
+    // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
+    // act is `operator_connection`.
+    ("crm_send_prepare", Rule::Handler("rpc_crm_send")),
+    ("crm_send_approve", Rule::Handler("rpc_crm_send")),
+    ("crm_send_show", Rule::Handler("rpc_crm_send")),
+    ("crm_send_list", Rule::Handler("rpc_crm_send")),
+    ("crm_send_resolve", Rule::Handler("rpc_crm_send")),
+    ("crm_send_origin_set", Rule::Handler("rpc_crm_send")),
+    ("crm_send_origin_show", Rule::Handler("rpc_crm_send")),
+    // CAD-786: the unsubscribe token is the credential — the verb
+    // can only add a suppression.
+    ("crm_unsubscribe_redeem", Rule::Bearer),
     ("platform_accounts", Rule::Read),
     ("platform_defaults", Rule::Read),
     (

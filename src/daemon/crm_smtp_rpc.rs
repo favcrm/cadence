@@ -64,7 +64,7 @@ impl Shared {
     /// Resolve the live installation/context, then run `action`.
     /// Unknown or diverted installations and unknown, archived or
     /// foreign contexts refuse before any file or socket opens.
-    fn crm_smtp_scope<R>(
+    pub(super) fn crm_smtp_scope<R>(
         self: &Arc<Self>,
         install: &str,
         context: &str,
@@ -90,7 +90,7 @@ impl Shared {
     /// Call with the custody lock held; the test send holds it
     /// across the submission so a concurrent revoke or rotate
     /// cannot interleave the send.
-    fn crm_smtp_authority(
+    pub(super) fn crm_smtp_authority(
         &self,
         connection_id: &str,
         auth_revision: i64,
@@ -398,6 +398,7 @@ impl Shared {
                             .as_str()
                             .unwrap_or("")
                             .to_string(),
+                        idempotency_key: None,
                     };
                     let content_digest = rendered["content_digest"]
                         .as_str()
@@ -436,7 +437,7 @@ impl Shared {
                         "smtp_code": outcome.code,
                         "smtp_message": outcome.message,
                         "delivery_claim": "smtp-acceptance-only",
-                        "unsubscribe_authority": "preview (CAD-786 pending)",
+                        "unsubscribe_authority": "test send (no unsubscribe token)",
                     });
                     // The receipt must not carry the secret even when
                     // the server echoed credential-shaped bytes — the
@@ -446,6 +447,19 @@ impl Shared {
                         &receipt.to_string(),
                         envelope.secret(),
                     )?;
+                    // CAD-786: an accepted test send is the only
+                    // "sent after preview" evidence a campaign
+                    // prepare accepts, and it binds this exact
+                    // content + link digest — an edit or rebind
+                    // makes the evidence stale by construction.
+                    if outcome.accepted {
+                        records.app_campaign_test_send_record(
+                            context,
+                            campaign,
+                            content_digest,
+                            &link.digest,
+                        )?;
+                    }
                     self.store.note_crm_smtp_test(install, context, &receipt);
                     Ok(json!({"receipt": receipt}))
                 })

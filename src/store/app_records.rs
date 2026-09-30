@@ -142,6 +142,39 @@ CREATE TABLE IF NOT EXISTS app_sender_binding_revisions(
  unsubscribe_base TEXT NOT NULL, connection_id TEXT,
  binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
  PRIMARY KEY(context_id, binding_id, revision));
+CREATE TABLE IF NOT EXISTS app_campaign_test_sends(
+ context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+ content_digest TEXT NOT NULL, link_digest TEXT NOT NULL,
+ accepted INTEGER NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id,campaign_id,content_digest,link_digest));
+CREATE TABLE IF NOT EXISTS app_campaign_sends(
+ context_id TEXT NOT NULL, send_id TEXT NOT NULL,
+ campaign_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ content_revision INTEGER NOT NULL, content_digest TEXT NOT NULL,
+ audience_freeze_id TEXT NOT NULL, audience_digest TEXT NOT NULL,
+ connection_id TEXT NOT NULL, auth_revision INTEGER NOT NULL,
+ link_revision INTEGER NOT NULL, link_digest TEXT NOT NULL,
+ max_recipients INTEGER NOT NULL, send_digest TEXT NOT NULL,
+ unsubscribe_origin TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('prepared','sending','completed','closed')),
+ close_reason TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+ approved_at REAL,
+ PRIMARY KEY(context_id,send_id),
+ UNIQUE(context_id,request_id));
+CREATE TABLE IF NOT EXISTS app_campaign_deliveries(
+ context_id TEXT NOT NULL, send_id TEXT NOT NULL,
+ customer_id TEXT NOT NULL, email TEXT NOT NULL,
+ idempotency_key TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('queued','submitting','accepted','failed','uncertain','suppressed','closed')),
+ attempts INTEGER NOT NULL DEFAULT 0,
+ smtp_code INTEGER, smtp_message TEXT, reason TEXT, resolved_by TEXT,
+ updated REAL NOT NULL,
+ PRIMARY KEY(context_id,send_id,customer_id),
+ UNIQUE(idempotency_key));
+CREATE TABLE IF NOT EXISTS app_unsubscribe_tokens(
+ token_hash TEXT PRIMARY KEY,
+ context_id TEXT NOT NULL, customer_id TEXT NOT NULL, send_id TEXT NOT NULL,
+ created REAL NOT NULL);
 ";
 
 /// The record file for an installation. The identifier grammar
@@ -555,6 +588,47 @@ impl RecordStore {
                  state TEXT NOT NULL CHECK(state IN ('open','used')),
                  used_by TEXT, created REAL NOT NULL, decided REAL,
                  PRIMARY KEY(context_id, request_id))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-786 campaign delivery: test-send evidence, the
+            // approved send rows, per-recipient deliveries and the
+            // hash-only unsubscribe-token index. Idempotent forward
+            // migration like the content tables above; the version
+            // stays 1 and older files gain empty tables.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_campaign_test_sends(
+                 context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                 content_digest TEXT NOT NULL, link_digest TEXT NOT NULL,
+                 accepted INTEGER NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id,campaign_id,content_digest,link_digest));
+                 CREATE TABLE IF NOT EXISTS app_campaign_sends(
+                 context_id TEXT NOT NULL, send_id TEXT NOT NULL,
+                 campaign_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                 content_revision INTEGER NOT NULL, content_digest TEXT NOT NULL,
+                 audience_freeze_id TEXT NOT NULL, audience_digest TEXT NOT NULL,
+                 connection_id TEXT NOT NULL, auth_revision INTEGER NOT NULL,
+                 link_revision INTEGER NOT NULL, link_digest TEXT NOT NULL,
+                 max_recipients INTEGER NOT NULL, send_digest TEXT NOT NULL,
+ unsubscribe_origin TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('prepared','sending','completed','closed')),
+                 close_reason TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+                 approved_at REAL,
+                 PRIMARY KEY(context_id,send_id),
+                 UNIQUE(context_id,request_id));
+                 CREATE TABLE IF NOT EXISTS app_campaign_deliveries(
+                 context_id TEXT NOT NULL, send_id TEXT NOT NULL,
+                 customer_id TEXT NOT NULL, email TEXT NOT NULL,
+                 idempotency_key TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('queued','submitting','accepted','failed','uncertain','suppressed','closed')),
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 smtp_code INTEGER, smtp_message TEXT, reason TEXT, resolved_by TEXT,
+                 updated REAL NOT NULL,
+                 PRIMARY KEY(context_id,send_id,customer_id),
+                 UNIQUE(idempotency_key));
+                 CREATE TABLE IF NOT EXISTS app_unsubscribe_tokens(
+                 token_hash TEXT PRIMARY KEY,
+                 context_id TEXT NOT NULL, customer_id TEXT NOT NULL, send_id TEXT NOT NULL,
+                 created REAL NOT NULL)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
         }

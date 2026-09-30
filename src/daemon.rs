@@ -31,6 +31,7 @@ mod area_rpc;
 mod caller_rule;
 mod checkup;
 mod connections_rpc;
+mod crm_send_rpc;
 mod crm_smtp_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
@@ -435,6 +436,18 @@ pub struct Shared {
     /// these verbs are operator-paced and rare, so a per-key map buys
     /// nothing here.
     platform_custody_lock: Mutex<()>,
+    /// CAD-786: live send workers keyed `install/context/send` — at
+    /// most one runner drains one send's queue.
+    crm_send_workers: Mutex<std::collections::HashSet<String>>,
+    /// CAD-786: pause between campaign submissions; default 1 s,
+    /// tests shorten it.
+    crm_send_interval: Duration,
+    /// CAD-786: the base the unsubscribe links mint — the board's
+    /// public origin; `None` refuses `crm_send_prepare`.
+    unsubscribe_origin: Option<String>,
+    /// `test-seam`: parks the send worker between recipient rows.
+    #[cfg(feature = "test-seam")]
+    crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
     /// CAD-506: the registered platform adapters the effect gate drives
     /// (`platform` name → adapter). A platform with none fails closed —
     /// no reviewed table means no classification, so no call.
@@ -634,6 +647,15 @@ impl Shared {
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Mutex::new(()),
+            crm_send_workers: Mutex::new(std::collections::HashSet::new()),
+            crm_send_interval: Duration::from_millis(if opts.crm_send_interval_ms == 0 {
+                1000
+            } else {
+                opts.crm_send_interval_ms
+            }),
+            unsubscribe_origin: opts.unsubscribe_origin.clone(),
+            #[cfg(feature = "test-seam")]
+            crm_send_row_gate: opts.crm_send_row_gate.clone(),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
@@ -672,6 +694,11 @@ impl Shared {
                        "last_state": r.last_state, "reason": r.reason}),
             );
         }
+        // CAD-786: a campaign send in flight when the last daemon
+        // stopped resumes — `submitting` rows go `uncertain` (maybe
+        // delivered; never resent) and a worker respawns for the
+        // still-`queued` rest.
+        shared.reconcile_crm_sends();
         Ok(shared)
     }
 
@@ -2938,6 +2965,16 @@ impl Shared {
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_show" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_test_send" => self.rpc_crm_smtp(method, params, peer_pid),
+            "crm_send_prepare" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_approve" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_show" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_list" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_resolve" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_origin_set" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_send_origin_show" => self.rpc_crm_send(method, params, peer_pid),
+            // CAD-786: the token is the credential — deliberately NOT
+            // operator-gated, and the answer reveals nothing.
+            "crm_unsubscribe_redeem" => self.rpc_crm_unsubscribe_redeem(params),
             "platform_enroll" => self.rpc_platform_enroll(params, peer_pid),
             "platform_rotate" => self.rpc_platform_rotate(params, peer_pid),
             "platform_revoke" => self.rpc_platform_revoke(params, peer_pid),
@@ -4083,6 +4120,20 @@ pub struct ServeOptions {
     /// callers present — and is refused for the production state dir
     /// or a dir outside the temp root.
     pub test_seam: bool,
+    /// CAD-786: pause between campaign-send submissions in
+    /// milliseconds; `0` is the production default (1 s). Tests pin
+    /// a small value so waits stay short.
+    pub crm_send_interval_ms: u64,
+    /// CAD-786: the public origin unsubscribe links mint
+    /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
+    /// loopback `http://` for rigs; `None` refuses
+    /// `crm_send_prepare`. Never sourced from RPC, PM or env —
+    /// daemon configuration sets it.
+    pub unsubscribe_origin: Option<String>,
+    /// `test-seam`: budget gate parked on between campaign-send rows.
+    /// `None` in production — the field does not exist there.
+    #[cfg(feature = "test-seam")]
+    pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
 /// Run the daemon in the foreground until `shutdown` or a signal.

@@ -46,6 +46,7 @@ mod app_release;
 mod app_runs;
 mod apps;
 mod connections;
+mod crm_send;
 mod crm_smtp;
 pub mod delivery_sync;
 mod home;
@@ -2332,6 +2333,22 @@ fn write_route(
         );
         return;
     }
+    // CAD-786: the recipient's one-click unsubscribe — the token in
+    // the path is the credential, so the write bypasses the board's
+    // session gate entirely (classified `RecipientToken` in
+    // `operator::WRITE_ROUTES`). Only the exact 43-char minted shape
+    // reaches the daemon; anything else is a plain 404.
+    if path.starts_with("/unsubscribe/") {
+        match (crm_send::unsubscribe_token(path), *method == Method::Post) {
+            (Some(token), true) => {
+                let response = crm_send::unsubscribe_redeem(&token, state_dir);
+                send(request, response);
+            }
+            (Some(_), false) => send(request, err_response(405, "method not allowed")),
+            (None, _) => send(request, err_response(404, "not found")),
+        }
+        return;
+    }
     // CAD-313: every other write is admitted HERE by its class in
     // `operator::WRITE_ROUTES` (unlisted: operator-only) before any
     // handler runs; the handlers below check no caller themselves.
@@ -2586,6 +2603,20 @@ fn write_route(
             return;
         }
         let response = crm_smtp::handle(&mut request, state_dir, route);
+        send(request, response);
+        return;
+    }
+    // CAD-786: the send verbs — operator-proof POST-only writes,
+    // exactly like the daemon RPCs they relay.
+    if let Some(route) = crm_send::route(path) {
+        // Origin is both: POST writes it, GET reads it (read
+        // dispatch below takes the GET).
+        let write = !route.is_read() || route.is_origin();
+        if *method != Method::Post || !write {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = crm_send::handle_write(&mut request, state_dir, route);
         send(request, response);
         return;
     }
@@ -3419,6 +3450,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
 
+    // CAD-786: the recipient's unsubscribe confirmation page — the
+    // token in the path is the credential, so the page is answered
+    // before every session gate, on any host this board serves. The
+    // matching POST is handled as a `RecipientToken` write.
+    if matches!(method, Method::Get) && path.starts_with("/unsubscribe/") {
+        let response = match crm_send::unsubscribe_token(&path) {
+            Some(token) => crm_send::unsubscribe_page(&token),
+            None => err_response(404, "not found"),
+        };
+        send(request, response);
+        return;
+    }
+
     // CAD-526: a request that names this board's public host is on the
     // platform sign-in surface. `/__platform/*` is the contract's
     // reserved prefix; every other request needs the
@@ -3957,6 +4001,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
                 let response = connections::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
+            }
+            if let Some(route) = crm_send::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = crm_send::handle_read(state_dir, route, &query);
                 send(request, response);
                 return;
             }

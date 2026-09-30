@@ -619,7 +619,7 @@ fn positive_assertions(receipt: &Value, seen: &Submission) {
     assert!(receipt["multipart"]["text_bytes"].as_u64().unwrap() > 20);
     assert_eq!(
         receipt["unsubscribe_authority"],
-        "preview (CAD-786 pending)"
+        "test send (no unsubscribe token)"
     );
     assert!(receipt.to_string().contains("smtp-acceptance-only"));
     // Nothing secret rode along in cleartext metadata.

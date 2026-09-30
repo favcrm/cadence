@@ -71,6 +71,8 @@ pub mod app_contexts;
 pub mod app_effects;
 pub mod app_records;
 pub mod app_runs;
+pub mod app_sends;
+pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;
 pub mod social_publish;

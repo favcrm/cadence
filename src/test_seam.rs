@@ -653,3 +653,46 @@ mod imp {
         ))
     }
 }
+
+#[cfg(feature = "test-seam")]
+mod send_gate {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// CAD-786: parks the campaign-send worker between recipient rows
+    /// so a test can mutate suppression/consent/binding state while
+    /// the worker is provably stopped — no wall-clock race. `allow(n)`
+    /// admits `n` more row iterations; a worker blocks once the budget
+    /// is spent. Never present in production builds: the module, the
+    /// ServeOptions field and the worker check are all cfg-gated.
+    pub struct SendRowGate {
+        budget: Mutex<usize>,
+        wake: Condvar,
+    }
+
+    impl SendRowGate {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                budget: Mutex::new(0),
+                wake: Condvar::new(),
+            })
+        }
+
+        /// Admit `n` more row iterations, waking a parked worker.
+        pub fn allow(&self, n: usize) {
+            *self.budget.lock().unwrap() += n;
+            self.wake.notify_all();
+        }
+
+        /// Worker side: block until the budget admits one more row.
+        pub(crate) fn take(&self) {
+            let mut budget = self.budget.lock().unwrap();
+            while *budget == 0 {
+                budget = self.wake.wait(budget).unwrap();
+            }
+            *budget -= 1;
+        }
+    }
+}
+
+#[cfg(feature = "test-seam")]
+pub use send_gate::SendRowGate;

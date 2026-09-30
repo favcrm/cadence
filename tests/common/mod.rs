@@ -1097,6 +1097,14 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-785: no isolated-test SMTP CA unless the test pins
         // one — production verifies against the platform roots.
         smtp_test_ca_pem: None,
+        // CAD-786: no unsubscribe origin unless the test pins one —
+        // a send without it refuses at prepare.
+        unsubscribe_origin: None,
+        // CAD-786: production pacing unless the test pins a small
+        // value.
+        crm_send_interval_ms: 0,
+        #[cfg(feature = "test-seam")]
+        crm_send_row_gate: None,
     }
 }
 
