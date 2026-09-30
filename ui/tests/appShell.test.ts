@@ -141,6 +141,9 @@ const { createRoot } = require("react-dom/client") as typeof import("react-dom/c
 const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell"));
 const AppShell = AppShellModule.default;
 const entryApp = AppShellModule.entryApp;
+// Context moves ride real URL writes — the same `navigate` the shell
+// uses, so tests exercise adoption exactly like a pasted link.
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 // Only a daemon-stamped binding renders: browser claims never do.
 // The stamp trims to ids — revision/digest stay server-side.
 equal(
@@ -238,7 +241,7 @@ await React.act(async () => {
   root.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
 });
 await flush(); await flush(); await flush();
-assert(text().includes("Apps") && text().includes("Reports"), "nested Apps → installed App breadcrumb");
+assert(text().includes("All apps") && text().includes("Reports"), "← All apps back-link plus installed App title, deduped");
 assert(text().includes("No records yet"), "generic outlet is truthfully empty, never fake rows");
 assert(text().includes("not installed yet") && !text().includes("CAD-781"), "non-CRM outlet copy stays neutral");
 assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
@@ -403,7 +406,7 @@ await React.act(async () => {
   root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
 });
 await settle(() => assert(
-  host.textContent?.includes("Only")
+  host.textContent?.includes("Only"),
   "second install adopts its sole active context",
 ));
 posts.length = 0;
