@@ -377,6 +377,9 @@ tests = [
     "device_pin_survives_a_second_ui_run_while_a_board_is_live",
     "device_pin_without_a_live_board_mints_nothing",
     "a_pin_for_a_dead_board_mints_nothing",
+    "a_verify_in_flight_mints_nothing_when_the_board_dies",
+    "a_verify_in_flight_mints_nothing_when_the_pin_rotates",
+    "a_poll_in_flight_mints_nothing_when_the_pin_rotates",
     "device_start_child_pins_the_saved_subjects_not_env",
 ]
 helpers = [

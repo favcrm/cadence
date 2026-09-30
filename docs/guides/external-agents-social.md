@@ -122,7 +122,9 @@ verified workspace member is refused `device_subject_not_allowed`. Find
 your subject id with `cadence auth status` (`principal.subject_id`);
 a refused sign-in also names the subject it saw. Changing the
 configuration while the board runs is refused. Stop the UI, then start
-it again.
+it again. If the board stops or its sign-in configuration changes while
+your grant is being verified, the sign-in is refused
+(`device_authority_changed`); start it again against the new board.
 
 On the board, open the header's **Sign in** menu and choose **Sign in
 with AgenticOS**. The board shows a user code and an approval link,

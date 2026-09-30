@@ -973,14 +973,46 @@ mod device {
         /// `/v1/runtime/session` hits — the issuer-side verify. A refused
         /// caller must never reach it.
         verifies: std::sync::atomic::AtomicUsize,
+        /// Optional hold on the `/v1/runtime/session` answer: while the
+        /// bool is false the response blocks, so a test can retire or
+        /// rotate board authority while the daemon's verify is in
+        /// flight (CAD-851).
+        verify_gate: Option<std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     }
 
+    type VerifyGate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
     fn device_stub(mode: &str) -> (String, std::sync::Arc<DeviceStub>) {
+        device_stub_with_gate(mode, None)
+    }
+
+    /// A stub whose `/v1/runtime/session` answer blocks until the
+    /// returned gate opens — set the bool and `notify_all` to release
+    /// it (CAD-851 in-flight-authority tests).
+    fn device_stub_gated(mode: &str) -> (String, std::sync::Arc<DeviceStub>, VerifyGate) {
+        let gate: VerifyGate =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (issuer, stub) = device_stub_with_gate(mode, Some(gate.clone()));
+        (issuer, stub, gate)
+    }
+
+    /// Open a verify gate: every `/v1/runtime/session` answer currently
+    /// held, and any arriving after, proceeds.
+    fn open_verify_gate(gate: &VerifyGate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    fn device_stub_with_gate(
+        mode: &str,
+        verify_gate: Option<VerifyGate>,
+    ) -> (String, std::sync::Arc<DeviceStub>) {
         let port = free_port();
         let stub = std::sync::Arc::new(DeviceStub {
             mode: std::sync::Mutex::new(mode.to_string()),
             polls: std::sync::atomic::AtomicUsize::new(0),
             verifies: std::sync::atomic::AtomicUsize::new(0),
+            verify_gate,
         });
         let serve = stub.clone();
         thread::spawn(move || {
@@ -1058,6 +1090,12 @@ mod device {
                         serve
                             .verifies
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(gate) = &serve.verify_gate {
+                            let mut open = gate.0.lock().unwrap();
+                            while !*open {
+                                open = gate.1.wait(open).unwrap();
+                            }
+                        }
                         if bearer == "Bearer agc_t" {
                             (
                                 200,
@@ -2351,6 +2389,185 @@ mod device {
             stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the issuer was contacted for a dead pin"
+        );
+    }
+
+    /// Spin until `f` holds or `deadline` passes — the in-flight-verify
+    /// tests below race a spawned call against a stub held answer, and
+    /// must not hang the suite when the call takes a wrong path.
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting: {what}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Whether the persisted pin is live authority right now — false
+    /// when the pin is gone or its board no longer holds the lock. The
+    /// same pair the daemon consults at mint time.
+    fn pin_is_live_now(state: &Path) -> bool {
+        cadence_agent::device_login::read_pin(state)
+            .ok()
+            .is_some_and(|p| cadence_agent::device_login::pin_is_live(state, &p).is_ok())
+    }
+
+    /// CAD-851: the issuer verify can park for seconds, and authority
+    /// can die inside that window. The stub holds its
+    /// `/v1/runtime/session` answer, the board stops (its pin lock
+    /// releases), the answer then arrives — the daemon must re-prove
+    /// the pin rather than mint off the snapshot it read before the
+    /// issuer call. Without the post-verify check this mints a session
+    /// under a dead board's retired authority.
+    #[test]
+    fn a_verify_in_flight_mints_nothing_when_the_board_dies() {
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, stub, gate) = device_stub_gated("approve");
+        let (_port, board) = start_device_board(pm.path(), state.path(), issuer);
+
+        // The daemon call parks inside the stub's session answer.
+        let state_dir = state.path().to_path_buf();
+        let call = thread::spawn(move || {
+            cadence_agent::client::rpc(
+                &state_dir,
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+        });
+        wait_for("the verify never reached the issuer", || {
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+
+        drop(board);
+        wait_for("the stopped board's pin never went dead", || {
+            !pin_is_live_now(state.path())
+        });
+        open_verify_gate(&gate);
+
+        let err = call.join().unwrap().unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("capability_unavailable"),
+            "a retired pin minted or misreported: {err}"
+        );
+        assert_eq!(
+            device_session_count(state.path()),
+            0,
+            "a session minted under retired authority"
+        );
+    }
+
+    /// The same window on the config axis: the board stays live, but
+    /// the pin under it changed — an operator rotated the allowlist.
+    /// The in-flight verify answered for the retired pin; minting off
+    /// it would sign in a subject the operator just removed.
+    #[test]
+    fn a_verify_in_flight_mints_nothing_when_the_pin_rotates() {
+        use cadence_agent::device_login::write_pin;
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, stub, gate) = device_stub_gated("approve");
+        let (_port, _board) = start_device_board(pm.path(), state.path(), issuer);
+
+        let state_dir = state.path().to_path_buf();
+        let call = thread::spawn(move || {
+            cadence_agent::client::rpc(
+                &state_dir,
+                "operator_session_open_device",
+                json!({"token": "agc_t", "origin": "loopback"}),
+            )
+        });
+        wait_for("the verify never reached the issuer", || {
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+
+        // Same writer, same pid, live lock — only the allowlist moved.
+        let mut pin = cadence_agent::device_login::read_pin(state.path()).unwrap();
+        pin.subjects = vec!["op_rotated_in".to_string()];
+        write_pin(state.path(), &pin).unwrap();
+        open_verify_gate(&gate);
+
+        let err = call.join().unwrap().unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("device_authority_changed"),
+            "a rotated pin minted or misreported: {err}"
+        );
+        assert_eq!(
+            device_session_count(state.path()),
+            0,
+            "a session minted under retired authority"
+        );
+    }
+
+    /// The same proof through the HTTP relay: a poll parked at the
+    /// issuer while the pin rotated must answer a refusal — the relay
+    /// is no weaker than the daemon RPC it wraps.
+    #[test]
+    fn a_poll_in_flight_mints_nothing_when_the_pin_rotates() {
+        use cadence_agent::device_login::write_pin;
+        let pm = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        seed(pm.path(), state.path());
+        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, stub, gate) = device_stub_gated("approve");
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let host = op::board_host(port);
+
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "{body}");
+        let pending = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (code, _, body) = device_post(
+            port,
+            &host,
+            "/api/session/device/poll",
+            &format!(r#"{{"pending_id":"{pending}"}}"#),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(status_of(&body), "pending", "{body}");
+
+        // This poll consumes the grant and parks inside the held verify.
+        let poll = thread::spawn(move || {
+            device_post(
+                port,
+                &host,
+                "/api/session/device/poll",
+                &format!(r#"{{"pending_id":"{pending}"}}"#),
+            )
+        });
+        wait_for("the verify never reached the issuer", || {
+            stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+        let mut pin = cadence_agent::device_login::read_pin(state.path()).unwrap();
+        pin.subjects = vec!["op_rotated_in".to_string()];
+        write_pin(state.path(), &pin).unwrap();
+        open_verify_gate(&gate);
+
+        let (code, head, body) = poll.join().unwrap();
+        assert_eq!(code, 403, "the rotated sign-in was not refused: {body}");
+        assert!(
+            body.contains("device_authority_changed"),
+            "the refusal did not name its cause: {body}"
+        );
+        assert!(
+            op::set_cookie(&head).is_none(),
+            "a session cookie was issued under a rotated pin: {head}"
+        );
+        assert_eq!(
+            device_session_count(state.path()),
+            0,
+            "a session minted under retired authority"
         );
     }
 
