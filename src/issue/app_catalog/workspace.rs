@@ -205,8 +205,8 @@ fn member_path_ok(name: &str) -> bool {
         return true;
     }
     match (parts.len(), normal(0)) {
-        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates" | "views") => normal(1)
-            .is_some_and(|leaf| {
+        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates" | "views") => {
+            normal(1).is_some_and(|leaf| {
                 !leaf.starts_with('.')
                     && match top {
                         // workflows are tag-named Markdown.
@@ -217,7 +217,8 @@ fn member_path_ok(name: &str) -> bool {
                         "views" => leaf == crate::issue::app_view::FILE,
                         _ => true,
                     }
-            }),
+            })
+        }
         // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
         (3, Some("screens")) => {
             normal(1).is_some_and(model::valid_tag)
