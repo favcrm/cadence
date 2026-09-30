@@ -220,13 +220,27 @@ impl Shared {
         // CAD-851: the verify above can block for the whole transport
         // timeout, and authority can retire inside that window — the
         // board stops (flock released) or a new board pins different
-        // issuer/org/subjects. Re-read the pin and re-prove liveness
-        // before minting, or a call in flight completes under a retired
-        // trust snapshot and its session outlives the board that owned
-        // it. An unchanged pin means the allowlist check below still
-        // applies the operator's current list.
-        let pin_now = crate::device_login::read_pin(&self.state_dir)?;
-        crate::device_login::pin_is_live(&self.state_dir, &pin_now)?;
+        // issuer/org/subjects. The re-check runs under the session mutex
+        // immediately before the mint it protects, so no further wait can
+        // intervene between re-validation and `open_device`; an unchanged
+        // pin means the allowlist check below still applies the
+        // operator's current list. (Residual: pid reuse or a foreign lock
+        // holder can spoof `pin_is_live` — deferred to CAD-842, and
+        // CAD-841 removes the pin file entirely.)
+        let mut auth = self.operator_auth();
+        let pin_now = match crate::device_login::read_pin(&self.state_dir)
+            .and_then(|p| crate::device_login::pin_is_live(&self.state_dir, &p).map(|()| p))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "operator_device_session_refused",
+                    json!({"reason": "authority_lost", "origin": origin.as_str()}),
+                );
+                return Err(e);
+            }
+        };
         if pin_now != pin {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
@@ -269,9 +283,7 @@ impl Shared {
             handle: verified.subject_id,
         };
         let now = self.operator_now();
-        let opened = self
-            .operator_auth()
-            .open_device(user, origin, user_agent, now)?;
+        let opened = auth.open_device(user, origin, user_agent, now)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_session_opened",
