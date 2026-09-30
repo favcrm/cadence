@@ -298,7 +298,8 @@ def fetch_staging_state(repo, limit_runs, limit_receipts, current_run_id):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "receipt.zip"
             archive.write_bytes(raw)
-            result = subprocess.run(["unzip", "-p", str(archive)], capture_output=True, timeout=60)
+            result = subprocess.run(["unzip", "-p", str(archive), "staging-receipt.json"],
+                                    capture_output=True, timeout=60)
             if result.returncode != 0:
                 continue
             try:
