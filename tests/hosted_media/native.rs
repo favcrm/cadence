@@ -90,6 +90,14 @@ impl PlatformAdapter for SyntheticMedia {
             "media.generate"
         );
         assert_eq!(authority["slot"], "image");
+        assert!(
+            authority["source"].is_null(),
+            "manual facts need no selected source receipt"
+        );
+        assert_eq!(
+            authority["inputs"]["image_prompt"],
+            "Create one editorial image grounded only in the source facts."
+        );
         assert_eq!(
             authority["inputs"]["source"],
             "JuicySuite CRM helps teams track customers"
@@ -150,7 +158,11 @@ fn cad868_native_assigned_image_quote_execute_and_replay_use_empty_builtin_custo
         )
         .unwrap();
     assert_eq!(quote["quote"]["total_price_micros"], 31_500);
-    let run = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-instagram","inputs":{"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear","writer":WRITER,"reviewer":REVIEWER},"request_id":"native-hosted-run","owner_pm":OWNER})).unwrap();
+    // The installed image-manual workflow declares only the image capability
+    // and takes pasted facts. image-instagram correctly requires a selected
+    // source receipt and is not a hosted-media-only fixture.
+    let run = h.daemon.operator_rpc("app_run_create", json!({"install_id":h.install["install_id"],"workflow":"image-manual","inputs":{"subject":"Customer follow-up","source":"JuicySuite CRM helps teams track customers","brand_voice":"Warm and clear","content_prompt":"Write a concise zh-HK caption grounded only in the source facts.","image_prompt":"Create one editorial image grounded only in the source facts.","writer":WRITER,"reviewer":REVIEWER},"request_id":"native-hosted-run","owner_pm":OWNER})).unwrap();
+    assert_eq!(run["snapshot"]["quotes"]["image"], quote["quote"]);
     std::fs::write(
         h.daemon.state.join(format!(
             "social-image-probe-{}.json",
@@ -160,13 +172,39 @@ fn cad868_native_assigned_image_quote_execute_and_replay_use_empty_builtin_custo
     )
     .unwrap();
     h.dispatch(&run);
-    h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    let completed = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
     let results = h
         .daemon
         .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
         .unwrap();
     assert_eq!(results["results"].as_array().unwrap().len(), 1);
-    assert_eq!(results["results"][0]["asset"]["media_type"], "image/png");
+    let receipt = &results["results"][0];
+    assert_eq!(receipt["asset"]["media_type"], "image/png");
+    assert_eq!(completed["reviews"][0]["asset_receipt_id"], receipt["id"]);
+    assert_eq!(
+        completed["reviews"][0]["asset_digest"],
+        receipt["asset"]["digest"]
+    );
+    assert!(
+        h.items().as_array().unwrap().is_empty(),
+        "review cannot release outward material"
+    );
+    let staged = h.stage(&completed, "native-hosted-local-draft");
+    assert_eq!(staged["state"], "waiting");
+    assert_eq!(staged["authority"]["asset"]["receipt_id"], receipt["id"]);
+    assert_eq!(
+        staged["authority"]["asset"]["digest"],
+        receipt["asset"]["digest"]
+    );
+    assert_eq!(
+        h.stage(&completed, "native-hosted-local-draft"),
+        staged,
+        "exact stage replay must keep the same receipt"
+    );
+    assert!(
+        h.items().as_array().unwrap().is_empty(),
+        "staging is not release"
+    );
     assert_eq!(
         observed_calls.load(Ordering::SeqCst),
         1,

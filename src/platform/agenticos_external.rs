@@ -1931,7 +1931,19 @@ mod tests {
                 let mut proof = if hosted {
                     hosted_image_proof()
                 } else {
-                    image_proof(media_quote())
+                    let mut proof = image_proof(media_quote());
+                    proof["binding"]["config"]["account"] =
+                        json!("ws_11111111-1111-4111-8111-111111111111");
+                    proof["binding"]["config"]["connection_kind"] = json!("enrolled");
+                    // A canonical external account still needs a bearer on
+                    // both consumers; empty bytes must make zero requests.
+                    assert!(adapter
+                        .quote_app_capability(b"", &proof["binding"])
+                        .is_err());
+                    assert!(adapter
+                        .execute_app_capability(b"", &proof, &json!({}), "app-call-868")
+                        .is_err());
+                    proof
                 };
                 let quote = adapter
                     .quote_app_capability(credential, &proof["binding"])

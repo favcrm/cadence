@@ -172,8 +172,8 @@ fn cad868_adapter_disappearance_or_mode_switch_stales_existing_binding() {
 }
 
 #[test]
-fn cad868_enrolled_external_account_named_hosted_never_upgrades_to_builtin() {
-    let (_dir, mut shared, bundle, files, proof) = fixture();
+fn cad868_legacy_external_account_named_hosted_never_upgrades_to_builtin() {
+    let (dir, mut shared, bundle, files, proof) = fixture();
     let token = b"synthetic-cad868-external-token";
     let custody = shared
         .platform_custody
@@ -185,25 +185,42 @@ fn cad868_enrolled_external_account_named_hosted_never_upgrades_to_builtin() {
             token,
         )
         .unwrap();
-    shared
+    let record = crate::store::CredentialRecord {
+        connection_id: "enrolled868".into(),
+        credential_revision: 1,
+        platform: "agenticos_external".into(),
+        account: "hosted".into(),
+        scopes: vec!["provider.draft".into()],
+        fingerprint: crate::secret::fingerprint(token),
+        custody: custody.into(),
+        exchange: "token".into(),
+        enrolled_at: 1.0,
+        by: "operator".into(),
+    };
+    // Current enrollment rightly rejects noncanonical workspace accounts.
+    let error = shared
         .store
-        .platform_enroll(
-            &crate::store::CredentialRecord {
-                connection_id: "enrolled868".into(),
-                credential_revision: 1,
-                platform: "agenticos_external".into(),
-                account: "hosted".into(),
-                scopes: vec!["provider.draft".into()],
-                fingerprint: crate::secret::fingerprint(token),
-                custody: custody.into(),
-                exchange: "token".into(),
-                enrolled_at: 1.0,
-                by: "operator".into(),
-            },
-            false,
-            None,
-        )
-        .unwrap();
+        .platform_enroll(&record, false, None)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("canonical workspace ID"),
+        "{error}"
+    );
+    assert!(shared
+        .store
+        .platform_credential("agenticos_external", "hosted")
+        .unwrap()
+        .is_none());
+    // Defensive legacy/corrupt-row case only: credential_row/load_credential
+    // read historical records without re-running current enrollment parsing.
+    // Seed just this synthetic temp database using the current explicit schema;
+    // neither the store validator nor any custody/runtime guard is weakened.
+    let db = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+    db.execute(
+        "INSERT INTO platform_credentials (platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        rusqlite::params![record.platform, record.account, serde_json::to_string(&record.scopes).unwrap(), record.fingerprint, record.custody, record.exchange, record.enrolled_at, record.by, record.connection_id, record.credential_revision],
+    ).unwrap();
+    drop(db);
     let mut enrolled = proof.clone();
     enrolled.config["connection_kind"] = json!("enrolled");
     enrolled.config["connection_id"] = json!("enrolled868");
@@ -244,4 +261,82 @@ fn cad868_enrolled_external_account_named_hosted_never_upgrades_to_builtin() {
     assert!(shared
         .app_binding_receipt_current("install868", None, "image", &proof, &bundle, &files)
         .is_err());
+}
+
+#[test]
+fn cad868_canonical_external_account_requires_enrolled_nonempty_custody() {
+    const ACCOUNT: &str = "ws_11111111-1111-4111-8111-111111111111";
+    let (_dir, mut shared, bundle, files, mut host_proof) = fixture();
+    let token = b"synthetic-cad868-canonical-token";
+    let key = Key {
+        platform: "agenticos_external",
+        account: ACCOUNT,
+    };
+    let custody = shared.platform_custody.put(&key, token).unwrap();
+    shared
+        .store
+        .platform_enroll(
+            &crate::store::CredentialRecord {
+                connection_id: "canonical868".into(),
+                credential_revision: 1,
+                platform: "agenticos_external".into(),
+                account: ACCOUNT.into(),
+                scopes: vec!["provider.draft".into()],
+                fingerprint: crate::secret::fingerprint(token),
+                custody: custody.into(),
+                exchange: "token".into(),
+                enrolled_at: 1.0,
+                by: "operator".into(),
+            },
+            false,
+            None,
+        )
+        .unwrap();
+    host_proof.config["account"] = json!(ACCOUNT);
+    host_proof.config["connection_kind"] = json!("enrolled");
+    host_proof.config["connection_id"] = json!("canonical868");
+    host_proof.config["connection_revision"] = json!(1);
+    assert!(
+        shared.app_capability_quote(&host_proof).is_err(),
+        "canonical bearer account cannot use hosted transport"
+    );
+    Arc::get_mut(&mut shared).unwrap().platforms.insert(
+        "agenticos_external".into(),
+        Arc::new(
+            agenticos_external::AgenticosExternalAdapter::with_deployment_pin(
+                "https://external.example.test",
+                Some(agenticos_external::MANIFEST_PIN),
+            )
+            .unwrap(),
+        ),
+    );
+    let config = shared
+        .app_binding_config("install868", None, "image", "canonical868", &bundle, &files)
+        .unwrap();
+    assert_eq!(config["account"], ACCOUNT);
+    assert_eq!(config["connection_kind"], "enrolled");
+    assert_eq!(shared.app_capability_credential(&config).unwrap(), token);
+    assert_eq!(
+        crate::platform::load_credential(
+            &shared.store,
+            &shared.platform_custody,
+            "agenticos_external",
+            ACCOUNT
+        )
+        .unwrap(),
+        token
+    );
+    // Missing custody cannot fall back to lease/empty bytes in external mode.
+    shared.platform_custody.remove(custody, &key).unwrap();
+    assert!(shared.app_capability_credential(&config).is_err());
+    let missing = BindingProof {
+        id: "canonical-proof".into(),
+        revision: 1,
+        digest: "synthetic".into(),
+        config,
+    };
+    assert!(
+        shared.app_capability_quote(&missing).is_err(),
+        "missing external custody must refuse before price traffic"
+    );
 }
