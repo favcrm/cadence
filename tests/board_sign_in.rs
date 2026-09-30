@@ -1957,7 +1957,9 @@ mod device {
             "forged field passed: {err}"
         );
         // `as` and `sub` are identity-shaped too — refused the same way
-        // even though no gated verb would ever read them (r1).
+        // even though no gated verb would ever read them (r1). The
+        // rejection precedes the secret check on `set`, `clear` and
+        // `show` alike — the field dies before the secret is compared.
         for forged in ["as", "sub"] {
             let err = d
                 .operator_rpc(
@@ -1975,8 +1977,18 @@ mod device {
                 .to_string();
             assert!(
                 err.contains("connection-bound") && err.contains(&format!("'{forged}'")),
-                "forged field '{forged}' passed: {err}"
+                "forged field '{forged}' passed on set: {err}"
             );
+            for verb in ["operator_device_login_clear", "operator_device_login_show"] {
+                let err = d
+                    .operator_rpc(verb, json!({forged: "operator"}))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("connection-bound"),
+                    "forged '{forged}' passed on {verb}: {err}"
+                );
+            }
         }
         assert_eq!(
             std::fs::read(&config).unwrap(),

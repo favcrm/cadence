@@ -725,24 +725,17 @@ fn resolve_device_login(flags: &UiFlags) -> Result<Option<DeviceLoginOpts>> {
     }
 }
 
-/// Push a resolved `--device-login-*` triple to the daemon-owned
-/// store — `ui run`/`ui start`'s thin-client half of
-/// `cadence ui device-login set` (CAD-841). This runs in the
-/// foreground process, before any bind or spawn: the call carries
-/// the operator secret, so it only succeeds for a provably-operator
-/// caller against a live daemon. A detached `ui run` child sees no
-/// device flags and a scrubbed env, so it never re-pushes. Absent
-/// flags resolve to `None` and daemon state stays exactly as it is —
-/// it no longer takes a board start to clear it.
-fn push_device_login(state_dir: &Path, flags: &UiFlags) -> Result<()> {
-    let Some(triple) = resolve_device_login(flags)? else {
-        return Ok(());
-    };
-    push_device_login_config(state_dir, &triple)
-}
-
-/// The RPC half of [`push_device_login`]: `operator_device_login_set`
-/// with the already-resolved triple.
+/// Push an already-resolved `--device-login-*` triple to the daemon —
+/// `operator_device_login_set` carrying the operator secret, so it
+/// only succeeds for a provably-operator caller against a live daemon
+/// (`ui run`/`ui start`'s thin-client half of `cadence ui device-login
+/// set`, CAD-841). Callers choose WHEN: `ui run` resolves eagerly but
+/// pushes inside `serve` once the port is bound; `ui start` resolves
+/// before spawn and pushes from this process after the child proves
+/// it serves — a detached child sees no device flags and a scrubbed
+/// env, so it never re-pushes. Absent flags resolve to `None` and
+/// daemon state stays untouched — it no longer takes a board start to
+/// change it.
 fn push_device_login_config(state_dir: &Path, triple: &DeviceLoginOpts) -> Result<()> {
     let secret = crate::operator_auth::read_secret(state_dir)?;
     crate::client::rpc(
@@ -4777,6 +4770,11 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
         recorded.clone()
     };
     let (eff, so) = resolve_opts(flags, &persisted)?;
+    // CAD-841 r2: resolve the device-login triple up front — a partial
+    // or invalid triple fails before any side effect (a saved ui.json,
+    // a spawned child). The push it feeds stays late: post-spawn on
+    // the fresh path, live on the running path.
+    let device_login_push = resolve_device_login(flags)?;
     let running = read_pid(state_dir);
     if running.is_some() {
         if eff.board_public_only != recorded.board_public_only {
@@ -4842,7 +4840,9 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
         // carries the operator secret; a detached child could never
         // prove itself). The board is already up: routes read the
         // daemon's store per request, so this is a live reconfigure.
-        push_device_login(state_dir, flags)?;
+        if let Some(triple) = &device_login_push {
+            push_device_login_config(state_dir, triple)?;
+        }
         let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
             .unwrap_or((0, String::new()));
         if !quiet {
@@ -4942,8 +4942,18 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                 // serves does a `--device-login-*` triple reach the
                 // daemon — a failed spawn changes no live config
                 // (review r1). The child can never push: it is
-                // detached, so this process does it.
-                push_device_login(state_dir, flags)?;
+                // detached, so this process does it. And if the push
+                // itself fails, the just-spawned board goes down with
+                // its start — `ui start` never leaves a live board the
+                // requested config was refused for (r2).
+                if let Some(triple) = &device_login_push {
+                    if let Err(e) = push_device_login_config(state_dir, triple) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = std::fs::remove_file(pid_file(state_dir));
+                        return Err(e);
+                    }
+                }
                 if !quiet {
                     println!(
                         "{}",
