@@ -388,7 +388,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     csvPosts.push({ path: url.pathname, body });
     return new Response(JSON.stringify({
       preview_token: "sha256:" + "a".repeat(64),
-      row_count: 3,
+      row_count: 4,
       summary: { create: 1, update: 0, skip: 1, needs_revision: 1, error: 1 },
       rows: [
         { row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye", email: "chidi@example.com", tags: ["newcomer"], consent: { email: "granted" } }, errors: [], reason: null },
@@ -453,6 +453,43 @@ assert(!host.querySelector('[data-plan-row="4"] select, [data-plan-row="4"] inpu
 // and refused rows are never counted as approved.
 const applyButton = () => Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import "));
 assert(applyButton()?.textContent === "Import 2 approved rows", "the button counts only apply-chosen rows");
+
+// The count tracks the operator's choices live: flipping a row to Skip
+// lowers it, and skipping every writable row disables commit with its
+// reason — an all-skip import is never offered as a write.
+const choiceFor = async (row: number, value: "apply" | "skip") => {
+  const select = host.querySelector(`#csv-choice-${row}`);
+  assert(select, `row ${row} has a choice control`);
+  await React.act(async () => {
+    // The custom Select trigger opens a portaled listbox; click it,
+    // then pick the option by its value. The apply option's label
+    // varies per row ("Create"/"Update with revision"/"Update"), so
+    // match on the option's own value text inside its listbox instead.
+    (select as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  const listbox = document.querySelector(`#csv-choice-${row}-listbox`);
+  assert(listbox, `row ${row} listbox opened`);
+  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
+  const option = options.find((el) =>
+    value === "skip"
+      ? (el.textContent ?? "").trim() === "Skip"
+      : (el.textContent ?? "").trim() !== "Skip",
+  );
+  assert(option, `row ${row} has a ${value} option`);
+  await React.act(async () => { option!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flush();
+};
+await choiceFor(2, "skip");
+assert(applyButton()?.textContent === "Import 1 approved row", "skipping row 2 drops the count to 1");
+await choiceFor(1, "skip");
+assert(applyButton()?.textContent === "Import 0 approved rows", "skipping row 1 drops the count to 0");
+assert((applyButton() as HTMLButtonElement).disabled, "zero approved rows disables the commit");
+assert((applyButton() as HTMLButtonElement).title.includes("No row is set to write"), "the disabled reason is truthful");
+await choiceFor(1, "apply");
+assert(applyButton()?.textContent === "Import 1 approved row", "re-applying row 1 restores the count");
+await choiceFor(2, "apply");
+assert(applyButton()?.textContent === "Import 2 approved rows", "re-applying row 2 restores both");
 
 // A needs_revision row demands the operator type the observed revision
 // — the field starts empty with the live revision as a hint, never a
@@ -617,6 +654,11 @@ const backLink = () => Array.from(host.querySelectorAll("button.lnk")).find((el)
 assert(backLink() && !backLink()!.disabled, "back is live before the import");
 await click(Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import ")));
 await settle(() => assert(backLink()!.disabled === true, "back is disabled while the import is in flight"));
+// A mid-flight Back click is a no-op — the page stays mounted.
+await click(backLink()!);
+await flush();
+assert(host.querySelector("#csv-text") !== null || host.querySelector("[data-preview-summary]"), "the import page survives a mid-flight back click");
+assert(!host.querySelector('#crm-customer-search'), "the list is not mounted under an in-flight import");
 await React.act(async () => { releaseImport!(); });
 await settle(() => assert(host.querySelector("[data-import-receipt]"), "the deferred import lands its receipt"));
 assert(backLink() && backLink()!.disabled !== true, "back re-arms once the receipt holds");
