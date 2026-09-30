@@ -4707,13 +4707,14 @@ fn ts_stop(state_dir: &Path) -> Result<i32> {
         );
         return Ok(0);
     };
-    let removed = match remove_mapping(ts.https_port, &ts.target) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("warning: {e}");
-            false
-        }
-    };
+    // A failed removal keeps the record — clearing it here would
+    // orphan the live mapping (a later sandbox reset would then
+    // delete its only trace).
+    let removed = remove_mapping(ts.https_port, &ts.target).map_err(|e| {
+        Error::rejected(format!(
+            "{e} — the tailnet record is kept; fix the failure and retry"
+        ))
+    })?;
     opts.tailscale = None;
     save_opts(state_dir, &opts)?;
     let was_running = read_pid(state_dir).is_some();

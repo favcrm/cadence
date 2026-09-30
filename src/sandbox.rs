@@ -771,15 +771,16 @@ fn persisted_share(sb: &Sandbox) -> Result<bool> {
             )))
         }
     };
-    let opts: crate::ui::UiOpts = serde_json::from_slice(&bytes).map_err(|e| {
+    // Only the `tailscale` key is read — unrelated invalid settings
+    // must not block `up`/`reset`, the recovery path for exactly such
+    // a file.
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
         Error::rejected(format!(
-            "{} is not valid JSON — `cadence sandbox reset {}` starts \
-             the sandbox over: {e}",
-            path.display(),
-            sb.name
+            "{} is not valid JSON — fix or delete it by hand: {e}",
+            path.display()
         ))
     })?;
-    Ok(opts.tailscale.is_some())
+    Ok(value.get("tailscale").is_some_and(|v| !v.is_null()))
 }
 
 fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {

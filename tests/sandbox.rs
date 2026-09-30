@@ -1252,3 +1252,20 @@ fn sandbox_reset_removes_a_persisted_share() {
         ts_calls(&fake)
     );
 }
+
+/// An invalid, non-sharing `ui.json` must not block `reset` — the
+/// file is the thing being recovered.
+#[test]
+fn sandbox_reset_works_with_invalid_unrelated_ui_opts() {
+    let mut host = Host::new();
+    let v = host.up_free("sb", &[]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    std::fs::write(
+        state.join("ui.json"),
+        json!({ "port": "not-a-number" }).to_string(),
+    )
+    .unwrap();
+    let out = host.run(&["sandbox", "reset", "sb"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!host.base().join("sb").exists(), "root deleted");
+}
