@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:app-views:v1:descriptor",
+  "title": "App view descriptor (app-views/v1)",
+  "description": "A versioned, data-only declaration of the record views a workspace app package may describe for the trusted host shell: named views of kinds table/detail/form, declared fields with an allowlisted format vocabulary, and table columns that may only name declared fields. The descriptor is data, never code — keys that name executable surfaces (script/code/html/css/eval/import/module), URLs or navigation (url/href/src/link/action/endpoint), scope or actor identity (install_id/context_id/workspace/project/actor/by/role/scope/capability), credentials (secret/credential/token/password), storage internals (sql/query/path/file), or authority claims (effect/verified/digest/revision) are forbidden at every level and are enforced by the consumer's recursive scan; this schema additionally forbids them at each object's `propertyNames`. Identifier grammar is [a-z][a-z0-9_-]{0,63}. Consumers must also enforce the bounds documented here (max views/fields/columns, string lengths, unique view/field ids, enum/format coherence, and fixture rows keyed only by declared field ids) — JSON Schema alone cannot express duplicate ids or cross-references.",
+  "type": "object",
+  "required": ["contract", "app", "title", "views"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "app-views/v1",
+      "description": "The contract tag. A descriptor naming any other version is refused."
+    },
+    "app": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "The workspace-app kind this descriptor was reviewed with (e.g. crm, social-content). Provenance only — never an installation id, route, or authority claim."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Human title for the descriptor — plain text."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280,
+      "description": "Inert free-text summary."
+    },
+    "views": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/view" },
+      "description": "Named views; ids unique within the descriptor (consumer-checked)."
+    }
+  },
+  "$defs": {
+    "safeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__proto__", "prototype", "constructor",
+            "script", "scripts", "code", "html", "innerHTML", "css", "style",
+            "javascript", "eval", "import", "module",
+            "url", "uri", "href", "src", "link", "action", "endpoint",
+            "install_id", "installId", "context_id", "contextId",
+            "workspace", "workspace_id", "project", "project_id", "project_link",
+            "actor", "by", "role", "grant", "scope", "scopes",
+            "capability", "capabilities",
+            "secret", "secrets", "credential", "credentials", "token", "password",
+            "sql", "query", "path", "file",
+            "effect", "effects", "verified", "digest", "revision"
+          ]
+        }
+      }
+    },
+    "field": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "format": {
+          "enum": ["text", "number", "date", "datetime", "enum", "tags"],
+          "default": "text"
+        },
+        "kind": {
+          "enum": ["scalar", "list"],
+          "default": "scalar"
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "description": "Allowed values — required on format \"enum\", forbidden on every other format (consumer-checked)."
+        },
+        "createView": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "Names a declared form view in the same descriptor (consumer-checked)."
+        }
+      }
+    },
+    "column": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["field"],
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "Must equal a field id declared on the same view (consumer-checked)."
+        },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 }
+      }
+    },
+    "view": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "title", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "kind": { "enum": ["table", "detail", "form"] },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "$ref": "#/$defs/field" },
+          "description": "table/detail only: declared fields; ids unique (consumer-checked)."
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": { "$ref": "#/$defs/column" },
+          "description": "table only: which declared fields become columns (consumer-checked)."
+        },
+        "previewOf": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "$ref": "#/$defs/field" },
+          "description": "form only: the fields a disabled host-form preview shows; the descriptor declares no live mutation."
+        }
+      }
+    }
+  }
+}

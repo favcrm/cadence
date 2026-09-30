@@ -22,6 +22,8 @@ import { workspaceApps, type AppContext, type Installation } from "../workspace-
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import { assertRecordId, type HostScope } from "./hostActions";
+import { isDev } from "../../env";
+import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
 import "./app-shell.css";
 
 /**
@@ -93,6 +95,10 @@ export default function AppShell({
   const crmSection: CrmSection =
     rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   const [chatOpen, setChatOpen] = useState(false);
+  // CAD-861: the app-views/v1 contract preview is a dev-only overlay
+  // keyed by `contract-preview` in the URL — it never mounts in a
+  // production bundle and never replaces the trusted outlet by default.
+  const previewKey = isDev ? contractPreviewKey(query) : null;
   const chatPaneRef = useRef<HTMLDivElement | null>(null);
   const chatOpenRef = useRef<HTMLButtonElement | null>(null);
   // Installation switches reset outlet state but keep the chat: the
@@ -352,6 +358,19 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
+        {isDev && installation !== null && (
+          <a
+            href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
+            className="lnk text-label app-shell-preview-toggle"
+            data-contract-preview-toggle
+            onClick={(e) => {
+              e.preventDefault();
+              navigate(contractPreviewHref(href, previewKey === null ? "crm" : null));
+            }}
+          >
+            {previewKey === null ? "Contract preview (dev)" : "Exit contract preview"}
+          </a>
+        )}
         <button
           ref={chatOpenRef}
           type="button"
@@ -448,7 +467,12 @@ export default function AppShell({
                   {linkNotice}
                 </p>
               )}
-              {isSocial && children ? (
+              {previewKey !== null ? (
+                <AppViewContractPreview
+                  exampleKey={previewKey}
+                  installationKind={installation.name}
+                />
+              ) : isSocial && children ? (
                 children
               ) : (
                 <CrmOutlet
