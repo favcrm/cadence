@@ -34,9 +34,13 @@ BASE = Path.home() / ".local/share/cadence-staging"
 SCRIPT_DIR = Path(__file__).resolve().parent
 URL_LOOPBACK = f"http://cadence-{PORT}.localhost:{PORT}"
 URL_TAILNET = f"https://ip-172-31-1-32.tail9fcf30.ts.net:{TS_PORT}"
-# These must never reach a sandbox child — they would alias it to the
-# caller's identity, profile or tracker.
-SCRUB_ENV = ["CADENCE_ALIAS", "CADENCE_PROFILE", "CADENCE_PM_DIR"]
+# Sandbox children get nothing CADENCE_* the caller exported — an
+# allowlist, not a denylist. CADENCE_ALIAS/PROFILE/PM_DIR would alias
+# the child to the caller's identity or tracker, and client::rpc
+# honours CADENCE_SOCKET over CADENCE_STATE_DIR, so an inherited one
+# would route `sandbox down`/`issue agent` at the production daemon.
+# The two below are the only ones the deploy adds itself; sandbox env
+# lines (STATE_DIR/PM_DIR/PROFILE) arrive via `extra`.
 
 
 class Refused(Exception):
@@ -68,7 +72,7 @@ def log_line(base, message):
 
 
 def child_env(extra=None):
-    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CADENCE_")}
     env["CADENCE_SANDBOX_ROOT"] = str(BASE / "sandbox")
     env["CADENCE_SANDBOX_ALLOW_GLOBAL"] = "1"
     if extra:
@@ -111,12 +115,18 @@ def sandbox_down(run, cadence):
 
 
 def health_ok(http_get):
+    """The live build commit, or False. /api/health is 200 even with a
+    dead daemon ({"ok": false, "daemon": "unreachable"}), so the body —
+    not the status — decides."""
     try:
-        status, _ = http_get(
+        status, body = http_get(
             f"http://127.0.0.1:{PORT}/api/health",
             f"cadence-{PORT}.localhost:{PORT}",
         )
         if status != 200:
+            return False
+        health = json.loads(body)
+        if not health.get("ok") or health.get("daemon") != "reachable":
             return False
         status, body = http_get(
             f"http://127.0.0.1:{PORT}/api/meta",

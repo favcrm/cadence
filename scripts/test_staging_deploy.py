@@ -115,7 +115,7 @@ class FakeRunner:
 def http_ok(sha):
     def get(url, host):
         if url.endswith("/api/health"):
-            return 200, "{}"
+            return 200, json.dumps({"ok": True, "daemon": "reachable"})
         if url.endswith("/api/meta"):
             return 200, json.dumps({"build_commit": sha})
         raise AssertionError(url)
@@ -149,6 +149,7 @@ class TickTest(unittest.TestCase):
         os.environ["CADENCE_ALIAS"] = "worker-1"
         os.environ["CADENCE_PROFILE"] = "sandbox:other"
         os.environ["CADENCE_PM_DIR"] = "/some/where"
+        os.environ["CADENCE_SOCKET"] = "/prod/state/cadence.sock"
 
     def tearDown(self):
         os.environ.clear()
@@ -192,6 +193,33 @@ class TickTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(r.argvs("sandbox up"))
         self.assertFalse(r.argvs("delivery-candidate.py"))
+
+    def test_dead_daemon_is_not_a_noop(self):
+        # /api/health stays 200 with the daemon gone — the tick must
+        # redeploy, not sit on the healthy path forever.
+        (self.base / "status.json").write_text(json.dumps(
+            {"deployed_release": REL_A, "deployed_sha": SHA_A}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+
+        r = FakeRunner(self.base)
+
+        def http_dead_daemon(url, host):
+            # The daemon comes back once the sandbox is restarted.
+            alive = bool(r.argvs("sandbox up"))
+            if url.endswith("/api/health"):
+                return 200, json.dumps({
+                    "ok": alive,
+                    "daemon": "reachable" if alive else "unreachable",
+                })
+            if url.endswith("/api/meta"):
+                return 200, json.dumps({"build_commit": SHA_A})
+            raise AssertionError(url)
+
+        rc = self.deploy(r, http_dead_daemon)
+        self.assertEqual(rc, 0)
+        cadence = str(self.base / "releases" / REL_A / "cadence")
+        self.assertTrue(r.argvs(f"{cadence} sandbox down"))
+        self.assertTrue(r.argvs(f"{cadence} sandbox up staging --port 3020"))
 
     def test_rerun_same_sha_new_attempt_is_a_new_release(self):
         # First deploy at attempt 1.
@@ -242,6 +270,9 @@ class TickTest(unittest.TestCase):
                 self.assertNotIn("CADENCE_ALIAS", env)
                 self.assertNotIn("CADENCE_PROFILE", env)
                 self.assertNotIn("CADENCE_PM_DIR", env)
+                # An inherited socket override would route these calls at
+                # the production daemon.
+                self.assertNotIn("CADENCE_SOCKET", env)
                 self.assertEqual(env["CADENCE_SANDBOX_ROOT"], str(sd.BASE / "sandbox"))
                 self.assertEqual(env["CADENCE_SANDBOX_ALLOW_GLOBAL"], "1")
         # The sandbox env itself provides profile/pm — not the caller's.

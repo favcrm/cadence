@@ -6,6 +6,10 @@ Description=Cadence live staging deploy tick (favcrm/cadence main)
 
 [Service]
 Type=oneshot
+# The sandbox's daemon and board are setsid'd children of this unit;
+# the default KillMode=control-group would kill them when the tick
+# exits. process kills only the deploy itself on stop.
+KillMode=process
 WorkingDirectory=%h/.local/share/cadence-staging/src
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStartPre=/usr/bin/git fetch origin
