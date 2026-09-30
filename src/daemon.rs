@@ -546,8 +546,14 @@ impl Shared {
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
-        let mut store = Store::open_adopting(&db_path, marker)?;
+        let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
         store.shutdown_entries_hook = opts.shutdown_entries_hook.clone();
+        // CAD-694: persist this start's recovery outcome before any
+        // later failure path can lose it — the restart verdict reads
+        // the record when no per-alias event cursor could have been
+        // taken (the predecessor was already dead) and for endpoints
+        // the cursors never covered.
+        write_recovery_record(state_dir, &daemon_id, &recovered);
         // CAD-538: the store's write path now shares the lease fence —
         // one trip refuses every later write.
         if let Some(lease) = &lease {
@@ -8583,8 +8589,9 @@ pub use serve::HotStart;
 use serve::{
     acquire_singleton, flush_budget, handle_conn, hosted_config, hot_restart_begin, lease_flush,
     process_start_identity, relaunch_agents, resolve_slot_config, write_failed_shutdown_marker,
-    write_shutdown_marker, CheckupDispatch, SHUTDOWN_FILE,
+    write_recovery_record, write_shutdown_marker, CheckupDispatch, SHUTDOWN_FILE,
 };
+pub use serve::{INSTANCE_FILE, LAST_RECOVERY_FILE};
 #[allow(unused_imports)]
 use timers::{
     apply_auto_stop_view, auto_stop_view, AgentGcState, AgentGcTimer, AutoStopState, AutoStopTimer,

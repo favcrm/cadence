@@ -2093,20 +2093,30 @@ pub(crate) fn daemon_restart(
     // `turn_adopted`/`turn_adopt_refused` to a busy agent's tail page,
     // and an older restart's events can never masquerade as this
     // one's.
-    let event_cursors: std::collections::HashMap<String, i64> = before
-        .iter()
-        .filter(|a| a["endpoint_kind"].as_str() == Some("pty"))
-        .filter_map(|a| a["alias"].as_str().map(str::to_string))
-        .filter_map(|alias| {
-            client::rpc(
-                state_dir,
-                "agent_events",
-                json!({"alias": alias, "tail": true}),
-            )
-            .ok()
-            .map(|v| (alias, v["cursor"].as_i64().unwrap_or(0)))
-        })
-        .collect();
+    let mut event_cursors: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    // Aliases whose pre-stop tail read failed — the verdict cannot
+    // bound their event history, so it must fail rather than silently
+    // drop the check (CAD-694).
+    let mut cursor_misses: Vec<String> = Vec::new();
+    for a in &before {
+        if a["endpoint_kind"].as_str() != Some("pty") {
+            continue;
+        }
+        let Some(alias) = a["alias"].as_str().map(str::to_string) else {
+            continue;
+        };
+        match client::rpc(
+            state_dir,
+            "agent_events",
+            json!({"alias": alias, "tail": true}),
+        ) {
+            Ok(v) => {
+                event_cursors.insert(alias, v["cursor"].as_i64().unwrap_or(0));
+            }
+            Err(_) => cursor_misses.push(alias),
+        }
+    }
     // The lease can be released, handed off, or expire while --when-idle
     // waits. Re-check immediately before shutdown and do not restart
     // when this caller no longer holds it.
@@ -2225,6 +2235,19 @@ pub(crate) fn daemon_restart(
         .collect();
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     let mut bad = false;
+    // CAD-694: the successor's recovery record is drain evidence the
+    // cursors cannot always carry — a predecessor already dead gave
+    // none, and non-pty endpoints were never scanned. The record is
+    // bound to the instance this start just recorded; missing or
+    // mismatched, a failed drain, or any fenced turn fails closed.
+    if let Some(reason) = recovery_record_verdict(state_dir) {
+        eprintln!("restart: {reason}");
+        bad = true;
+    }
+    for alias in &cursor_misses {
+        eprintln!("restart: no pre-stop event cursor for {alias} — its verdict is unverified");
+        bad = true;
+    }
     let mut existing_fences = Vec::new();
     for a in &after {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
@@ -2256,6 +2279,9 @@ pub(crate) fn daemon_restart(
             if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
                 let mut seq = cursor;
                 let mut kinds: Vec<String> = Vec::new();
+                // A failed page leaves this restart's verdict unknown —
+                // recorded and failed below, never silently skipped.
+                let mut pages_failed = false;
                 // Bounded: a restart's adopt verdicts land within a few
                 // events; 20 pages of 100 is far past any real gap and
                 // keeps a pathological event stream from looping.
@@ -2265,7 +2291,10 @@ pub(crate) fn daemon_restart(
                         "agent_events",
                         serde_json::json!({"alias": alias, "after": seq}),
                     );
-                    let Ok(v) = page else { break };
+                    let Ok(v) = page else {
+                        pages_failed = true;
+                        break;
+                    };
                     let events = v["events"].as_array().cloned().unwrap_or_default();
                     let n = events.len();
                     for e in &events {
@@ -2277,6 +2306,12 @@ pub(crate) fn daemon_restart(
                     if n < 100 {
                         break;
                     }
+                }
+                if pages_failed {
+                    eprintln!(
+                        "restart: event history unread for {alias} — its verdict is unverified"
+                    );
+                    bad = true;
                 }
                 if kinds.iter().any(|k| k == "turn_adopt_refused") {
                     bad = true;
@@ -2292,20 +2327,28 @@ pub(crate) fn daemon_restart(
         // it. Check each carried row directly so a swept stale turn
         // still fails the restart verdict.
         for (sal, mid) in stale_turns.iter().filter(|(sal, _)| sal == &alias) {
-            let swept = client::rpc(state_dir, "agent_show", json!({"alias": sal}))
-                .ok()
-                .and_then(|show| {
-                    show["messages"].as_array().map(|ms| {
-                        ms.iter().any(|m| {
-                            m["id"].as_str() == Some(mid.as_str())
-                                && m["state"].as_str() == Some("unknown")
+            // A carried stale turn the show cannot verify leaves the
+            // verdict unproven — fail closed (CAD-694).
+            match client::rpc(state_dir, "agent_show", json!({"alias": sal})) {
+                Ok(show) => {
+                    let swept = show["messages"]
+                        .as_array()
+                        .map(|ms| {
+                            ms.iter().any(|m| {
+                                m["id"].as_str() == Some(mid.as_str())
+                                    && m["state"].as_str() == Some("unknown")
+                            })
                         })
-                    })
-                })
-                .unwrap_or(false);
-            if swept {
-                bad = true;
-                turn = "fenced".to_string();
+                        .unwrap_or(false);
+                    if swept {
+                        bad = true;
+                        turn = "fenced".to_string();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("restart: could not verify carried stale turn {sal}/{mid}: {e}");
+                    bad = true;
+                }
             }
         }
         if after_state == "attention" {
@@ -2344,10 +2387,58 @@ pub(crate) fn daemon_restart(
         Err(Error::rejected(
             "restart completed but not cleanly — see the table above \
              (pane pid changed, a turn was fenced, an agent became \
-             fenced, or a previously live agent did not settle)",
+             fenced, a previously live agent did not settle, or the \
+             drain evidence was unverifiable)",
         ))
     } else {
         Ok(0)
+    }
+}
+
+/// CAD-694: evaluate the successor daemon's recovery record — drain
+/// evidence the verdict needs independent of the per-alias event
+/// cursors (a predecessor already dead yields none, and non-pty
+/// endpoints were never cursor-covered). `Some(reason)` fails the
+/// verdict: the record is absent, unreadable, or bound to a different
+/// run; the predecessor's drain failed; or this recovery fenced any
+/// in-flight turn.
+fn recovery_record_verdict(state_dir: &Path) -> Option<String> {
+    let current = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
+        .ok()
+        .map(|s| s.trim().to_string());
+    let record = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let (Some(current), Some(record)) = (current, record) else {
+        return Some(
+            "the new daemon left no readable recovery record — the predecessor's \
+             drain cannot be verified"
+                .to_string(),
+        );
+    };
+    if record["instance"].as_str() != Some(current.as_str()) {
+        return Some(
+            "the recovery record does not name this daemon run — the predecessor's \
+             drain cannot be verified"
+                .to_string(),
+        );
+    }
+    if let Some(failed) = record["consumed"]["failed"].as_str() {
+        return Some(format!("the previous daemon's drain failed: {failed}"));
+    }
+    let fenced = record["fenced"].as_array().cloned().unwrap_or_default();
+    if fenced.is_empty() {
+        None
+    } else {
+        let names = fenced
+            .iter()
+            .filter_map(|f| f["alias"].as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!(
+            "recovery fenced {} in-flight turn(s): {names}",
+            fenced.len()
+        ))
     }
 }
 

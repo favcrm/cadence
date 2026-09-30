@@ -232,9 +232,10 @@
             pane_pid: 4242,
             native_session: format!("session-{alias}"),
         };
-        let s = Store::open_adopting(
+        let (s, _) = Store::open_adopting(
             &path,
             Some(ConsumedMarker {
+                instance: "old".to_string(),
                 entries: vec![
                     entry("mc", &pty_token),
                     entry("dp", &claude_token),

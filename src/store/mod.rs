@@ -80,7 +80,7 @@ pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 pub(crate) use schema::open_read_only;
-pub use schema::{AdoptEntry, ConsumedMarker, Take};
+pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 #[cfg(test)]
 mod tests;
 
@@ -124,8 +124,7 @@ pub struct Store {
 /// attempt's live transaction; the hook may write through it or return
 /// a synthetic sqlite error, so rollback, retry bound and
 /// retryable-classification are provable without wedging the store.
-pub type ShutdownEntriesHook =
-    Arc<dyn Fn(&Connection) -> rusqlite::Result<()> + Send + Sync>;
+pub type ShutdownEntriesHook = Arc<dyn Fn(&Connection) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).

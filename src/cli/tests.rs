@@ -1342,3 +1342,66 @@ fn cad879_self_requests_no_history() {
         json!({"alias": "w1", "active_only": true})
     );
 }
+
+/// CAD-694 (review B1): the restart verdict reads the successor's
+/// recovery record — cursor-independent drain evidence. Every
+/// unverifiable shape must fail closed: absent, unreadable, bound to
+/// another run, a failed drain, or fenced turns.
+#[test]
+fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
+    use cadence_agent::daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
+    let dir = tempfile::tempdir().unwrap();
+
+    // No record at all — the predecessor's drain is unverifiable.
+    assert!(super::recovery_record_verdict(dir.path()).is_some());
+
+    // A record bound to a different run must not stand in for this one.
+    std::fs::write(dir.path().join(INSTANCE_FILE), "run-b").unwrap();
+    std::fs::write(
+        dir.path().join(LAST_RECOVERY_FILE),
+        json!({"instance": "run-a", "consumed": null, "fenced": []}).to_string(),
+    )
+    .unwrap();
+    assert!(super::recovery_record_verdict(dir.path()).is_some());
+
+    // Bound to this run but reporting a failed drain — fails.
+    std::fs::write(
+        dir.path().join(LAST_RECOVERY_FILE),
+        json!({
+            "instance": "run-b",
+            "consumed": {"instance": "run-a", "stale": null, "failed": "drain exploded"},
+            "fenced": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let verdict = super::recovery_record_verdict(dir.path()).unwrap();
+    assert!(verdict.contains("drain failed"), "{verdict}");
+
+    // Bound and clean-drained but fencing rows — fails.
+    std::fs::write(
+        dir.path().join(LAST_RECOVERY_FILE),
+        json!({
+            "instance": "run-b",
+            "consumed": {"instance": "run-a", "stale": null, "failed": null},
+            "fenced": [{"alias": "w1", "message": "m1"}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let verdict = super::recovery_record_verdict(dir.path()).unwrap();
+    assert!(verdict.contains("fenced"), "{verdict}");
+
+    // Bound, clean, nothing fenced — the only passing shape.
+    std::fs::write(
+        dir.path().join(LAST_RECOVERY_FILE),
+        json!({
+            "instance": "run-b",
+            "consumed": {"instance": "run-a", "stale": null, "failed": null},
+            "fenced": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(super::recovery_record_verdict(dir.path()), None);
+}

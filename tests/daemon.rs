@@ -3494,6 +3494,101 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
     }
 }
 
+/// CAD-694 (review B1): the verdict used to rest on the per-alias
+/// event cursors alone — but a predecessor already dead when
+/// `daemon restart` runs supplies no `agent_list` and therefore no
+/// cursor, so a failed drain's fencing went unseen. The successor's
+/// recovery record is the cursor-independent evidence: this restart,
+/// run entirely after the predecessor's death, must still fail
+/// non-cleanly.
+#[test]
+fn cad694_offline_restart_still_fences_a_failed_drain() {
+    // Three BUSY-family faults exhaust the retry bound — the drain
+    // fails, the failed marker lands, and the daemon exits before any
+    // restart command ever runs.
+    let faults = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+        rusqlite::ffi::SQLITE_BUSY,
+        rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+        rusqlite::ffi::SQLITE_LOCKED,
+    ])));
+    let pending = std::sync::Arc::clone(&faults);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let mut d = TestDaemon::start_opts(daemon::ServeOptions {
+        stop: Some(stop_flag),
+        shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+            match pending.lock().unwrap().pop_front() {
+                Some(code) => Err(injected_sqlite_err(code)),
+                None => Ok(()),
+            }
+        })),
+        ..daemon_opts()
+    });
+    let _reaper = DaemonReaper::new(&d.state);
+    d.register_inbox("stopped-pty");
+    d.send(
+        "stopped-pty",
+        json!({"text": "unproven turn", "message": "mid"}),
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='stopped-pty';
+         UPDATE messages SET state='running',turn_id='lost-turn' WHERE id='mid';",
+    )
+    .unwrap();
+    drop(conn);
+    // The predecessor dies of its own drain before the restart — the
+    // cursor path never even gets an `agent_list`.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(exit.is_err(), "the failed drain exits the daemon: {exit:?}");
+    assert!(
+        faults.lock().unwrap().is_empty(),
+        "the whole retry bound ran before the daemon died"
+    );
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
+    // Stop our detached replacement before any outcome assertion.
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success(), "owned replacement did not stop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout} {stderr}");
+    assert!(
+        stderr.contains("drain failed"),
+        "the recovery record must carry the failed drain to the verdict: {stderr}"
+    );
+    assert!(
+        stderr.contains("restart completed but not cleanly"),
+        "{stderr}"
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='stopped-pty'
+                AND kind='turn_adopt_refused'
+                AND json_extract(payload,'$.message')='mid'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "the failed drain's swept turn must fence");
+    let state: String = conn
+        .query_row("SELECT state FROM messages WHERE id='mid'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "unknown", "the unproven turn fences on restart");
+    drop(conn);
+}
+
 #[test]
 fn events_default_page_is_newest_with_continue_cursor() {
     let d = TestDaemon::start();

@@ -327,6 +327,7 @@ tests = [
     "shutdown_entries_retries_a_busy_once_then_records_one_refusal",
     "shutdown_entries_stops_at_first_nonretryable_fault",
     "cad694_failed_shutdown_fences_the_restart_verdict",
+    "cad694_offline_restart_still_fences_a_failed_drain",
     "cad384_no_sandbox_exemption_outside_a_sandbox",
     "cad384_agent_cannot_claim_the_lease_as_the_operator",
     "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",

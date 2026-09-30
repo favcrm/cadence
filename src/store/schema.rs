@@ -56,29 +56,72 @@ pub struct AdoptEntry {
 /// previous run's `shutdown_entries` never committed, so every
 /// in-flight row it left is unproven and `recover()` must fence each
 /// one with the refusal event its verdict reads.
+///
+/// The two Option fields are independent axes (CAD-694): `stale` is
+/// freshness — the pane-adoption TTL — while `failed` is provenance,
+/// valid whenever `instance` names the immediately preceding recorded
+/// run even after the TTL has lapsed. `stale.is_some()` and
+/// `failed.is_some()` CAN hold together (an expired marker from a
+/// predecessor whose drain still failed); `failed` on a marker whose
+/// `instance` does not match is never populated — `serve()` drops it
+/// before this is built.
 pub struct ConsumedMarker {
+    /// The daemon-instance id the consumed marker claimed — "" when the
+    /// marker carried none.
+    pub instance: String,
     pub entries: Vec<AdoptEntry>,
     pub stale: Option<String>,
     /// The drain error the marker recorded; `None` on a clean stop.
-    /// Only populated while the marker still names the immediately
-    /// preceding recorded run — a stale marker proves nothing about
-    /// this shutdown.
+    /// Set only for a marker that names the immediately preceding
+    /// recorded run — unlike `entries` this is provenance, not
+    /// freshness, so TTL expiry does not clear it.
     pub failed: Option<String>,
+}
+
+/// What `recover()` fenced and what marker informed it — returned by
+/// `open_adopting` so the daemon can persist it as this start's
+/// recovery record (CAD-694). A restart verdict reads the record to
+/// learn whether the predecessor's drain and this sweep are provable —
+/// evidence the per-alias event cursors cannot always carry (a
+/// predecessor already dead leaves no cursor to compare against, and
+/// non-pty endpoints were never cursor-covered).
+#[derive(Debug, Default)]
+pub struct RecoveryOutcome {
+    /// Instance id the consumed marker claimed; `None` when no marker
+    /// was consumed.
+    pub marker_instance: Option<String>,
+    /// Staleness provenance recorded at consume (wrong instance or
+    /// expired); `None` on a valid marker or no marker.
+    pub stale: Option<String>,
+    /// The drain failure the predecessor recorded, if any.
+    pub failed: Option<String>,
+    /// Every in-flight row this recovery fenced (swept to `unknown`,
+    /// never adopted): (alias, message_id).
+    pub fenced: Vec<(String, String)>,
+    /// `fenced` rows carrying no refusal event anywhere — a crash or a
+    /// drain that lost its writes left them unproven.
+    pub unevidenced: Vec<(String, String)>,
 }
 
 impl Store {
     /// Open (creating if needed), migrate, and recover in-flight state.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_adopting(path, None)
+        Self::open_adopting(path, None).map(|(store, _)| store)
     }
 
     /// `open` with the consumed hot-restart marker (CAD-89): `serve()`
     /// reads and validates `shutdown.json` before this — the store only
     /// sees the candidate entries and a staleness reason. Every other
     /// caller passes `None` and gets the historical fence-everything
-    /// recovery.
-    pub fn open_adopting(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
-        Self::open_inner(path, marker, true, true)
+    /// recovery. The `RecoveryOutcome` reports what that recovery
+    /// fenced so the daemon can persist it for the restart verdict
+    /// (CAD-694).
+    pub fn open_adopting(
+        path: &Path,
+        marker: Option<ConsumedMarker>,
+    ) -> Result<(Self, RecoveryOutcome)> {
+        let (store, outcome) = Self::open_inner(path, marker, true, true)?;
+        Ok((store, outcome.expect("open_adopting always recovers")))
     }
 
     /// Open a live database for a side write that must not run restart
@@ -86,7 +129,7 @@ impl Store {
     /// the daemon still holds the store — recovery would fence the
     /// daemon's in-flight turns (CAD-577).
     pub fn open_side(path: &Path) -> Result<Self> {
-        Self::open_inner(path, None, true, false)
+        Self::open_inner(path, None, true, false).map(|(store, _)| store)
     }
 
     /// Migrate an older database without the rollout lease gate.
@@ -95,7 +138,7 @@ impl Store {
     /// `open` and `open_adopting` — the daemon and doctor paths — never
     /// call it, so a lower-schema production database still refuses.
     pub fn open_for_schema_tests(path: &Path) -> Result<Self> {
-        Self::open_inner(path, None, false, true)
+        Self::open_inner(path, None, false, true).map(|(store, _)| store)
     }
 
     fn open_inner(
@@ -103,7 +146,7 @@ impl Store {
         marker: Option<ConsumedMarker>,
         gate: bool,
         recover: bool,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<RecoveryOutcome>)> {
         let permit = if gate {
             crate::rollout::authorize_migration(path)?
         } else {
@@ -808,10 +851,12 @@ impl Store {
             thread_held: Mutex::new(std::collections::HashMap::new()),
             shutdown_entries_hook: None,
         };
-        if recover {
-            store.recover(marker.as_ref())?;
-        }
-        Ok(store)
+        let outcome = if recover {
+            Some(store.recover(marker.as_ref())?)
+        } else {
+            None
+        };
+        Ok((store, outcome))
     }
 
     /// A restart cannot know whether an in-flight provider turn executed.
@@ -828,25 +873,31 @@ impl Store {
     /// then restores the recorded generation and the token validates
     /// again. Anything else falls back to the fence below, one
     /// `turn_adopt_refused` event per rejected entry.
-    fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<()> {
+    fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<RecoveryOutcome> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         // Store-level qualification of every recorded entry. A refused
         // entry still lands in the sweep below — the refusal only means
         // "not protected", never a state skip.
         let mut kept: Vec<&AdoptEntry> = Vec::new();
+        // Message ids refused in this transaction — the evidence check
+        // below must not read them as unproven.
+        let mut refused: Vec<String> = Vec::new();
         if let Some(marker) = marker {
             for e in &marker.entries {
                 let reason = marker.stale.clone().or_else(|| self.adoption_block(&tx, e));
                 match reason {
                     None => kept.push(e),
-                    Some(reason) => Self::event(
-                        &tx,
-                        &e.alias,
-                        "turn_adopt_refused",
-                        json!({"message": e.message_id, "turn_id": e.turn_id,
-                               "reason": reason}),
-                    )?,
+                    Some(reason) => {
+                        Self::event(
+                            &tx,
+                            &e.alias,
+                            "turn_adopt_refused",
+                            json!({"message": e.message_id, "turn_id": e.turn_id,
+                                   "reason": reason}),
+                        )?;
+                        refused.push(e.message_id.clone());
+                    }
                 }
             }
         }
@@ -885,6 +936,7 @@ impl Store {
                         json!({"message": e.message_id, "turn_id": e.turn_id,
                                "reason": "recorded pane facts disagree across the alias"}),
                     )?;
+                    refused.push(e.message_id.clone());
                 }
             }
         }
@@ -903,17 +955,17 @@ impl Store {
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
-        // CAD-694: a `failed` marker means the previous run's
-        // `shutdown_entries` never committed — no refusal events exist
-        // for the rows it left in flight. Emit each the same refusal a
-        // recorded refusal carries, so a restart landing on a
-        // now-working store cannot read this silent sweep as clean.
-        if let Some(failed) = marker.and_then(|m| m.failed.as_deref()) {
+        // CAD-694: select the rows this recovery fences before the
+        // UPDATE — a `failed` marker must emit each a refusal first,
+        // and the outcome record needs the row list plus which of them
+        // carry no refusal evidence at all. No `source` filter: this
+        // list must equal exactly what the UPDATE below rewrites.
+        let swept: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT alias, id, turn_id FROM messages
-                 WHERE state IN ('submitting','running') AND source != 'nudge'",
+                 WHERE state IN ('submitting','running')",
             )?;
-            let lost = stmt
+            let rows = stmt
                 .query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -923,20 +975,61 @@ impl Store {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(stmt);
-            for (alias, message_id, turn_id) in lost {
-                if kept_ids.contains(&message_id) {
+            rows.into_iter()
+                .filter(|(_, id, _)| !kept_ids.contains(id))
+                .collect()
+        };
+        // A `failed` marker means the previous run's
+        // `shutdown_entries` never committed — no refusal events exist
+        // for the rows it left in flight. Emit each the same refusal a
+        // recorded refusal carries, so a restart landing on a
+        // now-working store cannot read this silent sweep as clean.
+        if let Some(failed) = marker.and_then(|m| m.failed.as_deref()) {
+            for (alias, message_id, turn_id) in &swept {
+                if refused.contains(message_id) {
                     continue;
                 }
                 Self::event(
                     &tx,
-                    &alias,
+                    alias,
                     "turn_adopt_refused",
                     json!({"message": message_id, "turn_id": turn_id,
                            "reason":
                                format!("shutdown evidence failed ({failed}); the turn's fate is unproven — inspect and do not replay")}),
                 )?;
+                refused.push(message_id.clone());
             }
         }
+        // Every swept row is fenced — `refused` carries this tx's
+        // refusals and a committed drain wrote the rest. What remains
+        // (a crash, or a drain that lost its writes entirely) is
+        // unevidenced; the outcome reports both so a restart verdict
+        // needing no per-alias cursor can still fail.
+        let mut unevidenced: Vec<(String, String)> = Vec::new();
+        for (alias, message_id, _) in &swept {
+            if refused.contains(message_id) {
+                continue;
+            }
+            let evidenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE kind='turn_adopt_refused'
+                    AND json_extract(payload,'$.message')=?1)",
+                [message_id],
+                |r| r.get(0),
+            )?;
+            if !evidenced {
+                unevidenced.push((alias.clone(), message_id.clone()));
+            }
+        }
+        let outcome = RecoveryOutcome {
+            marker_instance: marker.map(|m| m.instance.clone()),
+            stale: marker.and_then(|m| m.stale.clone()),
+            failed: marker.and_then(|m| m.failed.clone()),
+            fenced: swept
+                .iter()
+                .map(|(a, id, _)| (a.clone(), id.clone()))
+                .collect(),
+            unevidenced,
+        };
         let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut sql = String::from(
             "UPDATE messages SET state='unknown',
@@ -980,7 +1073,7 @@ impl Store {
         // nothing needs re-parking.
         self.reconcile_effects_in(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// CAD-162: `token` is current for `generation` under the alias's
@@ -1196,14 +1289,6 @@ impl Store {
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
         let tx = conn.unchecked_transaction()?;
-        // Test seam (CAD-694): the hook runs inside this attempt's
-        // transaction — it may mutate rows or fail with a synthetic
-        // sqlite error, proving rollback and retry without wedging the
-        // store the restart's successor then opens. Never set in
-        // production.
-        if let Some(hook) = &self.shutdown_entries_hook {
-            hook(&tx)?;
-        }
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
              WHERE state IN ('running','submitting') AND source != 'nudge'",
@@ -1263,6 +1348,13 @@ impl Store {
                 pane_pid: *pane_pid,
                 native_session: native_session.clone(),
             });
+        }
+        // Test seam (CAD-694): the hook runs inside this attempt's
+        // transaction AFTER its production writes — a synthetic error
+        // here discards them too, so rollback coverage is the real
+        // shape, not just pre-write faults. Never set in production.
+        if let Some(hook) = &self.shutdown_entries_hook {
+            hook(&tx)?;
         }
         tx.commit()?;
         Ok(entries)

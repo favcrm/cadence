@@ -505,10 +505,17 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
 // path for the recorded agents.
 
 /// The last recorded serve() run's instance id.
-const INSTANCE_FILE: &str = "daemon-instance";
+pub const INSTANCE_FILE: &str = "daemon-instance";
 
 /// The clean-shutdown marker: running pty turns awaiting re-adoption.
 pub(super) const SHUTDOWN_FILE: &str = "shutdown.json";
+
+/// This run's recovery record (CAD-694): what `recover()` fenced and
+/// the consumed marker's provenance. A `daemon restart` verdict reads
+/// it instead of relying on per-alias event cursors a dead predecessor
+/// may never have allowed — and it names the run that wrote it, so a
+/// record from an earlier start cannot stand in for this one's.
+pub const LAST_RECOVERY_FILE: &str = "last-recovery.json";
 
 /// How long a shutdown marker stays adoptable — a bound on pane
 /// longevity, not on restart speed. Past it the recorded checks would
@@ -585,7 +592,13 @@ pub(super) fn hot_restart_begin(state_dir: &Path) -> HotStart {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let stale = if instance.is_empty() || Some(instance.as_str()) != previous.as_deref() {
+            // Provenance (does this marker name the run just gone?)
+            // is a separate axis from freshness (is it still inside
+            // the pane-adoption TTL?): expiry must not erase a recorded
+            // drain failure, and a wrong-instance marker must not lend
+            // its failure to this shutdown (CAD-694).
+            let proven = !instance.is_empty() && Some(instance.as_str()) == previous.as_deref();
+            let stale = if !proven {
                 Some("shutdown marker does not match the last recorded daemon run".to_string())
             } else if epoch_secs() - at > MARKER_TTL_SECS {
                 Some(format!(
@@ -596,15 +609,16 @@ pub(super) fn hot_restart_begin(state_dir: &Path) -> HotStart {
             } else {
                 None
             };
-            // `failed` is evidence only while the marker still names
-            // the immediately preceding run — a stale marker proves
-            // nothing about this shutdown.
-            let failed = if stale.is_none() {
+            // `failed` is evidence whenever the marker names the
+            // immediately preceding run — TTL expiry bounds pane
+            // adoption, never the provenance of a recorded failure.
+            let failed = if proven {
                 v["failed"].as_str().map(str::to_string)
             } else {
                 None
             };
             Some(store::ConsumedMarker {
+                instance,
                 entries,
                 stale,
                 failed,
@@ -661,6 +675,40 @@ pub(super) fn write_failed_shutdown_marker(state_dir: &Path, instance: &str, err
     });
     if let Err(e) = write_file_atomic(&state_dir.join(SHUTDOWN_FILE), &marker.to_string()) {
         eprintln!("hot-restart: could not write failed-shutdown marker: {e}");
+    }
+}
+
+/// Persist what this start's `recover()` fenced — the successor-bound
+/// drain evidence a `daemon restart` verdict reads in place of the
+/// per-alias event cursors a predecessor already dead cannot have
+/// provided (CAD-694). Rewritten on every start, bound to `instance`,
+/// so a later restart reads only this run's recovery; a write that
+/// fails leaves no record and the verdict fails closed on the gap.
+pub(crate) fn write_recovery_record(
+    state_dir: &Path,
+    instance: &str,
+    outcome: &store::RecoveryOutcome,
+) {
+    let consumed = outcome.marker_instance.as_ref().map(|id| {
+        json!({
+            "instance": id,
+            "stale": outcome.stale,
+            "failed": outcome.failed,
+        })
+    });
+    let fence_rows = |rows: &[(String, String)]| -> Vec<Value> {
+        rows.iter()
+            .map(|(alias, message)| json!({"alias": alias, "message": message}))
+            .collect()
+    };
+    let record = json!({
+        "instance": instance,
+        "consumed": consumed,
+        "fenced": fence_rows(&outcome.fenced),
+        "unevidenced": fence_rows(&outcome.unevidenced),
+    });
+    if let Err(e) = write_file_atomic(&state_dir.join(LAST_RECOVERY_FILE), &record.to_string()) {
+        eprintln!("hot-restart: could not write recovery record: {e}");
     }
 }
 
@@ -818,5 +866,70 @@ mod agent_uid_tests {
         let replacement = bind_shared_socket(&path, gid, true).unwrap();
         drop(replacement);
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod hot_restart_marker_tests {
+    use super::{hot_restart_begin, INSTANCE_FILE, SHUTDOWN_FILE};
+    use crate::daemon::watch::epoch_secs;
+
+    /// A state dir holding `daemon-instance` + `shutdown.json` as
+    /// written — the marker's `at` is constructed, never waited out.
+    fn dir_with(previous: &str, marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(INSTANCE_FILE), previous).unwrap();
+        std::fs::write(dir.path().join(SHUTDOWN_FILE), marker).unwrap();
+        dir
+    }
+
+    /// CAD-694 (review B2): the pane-adoption TTL bounds freshness, not
+    /// provenance — an expired marker that still names the run just
+    /// gone keeps its recorded drain failure.
+    #[test]
+    fn an_expired_matching_failed_marker_keeps_its_failure() {
+        let at = epoch_secs() - 3600.0;
+        let marker = format!(r#"{{"instance":"old-run","at":{at},"failed":"drain exploded"}}"#);
+        let dir = dir_with("old-run", &marker);
+        let hot = hot_restart_begin(dir.path());
+        let marker = hot.marker.expect("the marker still parses");
+        assert!(
+            marker.stale.is_some(),
+            "expired entries fence, but the marker parsed"
+        );
+        assert_eq!(marker.failed.as_deref(), Some("drain exploded"));
+        assert_eq!(marker.instance, "old-run");
+    }
+
+    /// The same expired marker under a different recorded run is
+    /// another daemon's evidence — neither its panes nor its failure
+    /// may bind to this shutdown.
+    #[test]
+    fn a_wrong_instance_failed_marker_suppresses_its_failure() {
+        let at = epoch_secs() - 3600.0;
+        let marker = format!(r#"{{"instance":"other-run","at":{at},"failed":"their crash"}}"#);
+        let dir = dir_with("old-run", &marker);
+        let hot = hot_restart_begin(dir.path());
+        let marker = hot.marker.expect("the marker still parses");
+        assert!(marker.stale.is_some());
+        assert_eq!(
+            marker.failed, None,
+            "a foreign run's failure must never fence here"
+        );
+    }
+
+    /// Control: a marker still inside the TTL keeps the failure too —
+    /// the change is that expiry no longer drops it.
+    #[test]
+    fn a_fresh_matching_failed_marker_keeps_its_failure() {
+        let marker = format!(
+            r#"{{"instance":"old-run","at":{},"failed":"drain exploded"}}"#,
+            epoch_secs()
+        );
+        let dir = dir_with("old-run", &marker);
+        let hot = hot_restart_begin(dir.path());
+        let marker = hot.marker.expect("the marker still parses");
+        assert!(marker.stale.is_none(), "fresh marker adopts");
+        assert_eq!(marker.failed.as_deref(), Some("drain exploded"));
     }
 }
