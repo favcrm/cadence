@@ -251,31 +251,40 @@ export default function AppShell({
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
     const urlCrm = query.get("crm");
+    // A rewrite this pass emits is still "external" until adoption has
+    // run against it: marking only the pre-write URL handled and
+    // returning would let the next pass re-enter, and marking the
+    // rewritten URL handled would make the next pass return early and
+    // never adopt the surviving ctx (the cold deep-link defect). So
+    // adoption is fall-through, not early-return: normalize each
+    // param, then act on the still-valid remainder.
     if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
     handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
     // An unknown CRM section never renders: strip it back to the
-    // default instead of guessing a section.
-    if (urlCrm !== null && urlCrm !== "segments" && urlCrm !== "campaigns") {
-      writeQuery({ crm: null }, { replace: true });
-      return;
-    }
+    // default instead of guessing a section. The explicit default
+    // (`crm=customers`) is already canonical, so it is not rewritten.
+    const badCrm = urlCrm !== null && urlCrm !== "customers" && urlCrm !== "segments" && urlCrm !== "campaigns";
+    let badRecord = false;
     if (urlRecord !== null) {
       try {
         assertRecordId(urlRecord);
       } catch {
-        writeQuery({ record: null }, { replace: true });
-        return;
+        badRecord = true;
       }
     }
-    if (urlCtx !== null && !activeIds.includes(urlCtx)) {
+    const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
+    const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord;
+    if (staleCtx) {
       setContextId(fallbackContext());
       setLinkNotice(
         "The linked context is not active in this installation — the selection was cleared.",
       );
-      writeQuery({ ctx: null, appview: null, record: null }, { replace: true });
-      return;
-    }
-    if (urlCtx !== null) {
+    } else if (scopelessRecord) {
+      // A record link without scope is ambiguous: refuse it with a
+      // notice rather than guessing which context it names.
+      setLinkNotice("The record link names no context — the selection was cleared.");
+      setContextId(fallbackContext());
+    } else if (urlCtx !== null) {
       // The URL's ctx+record/appview are adopted verbatim: they were
       // authored together — a deep link, a scoped-entry link, or a
       // history entry — never split or cleared here. Stale scope is
@@ -285,16 +294,25 @@ export default function AppShell({
       setContextId(urlCtx);
       rememberContext(installId, urlCtx);
       setLinkNotice(null);
-      return;
-    }
-    // No linked context: a record link without scope is ambiguous.
-    if (urlRecord !== null) {
-      setLinkNotice("The record link names no context — the selection was cleared.");
+    } else {
       setContextId(fallbackContext());
-      writeQuery({ record: null }, { replace: true });
-      return;
     }
-    setContextId(fallbackContext());
+    // One normalized write emits every strip at once. Marking the
+    // pre-write URL handled (done above) plus this write's own
+    // handled mark leaves the surviving ctx adoptable on the next
+    // pass — but adoption already ran on it above, so no second
+    // effect turn is needed and the URL settles in a single replace.
+    if (badCrm || badRecord || staleCtx || scopelessRecord) {
+      writeQuery(
+        {
+          crm: badCrm ? null : undefined,
+          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
+          ctx: staleCtx ? null : undefined,
+          appview: staleCtx ? null : undefined,
+        },
+        { replace: true },
+      );
+    }
   }, [loading, installation, activeIds, query, installId, writeQuery]);
 
   // The default selection, without persisting an empty choice when
