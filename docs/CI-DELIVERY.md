@@ -117,6 +117,55 @@ and a full merge-group run when estimating a landing. Do not describe
 replay timings as measurements of a production-code PR: those changes
 currently receive the full fallback.
 
+## Compile-once Rust test archives (CAD-858)
+
+The `test-build` job selects the scope using the PR base policy, proves the
+existing Cargo/nextest inventory parity once, and creates a pinned nextest
+0.9.145 archive. A trusted base runner without `ARCHIVE_PROTOCOL = 1` gets
+an explicitly recorded full-scope archive fallback, not eight independent
+compiles. Actual documentation edits still receive the full scope; existing
+explicit `docs` plans retain verified empty markers and receipts.
+
+Eight `test-shard` consumers download the exact immutable artifact ID from
+successful producer job outputs. Source SHA, run, original producer attempt,
+archive/plan/inventory/manifest digests, compiler/tool/config identity, flags,
+runner image and absolute workspace/target layout must match independently
+collected consumer context. The artifact cannot supply its own expected
+context. Failed-job reruns retain the original successful producer ID and
+attempt; missing/expired artifacts or incompatible contexts fail explicitly.
+Rerun the producer and its dependent consumers when new producer bytes are
+needed, rather than guessing a latest artifact or overwriting its name.
+
+Consumers require an absent `target/`, never delete or overwrite a restored
+cache, and preflight GNU tar.zst members before one archive-backed list extracts
+into the identical producer workspace. Preflight refuses non-target paths,
+links/devices, duplicates, corrupt decoding, missing metadata and resource
+limits: 20,000 members, 32 GiB cumulative logical file sizes, bounded metadata
+headers, and bounded decompressed input. These are explicit refusal thresholds,
+not sampled coverage; exceeding one requires investigation and reviewed policy
+changes. GNU long names and sparse files are supported. `zstd` is required.
+The archive-backed list must reproduce both testcase identities and run
+eligibility; the restored CLI must report the exact source SHA. Later filtered
+lists and runs use extracted metadata only, with no Cargo build selectors,
+features or `--locked`. Existing LPT weights, filter equality, eight disjoint
+assignment receipts, zero retries and the required `test` aggregate remain.
+Producer failures/skips/missing evidence cannot green the aggregate.
+
+`test-once` stays independent for default-feature refusal proofs and doctests.
+Each consumer still installs/builds the SPA and needs real `tsc`; Rust fixture
+Cargo subprocesses remain real. This is not elimination of every Rust build or
+sharing of release/UI-feature binaries. No production deployment or approval
+policy is changed.
+
+The historical two-partition archive was 1,523,895,478 bytes. Eight transfers
+would total about 12.2 GB before wrapper overhead; this is arithmetic, not a
+current measurement. Producer scheduling, upload/download, preflight/extraction,
+UI setup and other required builds can outweigh saved compilation. Require
+current-head full/selected archive execution and eight-shard coverage evidence;
+contract tests and the historical run are not a measured speedup or current
+runtime acceptance. Measure critical-path feedback and runner minutes before
+claiming delivery improvement.
+
 ## Remaining delivery work
 
 CAD-479 tracks measurement of affected-test selection; the queue retains

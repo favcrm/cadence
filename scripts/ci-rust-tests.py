@@ -1,18 +1,59 @@
 #!/usr/bin/env python3
-"""Execute the recorded scope with pinned tools and fixed feature shapes."""
+"""Execute the recorded scope with pinned tools and fixed feature shapes.
+
+CAD-858 reuse path: `--bundle DIR --expected FILE` (tests phase only)
+runs the shard off the verified producer archive instead of compiling.
+The bundle is verified against independently supplied context before any
+nextest call; `target/` must be absent so the single archive-extraction
+list is the only writer of `ROOT/target`; every later list/run is
+metadata-only (extracted cargo/binaries metadata + workspace/target
+remaps) and never invokes Cargo.
+"""
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
 
+# Trusted-base capability marker: the producer detects consumer archive
+# support by AST, so this must stay a literal assignment, never a flag
+# comment.
+ARCHIVE_PROTOCOL = 1
+
+
+def _load_bundle_helper():
+    """Sibling ci-nextest-bundle.py — verify_bundle/check_archive only.
+
+    Loaded by path so `python3 /runner-temp/ci-rust-tests.py` in CI works
+    regardless of sys.path; a missing helper fails loud at module load.
+    """
+    path = Path(__file__).resolve().parent / "ci-nextest-bundle.py"
+    spec = importlib.util.spec_from_file_location("ci_nextest_bundle", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Trusted inventory runners are copied alone into RUNNER_TEMP. Legacy
+# compilation/inventory must work there without an archive-helper sibling.
+bundle = _load_bundle_helper() if Path(__file__).with_name('ci-nextest-bundle.py').is_file() else None
+
 
 def scope_args(plan):
+    if not isinstance(plan, dict):
+        raise ValueError('invalid test plan')
     mode = plan.get("mode")
     targets = plan.get("targets")
-    if plan.get("schema") != 1 or not isinstance(targets, list):
+    if (
+        not isinstance(plan, dict)
+        or type(plan.get("schema")) is not int
+        or plan["schema"] != 1
+        or not isinstance(targets, list)
+    ):
         raise ValueError("invalid test plan")
     if mode in {"docs", "full"}:
         if targets:
@@ -25,6 +66,8 @@ def scope_args(plan):
         if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", target):
             raise ValueError("invalid Cargo test target")
         args.extend(["--test", target])
+    if len(set(targets)) != len(targets):
+        raise ValueError('duplicate Cargo test target')
     return args
 
 
@@ -138,7 +181,104 @@ def list_tests(root, args, extra=None):
                 and case["filter-match"]["status"] == "matches"
             ):
                 tests.append((binary_id, name))
+    if len(set(tests)) != len(tests):
+        raise ValueError("duplicate test id in nextest inventory")
     return sorted(tests)
+
+
+def producer_ids(path):
+    """Producer inventory.json (pinned nextest rust-suites JSON) → sorted ids
+    of every recorded testcase, selected or not.
+
+    The extracted tree's first full list is compared against this before
+    any test run: the archive must carry exactly the test inventory the
+    producer recorded.
+    """
+    return sorted(inventory_facts(json.loads(Path(path).read_text())))
+
+
+def inventory_facts(doc):
+    """Identity AND run eligibility must agree; matching names alone can omit tests."""
+    if not isinstance(doc, dict) or not isinstance(doc.get('rust-suites'), dict):
+        raise ValueError('inventory is not a rust-suites document')
+    facts = {}
+    for binary_id, suite in doc["rust-suites"].items():
+        if (
+            not isinstance(binary_id, str)
+            or not isinstance(suite, dict)
+            or not isinstance(suite.get("testcases"), dict)
+        ):
+            raise ValueError("malformed rust-suites inventory")
+        for name, case in suite["testcases"].items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(case, dict)
+                or case.get("kind") not in ('test', 'benchmark')
+                or type(case.get("ignored")) is not bool
+                or not isinstance(case.get("filter-match"), dict)
+                or case["filter-match"].get("status") not in {"matches", "mismatch"}
+            ):
+                raise ValueError("malformed rust-suites testcase")
+            ident = f'{binary_id} {name}'
+            if ident in facts:
+                raise ValueError('duplicate test id in inventory')
+            facts[ident] = (case['kind'], case['ignored'], case['filter-match']['status'])
+    return facts
+
+
+def reuse_args(root):
+    """Metadata-only nextest flags over the extracted tree — no Cargo."""
+    return [
+        "--cargo-metadata", str(root / "target/nextest/cargo-metadata.json"),
+        "--binaries-metadata", str(root / "target/nextest/binaries-metadata.json"),
+        "--workspace-remap", str(root),
+        "--target-dir-remap", str(root / "target"),
+    ]
+
+
+def list_reused(root, extra=None):
+    """(binary_id, name) of every selected non-ignored extracted test.
+
+    Deliberately never combines --archive-file with the metadata flags:
+    the extraction list is the single caller that carries archive flags.
+    """
+    command = [
+        str(root / "scripts/cadence-nextest"),
+        "list",
+        "--message-format",
+        "json",
+        *reuse_args(root),
+    ]
+    if extra:
+        command += extra
+    out = subprocess.run(command, cwd=root, check=True, capture_output=True, text=True)
+    doc = json.loads(out.stdout)
+    tests = []
+    for binary_id, suite in doc["rust-suites"].items():
+        for name, case in suite["testcases"].items():
+            if (
+                case["kind"] == "test"
+                and not case["ignored"]
+                and case["filter-match"]["status"] == "matches"
+            ):
+                tests.append((binary_id, name))
+    if len(set(tests)) != len(tests):
+        raise ValueError("duplicate test id in extracted inventory")
+    return sorted(tests)
+
+
+def verify_compiled_source(root, expected_sha):
+    """The restored binary must prove the exact expected source SHA."""
+    binary = root / "target/debug/cadence"
+    out = subprocess.run(
+        [str(binary), "--version"], cwd=root,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if not out.rstrip("\n").endswith("+" + expected_sha):
+        raise ValueError(
+            "extracted binary is not the expected source build: "
+            f"{out.strip()!r} does not end with +{expected_sha}"
+        )
 
 
 def write_assignment(path, shard, total, mode, inventory, tests, weights_sha256):
@@ -157,10 +297,68 @@ def write_assignment(path, shard, total, mode, inventory, tests, weights_sha256)
     Path(path).write_text(json.dumps(doc, indent=2) + "\n")
 
 
-def run(root, plan, phase, partition="", weights=None, assignment_out=None, dry_run=False):
+def verify_reuse_inputs(root, bundle_dir, expected_path, plan_bytes):
+    """Verify DIR against the expected context before any nextest call or
+    receipt. Returns (expected, verified archive path).
+
+    The trusted context is read and shape-checked by the sibling
+    verifier; the bundle directory must not live inside the workspace
+    root (it is downloaded output, never checkout content), and the CLI
+    plan bytes must be identical to the bundle's recorded
+    ci-test-plan.json — the shard executes exactly the scope the
+    producer pinned.
+    """
+    if bundle is None:
+        raise ValueError('archive reuse requires the helper beside the head runner')
+    bundle_dir = Path(bundle_dir)
+    if Path(expected_path).resolve().is_relative_to(bundle_dir.resolve()):
+        raise ValueError('expected context must be independent of the bundle')
+    if bundle_dir.resolve().is_relative_to(root):
+        raise ValueError("bundle directory must be independent of the workspace root")
+    if plan_bytes is None:
+        raise ValueError("archive reuse requires the recorded plan file")
+    expected = bundle.read_context(expected_path)
+    if not isinstance(expected, dict):
+        raise ValueError("expected context must be a JSON object")
+    if expected.get("workspace_root") != str(root):
+        raise ValueError("expected workspace_root does not equal the actual root")
+    archive = bundle.verify_bundle(bundle_dir, expected)
+    if plan_bytes != (bundle_dir / "ci-test-plan.json").read_bytes():
+        raise ValueError("bundle ci-test-plan.json does not equal the CLI plan")
+    return expected, archive
+
+
+def verify_docs_markers(bundle_dir, archive):
+    """A docs bundle is a verified empty receipt: an empty archive file
+    and the empty rust-suites inventory. Both are hash-pinned by
+    verify_bundle already; the marker check proves the producer chose
+    the docs shape, so no extraction ever happens for docs.
+    """
+    if archive.is_symlink() or not archive.is_file() or archive.stat().st_size != 0:
+        raise ValueError("docs bundle must carry an empty nextest.tar.zst marker")
+    doc = json.loads((bundle_dir / "inventory.json").read_text())
+    if doc != {"rust-suites": {}, "test-count": 0}:
+        raise ValueError("docs bundle must carry the empty rust-suites inventory marker")
+
+
+def run(root, plan, phase, partition="", weights=None, assignment_out=None,
+        dry_run=False, bundle_dir=None, expected_path=None):
+    if (bundle_dir is None) != (expected_path is None):
+        raise ValueError("--bundle and --expected are only valid together")
+    if bundle_dir is not None and phase != "tests":
+        raise ValueError("archive reuse applies to the tests phase only")
+    plan_bytes = None
+    if isinstance(plan, (str, Path)):
+        plan_bytes = Path(plan).read_bytes()
+        plan = json.loads(plan_bytes)
     args = scope_args(plan)
     shard = partition_args(partition)
     if plan["mode"] == "docs":
+        if bundle_dir is not None:
+            _, archive = verify_reuse_inputs(
+                root, bundle_dir, expected_path, plan_bytes
+            )
+            verify_docs_markers(Path(bundle_dir), archive)
         if assignment_out is not None and shard is not None:
             write_assignment(
                 assignment_out, shard[0], shard[1], plan["mode"], [], [], ""
@@ -176,15 +374,63 @@ def run(root, plan, phase, partition="", weights=None, assignment_out=None, dry_
         subprocess.run(command, cwd=root, check=True)
         return
 
-    (root / "target/nextest/cadence/junit.xml").unlink(missing_ok=True)
-    command = [str(root / "scripts/cadence-nextest"), *args, "--locked", "--features", "test-seam"]
+    reuse = bundle_dir is not None
+    if reuse:
+        expected, archive = verify_reuse_inputs(
+            root, bundle_dir, expected_path, plan_bytes
+        )
+        target = root / "target"
+        if target.exists() or target.is_symlink():
+            raise ValueError("target must be absent before archive extraction")
+        if os.environ.get("CARGO_TARGET_DIR") not in (None, ""):
+            raise ValueError("CARGO_TARGET_DIR must not remap the extracted tree")
+        # The archive bytes were verified; now gate unsafe members before
+        # the single extraction list that materializes target/.
+        bundle.check_archive(archive)
+        out = subprocess.run(
+            [
+                str(root / "scripts/cadence-nextest"),
+                "list",
+                "--archive-file", str(archive),
+                "--extract-to", str(root),
+                "--message-format", "json",
+            ],
+            cwd=root, check=True, capture_output=True, text=True,
+        )
+        doc = json.loads(out.stdout)
+        all_ids = []
+        inventory = []
+        for binary_id, suite in doc["rust-suites"].items():
+            for name, case in suite["testcases"].items():
+                all_ids.append(f"{binary_id} {name}")
+                if (
+                    case["kind"] == "test"
+                    and not case["ignored"]
+                    and case["filter-match"]["status"] == "matches"
+                ):
+                    inventory.append((binary_id, name))
+        if len(set(all_ids)) != len(all_ids):
+            raise ValueError("duplicate test id in extracted inventory")
+        producer_doc = json.loads((bundle_dir / 'inventory.json').read_text())
+        if inventory_facts(doc) != inventory_facts(producer_doc):
+            raise ValueError('extracted inventory eligibility differs from producer inventory.json')
+        inventory = sorted(inventory)
+        verify_compiled_source(root, expected["source_sha"])
+    else:
+        (root / "target/nextest/cadence/junit.xml").unlink(missing_ok=True)
+    command = [str(root / "scripts/cadence-nextest")]
+    if reuse:
+        command += reuse_args(root)
+    else:
+        command += [*args, "--locked", "--features", "test-seam"]
     if shard is not None:
         weights_doc = {}
         weights_sha256 = ""
         if weights is not None:
             weights_sha256 = hashlib.sha256(Path(weights).read_bytes()).hexdigest()
             weights_doc = load_weights(weights)
-        inventory = list_tests(root, args)
+        if not reuse:
+            inventory = list_tests(root, args)
         inventory_ids = [f"{b} {n}" for b, n in inventory]
         shards = assign(inventory, weights_doc, shard[1])
         mine = shards[shard[0] - 1]
@@ -200,7 +446,10 @@ def run(root, plan, phase, partition="", weights=None, assignment_out=None, dry_
         # Self-check: the filterset must select exactly this shard's
         # assignment — a quoting or escaping bug fails here, never
         # silently drops tests.
-        listed = {f"{b} {n}" for b, n in list_tests(root, args, ["-E", expr])}
+        listed = {f"{b} {n}" for b, n in (
+            list_reused(root, ["-E", expr])
+            if reuse else list_tests(root, args, ["-E", expr])
+        )}
         if listed != set(mine):
             raise ValueError(
                 "filterset self-check mismatch — "
@@ -223,15 +472,23 @@ def main():
     parser.add_argument("--weights", default=None, help="shard weights JSON (tests phase only)")
     parser.add_argument("--assignment-out", default=None, help="write this shard's assignment JSON")
     parser.add_argument("--dry-run", action="store_true", help="assign and self-check, don't run")
+    parser.add_argument("--bundle", type=Path, default=None,
+                        help="verified producer bundle dir (tests phase reuse)")
+    parser.add_argument("--expected", type=Path, default=None,
+                        help="independently supplied expected context JSON")
     args = parser.parse_args()
+    if (args.bundle is None) != (args.expected is None):
+        parser.error("--bundle and --expected must be used together")
     run(
         args.root.resolve(),
-        json.loads(args.plan.read_text()),
+        args.plan,
         args.phase,
         args.partition,
         args.weights,
         args.assignment_out,
         args.dry_run,
+        bundle_dir=args.bundle.resolve() if args.bundle else None,
+        expected_path=args.expected.resolve() if args.expected else None,
     )
 
 

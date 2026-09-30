@@ -149,6 +149,14 @@ jobs:
         run: python3 tests/scripts/test_release_publication_policy.py
       - name: Test assertion inventory scanner
         run: python3 tests/scripts/test_assert_inventory.py
+      # CAD-858: the producer-to-shard provenance boundary and the
+      # compile-once DAG wiring run once here, not per shard.
+      - name: Test bundle provenance and archive workflow contracts
+        run: |
+          python3 tests/scripts/test_ci_nextest_bundle.py
+          python3 tests/scripts/test_ci_archive_workflow.py
+          python3 tests/scripts/test_ci_bundle_producer.py
+          python3 tests/scripts/test_ci_archive_safety.py
 
   clippy:
     needs: [queue-evidence]
@@ -166,25 +174,30 @@ jobs:
       # run — lint the feature-on shape too so it cannot rot.
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
 
-  # The suite runs partitioned across shards for wall time (CAD-809):
-  # each shard compiles everything (warm rust-cache) and runs the tests
-  # a checked-in cost-weight table assigns to it (LPT over
-  # tests/shard-weights.json — even wall, deterministic, self-checked
-  # against a nextest list before the run). `test` below aggregates
-  # under the stable required-check name and proves coverage from the
-  # per-shard assignment artifacts, so branch protection and downstream
-  # `needs.test` gates need no changes.
-  test-shard:
+  # CAD-858: the recorded feature-on scope compiles once here instead of
+  # eight times in the shards. This producer runs the trusted base-policy
+  # scope selection (moved verbatim from the old shard), proves Cargo/nextest
+  # inventory parity, then archives the exact compiled test tree once. Its
+  # outputs are the shards' only authority for which artifact to download;
+  # they are emitted only after the sealed bundle exists (digests of the
+  # actual files), so a failed producer can never green-light a consumer.
+  # A docs plan produces verified empty archive/inventory markers with no
+  # Cargo build, so the eight shard receipts below stay uniform.
+  test-build:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      # A shard failure must never hide the others' signal (or their
-      # cost evidence): every shard runs to its own verdict.
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    timeout-minutes: 30
+    outputs:
+      source_sha: ${{ steps.prepare.outputs.source_sha }}
+      run_id: ${{ steps.prepare.outputs.run_id }}
+      producer_attempt: ${{ steps.prepare.outputs.producer_attempt }}
+      mode: ${{ steps.prepare.outputs.mode }}
+      archive_sha256: ${{ steps.prepare.outputs.archive_sha256 }}
+      plan_sha256: ${{ steps.prepare.outputs.plan_sha256 }}
+      inventory_sha256: ${{ steps.prepare.outputs.inventory_sha256 }}
+      manifest_sha256: ${{ steps.prepare.outputs.manifest_sha256 }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -221,30 +234,166 @@ jobs:
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
           fi
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
+      # The toolchain is unconditional: even a docs pack pins real rustc,
+      # cargo and nextest identity in its manifest so consumers verify the
+      # empty markers against the same provenance shape.
+      - run: rustup toolchain install stable --profile minimal
+      # The producer does the single compile, so it keeps the dependency
+      # cache the shards gave up.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.mode != 'docs'
+      # PR93 is an explicit dependency of this CI follow-up. Its installer
+      # and wrapper verify the reviewed archive/binary, force retries=0, and
+      # force --no-tests fail; no tool is installed into PATH or the repo.
+      - name: Install pinned cargo-nextest (PR93 dependency)
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      # Inventory parity compiles once via the trusted runner, then the same
+      # recorded scope is archived. A base runner without archive capability
+      # conservatively upgrades the scope to full (recorded reason) inside
+      # prepare — it never falls back to per-shard compiles. Docs plans
+      # record empty markers and run no Cargo build.
+      - name: Build the recorded scope once and seal the bundle
+        id: prepare
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+          CADENCE_INVENTORY_TIMINGS_REPORT: ${{ runner.temp }}/inventory-timings/inventory.html
+        run: python3 scripts/ci-nextest-bundle.py prepare --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --inventory-runner "$RUNNER_TEMP/ci-rust-tests.py" --directory "$RUNNER_TEMP/nextest-bundle"
+      - name: Record inventory build context
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.prepare.outputs.mode != 'docs' && (steps.prepare.outcome == 'success' || steps.prepare.outcome == 'failure') }}
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          dir="${{ runner.temp }}/inventory-timings"
+          mkdir -p "$dir"
+          if [ "${{ steps.prepare.outputs.timings_available }}" = true ]; then
+            availability='Inventory compiler timings captured from the first build.'
+          else
+            availability='Inventory compiler timings unavailable: no fresh complete report was retained.'
+          fi
+          echo "$availability" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "$availability"
+            printf 'source=%s\n' "$(git rev-parse HEAD)"
+            rustc --version --verbose
+            printf 'runner=%s/%s image=%s/%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'features=test-seam scope=%s jobs=%s RUSTFLAGS=%s\n' '${{ steps.prepare.outputs.mode }}' "$CARGO_BUILD_JOBS" "$RUSTFLAGS"
+            if [ -f "$RUNNER_TEMP/nextest-bundle/ci-test-plan.json" ]; then
+              cat "$RUNNER_TEMP/nextest-bundle/ci-test-plan.json"
+            else
+              echo 'prepared scope unavailable; inventory did not start'
+            fi
+            printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
+            printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
+            echo 'profile=test (dev settings in Cargo.toml); Rust cache via pinned Swatinem/rust-cache; actual warm/cold/cache hits not measured'
+            sha256sum Cargo.toml Cargo.lock .config/nextest.toml
+            echo 'Integration targets importing common (each unit also includes its own tests and link):'
+            git grep -l '^mod common;' -- 'tests/*.rs'
+            echo 'Unit durations are cumulative work, not elapsed critical path or common-module attribution.'
+            echo 'Compare later existing steps using their Finished profile log lines; only the first inventory build is captured here.'
+          } > "$dir/context.txt"
+      - name: Keep inventory compiler timings
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.prepare.outputs.mode != 'docs' && (steps.prepare.outcome == 'success' || steps.prepare.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-timings-${{ github.run_id }}-${{ github.run_attempt }}-inventory
+          path: |
+            ${{ steps.prepare.outputs.timings_available == 'true' && format('{0}/inventory-timings/inventory.html', runner.temp) || '' }}
+            ${{ runner.temp }}/inventory-timings/context.txt
+          if-no-files-found: warn
+          retention-days: 14
+      # The bundle name is unique to this exact run, attempt and source; it
+      # is never overwritten, so the artifact-id the job output names is
+      # immutable evidence a failed-only shard rerun can still trust.
+      # compression-level 0 keeps the already-zstd archive un-recompressed.
+      - name: Upload the sealed nextest bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-bundle-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/nextest-bundle/bundle.json
+            ${{ runner.temp }}/nextest-bundle/nextest.tar.zst
+            ${{ runner.temp }}/nextest-bundle/inventory.json
+            ${{ runner.temp }}/nextest-bundle/ci-test-plan.json
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  # The suite runs partitioned across shards for wall time (CAD-809):
+  # each shard downloads the producer's exact sealed archive (CAD-858 — no
+  # per-shard compile, no restored target cache) and runs the tests a
+  # checked-in cost-weight table assigns to it (LPT over
+  # tests/shard-weights.json — even wall, deterministic, self-checked
+  # against a nextest list before the run). `test` below aggregates
+  # under the stable required-check name and proves coverage from the
+  # per-shard assignment artifacts, so branch protection and downstream
+  # `needs.test` gates need no changes.
+  test-shard:
+    needs: [queue-evidence, test-build]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' && needs.test-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # A shard failure must never hide the others' signal (or their
+      # cost evidence): every shard runs to its own verdict.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - name: Test scope selection and execution contracts
         run: python3 tests/scripts/test_ci_test_plan.py
       - name: Test suite-shard partition contracts
         run: python3 tests/scripts/test_ci_rust_tests.py
       - name: Test shard-assignment coverage gate
         run: python3 tests/scripts/test_ci_shard_check.py
+      # The producer's needs JSON crosses jobs only through an env var and
+      # a file write — never text interpolation into a run block, so a
+      # crafted output cannot inject shell. The bundle carries no target
+      # cache and nothing here restores one; unknown target contents are
+      # never deleted to make room.
+      - name: Record producer job evidence
+        env:
+          PRODUCER_JSON: ${{ toJSON(needs.test-build) }}
+        run: printf '%s' "$PRODUCER_JSON" > "$RUNNER_TEMP/producer.json"
+      # Select validates the producer result, source/run identity and
+      # attempt against this workflow's own context, then emits the one
+      # immutable artifact-id — never a name lookup or a latest pointer.
+      - name: Select the exact immutable producer artifact
+        id: select
+        run: python3 scripts/ci-nextest-bundle.py select --root "$GITHUB_WORKSPACE" --producer "$RUNNER_TEMP/producer.json" --out "$RUNNER_TEMP/bundle-reference.json"
+      - name: Download the selected producer bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.select.outputs.artifact_id }}
+          path: ${{ runner.temp }}/nextest-bundle
       - run: rustup toolchain install stable --profile minimal
-        if: steps.scope.outputs.mode != 'docs'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.scope.outputs.mode != 'docs'
+      # No Swatinem cache step here: the consumer extracts the producer's
+      # exact archive into a fresh target and never compiles the suite.
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        if: steps.scope.outputs.mode != 'docs'
+        if: needs.test-build.outputs.mode != 'docs'
         with:
           package_json_file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: steps.scope.outputs.mode != 'docs'
+        if: needs.test-build.outputs.mode != 'docs'
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-        if: steps.scope.outputs.mode != 'docs'
+        if: needs.test-build.outputs.mode != 'docs'
         working-directory: ui
       - name: Test nextest cost reporting
         run: python3 tests/scripts/test_nextest_cost_report.py
@@ -257,67 +406,18 @@ jobs:
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
       - name: Install pinned cargo-nextest (PR93 dependency)
-        if: steps.scope.outputs.mode != 'docs'
         env:
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
-      # The recorded inventory must be non-empty and exactly equal between
-      # Cargo and nextest. Queue/main fallback/tag events retain all targets;
-      # selected PRs retain lib/bin and affected integration binaries.
-      # CAD-482: the suite runs under the `test-seam` feature so fixture
-      # daemons and boards exercise the asserted-identity seam (a debug
-      # build; release builds can never carry it — see the build job).
-      - name: Verify selected inventory parity
-        id: inventory
-        if: steps.scope.outputs.mode != 'docs'
-        env:
-          CARGO_BUILD_JOBS: 4
-          CADENCE_INVENTORY_TIMINGS_REPORT: ${{ runner.temp }}/inventory-timings/inventory.html
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase inventory
-      - name: Record inventory build context
-        continue-on-error: true
-        if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
-        env:
-          CARGO_BUILD_JOBS: 4
-        run: |
-          dir="${{ runner.temp }}/inventory-timings"
-          mkdir -p "$dir"
-          if [ "${{ steps.inventory.outputs.timings_available }}" = true ]; then
-            availability='Inventory compiler timings captured from the first build.'
-          else
-            availability='Inventory compiler timings unavailable: no fresh complete report was retained.'
-          fi
-          echo "$availability" >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo "$availability"
-            printf 'source=%s\n' "$(git rev-parse HEAD)"
-            rustc --version --verbose
-            printf 'runner=%s/%s image=%s/%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
-            printf 'features=test-seam scope=%s jobs=%s RUSTFLAGS=%s\n' '${{ steps.scope.outputs.mode }}' "$CARGO_BUILD_JOBS" "$RUSTFLAGS"
-            cat "$RUNNER_TEMP/ci-test-plan.json"
-            printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
-            printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
-            echo 'profile=test (dev settings in Cargo.toml); Rust cache via pinned Swatinem/rust-cache; actual warm/cold/cache hits not measured'
-            sha256sum Cargo.toml Cargo.lock .config/nextest.toml
-            echo 'Integration targets importing common (each unit also includes its own tests and link):'
-            git grep -l '^mod common;' -- 'tests/*.rs'
-            echo 'Unit durations are cumulative work, not elapsed critical path or common-module attribution.'
-            echo 'Compare later existing steps using their Finished profile log lines; only the first inventory build is captured here.'
-          } > "$dir/context.txt"
-      - name: Keep inventory compiler timings
-        continue-on-error: true
-        if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: compiler-timings-${{ github.run_id }}-${{ github.run_attempt }}-inventory-shard-${{ matrix.shard }}
-          path: |
-            ${{ steps.inventory.outputs.timings_available == 'true' && format('{0}/inventory-timings/inventory.html', runner.temp) || '' }}
-            ${{ runner.temp }}/inventory-timings/context.txt
-          if-no-files-found: warn
-          retention-days: 14
+      # Expected build/tool/runner facts come from this checkout and this
+      # runner, merged with the producer's validated digests — never read
+      # out of bundle.json, which cannot vouch for itself. Runs for docs
+      # too: the runner verifies the empty-marker bundle against it.
+      - name: Capture independent expected bundle context
+        run: python3 scripts/ci-nextest-bundle.py expect --root "$GITHUB_WORKSPACE" --reference "$RUNNER_TEMP/bundle-reference.json" --out "$RUNNER_TEMP/bundle-expected.json"
       # CAD-562: the CAD-536 generated tree must stay consistent with its
       # manifest — every declared item and every #[test] fn accounted
       # for (tests/split_map_inventory.rs is the suite-side twin check).
@@ -327,7 +427,7 @@ jobs:
       # through `ui/dist`. The ui job cannot hand files to this job
       # without artifact transfer, so build here before nextest (non-docs).
       - name: Build SPA for board-surface Rust tests
-        if: steps.scope.outputs.mode != 'docs'
+        if: needs.test-build.outputs.mode != 'docs'
         run: pnpm build
         working-directory: ui
       - name: Run recorded Rust scope with pinned nextest
@@ -335,7 +435,7 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/8" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
+        run: python3 scripts/ci-rust-tests.py --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/nextest-bundle/ci-test-plan.json" --phase tests --bundle "$RUNNER_TEMP/nextest-bundle" --expected "$RUNNER_TEMP/bundle-expected.json" --partition "${{ matrix.shard }}/8" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
       - name: Keep the shard's test assignment
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -366,7 +466,7 @@ jobs:
         with:
           name: nextest-costs-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/ci-test-plan.json
+            ${{ runner.temp }}/nextest-bundle/ci-test-plan.json
             ${{ runner.temp }}/nextest-costs.json
             ${{ runner.temp }}/nextest-costs.md
           if-no-files-found: warn
@@ -406,12 +506,12 @@ jobs:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
 
-  # Stable required-check name over the shards and the once-only job
-  # above: branch protection requires `test`, and downstream gates read
-  # `needs.test.result`. Skipped (not failed) when either fails, so red
-  # stays red.
+  # Stable required-check name over the producer, the shards and the
+  # once-only job above: branch protection requires `test`, and downstream
+  # gates read `needs.test.result`. Producer failure, skip or missing
+  # outputs can never read green here (CAD-858).
   test:
-    needs: [queue-evidence, test-shard, test-once]
+    needs: [queue-evidence, test-build, test-shard, test-once]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -423,6 +523,31 @@ jobs:
           echo "test-once: ${{ needs.test-once.result }}"
           [ "${{ needs.test-shard.result }}" = success ]
           [ "${{ needs.test-once.result }}" = success ]
+      # CAD-858: a failed, cancelled or skipped producer can never read
+      # green either, and it must not produce shards at all (their own
+      # gate pins test-build success, so this runs even when the shard
+      # was skipped — the aggregate still names the failed producer).
+      - name: Require a successful bundle producer
+        run: |
+          echo "test build: ${{ needs.test-build.result }}"
+          [ "${{ needs.test-build.result }}" = success ]
+      # A successful producer with missing or malformed outputs is not
+      # evidence either: every contract field the shards consumed must be
+      # present and shaped before coverage is even inspected.
+      - name: Require complete producer evidence
+        env:
+          PRODUCER_OUTPUTS: ${{ toJSON(needs.test-build.outputs) }}
+        run: |
+          printf '%s' "$PRODUCER_OUTPUTS" | jq -e '
+            (.source_sha | test("^[0-9a-f]{40}$")) and
+            (.run_id | test("^[1-9][0-9]*$")) and
+            (.producer_attempt | test("^[1-9][0-9]*$")) and
+            (.mode | test("^(docs|selected|full)$")) and
+            (.artifact_id | test("^[1-9][0-9]*$")) and
+            (.archive_sha256 | test("^[0-9a-f]{64}$")) and
+            (.plan_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
+            (.manifest_sha256 | test("^[0-9a-f]{64}$"))' >/dev/null
       # Cost-weighted shards carry no nextest partition hash, so coverage
       # is proven from the assignment artifacts themselves: eight files,
       # identical inventory, disjoint tests, union complete (CAD-809).

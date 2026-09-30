@@ -4,6 +4,7 @@
 The partition travels as an explicit CLI argument, never ambient env:
 exact-command contract tests broke twice on env leaking across steps.
 """
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -28,6 +29,24 @@ def load(name, filename):
 runner = load("runner", "ci-rust-tests.py")
 
 FULL = {"schema": 1, "mode": "full", "targets": [], "reason": "t"}
+
+
+class StandaloneInventoryCLI(unittest.TestCase):
+    def test_copied_inventory_runner_does_not_require_archive_sibling(self):
+        with tempfile.TemporaryDirectory(prefix='standalone-inventory.') as temporary:
+            root = Path(temporary)
+            copied = root / 'ci-rust-tests.py'
+            copied.write_bytes((ROOT / 'scripts/ci-rust-tests.py').read_bytes())
+            scripts = root / 'scripts'
+            scripts.mkdir()
+            inventory = scripts / 'nextest-inventory'
+            inventory.write_text('#!/bin/sh\n[ "$*" = "all-targets --features test-seam" ]\n')
+            inventory.chmod(0o755)
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps(FULL))
+            result = subprocess.run([sys.executable, str(copied), '--root', str(root), '--plan', str(plan),
+                                     '--phase', 'inventory'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class PartitionArgs(unittest.TestCase):
@@ -154,6 +173,20 @@ class Filterset(unittest.TestCase):
         for bad in ['b "quoted" n', 'b n"ame', "b a'b"]:
             with self.assertRaises(ValueError, msg=bad):
                 runner.filterset([bad])
+
+
+class ScopeArgsSchema(unittest.TestCase):
+    def test_duplicate_targets_refused(self):
+        for targets in [["a", "a"], ["a", "b", "a"]]:
+            with self.assertRaises(ValueError, msg=targets):
+                runner.scope_args({"schema": 1, "mode": "selected",
+                                   "targets": targets, "reason": "t"})
+
+    def test_schema_must_be_integer_one(self):
+        for bad_schema in (True, "1", 1.5):
+            with self.assertRaises(ValueError, msg=repr(bad_schema)):
+                runner.scope_args({"schema": bad_schema, "mode": "full",
+                                   "targets": [], "reason": "t"})
 
 
 class LoadWeights(unittest.TestCase):
@@ -318,6 +351,338 @@ def costs_dir(root, attempt, shard, tests):
         "slowest": [{"suite": s, "name": n, "status": "passed", "duration_s": dsec}
                     for s, n, dsec in tests],
     }))
+
+
+class BundleReuse(unittest.TestCase):
+    """CAD-858: shards consume the verified producer archive instead of
+    compiling. Only verify_bundle/check_archive/subprocess.run are
+    patched — read_context and the bundle files stay real, so byte/hash
+    comparisons genuinely bind the runner to the producer's outputs."""
+
+    SHA = "a" * 40
+    BIN_DIR = "target/nextest"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "ws"
+        self.root.mkdir()
+        self.dir = self.base / "bundle"
+        self.dir.mkdir()
+        # Producer-pinned plan and inventory travel inside the bundle.
+        (self.dir / "ci-test-plan.json").write_text(json.dumps(FULL, indent=2))
+        (self.dir / "inventory.json").write_text(json.dumps({
+            "rust-suites": {
+                "b::one": {"testcases": {"t1": case(), "skip_me": case(ignored=True)}},
+                "b::two": {"testcases": {"t2": case(), "filtered": case(status="mismatch")}},
+            },
+            "test-count": 4,
+        }))
+        (self.dir / "nextest.tar.zst").write_bytes(b"synthetic archive")
+        self.expected = {
+            "schema": 1,
+            "source_sha": self.SHA,
+            "run_id": "12345",
+            "producer_attempt": "1",
+            "nextest_version": "0.9.145",
+            "features": ["test-seam"],
+            "workspace_root": str(self.root),
+            "build": {"target_root": str(self.root / "target")},
+            "plan_sha256": hashlib.sha256(
+                (self.dir / "ci-test-plan.json").read_bytes()).hexdigest(),
+            "inventory_sha256": hashlib.sha256(
+                (self.dir / "inventory.json").read_bytes()).hexdigest(),
+            "archive_sha256": hashlib.sha256(
+                (self.dir / "nextest.tar.zst").read_bytes()).hexdigest(),
+        }
+        self.authority = self.base / "expected.json"
+        self.authority.write_text(json.dumps(self.expected))
+        self.plan = self.base / "cli-plan.json"
+        self.plan.write_bytes((self.dir / "ci-test-plan.json").read_bytes())
+        self.calls = []
+        self.real_run = subprocess.run
+
+    def served(self, cmd):
+        """The extracted list honours -E so the self-check stays real."""
+        doc = LIST_DOC
+        if "-E" in cmd:
+            names = set(re.findall(r'test\(=([A-Za-z0-9_:\-./]+)\)',
+                                   cmd[cmd.index("-E") + 1]))
+            doc = {"rust-suites": {b: {"testcases": {
+                n: c for n, c in s["testcases"].items() if n in names}}
+                for b, s in doc["rust-suites"].items()}}
+        return doc
+
+    def fake(self, cmd, **kw):
+        self.calls.append(cmd)
+        if "--extract-to" in cmd and self.stub_version is not None:
+            # The extraction list is what materializes target/; the
+            # version stub only exists once it has run.
+            self.install_version_stub(self.stub_version)
+        if cmd[0] == str(self.root / "target/debug/cadence"):
+            # The version probe is a real executable stub, not a nextest
+            # JSON endpoint.
+            return self.real_run(cmd, **kw)
+
+        class Out:
+            stdout = json.dumps(self.served(cmd))
+
+        return Out()
+
+    def install_version_stub(self, version=None):
+        """Executable `target/debug/cadence` reporting a source-suffixed build."""
+        binary = self.root / "target/debug/cadence"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        version = version or f"cadence 0.1.2+{self.SHA}"
+        binary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' " + version + "\n")
+        binary.chmod(0o755)
+
+    def reused(self, partition="1/8", plan_path=None, install_stub=True,
+               version=None, expected_patch=None, **overrides):
+        self.stub_version = (
+            (version or f"cadence 0.1.2+{self.SHA}") if install_stub else None
+        )
+        if expected_patch is not None:
+            patched = dict(self.expected, **expected_patch)
+            self.authority.write_text(json.dumps(patched))
+        kw = dict(partition=partition, assignment_out=self.base / "assignment.json")
+        kw.update(overrides)
+        bdir = kw.pop("bundle_dir", self.dir)
+        epath = kw.pop("expected_path", self.authority)
+        with patch.object(runner.bundle, "verify_bundle",
+                          return_value=Path(bdir) / "nextest.tar.zst") as verify, \
+             patch.object(runner.bundle, "check_archive",
+                          # The preflight callable lands with the main
+                          # patch; mock/patch only, never implemented here.
+                          create=True,
+                          return_value=Path(bdir) / "nextest.tar.zst") as check, \
+             patch.object(runner.subprocess, "run", side_effect=self.fake):
+            runner.run(self.root, plan_path or self.plan,
+                       "tests", bundle_dir=bdir,
+                       expected_path=epath, **kw)
+        return verify, check
+
+    def test_reuse_extracts_verified_archive_then_runs_metadata_only(self):
+        verify, check = self.reused()
+        verify.assert_called_once_with(self.dir, self.expected)
+        check.assert_called_once_with(self.dir / "nextest.tar.zst")
+        extract, probe, selfcheck, run = self.calls
+        self.assertEqual(probe,
+                         [str(self.root / "target/debug/cadence"), "--version"])
+        self.assertEqual(extract[0], str(self.root / "scripts/cadence-nextest"))
+        # Extraction list: archive flags only — never Cargo selectors,
+        # features, --locked or the reuse metadata flags.
+        self.assertEqual(extract[1:3], ["list", "--archive-file"])
+        self.assertEqual(extract[3], str(self.dir / "nextest.tar.zst"))
+        self.assertEqual(extract[4:6], ["--extract-to", str(self.root)])
+        self.assertEqual(extract[6:], ["--message-format", "json"])
+        for banned in ("--extract-overwrite", "--locked", "--features",
+                       "--all-targets", "--lib", "--bins", "--test",
+                       "--cargo-metadata", "--binaries-metadata",
+                       "--workspace-remap", "--target-dir-remap", "-E"):
+            self.assertNotIn(banned, extract)
+        # Self-check list and run: metadata reuse flags, never archive or
+        # Cargo invocation flags. The run's only selector is -E, and the
+        # run keeps the wrapper's default `run` subcommand (no positional).
+        self.assertEqual(selfcheck[:2],
+                         [str(self.root / "scripts/cadence-nextest"), "list"])
+        self.assertEqual(run[0], str(self.root / "scripts/cadence-nextest"))
+        self.assertTrue(run[1].startswith("--"))
+        for cmd in (selfcheck, run):
+            for flag, value in (
+                ("--cargo-metadata", str(self.root / self.BIN_DIR
+                                         / "cargo-metadata.json")),
+                ("--binaries-metadata", str(self.root / self.BIN_DIR
+                                            / "binaries-metadata.json")),
+                ("--workspace-remap", str(self.root)),
+                ("--target-dir-remap", str(self.root / "target")),
+            ):
+                self.assertIn(flag, cmd)
+                self.assertEqual(cmd[cmd.index(flag) + 1], value)
+            for banned in ("--archive-file", "--extract-to", "--locked",
+                           "--features", "--all-targets", "--lib", "--bins",
+                           "--test", "--partition"):
+                self.assertNotIn(banned, cmd)
+        self.assertIn("-E", selfcheck)
+        self.assertIn("-E", run)
+        self.assertEqual(run[-1], selfcheck[-1])  # identical filterset
+        assignment = json.loads((self.base / "assignment.json").read_text())
+        self.assertEqual(sorted(assignment["inventory"]),
+                         ["b::one t1", "b::two t2"])
+
+    def test_verify_precedes_every_nextest_call(self):
+        # A tampered bundle must refuse before the extraction list: the
+        # verifier's ValueError propagates and no subprocess runs.
+        with patch.object(runner.bundle, "verify_bundle",
+                          side_effect=ValueError("archive_sha256 mismatch")), \
+             patch.object(runner.subprocess, "run", side_effect=self.fake):
+            with self.assertRaises(ValueError):
+                runner.run(self.root, self.plan, "tests", partition="1/8",
+                           assignment_out=self.base / "a.json",
+                           bundle_dir=self.dir, expected_path=self.authority)
+        self.assertEqual(self.calls, [])
+
+    def test_expected_context_cannot_be_supplied_by_the_bundle(self):
+        inner = self.dir / 'expected.json'
+        inner.write_bytes(self.authority.read_bytes())
+        with self.assertRaises(ValueError):
+            self.reused(expected_path=inner)
+        self.assertEqual(self.calls, [])
+
+    def test_same_ids_with_changed_ignored_status_cannot_shrink_coverage(self):
+        changed = json.loads(json.dumps(LIST_DOC))
+        changed['rust-suites']['b::one']['testcases']['t1']['ignored'] = True
+        original = self.served
+        self.served = lambda cmd: changed
+        try:
+            with self.assertRaises(ValueError):
+                self.reused()
+        finally:
+            self.served = original
+        self.assertEqual(len(self.calls), 1)
+
+    def test_cli_plan_must_equal_bundle_plan_bytes(self):
+        self.plan.write_text(json.dumps(dict(FULL, reason="different")))
+        with self.assertRaises(ValueError):
+            self.reused()
+        self.assertEqual(self.calls, [])  # refused before any nextest call
+
+    def test_expected_workspace_root_mismatch_refuses_before_verify(self):
+        with patch.object(runner.bundle, "verify_bundle") as verify, \
+             patch.object(runner.subprocess, "run", side_effect=self.fake):
+            with self.assertRaises(ValueError):
+                self.reused(expected_patch={"workspace_root": str(self.base)})
+        verify.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_target_dir_must_be_absent_including_symlink(self):
+        (self.root / "target").mkdir()
+        with self.assertRaises(ValueError):
+            self.reused()
+        (self.root / "target").rmdir()
+        (self.root / "target").symlink_to(self.base / "elsewhere")
+        with self.assertRaises(ValueError):
+            self.reused()
+        self.assertEqual(self.calls, [])
+        (self.root / "target").unlink()
+
+    def test_cargo_target_dir_remap_env_refused(self):
+        for value in (str(self.base / "alt"), str(self.root / "target")):
+            self.calls.clear()
+            with self.subTest(value=value), \
+                 patch.dict("os.environ", {"CARGO_TARGET_DIR": value}):
+                with self.assertRaises(ValueError):
+                    self.reused()
+            self.assertEqual(self.calls, [])
+
+    def test_extracted_inventory_must_equal_producer_inventory(self):
+        doc = {"rust-suites": {"b::one": {"testcases": {
+            "t1": case(), "intruder": case()}}}}
+        served = self.served
+        self.served = lambda cmd: doc  # the extracted list lies
+        try:
+            with self.assertRaises(ValueError):
+                self.reused()
+        finally:
+            self.served = served
+        # Refusal lands before the run: only the extraction list happened.
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("--extract-to", self.calls[0])
+
+    def test_compiled_binary_must_match_expected_source(self):
+        # A binary whose embedded source SHA differs from the expected
+        # context refuses before any assigned-tests run.
+        with self.assertRaises(ValueError):
+            self.reused(version="cadence 0.1.2+" + "b" * 40)
+        for cmd in self.calls:  # the compiled-tests run never starts
+            self.assertNotEqual(cmd[1:2], ["run"])
+
+    def test_bundle_dir_must_not_live_under_root(self):
+        inner = self.root / "bundle"
+        inner.mkdir()
+        for name in ("ci-test-plan.json", "inventory.json", "nextest.tar.zst"):
+            (inner / name).write_bytes((self.dir / name).read_bytes())
+        with self.assertRaises(ValueError):
+            self.reused(bundle_dir=inner)
+        self.assertEqual(self.calls, [])
+
+    def test_empty_shard_still_extracts_and_verifies_binary(self):
+        _, check = self.reused(partition="8/8")
+        check.assert_called_once()
+        # Extraction list + version probe happen, but the empty
+        # assignment means no self-check list and no run.
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("--extract-to", self.calls[0])
+        assignment = json.loads((self.base / "assignment.json").read_text())
+        self.assertEqual(assignment["tests"], [])
+
+    def test_reuse_without_partition_runs_all_selected_metadata_only(self):
+        self.reused(partition="")
+        extract, probe, run = self.calls
+        self.assertIn("--extract-to", extract)
+        self.assertEqual(probe,
+                         [str(self.root / "target/debug/cadence"), "--version"])
+        self.assertIn("--workspace-remap", run)
+        self.assertNotIn("-E", run)
+        for banned in ("--locked", "--features", "--all-targets"):
+            self.assertNotIn(banned, run)
+
+    def test_reuse_requires_the_recorded_plan_file(self):
+        with self.assertRaises(ValueError):
+            runner.run(self.root, dict(FULL), "tests", partition="1/8",
+                       assignment_out=self.base / "a.json",
+                       bundle_dir=self.dir, expected_path=self.authority)
+
+    def test_missing_version_probe_binary_fails(self):
+        # Extraction that never produced target/debug/cadence must fail
+        # loud at the version probe, not silently run unverified code.
+        with self.assertRaises((ValueError, OSError)):
+            self.reused(install_stub=False)
+
+    def test_docs_bundle_verifies_markers_and_never_extracts(self):
+        plan_doc = {"schema": 1, "mode": "docs", "targets": [],
+                    "reason": "docs only"}
+        (self.dir / "ci-test-plan.json").write_text(json.dumps(plan_doc))
+        self.plan.write_bytes((self.dir / "ci-test-plan.json").read_bytes())
+        (self.dir / "inventory.json").write_text(
+            json.dumps({"rust-suites": {}, "test-count": 0}))
+        (self.dir / "nextest.tar.zst").write_bytes(b"")
+        out = self.base / "assignment.json"
+        verify, check = self.reused(partition="1/8", install_stub=False,
+                                    assignment_out=out)
+        verify.assert_called_once()
+        check.assert_not_called()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / "target").exists())
+        assignment = json.loads(out.read_text())
+        self.assertEqual(assignment["tests"], [])
+
+    def test_docs_bundle_rejects_non_empty_markers(self):
+        plan_doc = {"schema": 1, "mode": "docs", "targets": [],
+                    "reason": "docs only"}
+        (self.dir / "ci-test-plan.json").write_text(json.dumps(plan_doc))
+        self.plan.write_bytes((self.dir / "ci-test-plan.json").read_bytes())
+        (self.dir / "inventory.json").write_text(
+            json.dumps({"rust-suites": {}, "test-count": 0}))
+        # A non-empty archive marker refuses before extraction.
+        with self.assertRaises(ValueError):
+            self.reused(partition="1/8", install_stub=False)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / "target").exists())
+
+    def test_reuse_flags_rejected_without_bundle_pair(self):
+        for kw in ({"bundle_dir": self.dir}, {"expected_path": self.authority}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                runner.run(self.root, self.plan, "tests", **kw)
+        with self.assertRaises(ValueError):
+            runner.run(self.root, self.plan, "inventory",
+                       bundle_dir=self.dir, expected_path=self.authority)
+
+    def test_archive_protocol_marker_is_a_literal(self):
+        # The producer's AST capability probe needs an exact literal.
+        self.assertEqual(runner.ARCHIVE_PROTOCOL, 1)
 
 
 class ShardWeightsGen(unittest.TestCase):
