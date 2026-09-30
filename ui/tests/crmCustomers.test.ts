@@ -495,8 +495,22 @@ await click(Array.from(host.querySelectorAll("button")).find((el) => el.textCont
 await settle(() => assert(text().includes("Chidi Anagonye"), "the imported row re-reads from the list"));
 
 // A file over the byte bound is refused before it is ever read —
-// `File.text()` must not run. Stub the prototype's text() for the
-// duration; a real oversized File carries its size without reading.
+// `File.text()` must not run, AND a new selection must discard any
+// prior plan: the operator can never commit bytes they no longer have
+// selected. First build a real preview so there is a live plan to lose.
+// The fetch mock answers csv-preview again for this pick.
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "d".repeat(64),
+      row_count: 1,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 0, error: 0 },
+      rows: [{ row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye" }, errors: [], reason: null }],
+    }), { status: 200 });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
 const realText = File.prototype.text;
 let fileReads = 0;
 File.prototype.text = function () {
@@ -505,6 +519,11 @@ File.prototype.text = function () {
 };
 await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
 await settle(() => assert(host.querySelector("#csv-text"), "import page reopens for the file pick"));
+await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "a live preview stands before the oversized pick"));
+const applyBefore = Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import "));
+assert(applyBefore && !(applyBefore as HTMLButtonElement).disabled, "a live plan is committable before the bad pick");
 const oversized = new File([new Uint8Array(300 * 1024)], "big.csv", { type: "text/csv" });
 const fileInput = host.querySelector("#csv-file") as HTMLInputElement;
 assert(fileInput, "the file input renders");
@@ -516,6 +535,8 @@ await flush();
 assert(fileReads === 0, "an oversized file is refused without being read");
 assert(text().includes("256 KiB bound"), "the refusal names the bound");
 assert((host.querySelector("#csv-text") as HTMLTextAreaElement).value === "", "no bytes landed in the source");
+assert(!host.querySelector("[data-preview-summary]"), "the rejected pick discards the prior plan");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => (el.textContent ?? "").startsWith("Import ")), "no committable plan survives the rejected pick");
 File.prototype.text = realText;
 
 // A second import with a preview that went stale refuses — the token
