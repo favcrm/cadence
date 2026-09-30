@@ -309,21 +309,19 @@ export default function AppShell({
   // to the trigger. The closed drawer is `visibility: hidden`, so it
   // stays out of the tab order with the draft intact.
   //
-  // Focus is deferred to the next animation frame: a synchronous
-  // commit-phase `.focus()` loses the race to the pointer/keyboard
-  // activation's own focus (the browser re-targets the toggle on
-  // click/Enter after React commits), so the composer never received
-  // focus on open. The frame lands after native activation settles.
-  // Cleanup cancels a still-pending frame so a rapid close can't steal
-  // focus back, and a read-only/disabled composer yields to the Close
-  // control (an enabled target) instead of a no-op.
+  // Observed defect (baseline in d379ae54, real Chrome): a synchronous
+  // commit-phase `.focus()` ran before the open activation's own focus
+  // (the toggle is focused on mousedown / Enter) was applied, so the
+  // composer never received focus. A single rAF still fired too early —
+  // before `data-open` propagated. Deferring two frames clears the open
+  // commit in both real and synthesized input; the `data-open` guard
+  // means the callback never focuses a still-hidden pane. Both frame
+  // ids are tracked so cleanup cancels whichever is still pending — a
+  // rapid close can never refocus once the user has moved on. A
+  // disabled (read-only) composer yields to the enabled Close control.
   useEffect(() => {
     if (!chatOpen) return;
-    // Defer past the open commit: the activation's own focus (toggle
-    // on mousedown) must settle first, and the open pane must exist.
-    // Two rAFs clear the click/Enter focus ordering in both real and
-    // synthesized input; cleanup cancels both so a rapid close never
-    // steals focus back. A disabled composer yields to Close.
+    let inner = 0;
     const focusComposer = () => {
       const pane = chatPaneRef.current;
       if (!pane || !pane.hasAttribute("data-open")) return;
@@ -333,15 +331,16 @@ export default function AppShell({
         : pane.querySelector<HTMLElement>(".app-shell-chat-close") ?? composer;
       target?.focus();
     };
-    const frame = requestAnimationFrame(() => requestAnimationFrame(focusComposer));
-    const timer = setTimeout(focusComposer, 30);
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(focusComposer);
+    });
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setChatOpen(false);
     };
     addEventListener("keydown", onKey);
     return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(timer);
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
       removeEventListener("keydown", onKey);
       chatOpenRef.current?.focus();
     };

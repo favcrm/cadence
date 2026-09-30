@@ -114,7 +114,7 @@ const win = new Window({ url: "http://localhost/app-installations/install-shell"
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
-  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
+  Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 let eventSources = 0;
@@ -259,9 +259,9 @@ equal(toggle.getAttribute("aria-expanded"), "false", "drawer starts closed");
 assert(!host.querySelector("#app-shell-chat")?.hasAttribute("data-open"), "closed drawer carries no open marker");
 await click(toggle);
 equal(toggle.getAttribute("aria-expanded"), "true", "drawer opens with accessible state");
-// Focus is deferred a frame so it lands after the pointer/keyboard
-// activation's own focus; flush once more to let that frame run.
-await flush();
+// Focus is deferred two frames so it lands after the pointer/keyboard
+// activation's own focus; flush lets each queued frame run.
+await flush(); await flush(); await flush();
 assert(document.activeElement?.id === "app-shell-chat-box", "opening moves focus into the pane");
 await fill("#app-shell-chat-box", "unsent shell draft");
 await React.act(async () => {
@@ -271,15 +271,50 @@ await flush();
 equal(toggle.getAttribute("aria-expanded"), "false", "Escape closes the drawer");
 assert(document.activeElement === toggle, "closing returns focus to the trigger");
 equal(eventSources, 1, "drawer cycles open no second stream");
-// A rapid open→close cancels the deferred focus: the frame must not
-// fire after close and steal focus back from the trigger.
-await React.act(async () => {
-  toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-});
-await flush();
-equal(toggle.getAttribute("aria-expanded"), "false", "rapid open-close ends closed");
-assert(document.activeElement === toggle, "rapid close keeps focus on the trigger, no deferred steal");
+// Controlled-frame proof that closing mid-deferral cancels the queued
+// composer focus instead of stealing it back. Capture the rAF queue so
+// we can run the outer frame (which schedules the inner focus frame),
+// close before the inner frame fires, then prove the pending inner
+// frame was cancelled — the composer is never focused after close.
+const rafQueue = new Map<number, FrameRequestCallback>();
+let rafNext = 0;
+const cancelled = new Set<number>();
+const realRaf = globalThis.requestAnimationFrame;
+const realCaf = globalThis.cancelAnimationFrame;
+globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+  const id = ++rafNext;
+  rafQueue.set(id, cb);
+  return id;
+}) as typeof requestAnimationFrame;
+globalThis.cancelAnimationFrame = ((id: number) => {
+  cancelled.add(id);
+  rafQueue.delete(id);
+}) as typeof cancelAnimationFrame;
+try {
+  await React.act(async () => {
+    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  equal(toggle.getAttribute("aria-expanded"), "true", "drawer open before the deferred frame runs");
+  // The outer rAF is queued; run it so it schedules the inner focus frame.
+  equal(rafQueue.size, 1, "one outer frame queued");
+  const outerCb = rafQueue.get(1)!;
+  rafQueue.delete(1);
+  await React.act(async () => { outerCb(performance.now()); });
+  equal(rafQueue.size, 1, "outer frame queued the inner focus frame");
+  // Close before the inner focus frame fires.
+  await React.act(async () => {
+    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  equal(toggle.getAttribute("aria-expanded"), "false", "closed before the focus frame");
+  assert(cancelled.has(2), "the pending inner focus frame was cancelled on close");
+  equal(rafQueue.size, 0, "no frame survives to refocus after close");
+  assert(document.activeElement === toggle, "focus returned to the trigger, never the composer");
+} finally {
+  globalThis.requestAnimationFrame = realRaf;
+  globalThis.cancelAnimationFrame = realCaf;
+}
 await click(toggle);
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across close/open");
 await click(toggle);
