@@ -50,8 +50,18 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/` and `templates/` files. See the
-existing [Blog post bundle](../../apps/blog-post/app.md) and
+`workflows/`, and supported optional `rubrics/`, `templates/` and `views/`
+files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
+data-only [app-views/v1](../../contracts/app-views/v1/README.md) descriptor —
+and only when `app.md` declares it with `needs.views.contract: app-views/v1`.
+The declaration and the file pair up: either alone refuses install, and the
+descriptor's `app` must be the bundle's own `app` name. Descriptor bytes are
+inside the installed bundle's digest, so a byte change re-gates approval like
+any other structural change; the verified `app catalog show` receipt serves
+the validated descriptor as `view_descriptor` (plus `view_descriptor_digest`),
+or `null` on bundles without one. Descriptors are declarations only — they do
+not render live data or carry actions. See the existing
+[Blog post bundle](../../apps/blog-post/app.md) and
 [Social Content bundle](../../apps/social-content/app.md).
 
 The React fixture preview at `app-previews/social-content` is **not** an
