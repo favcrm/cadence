@@ -570,8 +570,11 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor> {
     }
     let app = expect_ident(&raw["app"], "$.app")?.to_string();
     let title = expect_string(&raw["title"], "$.title", MAX_TITLE_LENGTH)?.to_string();
+    // `summary` is optional but never null — contract.ts's `text()`
+    // accepts only a present string; a JSON null is a type violation,
+    // not an absence.
     let summary = match map.get("summary") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(s) => Some(expect_string(s, "$.summary", MAX_SUMMARY_LENGTH)?.to_string()),
     };
     let raw_views = map
@@ -835,6 +838,37 @@ mod tests {
             parse_descriptor(&over).is_err(),
             "82 UTF-16-unit label (41 chars) accepted"
         );
+    }
+
+    /// `summary` parity with contract.ts `text()`: optional, but a
+    /// present non-string (incl. `null`) refuses — absent is the only
+    /// "none". Pins the exact optionality the consumer enforces.
+    #[test]
+    fn summary_is_optional_never_null() {
+        let view = "{\"id\":\"v\",\"title\":\"t\",\"kind\":\"detail\",\"fields\":[{\"id\":\"f\",\"label\":\"l\"}]}";
+        // Absent summary parses and stays absent.
+        let none = format!(
+            "{{\"contract\":\"app-views/v1\",\"app\":\"d\",\"title\":\"t\",\"views\":[{}]}}",
+            view
+        );
+        assert_eq!(parse_descriptor(&none).unwrap().summary, None);
+        // A real string parses.
+        let some = format!(
+            "{{\"contract\":\"app-views/v1\",\"app\":\"d\",\"title\":\"t\",\"summary\":\"hello\",\"views\":[{}]}}",
+            view
+        );
+        assert_eq!(
+            parse_descriptor(&some).unwrap().summary.as_deref(),
+            Some("hello")
+        );
+        // null / empty / non-string all refuse.
+        for bad in ["null", "\"\"", "0", "[]", "{}"] {
+            let input = format!(
+                "{{\"contract\":\"app-views/v1\",\"app\":\"d\",\"title\":\"t\",\"summary\":{},\"views\":[{}]}}",
+                bad, view
+            );
+            assert!(parse_descriptor(&input).is_err(), "summary {bad} accepted");
+        }
     }
 
     #[test]
