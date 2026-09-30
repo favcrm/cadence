@@ -89,8 +89,8 @@ function Cell({ field, value }: { field: AppViewField; value: AppViewCell | unde
       <span className="text-ink-500">—</span>
     ) : (
       <span className="av-tags">
-        {items.map((item) => (
-          <span key={item} className="chip">
+        {items.map((item, index) => (
+          <span key={`${index}:${item}`} className="chip">
             {item}
           </span>
         ))}

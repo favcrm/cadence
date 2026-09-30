@@ -251,6 +251,29 @@ assert(host.querySelector("table"), "the table view renders a real table");
 assert(host.querySelectorAll("th").length === 5, "five declared columns render as headers");
 assert(host.querySelector('[role="region"]'), "the scrollable table region is labelled");
 
+// Duplicate tag values are valid list data; the renderer must keep unique
+// reconciliation keys and preserve every chip when the list changes.
+const keyErrors: string[] = [];
+const originalConsoleError = console.error;
+console.error = (...args: unknown[]) => {
+  const message = args.map(String).join(" ");
+  if (/same key|unique.*key/i.test(message)) keyErrors.push(message);
+  else originalConsoleError(...args);
+};
+try {
+  for (const tags of [["vip", "vip"], ["vip", "member", "vip"]]) {
+    const rows = { customers: fixtureRows(crmTable, [{ ...appViewExamples.crm.rows.customers[0], tags }]) };
+    await React.act(async () => { root.render(React.createElement(AppView, {
+      descriptor: appViewExamples.crm.descriptor, rows, initialViewId: "customers",
+    })); });
+    equal(Array.from(host.querySelectorAll(".av-tags .chip")).map((el) => el.textContent), tags,
+      "duplicate chips survive list reconciliation without extra or missing nodes");
+  }
+  equal(keyErrors, [], "duplicate tag values produce no React key warnings");
+} finally {
+  console.error = originalConsoleError;
+}
+
 // Detail view renders labelled fields.
 await React.act(async () => {
   root.render(
