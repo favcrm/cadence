@@ -1096,6 +1096,20 @@ pub(super) fn board_caller(
     }
 }
 
+/// The daemon-owned device-login config (CAD-841), fetched per
+/// request — the daemon's store is the only authority, so a
+/// `device-login set`/`clear` applies to this running board at once.
+/// `None` → the flow is off (or the daemon is unreachable — the mint
+/// would refuse anyway), and the routes answer the same `device_off`
+/// as before.
+fn device_config(state_dir: &std::path::Path) -> Option<crate::device_login::DeviceConfig> {
+    let out = client::rpc(state_dir, "device_login_config", json!({})).ok()?;
+    if out["configured"].as_bool() != Some(true) {
+        return None;
+    }
+    crate::device_login::DeviceConfig::new(out["issuer"].as_str()?, out["org"].as_str()?).ok()
+}
+
 /// `/api/meta`'s session fields: `operator` (this request holds a live
 /// session), `session` (its display id and expiries, never the token)
 /// and `login_hint` (the command that signs this origin in).
@@ -1121,13 +1135,13 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
         }
         ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
-    // CAD-777: device sign-in is advertised on the operator surface
-    // only — never to the public host or an unattributable request.
-    let device_login = opts.device_login.is_some()
-        && matches!(
-            request_origin(request, opts),
-            ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
-        );
+    // CAD-777/CAD-841: device sign-in is advertised on the operator
+    // surface only — never to the public host or an unattributable
+    // request — and only while the daemon's store says configured.
+    let device_login = matches!(
+        request_origin(request, opts),
+        ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
+    ) && device_config(state_dir).is_some();
     json!({
         "signed_in": session.is_some(),
         "hosted": hosted,
@@ -1418,7 +1432,10 @@ pub(super) fn device_code(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> HttpResp {
-    let Some(login) = opts.device_login.clone() else {
+    let login = &opts.device_login;
+    // CAD-841: the daemon's store decides whether the route serves at
+    // all — `clear` on a running board closes it on this very request.
+    let Some(config) = device_config(state_dir) else {
         return device_off();
     };
     if opts.read_only {
@@ -1455,8 +1472,7 @@ pub(super) fn device_code(
     }
     // The issuer call runs WITHOUT the lock: holding it across up to
     // 20 s of network would stall every poll's prune/remove.
-    let (display, code) = match crate::device_login::request_code(&*login.transport, &login.config)
-    {
+    let (display, code) = match crate::device_login::request_code(&*login.transport, &config) {
         Ok(v) => v,
         Err(_) => {
             return coded_response(
@@ -1512,7 +1528,8 @@ pub(super) fn device_poll(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> HttpResp {
-    let Some(login) = opts.device_login.clone() else {
+    let login = &opts.device_login;
+    let Some(config) = device_config(state_dir) else {
         return device_off();
     };
     if opts.read_only {
@@ -1551,13 +1568,13 @@ pub(super) fn device_poll(
         }
     };
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
-    match crate::device_login::poll_token(&*login.transport, &login.config, &code) {
+    match crate::device_login::poll_token(&*login.transport, &config, &code) {
         Ok(crate::device_login::Poll::Pending) => {
-            repend(&login, req.pending_id, code, expires_at);
+            repend(login, req.pending_id, code, expires_at);
             super::json_response(json!({"status": "pending"}))
         }
         Ok(crate::device_login::Poll::SlowDown) => {
-            repend(&login, req.pending_id, code, expires_at);
+            repend(login, req.pending_id, code, expires_at);
             super::json_response(json!({"status": "slow_down"}))
         }
         Ok(crate::device_login::Poll::Denied) => super::json_response(json!({"status": "denied"})),

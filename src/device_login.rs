@@ -41,100 +41,72 @@ fn rejected(message: &str) -> Error {
     Error::rejected(message)
 }
 
-/// The daemon-side trust pin for device sign-in (CAD-777, fix of the
-/// reviewer finding on #541): the operator-configured issuer + exact
-/// workspace + the subject allowlist, written by `ui run`/`ui start`
-/// resolve and read by the daemon at mint time. The daemon verifies
-/// the presented `agc_` against THIS pin — never against
-/// caller-supplied issuer/org — and mints only when the verified
-/// subject is on `subjects`, so a socket caller can neither choose
-/// the trust root nor mint for a principal the operator did not name.
-/// Lives at `<state>/operator/device-login.json`, `0600` in the
-/// `0700` operator directory, under the same hygiene as the secret.
+/// The daemon-owned device-login configuration (CAD-841, replacing
+/// the board-written `DevicePin` of CAD-777): the operator-set issuer,
+/// exact workspace and subject allowlist. Only the daemon writes
+/// this file — `operator_device_login_set`/`_clear` under the
+/// operator-secret gate — so no board process, restart, crash or
+/// second board can change or retain minting authority; the board
+/// only ever reads it through the `device_login_config` RPC.
+///
+/// The daemon verifies a presented `agc_` against THIS config — never
+/// against caller-supplied issuer/org — and mints only when the
+/// verified subject is on `subjects`, so a socket caller can neither
+/// choose the trust root nor mint for a principal the operator did
+/// not name. Lives at `<state>/operator/device-login.json`, `0600` in
+/// the `0700` operator directory, under the same hygiene as the
+/// secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DevicePin {
+pub struct DeviceLoginConfig {
     pub issuer: String,
     pub org: String,
     /// The verified issuer subjects allowed a board session — one or
-    /// a few named operators. No wildcard: an empty list fails the
-    /// pin's validation, i.e. the flow stays off.
+    /// a few named operators. No wildcard: an empty list fails
+    /// validation, i.e. the flow stays off.
     pub subjects: Vec<String>,
-    /// The board process that wrote this pin while holding the pin
-    /// lock. The daemon accepts the pin only while that pid is alive
-    /// AND the lock is still held (review r9) — a stale file behind a
-    /// dead or replaced board mints nothing. A pin written without
-    /// this field fails closed on read.
-    pub board_pid: u32,
 }
 
-const PIN_FILE: &str = "device-login.json";
+const CONFIG_FILE: &str = "device-login.json";
 
-/// Advisory lock the serving board holds for its lifetime, taken
-/// before the pin is written or cleared — a second `ui run` on ANY
-/// port cannot rewrite or clear the pin under a live board. Lives
-/// in the `0700` operator dir next to the pin; the daemon also reads
-/// its held-ness as part of pin liveness ([`pin_is_live`]).
-pub const DEVICE_PIN_LOCK: &str = "device-login.lock";
+/// The pre-CAD-841 pin's advisory lock file, written by boards that
+/// no longer exist in this design. [`migrate`] deletes it on sight.
+const LEGACY_LOCK: &str = "device-login.lock";
 
-/// The pin is mint authority only while the board that wrote it is
-/// alive and still holds [`DEVICE_PIN_LOCK`]: (a) `kill(board_pid, 0)`
-/// must succeed, and (b) a shared non-blocking flock on the lock file
-/// must fail with EWOULDBLOCK — someone holds the exclusive lock. A
-/// missing file, a free lock, or a dead pid all fail closed with
-/// `capability_unavailable`; the daemon calls this before any issuer
-/// contact (review r9).
-pub fn pin_is_live(state_dir: &std::path::Path, pin: &DevicePin) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let gone = || {
-        Error::invalid(
-            "capability_unavailable",
-            "device login is not live: the board that pinned it is gone",
-        )
-    };
-    let alive = unsafe { libc::kill(pin.board_pid as i32, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    if !alive {
-        return Err(gone());
-    }
-    let lock_path = crate::operator_auth::dir(state_dir).join(DEVICE_PIN_LOCK);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&lock_path)
-        .map_err(|_| gone())?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-        // Nobody holds it — release ours and fail closed.
-        unsafe {
-            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+/// One-time move off the board-written pin (CAD-841): a
+/// `device-login.json` that fails the new strict schema — the legacy
+/// pin carried `board_pid`, which `deny_unknown_fields` rejects — was
+/// board-written trust state, so it is removed rather than parsed,
+/// and the lock file always goes. A file the daemon itself wrote
+/// survives untouched. Best-effort: a filesystem failure only logs.
+pub fn migrate(state_dir: &std::path::Path) {
+    let dir = crate::operator_auth::dir(state_dir);
+    let _ = std::fs::remove_file(dir.join(LEGACY_LOCK));
+    if let Ok(bytes) = std::fs::read(dir.join(CONFIG_FILE)) {
+        if serde_json::from_slice::<DeviceLoginConfig>(&bytes).is_err() {
+            let _ = std::fs::remove_file(dir.join(CONFIG_FILE));
         }
-        return Err(gone());
     }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(());
-    }
-    Err(Error::internal(format!("device pin liveness: {error}")))
 }
 
-/// Record the pin. Overwrites atomically (tmp + rename); a partial
-/// write never replaces a good one.
-pub fn write_pin(state_dir: &std::path::Path, pin: &DevicePin) -> Result<()> {
-    // Validate before persisting: a bad triple fails the board at
-    // boot, never at first sign-in.
-    pin.check()?;
+/// Record the configuration. Overwrites atomically (tmp + rename); a
+/// partial write never replaces a good one. Daemon-only: called from
+/// `operator_device_login_set`, never from a board process.
+pub fn write_config(state_dir: &std::path::Path, config: &DeviceLoginConfig) -> Result<()> {
+    // Validate before persisting: a bad triple fails the CLI call,
+    // never at first sign-in.
+    config.check()?;
     crate::operator_auth::write_private(
         state_dir,
-        PIN_FILE,
-        &serde_json::to_vec_pretty(pin).map_err(|e| Error::internal(e.to_string()))?,
+        CONFIG_FILE,
+        &serde_json::to_vec_pretty(config).map_err(|e| Error::internal(e.to_string()))?,
     )
 }
 
-/// Remove the pin (operator disabled device login): mint fails closed
-/// afterwards. Missing file is fine.
-pub fn clear_pin(state_dir: &std::path::Path) -> Result<()> {
-    let path = crate::operator_auth::dir(state_dir).join(PIN_FILE);
+/// Remove the configuration (`operator_device_login_clear`): mint
+/// fails closed afterwards. Missing file is fine.
+pub fn clear_config(state_dir: &std::path::Path) -> Result<()> {
+    let path = crate::operator_auth::dir(state_dir).join(CONFIG_FILE);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -142,23 +114,24 @@ pub fn clear_pin(state_dir: &std::path::Path) -> Result<()> {
     }
 }
 
-/// The configured pin — `Err` (`capability_unavailable`) when device
-/// login is not provisioned or the file fails strict modes.
-pub fn read_pin(state_dir: &std::path::Path) -> Result<DevicePin> {
-    let bytes = crate::operator_auth::read_private(state_dir, PIN_FILE)?;
-    let pin: DevicePin = serde_json::from_slice(&bytes).map_err(|e| {
+/// The configured triple — `Err` (`capability_unavailable`) when
+/// device login is not configured or the file fails strict modes or
+/// schema (a legacy pin with `board_pid` included).
+pub fn read_config(state_dir: &std::path::Path) -> Result<DeviceLoginConfig> {
+    let bytes = crate::operator_auth::read_private(state_dir, CONFIG_FILE)?;
+    let config: DeviceLoginConfig = serde_json::from_slice(&bytes).map_err(|e| {
         Error::invalid(
             "capability_unavailable",
-            format!("device login pin is invalid: {e}"),
+            format!("device login config is invalid: {e}"),
         )
     })?;
     // Re-validate on read: a hand-edited file cannot widen the grant.
-    pin.check()?;
-    Ok(pin)
+    config.check()?;
+    Ok(config)
 }
 
-impl DevicePin {
-    /// The pin's own consistency: a valid issuer + workspace AND a
+impl DeviceLoginConfig {
+    /// The config's own consistency: a valid issuer + workspace AND a
     /// well-formed non-empty allowlist. Used by both the write and the
     /// read path so a hand-edited file fails closed the same way.
     fn check(&self) -> Result<()> {
@@ -870,22 +843,21 @@ mod tests {
         tempfile::TempDir::new().unwrap()
     }
 
-    /// The pin round-trips through the operator directory with secret
-    /// hygiene (0700 dir, 0600 file); absent or malformed pins fail
-    /// closed, and an invalid pair never persists.
+    /// The config round-trips through the operator directory with
+    /// secret hygiene (0700 dir, 0600 file); absent or malformed
+    /// configs fail closed, and an invalid pair never persists.
     #[test]
-    fn device_pin_round_trips_under_strict_modes() {
+    fn device_config_round_trips_under_strict_modes() {
         use std::os::unix::fs::MetadataExt;
         let dir = pin_dir();
-        assert!(read_pin(dir.path()).is_err());
-        let pin = DevicePin {
+        assert!(read_config(dir.path()).is_err());
+        let config = DeviceLoginConfig {
             issuer: "https://issuer.example".to_string(),
             org: "ws_company".to_string(),
             subjects: vec!["op_1".to_string()],
-            board_pid: std::process::id(),
         };
-        write_pin(dir.path(), &pin).unwrap();
-        assert_eq!(read_pin(dir.path()).unwrap(), pin);
+        write_config(dir.path(), &config).unwrap();
+        assert_eq!(read_config(dir.path()).unwrap(), config);
         let md = std::fs::symlink_metadata(dir.path().join("operator")).unwrap();
         assert_eq!(md.mode() & 0o777, 0o700);
         let md = std::fs::symlink_metadata(dir.path().join("operator").join("device-login.json"))
@@ -898,75 +870,69 @@ mod tests {
             b"{not json",
         )
         .unwrap();
-        assert!(read_pin(dir.path()).is_err());
-        // A pin written before the allowlist existed fails closed too.
+        assert!(read_config(dir.path()).is_err());
+        // A config missing the allowlist fails closed too.
         std::fs::write(
             dir.path().join("operator").join("device-login.json"),
             br#"{"issuer":"https://issuer.example","org":"ws_company"}"#,
         )
         .unwrap();
-        assert!(read_pin(dir.path()).is_err());
-        assert!(write_pin(
+        assert!(read_config(dir.path()).is_err());
+        assert!(write_config(
             dir.path(),
-            &DevicePin {
+            &DeviceLoginConfig {
                 issuer: "http://evil.example".to_string(),
                 org: "ws_company".to_string(),
                 subjects: vec!["op_1".to_string()],
-                board_pid: std::process::id(),
             }
         )
         .is_err());
         // Clearing removes mint authority; clearing twice is fine.
-        clear_pin(dir.path()).unwrap();
-        clear_pin(dir.path()).unwrap();
-        assert!(read_pin(dir.path()).is_err());
+        clear_config(dir.path()).unwrap();
+        clear_config(dir.path()).unwrap();
+        assert!(read_config(dir.path()).is_err());
     }
 
-    /// The pin is mint authority only while its writer is alive AND
-    /// holds the lock: no lock file, a free lock file, or a dead pid
-    /// all refuse `capability_unavailable` (review r9).
+    /// CAD-841 migration: a board-written legacy pin (it carries
+    /// `board_pid`) can never mint again — `read_config` fails closed
+    /// on it, and `migrate` removes it plus the pin's lock file. A
+    /// daemon-written config survives the sweep.
     #[test]
-    fn pin_is_live_requires_a_live_lock_holder() {
+    fn migrate_removes_legacy_pin_and_lock() {
         use std::os::unix::fs::DirBuilderExt;
-        use std::os::unix::io::AsRawFd;
         let dir = pin_dir();
-        let lock_path = dir.path().join("operator").join(DEVICE_PIN_LOCK);
-        let pin = DevicePin {
-            issuer: "https://issuer.example".to_string(),
-            org: "ws_company".to_string(),
-            subjects: vec!["op_1".to_string()],
-            board_pid: std::process::id(),
-        };
-        // No operator dir at all → refuse.
-        let err = pin_is_live(dir.path(), &pin).unwrap_err();
-        assert_eq!(err.code(), Some("capability_unavailable"), "{err}");
-        // A lock file nobody holds → refuse.
+        // No operator dir at all → migration is a no-op.
+        migrate(dir.path());
+        // A legacy pin + lock are both removed; the pin never reads.
         std::fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
             .create(dir.path().join("operator"))
             .unwrap();
-        std::fs::write(&lock_path, b"").unwrap();
-        assert!(pin_is_live(dir.path(), &pin).is_err());
-        // Take the exclusive lock ourselves: a live holder.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        assert!(pin_is_live(dir.path(), &pin).is_ok());
-        // The lock is held but the writing pid is gone → refuse.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        child.wait().unwrap();
-        let dead = DevicePin {
-            board_pid: child.id(),
-            ..pin
+        let file = dir.path().join("operator").join("device-login.json");
+        std::fs::write(
+            &file,
+            br#"{"issuer":"https://issuer.example","org":"ws_company",
+                 "subjects":["op_1"],"board_pid":1234}"#,
+        )
+        .unwrap();
+        let lock = dir.path().join("operator").join("device-login.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(read_config(dir.path()).is_err());
+        migrate(dir.path());
+        assert!(!file.exists());
+        assert!(!lock.exists());
+        // A daemon-written config survives; a stray lock still goes.
+        let config = DeviceLoginConfig {
+            issuer: "https://issuer.example".to_string(),
+            org: "ws_company".to_string(),
+            subjects: vec!["op_1".to_string()],
         };
-        assert!(pin_is_live(dir.path(), &dead).is_err());
+        write_config(dir.path(), &config).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        migrate(dir.path());
+        assert_eq!(read_config(dir.path()).unwrap(), config);
+        assert!(!lock.exists());
     }
 
     /// The subject allowlist is a list of 1–16 workspace-style ids,
@@ -987,21 +953,21 @@ mod tests {
             );
         }
         assert!(validate_subjects(&["op_1".to_string(), "op_1".to_string()]).is_err());
-        // A hand-edited pin with a bad allowlist fails closed on read.
+        // A hand-edited config with a bad allowlist fails closed on
+        // read.
         let dir = pin_dir();
-        let pin = DevicePin {
+        let config = DeviceLoginConfig {
             issuer: "https://issuer.example".to_string(),
             org: "ws_company".to_string(),
             subjects: vec!["op_1".to_string()],
-            board_pid: std::process::id(),
         };
-        write_pin(dir.path(), &pin).unwrap();
+        write_config(dir.path(), &config).unwrap();
         let file = dir.path().join("operator").join("device-login.json");
         std::fs::write(
             &file,
             br#"{"issuer":"https://issuer.example","org":"ws_company","subjects":[]}"#,
         )
         .unwrap();
-        assert!(read_pin(dir.path()).is_err());
+        assert!(read_config(dir.path()).is_err());
     }
 }

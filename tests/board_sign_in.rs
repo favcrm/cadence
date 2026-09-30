@@ -8,8 +8,6 @@ mod board_common;
 use board_common::*;
 
 #[cfg(feature = "test-seam")]
-use cadence_agent::device_login::DeviceConfig;
-#[cfg(feature = "test-seam")]
 use cadence_agent::store::Store;
 use cadence_agent::ui;
 use serde_json::json;
@@ -1122,8 +1120,26 @@ mod device {
         (format!("http://127.0.0.1:{port}"), stub)
     }
 
-    /// A board with device login armed for `ws_company` against the stub,
-    /// allowlisting the stub's approved subject `op_9`.
+    /// Write the daemon-owned device-login config the operator's
+    /// `device-login set` would land (CAD-841): the same file, seeded
+    /// directly — boards never write it, so tests configure the store
+    /// the daemon reads.
+    fn configure_device_login(state: &Path, issuer: &str, subjects: &[&str]) {
+        cadence_agent::device_login::write_config(
+            state,
+            &cadence_agent::device_login::DeviceLoginConfig {
+                issuer: issuer.to_string(),
+                org: "ws_company".to_string(),
+                subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// A board with device login armed for `ws_company` against the
+    /// stub, allowlisting the stub's approved subject `op_9`: the
+    /// config is written into the daemon's store, then a plain board
+    /// starts — routes read the config live over the socket.
     fn start_device_board(pm: &Path, state: &Path, issuer: String) -> (u16, BoardStop) {
         start_device_board_for(pm, state, issuer, vec!["op_9".to_string()])
     }
@@ -1135,12 +1151,12 @@ mod device {
         issuer: String,
         subjects: Vec<String>,
     ) -> (u16, BoardStop) {
-        start_ui_opts(pm.to_path_buf(), state.to_path_buf(), move |opts| {
-            opts.device_login = Some(ui::DeviceLogin::with_issuer(
-                DeviceConfig::new(&issuer, "ws_company").unwrap(),
-                subjects.clone(),
-            ));
-        })
+        configure_device_login(
+            state,
+            &issuer,
+            &subjects.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        );
+        start_ui(pm.to_path_buf(), state.to_path_buf())
     }
 
     /// Device sessions on disk (`<state>/operator/sessions.json`) — the
@@ -1453,82 +1469,63 @@ mod device {
         assert!(head.to_ascii_lowercase().contains("set-cookie"), "{head}");
     }
 
-    /// Disabling device login while the board runs is refused — the live
-    /// routes, the pin file and the saved options cannot drift apart.
-    /// A restart without the pair clears the pin and the routes go 404.
+    /// CAD-841: device login is daemon-owned — `operator_device_login`
+    /// `set`/`clear` take effect on a RUNNING board because the routes
+    /// read the daemon per request, and a restart never touches the
+    /// config on its own.
     #[test]
-    fn device_login_change_refused_while_running_cleared_on_restart() {
+    fn device_login_config_changes_apply_live_on_a_running_board() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
-        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, _stub) = device_stub("approve");
         let (port, board) = start_device_board(pm.path(), state.path(), issuer.clone());
         let host = op::board_host(port);
-        let pin = state.path().join("operator").join("device-login.json");
-        assert!(pin.is_file(), "serve writes the pin");
+        let config = state.path().join("operator").join("device-login.json");
+        assert!(config.is_file(), "the operator's config was seeded");
         let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
         assert_eq!(code, 200);
 
-        // A reset while running is refused; nothing changes. The fixture
-        // board never persists ui.json, so record what a real `ui start`
-        // would have saved (pair + port).
-        std::fs::write(
-            state.path().join("ui.json"),
-            serde_json::to_vec_pretty(&ui::UiOpts {
-                port: Some(port),
-                device_login: Some(ui::DeviceLoginOpts {
-                    issuer: issuer.clone(),
-                    org: "ws_company".to_string(),
-                    subjects: vec!["op_9".to_string()],
+        // The operator's secret the daemon minted at boot; set/clear are
+        // gated on it.
+        let secret = cadence_agent::operator_auth::read_secret(state.path()).unwrap();
+
+        // A clear lands live — the running board's routes go dead.
+        let cleared = d
+            .operator_rpc("operator_device_login_clear", json!({"secret": secret}))
+            .unwrap();
+        assert_eq!(cleared["configured"], json!(false), "{cleared}");
+        assert!(!config.exists(), "clear removed the file");
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 404, "routes still live after clear: {body}");
+        let (code, body) = http(port, "GET", "/api/meta", &host);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["device_login"],
+            json!(false),
+            "meta still advertises after clear: {body}"
+        );
+
+        // A set lands live the same way — no restart.
+        let set = d
+            .operator_rpc(
+                "operator_device_login_set",
+                json!({
+                    "secret": secret,
+                    "issuer": issuer,
+                    "org": "ws_company",
+                    "subjects": ["op_9"]
                 }),
-                ..Default::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(state.path().join("ui.pid"), std::process::id().to_string()).unwrap();
-        let reset = ui::UiFlags::default();
-        let err = ui::run_cli(
-            state.path(),
-            &ui::UiAction::Start {
-                flags: reset,
-                reset: true,
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("device login configuration cannot change"),
-            "{err}"
-        );
-        assert!(pin.is_file(), "refused reset keeps the pin");
-        // A subjects-only change is refused the same way — the running
-        // comparison covers the allowlist (DeviceLoginOpts !=).
-        let err = ui::run_cli(
-            state.path(),
-            &ui::UiAction::Start {
-                flags: ui::UiFlags {
-                    device_login_issuer: Some(issuer.clone()),
-                    device_login_org: Some("ws_company".to_string()),
-                    device_login_subject: vec!["op_1".to_string()],
-                    ..Default::default()
-                },
-                reset: false,
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("device login configuration cannot change"),
-            "subjects-only change while running: {err}"
-        );
-        let (code, _, _) = device_post(port, &host, "/api/session/device/code", "{}");
-        assert_eq!(code, 200, "live routes untouched by the refused reset");
-        std::fs::remove_file(state.path().join("ui.pid")).unwrap();
+            )
+            .unwrap();
+        assert_eq!(set["configured"], json!(true), "{set}");
+        let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "routes still dead after set: {body}");
+
+        // A board restart changes nothing on its own: the daemon store
+        // is the persistence, not ui.json or the board.
         drop(board);
-        // BoardStop only signals — wait for the serve thread (and its
-        // device pin lock) to be gone before the restart probes it.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while TcpStream::connect(("127.0.0.1", port)).is_ok() {
             assert!(
@@ -1537,13 +1534,12 @@ mod device {
             );
             thread::sleep(Duration::from_millis(50));
         }
-
-        // Restarted without the pair: pin gone, routes dead.
+        assert!(config.is_file(), "a board stop cleared the daemon config");
         let (port2, _board2) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
-        assert!(!pin.exists(), "restart without the pair clears the pin");
         let host2 = op::board_host(port2);
-        let (code, _, _) = device_post(port2, &host2, "/api/session/device/code", "{}");
-        assert_eq!(code, 404);
+        let (code, _, body) = device_post(port2, &host2, "/api/session/device/code", "{}");
+        assert_eq!(code, 200, "a plain board lost the daemon config: {body}");
+        assert!(config.is_file(), "restart rewrote the daemon config");
     }
 
     /// An approval for another workspace settles with no session.
@@ -1581,14 +1577,15 @@ mod device {
         assert!(!head.to_ascii_lowercase().contains("set-cookie"), "{head}");
     }
 
-    /// The reviewer's exploit, closed: the daemon RPC mints nothing for a
-    /// forged bearer, and nothing at all without its pinned trust root.
-    /// The only key that opens a session is an issuer-minted grant the
-    /// live issuer verifies — verified here against the stub.
+    /// The reviewer's exploit, closed: the daemon RPC mints nothing for
+    /// a forged bearer, and nothing at all without its daemon-owned
+    /// config (CAD-841). The only key that opens a session is an
+    /// issuer-minted grant the live issuer verifies — verified here
+    /// against the stub.
     #[test]
-    fn device_daemon_rpc_needs_an_issuer_verified_bearer_and_a_pin() {
-        use cadence_agent::device_login::{write_pin, DevicePin};
-        // No pin file anywhere: fail closed before any issuer contact.
+    fn device_daemon_rpc_needs_an_issuer_verified_bearer_and_a_config() {
+        // No config file anywhere: fail closed before any issuer
+        // contact.
         let lonely = TempDir::new().unwrap();
         let _alone = UiDaemon::start_on(lonely.path().to_path_buf());
         let err = _alone
@@ -1600,24 +1597,15 @@ mod device {
         assert_eq!(
             err.code(),
             Some("capability_unavailable"),
-            "unpinned daemon minted or misreported: {err}"
+            "unconfigured daemon minted or misreported: {err}"
         );
 
-        // Pinned daemon, forged bearer: the stub answers 401, no session.
+        // Configured daemon, forged bearer: the stub answers 401, no
+        // session.
         let state = TempDir::new().unwrap();
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, _stub) = device_stub("approve");
-        let _lock = hold_device_lock(state.path());
-        write_pin(
-            state.path(),
-            &DevicePin {
-                issuer: issuer.clone(),
-                org: "ws_company".to_string(),
-                subjects: vec!["op_9".to_string()],
-                board_pid: std::process::id(),
-            },
-        )
-        .unwrap();
+        configure_device_login(state.path(), &issuer, &["op_9"]);
         let err = _d
             .rpc_opt(
                 "operator_session_open_device",
@@ -1667,51 +1655,13 @@ mod device {
             .collect()
     }
 
-    /// A daemon on `state` with the device pin written for `subjects`.
-    /// The exclusive `device-login.lock` a serving board would hold —
-    /// the daemon's pin-liveness gate passes while the returned file
-    /// stays open.
-    fn hold_device_lock(state: &Path) -> std::fs::File {
-        use std::os::unix::fs::DirBuilderExt;
-        use std::os::unix::io::AsRawFd;
-        let dir = state.join("operator");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(&dir)
-            .unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(cadence_agent::device_login::DEVICE_PIN_LOCK))
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "the test's pin lock must be free"
-        );
-        file
-    }
-
-    /// A daemon on `state` with the device pin written for `subjects` —
-    /// live because the pin names this process and we hold the lock.
-    fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> (UiDaemon, std::fs::File) {
-        use cadence_agent::device_login::{write_pin, DevicePin};
+    /// A daemon on `state` with the device-login config written for
+    /// `subjects` — daemon-owned state (CAD-841), live for as long as
+    /// the file exists; no board process or lock is involved.
+    fn device_daemon(state: &Path, issuer: &str, subjects: &[&str]) -> UiDaemon {
         let d = UiDaemon::start_on(state.to_path_buf());
-        let lock = hold_device_lock(state);
-        write_pin(
-            state,
-            &DevicePin {
-                issuer: issuer.to_string(),
-                org: "ws_company".to_string(),
-                subjects: subjects.iter().map(|s| s.to_string()).collect(),
-                board_pid: std::process::id(),
-            },
-        )
-        .unwrap();
-        (d, lock)
+        configure_device_login(state, issuer, subjects);
+        d
     }
 
     /// Run `probe` as a child of a pane planted for `alias` under `d`;
@@ -1796,6 +1746,25 @@ mod device {
                 );
                 json!({"status": status, "headers": headers, "body": body})
             }
+            // CAD-841: call `CADENCE_PROBE_METHOD` (an operator-secret
+            // device-login verb) with `CADENCE_PROBE_PARAMS` merged
+            // over the daemon's real secret — proving the gate is the
+            // caller, not credential possession.
+            "config" => {
+                let state = std::env::var("CADENCE_PROBE_STATE").unwrap();
+                let method = std::env::var("CADENCE_PROBE_METHOD").unwrap();
+                let mut params: Value = serde_json::from_str(
+                    &std::env::var("CADENCE_PROBE_PARAMS").unwrap_or_else(|_| "{}".into()),
+                )
+                .unwrap();
+                params["secret"] =
+                    json!(cadence_agent::operator_auth::read_secret(Path::new(&state))
+                        .unwrap_or_default());
+                match cadence_agent::client::rpc(Path::new(&state), &method, params) {
+                    Ok(v) => json!({"ok": true, "text": v.to_string()}),
+                    Err(e) => json!({"ok": false, "text": e.to_string()}),
+                }
+            }
             other => json!({"ok": false, "text": format!("unknown probe kind {other}")}),
         };
         std::fs::write(format!("{out}.tmp"), answer.to_string()).unwrap();
@@ -1809,7 +1778,7 @@ mod device {
     fn device_rpc_from_a_pane_is_refused_before_issuer_contact() {
         let state = TempDir::new().unwrap();
         let (issuer, stub) = device_stub("approve");
-        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
         let out_file = state.path().join("probe-out.json");
         let answer = pane_probe(
             &d,
@@ -1840,7 +1809,7 @@ mod device {
     fn device_rpc_from_a_detached_child_is_refused() {
         let state = TempDir::new().unwrap();
         let (issuer, stub) = device_stub("approve");
-        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
         let out_file = state.path().join("probe-out.json");
         let answer = pane_probe(
             &d,
@@ -1863,6 +1832,192 @@ mod device {
             "refused detached caller reached the issuer"
         );
         assert_eq!(device_session_count(state.path()), 0);
+    }
+
+    /// The `operator_device_login_set` gate: an agent pane's child —
+    /// presenting the daemon's REAL secret — is refused before any
+    /// write. The credential is not the authority; the caller is.
+    #[test]
+    fn device_login_set_from_a_pane_is_refused() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let config = state.path().join("operator").join("device-login.json");
+        let before = std::fs::read(&config).unwrap();
+        let out_file = state.path().join("probe-out.json");
+        let answer = pane_probe(
+            &d,
+            "w-device",
+            false,
+            &[
+                ("CADENCE_PROBE_KIND", "config".to_string()),
+                (
+                    "CADENCE_PROBE_METHOD",
+                    "operator_device_login_set".to_string(),
+                ),
+                ("CADENCE_PROBE_STATE", state.path().display().to_string()),
+                (
+                    "CADENCE_PROBE_PARAMS",
+                    json!({"issuer": "http://127.0.0.1:1", "org": "ws_company",
+                           "subjects": ["op_evil"]})
+                    .to_string(),
+                ),
+                ("CADENCE_PROBE_OUT", out_file.display().to_string()),
+            ],
+        );
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        assert!(
+            answer["text"].as_str().unwrap().contains("agent"),
+            "{answer}"
+        );
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "a refused agent write touched the config"
+        );
+    }
+
+    /// Same gate, from a `setsid` child of the pane: a new session is
+    /// no escape — the /proc ancestry still names the agent.
+    #[test]
+    fn device_login_clear_from_a_detached_child_is_refused() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let config = state.path().join("operator").join("device-login.json");
+        let out_file = state.path().join("probe-out.json");
+        let answer = pane_probe(
+            &d,
+            "w-device",
+            true,
+            &[
+                ("CADENCE_PROBE_KIND", "config".to_string()),
+                (
+                    "CADENCE_PROBE_METHOD",
+                    "operator_device_login_clear".to_string(),
+                ),
+                ("CADENCE_PROBE_STATE", state.path().display().to_string()),
+                ("CADENCE_PROBE_OUT", out_file.display().to_string()),
+            ],
+        );
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        assert!(
+            answer["text"].as_str().unwrap().contains("agent"),
+            "{answer}"
+        );
+        assert!(
+            config.is_file(),
+            "a refused detached write cleared the config"
+        );
+    }
+
+    /// The secret half of the gate: a proven operator caller without
+    /// the secret, or with the wrong one, is refused — and forged
+    /// identity fields die in `reject_operator_fields` before either.
+    /// Bad values (an empty allowlist, a loopback issuer in a
+    /// non-test-seam build) never reach the store.
+    #[test]
+    fn device_login_verbs_need_the_operator_secret_and_clean_fields() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
+        let config = state.path().join("operator").join("device-login.json");
+        let before = std::fs::read(&config).unwrap();
+
+        // No secret at all.
+        let err = d
+            .operator_rpc("operator_device_login_clear", json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret"), "{err}");
+        // A wrong secret.
+        let err = d
+            .operator_rpc("operator_device_login_clear", json!({"secret": "wrong"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret"), "{err}");
+        // Forged operator-identity fields die in
+        // `reject_operator_fields` before the secret is even read.
+        let err = d
+            .operator_rpc(
+                "operator_device_login_set",
+                json!({
+                    "secret": cadence_agent::operator_auth::read_secret(state.path())
+                        .unwrap(),
+                    "issuer": issuer.clone(),
+                    "org": "ws_company",
+                    "subjects": ["op_9"],
+                    "alias": "operator"
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("connection-bound") && err.contains("'alias'"),
+            "forged field passed: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            before,
+            "a refused write touched the config"
+        );
+
+        // An empty allowlist is refused — `set` can never land a config
+        // that would refuse every subject at mint.
+        let err = d
+            .operator_rpc(
+                "operator_device_login_set",
+                json!({
+                    "secret": cadence_agent::operator_auth::read_secret(state.path())
+                        .unwrap(),
+                    "issuer": issuer,
+                    "org": "ws_company",
+                    "subjects": []
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("subject"), "empty allowlist landed: {err}");
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+    }
+
+    /// `device_login_config` is the board-facing read: it answers for
+    /// any caller and never exposes the allowlist — subjects stay
+    /// daemon-side. `operator_device_login_show` answers them, but only
+    /// behind the secret.
+    #[test]
+    fn device_login_config_is_thin_show_is_gated() {
+        let state = TempDir::new().unwrap();
+        let (issuer, _stub) = device_stub("approve");
+        let d = device_daemon(state.path(), &issuer, &["op_9", "op_2"]);
+
+        // Any caller (the board's own ambient identity here) reads the
+        // thin view — no subjects field at all.
+        let thin = d.rpc_opt("device_login_config", json!({})).unwrap();
+        assert_eq!(thin["configured"], json!(true), "{thin}");
+        assert_eq!(thin["issuer"], json!(issuer), "{thin}");
+        assert_eq!(thin["org"], json!("ws_company"), "{thin}");
+        assert!(
+            thin.get("subjects").is_none(),
+            "thin view leaked subjects: {thin}"
+        );
+
+        // The full view is gated.
+        let err = d
+            .operator_rpc("operator_device_login_show", json!({"secret": "wrong"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret"), "{err}");
+        let full = d
+            .operator_rpc(
+                "operator_device_login_show",
+                json!({
+                    "secret": cadence_agent::operator_auth::read_secret(state.path())
+                        .unwrap()
+                }),
+            )
+            .unwrap();
+        assert_eq!(full["subjects"], json!(["op_9", "op_2"]), "{full}");
     }
 
     /// The HTTP twin: a detached pane child polling spends nothing — the
@@ -2004,7 +2159,7 @@ mod device {
     fn device_rpc_mints_the_issuers_subject_not_forged_fields() {
         let state = TempDir::new().unwrap();
         let (issuer, _stub) = device_stub("approve");
-        let (d, _pin_lock) = device_daemon(state.path(), &issuer, &["op_9"]);
+        let d = device_daemon(state.path(), &issuer, &["op_9"]);
         let opened = d
             .rpc_opt(
                 "operator_session_open_device",
@@ -2156,33 +2311,36 @@ mod device {
         );
     }
 
-    /// A second foreground `ui run` against the same state dir must not
-    /// touch the daemon's device trust pin while a board is live — the
-    /// serving board holds `device-login.lock` for its lifetime, so a
-    /// run on ANY free port can neither re-point nor clear the pin, and
-    /// a run that loses the bind touches nothing (reviews r3/r4).
+    /// CAD-841: a second foreground `ui run` against the same state dir
+    /// shares the daemon-owned device config — there is no pin or lock
+    /// for it to drift from. It serves (bind permitting) and its device
+    /// routes answer from the same daemon store; a run that loses the
+    /// bind touches nothing.
     #[test]
-    fn device_pin_survives_a_second_ui_run_while_a_board_is_live() {
+    fn a_second_ui_run_shares_the_daemon_device_config() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, _stub) = device_stub("approve");
-        let pin = state.path().join("operator").join("device-login.json");
+        let config = state.path().join("operator").join("device-login.json");
 
-        // Board one: a real `ui run` on a thread — no ui.pid anywhere,
-        // exactly the foreground case the pid-file guard could not see.
+        // Board one: a real `ui run` on a thread — no ui.pid anywhere.
+        // With no device flags it pushes nothing; the daemon config is
+        // seeded directly, exactly as `device-login set` leaves it.
+        configure_device_login(state.path(), &issuer, &["op_9"]);
         let port1 = free_port();
         let first_state = state.path().to_path_buf();
-        let first_flags = ui::UiFlags {
-            port: Some(port1),
-            device_login_issuer: Some(issuer.clone()),
-            device_login_org: Some("ws_company".into()),
-            device_login_subject: vec!["op_9".into()],
-            ..Default::default()
-        };
         thread::spawn(move || {
-            let _ = ui::run_cli(&first_state, &ui::UiAction::Run { flags: first_flags });
+            let _ = ui::run_cli(
+                &first_state,
+                &ui::UiAction::Run {
+                    flags: ui::UiFlags {
+                        port: Some(port1),
+                        ..Default::default()
+                    },
+                },
+            );
         });
         let host = op::board_host(port1);
         // Bound port = serving: probe the socket, never a request that
@@ -2194,39 +2352,9 @@ mod device {
             thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(http(port1, "GET", "/api/health", &host).0, 200);
-        let before = std::fs::read(&pin).unwrap();
+        let before = std::fs::read(&config).unwrap();
 
-        // A run's answer: Err on a refusal; a run that starts SERVING
-        // never answers — detected as a timeout, which is failure either
-        // way for the refuse cases.
-        let run = |flags: ui::UiFlags| -> bool {
-            let state = state.path().to_path_buf();
-            let (tx, rx) = std::sync::mpsc::channel();
-            thread::spawn(move || {
-                let _ = tx.send(ui::run_cli(&state, &ui::UiAction::Run { flags }));
-            });
-            matches!(rx.recv_timeout(Duration::from_secs(10)), Ok(Err(_)))
-        };
-
-        // (i) re-pointing flags on a FREE port: refused by the held lock.
-        let errored = run(ui::UiFlags {
-            port: Some(free_port()),
-            device_login_issuer: Some("http://127.0.0.1:1".into()),
-            device_login_org: Some("ws_company".into()),
-            device_login_subject: vec!["op_evil".into()],
-            ..Default::default()
-        });
-        assert!(
-            errored,
-            "a second `ui run` with device login must refuse while a board owns the pin"
-        );
-        assert_eq!(
-            std::fs::read(&pin).unwrap(),
-            before,
-            "re-pointing run rewrote the pin"
-        );
-
-        // The live board still mints: its poll flow is untouched.
+        // The live board mints: its poll flow is untouched.
         let (code, _, body) = device_post(port1, &host, "/api/session/device/code", "{}");
         assert_eq!(code, 200, "{body}");
         let pending_id = serde_json::from_str::<Value>(&body).unwrap()["pending_id"]
@@ -2254,8 +2382,8 @@ mod device {
         }
         assert!(minted, "the first board's poll must still mint");
 
-        // (ii) no device flags: a second board on another state dir-free
-        // port is allowed to serve — it just may not clear the pin.
+        // A second board on a free port serves and reads the SAME
+        // daemon config — routes live, file untouched.
         let port2 = free_port();
         let second_state = state.path().to_path_buf();
         let second = thread::spawn(move || {
@@ -2278,52 +2406,56 @@ mod device {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(up, "an unconfigured second board may serve");
+        assert!(up, "a second board on the same state dir may serve");
         assert_eq!(
-            std::fs::read(&pin).unwrap(),
+            std::fs::read(&config).unwrap(),
             before,
-            "an unconfigured board cleared the pin"
+            "a board rewrote the daemon's config"
         );
-        // Its device routes stay dead while it holds no config.
         let (code, _, body) = device_post(port2, &host2, "/api/session/device/code", "{}");
-        assert_eq!(code, 404, "{body}");
+        assert_eq!(code, 200, "second board shares the daemon config: {body}");
         drop(second); // a serve thread outlives the test, like every fixture board
 
-        // (iii) the bind-loss case: a re-pointing run on board one's OWN
-        // port fails the bind and touches nothing.
-        let errored = run(ui::UiFlags {
-            port: Some(port1),
-            device_login_issuer: Some("http://127.0.0.1:1".into()),
-            device_login_org: Some("ws_company".into()),
-            device_login_subject: vec!["op_evil".into()],
-            ..Default::default()
+        // The bind-loss case: a run on board one's OWN port fails the
+        // bind and touches nothing.
+        let lost_state = state.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(ui::run_cli(
+                &lost_state,
+                &ui::UiAction::Run {
+                    flags: ui::UiFlags {
+                        port: Some(port1),
+                        ..Default::default()
+                    },
+                },
+            ));
         });
+        let errored = matches!(rx.recv_timeout(Duration::from_secs(10)), Ok(Err(_)));
         assert!(errored, "a run that loses the bind must fail");
         assert_eq!(
-            std::fs::read(&pin).unwrap(),
+            std::fs::read(&config).unwrap(),
             before,
-            "a lost bind rewrote the pin"
+            "a lost bind rewrote the config"
         );
     }
 
-    /// A pin on disk outlives its board only as a file — the daemon
-    /// accepts it only while the writing board is alive and holds the
-    /// lock (review r9). A stopped board's pin mints nothing, and the
-    /// refusal comes before any issuer contact.
+    /// CAD-841 inverts the stale-pin case: the config is the operator's
+    /// own authority, not the board's — a stopped board's config still
+    /// mints, because disabling device login is the operator's
+    /// `device-login clear`, never a side effect of a board's death.
     #[test]
-    fn device_pin_without_a_live_board_mints_nothing() {
+    fn device_config_outlives_its_board() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
-        let _d = UiDaemon::start_on(state.path().to_path_buf());
-        let (issuer, stub) = device_stub("approve");
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        let (issuer, _stub) = device_stub("approve");
         let (port, board) = start_device_board(pm.path(), state.path(), issuer);
-        let pin = state.path().join("operator").join("device-login.json");
-        assert!(pin.is_file(), "serve writes the pin");
+        let config = state.path().join("operator").join("device-login.json");
+        assert!(config.is_file(), "the operator's config was seeded");
 
         drop(board);
-        // BoardStop only signals — wait for the serve thread (and its
-        // pin lock) to be gone before probing the daemon.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while TcpStream::connect(("127.0.0.1", port)).is_ok() {
             assert!(
@@ -2332,49 +2464,53 @@ mod device {
             );
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            pin.is_file(),
-            "the pin file itself is still there — only its liveness is gone"
-        );
-        let err = _d
+        assert!(config.is_file(), "a board stop touched the config");
+        let opened = d
             .rpc_opt(
                 "operator_session_open_device",
                 json!({"token": "agc_t", "origin": "loopback"}),
             )
-            .unwrap_err();
-        assert_eq!(
-            err.code(),
-            Some("capability_unavailable"),
-            "a stale pin minted or misreported: {err}"
-        );
-        assert_eq!(
-            stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the issuer was contacted for a dead pin"
-        );
+            .unwrap();
+        assert_eq!(opened["session"]["origin"], json!("loopback"));
     }
 
-    /// The same gate for a pin whose writing pid is simply gone — the
-    /// minimal stale-file shape (review r9).
+    /// The migration edge: a legacy pin file — the old board-written
+    /// shape carrying `board_pid` — fails the strict config schema, so
+    /// the daemon's boot removes it and never mints from it. The same
+    /// boot removes the old `device-login.lock`.
     #[test]
-    fn a_pin_for_a_dead_board_mints_nothing() {
-        use cadence_agent::device_login::{write_pin, DevicePin};
+    fn a_legacy_board_pin_never_mints_again() {
+        use std::os::unix::fs::DirBuilderExt;
         let state = TempDir::new().unwrap();
-        let _d = UiDaemon::start_on(state.path().to_path_buf());
+        let dir = state.path().join("operator");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .unwrap();
+        let pin = dir.join("device-login.json");
+        let lock = dir.join("device-login.lock");
         let (issuer, stub) = device_stub("approve");
-        let mut gone = std::process::Command::new("true").spawn().unwrap();
-        gone.wait().unwrap();
-        write_pin(
-            state.path(),
-            &DevicePin {
-                issuer: issuer.clone(),
-                org: "ws_company".to_string(),
-                subjects: vec!["op_9".to_string()],
-                board_pid: gone.id(),
-            },
+        std::fs::write(
+            &pin,
+            serde_json::to_vec_pretty(&json!({
+                "issuer": issuer,
+                "org": "ws_company",
+                "subjects": ["op_9"],
+                "board_pid": std::process::id()
+            }))
+            .unwrap(),
         )
         .unwrap();
-        let err = _d
+        std::fs::write(&lock, b"").unwrap();
+        assert!(pin.is_file() && lock.is_file());
+
+        let d = UiDaemon::start_on(state.path().to_path_buf());
+        assert!(!pin.exists(), "the legacy pin survived daemon boot");
+        assert!(!lock.exists(), "the legacy lock survived daemon boot");
+        let advertised = d.rpc_opt("device_login_config", json!({})).unwrap();
+        assert_eq!(advertised["configured"], json!(false), "{advertised}");
+        let err = d
             .rpc_opt(
                 "operator_session_open_device",
                 json!({"token": "agc_t", "origin": "loopback"}),
@@ -2383,12 +2519,12 @@ mod device {
         assert_eq!(
             err.code(),
             Some("capability_unavailable"),
-            "a dead board's pin minted or misreported: {err}"
+            "a legacy pin minted or misreported: {err}"
         );
         assert_eq!(
             stub.verifies.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the issuer was contacted for a dead pin"
+            "the issuer was contacted for a legacy pin"
         );
     }
 
@@ -2406,30 +2542,21 @@ mod device {
         }
     }
 
-    /// Whether the persisted pin is live authority right now — false
-    /// when the pin is gone or its board no longer holds the lock. The
-    /// same pair the daemon consults at mint time.
-    fn pin_is_live_now(state: &Path) -> bool {
-        cadence_agent::device_login::read_pin(state)
-            .ok()
-            .is_some_and(|p| cadence_agent::device_login::pin_is_live(state, &p).is_ok())
-    }
-
-    /// CAD-851: the issuer verify can park for seconds, and authority
-    /// can die inside that window. The stub holds its
-    /// `/v1/runtime/session` answer, the board stops (its pin lock
-    /// releases), the answer then arrives — the daemon must re-prove
-    /// the pin rather than mint off the snapshot it read before the
-    /// issuer call. Without the post-verify check this mints a session
-    /// under a dead board's retired authority.
+    /// CAD-851 + CAD-841: the issuer verify can park for seconds, and
+    /// the operator's authority can move inside that window. The stub
+    /// holds its `/v1/runtime/session` answer, the config is cleared,
+    /// the answer then arrives — the daemon must re-read the store
+    /// rather than mint off the snapshot it read before the issuer
+    /// call. Without the post-verify check this mints a session under
+    /// retired authority.
     #[test]
-    fn a_verify_in_flight_mints_nothing_when_the_board_dies() {
+    fn a_verify_in_flight_mints_nothing_when_the_config_is_cleared() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, stub, gate) = device_stub_gated("approve");
-        let (_port, board) = start_device_board(pm.path(), state.path(), issuer);
+        let (_port, _board) = start_device_board(pm.path(), state.path(), issuer);
 
         // The daemon call parks inside the stub's session answer.
         let state_dir = state.path().to_path_buf();
@@ -2444,17 +2571,14 @@ mod device {
             stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
         });
 
-        drop(board);
-        wait_for("the stopped board's pin never went dead", || {
-            !pin_is_live_now(state.path())
-        });
+        cadence_agent::device_login::clear_config(state.path()).unwrap();
         open_verify_gate(&gate);
 
         let err = call.join().unwrap().unwrap_err();
         assert_eq!(
             err.code(),
             Some("capability_unavailable"),
-            "a retired pin minted or misreported: {err}"
+            "a retired config minted or misreported: {err}"
         );
         assert_eq!(
             device_session_count(state.path()),
@@ -2463,19 +2587,17 @@ mod device {
         );
     }
 
-    /// The same window on the config axis: the board stays live, but
-    /// the pin under it changed — an operator rotated the allowlist.
-    /// The in-flight verify answered for the retired pin; minting off
-    /// it would sign in a subject the operator just removed.
+    /// The same window on the config axis: the verify answered for the
+    /// retired config; minting off it would sign in a subject the
+    /// operator just removed from the allowlist.
     #[test]
-    fn a_verify_in_flight_mints_nothing_when_the_pin_rotates() {
-        use cadence_agent::device_login::write_pin;
+    fn a_verify_in_flight_mints_nothing_when_the_config_rotates() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, stub, gate) = device_stub_gated("approve");
-        let (_port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let (_port, _board) = start_device_board(pm.path(), state.path(), issuer.clone());
 
         let state_dir = state.path().to_path_buf();
         let call = thread::spawn(move || {
@@ -2489,17 +2611,15 @@ mod device {
             stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
         });
 
-        // Same writer, same pid, live lock — only the allowlist moved.
-        let mut pin = cadence_agent::device_login::read_pin(state.path()).unwrap();
-        pin.subjects = vec!["op_rotated_in".to_string()];
-        write_pin(state.path(), &pin).unwrap();
+        // Same issuer, same org — only the allowlist moved.
+        configure_device_login(state.path(), &issuer, &["op_rotated_in"]);
         open_verify_gate(&gate);
 
         let err = call.join().unwrap().unwrap_err();
         assert_eq!(
             err.code(),
             Some("device_authority_changed"),
-            "a rotated pin minted or misreported: {err}"
+            "a rotated config minted or misreported: {err}"
         );
         assert_eq!(
             device_session_count(state.path()),
@@ -2509,17 +2629,16 @@ mod device {
     }
 
     /// The same proof through the HTTP relay: a poll parked at the
-    /// issuer while the pin rotated must answer a refusal — the relay
-    /// is no weaker than the daemon RPC it wraps.
+    /// issuer while the config rotated must answer a refusal — the
+    /// relay is no weaker than the daemon RPC it wraps.
     #[test]
-    fn a_poll_in_flight_mints_nothing_when_the_pin_rotates() {
-        use cadence_agent::device_login::write_pin;
+    fn a_poll_in_flight_mints_nothing_when_the_config_rotates() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, stub, gate) = device_stub_gated("approve");
-        let (port, _board) = start_device_board(pm.path(), state.path(), issuer);
+        let (port, _board) = start_device_board(pm.path(), state.path(), issuer.clone());
         let host = op::board_host(port);
 
         let (code, _, body) = device_post(port, &host, "/api/session/device/code", "{}");
@@ -2549,9 +2668,7 @@ mod device {
         wait_for("the verify never reached the issuer", || {
             stub.verifies.load(std::sync::atomic::Ordering::SeqCst) > 0
         });
-        let mut pin = cadence_agent::device_login::read_pin(state.path()).unwrap();
-        pin.subjects = vec!["op_rotated_in".to_string()];
-        write_pin(state.path(), &pin).unwrap();
+        configure_device_login(state.path(), &issuer, &["op_rotated_in"]);
         open_verify_gate(&gate);
 
         let (code, head, body) = poll.join().unwrap();
@@ -2562,7 +2679,7 @@ mod device {
         );
         assert!(
             op::set_cookie(&head).is_none(),
-            "a session cookie was issued under a rotated pin: {head}"
+            "a session cookie was issued under a rotated config: {head}"
         );
         assert_eq!(
             device_session_count(state.path()),
@@ -2571,56 +2688,59 @@ mod device {
         );
     }
 
-    /// A detached `ui start` child re-resolves device login — its env
-    /// must not beat the triple the parent just persisted (review r9).
-    /// `CADENCE_DEVICE_LOGIN_SUBJECTS=op_old` in the parent's env with
-    /// `--device-login-subject op_new` must leave `op_new` in the pin
-    /// the running child writes.
+    /// `ui start --device-login-*` is a thin client: the foreground
+    /// parent pushes the resolved triple to the daemon's store through
+    /// the operator-secret RPC before it spawns — flags beat a leaked
+    /// `CADENCE_DEVICE_LOGIN_SUBJECTS` env, and the detached child
+    /// pushes nothing itself (a setsid child can't prove operator).
     #[test]
-    fn device_start_child_pins_the_saved_subjects_not_env() {
+    fn device_start_flags_push_the_flag_subjects_not_env() {
         let pm = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         seed(pm.path(), state.path());
         let _d = UiDaemon::start_on(state.path().to_path_buf());
         let (issuer, _stub) = device_stub("approve");
         let port = free_port();
-        let mut cmd = std::process::Command::new(bin());
-        cmd.arg("--state-dir")
-            .arg(state.path())
-            .args([
+        let port_s = port.to_string();
+        let pm_s = pm.path().display().to_string();
+        let (ok, out, err) = op::operator_cli_env(
+            bin(),
+            state.path(),
+            &[
                 "ui",
                 "start",
                 "--port",
-                &port.to_string(),
+                &port_s,
                 "--device-login-issuer",
                 &issuer,
                 "--device-login-org",
                 "ws_company",
                 "--device-login-subject",
                 "op_new",
-            ])
-            .env("CADENCE_PM_DIR", pm.path())
-            // The leak under test: env must lose to the persisted triple.
-            .env("CADENCE_DEVICE_LOGIN_SUBJECTS", "op_old")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Same operator-shaped spawn as the other detached-board tests.
-        cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
-            .env(cadence_agent::test_seam::AS_ENV, "operator");
-        let out = cmd.output().unwrap();
-        assert!(out.status.success(), "ui start failed");
-        // `ui start` answers only after the child's health does, and the
-        // child writes the pin before it serves.
-        let pin: Value = serde_json::from_slice(
-            &std::fs::read(state.path().join("operator").join("device-login.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            pin["subjects"],
-            json!(["op_new"]),
-            "the detached child re-resolved the leaked env: {pin}"
+            ],
+            &[
+                ("CADENCE_PM_DIR", pm_s.as_str()),
+                // The leak under test: env must lose to the flag.
+                ("CADENCE_DEVICE_LOGIN_SUBJECTS", "op_old"),
+            ],
         );
-        let (ok, _) = cli(pm.path(), state.path(), &["ui", "stop"]);
+        assert!(ok, "ui start failed: {out}{err}");
+        // `ui start` answers only after the child's health does; the
+        // parent's push landed before the spawn.
+        let (ok, out, err) = op::operator_cli(
+            bin(),
+            state.path(),
+            &["ui", "device-login", "show", "--json"],
+        );
+        assert!(ok, "device-login show failed: {out}{err}");
+        let shown: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(
+            shown["subjects"],
+            json!(["op_new"]),
+            "the leaked env beat the flag: {shown}"
+        );
+        assert_eq!(shown["org"], json!("ws_company"), "{shown}");
+        let (ok, _, _) = op::operator_cli(bin(), state.path(), &["ui", "stop"]);
         assert!(ok, "ui stop failed");
     }
 }

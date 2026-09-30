@@ -174,13 +174,14 @@ impl Shared {
     /// `operator_session_open_device {token, origin, user_agent?}` —
     /// the board's device-grant sign-in exchange (CAD-777). `token` is
     /// the issuer-approved `agc_` grant, verified LIVE against the
-    /// daemon-owned trust pin (`operator/device-login.json`, written
-    /// by `ui run`/`ui start` resolve) before anything is minted: the
-    /// subject and workspace come out of that verification, never out
-    /// of request fields, so a socket caller cannot forge them. The
-    /// verified subject must then be on the pin's allowlist — the
-    /// operator named the few principals who may sign in remotely;
-    /// any other verified workspace member is refused, loudly.
+    /// daemon-owned config (`operator/device-login.json`, written only
+    /// by `operator_device_login_set` under the operator-secret gate,
+    /// CAD-841) before anything is minted: the subject and workspace
+    /// come out of that verification, never out of request fields, so
+    /// a socket caller cannot forge them. The verified subject must
+    /// then be on the config's allowlist — the operator named the few
+    /// principals who may sign in remotely; any other verified
+    /// workspace member is refused, loudly.
     ///
     /// A connection that derives an agent is refused before any issuer
     /// contact — a browser session is never minted for a pane.
@@ -199,14 +200,12 @@ impl Shared {
         let token = required_str(params, "token")?;
         let origin = origin_param(params)?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
-        // The pin is the only issuer/org authority: an absent file (or
-        // one failing strict modes) fails closed with no session. And
-        // the pin is mint authority only while the board that wrote it
-        // is alive and holds the pin lock — a stale file behind a dead
-        // or replaced board mints nothing, before any issuer contact.
-        let pin = crate::device_login::read_pin(&self.state_dir)?;
-        crate::device_login::pin_is_live(&self.state_dir, &pin)?;
-        let config = crate::device_login::DeviceConfig::new(&pin.issuer, &pin.org)?;
+        // The daemon-owned config is the only issuer/org authority
+        // (CAD-841): an absent file (or one failing strict modes or
+        // schema — a legacy board-written pin included) fails closed
+        // with no session, before any issuer contact.
+        let authority = crate::device_login::read_config(&self.state_dir)?;
+        let config = crate::device_login::DeviceConfig::new(&authority.issuer, &authority.org)?;
         let verified = crate::device_login::verify_session(
             &crate::device_login::UreqTransport::new(),
             &config,
@@ -219,19 +218,15 @@ impl Shared {
         .map_err(|e| Error::invalid("device_verification_failed", e.to_string()))?;
         // CAD-851: the verify above can block for the whole transport
         // timeout, and authority can retire inside that window — the
-        // board stops (flock released) or a new board pins different
-        // issuer/org/subjects. The re-check runs under the session mutex
-        // immediately before the mint it protects, so no further wait can
-        // intervene between re-validation and `open_device`; an unchanged
-        // pin means the allowlist check below still applies the
-        // operator's current list. (Residual: pid reuse or a foreign lock
-        // holder can spoof `pin_is_live` — deferred to CAD-842, and
-        // CAD-841 removes the pin file entirely.)
+        // operator's `device-login clear`/`set` lands between verify and
+        // mint. The re-check runs under the session mutex immediately
+        // before the mint it protects, so no further wait can intervene
+        // between re-validation and `open_device`; an unchanged config
+        // means the allowlist check below still applies the operator's
+        // current list.
         let mut auth = self.operator_auth();
-        let pin_now = match crate::device_login::read_pin(&self.state_dir)
-            .and_then(|p| crate::device_login::pin_is_live(&self.state_dir, &p).map(|()| p))
-        {
-            Ok(p) => p,
+        let authority_now = match crate::device_login::read_config(&self.state_dir) {
+            Ok(a) => a,
             Err(e) => {
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
@@ -241,7 +236,7 @@ impl Shared {
                 return Err(e);
             }
         };
-        if pin_now != pin {
+        if authority_now != authority {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "operator_device_session_refused",
@@ -249,7 +244,7 @@ impl Shared {
             );
             return Err(Error::invalid(
                 "device_authority_changed",
-                "device sign-in refused: the board's device-login \
+                "device sign-in refused: the daemon's device-login \
                  configuration changed while the grant was being verified \
                  — sign in again",
             ));
@@ -258,7 +253,7 @@ impl Shared {
         // verified workspace member who is not on it gets no session.
         // The refusal echoes the subject id — ids aren't credentials,
         // and naming it is how the operator learns what to allowlist.
-        if !pin_now.subjects.contains(&verified.subject_id) {
+        if !authority_now.subjects.contains(&verified.subject_id) {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "operator_device_session_refused",
@@ -269,8 +264,8 @@ impl Shared {
                 "device_subject_not_allowed",
                 format!(
                     "device sign-in refused: subject '{}' is not on this board's \
-                     device-login allowlist — add it with --device-login-subject {} \
-                     and restart the UI",
+                     device-login allowlist — allowlist it with \
+                     `cadence ui device-login set --subject {}`",
                     verified.subject_id, verified.subject_id
                 ),
             ));
@@ -290,6 +285,113 @@ impl Shared {
             json!({"session": opened.session.id, "origin": origin.as_str(), "org": verified.org}),
         );
         Ok(json!({"token": opened.token, "key": opened.key, "session": opened.session}))
+    }
+
+    /// `device_login_config {}` — the board-facing read of the
+    /// daemon-owned device-login config (CAD-841). Read-only: any
+    /// socket caller may learn `{configured, issuer, org}` — the
+    /// issuer URL reaches browsers anyway via the approval link — but
+    /// the subject allowlist never leaves the daemon; minting consults
+    /// it server-side only.
+    pub(super) fn rpc_device_login_config(&self) -> Result<Value> {
+        match crate::device_login::read_config(&self.state_dir) {
+            Ok(config) => Ok(json!({
+                "configured": true,
+                "issuer": config.issuer,
+                "org": config.org,
+            })),
+            Err(_) => Ok(json!({"configured": false})),
+        }
+    }
+
+    /// `operator_device_login_set {secret, issuer, org, subjects}` —
+    /// the only writer of the mint-authority config (CAD-841). Same
+    /// caller rule as `ui login`: positive operator proof + the
+    /// operator secret, so an agent caller, a detached pane child or a
+    /// secret-less caller is refused before the file changes. The
+    /// triple is validated exactly as the read path demands, so a bad
+    /// or forged field can never persist.
+    pub(super) fn rpc_operator_device_login_set(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_with_secret("ui device-login set", params, peer_pid)?;
+        let issuer = required_str(params, "issuer")?;
+        let org = required_str(params, "org")?;
+        let subjects: Vec<String> = params
+            .get("subjects")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Error::invalid(
+                    "bad_request",
+                    "operator_device_login_set needs a non-empty `subjects` array of \
+                     issuer subject ids",
+                )
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    Error::invalid("bad_request", "`subjects` entries must be strings")
+                })
+            })
+            .collect::<Result<_>>()?;
+        // `DeviceConfig::new` normalizes the issuer origin; `check`
+        // (via `write_config`) validates the whole triple — the stored
+        // file carries the normalized values it was audited as.
+        let normalized = crate::device_login::DeviceConfig::new(issuer, org)?;
+        let config = crate::device_login::DeviceLoginConfig {
+            issuer: normalized.issuer().to_string(),
+            org: normalized.org().to_string(),
+            subjects,
+        };
+        crate::device_login::write_config(&self.state_dir, &config)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "operator_device_login_set",
+            json!({"issuer": config.issuer, "org": config.org,
+                   "subjects": config.subjects}),
+        );
+        Ok(json!({"configured": true, "issuer": config.issuer, "org": config.org}))
+    }
+
+    /// `operator_device_login_clear {secret}` — removes the
+    /// mint-authority config (CAD-841). Afterwards the mint path and
+    /// every board route fail closed until the operator sets it again.
+    /// Clearing on an unconfigured daemon is a no-op success.
+    pub(super) fn rpc_operator_device_login_clear(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_with_secret("ui device-login clear", params, peer_pid)?;
+        crate::device_login::clear_config(&self.state_dir)?;
+        let _ = self
+            .store
+            .event_public(DAEMON_ALIAS, "operator_device_login_cleared", json!({}));
+        Ok(json!({"configured": false}))
+    }
+
+    /// `operator_device_login_show {secret}` — the full triple,
+    /// subjects included, for `cadence ui device-login show`
+    /// (CAD-841). Secret-gated because the allowlist names the
+    /// operators who may sign in; the open `device_login_config` read
+    /// omits it.
+    pub(super) fn rpc_operator_device_login_show(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_with_secret("ui device-login show", params, peer_pid)?;
+        match crate::device_login::read_config(&self.state_dir) {
+            Ok(config) => Ok(json!({
+                "configured": true,
+                "issuer": config.issuer,
+                "org": config.org,
+                "subjects": config.subjects,
+            })),
+            Err(_) => Ok(json!({"configured": false})),
+        }
     }
 
     /// `board_session_open {assertion, user_agent?}` — the board's

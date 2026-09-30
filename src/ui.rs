@@ -130,23 +130,26 @@ pub struct UiFlags {
     /// `{issuer}/v2/board/authorize`.
     #[arg(long)]
     pub board_authorize_url: Option<String>,
-    /// CAD-777: allow remote operator sign-in through the AgenticOS
-    /// device grant — the issuer origin that mints the grant.
-    /// Requires `--device-login-org` (and env `CADENCE_DEVICE_LOGIN_ORG`
-    /// as fallback); the pair persists in ui.json. Default: off — the
-    /// device routes answer 404 unless both resolve.
+    /// CAD-777/CAD-841: allow remote operator sign-in through the
+    /// AgenticOS device grant — the issuer origin that mints the
+    /// grant. A thin client of `cadence ui device-login set`: this
+    /// process pushes the resolved triple to the daemon (operator
+    /// proof + the operator secret) before serving, and the daemon's
+    /// own store then owns it — nothing is persisted in ui.json and a
+    /// board restart never changes it. Requires `--device-login-org`
+    /// (env `CADENCE_DEVICE_LOGIN_ORG` is the fallback). Default: off.
     #[arg(long)]
     pub device_login_issuer: Option<String>,
-    /// CAD-777: the exact workspace the device sign-in is for.
+    /// CAD-777/CAD-841: the exact workspace the device sign-in is for.
     /// Requires `--device-login-issuer` (env
     /// `CADENCE_DEVICE_LOGIN_ISSUER` as fallback).
     #[arg(long)]
     pub device_login_org: Option<String>,
-    /// CAD-777: an issuer subject allowed to sign in — repeatable,
-    /// once per operator (`cadence auth status` prints yours under
-    /// `principal.subject_id`). Required with the issuer/org pair;
-    /// env `CADENCE_DEVICE_LOGIN_SUBJECTS` (comma-separated) is the
-    /// fallback.
+    /// CAD-777/CAD-841: an issuer subject allowed to sign in —
+    /// repeatable, once per operator (`cadence auth status` prints
+    /// yours under `principal.subject_id`). Required with the
+    /// issuer/org pair; env `CADENCE_DEVICE_LOGIN_SUBJECTS`
+    /// (comma-separated) is the fallback.
     #[arg(long)]
     pub device_login_subject: Vec<String>,
 }
@@ -209,11 +212,50 @@ pub enum UiAction {
         #[arg(long)]
         json: bool,
     },
+    /// Manage remote sign-in through the AgenticOS device grant
+    /// (CAD-777/CAD-841): set or clear the daemon-owned issuer +
+    /// workspace + subject allowlist. Applies live to every board on
+    /// this state dir — no restart. Operator-only: needs positive
+    /// operator proof and the operator secret, like `ui login`.
+    DeviceLogin {
+        #[command(subcommand)]
+        action: DeviceLoginAction,
+    },
     /// Share the board over the tailnet (`tailscale serve`, never
     /// funnel). The primary UX for phone/laptop access.
     Tailscale {
         #[command(subcommand)]
         action: TailscaleAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DeviceLoginAction {
+    /// Point the device sign-in at an AgenticOS issuer + workspace and
+    /// name the subjects who may sign in. Replaces the whole triple —
+    /// a later `set` rotates it, `clear` removes it.
+    Set {
+        /// The issuer origin that mints the grant (https://…).
+        #[arg(long)]
+        issuer: String,
+        /// The exact workspace/org id the sign-in is for.
+        #[arg(long)]
+        org: String,
+        /// An issuer subject allowed to sign in — repeatable, once
+        /// per operator (`cadence auth status` prints yours under
+        /// `principal.subject_id`).
+        #[arg(long, required = true)]
+        subject: Vec<String>,
+    },
+    /// Turn remote sign-in off: the mint path and the board routes
+    /// fail closed until `set` runs again. Live sessions already
+    /// minted keep running — `ui sessions --revoke-all` ends those.
+    Clear,
+    /// Show the configured issuer, workspace and subject allowlist.
+    Show {
+        /// Print `{configured, issuer, org, subjects}` as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -255,6 +297,7 @@ pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
             revoke_all,
             json,
         } => login::sessions(state_dir, revoke.as_deref(), *revoke_all, *json),
+        UiAction::DeviceLogin { action } => login::device_login(state_dir, action),
         UiAction::Tailscale { action } => tailscale_cli(state_dir, action),
     }
 }
@@ -331,14 +374,16 @@ pub struct PublicBoard {
 
 /// Remote operator sign-in through the AgenticOS device grant
 /// (CAD-777): the issuer origin, the exact workspace and the subject
-/// allowlist. All or none — a partial triple never resolves.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// allowlist as the operator supplied them — flags win, then the
+/// `CADENCE_DEVICE_LOGIN_*` env. All or none — a partial triple never
+/// resolves. CAD-841: this is only the push payload for
+/// `operator_device_login_set`; the daemon's own store is the
+/// authority, ui.json never holds it.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct DeviceLoginOpts {
     pub issuer: String,
     pub org: String,
     /// The verified issuer subjects allowed a board session.
-    #[serde(default)]
     pub subjects: Vec<String>,
 }
 
@@ -353,37 +398,30 @@ pub struct DevicePending {
     expires_at: i64,
 }
 
-/// The resolved device-login configuration (CAD-777): the validated
-/// issuer + workspace pair, the operator's subject allowlist, and the
-/// live pending map. `None` in `ServeOpts` is off.
+/// The board's device-login machinery (CAD-777/CAD-841): the live
+/// pending map plus the issuer transport. The issuer + workspace +
+/// allowlist are NOT here — they are the daemon's config, read
+/// per-request through `device_login_config`, so a `set`/`clear`
+/// takes effect on a running board without a restart.
 #[derive(Clone)]
 pub struct DeviceLogin {
-    pub config: crate::device_login::DeviceConfig,
-    /// The allowlist `serve` writes into the daemon's pin — the only
-    /// subjects a verified grant may mint for.
-    pub subjects: Vec<String>,
     pub pending: std::sync::Arc<std::sync::Mutex<HashMap<String, DevicePending>>>,
     /// The issuer transport — live ureq unless a test injects a fake.
     pub transport: std::sync::Arc<dyn crate::device_login::IssuerTransport>,
 }
 
-/// Live device grants awaiting approval are bounded: past this many,
-/// `/api/session/device/code` refuses with 429 until one settles.
-const DEVICE_PENDING_CAP: usize = 16;
-
-impl DeviceLogin {
-    /// A live configuration: validated issuer pair + subject allowlist,
-    /// empty pending map, live issuer transport. Tests point `config`
-    /// at a loopback stub; production uses an HTTPS issuer origin.
-    pub fn with_issuer(config: crate::device_login::DeviceConfig, subjects: Vec<String>) -> Self {
+impl Default for DeviceLogin {
+    fn default() -> Self {
         Self {
-            config,
-            subjects,
             pending: Default::default(),
             transport: std::sync::Arc::new(crate::device_login::UreqTransport::new()),
         }
     }
 }
+
+/// Live device grants awaiting approval are bounded: past this many,
+/// `/api/session/device/code` refuses with 429 until one settles.
+const DEVICE_PENDING_CAP: usize = 16;
 
 /// The effective options `ui start` persists — a later plain start
 /// reuses them, `ui status` prints them, `--reset` forgets them.
@@ -400,9 +438,6 @@ pub struct UiOpts {
     pub tailscale: Option<TailscaleOpts>,
     /// The AgenticOS board-identity configuration (CAD-526).
     pub board: Option<PublicBoard>,
-    /// Remote operator sign-in through the AgenticOS device grant
-    /// (CAD-777): issuer + workspace, or neither. Default off.
-    pub device_login: Option<DeviceLoginOpts>,
 }
 
 /// Everything the running server needs, resolved.
@@ -460,11 +495,12 @@ pub struct ServeOpts {
     /// `__platform/*` routes and `__Host-aos-board-session` reads —
     /// never the local login flow.
     pub public: Option<PublicBoard>,
-    /// CAD-777: remote operator sign-in through the AgenticOS device
-    /// grant, when the issuer + workspace pair resolved. `None` is
-    /// off — the device routes answer 404. Never set from the command
-    /// line — tests inject a fake issuer transport beside it.
-    pub device_login: Option<DeviceLogin>,
+    /// CAD-777/CAD-841: the board's device-login machinery — pending
+    /// map + issuer transport. Whether the flow is ON is the daemon's
+    /// answer (`device_login_config` RPC), read per request; the
+    /// board never owns configuration. Never set from the command
+    /// line — tests inject a fake issuer transport.
+    pub device_login: DeviceLogin,
     /// CAD-482: arm the test-only caller seam — the board honors
     /// `X-Cadence-Test-As`/`X-Cadence-Test-Token` request headers and
     /// its daemon calls carry the asserted identity. Honored only in
@@ -588,10 +624,6 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
         // is all-or-nothing — any field present with another missing is
         // an operator error, never a partial trust root.
         board: resolve_board(flags, persisted)?,
-        // CAD-777: same shape — flag → env → persisted, issuer + org +
-        // subjects or none. Validation (fail closed at boot) happens in
-        // `serve_opts` so `ui status` can show the raw triple.
-        device_login: resolve_device_login(flags, persisted)?,
     };
     if eff.board_public_only && eff.board.is_none() {
         return Err(Error::rejected(
@@ -621,34 +653,28 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
     Ok((eff, serve))
 }
 
-/// CAD-777: merge the device-login triple — flags win, then
-/// `CADENCE_DEVICE_LOGIN_*` env, then the persisted block. Issuer +
-/// org + at least one subject, or none of it; a partial combination
-/// is an operator error naming the missing piece, never a silent
-/// half trust root. Values are validated when `serve_opts` builds
-/// the runtime config, so a bad triple fails the board at boot.
-fn resolve_device_login(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<DeviceLoginOpts>> {
-    let field = |flag: Option<&String>, env: &str, saved: Option<&String>| {
+/// CAD-841: the `--device-login-*` flags (and their
+/// `CADENCE_DEVICE_LOGIN_*` fallbacks) as a thin client of
+/// `operator_device_login_set`. Flags win, then env — never a
+/// persisted block: the daemon's own store is the persistence now.
+/// Issuer + org + at least one subject, or none of it; a partial
+/// combination is an operator error naming the missing piece, never
+/// a silent half trust root. The daemon validates the resolved
+/// triple authoritatively in the RPC.
+fn resolve_device_login(flags: &UiFlags) -> Result<Option<DeviceLoginOpts>> {
+    let field = |flag: Option<&String>, env: &str| {
         flag.cloned()
             .or_else(|| std::env::var(env).ok())
-            .or_else(|| saved.cloned())
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let saved = persisted.device_login.as_ref();
     let issuer = field(
         flags.device_login_issuer.as_ref(),
         "CADENCE_DEVICE_LOGIN_ISSUER",
-        saved.map(|d| &d.issuer),
     );
-    let org = field(
-        flags.device_login_org.as_ref(),
-        "CADENCE_DEVICE_LOGIN_ORG",
-        saved.map(|d| &d.org),
-    );
-    // Subjects resolve as a list: any flag beats the env list, which
-    // beats the saved one. Env is comma-separated, trimmed, empties
-    // dropped.
+    let org = field(flags.device_login_org.as_ref(), "CADENCE_DEVICE_LOGIN_ORG");
+    // Subjects resolve as a list: any flag beats the env list. Env is
+    // comma-separated, trimmed, empties dropped.
     let flag_subjects: Vec<String> = flags
         .device_login_subject
         .iter()
@@ -664,7 +690,7 @@ fn resolve_device_login(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<De
             .map(str::to_string)
             .collect()
     } else {
-        saved.map(|d| d.subjects.clone()).unwrap_or_default()
+        Vec::new()
     };
     match (issuer, org, subjects.is_empty()) {
         (None, None, true) => Ok(None),
@@ -690,6 +716,33 @@ fn resolve_device_login(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<De
             )))
         }
     }
+}
+
+/// Push a resolved `--device-login-*` triple to the daemon-owned
+/// store — `ui run`/`ui start`'s thin-client half of
+/// `cadence ui device-login set` (CAD-841). This runs in the
+/// foreground process, before any bind or spawn: the call carries
+/// the operator secret, so it only succeeds for a provably-operator
+/// caller against a live daemon. A detached `ui run` child sees no
+/// device flags and a scrubbed env, so it never re-pushes. Absent
+/// flags resolve to `None` and daemon state stays exactly as it is —
+/// it no longer takes a board start to clear it.
+fn push_device_login(state_dir: &Path, flags: &UiFlags) -> Result<()> {
+    let Some(triple) = resolve_device_login(flags)? else {
+        return Ok(());
+    };
+    let secret = crate::operator_auth::read_secret(state_dir)?;
+    crate::client::rpc(
+        state_dir,
+        "operator_device_login_set",
+        json!({
+            "secret": secret,
+            "issuer": triple.issuer,
+            "org": triple.org,
+            "subjects": triple.subjects,
+        }),
+    )?;
+    Ok(())
 }
 
 /// CAD-526: merge the board-identity configuration — flags win, then
@@ -839,23 +892,11 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // copies a caller's env into the field.
         ready_nonce: None,
         public: eff.board.clone(),
-        // CAD-777: the triple validates here so a bad issuer/org or a
-        // malformed allowlist fails the board at boot, never at first
-        // sign-in. The pending map starts empty; tests replace the
-        // whole `DeviceLogin`.
-        device_login: eff
-            .device_login
-            .as_ref()
-            .map(|pair| -> Result<DeviceLogin> {
-                crate::device_login::validate_subjects(&pair.subjects)?;
-                Ok(DeviceLogin {
-                    config: crate::device_login::DeviceConfig::new(&pair.issuer, &pair.org)?,
-                    subjects: pair.subjects.clone(),
-                    pending: Default::default(),
-                    transport: std::sync::Arc::new(crate::device_login::UreqTransport::new()),
-                })
-            })
-            .transpose()?,
+        // CAD-841: the board's half of device login is only the
+        // pending map + issuer transport — configuration lives in the
+        // daemon store and is read per request, so a `device-login
+        // set`/`clear` applies to a running board at once.
+        device_login: DeviceLogin::default(),
         // CAD-482: `ui run`/`ui start`'s fixture child arms from its
         // environment; in-process fixtures set the field directly.
         test_seam: crate::test_seam::env_armed(),
@@ -4487,20 +4528,11 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         }
         Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
     })?;
-    // CAD-777: same handoff for the device trust pin — the daemon
-    // verifies the presented grant against this file at mint time, so
-    // a socket caller can never choose the issuer, the workspace, or
-    // mint for a subject off the operator's allowlist. When device
-    // login is not configured, any stale pin is removed so an old
-    // file cannot mint after the operator turned the flow off.
-    //
-    // Written ONLY here: after the bind succeeded (a process that
-    // loses the port touches nothing) and while no OTHER live UI owns
-    // this state dir — a second `ui run` must not rewrite or delete
-    // the pin out from under the running board (review r3).
-    // The lock File stays bound for the rest of `serve()` — the
-    // board's claim on the pin dies only with this process.
-    let _device_pin_lock = pin_device_login(state_dir, &opts)?;
+    // CAD-841: the daemon owns the device-login config — no pin file,
+    // no lock, nothing for a board process to write or clear at bind.
+    // The operator's `device-login set`/`clear` (or the `--device-
+    // login-*` thin client) is the only authority, and it applies to
+    // this running board at once because routes read it per request.
     // CAD-446: merge decisions appear without a terminal — this process
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
@@ -4646,106 +4678,6 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
         })
 }
 
-use crate::device_login::DEVICE_PIN_LOCK;
-
-/// Try to take [`DEVICE_PIN_LOCK`]. `wait` retries up to 5 s so a
-/// restart's old-board/new-child handoff (`ui tailscale start`,
-/// `ui start` after `ui stop`) does not race the exiting holder;
-/// `!wait` is a single non-blocking attempt — an unconfigured board
-/// never stalls on a lock it does not need (review r6). `Ok(Some)` —
-/// this board owns the pin; `Ok(None)` — another live board does.
-fn device_pin_lock(state_dir: &Path, wait: bool) -> Result<Option<std::fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let dir = crate::operator_auth::checked_dir(state_dir)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir.join(DEVICE_PIN_LOCK))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(file));
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(Error::internal(format!("device pin lock: {error}")));
-        }
-        if !wait || Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Write or clear the daemon's device trust pin for this board
-/// (`opts.device_login` ⇔ the pin file), guarded by the lock. The
-/// returned File must stay bound for the rest of `serve()`. While
-/// ANOTHER board holds the lock: a board WITH device login refuses
-/// to start — nothing is written; a board WITHOUT it serves anyway
-/// but never clears the pin (two unconfigured boards on one state
-/// dir keeps working as before).
-fn pin_device_login(state_dir: &Path, opts: &ServeOpts) -> Result<Option<std::fs::File>> {
-    let configured = opts.device_login.is_some();
-    // A board with no device login never fails on pin handling
-    // (review r6/r8): absent operator dir → no pin could exist →
-    // nothing to clear or lock, and the dir is not created. A dir
-    // that exists gets one non-blocking lock attempt — clearing a
-    // stale pin on a win — and ANY error (dir check, open, flock)
-    // is one warning line, never a startup refusal.
-    if !configured {
-        let dir = crate::operator_auth::dir(state_dir);
-        if !dir.is_dir() {
-            return Ok(None);
-        }
-        let lock = match device_pin_lock(state_dir, false) {
-            Ok(lock) => lock,
-            Err(e) => {
-                eprintln!(
-                    "warning: device pin lock skipped: {e} — serving without touching the pin"
-                );
-                return Ok(None);
-            }
-        };
-        if lock.is_some() {
-            if let Err(e) = crate::device_login::clear_pin(state_dir) {
-                eprintln!("warning: stale device pin not cleared: {e} — serving anyway");
-            }
-        }
-        // A board with no pin of its own does not keep the lock —
-        // releasing it lets a configured board start while this one
-        // serves.
-        return Ok(None);
-    }
-    // Configured: strict — create/verify the dir, wait out the
-    // restart handoff, refuse to start when the lock is held.
-    let lock = device_pin_lock(state_dir, true)?;
-    if let Some(login) = opts
-        .device_login
-        .as_ref()
-        .map(|login| crate::device_login::DevicePin {
-            issuer: login.config.issuer().to_string(),
-            org: login.config.org().to_string(),
-            subjects: login.subjects.clone(),
-            // Written under the held lock — the daemon treats the pin
-            // as live only while this pid holds it (review r9).
-            board_pid: std::process::id(),
-        })
-    {
-        if lock.is_none() {
-            return Err(Error::rejected(
-                "device login is pinned by another live board on this state dir — \
-                 stop it first",
-            ));
-        }
-        crate::device_login::write_pin(state_dir, &login)?;
-    }
-    Ok(lock)
-}
-
 /// Tiny blocking GET — enough for health checks without an HTTP client
 /// dependency. `headers` are extra request lines (`Tailscale-User-Login`
 /// for the identity probe). Returns `(status, body)`.
@@ -4788,6 +4720,11 @@ pub(crate) fn http_get(
 fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     let persisted = load_opts(state_dir);
     let (_eff, so) = resolve_opts(flags, &persisted)?;
+    // CAD-841: `--device-login-*` is a thin client — push the triple to
+    // the daemon before serving (operator proof + secret; a detached
+    // child resolves no flags and never reaches this). Absent flags
+    // leave the daemon's own store untouched.
+    push_device_login(state_dir, flags)?;
     serve(state_dir, &crate::issue::default_dir()?, &so)?;
     Ok(0)
 }
@@ -4827,16 +4764,10 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                 "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
             ));
         }
-        // CAD-777: the device trust pin is written once at board
-        // start; a live board serves its in-memory triple. Refuse any
-        // change (enable, disable, re-point, re-subject) while running
-        // so the pin file, the saved options and the live routes cannot
-        // drift apart — stop the UI, then start it with the new values.
-        if eff.device_login != recorded.device_login {
-            return Err(Error::rejected(
-                "device login configuration cannot change while the UI is running — stop the UI, then start it with the new configuration",
-            ));
-        }
+        // CAD-841: device login is deliberately absent from the
+        // running-change refuses — the daemon owns the config now, and
+        // a `--device-login-*` flag push on an already-running board is
+        // a live `operator_device_login_set`, not a restart.
         if eff.board_public_only {
             if eff.board != recorded.board || eff.host != recorded.host || eff.port != recorded.port
             {
@@ -4880,6 +4811,13 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
             }
         }
     }
+    // CAD-841: `--device-login-*` is a thin client of
+    // `operator_device_login_set` — push in THIS process (it carries
+    // the operator secret; the detached child could never prove
+    // itself). Running board or not, the daemon's store is the truth
+    // and routes read it live, so this is also how the config changes
+    // on an already-running board.
+    push_device_login(state_dir, flags)?;
     save_opts(state_dir, &eff)?;
     let (host, port) = (so.host.clone(), so.port);
     // A previous start's marker must not satisfy this one's wait —
@@ -4913,8 +4851,11 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     // leak into the child (a `daemon restart --ui` under it would
     // blanket-assert every board→daemon RPC).
     command.env_remove(crate::test_seam::AS_ENV);
-    // CAD-777 r9: the child re-resolves device login — env must not
-    // beat the effective triple the parent just persisted.
+    // CAD-841: the child must never push a device-login config — the
+    // parent already did (or nobody did). Its argv carries none of the
+    // flags; strip the env fallbacks so an inherited
+    // `CADENCE_DEVICE_LOGIN_*` cannot make it try (a detached child
+    // fails operator proof and would die at startup).
     command
         .env_remove("CADENCE_DEVICE_LOGIN_ISSUER")
         .env_remove("CADENCE_DEVICE_LOGIN_ORG")
@@ -5099,6 +5040,11 @@ fn status(state_dir: &Path) -> Result<i32> {
                 "{}://{}", operator::public_scheme(&b.host), b.host)),
             "board_issuer": opts.board.as_ref().map(|b| b.issuer.clone()),
             "board_company": opts.board.as_ref().map(|b| b.company.clone()),
+            // CAD-841: device login is daemon-owned — report the
+            // daemon's answer (issuer/org only; the allowlist is for
+            // `ui device-login show`), `null` while the daemon is away.
+            "device_login": crate::client::rpc(
+                state_dir, "device_login_config", json!({})).ok(),
         }))
         .unwrap_or_default()
     );
@@ -5476,7 +5422,7 @@ mod tests {
     use super::{
         agents_payload_from, content_type, context_query, health_supports_model_defaults,
         proxied_actor, resolve_device_login, running_json, static_answer_for, static_file,
-        DeviceLoginOpts, StaticAnswer, UiFlags, UiOpts,
+        StaticAnswer, UiFlags, UiOpts,
     };
     use serde_json::{json, Value};
     use tiny_http::{Header, Response};
@@ -5889,23 +5835,15 @@ mod tests {
         assert!(proxied_actor(Some("bad\u{1}login")).is_err());
     }
 
-    /// CAD-777: the device-login triple resolves flag → env →
-    /// persisted — issuer + org + at least one subject, or none. A
-    /// partial combination is an operator error naming the missing
-    /// piece. Env is restored after each case so parallel runners
-    /// sharing the process see no leak.
+    /// CAD-841: the device-login triple resolves flag → env — issuer +
+    /// org + at least one subject, or none. `ui.json` is no longer a
+    /// source (the daemon store is the persistence), and a stale
+    /// `device_login` key in an old ui.json is ignored rather than
+    /// resurrected. A partial combination is an operator error naming
+    /// the missing piece. Env is restored after each case so parallel
+    /// runners sharing the process see no leak.
     #[test]
     fn device_login_triple_resolves_all_or_nothing() {
-        fn persisted(triple: Option<(&str, &str, &[&str])>) -> UiOpts {
-            UiOpts {
-                device_login: triple.map(|(issuer, org, subjects)| DeviceLoginOpts {
-                    issuer: issuer.to_string(),
-                    org: org.to_string(),
-                    subjects: subjects.iter().map(|s| s.to_string()).collect(),
-                }),
-                ..Default::default()
-            }
-        }
         fn flags(issuer: Option<&str>, org: Option<&str>, subjects: &[&str]) -> UiFlags {
             UiFlags {
                 device_login_issuer: issuer.map(str::to_string),
@@ -5924,54 +5862,40 @@ mod tests {
         }
         let _guard = EnvGuard;
         // Nothing anywhere: off.
-        assert!(
-            resolve_device_login(&flags(None, None, &[]), &persisted(None))
-                .unwrap()
-                .is_none()
-        );
-        // Full flags win and name all three.
-        let triple = resolve_device_login(
-            &flags(Some("https://issuer.example"), Some("ws_co"), &["op_1"]),
-            &persisted(None),
-        )
+        assert!(resolve_device_login(&flags(None, None, &[]))
+            .unwrap()
+            .is_none());
+        // Full flags name all three.
+        let triple = resolve_device_login(&flags(
+            Some("https://issuer.example"),
+            Some("ws_co"),
+            &["op_1"],
+        ))
         .unwrap()
         .unwrap();
         assert_eq!(triple.issuer, "https://issuer.example");
         assert_eq!(triple.subjects, vec!["op_1".to_string()]);
         // Every partial combination refuses, and the error names the
         // missing piece.
-        let err = resolve_device_login(
-            &flags(Some("https://issuer.example"), Some("ws_co"), &[]),
-            &persisted(None),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = resolve_device_login(&flags(Some("https://issuer.example"), Some("ws_co"), &[]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--device-login-subject"), "{err}");
-        let err = resolve_device_login(
-            &flags(Some("https://issuer.example"), None, &["op_1"]),
-            &persisted(None),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = resolve_device_login(&flags(Some("https://issuer.example"), None, &["op_1"]))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--device-login-org"), "{err}");
-        let err = resolve_device_login(&flags(None, None, &["op_1"]), &persisted(None))
+        let err = resolve_device_login(&flags(None, None, &["op_1"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("--device-login-issuer"), "{err}");
         assert!(err.contains("--device-login-org"), "{err}");
-        // A flag pair alone still falls through to persisted subjects.
-        assert!(resolve_device_login(
-            &flags(None, Some("ws_co"), &[]),
-            &persisted(Some(("https://issuer.example", "ws_co", &["op_2"])))
-        )
-        .unwrap()
-        .is_some());
         // Env fills the gaps; the subject list is comma-separated,
         // trimmed, empties dropped. Whitespace-only counts as absent.
         std::env::set_var("CADENCE_DEVICE_LOGIN_ISSUER", "https://env.example");
         std::env::set_var("CADENCE_DEVICE_LOGIN_ORG", "ws_env");
         std::env::set_var("CADENCE_DEVICE_LOGIN_SUBJECTS", " op_3 , ,op_4 ,");
-        let triple = resolve_device_login(&flags(None, None, &[]), &persisted(None))
+        let triple = resolve_device_login(&flags(None, None, &[]))
             .unwrap()
             .unwrap();
         assert_eq!(triple.org, "ws_env");
@@ -5980,30 +5904,35 @@ mod tests {
             vec!["op_3".to_string(), "op_4".to_string()]
         );
         // Flag subjects beat the env list.
-        let triple = resolve_device_login(&flags(None, None, &["op_9"]), &persisted(None))
+        let triple = resolve_device_login(&flags(None, None, &["op_9"]))
             .unwrap()
             .unwrap();
         assert_eq!(triple.subjects, vec!["op_9".to_string()]);
         // An env that yields no subject still misses the piece.
         std::env::set_var("CADENCE_DEVICE_LOGIN_SUBJECTS", " , ,");
-        assert!(resolve_device_login(&flags(None, None, &[]), &persisted(None)).is_err());
+        assert!(resolve_device_login(&flags(None, None, &[])).is_err());
         std::env::remove_var("CADENCE_DEVICE_LOGIN_ISSUER");
         std::env::remove_var("CADENCE_DEVICE_LOGIN_ORG");
         std::env::remove_var("CADENCE_DEVICE_LOGIN_SUBJECTS");
-        // Persisted values survive when nothing overrides them.
-        assert!(resolve_device_login(
-            &flags(None, None, &[]),
-            &persisted(Some(("https://saved.example", "ws_saved", &["op_7"])))
-        )
-        .unwrap()
-        .is_some());
-        // Persisted issuer/org without subjects is a partial block —
-        // refused, never silently on.
-        assert!(resolve_device_login(
-            &flags(None, None, &[]),
-            &persisted(Some(("https://saved.example", "ws_saved", &[])))
-        )
-        .is_err());
+        // A pre-CAD-841 ui.json carrying the old `device_login` options
+        // block parses and is ignored — the board must not resurrect a
+        // persisted triple the daemon no longer reads.
+        let stale: UiOpts = serde_json::from_value(serde_json::json!({
+            "port": 3110,
+            "device_login": {
+                "issuer": "https://saved.example",
+                "org": "ws_saved",
+                "subjects": ["op_7"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(stale.port, Some(3110));
+        assert!(
+            resolve_device_login(&flags(None, None, &[]))
+                .unwrap()
+                .is_none(),
+            "a stale ui.json triple must not feed resolution"
+        );
     }
 
     /// CAD-140: the board's create takes an optional description body
