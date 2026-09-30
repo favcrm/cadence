@@ -374,6 +374,19 @@ export function buildCsvDecisions(
   return decisions;
 }
 
+/** How many rows will actually write — the apply-chosen create,
+ *  update and revision-confirmed rows. Plan skips, operator skips and
+ *  error rows are never counted as approved writes. */
+export function csvApplyCount(
+  rows: CsvPlanRow[],
+  choices: Map<number, CsvRowChoice>,
+): number {
+  return rows.filter((row) => {
+    if (row.decision === "error" || row.decision === "skip") return false;
+    return (choices.get(row.row) ?? csvPlanChoice(row)) === "apply";
+  }).length;
+}
+
 /** Whether the current choices can be sent: every applied
  *  `needs_revision` row needs a strictly positive integer revision. */
 export function csvDecisionsReady(
