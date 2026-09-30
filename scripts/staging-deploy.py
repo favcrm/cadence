@@ -71,9 +71,9 @@ def log_line(base, message):
         f.write(f"{stamp} {message}\n")
 
 
-def child_env(extra=None):
+def child_env(extra=None, base=BASE):
     env = {k: v for k, v in os.environ.items() if not k.startswith("CADENCE_")}
-    env["CADENCE_SANDBOX_ROOT"] = str(BASE / "sandbox")
+    env["CADENCE_SANDBOX_ROOT"] = str(base / "sandbox")
     env["CADENCE_SANDBOX_ALLOW_GLOBAL"] = "1"
     if extra:
         env.update(extra)
@@ -90,10 +90,10 @@ def run_ok(run, argv, env, cwd=None):
     return out
 
 
-def sandbox_env(run, cadence):
+def sandbox_env(run, cadence, base=BASE):
     """Parse `cadence sandbox env` export lines into an env dict."""
-    out = run_ok(run, [cadence, "sandbox", "env", NAME], child_env())
-    env = child_env()
+    out = run_ok(run, [cadence, "sandbox", "env", NAME], child_env(base=base))
+    env = child_env(base=base)
     for line in out.splitlines():
         m = re.fullmatch(r"export (\w+)='(.*)'", line.strip())
         if m:
@@ -104,9 +104,9 @@ def sandbox_env(run, cadence):
     return env
 
 
-def sandbox_down(run, cadence):
+def sandbox_down(run, cadence, base=BASE):
     code, out, err = run(
-        [cadence, "sandbox", "down", NAME], env=child_env()
+        [cadence, "sandbox", "down", NAME], env=child_env(base=base)
     )
     if code != 0 and "no sandbox" not in (err + out):
         raise Refused(
@@ -349,11 +349,11 @@ def _tick_locked(run, http_get, base, run_id):
         if prev_rel and prev_rel != rel_id and prev_bin:
             log_line(base, f"tick: known-bad {rel_id[:12]} — recovering {prev_rel[:12]}")
             try:
-                sandbox_down(run, prev_bin)
+                sandbox_down(run, prev_bin, base)
                 run_ok(
                     run,
                     [prev_bin, "sandbox", "up", NAME, "--port", str(PORT)],
-                    child_env(),
+                    child_env(base=base),
                 )
                 live = health_ok(http_get)
                 prev_sha = status.get("previous_sha")
@@ -386,7 +386,7 @@ def _tick_locked(run, http_get, base, run_id):
             cadence = verified_binary(base / "releases" / rel_id)
             if cadence:
                 status["tailnet"] = tailnet(
-                    run, cadence, sandbox_env(run, cadence)
+                    run, cadence, sandbox_env(run, cadence, base)
                 )
                 status["tailnet_health"] = (
                     probe_tailnet(http_get)
@@ -401,25 +401,31 @@ def _tick_locked(run, http_get, base, run_id):
     cadence = verified_binary(release)
     if cadence is None:  # cannot happen after ensure_release — belt and braces
         raise Refused(f"release {rel_id} produced no verified binary")
-    env = child_env()
+    env = child_env(base=base)
 
     previous_release = status.get("deployed_release")
     previous_sha = status.get("deployed_sha")
+    if rel_id == previous_release:
+        # Repairing the live release: its own rollback target is the
+        # one that must survive — keep the recorded distinct fallback
+        # or a failed restart would leave nothing else to try.
+        previous_release = status.get("previous_release")
+        previous_sha = status.get("previous_sha")
     log_line(base, f"deploying {rel_id} (previous {previous_release})")
-    sandbox_down(run, cadence)
+    sandbox_down(run, cadence, base)
 
     try:
         run_ok(run, [cadence, "sandbox", "up", NAME, "--port", str(PORT)], env)
         try:
             if not (base / "seeded").exists():
-                seed(run, cadence, sandbox_env(run, cadence), base)
+                seed(run, cadence, sandbox_env(run, cadence, base), base)
         except Exception as e:
             # A partial seed leaves projects in the tracker and the seed
             # then refuses every retry — reset the sandbox (never when
             # the seeded marker exists) so the next tick starts clean.
             # A failed reset means the tracker is in an unknown state.
             rc, _, reset_err = run(
-                [cadence, "sandbox", "reset", NAME], env=child_env()
+                [cadence, "sandbox", "reset", NAME], env=child_env(base=base)
             )
             if rc != 0:
                 raise Refused(
@@ -427,7 +433,7 @@ def _tick_locked(run, http_get, base, run_id):
                     f"{reset_err.strip()[:300]} — manual repair needed"
                 )
             raise Refused(f"seed failed ({e}); staging sandbox reset")
-        tailnet_state = tailnet(run, cadence, sandbox_env(run, cadence))
+        tailnet_state = tailnet(run, cadence, sandbox_env(run, cadence, base))
         tailnet_health = (
             probe_tailnet(http_get)
             if tailnet_state.startswith("sharing")
@@ -446,7 +452,7 @@ def _tick_locked(run, http_get, base, run_id):
             prev_bin = verified_binary(base / "releases" / previous_release)
             if prev_bin:
                 try:
-                    sandbox_down(run, prev_bin)
+                    sandbox_down(run, prev_bin, base)
                     run_ok(
                         run,
                         [prev_bin, "sandbox", "up", NAME, "--port", str(PORT)],

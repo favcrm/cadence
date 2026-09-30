@@ -276,6 +276,24 @@ class TickTest(unittest.TestCase):
             self.assertNotEqual(argv[0], str(self.base / "releases" / rel / "cadence"))
         self.assertFalse(r.argvs("sandbox up"))
 
+    def test_repairing_live_release_keeps_distinct_fallback(self):
+        # rel_id == deployed_release but unhealthy: the redeploy's
+        # rollback target must stay the recorded older release, not the
+        # same candidate it just failed on.
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "previous_release": REL_B, "previous_sha": SHA_B}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        make_release(self.base, REL_B, SHA_B, 1, 1)
+        r = FakeRunner(self.base)
+        r.fail_up_for = REL_A
+        rc = self.deploy(r, http_down)
+        self.assertEqual(rc, 1)
+        prev_bin = str(self.base / "releases" / REL_B / "cadence")
+        self.assertTrue(
+            r.argvs(f"{prev_bin} sandbox up staging --port 3020"),
+            "rollback must target the older release")
+
     def test_run_id_override_pins_the_run(self):
         r = FakeRunner(self.base, sha=SHA_B, run_id=999, attempt=3)
         rc = self.deploy(r, http_ok(SHA_B), run_id=999)
@@ -301,7 +319,10 @@ class TickTest(unittest.TestCase):
                 # An inherited socket override would route these calls at
                 # the production daemon.
                 self.assertNotIn("CADENCE_SOCKET", env)
-                self.assertEqual(env["CADENCE_SANDBOX_ROOT"], str(sd.BASE / "sandbox"))
+                # The sandbox root follows the tick's base — never the
+                # permanent live-staging root.
+                self.assertEqual(
+                    env["CADENCE_SANDBOX_ROOT"], str(self.base / "sandbox"))
                 self.assertEqual(env["CADENCE_SANDBOX_ALLOW_GLOBAL"], "1")
         # The sandbox env itself provides profile/pm — not the caller's.
         for argv, env, _ in r.calls:
