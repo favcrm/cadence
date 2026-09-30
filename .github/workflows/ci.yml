@@ -149,6 +149,29 @@ jobs:
         run: python3 tests/scripts/test_release_publication_policy.py
       - name: Test assertion inventory scanner
         run: python3 tests/scripts/test_assert_inventory.py
+      # CAD-854: these head-revision contracts need only tracked fixtures
+      # and Python (split-map also has rustfmt available here). Run them
+      # once in this required gate, not once in every Rust shard. This job
+      # keeps the same exact-SHA queue-evidence reuse as the other gates.
+      - name: Test scope selection and execution contracts
+        run: python3 tests/scripts/test_ci_test_plan.py
+      - name: Test suite-shard partition contracts
+        run: python3 tests/scripts/test_ci_rust_tests.py
+      - name: Test shard-assignment coverage gate
+        run: python3 tests/scripts/test_ci_shard_check.py
+      - name: Test nextest cost reporting
+        run: python3 tests/scripts/test_nextest_cost_report.py
+      - name: Test delivery candidate and mutation validation
+        run: |
+          python3 tests/scripts/test_delivery_candidate.py
+          python3 tests/scripts/test_auto_stage.py
+          python3 tests/scripts/test_native_review_observation.py
+      # CAD-562: keep the generated tree and its manifest consistent,
+      # including each declared item and every #[test] fn.
+      - name: Verify doctor/host split-map consistency
+        run: scripts/split-doctor-host --check
+      - name: Test shared CI checks remain required and run once
+        run: python3 tests/scripts/test_ci_shared_checks.py
 
   clippy:
     needs: [queue-evidence]
@@ -221,12 +244,6 @@ jobs:
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
           fi
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
-      - name: Test scope selection and execution contracts
-        run: python3 tests/scripts/test_ci_test_plan.py
-      - name: Test suite-shard partition contracts
-        run: python3 tests/scripts/test_ci_rust_tests.py
-      - name: Test shard-assignment coverage gate
-        run: python3 tests/scripts/test_ci_shard_check.py
       - run: rustup toolchain install stable --profile minimal
         if: steps.scope.outputs.mode != 'docs'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -246,13 +263,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
         if: steps.scope.outputs.mode != 'docs'
         working-directory: ui
-      - name: Test nextest cost reporting
-        run: python3 tests/scripts/test_nextest_cost_report.py
-      - name: Test delivery candidate and mutation validation
-        run: |
-          python3 tests/scripts/test_delivery_candidate.py
-          python3 tests/scripts/test_auto_stage.py
-          python3 tests/scripts/test_native_review_observation.py
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
@@ -318,11 +328,6 @@ jobs:
             ${{ runner.temp }}/inventory-timings/context.txt
           if-no-files-found: warn
           retention-days: 14
-      # CAD-562: the CAD-536 generated tree must stay consistent with its
-      # manifest — every declared item and every #[test] fn accounted
-      # for (tests/split_map_inventory.rs is the suite-side twin check).
-      - name: Verify doctor/host split-map consistency
-        run: scripts/split-doctor-host --check
       # CAD-771: board-surface Rust tests serve the real SPA build
       # through `ui/dist`. The ui job cannot hand files to this job
       # without artifact transfer, so build here before nextest (non-docs).

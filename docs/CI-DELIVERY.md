@@ -117,6 +117,23 @@ and a full merge-group run when estimating a landing. Do not describe
 replay timings as measurements of a production-code PR: those changes
 currently receive the full fallback.
 
+## Shared CI contracts
+
+The required `fmt` job runs the shared scope/runner, shard-coverage,
+nextest-cost, delivery/staging/review-observation contracts and doctor/host
+split-map check once. Their failures still block the required gate and
+release evidence. They no longer repeat in every Rust test shard.
+`tests/scripts/test_ci_shared_checks.py` checks that each command remains
+once-only and blocking, including early failures in multi-command steps.
+
+Each shard still selects its own scope, verifies its compiled inventory,
+builds its SPA, executes its assigned tests and uploads assignment/cost
+artifacts. The required `test` aggregate still verifies complete, disjoint
+coverage. Default-feature refusal proofs and doctests remain in `test-once`.
+Exact-SHA main queue-evidence reuse is unchanged. This deduplicates eight
+shared commands from eight copies to one on a full gate run; it does not
+claim measured wall-time savings or implement build-once distribution.
+
 ## Remaining delivery work
 
 CAD-479 tracks measurement of affected-test selection; the queue retains
