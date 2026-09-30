@@ -6,6 +6,7 @@ import type { Viewer } from "../projects/work";
 import CrmCampaigns from "./CrmCampaigns";
 import type { CrmSection } from "./CrmOutlet";
 import CrmSegments from "./CrmSegments";
+import CustomerCsvImport from "./CustomerCsvImport";
 import {
   buildCustomerProfile,
   consentEntries,
@@ -60,6 +61,12 @@ export default function CrmShell({
   onRecordCreated?: (recordId: string) => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
+  // The CSV import page is component-local page state under
+  // Customers — it never enters the route URL (no customer content
+  // or bulk bytes in history), so `record`/`view` still own the URL
+  // grammar exactly as before.
+  const [importing, setImporting] = useState(false);
+  const [listRefresh, setListRefresh] = useState(0);
   // Section navigation lives in the host-owned outlet submenu
   // (CrmOutlet): this pane only renders the active section body.
   return (
@@ -93,11 +100,36 @@ export default function CrmShell({
         <CustomerList
           scope={scope}
           viewer={viewer}
+          refresh={listRefresh}
           onSelect={onSelect}
-          onNew={() => onView("new")}
+          onNew={() => {
+            setImporting(false);
+            onView("new");
+          }}
+          onImport={() => {
+            setImporting(true);
+            onView("new");
+          }}
         />
       )}
-      {section === "customers" && view === "new" && (
+      {section === "customers" && view === "new" && importing && (
+        <CustomerCsvImport
+          scope={scope}
+          viewer={viewer}
+          onDone={() => {
+            // A committed import re-reads the list from the server —
+            // never trust local state over the rows the host stores.
+            setListRefresh((count) => count + 1);
+            setImporting(false);
+            onView("list");
+          }}
+          onCancel={() => {
+            setImporting(false);
+            onView("list");
+          }}
+        />
+      )}
+      {section === "customers" && view === "new" && !importing && (
         <CustomerNew
           scope={scope}
           viewer={viewer}
@@ -110,7 +142,10 @@ export default function CrmShell({
               onSelect(id);
             }
           }}
-          onCancel={() => onView("list")}
+          onCancel={() => {
+            setImporting(false);
+            onView("list");
+          }}
         />
       )}
       {section === "customers" && recordId !== null && (
@@ -131,13 +166,18 @@ const PAGE_SIZE = 20;
 function CustomerList({
   scope,
   viewer,
+  refresh,
   onSelect,
   onNew,
+  onImport,
 }: {
   scope: HostScope;
   viewer: Viewer;
+  /** Bumped after a committed CSV import — re-reads server rows. */
+  refresh: number;
   onSelect: (recordId: string) => void;
   onNew: () => void;
+  onImport: () => void;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [query, setQuery] = useState("");
@@ -163,7 +203,7 @@ function CustomerList({
     setCursors([]);
   }, [committed, scope.installId, scope.contextId]);
 
-  const reloadToken = `${scope.installId}:${scope.contextId}:${committed}:${cursor ?? ""}:${retry}`;
+  const reloadToken = `${scope.installId}:${scope.contextId}:${committed}:${cursor ?? ""}:${retry}:${refresh}`;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -214,9 +254,14 @@ function CustomerList({
           />
         </div>
         {canWrite && (
-          <Button variant="primary" size="sm" onClick={onNew}>
-            New customer
-          </Button>
+          <>
+            <Button size="sm" onClick={onImport}>
+              Import CSV
+            </Button>
+            <Button variant="primary" size="sm" onClick={onNew}>
+              New customer
+            </Button>
+          </>
         )}
       </div>
       {!viewer.operator && (
@@ -258,7 +303,7 @@ function CustomerList({
           </p>
           <p className="mt-1">
             {committed === ""
-              ? "Create the first record with New customer, or import a CSV once that flow lands. Only real server rows appear here."
+              ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
               : "Clear the search to see every record in this context."}
           </p>
         </div>

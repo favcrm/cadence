@@ -277,6 +277,16 @@ async function fill(selector: string, value: string) {
   });
   await flush();
 }
+// Textareas ride their own prototype setter — fill() above is inputs only.
+async function fillArea(selector: string, value: string) {
+  const element = host.querySelector(selector) as HTMLTextAreaElement;
+  assert(element, `area exists: ${selector}`);
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await flush();
+}
 
 await React.act(async () => {
   root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: false } }));
@@ -361,11 +371,163 @@ await fill("#crm-display-name", "New Person Edited");
 await click(host.querySelector('[data-drawer="customer"] button[type="submit"]'));
 await settle(() => assert(text().includes("stale"), "stale write explains itself with a next step"));
 
+// ---- CAD-865: the CSV import flow — preview, per-row decisions,
+// commit. The fixture answers the two reserved bulk routes with the
+// daemon's shapes; nothing mutates until the import POST lands.
+const csvPosts: { path: string; body: any }[] = [];
+const importedIds: string[] = [];
+const csvText =
+  "record_id,display_name,email,tags,consent_email,expected_revision\n" +
+  "customer-9,Chidi Anagonye,chidi@example.com,newcomer,granted,\n" +
+  "customer-s2,Boris Feld Jr,beta-two@example.com,,denied,\n" +
+  "customer-bad,Bad Row,not-an-email,,granted,\n";
+const priorFetch = globalThis.fetch;
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "a".repeat(64),
+      row_count: 3,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 1, error: 1 },
+      rows: [
+        { row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye", email: "chidi@example.com", tags: ["newcomer"], consent: { email: "granted" } }, errors: [], reason: null },
+        { row: 2, record_id: "customer-s2", decision: "needs_revision", expected_revision: null, current_revision: 2, profile: { schema: 1, display_name: "Boris Feld Jr", email: "beta-two@example.com", tags: [], consent: { email: "denied" } }, errors: [], reason: "missing expected revision" },
+        { row: 3, record_id: "customer-bad", decision: "error", expected_revision: null, current_revision: null, profile: null, errors: ["invalid email"], reason: null },
+      ],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  if (url.pathname.endsWith("/records/csv-import")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    // The fixture refuses a token that does not bind the bytes —
+    // the same guard the daemon enforces on a stale preview.
+    if (body.preview_token !== "sha256:" + "a".repeat(64)) {
+      return new Response(JSON.stringify({ error: "customer CSV preview is stale; preview again" }), { status: 409 });
+    }
+    const decisions: any[] = body.decisions ?? [];
+    for (const decision of decisions) {
+      if (decision.action !== "skip") importedIds.push(`row-${decision.row}`);
+    }
+    return new Response(JSON.stringify({
+      request_id: body.request_id,
+      preview_token: body.preview_token,
+      replayed: false,
+      summary: { applied: 2, skipped: 1, failed: 0 },
+      rows: [
+        { row: 1, record_id: "customer-9", outcome: "created", reason: null },
+        { row: 2, record_id: "customer-s2", outcome: "updated", reason: null },
+        { row: 3, record_id: "customer-bad", outcome: "skipped", reason: "row error" },
+      ],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+
+// The list's toolbar carries the import affordance next to New.
+const importButton = Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV");
+assert(importButton, "the customers list offers Import CSV");
+await click(importButton);
+await settle(() => assert(host.querySelector("#csv-text"), "the import page renders its CSV source"));
+assert(!location.search.includes("csv"), "no CSV bytes or marker enter the URL");
+
+// Paste the CSV and preview: the plan writes nothing and binds the
+// bytes under one token.
+await fillArea("#csv-text", csvText);
+csvPosts.length = 0;
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "the preview summary renders"));
+equal(csvPosts.length, 1, "exactly one preview POST left the browser");
+equal(Object.keys(csvPosts[0].body).sort(), ["csv_text"], "preview body is exactly csv_text");
+assert(text().includes("1 create"), "preview counts the planned create");
+assert(text().includes("1 need a revision"), "preview counts needs_revision rows");
+assert(text().includes("1 refused"), "preview counts error rows");
+assert(host.querySelector('[data-plan-row="2"] input#csv-revision-2'), "the needs_revision row offers its revision field");
+assert(!host.querySelector('[data-plan-row="3"] input#csv-revision-3'), "the error row carries no revision field");
+
+// The apply decision on the needs_revision row needs its confirmed
+// revision before the commit arms. The field pre-fills with the row's
+// observed current revision; clearing it disarms the commit.
+const applyButton = () => Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import "));
+assert(applyButton() && !(applyButton() as HTMLButtonElement).disabled, "the pre-filled observed revision arms commit");
+await fill("#csv-revision-2", "");
+assert(applyButton() && (applyButton() as HTMLButtonElement).disabled, "clearing the revision disarms commit");
+await fill("#csv-revision-2", "2");
+assert(applyButton() && !(applyButton() as HTMLButtonElement).disabled, "the confirmed revision re-arms commit");
+
+// Commit: the import body carries the exact grammar — same bytes,
+// the bound token, one request id, explicit per-row decisions.
+csvPosts.length = 0;
+await click(applyButton());
+await settle(() => assert(host.querySelector("[data-import-receipt]"), "the import receipt renders"));
+equal(csvPosts.length, 1, "exactly one import POST left the browser");
+equal(
+  Object.keys(csvPosts[0].body).sort(),
+  ["csv_text", "decisions", "preview_token", "request_id"],
+  "import body is exactly the allowlist",
+);
+equal(csvPosts[0].body.preview_token, "sha256:" + "a".repeat(64), "the bound token ships");
+assert(/^csv-[0-9a-f]{24}$/.test(csvPosts[0].body.request_id), "the request id is identifier-safe");
+const sent = csvPosts[0].body.decisions as any[];
+equal(sent.length, 3, "every planned row carries a decision");
+equal(
+  sent.find((d) => d.row === 2),
+  { row: 2, action: "update", expected_revision: 2 },
+  "the needs_revision row commits with its confirmed revision",
+);
+equal(sent.find((d) => d.row === 3)?.action, "skip", "the error row stays skipped");
+assert(importedIds.includes("row-1") && importedIds.includes("row-2"), "the committed rows report applied");
+assert(text().includes("2 applied"), "the receipt counts applied rows");
+assert(text().includes("row error"), "the skipped row's reason stays visible");
+
+// The receipt stays mounted — the operator chooses to return.
+assert(host.querySelector('[data-outcome-row="3"]'), "the skipped row's outcome stays visible");
+
+// Return to the list and re-read it — the imported record surfaces
+// from the server, not from local state. The record store gains it so
+// the next read paints it.
+recordStore["customer-9"] = { id: "customer-9", install_id: "install-crm", context_id: "ctx-a", kind: "customer", revision: 1, digest: "sha256:imp", profile: { schema: 1, display_name: "Chidi Anagonye", email: "chidi@example.com", tags: ["newcomer"], consent: { email: "granted" } }, history: [], consent_history: [] };
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Return to customers"));
+await settle(() => assert(text().includes("Chidi Anagonye"), "the imported row re-reads from the list"));
+
+// A second import with a preview that went stale refuses — the token
+// binds bytes the operator actually saw planned. The fixture refuses
+// any token but the one bound to the bytes above.
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+  const url = new URL(String(input), "http://localhost");
+  if (url.pathname.endsWith("/records/csv-preview")) {
+    return new Response(JSON.stringify({
+      preview_token: "sha256:" + "c".repeat(64),
+      row_count: 1,
+      summary: { create: 1, update: 0, skip: 0, needs_revision: 0, error: 0 },
+      rows: [{ row: 1, record_id: "customer-9", decision: "create", expected_revision: null, current_revision: null, profile: { schema: 1, display_name: "Chidi Anagonye" }, errors: [], reason: null }],
+    }), { status: 200 });
+  }
+  if (url.pathname.endsWith("/records/csv-import")) {
+    const body = JSON.parse(String(init!.body));
+    csvPosts.push({ path: url.pathname, body });
+    return new Response(JSON.stringify({ error: "customer CSV preview is stale; preview again" }), { status: 409 });
+  }
+  return priorFetch(input as RequestInfo | URL, init);
+}) as typeof fetch;
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
+await settle(() => assert(host.querySelector("#csv-text"), "import page reopens"));
+await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
+await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
+await settle(() => assert(host.querySelector("[data-preview-summary]"), "the second preview lands"));
+csvPosts.length = 0;
+await click(Array.from(host.querySelectorAll("button")).find((el) => (el.textContent ?? "").startsWith("Import ")));
+await settle(() => assert(text().includes("stale"), "a stale preview refuses with its next step"));
+assert(host.querySelector("[data-preview-summary]"), "the preview stays mounted under the refusal");
+globalThis.fetch = priorFetch;
+
 // Read-only viewers get truthful states, never forms.
 await React.act(async () => { root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: true } })); });
 await flush(); await flush();
 assert(text().includes("Read-only"), "read-only state is explicit");
 assert(!host.querySelector("#crm-display-name"), "read-only renders no edit form");
+assert(!Array.from(host.querySelectorAll("button")).some((el) => el.textContent === "Import CSV"), "read-only renders no import control");
 
 await React.act(async () => { root.unmount(); });
 console.log("crm customer checks passed");
