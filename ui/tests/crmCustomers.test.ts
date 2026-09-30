@@ -470,13 +470,16 @@ equal(
 equal(csvPosts[0].body.preview_token, "sha256:" + "a".repeat(64), "the bound token ships");
 assert(/^csv-[0-9a-f]{24}$/.test(csvPosts[0].body.request_id), "the request id is identifier-safe");
 const sent = csvPosts[0].body.decisions as any[];
-equal(sent.length, 3, "every planned row carries a decision");
+// The error row is omitted from decisions entirely — the daemon
+// refuses a decision that targets an error row, so only rows 1 and 2
+// travel.
+equal(sent.length, 2, "only decided rows travel — the error row is omitted");
 equal(
   sent.find((d) => d.row === 2),
   { row: 2, action: "update", expected_revision: 2 },
   "the needs_revision row commits with its confirmed revision",
 );
-equal(sent.find((d) => d.row === 3)?.action, "skip", "the error row stays skipped");
+assert(sent.every((d) => d.row !== 3), "the error row carries no decision");
 assert(importedIds.includes("row-1") && importedIds.includes("row-2"), "the committed rows report applied");
 assert(text().includes("2 applied"), "the receipt counts applied rows");
 assert(text().includes("row error"), "the skipped row's reason stays visible");

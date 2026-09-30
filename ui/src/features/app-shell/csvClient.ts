@@ -313,3 +313,78 @@ export function newImportRequestId(): string {
   crypto.getRandomValues(bytes);
   return `csv-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
+
+/** Strict positive-integer parse: a full decimal string, no signs,
+ *  whitespace, exponents, decimals or leading junk — the same shape the
+ *  daemon's `as_u64`/`>0` check demands. `undefined` when malformed. */
+export function parseRevision(text: string | undefined): number | undefined {
+  if (text === undefined) return undefined;
+  const trimmed = text.trim();
+  if (!/^[0-9]+$/.test(trimmed)) return undefined;
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 1) return undefined;
+  return value;
+}
+
+/** The decision list the import verb accepts. Error rows are omitted
+ *  entirely — the daemon refuses a decision that targets an error row,
+ *  so omitting (never an explicit skip) is the only safe send. `apply`
+ *  keeps the plan's action; `skip` drops a row the plan said it could
+ *  apply. */
+export type CsvRowChoice = "apply" | "skip";
+
+export function csvPlanChoice(row: CsvPlanRow): CsvRowChoice {
+  return row.decision === "error" || row.decision === "skip" ? "skip" : "apply";
+}
+
+export function buildCsvDecisions(
+  rows: CsvPlanRow[],
+  choices: Map<number, CsvRowChoice>,
+  revisions: Map<number, string>,
+): CsvRowDecision[] {
+  const decisions: CsvRowDecision[] = [];
+  for (const row of rows) {
+    // An error row is never decided — the daemon refuses it outright.
+    if (row.decision === "error") continue;
+    const choice = choices.get(row.row) ?? csvPlanChoice(row);
+    if (choice === "skip") {
+      decisions.push({ row: row.row, action: "skip" });
+      continue;
+    }
+    switch (row.decision) {
+      case "create":
+        decisions.push({ row: row.row, action: "create" });
+        break;
+      case "update":
+        decisions.push({
+          row: row.row,
+          action: "update",
+          expectedRevision: row.expectedRevision ?? undefined,
+        });
+        break;
+      case "needs_revision": {
+        const revision = parseRevision(revisions.get(row.row));
+        if (revision === undefined) continue; // readiness keeps it off the wire
+        decisions.push({ row: row.row, action: "update", expectedRevision: revision });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return decisions;
+}
+
+/** Whether the current choices can be sent: every applied
+ *  `needs_revision` row needs a strictly positive integer revision. */
+export function csvDecisionsReady(
+  rows: CsvPlanRow[],
+  choices: Map<number, CsvRowChoice>,
+  revisions: Map<number, string>,
+): boolean {
+  return rows.every((row) => {
+    if (row.decision !== "needs_revision") return true;
+    if ((choices.get(row.row) ?? "apply") !== "apply") return true;
+    return parseRevision(revisions.get(row.row)) !== undefined;
+  });
+}
