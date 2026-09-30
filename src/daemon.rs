@@ -4377,6 +4377,17 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         if let Err(se) = shared.shutdown() {
             eprintln!("cadence: shutdown after relaunch failure: {se}");
         }
+        // The CAD-947 heartbeat is running here: the tail flushes, stops
+        // and joins it, then releases the acquired lease and bound
+        // sockets, or the hosted slot stays owned until the TTL expires.
+        release_lease_tail(
+            &shared,
+            &hosted,
+            opts.flush_delay_for_test.unwrap_or_default(),
+            lease_heartbeat,
+            &socket_path,
+            shared_socket,
+        );
         return Err(e);
     }
     // Stall watch: a running turn that goes silent is reported to
@@ -4553,12 +4564,42 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // now is it stopped and joined, so there is never a window with
     // zero posters (heartbeat dead, flush still running) or two (a
     // late renew racing the release and rewriting a removed lease).
-    lease_flush(
+    release_lease_tail(
         &shared,
-        flush_budget(&hosted, shared.lease.as_deref()),
+        &hosted,
         opts.flush_delay_for_test.unwrap_or_default(),
+        lease_heartbeat,
+        &socket_path,
+        shared_socket,
     );
-    if let Some(heartbeat) = &mut lease_heartbeat {
+    match serve_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The shared serve-exit tail once `Shared` exists (CAD-702): flush
+/// the lease's stores, stop the heartbeat poster, release the lease
+/// LAST — a successor may start the moment it is gone, so this process
+/// must have no writes left — then unbind the sockets. `heartbeat` is
+/// the CAD-947 guard, running from just after acquire on every exit
+/// path (the relaunch failure included); it is stopped and joined
+/// after the flush and before the release, so no renewal can race the
+/// release and rewrite a removed lease.
+fn release_lease_tail(
+    shared: &Arc<Shared>,
+    hosted: &crate::lease::Hosted,
+    flush_delay: Duration,
+    mut heartbeat: Option<serve::LeaseHeartbeat>,
+    socket_path: &Path,
+    shared_socket: Option<serve::SharedSocket>,
+) {
+    lease_flush(
+        shared,
+        flush_budget(hosted, shared.lease.as_deref()),
+        flush_delay,
+    );
+    if let Some(heartbeat) = &mut heartbeat {
         heartbeat.stop();
     }
     if let Some(lease) = &shared.lease {
@@ -4566,12 +4607,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             eprintln!("cadence: lease release failed (expiry covers it): {e}");
         }
     }
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(socket_path);
     drop(shared_socket);
-    match serve_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
 }
 
 /// Fallback detail when an unknown fence has no provider account.
