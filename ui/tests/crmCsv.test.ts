@@ -168,7 +168,9 @@ async function main() {
   for (const [input, expected] of [
     ["2", 2],
     ["42", 42],
-    [" 7 ", 7],
+    [" 7 ", undefined],
+    ["7 ", undefined],
+    [" 7", undefined],
     ["2abc", undefined],
     ["2.5", undefined],
     ["+2", undefined],
@@ -177,6 +179,7 @@ async function main() {
     ["", undefined],
     ["1e3", undefined],
     ["abc", undefined],
+    ["9007199254740993", undefined],
   ] as [string, number | undefined][]) {
     equal(parseRevision(input), expected, `parseRevision(${JSON.stringify(input)})`);
   }
