@@ -6,7 +6,6 @@ import { useQuery } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
-import Select from "../../ui/Select";
 import { MASTER } from "../home/master";
 import {
   addPending,
@@ -297,19 +296,8 @@ export default function AppShell({
   const fallbackContext = () =>
     activeIds.length > 0 ? initialContext(installId, activeIds) : "";
 
-  const pickContext = useCallback(
-    (next: string) => {
-      if (next === contextId) return;
-      setContextId(next);
-      rememberContext(installId, next);
-      setLinkNotice(null);
-      // Context switch clears the selected record and returns the
-      // outlet to the list — the outlet remounts on the scope key, so
-      // no unsaved draft survives the switch.
-      writeQuery({ ctx: next === "" ? null : next, appview: null, record: null });
-    },
-    [contextId, installId, writeQuery],
-  );
+  // The context picker is removed (operator review): context follows
+  // the URL, not a selector.
 
   // Narrow drawer focus: opening moves into the pane, closing returns
   // to the trigger. The closed drawer is `visibility: hidden`, so it
@@ -354,12 +342,9 @@ export default function AppShell({
     <div className="app-shell" data-app-shell-outlet={installId}>
       <div className="app-shell-crumb">
         <Link href="/apps" className="lnk text-label">
-          Apps
+          ← All apps
         </Link>
-        <span aria-hidden="true" className="text-ink-600">
-          /
-        </span>
-        <span className="truncate text-ink-100" aria-current="page">
+        <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
@@ -448,24 +433,9 @@ export default function AppShell({
                   {installId} · {installation.version} · context is managed inside the workspace screen
                 </p>
               ) : (
-                <div className="app-shell-context">
-                  <Select
-                    value={contextId}
-                    onChange={pickContext}
-                    options={[
-                      { value: "", label: "No context" },
-                      ...contexts
-                        .filter((c) => c.state === "active")
-                        .map((c) => ({ value: c.id, label: c.config.label })),
-                    ]}
-                    aria-label="App context"
-                    disabled={!viewer.operator || viewer.readOnly}
-                    full
-                  />
-                  <p className="num text-micro text-ink-500" title="Verified installation digest">
-                    {installId} · {installation.version}
-                  </p>
-                </div>
+                <p className="num text-micro text-ink-500">
+                  {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
+                </p>
               )}
               {linkNotice && (
                 <p className="card px-4 py-3 text-label text-warn border-warn/40" role="alert">
