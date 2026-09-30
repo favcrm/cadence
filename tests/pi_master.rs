@@ -2022,6 +2022,107 @@ fn a_provider_reporting_the_wrong_model_fails_the_open() {
     pi.close();
 }
 
+// ---- CAD-601: the cold-cache fabricated-model gate ----
+//
+// Contract (evidence on the ticket): on a cold pi-devin catalog real Pi
+// fabricates an unknown `--model` entry — get_state echoes the requested
+// provider/id so the name-only check accepts, but the fabricated
+// thinkingLevelMap resolves `--effort` onto the paid claude-opus-5
+// family. The open must cross-check the reported model against
+// get_available_models: id listed AND every reported execution field
+// (id/provider/api/baseUrl/thinkingLevelMap/reasoning — mutable
+// label/cost excluded) equal to the catalog entry; a refused open must
+// never reach `prompt`. These pin the contract BEFORE the guard lands:
+// FAIL on the name-only check, PASS once the cross-check is enforced.
+// The worker-side matrix and positive control are in pi_worker.rs.
+
+/// One master open refused on the fabricated map — used directly, under
+/// a concurrent duplicate, and from a setsid-detached child. Owns a
+/// fresh state dir per call.
+fn master_fabricated_open_never_prompts() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "catalog-mismatch-model",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    std::fs::write(
+        state.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"acme/demo-1\", \"fake/model-1\"]\n    master_allow: [\"acme/demo-1\", \"fake/model-1\"]\n",
+    )
+    .unwrap();
+    let err = pi
+        .open(&master_agent(
+            state.path(),
+            json!({"model": "acme/demo-1", "unconfined": true}),
+        ))
+        .err()
+        .expect("a fabricated model must refuse the master open");
+    assert!(
+        err.to_string().contains("claude-opus-5")
+            || err.to_string().contains("acme/demo-1")
+            || err.to_string().contains("catalog"),
+        "master refusal should name the disagreement: {err}"
+    );
+    let journal = std::fs::read_to_string(state.path().join("master/cwd/pi-rpc.jsonl"))
+        .unwrap_or_else(|e| {
+            panic!("no master RPC journal recorded (open never reached the fake): {e}")
+        });
+    assert!(
+        journal.contains("\"get_state\""),
+        "the master open attempt left no journal trace: {journal:?}"
+    );
+    assert!(
+        !journal.contains("\"prompt\""),
+        "a prompt crossed RPC on a refused master open: {journal}"
+    );
+    pi.close();
+}
+
+#[test]
+fn master_open_refuses_a_fabricated_model() {
+    master_fabricated_open_never_prompts();
+}
+
+/// Two independent master opens refuse concurrently — each on its own
+/// tempdir, adapter, policy file and journal, so the gate is per-open
+/// state, not a shared latch. Each owned journal is asserted inside the
+/// helper.
+#[test]
+fn concurrent_opens_refuse_a_fabricated_model() {
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(master_fabricated_open_never_prompts);
+        }
+    });
+}
+
+/// A setsid-detached caller is held to the same catalog gate.
+#[test]
+fn fabricated_model_detached_child_refuses() {
+    if std::env::var_os("CADENCE_601_DETACHED_PROOF").is_some() {
+        master_fabricated_open_never_prompts();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fabricated_model_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_601_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "detached proof failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A pinned `[pi].providers` package contributes its `pi.extensions`
 /// files as `-e` argv entries — the only extensions `--no-extensions`
 /// admits — and its dir joins the confinement read set, read-only.

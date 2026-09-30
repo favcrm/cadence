@@ -822,3 +822,159 @@ fn a_provider_reporting_the_wrong_model_fences_the_agent() {
         "{reason}"
     );
 }
+
+// ---- CAD-601: the cold-cache fabricated-model gate ----
+//
+// Same contract as pi_master.rs — the open must cross-check the
+// reported model against get_available_models: id listed AND every
+// reported execution field equal to the catalog entry. The concurrent
+// and setsid-detached proofs live there; this file holds the worker
+// adapter and the daemon-level fence.
+
+/// A refused open must never reach `prompt`: the provider stayed
+/// unverifiable, so a private turn cannot cross the wire. Each call
+/// owns an independent tempdir, adapter, alias/session dir and pm.yaml
+/// — nothing is shared between calls. The journal must exist and show
+/// the open attempt before its silence on `prompt` means anything.
+fn forged_worker_open_never_prompts(mode: &str, alias: &str, requested: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let ad = adapter(mode, state, &[]);
+    std::fs::write(
+        state.join("pm/pm.yaml"),
+        format!("pi:\n  models:\n    allow: [\"{requested}\", \"fake/model-1\"]\n"),
+    )
+    .unwrap();
+    let agent = worker(alias, state, json!({"model": requested}));
+    let opened = ad.open(&agent);
+    let private = format!("CAD601-PRIVATE-SENTINEL{}", "x".repeat(140_000));
+    let turn = ad.run_turn(&private, "after-forged-open", &|_| {});
+    ad.close();
+    assert!(
+        opened.is_err(),
+        "{mode}: open accepted an unverifiable model '{requested}'"
+    );
+    assert!(turn.is_err(), "{mode}: a refused open still ran a turn");
+    // An unconfined worker journals beside the launch record; a
+    // confined one can write only under `agents/<alias>/`.
+    let journal_path = state.join("agents").join(format!("pi-rpc-{alias}.jsonl"));
+    let journal = std::fs::read_to_string(&journal_path)
+        .or_else(|_| std::fs::read_to_string(state.join("agents").join(alias).join("pi-rpc.jsonl")))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{mode}: no RPC journal at {} (open never reached the fake): {e}",
+                journal_path.display()
+            )
+        });
+    assert!(
+        journal.contains("\"get_state\""),
+        "{mode}: the open attempt left no journal trace: {journal:?}"
+    );
+    assert!(
+        !journal.contains("\"prompt\""),
+        "{mode}: a prompt crossed RPC on a refused open: {journal}"
+    );
+    let session = state.join("agents").join(alias).join("session.jsonl");
+    let lines = std::fs::read_to_string(&session)
+        .unwrap_or_else(|e| panic!("{mode}: no session file at {}: {e}", session.display()));
+    assert!(
+        !lines.contains("\"prompt\""),
+        "{mode}: a prompt landed in the session of a refused open: {lines}"
+    );
+}
+
+/// Each fabricated/unverifiable shape must refuse at open and never
+/// prompt — each on its own alias, state dir and session file.
+#[test]
+fn worker_open_refuses_a_fabricated_or_unverifiable_model() {
+    for (mode, alias) in [
+        ("catalog-missing-model", "w-missing"),
+        ("catalog-mismatch-model", "w-map"),
+        ("catalog-mismatch-api", "w-api"),
+        ("catalog-mismatch-baseurl", "w-url"),
+        ("catalog-mismatch-reasoning", "w-reason"),
+        ("catalog-fail", "w-fail"),
+        ("catalog-empty-models", "w-empty"),
+        ("catalog-malformed", "w-malformed"),
+    ] {
+        forged_worker_open_never_prompts(mode, alias, "acme/demo-1");
+    }
+}
+
+/// Two independent workers refuse the same forged open concurrently —
+/// distinct tempdirs, adapters, aliases and session files; each owned
+/// journal is asserted inside the helper.
+#[test]
+fn concurrent_worker_opens_refuse_a_fabricated_model() {
+    std::thread::scope(|scope| {
+        for alias in ["w-cc-a", "w-cc-b"] {
+            scope.spawn(move || {
+                forged_worker_open_never_prompts("catalog-mismatch-model", alias, "acme/demo-1")
+            });
+        }
+    });
+}
+
+/// The truthy control: reported fields equal the catalog entry — open
+/// succeeds, and the prompt provably crossed the wire (RPC journal) and
+/// landed in the worker's own session file.
+#[test]
+fn worker_open_accepts_a_model_consistent_with_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let ad = adapter("catalog-consistent-model", state, &[]);
+    let agent = worker("wc", state, json!({"model": "acme/demo-1"}));
+    let id = ad.open(&agent).unwrap();
+    assert_eq!(id.model.as_deref(), Some("acme/demo-1"));
+    assert!(ad.run_turn("a verifiable model", "m1", &|_| {}).is_ok());
+    ad.close();
+    let journal = std::fs::read_to_string(state.join("agents/pi-rpc-wc.jsonl"))
+        .expect("the consistent open must leave an RPC journal");
+    assert!(
+        journal.contains("\"prompt\""),
+        "the prompt journal must record the turn: {journal}"
+    );
+    let session = std::fs::read_to_string(state.join("agents/wc/session.jsonl"))
+        .expect("a worker keeps a persistent session file");
+    assert!(
+        session.contains("\"prompt\""),
+        "the turn must land in the worker session file: {session}"
+    );
+}
+
+/// Daemon-level: a fabricated model fences the worker `attention` at
+/// open — never `idle` on a model that resolves its effort onto a paid
+/// family. The journal must prove the open reached the fake and that
+/// no prompt ever did.
+#[test]
+fn a_fabricated_model_fences_the_worker() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("catalog-mismatch-model");
+    d.register_pi("wd", json!({"model": "acme/demo-1"}));
+    d.wait_agent("wd", "attention", 20);
+    let show = d.rpc("agent_show", json!({"alias": "wd"})).unwrap();
+    let reason = show["agent"]["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("claude-opus-5")
+            || reason.contains("acme/demo-1")
+            || reason.contains("catalog"),
+        "{reason}"
+    );
+    let journal = std::fs::read_to_string(d.state.join("agents/pi-rpc-wd.jsonl"))
+        .or_else(|_| std::fs::read_to_string(d.state.join("agents/wd/pi-rpc.jsonl")))
+        .unwrap_or_else(|e| panic!("no RPC journal recorded (open never reached the fake): {e}"));
+    assert!(
+        journal.contains("\"get_state\""),
+        "the fenced open attempt left no journal trace: {journal:?}"
+    );
+    assert!(
+        !journal.contains("\"prompt\""),
+        "a prompt crossed RPC on a fenced worker: {journal}"
+    );
+    let session = std::fs::read_to_string(d.state.join("agents/wd/session.jsonl"))
+        .expect("the fenced worker still launched with its session file");
+    assert!(
+        !session.contains("\"prompt\""),
+        "a prompt landed in the session of a fenced worker: {session}"
+    );
+}
