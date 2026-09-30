@@ -52,9 +52,18 @@ pub struct AdoptEntry {
 /// opening the store: the recorded entries plus a staleness reason when
 /// the marker itself failed validation (wrong instance, expired) —
 /// entries in a stale marker are refused one by one in `recover()`.
+/// `failed` carries the error a DRAIN failure recorded instead: the
+/// previous run's `shutdown_entries` never committed, so every
+/// in-flight row it left is unproven and `recover()` must fence each
+/// one with the refusal event its verdict reads.
 pub struct ConsumedMarker {
     pub entries: Vec<AdoptEntry>,
     pub stale: Option<String>,
+    /// The drain error the marker recorded; `None` on a clean stop.
+    /// Only populated while the marker still names the immediately
+    /// preceding recorded run — a stale marker proves nothing about
+    /// this shutdown.
+    pub failed: Option<String>,
 }
 
 impl Store {
@@ -797,6 +806,7 @@ impl Store {
             write_fence: Default::default(),
             adoptions: Mutex::new(std::collections::HashMap::new()),
             thread_held: Mutex::new(std::collections::HashMap::new()),
+            shutdown_entries_hook: None,
         };
         if recover {
             store.recover(marker.as_ref())?;
@@ -893,6 +903,40 @@ impl Store {
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
+        // CAD-694: a `failed` marker means the previous run's
+        // `shutdown_entries` never committed — no refusal events exist
+        // for the rows it left in flight. Emit each the same refusal a
+        // recorded refusal carries, so a restart landing on a
+        // now-working store cannot read this silent sweep as clean.
+        if let Some(failed) = marker.and_then(|m| m.failed.as_deref()) {
+            let mut stmt = tx.prepare(
+                "SELECT alias, id, turn_id FROM messages
+                 WHERE state IN ('submitting','running') AND source != 'nudge'",
+            )?;
+            let lost = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (alias, message_id, turn_id) in lost {
+                if kept_ids.contains(&message_id) {
+                    continue;
+                }
+                Self::event(
+                    &tx,
+                    &alias,
+                    "turn_adopt_refused",
+                    json!({"message": message_id, "turn_id": turn_id,
+                           "reason":
+                               format!("shutdown evidence failed ({failed}); the turn's fate is unproven — inspect and do not replay")}),
+                )?;
+            }
+        }
         let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut sql = String::from(
             "UPDATE messages SET state='unknown',
@@ -1128,7 +1172,7 @@ impl Store {
         loop {
             let result = {
                 let conn = self.write_conn()?;
-                Self::shutdown_entries_tx(&conn, facts)
+                self.shutdown_entries_tx(&conn, facts)
             };
             match result {
                 Ok(entries) => return Ok(entries),
@@ -1147,10 +1191,19 @@ impl Store {
     /// One [`Self::shutdown_entries`] transaction, rusqlite-typed so
     /// the caller can tell retryable lock contention from a dead store.
     fn shutdown_entries_tx(
+        &self,
         conn: &Connection,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
         let tx = conn.unchecked_transaction()?;
+        // Test seam (CAD-694): the hook runs inside this attempt's
+        // transaction — it may mutate rows or fail with a synthetic
+        // sqlite error, proving rollback and retry without wedging the
+        // store the restart's successor then opens. Never set in
+        // production.
+        if let Some(hook) = &self.shutdown_entries_hook {
+            hook(&tx)?;
+        }
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
              WHERE state IN ('running','submitting') AND source != 'nudge'",
@@ -1227,5 +1280,7 @@ fn shutdown_retryable(e: &rusqlite::Error) -> bool {
 }
 
 /// Extra `shutdown_entries` attempts on lock contention — two retries
-/// bound a doomed store's added wait to the busy_timeout it already pays.
+/// after the first try, at most three transactions; each pays the
+/// connection's busy_timeout (~5s) only while contention lasts, so a
+/// store that stays wedged adds ~15s to the stop before it fails loud.
 const SHUTDOWN_ENTRIES_RETRIES: u32 = 2;

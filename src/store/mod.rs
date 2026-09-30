@@ -113,7 +113,19 @@ pub struct Store {
     /// Provider text the turn result may carry, held per running message
     /// until it finishes ([`Store::thread_hold_running`], CAD-320).
     thread_held: Mutex<std::collections::HashMap<String, Vec<threads::HeldText>>>,
+    /// Test seam (CAD-694): invoked inside every `shutdown_entries`
+    /// transaction with that attempt's live tx — a test can mutate rows
+    /// or return a synthetic sqlite error to prove rollback and retry.
+    /// Production leaves it unset.
+    pub(crate) shutdown_entries_hook: Option<ShutdownEntriesHook>,
 }
+
+/// The `shutdown_entries` test seam (CAD-694): called with each
+/// attempt's live transaction; the hook may write through it or return
+/// a synthetic sqlite error, so rollback, retry bound and
+/// retryable-classification are provable without wedging the store.
+pub type ShutdownEntriesHook =
+    Arc<dyn Fn(&Connection) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).

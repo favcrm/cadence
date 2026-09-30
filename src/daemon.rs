@@ -546,7 +546,8 @@ impl Shared {
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
-        let store = Store::open_adopting(&db_path, marker)?;
+        let mut store = Store::open_adopting(&db_path, marker)?;
+        store.shutdown_entries_hook = opts.shutdown_entries_hook.clone();
         // CAD-538: the store's write path now shares the lease fence —
         // one trip refuses every later write.
         if let Some(lease) = &lease {
@@ -3211,9 +3212,10 @@ impl Shared {
     /// interrupt-and-grace path: their provider process dies with the
     /// daemon either way.
     ///
-    /// `Err` is the drain's own failure: no refusal events and no
-    /// shutdown marker were written — a crash-equivalent state dir.
-    /// Callers propagate it so the exit cannot claim clean.
+    /// `Err` is the drain's own failure: no refusal events were
+    /// committed — the marker records the failure instead, so the next
+    /// start's `recover` fences every in-flight row the sweep finds and
+    /// a restart cannot read the stop as clean.
     fn shutdown(&self) -> Result<()> {
         // Facts come from `begin_closing`, taken before the wake that
         // lets an idle actor detach. Re-reading the agent rows here is
@@ -3252,15 +3254,20 @@ impl Shared {
         }
         // LAST: every actor has detached and written its final state,
         // so the message rows are settled — and a marker written here
-        // can only ever describe a clean stop. A failed sweep writes no
-        // marker and no refusals — a crash-equivalent exit — so it must
-        // be loud on stderr and in the caller's result, never silent.
-        let entries = self.store.shutdown_entries(&facts).map_err(|e| {
-            eprintln!(
-                "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
-            );
-            Error::internal(format!("shutdown entries failed: {e}"))
-        })?;
+        // can only ever describe a clean stop. A failed sweep commits
+        // no refusals, so the file becomes the evidence channel: the
+        // next start's recover() fences every unproven row it finds and
+        // the restart verdict stays loud.
+        let entries = match self.store.shutdown_entries(&facts) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
+                );
+                write_failed_shutdown_marker(&self.state_dir, &self.instance, &e.to_string());
+                return Err(Error::internal(format!("shutdown entries failed: {e}")));
+            }
+        };
         write_shutdown_marker(&self.state_dir, &self.instance, entries);
         Ok(())
     }
@@ -4117,6 +4124,12 @@ pub struct ServeOptions {
     /// the accept loop take its fatal-error exit — the path that must
     /// still run the shutdown below. Production leaves it unset.
     pub serve_loop_fault: Option<Arc<AtomicBool>>,
+    /// Test seam (CAD-694): invoked inside every `shutdown_entries`
+    /// transaction with that attempt's live tx — a test can mutate rows
+    /// or return a synthetic sqlite error, proving rollback and the
+    /// retry bound without wedging the store a restart then opens.
+    /// Never set from RPC, PM, or the environment.
+    pub shutdown_entries_hook: Option<crate::store::ShutdownEntriesHook>,
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
@@ -4197,14 +4210,17 @@ pub struct ServeOptions {
     pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
-/// Cap on the serve loop's transient-accept backoff — bounded so a
-/// stop request is still observed promptly while fd/memory pressure
-/// clears. Doubles from 5ms on each consecutive failure.
+/// Cap on the serve loop's transient-accept backoff — per listener
+/// pass, doubling from 5ms on each consecutive failure. With the
+/// shared socket a pass can sleep twice plus the accept poll, so the
+/// loop is silent for ~450ms at worst before it checks `closing`.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
-/// A fatal listener or drain failure returns `Err` — but only after
-/// the shutdown below has run: an exit never skips adoption evidence.
+/// Once `Shared` exists — including a partial actor relaunch — every
+/// exit drains through `shutdown`, so a fatal listener or drain failure
+/// returns `Err` only after the shutdown below has run: adoption
+/// evidence (or a recorded failure) is never skipped.
 pub fn serve(state_dir: &Path) -> Result<()> {
     // CAD-482: a spawned fixture daemon (`daemon run`/`daemon start`
     // under the test suite) arms the seam from its environment —
@@ -4331,8 +4347,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    relaunch_agents(&shared)?;
-    // Signal-driven shutdown: set the same flag as the rpc.
+    // Signal-driven shutdown: set the same flag as the rpc. Installed
+    // before actors launch so a signal during relaunch — or a relaunch
+    // failure — still reaches `shutdown` below rather than exiting
+    // unrecorded.
     {
         let shared = Arc::clone(&shared);
         let mut signals = signal_hook::iterator::Signals::new([
@@ -4345,6 +4363,15 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                 shared.begin_closing();
             }
         });
+    }
+    if let Err(e) = relaunch_agents(&shared) {
+        // A partial relaunch can still own actor threads — drain them
+        // so this exit records the same evidence every later exit does.
+        shared.begin_closing();
+        if let Err(se) = shared.shutdown() {
+            eprintln!("cadence: shutdown after relaunch failure: {se}");
+        }
+        return Err(e);
     }
     // Stall watch: a running turn that goes silent is reported to
     // whoever waits on it — never interrupted, never replayed.
@@ -8555,8 +8582,8 @@ pub use serve::HotStart;
 #[allow(unused_imports)]
 use serve::{
     acquire_singleton, flush_budget, handle_conn, hosted_config, hot_restart_begin, lease_flush,
-    process_start_identity, relaunch_agents, resolve_slot_config, write_shutdown_marker,
-    CheckupDispatch, SHUTDOWN_FILE,
+    process_start_identity, relaunch_agents, resolve_slot_config, write_failed_shutdown_marker,
+    write_shutdown_marker, CheckupDispatch, SHUTDOWN_FILE,
 };
 #[allow(unused_imports)]
 use timers::{

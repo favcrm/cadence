@@ -494,13 +494,14 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
 
 // ---- Hot restart (CAD-89): clean-stop marker + instance files ----
 //
-// A provably clean shutdown is the ONLY path that writes
-// `shutdown.json`: it is the daemon's last act, after every actor has
-// detached. The marker names the daemon run that wrote it
-// (`daemon-instance`, recorded at serve start) and each pty turn still
-// `running`. On the next start the marker is consumed exactly once —
-// it is valid only against the immediately preceding recorded run and
-// only within MARKER_TTL; anything else takes the historical fence
+// The daemon's last act always writes `shutdown.json`: a provably
+// clean shutdown records each pty turn still `running`; a FAILED drain
+// records the error instead (CAD-694 — the restart verdict must read a
+// lost-evidence stop, never mistake it for a clean one). Either marker
+// names the daemon run that wrote it (`daemon-instance`, recorded at
+// serve start). On the next start the marker is consumed exactly once
+// — it is valid only against the immediately preceding recorded run
+// and only within MARKER_TTL; anything else takes the historical fence
 // path for the recorded agents.
 
 /// The last recorded serve() run's instance id.
@@ -595,7 +596,19 @@ pub(super) fn hot_restart_begin(state_dir: &Path) -> HotStart {
             } else {
                 None
             };
-            Some(store::ConsumedMarker { entries, stale })
+            // `failed` is evidence only while the marker still names
+            // the immediately preceding run — a stale marker proves
+            // nothing about this shutdown.
+            let failed = if stale.is_none() {
+                v["failed"].as_str().map(str::to_string)
+            } else {
+                None
+            };
+            Some(store::ConsumedMarker {
+                entries,
+                stale,
+                failed,
+            })
         }
         Err(_) => {
             eprintln!("hot-restart: unreadable shutdown marker discarded");
@@ -631,6 +644,23 @@ pub(super) fn write_shutdown_marker(
     });
     if let Err(e) = write_file_atomic(&state_dir.join(SHUTDOWN_FILE), &marker.to_string()) {
         eprintln!("hot-restart: could not write shutdown marker: {e}");
+    }
+}
+
+/// The last write of a FAILED shutdown drain (CAD-694): the store
+/// refused the refusal events, so the file is the only channel left —
+/// the next start's `recover()` fences every in-flight row it sweeps,
+/// and the restart verdict cannot read the stop as clean. Like
+/// `write_shutdown_marker` it never fails the stop itself: a marker
+/// that cannot be written is a crash-equivalent state dir.
+pub(super) fn write_failed_shutdown_marker(state_dir: &Path, instance: &str, error: &str) {
+    let marker = json!({
+        "instance": instance,
+        "at": epoch_secs(),
+        "failed": error,
+    });
+    if let Err(e) = write_file_atomic(&state_dir.join(SHUTDOWN_FILE), &marker.to_string()) {
+        eprintln!("hot-restart: could not write failed-shutdown marker: {e}");
     }
 }
 

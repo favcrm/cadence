@@ -241,6 +241,7 @@
                     entry("ok", &pty_token),
                 ],
                 stale: None,
+                failed: None,
             }),
         )
         .unwrap();

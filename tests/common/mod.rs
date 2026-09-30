@@ -1065,6 +1065,8 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         stop: None,
         // No injected serve-loop failure unless a test sets one.
         serve_loop_fault: None,
+        // No injected shutdown-entries fault unless a test sets one.
+        shutdown_entries_hook: None,
         // CAD-313: links and sessions expire by the wall clock unless a
         // test injects one.
         operator_clock: None,
