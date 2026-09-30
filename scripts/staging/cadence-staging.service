@@ -1,0 +1,17 @@
+[Unit]
+Description=Cadence live staging deploy tick (favcrm/cadence main)
+# The deploy logic is always main's reviewed code: the working
+# directory is a dedicated clean clone that is detached onto
+# origin/main before every tick.
+
+[Service]
+Type=oneshot
+# The sandbox's daemon and board are setsid'd children of this unit;
+# the default KillMode=control-group would kill them when the tick
+# exits. process kills only the deploy itself on stop.
+KillMode=process
+WorkingDirectory=%h/.local/share/cadence-staging/src
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/git fetch origin
+ExecStartPre=/usr/bin/git checkout --detach origin/main
+ExecStart=/usr/bin/python3 scripts/staging-deploy.py

@@ -127,3 +127,65 @@ review bridge must report both PR-head and merge-group checks before
 activating it in branch protection. CAD-120 tracks reviewer identity
 integration. Real-provider acceptance remains CAD-434; the fake-provider
 MVP journey cannot prove provider compatibility or real fleet continuity.
+
+## Live staging on the host
+
+A `cadence sandbox` named `staging` runs on this host as the live
+staging instance, redeployed from every green `ci.yml` run on main:
+
+- **Loopback:** `http://cadence-3020.localhost:3020` (board on
+  `127.0.0.1:3020`, its own daemon, tracker, seed data and two inbox
+  agents `staging-a`/`staging-b`).
+- **Tailnet:** `https://ip-172-31-1-32.tail9fcf30.ts.net:9460` once the
+  operator has published the mapping (below).
+
+`scripts/staging-deploy.py` is one idempotent tick, driven by the
+`cadence-staging` systemd user timer every five minutes: pick the newest
+successful ci.yml push run on main (`--run-id N` pins a manual deploy or
+rollback), verify the artifact through `delivery-candidate.py prepare`
+— attestation, manifest and digest, so a binary that never passed
+prepare is never executed — then `sandbox down`/`sandbox up` the verified
+release on port 3020. Health is checked on loopback with the board's own
+Host header and `/api/meta`'s `build_commit` must equal the candidate
+SHA; a failed check rolls back to the previous release. `status.json`,
+`deploy.log`, the deploy flock and the last five verified releases live
+under `~/.local/share/cadence-staging/`; children run with
+`CADENCE_SANDBOX_ROOT` pointed there so the staging sandbox never
+collides with agents' sandboxes. `deploy.lock` makes overlapping ticks a
+clean no-op, and the timer's `ExecStartPre` detaches its dedicated clone
+(`%h/.local/share/cadence-staging/src`) onto `origin/main` first — the
+deploy logic is always main's reviewed code, never a lane's.
+
+Flow: green main build → staging live within ~5 min → human review on
+the board → the existing `staging.yml` approval → rollout.
+
+**Tailnet publish.** The board's live updates are Server-Sent Events
+(`ui/src/lib/sse.ts`, served by `src/ui/threads.rs`), which
+`tailscale serve` streams — no WebSocket is involved. Publishing is the
+operator's one-time act, not the timer's:
+
+```bash
+sudo tailscale serve --bg --https=9460 http://127.0.0.1:3020
+```
+
+The sandbox may only touch the tailnet with the explicit opt-in
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1` (the deploy sets it); without it every
+route onto the tailnet is refused, and a serve port that already targets
+production's board is never overwritten. No nginx or other relay: the
+board refuses operator sessions arriving through relays by design (the
+peer check in `src/ui/operator.rs`), so the tailscale HTTPS proxy — for
+which the board has a dedicated proof chain — is the only remote path.
+
+**One-time operator setup:**
+
+```bash
+# dedicated clean clone the timer checks out onto origin/main
+git clone https://github.com/favcrm/cadence.git \
+  ~/.local/share/cadence-staging/src
+# install and enable the user units
+install -Dm644 scripts/staging/cadence-staging.{service,timer} \
+  -t ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cadence-staging.timer
+# publish the tailnet mapping (above)
+```
