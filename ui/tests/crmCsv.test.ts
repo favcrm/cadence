@@ -63,7 +63,7 @@ async function main() {
   );
   // Too many columns refuse before the wire.
   await rejected(
-    () => Promise.resolve().then(() => checkCsvText("display_name," + Array.from({ length: 16 }, (_, i) => `record_id`).join(",") + "\n")),
+    () => Promise.resolve().then(() => checkCsvText("display_name," + "record_id,".repeat(16) + "\n")),
     (e) => e instanceof ApiError,
     "a 17-column header refuses",
   );
