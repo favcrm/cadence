@@ -246,7 +246,7 @@ assert(text().includes("✓ ctx-a"), "the read-back verified stamp renders, neve
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 equal(eventSources, 1, "exactly one SSE subscription for the shell");
-assert(host.querySelector('[aria-label="App context"]'), "verified context selector is present");
+assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
 // Drawer keyboard: toggle opens into the pane, Escape closes back to
 // the trigger, the closed drawer keeps no tab stop yet keeps the draft.
@@ -270,11 +270,10 @@ equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value,
 await click(toggle);
 
 // Chat sends carry the verified-scope request; refusal would surface.
-// (Two active contexts and no preference select none — pick one first.)
-await click(host.querySelector('[aria-label="App context"]'));
-await click(Array.from(document.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes("Acme")));
+// Context is adopted from the URL — no selector needed.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush();
-assert(location.search.includes("ctx=ctx-a"), "picking a context binds it in the URL");
+assert(location.search.includes("ctx=ctx-a"), "context is adopted from the URL");
 posts.length = 0;
 await fill("#app-shell-chat-box", "scoped question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -284,16 +283,13 @@ assert(chatPost, "chat send posted");
 equal(chatPost?.body.app, { install_id: "install-shell", context_id: "ctx-a" }, "send binds the selected scope, never actor claims");
 assert(!("actor" in (chatPost?.body ?? {})) && !("verified" in (chatPost?.body ?? {})), "send carries no authority claim");
 
-// Outlet navigation: New view + typed draft, then a context switch
+// Outlet navigation: New view + typed draft, then a URL context change
 // clears the view, the selection and the unsaved draft.
 const newTab = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
 await click(newTab);
 assert(location.search.includes("appview=new"), "New view lands in the URL for direct links");
 await fill("#app-outlet-draft", "typed outlet draft");
-const ctxButton = host.querySelector('[aria-label="App context"]') as HTMLButtonElement;
-await click(ctxButton);
-const beta = Array.from(document.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes("Beta"));
-await click(beta);
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
 await flush();
 assert(!location.search.includes("appview="), "context switch returns the outlet to the list");
 assert(!location.search.includes("record="), "context switch clears the stale selection");
@@ -376,7 +372,7 @@ await React.act(async () => {
   }));
 });
 await flush(); await flush(); await flush();
-assert(!host.querySelector('[aria-label="App context"]'), "no second shell selector beside the workspace one");
+assert(!host.querySelector('[aria-label="App context"]'), "no shell selector — social workspace owns its own");
 assert(host.querySelector("#brand"), "the workspace keeps its own selector");
 assert(text().includes("managed inside the workspace screen"), "shell display defers to the workspace owner");
 posts.length = 0;
@@ -407,7 +403,7 @@ await React.act(async () => {
   root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
 });
 await settle(() => assert(
-  host.querySelector('[aria-label="App context"]')?.textContent?.includes("Only"),
+  host.textContent?.includes("Only")
   "second install adopts its sole active context",
 ));
 posts.length = 0;
