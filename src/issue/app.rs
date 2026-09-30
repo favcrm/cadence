@@ -1,10 +1,11 @@
 //! Apps (CAD-547): an app is a folder that bundles the workflows for
 //! one kind of work — `app.md` (frontmatter `app`, `title`, `version`,
 //! `needs.connections: [<slot>…]`; the body is the guide agents read),
-//! `workflows/*.md` (the same plan templates CAD-487 ships) and
-//! optional flat `rubrics/` and `templates/` dirs. A1 carries nothing
-//! else — `records`, `actions`, `ui`, `settings` stay gated for later
-//! stages.
+//! `workflows/*.md` (the same plan templates CAD-487 ships), optional
+//! flat `rubrics/` and `templates/` dirs, and — CAD-864 — an optional
+//! `views/app-views-v1.json` data-only view descriptor declared by
+//! `needs.views.contract`. `records`, `actions`, `ui`, `settings` stay
+//! gated for later stages.
 //!
 //! `cadence app install <path|git-url> --project <key>` copies a
 //! verified bundle to `<pm>/<project>/apps/<name>/` and writes the
@@ -47,7 +48,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::parse;
-use crate::issue::{board, plan, project, workflow, write, Pm};
+use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
 
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
@@ -72,8 +73,10 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// The only directories an app folder may carry at top level. CAD-1006:
 /// `screens/` joins them — it holds one `<tag>/` subdir per screen
 /// package, each carrying a `screens.json` declaration plus flat
-/// `<stem>.<js|css|svg|json>` asset leaves.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens"];
+/// `<stem>.<js|css|svg|json>` asset leaves. `views/` (CAD-864) holds
+/// exactly one file — `views/app-views-v1.json`, the app-views/v1
+/// descriptor — and only when `app.md` declares `needs.views.contract`.
+const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "views"];
 
 /// Largest single file in a bundle — workflows render to plans, so the
 /// plan cap applies; the same bound keeps every other file small.
@@ -98,6 +101,11 @@ pub struct Manifest {
     pub connections: Vec<String>,
     pub capabilities: BTreeMap<String, CapabilityNeed>,
     pub summary: Option<String>,
+    /// CAD-864: `needs.views.contract` — the one descriptor contract
+    /// this bundle's `views/app-views-v1.json` declares. `Some` only
+    /// when the manifest declared it; the file and declaration pair up
+    /// at `validate`/`validate_texts` (either alone refuses).
+    pub view_contract: Option<String>,
     pub guide: String,
 }
 
@@ -318,7 +326,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         if GATED_KEYS.contains(&k) {
             return Err(Error::rejected(format!(
                 "app.md frontmatter key '{k}' is a later stage (A2/A3) — v0 installs \
-                 app.md + workflows/ + optional rubrics/, templates/ only"
+                 app.md + workflows/ + optional rubrics/, templates/, views/ only"
             )));
         }
         if !MANIFEST_KEYS.contains(&k) {
@@ -370,6 +378,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     };
     let mut connections = Vec::new();
     let mut capabilities = BTreeMap::new();
+    let mut view_contract: Option<String> = None;
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
             return Err(Error::rejected(
@@ -378,10 +387,36 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities") {
+            if !matches!(k, "connections" | "capabilities" | "views") {
                 return Err(Error::rejected(format!(
-                    "app.md `needs.{k}` is unknown — v0 knows `needs.connections`"
+                    "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
+                     `needs.capabilities`, `needs.views`"
                 )));
+            }
+        }
+        if let Some(value) = needs.get(serde_yaml::Value::String("views".into())) {
+            let serde_yaml::Value::Mapping(views) = value else {
+                return Err(Error::rejected(
+                    "app.md `needs.views` is a mapping — `contract: app-views/v1`",
+                ));
+            };
+            for key in views.keys() {
+                if key.as_str() != Some("contract") {
+                    return Err(Error::rejected(
+                        "app.md `needs.views` knows only `contract`",
+                    ));
+                }
+            }
+            match views.get(serde_yaml::Value::String("contract".into())) {
+                Some(serde_yaml::Value::String(c)) if c == app_view::CONTRACT => {
+                    view_contract = Some(app_view::CONTRACT.to_string());
+                }
+                _ => {
+                    return Err(Error::rejected(
+                        "app.md `needs.views.contract` is exactly `app-views/v1` — \
+                         the contract the bundle's `views/app-views-v1.json` declares",
+                    ));
+                }
             }
         }
         if let Some(value) = needs.get(serde_yaml::Value::String("capabilities".into())) {
@@ -442,6 +477,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         connections,
         capabilities,
         summary,
+        view_contract,
         guide: body.to_string(),
     })
 }
@@ -524,7 +560,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
         return Err(Error::rejected(format!(
             "app source entry '{name}' — v0 knows app.md, app-chat.json, workflows/, \
-             rubrics/, templates/; everything else refuses"
+             rubrics/, templates/, screens/, views/; everything else refuses"
         )));
     }
     if !manifest {
@@ -591,6 +627,14 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     ));
                 };
                 check_name(stem, "workflow name")?;
+            }
+            if top == "views" && name != app_view::FILE {
+                // The filename pins the contract version — a bundle
+                // cannot rename the descriptor or ship a second one.
+                return Err(entry_err(
+                    &format!("{top}/{name}"),
+                    "views/ holds exactly app-views-v1.json",
+                ));
             }
             files.push((format!("{top}/{name}"), entry.path()));
         }
@@ -819,6 +863,7 @@ fn validate_contents(
                     connections: vec![],
                     capabilities: BTreeMap::new(),
                     summary: None,
+                    view_contract: None,
                     guide: String::new(),
                 }
             }
@@ -830,6 +875,7 @@ fn validate_contents(
             connections: vec![],
             capabilities: BTreeMap::new(),
             summary: None,
+            view_contract: None,
             guide: String::new(),
         },
     };
@@ -842,6 +888,42 @@ fn validate_contents(
         if let Err(e) = crate::issue::app_chat::validate(text, &manifest.app) {
             errors.push(e.to_string());
         }
+    }
+    // CAD-864: the descriptor and its manifest declaration pair up —
+    // either alone refuses. A declared `needs.views` with no
+    // `views/app-views-v1.json` (or the reverse) is a bundle that
+    // misstates what it ships. When both exist the descriptor parses
+    // under the app-views/v1 gate and its `app` is this manifest's app:
+    // the descriptor was reviewed *with* this bundle, and its
+    // provenance can never borrow another app's views.
+    let descriptor_file = files
+        .iter()
+        .find(|(rel, _)| rel == app_view::REL_PATH)
+        .map(|(_, text)| text.as_str());
+    match (manifest.view_contract.as_deref(), descriptor_file) {
+        (Some(app_view::CONTRACT), Some(text)) => match app_view::parse_descriptor(text) {
+            Ok(descriptor) if descriptor.app == manifest.app => {}
+            Ok(descriptor) => errors.push(format!(
+                "{}: descriptor `app` is '{}' — it must be this bundle's '{}'",
+                app_view::REL_PATH,
+                descriptor.app,
+                manifest.app
+            )),
+            Err(e) => errors.push(format!("{}: {e}", app_view::REL_PATH)),
+        },
+        (Some(_), None) => errors.push(format!(
+            "app.md declares `needs.views` but the bundle carries no {} — the \
+             declaration and the descriptor file install together or not at all",
+            app_view::REL_PATH
+        )),
+        (None, Some(_)) => errors.push(format!(
+            "{} is present but app.md never declares `needs.views.contract` — an \
+             undeclared descriptor can never install",
+            app_view::REL_PATH
+        )),
+        (None, None) => {}
+        // An unknown contract value already failed `parse_manifest`.
+        (Some(_), Some(_)) => {}
     }
     let mut notes = Vec::new();
     let mut workflow_count = 0usize;
@@ -3093,6 +3175,83 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         std::fs::write(&yaml, text).unwrap();
         let grants = derive_grants(pm.path(), "demo", "capability-demo").unwrap();
         assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// CAD-864: `needs.views` declares the one descriptor contract a
+    /// bundle may carry; every other shape or value refuses, and the
+    /// gated `ui`/`schema` keys still refuse at top level.
+    #[test]
+    fn manifest_views_declaration_is_exact() {
+        let base = "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  views:\n    contract: app-views/v1\n---\n\nGuide\n";
+        let m = parse_manifest(base).unwrap();
+        assert_eq!(m.view_contract.as_deref(), Some(app_view::CONTRACT));
+        for bad in [
+            // Unknown needs key still refuses.
+            "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  viewz: {}\n---\n\nGuide\n",
+            // Wrong contract tag.
+            "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  views:\n    contract: app-views/v2\n---\n\nGuide\n",
+            // views is not a bare scalar.
+            "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  views: app-views/v1\n---\n\nGuide\n",
+            // Extra keys under needs.views refuse.
+            "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  views:\n    contract: app-views/v1\n    file: views/other.json\n---\n\nGuide\n",
+            // Gated keys are still gated.
+            "---\napp: demo\ntitle: Demo\nversion: '1'\nui: {}\n---\n\nGuide\n",
+        ] {
+            assert!(parse_manifest(bad).is_err(), "{bad}");
+        }
+        // No declaration → None.
+        let none = parse_manifest(APP_MD).unwrap();
+        assert_eq!(none.view_contract, None);
+    }
+
+    /// CAD-864: declaration and descriptor file pair up in the
+    /// validator — either alone refuses, a mismatched `app` refuses.
+    #[test]
+    fn descriptor_pairs_with_its_declaration() {
+        let agents = HashSet::new();
+        let descriptor = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/app-views/v1/examples/crm.json"),
+        )
+        .unwrap()
+        .replace("\"app\": \"crm\"", "\"app\": \"demo\"");
+        let manifest = "---\napp: demo\ntitle: Demo\nversion: '1'\nneeds:\n  views:\n    contract: app-views/v1\n---\n\nGuide\n";
+        let workflow_md = "---\ntitle: Do\ngoal: g\n---\n\n## Step\nagent: a\n\nDo.\n\n### Acceptance\n- [ ] done\n";
+        let files = vec![
+            ("app.md".to_string(), manifest.to_string()),
+            ("workflows/do.md".to_string(), workflow_md.to_string()),
+            (app_view::REL_PATH.to_string(), descriptor.clone()),
+        ];
+        validate_texts(files.clone(), &agents, &[]).unwrap();
+        // Declaration without the file refuses.
+        let no_file: Vec<_> = files
+            .iter()
+            .filter(|(rel, _)| rel != app_view::REL_PATH)
+            .cloned()
+            .collect();
+        assert!(validate_texts(no_file, &agents, &[]).is_err());
+        // File without the declaration refuses.
+        let no_decl = vec![
+            ("app.md".to_string(), APP_MD.to_string()),
+            ("workflows/do.md".to_string(), workflow_md.to_string()),
+            (app_view::REL_PATH.to_string(), descriptor.clone()),
+        ];
+        assert!(validate_texts(no_decl, &agents, &[]).is_err());
+        // Descriptor `app` must be the manifest's app.
+        let other = descriptor.replace("\"app\": \"demo\"", "\"app\": \"other\"");
+        let mismatched = vec![
+            ("app.md".to_string(), manifest.to_string()),
+            ("workflows/do.md".to_string(), workflow_md.to_string()),
+            (app_view::REL_PATH.to_string(), other),
+        ];
+        assert!(validate_texts(mismatched, &agents, &[]).is_err());
+        // Malformed descriptor refuses.
+        let bad = vec![
+            ("app.md".to_string(), manifest.to_string()),
+            ("workflows/do.md".to_string(), workflow_md.to_string()),
+            (app_view::REL_PATH.to_string(), "{}".to_string()),
+        ];
+        assert!(validate_texts(bad, &agents, &[]).is_err());
     }
 
     #[test]

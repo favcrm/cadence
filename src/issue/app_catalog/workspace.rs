@@ -1,6 +1,6 @@
 //! Operator-owned workspace installation transport. Execution is deliberately absent.
 use super::*;
-use crate::issue::{app, workflow, write};
+use crate::issue::{app, app_view, workflow, write};
 use serde_json::{json, Value};
 
 const INSTALL_PENDING: &str = ".apps/install-pending.yaml";
@@ -205,12 +205,18 @@ fn member_path_ok(name: &str) -> bool {
         return true;
     }
     match (parts.len(), normal(0)) {
-        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates") => normal(1)
+        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates" | "views") => normal(1)
             .is_some_and(|leaf| {
                 !leaf.starts_with('.')
-                    && (top != "workflows"
-                        || (leaf.ends_with(".md")
-                            && model::valid_tag(leaf.trim_end_matches(".md"))))
+                    && match top {
+                        // workflows are tag-named Markdown.
+                        "workflows" => {
+                            leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md"))
+                        }
+                        // views/ holds exactly the app-views/v1 descriptor.
+                        "views" => leaf == crate::issue::app_view::FILE,
+                        _ => true,
+                    }
             }),
         // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
         (3, Some("screens")) => {
@@ -336,16 +342,22 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                 }
             }
             Some(libc::S_IFDIR)
-                if matches!(name.as_str(), "workflows" | "rubrics" | "templates") =>
+                if matches!(
+                    name.as_str(),
+                    "workflows" | "rubrics" | "templates" | "views"
+                ) =>
             {
                 for leaf in root.list(&path, &mut budget)? {
                     if leaf.starts_with('.')
                         || (name == "workflows"
                             && (!leaf.ends_with(".md")
                                 || !model::valid_tag(leaf.trim_end_matches(".md"))))
+                        // views/ holds exactly one file — the filename
+                        // pins the descriptor contract version.
+                        || (name == "views" && leaf != app_view::FILE)
                     {
                         return Err(Error::rejected(
-                            "workflows must be named Markdown files and all bundle entries must be visible flat text files",
+                            "workflows must be named Markdown files, views/ holds exactly app-views-v1.json, and all bundle entries must be visible flat text files",
                         ));
                     }
                     add(format!("{name}/{leaf}"), path.join(leaf))?;
@@ -993,6 +1005,43 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             "installation record changed during inspection",
         ));
     }
+    // CAD-864: the installed descriptor rides the receipt as validated
+    // data — re-parsed from the bundle snapshot every read, so a
+    // hand-edited installed file that no longer meets the contract
+    // surfaces as this read's refusal rather than stale served bytes.
+    // The read re-proves the pairing too: a descriptor file whose
+    // manifest no longer declares `needs.views`, or one naming another
+    // app, is a tampered install — refuse rather than serve it.
+    let (view_descriptor, view_descriptor_digest) = match files.get(app_view::REL_PATH) {
+        Some(text) => {
+            if manifest.view_contract.as_deref() != Some(app_view::CONTRACT) {
+                return Err(Error::rejected(format!(
+                    "installed bundle carries {} that its manifest does not declare",
+                    app_view::REL_PATH
+                )));
+            }
+            let descriptor = app_view::parse_descriptor(text)
+                .map_err(|e| Error::rejected(format!("installed {}: {e}", app_view::REL_PATH)))?;
+            if descriptor.app != manifest.app {
+                return Err(Error::rejected(format!(
+                    "installed {} names app '{}' — this installation is '{}'",
+                    app_view::REL_PATH,
+                    descriptor.app,
+                    manifest.app
+                )));
+            }
+            (descriptor.raw, json!(format!("sha256:{}", hash(text))))
+        }
+        None => {
+            if manifest.view_contract.is_some() {
+                return Err(Error::rejected(format!(
+                    "installed manifest declares `needs.views` but {} is absent",
+                    app_view::REL_PATH
+                )));
+            }
+            (Value::Null, Value::Null)
+        }
+    };
     let workflows = files
         .iter()
         .filter_map(|(path, text)| {
@@ -1023,7 +1072,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 pub fn list(pm: &Pm) -> Result<Value> {
