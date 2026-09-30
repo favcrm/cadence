@@ -494,6 +494,30 @@ recordStore["customer-9"] = { id: "customer-9", install_id: "install-crm", conte
 await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Return to customers"));
 await settle(() => assert(text().includes("Chidi Anagonye"), "the imported row re-reads from the list"));
 
+// A file over the byte bound is refused before it is ever read —
+// `File.text()` must not run. Stub the prototype's text() for the
+// duration; a real oversized File carries its size without reading.
+const realText = File.prototype.text;
+let fileReads = 0;
+File.prototype.text = function () {
+  fileReads += 1;
+  return realText.call(this);
+};
+await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
+await settle(() => assert(host.querySelector("#csv-text"), "import page reopens for the file pick"));
+const oversized = new File([new Uint8Array(300 * 1024)], "big.csv", { type: "text/csv" });
+const fileInput = host.querySelector("#csv-file") as HTMLInputElement;
+assert(fileInput, "the file input renders");
+await React.act(async () => {
+  Object.defineProperty(fileInput, "files", { value: [oversized], configurable: true });
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+});
+await flush();
+assert(fileReads === 0, "an oversized file is refused without being read");
+assert(text().includes("256 KiB bound"), "the refusal names the bound");
+assert((host.querySelector("#csv-text") as HTMLTextAreaElement).value === "", "no bytes landed in the source");
+File.prototype.text = realText;
+
 // A second import with a preview that went stale refuses — the token
 // binds bytes the operator actually saw planned. The fixture refuses
 // any token but the one bound to the bytes above.
@@ -514,7 +538,8 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   return priorFetch(input as RequestInfo | URL, init);
 }) as typeof fetch;
-await click(Array.from(host.querySelectorAll("button")).find((el) => el.textContent === "Import CSV"));
+// (the oversized-file case above already reopened and dismissed its
+// refusal) — re-enter cleanly for the stale-preview check.
 await settle(() => assert(host.querySelector("#csv-text"), "import page reopens"));
 await fillArea("#csv-text", "record_id,display_name\ncustomer-9,Chidi Anagonye\n");
 await click(host.querySelector('form[aria-label="CSV source"] button[type="submit"]'));
