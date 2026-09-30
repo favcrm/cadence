@@ -113,7 +113,7 @@ const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
-for (const name of ["addEventListener", "removeEventListener"])
+for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
@@ -259,6 +259,9 @@ equal(toggle.getAttribute("aria-expanded"), "false", "drawer starts closed");
 assert(!host.querySelector("#app-shell-chat")?.hasAttribute("data-open"), "closed drawer carries no open marker");
 await click(toggle);
 equal(toggle.getAttribute("aria-expanded"), "true", "drawer opens with accessible state");
+// Focus is deferred a frame so it lands after the pointer/keyboard
+// activation's own focus; flush once more to let that frame run.
+await flush();
 assert(document.activeElement?.id === "app-shell-chat-box", "opening moves focus into the pane");
 await fill("#app-shell-chat-box", "unsent shell draft");
 await React.act(async () => {
@@ -268,6 +271,15 @@ await flush();
 equal(toggle.getAttribute("aria-expanded"), "false", "Escape closes the drawer");
 assert(document.activeElement === toggle, "closing returns focus to the trigger");
 equal(eventSources, 1, "drawer cycles open no second stream");
+// A rapid open→close cancels the deferred focus: the frame must not
+// fire after close and steal focus back from the trigger.
+await React.act(async () => {
+  toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+});
+await flush();
+equal(toggle.getAttribute("aria-expanded"), "false", "rapid open-close ends closed");
+assert(document.activeElement === toggle, "rapid close keeps focus on the trigger, no deferred steal");
 await click(toggle);
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across close/open");
 await click(toggle);
