@@ -2152,7 +2152,15 @@ pub(crate) fn daemon_restart(
              process is still draining (see daemon.log)",
         ));
     }
-    client::daemon_start_as(state_dir, Some(&caller.identity))?;
+    let started = client::daemon_start_as(state_dir, Some(&caller.identity))?;
+    // CAD-694: the recovery-record verdict binds to the instance THIS
+    // start returned — the health answer pid-matched to the spawned
+    // child — never to whatever instance/record files a later boot or a
+    // failed write left on disk. A restart that raced us past this
+    // point can only replace the files, and the record then names a
+    // different run than the one we asked for: fail closed, never clean
+    // on another run's evidence.
+    let started_instance = started["health"]["instance"].as_str().map(str::to_string);
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
     // and `offline` (actor exited under shutdown). Stopped and fenced
@@ -2238,9 +2246,9 @@ pub(crate) fn daemon_restart(
     // CAD-694: the successor's recovery record is drain evidence the
     // cursors cannot always carry — a predecessor already dead gave
     // none, and non-pty endpoints were never scanned. The record is
-    // bound to the instance this start just recorded; missing or
+    // bound to the instance this start returned; missing, malformed or
     // mismatched, a failed drain, or any fenced turn fails closed.
-    if let Some(reason) = recovery_record_verdict(state_dir) {
+    if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
         eprintln!("restart: {reason}");
         bad = true;
     }
@@ -2395,20 +2403,56 @@ pub(crate) fn daemon_restart(
     }
 }
 
+/// The `last-recovery.json` shape the verdict trusts (CAD-694): every
+/// field the writer emits is required and typed, so a truncated,
+/// stale-format or hand-edited record is a parse failure — never clean
+/// evidence. `consumed` stays a raw `Value` because its members are
+/// required-but-nullable (serde `Option` accepts a MISSING key, which
+/// must fail instead).
+#[derive(serde::Deserialize)]
+struct RecoveryRecordView {
+    instance: String,
+    consumed: serde_json::Value,
+    fenced: Vec<FencedRowView>,
+    /// Sibling of `fenced` — required for shape completeness; the
+    /// verdict keys on `fenced` alone.
+    #[allow(dead_code)]
+    unevidenced: Vec<FencedRowView>,
+}
+
+#[derive(serde::Deserialize)]
+struct FencedRowView {
+    alias: String,
+    /// Required for shape completeness; the report lists aliases only.
+    #[allow(dead_code)]
+    message_id: String,
+}
+
 /// CAD-694: evaluate the successor daemon's recovery record — drain
 /// evidence the verdict needs independent of the per-alias event
 /// cursors (a predecessor already dead yields none, and non-pty
-/// endpoints were never cursor-covered). `Some(reason)` fails the
-/// verdict: the record is absent, unreadable, or bound to a different
-/// run; the predecessor's drain failed; or this recovery fenced any
-/// in-flight turn.
-fn recovery_record_verdict(state_dir: &Path) -> Option<String> {
+/// endpoints were never cursor-covered). `started_id` is the instance
+/// the restart's own start returned (pid-matched health), NOT a file:
+/// a later boot or a pair of failed writes can leave an old, mutually
+/// matching (instance, record) pair on disk, so equality between the
+/// two files proves nothing — only naming THIS successor counts.
+/// `Some(reason)` fails the verdict: the record is absent, unreadable,
+/// wrongly shaped, or bound to a different run; the predecessor's drain
+/// failed; or this recovery fenced any in-flight turn.
+fn recovery_record_verdict(state_dir: &Path, started_id: Option<&str>) -> Option<String> {
+    let Some(started_id) = started_id else {
+        return Some(
+            "the daemon start answer did not name its instance — the predecessor's \
+             drain cannot be verified"
+                .to_string(),
+        );
+    };
     let current = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
         .ok()
         .map(|s| s.trim().to_string());
     let record = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
         .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok());
     let (Some(current), Some(record)) = (current, record) else {
         return Some(
             "the new daemon left no readable recovery record — the predecessor's \
@@ -2416,29 +2460,57 @@ fn recovery_record_verdict(state_dir: &Path) -> Option<String> {
                 .to_string(),
         );
     };
-    if record["instance"].as_str() != Some(current.as_str()) {
+    if current != started_id {
         return Some(
-            "the recovery record does not name this daemon run — the predecessor's \
-             drain cannot be verified"
+            "the recorded daemon instance does not name the run this restart \
+             started — the predecessor's drain cannot be verified"
                 .to_string(),
         );
     }
-    if let Some(failed) = record["consumed"]["failed"].as_str() {
-        return Some(format!("the previous daemon's drain failed: {failed}"));
+    if record.instance != started_id {
+        return Some(
+            "the recovery record names a different run than the one this restart \
+             started — the predecessor's drain cannot be verified"
+                .to_string(),
+        );
     }
-    let fenced = record["fenced"].as_array().cloned().unwrap_or_default();
-    if fenced.is_empty() {
-        None
-    } else {
-        let names = fenced
-            .iter()
-            .filter_map(|f| f["alias"].as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        Some(format!(
-            "recovery fenced {} in-flight turn(s): {names}",
-            fenced.len()
-        ))
+    // `consumed` is null or an object whose `failed` member is present
+    // and null|string — anything else is evidence that did not come
+    // from this build's writer.
+    let failed = match &record.consumed {
+        Value::Null => Ok(None),
+        Value::Object(map) => match (
+            map.get("instance").is_some_and(|v| v.is_string()),
+            map.get("stale")
+                .is_some_and(|v| v.is_string() || v.is_null()),
+            map.get("failed"),
+        ) {
+            (true, true, Some(f)) if f.is_string() || f.is_null() => {
+                Ok(f.as_str().map(str::to_string))
+            }
+            _ => Err("recovery record's `consumed` is malformed"),
+        },
+        _ => Err("recovery record's `consumed` is malformed"),
+    };
+    match failed {
+        Err(why) => Some(format!("{why} — the drain cannot be verified")),
+        Ok(Some(failed)) => Some(format!("the previous daemon's drain failed: {failed}")),
+        Ok(None) => {
+            if record.fenced.is_empty() {
+                None
+            } else {
+                let names = record
+                    .fenced
+                    .iter()
+                    .map(|f| f.alias.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Some(format!(
+                    "recovery fenced {} in-flight turn(s): {names}",
+                    record.fenced.len()
+                ))
+            }
+        }
     }
 }
 

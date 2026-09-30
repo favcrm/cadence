@@ -491,6 +491,59 @@ fn cad538_wedged_lease_lock_bounds_shutdown() {
     assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
 }
 
+/// CAD-694 (review B3): a start that fails AFTER acquiring the lease —
+/// here an injected relaunch fault on the exact flagged path — must not
+/// release the lease while the shutdown flush is still unproven: a
+/// successor taking over would share the live writer. Park the flush at
+/// the gate, let the tail's injected budget lapse, and the lease must
+/// stay held; the parked worker then completes into our own still-valid
+/// TTL window, never a successor's epoch.
+#[test]
+fn cad694_failed_start_withholds_lease_while_flush_unproven() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let gate = Arc::new(Barrier::new(2));
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.relaunch_fault_for_test = Some(Arc::new(AtomicBool::new(true)));
+    opts.flush_gate_for_test = Some({
+        let gate = gate.clone();
+        Arc::new(move || {
+            gate.wait();
+        })
+    });
+    opts.flush_budget_for_test = Some(Duration::from_millis(50));
+    // Same-shape fixture daemon as the cad702 test: a hosted lease
+    // triggers the deployment lookup, which must stay hermetic.
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let state_dir = state.path().to_path_buf();
+    let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
+    let exit = handle.join().unwrap();
+    assert!(
+        exit.is_err(),
+        "the injected relaunch fault exits serve: {exit:?}"
+    );
+    // The flush never completed inside the (tiny) budget — the tail
+    // withheld release, so the file lease is still ours until TTL.
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    assert!(
+        body["expires_unix"].as_f64().unwrap_or(0.0) > now_unix(),
+        "released under a live flush: {body}"
+    );
+    // Let the parked worker finish — release stays withheld; the lease
+    // transfers by TTL, the fence-bounded window a late write is
+    // confined to.
+    gate.wait();
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    assert!(
+        body["expires_unix"].as_f64().unwrap_or(0.0) > now_unix(),
+        "a late flush completion must not release retroactively: {body}"
+    );
+}
+
 /// `hosted.lease` off leaves startup untouched: no lease file, no
 /// `lease` in health. `daemon_opts` pins `Hosted::default()` —
 /// explicitly off, so a real `hosted:` table on this host cannot leak

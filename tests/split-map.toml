@@ -325,6 +325,7 @@ tests = [
     "serve_loop_error_still_records_shutdown_evidence",
     "shutdown_entries_failure_is_an_observable_exit",
     "shutdown_entries_retries_a_busy_once_then_records_one_refusal",
+    "shutdown_entries_retries_sqlite_locked_then_records_one_refusal",
     "shutdown_entries_stops_at_first_nonretryable_fault",
     "cad694_failed_shutdown_fences_the_restart_verdict",
     "cad694_offline_restart_still_fences_a_failed_drain",

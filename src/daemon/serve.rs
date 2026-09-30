@@ -429,11 +429,22 @@ pub(super) fn flush_budget(
 /// fold is the flush of what it committed while it still held the lease.
 /// `slow` is a test-only dwell (CAD-702) at the flush's start, proving
 /// renewal spans a slow flush; production passes zero.
-pub(super) fn lease_flush(shared: &Arc<Shared>, budget: Duration, slow: Duration) {
+pub(super) fn lease_flush(
+    shared: &Arc<Shared>,
+    budget: Duration,
+    slow: Duration,
+    gate: Option<crate::daemon::FlushGate>,
+) -> bool {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let leased = shared.lease.is_some();
     let shared = Arc::clone(shared);
     thread::spawn(move || {
+        // Test seam (CAD-694): a parked gate models a flush still in
+        // flight when the budget lapses — the tail must then keep the
+        // lease rather than release under a live writer.
+        if let Some(gate) = gate {
+            gate();
+        }
         if !slow.is_zero() {
             thread::sleep(slow);
         }
@@ -453,9 +464,15 @@ pub(super) fn lease_flush(shared: &Arc<Shared>, budget: Duration, slow: Duration
         }
         let _ = tx.send(());
     });
+    // The send is the worker's completion proof — every write it owns
+    // (checkpoint, the synchronous `git commit`) finished by then.
+    // `false` means the worker may still be writing: callers must not
+    // release the lease under it.
     if rx.recv_timeout(budget).is_err() {
-        eprintln!("cadence: shutdown flush exceeded {budget:?} — exiting anyway");
+        eprintln!("cadence: shutdown flush exceeded {budget:?} — completion unproven");
+        return false;
     }
+    true
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -499,10 +516,12 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
 // records the error instead (CAD-694 — the restart verdict must read a
 // lost-evidence stop, never mistake it for a clean one). Either marker
 // names the daemon run that wrote it (`daemon-instance`, recorded at
-// serve start). On the next start the marker is consumed exactly once
-// — it is valid only against the immediately preceding recorded run
-// and only within MARKER_TTL; anything else takes the historical fence
-// path for the recorded agents.
+// serve start). On the next start the marker is consumed exactly once:
+// the recorded ENTRIES are adoption candidates, valid only against the
+// immediately preceding recorded run and only within MARKER_TTL — stale
+// entries take the historical fence path. A recorded drain FAILURE is
+// different evidence — provenance, not freshness: it stays set whenever
+// the marker names the immediately preceding run, even past the TTL.
 
 /// The last recorded serve() run's instance id.
 pub const INSTANCE_FILE: &str = "daemon-instance";
@@ -682,8 +701,10 @@ pub(super) fn write_failed_shutdown_marker(state_dir: &Path, instance: &str, err
 /// drain evidence a `daemon restart` verdict reads in place of the
 /// per-alias event cursors a predecessor already dead cannot have
 /// provided (CAD-694). Rewritten on every start, bound to `instance`,
-/// so a later restart reads only this run's recovery; a write that
-/// fails leaves no record and the verdict fails closed on the gap.
+/// so a later restart reads only this run's recovery. A failed write
+/// can leave an OLDER record in place — the verdict therefore binds to
+/// the instance its own start returned and rejects any record (and any
+/// instance file) naming a different run.
 pub(crate) fn write_recovery_record(
     state_dir: &Path,
     instance: &str,
@@ -698,7 +719,7 @@ pub(crate) fn write_recovery_record(
     });
     let fence_rows = |rows: &[(String, String)]| -> Vec<Value> {
         rows.iter()
-            .map(|(alias, message)| json!({"alias": alias, "message": message}))
+            .map(|(alias, message_id)| json!({"alias": alias, "message_id": message_id}))
             .collect()
     };
     let record = json!({

@@ -118,6 +118,10 @@ pub struct Store {
     /// or return a synthetic sqlite error to prove rollback and retry.
     /// Production leaves it unset.
     pub(crate) shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// Test seam (CAD-694): the `shutdown_entries` retry backoff
+    /// multiplier in milliseconds — production 50; tests set 0 so the
+    /// retry bound is proven without wall-clock sleeps.
+    pub(crate) shutdown_backoff_ms: u64,
 }
 
 /// The `shutdown_entries` test seam (CAD-694): called with each

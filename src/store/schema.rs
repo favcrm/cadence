@@ -850,6 +850,7 @@ impl Store {
             adoptions: Mutex::new(std::collections::HashMap::new()),
             thread_held: Mutex::new(std::collections::HashMap::new()),
             shutdown_entries_hook: None,
+            shutdown_backoff_ms: 50,
         };
         let outcome = if recover {
             Some(store.recover(marker.as_ref())?)
@@ -1004,22 +1005,35 @@ impl Store {
         // refusals and a committed drain wrote the rest. What remains
         // (a crash, or a drain that lost its writes entirely) is
         // unevidenced; the outcome reports both so a restart verdict
-        // needing no per-alias cursor can still fail.
-        let mut unevidenced: Vec<(String, String)> = Vec::new();
-        for (alias, message_id, _) in &swept {
-            if refused.contains(message_id) {
-                continue;
-            }
-            let evidenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE kind='turn_adopt_refused'
-                    AND json_extract(payload,'$.message')=?1)",
-                [message_id],
-                |r| r.get(0),
-            )?;
-            if !evidenced {
-                unevidenced.push((alias.clone(), message_id.clone()));
+        // needing no per-alias cursor can still fail. The evidence
+        // lookup is ONE chunked scan, not a query per row: the events
+        // index is on job/seq, so a per-row EXISTS rescans the whole
+        // history for every swept turn.
+        let unprobed: Vec<&String> = swept
+            .iter()
+            .filter(|(_, id, _)| !refused.contains(id))
+            .map(|(_, id, _)| id)
+            .collect();
+        let mut evidenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chunk in unprobed.chunks(500) {
+            let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT json_extract(payload,'$.message') FROM events
+                 WHERE kind='turn_adopt_refused'
+                   AND json_extract(payload,'$.message') IN ({marks})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                r.get::<_, String>(0)
+            })?;
+            for row in rows {
+                evidenced.insert(row?);
             }
         }
+        let unevidenced: Vec<(String, String)> = swept
+            .iter()
+            .filter(|(_, id, _)| !refused.contains(id) && !evidenced.contains(id))
+            .map(|(alias, id, _)| (alias.clone(), id.clone()))
+            .collect();
         let outcome = RecoveryOutcome {
             marker_instance: marker.map(|m| m.instance.clone()),
             stale: marker.and_then(|m| m.stale.clone()),
@@ -1274,7 +1288,9 @@ impl Store {
                     eprintln!(
                         "store: shutdown entries hit {e}; retrying ({attempt}/{SHUTDOWN_ENTRIES_RETRIES})"
                     );
-                    std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                    std::thread::sleep(Duration::from_millis(
+                        self.shutdown_backoff_ms * u64::from(attempt),
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }

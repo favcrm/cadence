@@ -548,6 +548,9 @@ impl Shared {
         crate::rollout::authorize_migration(&db_path)?;
         let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
         store.shutdown_entries_hook = opts.shutdown_entries_hook.clone();
+        if let Some(ms) = opts.shutdown_backoff_ms_for_test {
+            store.shutdown_backoff_ms = ms;
+        }
         // CAD-694: persist this start's recovery outcome before any
         // later failure path can lose it — the restart verdict reads
         // the record when no per-alias event cursor could have been
@@ -2263,6 +2266,10 @@ impl Shared {
                 json!({
                 "state": "ready",
                 "pid": std::process::id(),
+                // CAD-694: this run's instance id — `daemon restart`
+                // binds the recovery record to the daemon it actually
+                // started, not whatever a later boot left on disk.
+                "instance": self.instance,
                 // The board compares this boot-pinned UID to the private
                 // record before attributing any session-bearing peer.
                 "agent_uid": self.agent_uid,
@@ -3271,6 +3278,14 @@ impl Shared {
                     "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
                 );
                 write_failed_shutdown_marker(&self.state_dir, &self.instance, &e.to_string());
+                // A drain refused by an already-tripped lease fence is
+                // the fence's own consequence, not a new fault: writes
+                // have been refused since the trip and the fence reason
+                // already reports why. The marker still carries the
+                // evidence; the stop itself exits cleanly (CAD-538).
+                if self.store.fence_reason().is_some() {
+                    return Ok(());
+                }
                 return Err(Error::internal(format!("shutdown entries failed: {e}")));
             }
         };
@@ -4044,6 +4059,12 @@ fn group_root_reason(agent: &Agent, roots: &HashSet<String>) -> Option<&'static 
 #[cfg(feature = "test-seam")]
 pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Test seam (CAD-694): a one-shot barrier inside the shutdown flush
+/// worker — the closure runs before the checkpoint and may park the
+/// worker so a test can hold a flush open while the exit tail waits on
+/// its budget. Production leaves it unset.
+pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
@@ -4193,6 +4214,23 @@ pub struct ServeOptions {
     /// write — a recovery that outlives the lease TTL. In-process
     /// fixtures only; production leaves it unset.
     pub startup_delay_for_test: Option<Duration>,
+    /// Test seam (CAD-694): runs inside the shutdown flush worker
+    /// before the checkpoint — park it to hold the flush open while the
+    /// exit tail's budget lapses. Production leaves it unset.
+    pub flush_gate_for_test: Option<FlushGate>,
+    /// Test seam (CAD-694): replaces the flush bound the exit tail
+    /// waits on — a test proves the withheld-release path without
+    /// paying a real lease `flush_timeout`. Production leaves it unset.
+    pub flush_budget_for_test: Option<Duration>,
+    /// Test seam (CAD-694): when set, `serve` treats `relaunch_agents`
+    /// as failed — the failed-start exit must still drain actors and
+    /// release the lease tail. Production leaves it unset.
+    pub relaunch_fault_for_test: Option<Arc<AtomicBool>>,
+    /// Test seam (CAD-694): replaces the `shutdown_entries` retry
+    /// backoff multiplier (production 50ms) — tests prove the retry
+    /// bound without paying wall-clock sleeps. Production leaves it
+    /// unset.
+    pub shutdown_backoff_ms_for_test: Option<u64>,
     /// CAD-482: arm the test-only caller seam. Honored only in
     /// `test-seam` builds; a daemon asked for it on any other build
     /// refuses to start rather than fall back to ambient identity.
@@ -4223,8 +4261,10 @@ pub struct ServeOptions {
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
-/// Once `Shared` exists — including a partial actor relaunch — every
-/// exit drains through `shutdown`, so a fatal listener or drain failure
+/// Earlier setup exits (lease acquire, socket bind, signal hooks) return
+/// before anything is launched; once the sockets and signal hooks are
+/// bound — including a partial actor relaunch — every exit drains
+/// through `shutdown`, so a fatal listener or drain failure
 /// returns `Err` only after the shutdown below has run: adoption
 /// evidence (or a recorded failure) is never skipped.
 pub fn serve(state_dir: &Path) -> Result<()> {
@@ -4370,7 +4410,16 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
         });
     }
-    if let Err(e) = relaunch_agents(&shared) {
+    let relaunch = if opts
+        .relaunch_fault_for_test
+        .as_ref()
+        .is_some_and(|f| f.load(Ordering::SeqCst))
+    {
+        Err(Error::internal("injected relaunch fault (test seam)"))
+    } else {
+        relaunch_agents(&shared)
+    };
+    if let Err(e) = relaunch {
         // A partial relaunch can still own actor threads — drain them
         // so this exit records the same evidence every later exit does.
         shared.begin_closing();
@@ -4383,7 +4432,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         release_lease_tail(
             &shared,
             &hosted,
-            opts.flush_delay_for_test.unwrap_or_default(),
+            &opts,
             lease_heartbeat,
             &socket_path,
             shared_socket,
@@ -4567,7 +4616,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     release_lease_tail(
         &shared,
         &hosted,
-        opts.flush_delay_for_test.unwrap_or_default(),
+        &opts,
         lease_heartbeat,
         &socket_path,
         shared_socket,
@@ -4586,25 +4635,43 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
 /// path (the relaunch failure included); it is stopped and joined
 /// after the flush and before the release, so no renewal can race the
 /// release and rewrite a removed lease.
+///
+/// CAD-694 (review): the lease is released only on PROVEN flush
+/// completion — the flush worker owns the WAL fold and the tracker's
+/// synchronous git commit, so its `send` is the joined-completion proof
+/// for every store write this tail could otherwise orphan. When the
+/// budget lapses the worker may still be writing; releasing then would
+/// let a successor boot into a live writer, so the hold is left to TTL
+/// expiry instead — the fence then bounds any late write to our own
+/// still-valid window rather than a successor's epoch.
 fn release_lease_tail(
     shared: &Arc<Shared>,
     hosted: &crate::lease::Hosted,
-    flush_delay: Duration,
+    opts: &ServeOptions,
     mut heartbeat: Option<serve::LeaseHeartbeat>,
     socket_path: &Path,
     shared_socket: Option<serve::SharedSocket>,
 ) {
-    lease_flush(
+    let flushed = lease_flush(
         shared,
-        flush_budget(hosted, shared.lease.as_deref()),
-        flush_delay,
+        opts.flush_budget_for_test
+            .unwrap_or_else(|| flush_budget(hosted, shared.lease.as_deref())),
+        opts.flush_delay_for_test.unwrap_or_default(),
+        opts.flush_gate_for_test.clone(),
     );
     if let Some(heartbeat) = &mut heartbeat {
         heartbeat.stop();
     }
     if let Some(lease) = &shared.lease {
-        if let Err(e) = lease.release() {
-            eprintln!("cadence: lease release failed (expiry covers it): {e}");
+        if flushed {
+            if let Err(e) = lease.release() {
+                eprintln!("cadence: lease release failed (expiry covers it): {e}");
+            }
+        } else {
+            eprintln!(
+                "cadence: lease release withheld — the shutdown flush never completed; \
+                 the lease expires by TTL instead of handing a live writer to a successor"
+            );
         }
     }
     let _ = std::fs::remove_file(socket_path);

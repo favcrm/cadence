@@ -1088,6 +1088,12 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         lease_http_endpoint_override: None,
         flush_delay_for_test: None,
         startup_delay_for_test: None,
+        // No flush gate/budget override, relaunch fault, or shutdown
+        // backoff unless a test pins them — production never sets any.
+        flush_gate_for_test: None,
+        flush_budget_for_test: None,
+        relaunch_fault_for_test: None,
+        shutdown_backoff_ms_for_test: None,
         agent_uid: None,
         shared_socket: None,
         // CAD-482: when the test build carries the seam, fixture

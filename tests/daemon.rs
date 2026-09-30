@@ -3329,6 +3329,10 @@ fn shutdown_entries_retries_a_busy_once_then_records_one_refusal() {
                 Ok(())
             }
         })),
+        // CAD-809: the retry bound itself is proven once at production
+        // backoff by cad694_failed_shutdown_fences_the_restart_verdict;
+        // every other scenario injects a zero backoff.
+        shutdown_backoff_ms_for_test: Some(0),
         ..daemon_opts()
     };
     let mut d = TestDaemon::start_opts(opts);
@@ -3389,6 +3393,7 @@ fn shutdown_entries_stops_at_first_nonretryable_fault() {
             attempts.fetch_add(1, Ordering::SeqCst);
             Err(injected_sqlite_err(rusqlite::ffi::SQLITE_FULL))
         })),
+        shutdown_backoff_ms_for_test: Some(0),
         ..daemon_opts()
     };
     let mut d = TestDaemon::start_opts(opts);
@@ -3406,6 +3411,60 @@ fn shutdown_entries_stops_at_first_nonretryable_fault() {
     let marker = std::fs::read_to_string(d.state.join("shutdown.json"))
         .expect("a failed drain still records its marker");
     assert!(marker.contains("\"failed\""), "{marker}");
+}
+
+/// SQLITE_LOCKED sits on the retryable list like BUSY — the exhaustion
+/// scenarios land it only in the final attempt slot, where the bound
+/// check never consults the classifier, so a LOCKED-then-success queue
+/// is the proof it retries (S2).
+#[test]
+fn shutdown_entries_retries_sqlite_locked_then_records_one_refusal() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&attempted);
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        shutdown_entries_hook: Some(Arc::new(move |_conn| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_LOCKED))
+            } else {
+                Ok(())
+            }
+        })),
+        shutdown_backoff_ms_for_test: Some(0),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    d.register_inbox("unprovable");
+    d.send("unprovable", json!({"text": "mid-turn", "message": "mid"}))
+        .unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='unprovable';
+         UPDATE messages SET state='running',turn_id='busy-turn' WHERE id='mid';",
+    )
+    .unwrap();
+    drop(conn);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_ok(),
+        "one LOCKED must be retried, not fatal: {exit:?}"
+    );
+    assert_eq!(attempted.load(Ordering::SeqCst), 2, "first try + one retry");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='unprovable'
+                AND kind='turn_adopt_refused'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "retry commits its refusal exactly once");
 }
 
 /// CAD-694 follow-up (review B1): the restart verdict is the real
@@ -3435,6 +3494,11 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
                     None => Ok(()),
                 }
             })),
+            // CAD-809: THE one bound-prover for the `shutdown_entries`
+            // backoff — this test pays the production 50+100ms sleeps so
+            // the real attempt schedule, not an injected one, is what
+            // exhausts below. Every other shutdown-entries scenario runs
+            // on `shutdown_backoff_ms_for_test: Some(0)`.
             ..daemon_opts()
         });
         let _reaper = DaemonReaper::new(&d.state);
@@ -3522,6 +3586,9 @@ fn cad694_offline_restart_still_fences_a_failed_drain() {
                 None => Ok(()),
             }
         })),
+        // The bound is proven once at production backoff by the online
+        // scenario; this offline restart pays none (CAD-809).
+        shutdown_backoff_ms_for_test: Some(0),
         ..daemon_opts()
     });
     let _reaper = DaemonReaper::new(&d.state);

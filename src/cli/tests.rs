@@ -1346,23 +1346,61 @@ fn cad879_self_requests_no_history() {
 /// CAD-694 (review B1): the restart verdict reads the successor's
 /// recovery record — cursor-independent drain evidence. Every
 /// unverifiable shape must fail closed: absent, unreadable, bound to
-/// another run, a failed drain, or fenced turns.
+/// another run than the one this restart started, a failed drain,
+/// malformed fields, or fenced turns.
 #[test]
 fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
     use cadence_agent::daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
     let dir = tempfile::tempdir().unwrap();
+    let verdict = |dir: &std::path::Path| super::recovery_record_verdict(dir, Some("run-b"));
 
+    // No start answer at all cannot stand in for a binding.
+    assert!(super::recovery_record_verdict(dir.path(), None).is_some());
     // No record at all — the predecessor's drain is unverifiable.
-    assert!(super::recovery_record_verdict(dir.path()).is_some());
-
-    // A record bound to a different run must not stand in for this one.
+    assert!(verdict(dir.path()).is_some());
+    // Unparseable JSON is evidence that never reached the writer.
     std::fs::write(dir.path().join(INSTANCE_FILE), "run-b").unwrap();
+    std::fs::write(dir.path().join(LAST_RECOVERY_FILE), "{not json").unwrap();
+    assert!(verdict(dir.path()).is_some());
+
+    // An instance file naming a different run than the one started —
+    // the stale-pair replay a double write failure leaves behind.
+    std::fs::write(dir.path().join(INSTANCE_FILE), "run-a").unwrap();
     std::fs::write(
         dir.path().join(LAST_RECOVERY_FILE),
-        json!({"instance": "run-a", "consumed": null, "fenced": []}).to_string(),
+        json!({
+            "instance": "run-a",
+            "consumed": null,
+            "fenced": [],
+            "unevidenced": []
+        })
+        .to_string(),
     )
     .unwrap();
-    assert!(super::recovery_record_verdict(dir.path()).is_some());
+    assert!(verdict(dir.path()).is_some());
+    // Restore the file; a record naming another run still fails — the
+    // concurrent-restart overwrite this binding exists to reject.
+    std::fs::write(dir.path().join(INSTANCE_FILE), "run-b").unwrap();
+    assert!(verdict(dir.path()).is_some());
+
+    // Parseable but wrongly shaped — each is unknown evidence, never clean.
+    for record in [
+        json!({"instance": "run-b"}), // missing members
+        json!({"instance": "run-b", "consumed": null,
+               "fenced": "unreadable", "unevidenced": []}), // wrong type
+        json!({"instance": "run-b", "consumed": null,
+               "fenced": [{"alias": "w1"}], "unevidenced": []}), // row missing message_id
+        json!({"instance": "run-b", "consumed": {"instance": "run-a"},
+               "fenced": [], "unevidenced": []}), // consumed missing failed
+        json!({"instance": "run-b",
+               "consumed": {"instance": "run-a", "stale": null, "failed": true},
+               "fenced": [], "unevidenced": []}), // failed wrong type
+        json!({"instance": "run-b", "consumed": "gone",
+               "fenced": [], "unevidenced": []}), // consumed wrong type
+    ] {
+        std::fs::write(dir.path().join(LAST_RECOVERY_FILE), record.to_string()).unwrap();
+        assert!(verdict(dir.path()).is_some(), "{record}");
+    }
 
     // Bound to this run but reporting a failed drain — fails.
     std::fs::write(
@@ -1371,12 +1409,13 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
             "instance": "run-b",
             "consumed": {"instance": "run-a", "stale": null, "failed": "drain exploded"},
             "fenced": [],
+            "unevidenced": [],
         })
         .to_string(),
     )
     .unwrap();
-    let verdict = super::recovery_record_verdict(dir.path()).unwrap();
-    assert!(verdict.contains("drain failed"), "{verdict}");
+    let reason = verdict(dir.path()).unwrap();
+    assert!(reason.contains("drain failed"), "{reason}");
 
     // Bound and clean-drained but fencing rows — fails.
     std::fs::write(
@@ -1384,13 +1423,14 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
         json!({
             "instance": "run-b",
             "consumed": {"instance": "run-a", "stale": null, "failed": null},
-            "fenced": [{"alias": "w1", "message": "m1"}],
+            "fenced": [{"alias": "w1", "message_id": "m1"}],
+            "unevidenced": [{"alias": "w1", "message_id": "m1"}],
         })
         .to_string(),
     )
     .unwrap();
-    let verdict = super::recovery_record_verdict(dir.path()).unwrap();
-    assert!(verdict.contains("fenced"), "{verdict}");
+    let reason = verdict(dir.path()).unwrap();
+    assert!(reason.contains("fenced"), "{reason}");
 
     // Bound, clean, nothing fenced — the only passing shape.
     std::fs::write(
@@ -1399,9 +1439,10 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
             "instance": "run-b",
             "consumed": {"instance": "run-a", "stale": null, "failed": null},
             "fenced": [],
+            "unevidenced": [],
         })
         .to_string(),
     )
     .unwrap();
-    assert_eq!(super::recovery_record_verdict(dir.path()), None);
+    assert_eq!(verdict(dir.path()), None);
 }
