@@ -154,12 +154,14 @@ fn retro_reports_rounds_defects_flakes_and_unknowns() {
         .iter()
         .any(|f| f["text"].as_str().unwrap().contains("transient")));
 
-    // Timings from set-transitions; done_at falls back to the
-    // passing-verdict note while no `set status=done` exists.
+    // Timings from set-transitions; since CAD-823 a passing verdict
+    // is review evidence, never delivery — `passed_at` records it and
+    // `done_at` stays null until a `set status=done` exists.
     assert!(v["timings"]["ready_at"].is_string());
     assert!(v["timings"]["doing_at"].is_string());
     assert!(v["timings"]["review_at"].is_string());
-    assert_eq!(v["timings"]["done_at"], "2026-09-20T13:00:00Z");
+    assert_eq!(v["timings"]["passed_at"], "2026-09-20T13:00:00Z");
+    assert!(v["timings"]["done_at"].is_null());
 
     // With status=done the tracker commit supplies done_at and the
     // lead time becomes a real (small) number.

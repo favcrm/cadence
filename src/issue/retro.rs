@@ -377,13 +377,15 @@ pub fn run(pm_dir: &Path, notes_dir: &Path, state_dir: &Path, id: &str) -> Resul
     let ready_at = first_set(&log, "ready");
     let doing_at = first_set(&log, "doing").or_else(|| notes_first("kickoff"));
     let review_at = first_set(&log, "review").or_else(|| notes_first("qa"));
-    let done_at = first_set(&log, "done").or_else(|| {
-        ev_notes
-            .iter()
-            .find(|n| n.verdict == Some(true))
-            .map(|n| n.at.clone())
-            .filter(|s| !s.is_empty())
-    });
+    // CAD-823: `done` is only the file's transition — a passing
+    // verdict is a review outcome, not delivery. Its time is reported
+    // separately as `passed_at`.
+    let done_at = first_set(&log, "done");
+    let passed_at = ev_notes
+        .iter()
+        .find(|n| n.verdict == Some(true))
+        .map(|n| n.at.clone())
+        .filter(|s| !s.is_empty());
     let merged_at = commits
         .iter()
         .filter(|c| c["on_default"] == json!(true))
@@ -411,19 +413,33 @@ pub fn run(pm_dir: &Path, notes_dir: &Path, state_dir: &Path, id: &str) -> Resul
         "doing_at": doing_at,
         "review_at": review_at,
         "done_at": done_at,
+        "passed_at": passed_at,
         "merged_at": merged_at,
         "lead_hours_ready_to_done": hours(&ready_at, &done_at),
         "lead_hours_created_to_done": hours(&Some(created.clone()), &done_at),
         "lead_hours_created_to_merged": hours(&Some(created.clone()), &merged_at),
     });
-    for (f, v) in [
-        ("ready_at", &ready_at),
-        ("doing_at", &doing_at),
-        ("review_at", &review_at),
-        ("done_at", &done_at),
+    for (f, v, why) in [
+        (
+            "ready_at",
+            &ready_at,
+            "no set-transition or tagged note records it",
+        ),
+        (
+            "doing_at",
+            &doing_at,
+            "no set-transition or tagged note records it",
+        ),
+        (
+            "review_at",
+            &review_at,
+            "no set-transition or tagged note records it",
+        ),
+        // CAD-823: a note can record a review verdict, never `done`.
+        ("done_at", &done_at, "no status=done transition records it"),
     ] {
         if v.is_none() {
-            unknowns.push(unknown(f, "no set-transition or tagged note records it"));
+            unknowns.push(unknown(f, why));
         }
     }
 

@@ -355,9 +355,11 @@ pub fn fetch_job_outcomes(state_dir: &Path) -> JobOutcomes {
 }
 
 /// Derivation pipeline, in priority order: container roll-up, then the
-/// bound job's task state, then the newest tagged agent-note, then the
-/// file field. `job_blocked` is the side-channel flag for a blocked
-/// task — the status itself still derives from notes or the file.
+/// bound job's task state, then a terminal file status
+/// (`done`/`dropped` — CAD-823: notes can never reopen it), then the
+/// newest tagged agent-note, then the file field. `job_blocked` is the
+/// side-channel flag for a blocked task — the status itself still
+/// derives from notes or the file.
 pub fn derive_status(
     children_statuses: &[&str],
     notes_dir: &Path,

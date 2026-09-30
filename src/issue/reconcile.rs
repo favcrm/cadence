@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use crate::error::Result;
 use crate::issue::model;
 use crate::issue::time;
-use crate::issue::{board, finish, project, write, Pm};
+use crate::issue::{board, finish, line_times::LineTimes, project, write, Pm};
 use crate::proc::run_bounded;
 use crate::worktree::layout;
 
@@ -208,6 +208,25 @@ fn lane_tip(root: &Path, branch: &str) -> Option<(String, bool)> {
             .ok()
             .map(|t| (t, false))
         })
+}
+
+/// The note-driven arm's freshness check (CAD-823): a notes-derived
+/// `doing`/`review` admits a non-terminal file only when the newest
+/// tagged note is at least as fresh as the `status:` line's last
+/// recorded write. A status move after the note — the operator
+/// parking or re-scoping — outranks a stale note. `None` for `times`
+/// (the history walk failed) means "cannot tell" — don't widen on a
+/// guess; `None` for `status_at` means no write was ever recorded,
+/// so the note is the freshest signal.
+fn note_fresh(times: Option<&LineTimes>, v: &board::View) -> bool {
+    let Some(times) = times else { return false };
+    let Some(at) = times.status_at(&v.issue.project, &v.issue.front.id) else {
+        return true;
+    };
+    v.chain
+        .last()
+        .and_then(|n| time::parse_iso(&n.at))
+        .is_some_and(|note_at| note_at >= at)
 }
 
 /// Everything one issue's refs say about its lanes, before evidence.
@@ -461,12 +480,15 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
 }
 
 /// `issue reconcile [--project P] [--dry-run] [--limit N]` — the
-/// sweep. Leaf issues that look in flight — file `doing`/`review`,
-/// or a non-terminal file whose notes/job derive `doing`/`review`
-/// (CAD-823) — are marked done when their recorded work merged (one
-/// commit per issue, `mark_done_on_merge` semantics: `expect` pins
-/// the status it was read at so a mid-sweep reopen is never
-/// overwritten). `held`/`stalled` rows are reported, not moved.
+/// sweep. Leaf issues whose file OR derived status is `doing`/`review`
+/// are marked done when their recorded work merged. The derived side
+/// (CAD-823) covers a ticket whose file never left backlog/ready
+/// while a note or a live job says in flight — a verdict no longer
+/// fakes `done`, so it must still reach the probe — and a live job
+/// still outranks even a terminal file (CAD-244). (One commit per
+/// issue, `mark_done_on_merge` semantics: `expect` pins the status it
+/// was read at so a mid-sweep reopen is never overwritten.)
+/// `held`/`stalled` rows are reported, not moved.
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
 pub fn run(
@@ -516,6 +538,11 @@ fn run_inner(
     // merged PR strands it at review forever.
     let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
     let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    // `status:` line times from tracker history — the note-driven arm
+    // is only as fresh as the newest note vs the last status write
+    // (a status move after the note is a deliberate park/reopen and
+    // wins). `None` when the walk fails: then nothing widens.
+    let times = LineTimes::load(&pm.dir, Duration::from_secs(10)).ok();
     let children: HashSet<&str> = views
         .iter()
         .filter_map(|v| v.issue.front.parent.as_deref())
@@ -529,19 +556,28 @@ fn run_inner(
 
     for v in &views {
         let f = &v.issue.front;
-        if !matches!(f.status.as_str(), "doing" | "review")
-            && !matches!(v.status.as_str(), "doing" | "review")
+        let in_flight = |s: &str| matches!(s, "doing" | "review");
+        if !in_flight(&f.status)
+            && !(in_flight(&v.status)
+                && (v.status_source == "job"
+                    || (v.status_source == "notes" && note_fresh(times.as_ref(), v))))
         {
             continue;
         }
-        if children.contains(f.id.as_str()) || f.item_type.as_deref() == Some("epic") {
+        let is_parent = children.contains(f.id.as_str());
+        if is_parent || model::item_type(f, is_parent) == "epic" {
             continue;
         }
-        if limit > 0 && classified >= limit {
-            break;
-        }
-        classified += 1;
         let p = probe(&v.issue);
+        // Only evidence-bearing candidates spend the limited budget —
+        // a ref-less one classifies `skipped` for free and must never
+        // starve real probes when a tick caps `classified`.
+        if !p.lanes.is_empty() || !p.pr_urls.is_empty() {
+            if limit > 0 && classified >= limit {
+                break;
+            }
+            classified += 1;
+        }
         let (verdict, detail) = classify(&p, pr_list, pr_view);
         let mut row = json!({"issue": p.id, "status": p.status});
         row["detail"] = detail;
@@ -733,6 +769,56 @@ mod tests {
         front.status = status.to_string();
         write::save_front(&dir, &front, &body).unwrap();
         id
+    }
+
+    /// A bare `backlog` issue with no worktree/branch/pr refs — the
+    /// probe has nothing to check, so it classifies `skipped`.
+    fn put_idle(rig: &Rig, n: u32) -> String {
+        let id = format!("CAD-{n}");
+        let dir = rig.pm.dir.join(&rig.key).join(&id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut front = Front::new(&id, "t", "2026-09-28T00:00:00Z");
+        front.status = "backlog".to_string();
+        write::save_front(&dir, &front, "").unwrap();
+        id
+    }
+
+    /// A verdict note naming `id`, timestamped by its filename.
+    fn verdict_note(rig: &Rig, id: &str, name: &str) {
+        fs::create_dir_all(rig.pm.config.notes_dir()).unwrap();
+        fs::write(
+            rig.pm.config.notes_dir().join(name),
+            format!("# Verdict: x\n> Issue: `{id}`\n\n## Verdict\npass\n"),
+        )
+        .unwrap();
+    }
+
+    /// Commit the issue's dir into tracker history at a pinned author
+    /// time — `status:` line times are author dates, so a test can
+    /// order a status write against a note's fixed filename stamp.
+    /// `20260928-120000` parses to 2026-09-28T12:00:00Z = 1790596800.
+    fn pm_commit(rig: &Rig, id: &str, at: i64) {
+        let rel = format!("{}/{id}", rig.key);
+        let date = format!("@{at} +0000");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig.pm.dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "add", "--"])
+            .arg(&rel)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "pm add: {out:?}");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&rig.pm.dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-q", "-m", "move", "--"])
+            .arg(&rel)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "pm commit: {out:?}");
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -990,6 +1076,63 @@ mod tests {
         let out = sweep(&rig, false, &no_gh, &no_view);
         assert_eq!(status(&rig, &id), "backlog", "{out}");
         assert_eq!(out["rows"][0]["outcome"], "open");
+    }
+
+    /// The notes arm is only as fresh as its newest note: a `status:`
+    /// write that landed *after* it — the operator parking or
+    /// re-opening the ticket — wins, and a merged lane must not
+    /// re-close the file. The note stamps 12:00Z; the status write is
+    /// committed an hour later.
+    #[test]
+    fn status_move_newer_than_the_note_is_not_reclosed() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 30, None, "backlog");
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        pm_commit(&rig, &id, 1_790_600_400); // 2026-09-28T13:00:00Z
+        lane(&rig.repo, true);
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        assert!(out["done"].as_array().unwrap().is_empty(), "{out}");
+        assert!(out["rows"].as_array().unwrap().is_empty(), "{out}");
+    }
+
+    /// The converse: the note landing *after* the last `status:` write
+    /// is the fresher signal, so the merged lane still closes the
+    /// parked-back ticket.
+    #[test]
+    fn note_newer_than_the_status_write_closes_on_merge() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 31, None, "backlog");
+        pm_commit(&rig, &id, 1_790_553_600); // 2026-09-28T00:00:00Z
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        lane(&rig.repo, true);
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "done", "{out}");
+    }
+
+    /// A ref-less candidate classifies `skipped` without spending the
+    /// per-tick budget — otherwise a run of note-driven idle tickets
+    /// ahead of a real candidate would starve it forever.
+    #[test]
+    fn ref_less_candidates_never_starve_the_batch() {
+        let rig = rig();
+        for n in 10..40 {
+            let id = put_idle(&rig, n);
+            verdict_note(&rig, &id, &format!("20260928-120000-{n}-verdict.md"));
+        }
+        // CAD-99 sorts after all the idles and carries real refs.
+        let id = put_issue(&rig, 99, None);
+        lane(&rig.repo, true);
+        let out = run_inner(&rig.pm, None, false, "op", None, 5, &no_gh, &no_view).unwrap();
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert_eq!(out["classified"], 1, "{out}");
+        let skipped = out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["outcome"] == "skipped")
+            .count();
+        assert_eq!(skipped, 30, "{out}");
     }
 
     #[test]

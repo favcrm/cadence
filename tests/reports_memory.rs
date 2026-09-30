@@ -2026,9 +2026,19 @@ fn report_ls_uses_derived_status() {
         format!("# Close-out\n> Issue: `{id}`\n\n## Verdict\npass\n"),
     )
     .unwrap();
-    // A PASS verdict derives `review` — still an open report.
+    // A PASS verdict derives `review` — still an open report. The
+    // row's `review` is the notes-derived status: the file still says
+    // `backlog`, so a file-only read could never produce it.
     let (_, out) = s.cli(&["report", "ls"]);
     assert_eq!(out["count"], 1, "{out}");
+    let row = &out["reports"][0];
+    assert_eq!(
+        (row["id"].as_str(), row["status"].as_str()),
+        (Some(id.as_str()), Some("review")),
+        "{out}"
+    );
+    let stored = s.issue_body("cadence", &id);
+    assert!(stored.contains("status: backlog"), "{stored}");
     // `done` needs the file field (merge evidence or an explicit set);
     // the lingering PASS note cannot outrank it once the file moves.
     let (ok, out) = s.cli(&["issue", "set", &id, "status=done", "--force", "close out"]);
