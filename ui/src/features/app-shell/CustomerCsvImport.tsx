@@ -3,6 +3,9 @@ import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
+import DataTable from "./shared/DataTable";
+import Field from "./shared/Field";
+import { ErrorNotice, Notice } from "./shared/States";
 import {
   CSV_MAX_BYTES,
   buildCsvDecisions,
@@ -210,11 +213,11 @@ export default function CustomerCsvImport({
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
           Import customers
         </h3>
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
+        <Notice className="mt-2" state="read-only">
           {viewer.operator
             ? "Read-only view. Customer imports are disabled on this board."
             : "Sign in as the operator to import customer records."}
-        </p>
+        </Notice>
       </section>
     );
   }
@@ -224,9 +227,7 @@ export default function CustomerCsvImport({
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
           Import customers
         </h3>
-        <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before importing customers.
-        </p>
+        <Notice className="mt-2">Pick an App context above before importing customers.</Notice>
       </section>
     );
   }
@@ -264,45 +265,49 @@ export default function CustomerCsvImport({
             }
           }}
         >
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="csv-file">
-              CSV file (up to 256 KiB, 500 rows)
-            </label>
-            <input
-              id="csv-file"
-              ref={fileRef}
-              type="file"
-              accept=".csv,text/csv,text/plain"
-              disabled={pending !== null}
-              onChange={(e) => pickFile(e.target.files?.[0])}
-            />
-          </div>
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="csv-text">
-              CSV text — header plus one row per customer
-            </label>
-            <textarea
-              id="csv-text"
-              className="field"
-              rows={8}
-              value={csvText}
-              onChange={(e) => editText(e.target.value)}
-              disabled={pending !== null}
-              spellCheck={false}
-              autoComplete="off"
-              placeholder={CSV_HINT}
-            />
-          </div>
+          <Field
+            label="CSV file (up to 256 KiB, 500 rows)"
+            id="csv-file"
+            disabled={pending !== null}
+            className="crm-field"
+          >
+            {(c) => (
+              <input
+                id={c.id}
+                ref={fileRef}
+                type="file"
+                accept=".csv,text/csv,text/plain"
+                disabled={c.disabled}
+                onChange={(e) => pickFile(e.target.files?.[0])}
+              />
+            )}
+          </Field>
+          <Field
+            label="CSV text — header plus one row per customer"
+            id="csv-text"
+            disabled={pending !== null}
+            className="crm-field"
+          >
+            {(c) => (
+              <textarea
+                id={c.id}
+                className="field"
+                rows={8}
+                value={csvText}
+                onChange={(e) => editText(e.target.value)}
+                disabled={c.disabled}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder={CSV_HINT}
+              />
+            )}
+          </Field>
           <p className="text-micro text-ink-500">
             Columns: record_id (required), display_name (required), email, phone, tags
             (semicolon-separated), source, consent_email, consent_sms, expected_revision. Empty
             consent cells import as unknown — consent is never inferred.
           </p>
-          {error !== null && (
-            <p className="text-label text-fail" role="alert">
-              {error}
-            </p>
-          )}
+          {error !== null && <ErrorNotice bare>{error}</ErrorNotice>}
           <div>
             <Button
               type="submit"
@@ -329,116 +334,124 @@ export default function CustomerCsvImport({
               exact bytes — changing the text above requires a new preview.
             </p>
           </div>
-          <div
-            className="crm-table-wrap"
-            tabIndex={0}
-            role="region"
-            aria-label="Planned rows — scroll horizontally to reach every column"
-          >
-            <table className="crm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Row</th>
-                  <th scope="col">Record</th>
-                  <th scope="col">Plan</th>
-                  <th scope="col">Detail</th>
-                  <th scope="col">Revision</th>
-                  <th scope="col">Import</th>
-                </tr>
-              </thead>
-              <tbody>
-                {preview.rows.map((row) => {
-                  const choice = choices.get(row.row) ?? csvPlanChoice(row);
+          <DataTable
+            label="Planned rows — scroll horizontally to reach every column"
+            wrapClassName="crm-table-wrap"
+            tableClassName="crm-table"
+            rowKey={(row) => row.row}
+            rowProps={(row) => ({ "data-plan-row": row.row })}
+            rows={preview.rows}
+            columns={[
+              {
+                key: "row",
+                header: "Row",
+                cellClassName: "num text-ink-500",
+                cell: (row) => row.row,
+              },
+              {
+                key: "record",
+                header: "Record",
+                cellClassName: "num text-ink-300",
+                cell: (row) => {
                   const view = row.profile !== null ? viewProfile(row.profile) : null;
                   return (
-                    <tr key={row.row} data-plan-row={row.row}>
-                      <td className="num text-ink-500">{row.row}</td>
-                      <td className="num text-ink-300">
-                        {row.recordId}
-                        {view !== null && (
-                          <span className="text-ink-100"> — {view.displayName}</span>
-                        )}
-                      </td>
-                      <td>
-                        <span className="chip" data-decision={row.decision}>
-                          {row.decision === "needs_revision" ? "needs revision" : row.decision}
-                        </span>
-                      </td>
-                      <td className="text-label text-ink-300">
-                        {row.errors.length > 0
-                          ? row.errors.join(" · ")
-                          : (row.reason ??
-                            (row.duplicateOf !== null ? `duplicate of ${row.duplicateOf}` : "—"))}
-                      </td>
-                      <td>
-                        {row.decision === "needs_revision" && choice === "apply" ? (
-                          <input
-                            id={`csv-revision-${row.row}`}
-                            className="field num"
-                            style={{ width: "5rem" }}
-                            inputMode="numeric"
-                            maxLength={6}
-                            autoComplete="off"
-                            aria-label={`Expected revision for row ${row.row}`}
-                            placeholder={
-                              row.currentRevision !== null ? `r${row.currentRevision}` : "revision"
-                            }
-                            value={revisions.get(row.row) ?? ""}
-                            onChange={(e) =>
-                              setRevisions(new Map(revisions).set(row.row, e.target.value))
-                            }
-                          />
-                        ) : row.decision === "update" ? (
-                          <span className="num text-ink-300">
-                            r{row.expectedRevision ?? "—"} → r
-                            {row.currentRevision !== null ? row.currentRevision + 1 : "?"}
-                          </span>
-                        ) : (
-                          <span className="num text-ink-500">—</span>
-                        )}
-                      </td>
-                      <td>
-                        {row.decision === "error" ? (
-                          <span className="text-label text-ink-500">skipped — fix the row</span>
-                        ) : (
-                          <Select
-                            id={`csv-choice-${row.row}`}
-                            size="sm"
-                            value={choice}
-                            onChange={(value) => {
-                              if (value === "apply" || value === "skip") {
-                                setChoices(new Map(choices).set(row.row, value));
-                              }
-                            }}
-                            options={[
-                              {
-                                value: "apply",
-                                label:
-                                  row.decision === "create"
-                                    ? "Create"
-                                    : row.decision === "needs_revision"
-                                      ? "Update with revision"
-                                      : row.decision === "update"
-                                        ? "Update"
-                                        : "Apply",
-                              },
-                              { value: "skip", label: "Skip" },
-                            ]}
-                            aria-label={`Import choice for row ${row.row}`}
-                          />
-                        )}
-                      </td>
-                    </tr>
+                    <>
+                      {row.recordId}
+                      {view !== null && <span className="text-ink-100"> — {view.displayName}</span>}
+                    </>
                   );
-                })}
-              </tbody>
-            </table>
-          </div>
-          {error !== null && (
-            <p className="text-label text-fail" role="alert">
-              {error}
-            </p>
-          )}
+                },
+              },
+              {
+                key: "plan",
+                header: "Plan",
+                cell: (row) => (
+                  <span className="chip" data-decision={row.decision}>
+                    {row.decision === "needs_revision" ? "needs revision" : row.decision}
+                  </span>
+                ),
+              },
+              {
+                key: "detail",
+                header: "Detail",
+                cellClassName: "text-label text-ink-300",
+                cell: (row) =>
+                  row.errors.length > 0
+                    ? row.errors.join(" · ")
+                    : (row.reason ??
+                      (row.duplicateOf !== null ? `duplicate of ${row.duplicateOf}` : "—")),
+              },
+              {
+                key: "revision",
+                header: "Revision",
+                cell: (row) => {
+                  const choice = choices.get(row.row) ?? csvPlanChoice(row);
+                  return row.decision === "needs_revision" && choice === "apply" ? (
+                    <input
+                      id={`csv-revision-${row.row}`}
+                      className="field num"
+                      style={{ width: "5rem" }}
+                      inputMode="numeric"
+                      maxLength={6}
+                      autoComplete="off"
+                      aria-label={`Expected revision for row ${row.row}`}
+                      placeholder={
+                        row.currentRevision !== null ? `r${row.currentRevision}` : "revision"
+                      }
+                      value={revisions.get(row.row) ?? ""}
+                      onChange={(e) =>
+                        setRevisions(new Map(revisions).set(row.row, e.target.value))
+                      }
+                    />
+                  ) : row.decision === "update" ? (
+                    <span className="num text-ink-300">
+                      r{row.expectedRevision ?? "—"} → r
+                      {row.currentRevision !== null ? row.currentRevision + 1 : "?"}
+                    </span>
+                  ) : (
+                    <span className="num text-ink-500">—</span>
+                  );
+                },
+              },
+              {
+                key: "import",
+                header: "Import",
+                cell: (row) => {
+                  const choice = choices.get(row.row) ?? csvPlanChoice(row);
+                  return row.decision === "error" ? (
+                    <span className="text-label text-ink-500">skipped — fix the row</span>
+                  ) : (
+                    <Select
+                      id={`csv-choice-${row.row}`}
+                      size="sm"
+                      value={choice}
+                      onChange={(value) => {
+                        if (value === "apply" || value === "skip") {
+                          setChoices(new Map(choices).set(row.row, value));
+                        }
+                      }}
+                      options={[
+                        {
+                          value: "apply",
+                          label:
+                            row.decision === "create"
+                              ? "Create"
+                              : row.decision === "needs_revision"
+                                ? "Update with revision"
+                                : row.decision === "update"
+                                  ? "Update"
+                                  : "Apply",
+                        },
+                        { value: "skip", label: "Skip" },
+                      ]}
+                      aria-label={`Import choice for row ${row.row}`}
+                    />
+                  );
+                },
+              },
+            ]}
+          />
+          {error !== null && <ErrorNotice bare>{error}</ErrorNotice>}
           <div className="crm-toolbar">
             <Button
               variant="primary"
@@ -488,39 +501,45 @@ export default function CustomerCsvImport({
             </p>
           </div>
           {receipt.rows.some((row) => row.outcome !== "created" && row.outcome !== "updated") && (
-            <div
-              className="crm-table-wrap"
-              tabIndex={0}
-              role="region"
-              aria-label="Rows that did not apply — scroll horizontally to reach every column"
-            >
-              <table className="crm-table">
-                <thead>
-                  <tr>
-                    <th scope="col">Row</th>
-                    <th scope="col">Record</th>
-                    <th scope="col">Outcome</th>
-                    <th scope="col">Reason</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {receipt.rows
-                    .filter((row) => row.outcome !== "created" && row.outcome !== "updated")
-                    .map((row) => (
-                      <tr key={row.row} data-outcome-row={row.row}>
-                        <td className="num text-ink-500">{row.row}</td>
-                        <td className="num text-ink-300">{row.recordId}</td>
-                        <td>
-                          <span className="chip" data-outcome={row.outcome}>
-                            {OUTCOME_LABEL[row.outcome] ?? row.outcome}
-                          </span>
-                        </td>
-                        <td className="text-label text-ink-300">{row.reason ?? "—"}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </div>
+            <DataTable
+              label="Rows that did not apply — scroll horizontally to reach every column"
+              wrapClassName="crm-table-wrap"
+              tableClassName="crm-table"
+              rowKey={(row) => row.row}
+              rowProps={(row) => ({ "data-outcome-row": row.row })}
+              rows={receipt.rows.filter(
+                (row) => row.outcome !== "created" && row.outcome !== "updated",
+              )}
+              columns={[
+                {
+                  key: "row",
+                  header: "Row",
+                  cellClassName: "num text-ink-500",
+                  cell: (row) => row.row,
+                },
+                {
+                  key: "record",
+                  header: "Record",
+                  cellClassName: "num text-ink-300",
+                  cell: (row) => row.recordId,
+                },
+                {
+                  key: "outcome",
+                  header: "Outcome",
+                  cell: (row) => (
+                    <span className="chip" data-outcome={row.outcome}>
+                      {OUTCOME_LABEL[row.outcome] ?? row.outcome}
+                    </span>
+                  ),
+                },
+                {
+                  key: "reason",
+                  header: "Reason",
+                  cellClassName: "text-label text-ink-300",
+                  cell: (row) => row.reason ?? "—",
+                },
+              ]}
+            />
           )}
           <div className="crm-toolbar">
             <Button size="sm" variant="primary" onClick={onDone}>
