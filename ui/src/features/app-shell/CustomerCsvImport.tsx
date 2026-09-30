@@ -7,6 +7,7 @@ import {
   CSV_MAX_BYTES,
   buildCsvDecisions,
   csvActions,
+  csvApplyCount,
   csvDecisionsReady,
   csvPlanChoice,
   newImportRequestId,
@@ -165,16 +166,9 @@ export default function CustomerCsvImport({
         setPreview(plan);
         setRequestId(newImportRequestId());
         setChoices(new Map(plan.rows.map((row) => [row.row, csvPlanChoice(row)])));
-        setRevisions(
-          new Map(
-            plan.rows
-              .filter((row) => row.decision === "needs_revision")
-              .map((row) => [
-                row.row,
-                String(row.currentRevision ?? row.expectedRevision ?? ""),
-              ]),
-          ),
-        );
+        // needs_revision fields start empty — the operator types the
+        // observed revision; the live value is rendered as a hint only.
+        setRevisions(new Map());
       })
       .catch((e: unknown) => {
         if (live.current.mounted && live.current.scope === scopeKey) {
@@ -237,6 +231,8 @@ export default function CustomerCsvImport({
     );
   }
 
+  const applyCount = preview === null ? 0 : csvApplyCount(preview.rows, choices);
+
   return (
     <section aria-label="Import customers" className="grid gap-3">
       <div>
@@ -244,7 +240,7 @@ export default function CustomerCsvImport({
           Import customers
         </h3>
         <p className="text-label text-ink-400 mt-1">
-          <button type="button" className="lnk" onClick={onCancel}>
+          <button type="button" className="lnk" onClick={onCancel} disabled={pending === "import"}>
             ← Customers
           </button>{" "}
           · Context {scope.contextId} — the preview writes nothing; the import commits the rows
@@ -384,6 +380,9 @@ export default function CustomerCsvImport({
                             maxLength={6}
                             autoComplete="off"
                             aria-label={`Expected revision for row ${row.row}`}
+                            placeholder={
+                              row.currentRevision !== null ? `r${row.currentRevision}` : "revision"
+                            }
                             value={revisions.get(row.row) ?? ""}
                             onChange={(e) =>
                               setRevisions(new Map(revisions).set(row.row, e.target.value))
@@ -446,19 +445,19 @@ export default function CustomerCsvImport({
               loading={pending === "import"}
               disabled={
                 pending !== null ||
-                preview.summary.error === preview.rowCount ||
+                applyCount === 0 ||
                 !csvDecisionsReady(preview.rows, choices, revisions)
               }
               title={
-                preview.summary.error === preview.rowCount
-                  ? "No row is importable — every row refused in the preview"
+                applyCount === 0
+                  ? "No row is set to write — the plan refused or skipped every row, or you skipped them all"
                   : csvDecisionsReady(preview.rows, choices, revisions)
                     ? "Commit the approved rows under this exact preview"
                     : "Every row marked for update needs its expected revision"
               }
               onClick={runImport}
             >
-              Import {preview.rowCount - preview.summary.error} approved rows
+              Import {applyCount} approved {applyCount === 1 ? "row" : "rows"}
             </Button>
             <Button
               size="sm"
