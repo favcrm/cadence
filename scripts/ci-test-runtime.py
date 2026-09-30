@@ -103,7 +103,8 @@ def orphan_reap_capability():
     while time.monotonic() < deadline:
         try:
             Path(f'/proc/{orphan_pid}/stat').read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # procfs can lose the task between open and read (ESRCH).
             return
         time.sleep(0.05)
     raise ValueError(

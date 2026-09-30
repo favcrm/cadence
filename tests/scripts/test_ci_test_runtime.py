@@ -126,6 +126,21 @@ class CapabilityProbes(unittest.TestCase):
         # On this dev host PID 1 reaps; the probe must pass quickly.
         module.orphan_reap_capability()
 
+    def test_orphan_disappearance_during_proc_read_is_success(self):
+        # Linux procfs can report ESRCH after open when the task is
+        # reaped during read, rather than ENOENT before open. Both mean
+        # the known exited child has disappeared; other I/O errors fail.
+        module = load()
+        real_read = Path.read_text
+
+        def gone(path, *args, **kwargs):
+            if str(path).startswith('/proc/') and str(path).endswith('/stat'):
+                raise ProcessLookupError(3, 'No such process')
+            return real_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', gone):
+            module.orphan_reap_capability()
+
     def test_orphan_reap_probe_waits_for_the_orphan_to_leave(self):
         # A lingering zombie must fail the probe — without --init in the
         # job container the suite's detached mock panes stay zombies.
