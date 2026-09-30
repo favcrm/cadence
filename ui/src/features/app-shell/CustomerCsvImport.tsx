@@ -94,10 +94,22 @@ export default function CustomerCsvImport({
   // A monotonically increasing pick id makes the newest pick win: a slow
   // read landing after a newer pick (or a manual paste) can never
   // overwrite it.
+  // Any new file selection — including one we then refuse — discards
+  // the prior plan before it can be committed under a file the
+  // operator no longer means to import. `resetPlan` runs before the
+  // size check, the read and the error path alike.
   const pickSeq = useRef(0);
+  const resetPlan = () => {
+    setCsvText("");
+    setPreview(null);
+    setReceipt(null);
+    setChoices(new Map());
+    setRevisions(new Map());
+  };
   const pickFile = (file: File | undefined) => {
     if (!file) return;
     const seq = ++pickSeq.current;
+    resetPlan();
     if (file.size > CSV_MAX_BYTES) {
       // Clear the input so re-picking the same file re-fires onChange.
       if (fileRef.current) fileRef.current.value = "";
@@ -128,11 +140,11 @@ export default function CustomerCsvImport({
   };
 
   const editText = (text: string) => {
-    // A manual paste is a newer edit than any in-flight file read.
+    // A manual paste is a newer edit than any in-flight file read and
+    // invalidates any plan bound to the earlier bytes.
     pickSeq.current += 1;
     setCsvText(text);
-    if (preview !== null) {
-      // The token binds these exact bytes — a keystroke invalidates it.
+    if (preview !== null || receipt !== null) {
       setPreview(null);
       setReceipt(null);
       setChoices(new Map());
