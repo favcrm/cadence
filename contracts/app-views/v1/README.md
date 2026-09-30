@@ -4,11 +4,12 @@ A **versioned, data-only** grammar for the record views a workspace app
 package may describe for the trusted host shell. This directory is the
 contract; the board UI under `ui/src/features/app-shell/app-views/` is
 its reference consumer (strict validator + one shared renderer +
-dev-only preview). Both sides of the seam live in this repo today; the
-package side of the seam — a workspace bundle shipping a descriptor
-file, the install validator accepting it, the host loading a *verified*
-descriptor for a real installation — is later CAD-811 work and is **not**
-delivered here.
+dev-only preview). Since CAD-864 the package side of the seam exists: a
+workspace bundle may carry exactly `views/app-views-v1.json`, declared
+by `needs.views.contract: app-views/v1` in `app.md`, installed through
+the same verified bundle machinery and served back over the verified
+installation receipt. Rendering it against *live* records remains later
+CAD-811 work.
 
 ## Contents
 
@@ -113,20 +114,46 @@ tag.
   malformed/forbidden/oversized and non-JSON descriptors refuse, and
   mounts the renderer over both fixtures to check text-only output.
   Running these tests is validation evidence, not supplied by this document.
-- A future package loader must run `parseAppView` (or an equivalent
-  schema check plus the consumer rules listed above) on descriptor
-  bytes *before* any descriptor reaches the renderer — the renderer
-  assumes validated input.
+- **Package loader** (`src/issue/app_view.rs`, CAD-864):
+  `parse_descriptor` is the Rust-side gate, mirroring every rule here
+  rule-for-rule — forbidden keys recursively, unknown keys, identifier
+  grammar, format/kind coherence, column and `createView`
+  cross-references, and the same bounds (16 views, 24 fields, 12
+  columns, 24 enum values, 64/80/120/280-char strings, 4 096 nodes,
+  depth 24, 64 KiB serialized). Install and upgrade validate the bytes
+  before they join the bundle; the workspace receipt re-parses the
+  installed bytes on every read so a hand-edited installed descriptor
+  can never be served as reviewed.
+
+## The bundle seam (CAD-864)
+
+- A package declares the descriptor in `app.md`:
+  `needs: {views: {contract: app-views/v1}}` — a declaration, never a
+  locator. The contract value is exactly `app-views/v1`; any other value
+  (and any other `needs.views` key) refuses.
+- The descriptor lives at exactly `views/app-views-v1.json` — one file,
+  flat, the filename itself pinning the contract version. Any other
+  name under `views/` (or a nested dir) refuses at scan time.
+- Declaration and file are paired: either alone refuses install.
+  `descriptor.app` must equal `app.md`'s `app` — the descriptor was
+  reviewed with this bundle and never names an installation.
+- Descriptor bytes are inside the bundle digest on both install
+  transports (legacy `file.<rel>` arm; workspace `bundle_digest`), so
+  any byte change is a structural change that re-gates approval, and
+  the journaled install/upgrade apply paths re-validate it — a forged
+  journal carrying a bad descriptor cannot apply.
+- The verified workspace receipt (`app_workspace_show`, and its
+  operator-gated `GET /api/app-installations/<id>` peer) carries
+  `view_descriptor` (the validated JSON) and
+  `view_descriptor_digest`. A bundle without a descriptor serves `null`;
+  legacy project installs are unchanged.
 
 ## Remaining CAD-811 integration (not this increment)
 
-- A bundle-side descriptor file (name/format inside the A1 bundle) and
-  the install validator accepting it — today's `app.md` front matter
-  refuses `ui`/`schema`/`actions` keys, so descriptors are not
-  installable yet.
-- The host loading a descriptor from a *verified installation receipt*
-  (not from this dev fixture map) and wiring `createView` to the host's
-  real record-create path.
+- The host loading a descriptor from the verified receipt into the
+  shared renderer (the dev preview still reads the fixture map) and
+  wiring `createView` to the host's real record-create path — the live
+  adapter lane.
 - Live record projection: `fixtureRows` becomes a fetch through the
   existing scoped host-actions client; the descriptor keeps declaring
   only shape, never query or path.
