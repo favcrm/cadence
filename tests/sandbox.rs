@@ -151,7 +151,9 @@ fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
             )
         })
         .ok()?;
-    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+    // One syscall: a request split across writes can race a server
+    // that answers and closes early (CAD-817).
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
         .inspect_err(|e| {
             diag(
                 port,
@@ -785,6 +787,56 @@ fn ui_start_refuses_a_port_another_board_already_serves() {
     assert_eq!(http_status(port, "/api/health"), Some(200));
 }
 
+/// CAD-817 root cause: the fake foreign board answered after ONE
+/// `read`. The test client's `write!` sends a request as several
+/// syscalls (one per format piece), so the server could answer and
+/// close between two of them; the client's next write then failed with
+/// EPIPE and `http_get` returned `None` for a listener that was alive
+/// and correct (about 1 in 12 requests on an idle host). The helper
+/// must read the whole request head before it answers, whatever the
+/// segmentation.
+#[test]
+fn foreign_health_listener_answers_every_fragmented_request() {
+    let (port, _fence, listener) = fenced_bindable_port("pieces");
+    let _foreign = serve_health_200(listener);
+    for i in 0..400 {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let pieces = [
+            "GET ",
+            "/api/health",
+            " HTTP/1.0\r\nHost: 127.0.0.1:",
+            &port.to_string(),
+            "\r\n\r\n",
+        ];
+        for piece in pieces {
+            s.write_all(piece.as_bytes())
+                .unwrap_or_else(|e| panic!("request {i}: write cut off by {e:?}"));
+        }
+        let mut buf = String::new();
+        s.read_to_string(&mut buf)
+            .unwrap_or_else(|e| panic!("request {i}: response lost to {e:?} after {buf:?}"));
+        assert!(buf.starts_with("HTTP/1.0 200"), "request {i}: {buf:?}");
+    }
+}
+
+/// CAD-817: a client that connects and never sends (a port probe, a
+/// half-open peer) must not wedge the fake foreign board for the next
+/// request.
+#[test]
+fn foreign_health_listener_is_not_wedged_by_a_silent_client() {
+    let (port, _fence, listener) = fenced_bindable_port("silent");
+    let _foreign = serve_health_200(listener);
+    let _silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.write_all(b"GET /api/health HTTP/1.0\r\n\r\n").unwrap();
+    let mut buf = String::new();
+    s.read_to_string(&mut buf)
+        .unwrap_or_else(|e| panic!("listener wedged: {e:?} after {buf:?}"));
+    assert!(buf.starts_with("HTTP/1.0 200"), "{buf:?}");
+}
+
 /// CAD-817 companion — fence hygiene. `fence_port` is what the
 /// lifecycle test holds across `down`: a second opener of the same
 /// lock file must lose the `flock`, or a parallel pick could take the
@@ -856,55 +908,63 @@ fn serve_health_200(listener: TcpListener) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let port = listener.local_addr().ok().map(|a| a.port()).unwrap_or(0);
         for stream in listener.incoming() {
-            let Ok(mut s) = stream.inspect_err(|e| {
-                diag(
-                    port,
-                    "accept",
-                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
-                )
-            }) else {
-                break;
-            };
-            let mut buf = [0u8; 2048];
-            if s.read(&mut buf)
-                .inspect_err(|e| {
+            match stream {
+                // One thread per connection: a client that connects and
+                // never sends (a port probe, a half-open peer) must not
+                // wedge the listener for the next request.
+                Ok(s) => {
+                    std::thread::spawn(move || answer_health_200(port, s));
+                }
+                // A failed accept is not the end of the foreign board:
+                // the listener outlives it (CAD-817).
+                Err(e) => {
                     diag(
                         port,
-                        "read_request",
+                        "accept",
                         format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
-                    )
-                })
-                .is_err()
-            {
-                continue;
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
-            // Closing with unread request bytes RSTs the peer; answer
-            // then shutdown the write side so `read_to_string` sees EOF.
-            let _ = s
-                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}" as &[u8])
-                .inspect_err(|e| {
-                    diag(
-                        port,
-                        "write_response",
-                        format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
-                    )
-                });
-            let _ = s.shutdown(std::net::Shutdown::Write).inspect_err(|e| {
-                diag(
-                    port,
-                    "shutdown_write",
-                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
-                )
-            });
-            let _ = s.read(&mut buf).inspect_err(|e| {
-                diag(
-                    port,
-                    "drain_request",
-                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
-                )
-            });
         }
     })
+}
+
+/// Serve one connection of `serve_health_200`. The whole request head
+/// is read BEFORE the answer, however the client segments it: answering
+/// after a partial read and closing made the client's remaining writes
+/// fail with EPIPE or its read fail with a RST (CAD-817).
+fn answer_health_200(port: u16, mut s: TcpStream) {
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut buf = [0u8; 2048];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 64 * 1024 {
+        match s.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                diag(
+                    port,
+                    "read_request",
+                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                );
+                return;
+            }
+        }
+    }
+    let _ = s
+        .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}" as &[u8])
+        .inspect_err(|e| {
+            diag(
+                port,
+                "write_response",
+                format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+            )
+        });
+    // Half-close so the client's `read_to_string` sees EOF, then wait
+    // for the client to close: nothing is unread, so no RST.
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    let _ = s.read(&mut buf);
 }
 
 /// The marker is a hand-writable file: `<x>/state` symlinked onto
