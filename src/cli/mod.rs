@@ -3339,10 +3339,24 @@ pub(crate) fn run() -> Result<i32> {
         print!("{text}");
         return Ok(0);
     }
-    let cli = help::root_command(help::in_pane())
+    let parsed = help::root_command(help::in_pane())
         .try_get_matches()
-        .and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m))
-        .unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+        .and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m));
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(e) => {
+            let e = email_flag_error(&e).unwrap_or(e);
+            // `--help` and `--version` print to stdout and exit 0 as before.
+            if !e.use_stderr() {
+                e.exit();
+            }
+            // CAD-876: a usage error is a JSON error like every other one
+            // (`main` prints it and exits 2).
+            let text = e.to_string();
+            let text = text.trim();
+            return Err(Error::usage(text.strip_prefix("error: ").unwrap_or(text)));
+        }
+    };
     // Offline custody never resolves daemon, org defaults or issuer credentials.
     if let Commands::Remote { action } = &cli.command {
         if cli.state_dir.is_some() {

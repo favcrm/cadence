@@ -51,10 +51,12 @@ pub fn unwrap(frame: Value) -> Result<Value> {
     let revision = frame.pointer("/error/revision").and_then(Value::as_i64);
     if kind == "conflict" || code.is_some() {
         return Err(Error::Structured(crate::error::Structured {
-            kind: if kind == "conflict" {
-                "conflict"
-            } else {
-                "rejected"
+            // CAD-876: `busy` keeps its kind across the wire so the
+            // CLI exits 75 (retryable), not 3 (final).
+            kind: match kind {
+                "conflict" => "conflict",
+                "busy" => "busy",
+                _ => "rejected",
             },
             code: code.unwrap_or_else(|| "rejected".to_string()),
             message,
@@ -64,6 +66,7 @@ pub fn unwrap(frame: Value) -> Result<Value> {
     Err(match kind {
         "rejected" => Error::Rejected(message),
         "provider" => Error::Provider(message),
+        "gate" => Error::GateRefused(message),
         "unknown" => Error::OutcomeUnknown(message),
         _ => Error::Internal(message),
     })

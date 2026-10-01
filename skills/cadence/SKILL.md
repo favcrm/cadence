@@ -147,6 +147,27 @@ Stdin feeds one body per call. `issue new --file -` and
 use a file in its tmp dir). The single-purpose verbs stay for one-part
 updates.
 
+## Errors and exit codes
+
+Every failure prints one JSON object on stderr: `{"error", "kind"}` plus
+`code` for a stable refusal name. Clap usage errors use the same shape with
+`"kind": "usage"`. Branch on the exit code instead of parsing stderr:
+
+| Exit | Kind | Meaning | Retry? |
+|-----:|------|---------|--------|
+| 0 | | success | |
+| 1 | `unknown` | outcome unknown, or a failure with no kind; the verbs below also use 1 for "found a problem" | only after checking whether the side effect landed |
+| 2 | `usage` | bad command line (clap), or the verb's own no-go (`doctor --host`, `audit`, `message` pending, `agent-uid provision`) | no, fix the command |
+| 3 | `rejected` | invalid or disallowed request | no |
+| 4 | `gate` | a safety gate refused the action right now | no, until the gate's reason is resolved |
+| 5 | `conflict` | stale revision; reload and redo the edit | no, reload first |
+| 6 | `provider` | the provider explicitly rejected the request | no |
+| 70 | `internal` | local failure (I/O, storage, daemon not reachable) | maybe, after fixing the cause |
+| 75 | `busy` | transient contention (e.g. the tracker write lock) | yes, same idempotency key, with backoff |
+
+Verbs that wrap another program (`cadence test`, `build-slot`, attach) pass
+that program's own exit code through. `--help` and `--version` exit 0.
+
 ## Rules
 
 - Messages must be **single line**, no control characters (pty transport).

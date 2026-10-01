@@ -108,6 +108,16 @@ impl Error {
             revision: None,
         })
     }
+    /// A command line the parser rejected (CAD-876). Printed by `main`
+    /// like any other error, so usage errors share the JSON shape.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "usage",
+            code: "usage".to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     /// Revision mismatch. `revision` is the current stored revision.
     pub fn conflict(revision: i64, message: impl Into<String>) -> Self {
         Self::Structured(Structured {
@@ -146,6 +156,33 @@ impl Error {
             Self::Structured(structured) => structured.kind,
         }
     }
+}
+
+/// The one table from an error `kind` to the CLI process exit code
+/// (CAD-876). `main` and nothing else maps kinds to codes, so an agent
+/// can branch on `$?` without parsing stderr. Codes 0 and 1 and the
+/// verb-specific 2 (`doctor --host`, `setup`, `audit`, `message`
+/// pending, `agent-uid provision`) predate the table; it only adds
+/// codes that none of them uses, and `usage` shares the clap-compatible
+/// 2. `busy` and `unknown` are the retryable kinds; `unknown` stays 1
+/// so an unrecognised kind still looks like the old generic failure.
+pub const EXIT_TABLE: &[(&str, i32)] = &[
+    ("usage", 2),
+    ("rejected", 3),
+    ("gate", 4),
+    ("conflict", 5),
+    ("provider", 6),
+    ("internal", 70),
+    ("busy", 75),
+    ("unknown", 1),
+];
+
+/// Exit code for an error `kind`; anything not in [`EXIT_TABLE`] is 1.
+pub fn exit_code_for_kind(kind: &str) -> i32 {
+    EXIT_TABLE
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(1, |(_, code)| *code)
 }
 
 impl fmt::Display for Error {
