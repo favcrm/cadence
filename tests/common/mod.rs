@@ -11,6 +11,7 @@ use cadence_agent::store::Store;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
+use std::cell::Cell;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -439,6 +440,20 @@ pub fn stop_and_join<T>(
     Joined::Finished
 }
 
+thread_local! {
+    /// CAD-972 test seam: the teardown policy `Drop` uses on this thread.
+    static TEARDOWN_POLICY: std::cell::Cell<Teardown> = const { std::cell::Cell::new(Teardown::DEFAULT) };
+}
+
+/// Run `f` with `Drop` on this thread using `policy` (a test shortens
+/// the join deadline to prove a wedged daemon fails its test).
+pub fn with_teardown<T>(policy: Teardown, f: impl FnOnce() -> T) -> T {
+    let old = TEARDOWN_POLICY.with(|p| p.replace(policy));
+    let out = f();
+    TEARDOWN_POLICY.with(|p| p.set(old));
+    out
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,
@@ -578,7 +593,8 @@ impl TestDaemon {
             process: Some(process),
         };
         let deadline = Instant::now() + DAEMON_HEALTH_WAIT;
-        while daemon.rpc("health", json!({})).is_err() {
+        while client::rpc_timeout(&daemon.state, "health", json!({}), HEALTH_PROBE_TIMEOUT).is_err()
+        {
             assert!(
                 Instant::now() < deadline,
                 "daemon run never became healthy: {}",
@@ -943,6 +959,11 @@ impl Drop for TestDaemon {
             client::rpc_timeout(&self.state, "shutdown", json!({}), SHUTDOWN_RPC_TIMEOUT)
         {
             if e.to_string().contains("caller rule") {
+                // Signal before the fallback: if it panics during an
+                // unwind the daemon is already told to stop.
+                if let Some(stop) = &self.stop {
+                    stop.store(true, Ordering::SeqCst);
+                }
                 let _ = self.operator_rpc("shutdown", json!({}));
             }
         }
@@ -950,8 +971,13 @@ impl Drop for TestDaemon {
         // daemon that answered. The stop flag needs no socket, so it
         // also ends a daemon that was still starting, when `shutdown`
         // had nothing to connect to (the CAD-972 hang).
+        let mut wedged = false;
         if let Some(handle) = self.handle.take() {
-            stop_and_join(handle, self.stop.as_ref(), Teardown::DEFAULT, "test daemon");
+            let policy = TEARDOWN_POLICY.with(Cell::get);
+            wedged = matches!(
+                stop_and_join(handle, self.stop.as_ref(), policy, "test daemon"),
+                Joined::Detached
+            );
         }
         // Our own child: waiting on it can never touch another process.
         if let Some(mut process) = self.process.take() {
@@ -961,6 +987,15 @@ impl Drop for TestDaemon {
             }
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // A daemon that will not stop keeps the state flock and reads
+        // re-pointed process env: the owning test must fail. During an
+        // unwind it only detaches (a second panic would abort).
+        if wedged && !thread::panicking() {
+            panic!(
+                "TEARDOWN WEDGED: daemon did not stop within {:?}",
+                TEARDOWN_POLICY.with(Cell::get).join_deadline
+            );
         }
     }
 }

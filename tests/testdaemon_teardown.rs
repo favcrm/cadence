@@ -178,18 +178,60 @@ fn a_daemon_that_accepts_but_never_answers_does_not_hold_the_fixture() {
 }
 
 /// The real daemon, given no time to start: whatever interleaving the
-/// start loses or wins, the teardown ends and the thread is gone.
+/// start loses or wins, the teardown ends with a CLEAN join (a detach
+/// would panic TEARDOWN WEDGED, which fails this test).
 #[test]
 fn real_daemon_start_that_gives_up_early_tears_down() {
     for _ in 0..5 {
         let done = within(Duration::from_secs(90), || {
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            catch_unwind(AssertUnwindSafe(|| {
                 TestDaemon::start_opts_waiting(daemon_opts(), Duration::ZERO)
-            }));
-        });
-        assert!(
-            done.is_some(),
-            "real-daemon teardown hung past the outer bound"
-        );
+            }))
+        })
+        .expect("real-daemon teardown hung past the outer bound");
+        if let Err(e) = done {
+            let text = panic_text(e);
+            assert!(text.contains("did not become healthy"), "{text}");
+        }
     }
+}
+
+/// A daemon that ignores stop must FAIL its owning test with
+/// TEARDOWN WEDGED (not pass with a leaked thread), within a bound.
+/// The 300 ms deadline is injected; production uses 60 s.
+#[test]
+fn a_wedged_daemon_fails_its_test_at_drop() {
+    let release = Arc::new(AtomicBool::new(false));
+    let hold = Arc::clone(&release);
+    let policy = Teardown {
+        join_deadline: Duration::from_millis(300),
+        ..Teardown::DEFAULT
+    };
+    let outcome = within(Duration::from_secs(20), move || {
+        with_teardown(policy, || {
+            catch_unwind(AssertUnwindSafe(|| {
+                let d =
+                    TestDaemon::start_stub_thread(Duration::from_secs(5), move |state, _stop| {
+                        // Healthy (answers once bound) but ignores stop.
+                        let l = UnixListener::bind(state.join("cadence.sock"))?;
+                        l.set_nonblocking(true)?;
+                        while !hold.load(Ordering::SeqCst) {
+                            if let Ok((mut c, _)) = l.accept() {
+                                use std::io::{BufRead, Write};
+                                let mut line = String::new();
+                                let _ = std::io::BufReader::new(&c).read_line(&mut line);
+                                let _ = writeln!(c, r#"{{"ok":true,"result":{{}}}}"#);
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(())
+                    });
+                drop(d); // the test body ends here, daemon wedged
+            }))
+        })
+    })
+    .expect("wedged teardown hung past the outer bound");
+    release.store(true, Ordering::SeqCst);
+    let text = panic_text(outcome.expect_err("a wedged daemon must fail the test at drop"));
+    assert!(text.contains("TEARDOWN WEDGED"), "{text}");
 }
