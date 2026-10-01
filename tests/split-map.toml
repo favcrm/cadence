@@ -591,6 +591,7 @@ tests = [
     "pty_devin_render_miss_reprobe_accepts_the_busy_turn",
     "pty_devin_render_miss_records_reprobe_evidence",
     "pty_delivery_stalled_fires_once_and_clears",
+    "stall_clock_advance_waits_for_settled_streak",
 ]
 helpers = [
     "stuck_draft",
