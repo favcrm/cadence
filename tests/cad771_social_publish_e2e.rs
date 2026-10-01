@@ -36,6 +36,10 @@ use std::time::Duration;
 
 const DEST_FB: &str = "275491372109884";
 const CONN_FB: &str = "con_harbour_fb";
+/// CAD-979 v9 remote AOS `connectionId` (the wire identity the resolver
+/// returns; the local `con_harbour_*` stays the custody/install id).
+const AOS_IG: &str = "connA_harbour_ig";
+const AOS_FB: &str = "connA_harbour_fb";
 const GRANT_FB: &str = "dpq_synthetic_grant_fb";
 const DEST_IG: &str = "17841400008460056";
 const CONN_IG: &str = "con_harbour_ig";
@@ -58,13 +62,6 @@ fn discovery(toolkit: Toolkit) -> Destination {
             status_active: true,
             available: true,
         },
-    }
-}
-
-fn connection_for(toolkit: Toolkit) -> &'static str {
-    match toolkit {
-        Toolkit::Instagram => CONN_IG,
-        Toolkit::Facebook => CONN_FB,
     }
 }
 
@@ -149,7 +146,13 @@ impl FakeDoor {
                 let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(50)) else {
                     continue;
                 };
-                *worker_calls.lock().unwrap() += 1;
+                // CAD-979 v9: the destinations GET is a read-only lookup,
+                // not a provider send — it must NOT count toward the
+                // exactly-once send-call assertions.
+                let is_destinations_read = request.url().contains("/connectors/destinations");
+                if !is_destinations_read {
+                    *worker_calls.lock().unwrap() += 1;
+                }
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap_or(0);
                 let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -204,6 +207,20 @@ impl FakeDoor {
     /// Native-vs-HTTP parity core: the HTTP door reaches exactly the verdicts
     /// the native [`FakePublishLedger`] gate computes for the same binding.
     fn route(shared: &DoorShared<'_>, url: &str, value: &Value) -> Value {
+        // CAD-979 v9: the destinations read supplies the local→AOS
+        // `connectionId` map for `(toolkit, destination_id)` — the wire
+        // identity the send binding carries. Answered on a GET path with no
+        // `SendBinding` to parse, before the binding decode below.
+        if url.contains("/connectors/destinations") {
+            return json!({"ok": true, "data": [
+                {"connectionId": AOS_IG, "toolkit": "instagram",
+                 "displayName": "ig", "destinationId": DEST_IG,
+                 "status": "active", "available": true, "publishable": true},
+                {"connectionId": AOS_FB, "toolkit": "facebook",
+                 "displayName": "fb", "destinationId": DEST_FB,
+                 "status": "active", "available": true, "publishable": true},
+            ]});
+        }
         let toolkit =
             Toolkit::parse(value["toolkit"].as_str().unwrap_or("")).unwrap_or(Toolkit::Facebook);
         let binding = SendBinding {
@@ -550,10 +567,11 @@ impl cadence_agent::platform::agenticos_external::publish::PublishSender for Htt
 
 fn door_binding(intent: &Value, behavior: &str) -> Value {
     let frozen = &intent["frozen"];
-    let toolkit =
-        Toolkit::parse(frozen["toolkit"].as_str().unwrap_or("")).unwrap_or(Toolkit::Facebook);
+    // v9: the wire `connection_id` is the resolved remote AOS
+    // `connectionId` persisted as `frozen["aos_connection_id"]` — the local
+    // `con_*` custody id is never sent on the wire.
     json!({"key": intent["request"],
-        "connection_id": connection_for(toolkit), "toolkit": frozen["toolkit"],
+        "connection_id": frozen["aos_connection_id"], "toolkit": frozen["toolkit"],
         "destination_id": frozen["destination_id"],
         "caption_digest": frozen["caption_digest"],
         "image_digest": frozen["image_digest"],
@@ -565,8 +583,12 @@ fn door_binding(intent: &Value, behavior: &str) -> Value {
 
 fn recheck_for(intent: &Value) -> Value {
     let frozen = &intent["frozen"];
+    // v9: the claim recheck compares the remote AOS wire identity
+    // (`aos_connection_id`) — the field the frozen approval binds. The
+    // local `connection_id` stays custody, not the rechecked wire field.
     json!({"grant_id": frozen["grant_id"],
         "connection_id": frozen["connection_id"],
+        "aos_connection_id": frozen["aos_connection_id"],
         "destination_id": frozen["destination_id"],
         "caption_digest": frozen["caption_digest"],
         "image_digest": frozen["image_digest"]})
@@ -617,11 +639,43 @@ fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
 /// A daemon with the fake dispatch sender registered: claims execute
 /// daemon-side and persist provider evidence, exactly the path posted
 /// reports verify against.
+/// A daemon with ONLY the read-credential destinations resolver configured
+/// (no publish sender). The schedule path still resolves the remote AOS
+/// `connectionId` via the fake door; dispatch/sender is absent so the
+/// cancel/revoke/parity assertions keep their no-sender semantics.
+fn resolver_only_release(door: &FakeDoor) -> Release {
+    let dest_base = format!("http://{}", door.addr);
+    Release::with_options(move |opts, _| {
+        opts.social_media_resolver = Some(std::sync::Arc::new(
+            cadence_agent::platform::agenticos_external::media_import::MediaResolver::new(
+                &dest_base,
+                cadence_agent::platform::agenticos_external::publish_sender::DeviceCredential::new(
+                    "cad-test-read".to_owned(),
+                ),
+            )
+            .expect("fake destinations resolver"),
+        ));
+    })
+}
+
 fn e2e_release(door: &FakeDoor) -> (Release, Arc<HttpSender>) {
     let sender = Arc::new(HttpSender::new(format!("http://{}", door.addr)));
     let registered = Arc::clone(&sender);
+    let dest_base = format!("http://{}", door.addr);
     let h = Release::with_options(move |opts, _| {
         opts.social_publish_sender = Some(registered);
+        // CAD-979 v9: the schedule/import path resolves the remote AOS
+        // `connectionId` under a read credential — here a real
+        // `MediaResolver` pointed at the fake door's destinations route.
+        opts.social_media_resolver = Some(std::sync::Arc::new(
+            cadence_agent::platform::agenticos_external::media_import::MediaResolver::new(
+                &dest_base,
+                cadence_agent::platform::agenticos_external::publish_sender::DeviceCredential::new(
+                    "cad-test-read".to_owned(),
+                ),
+            )
+            .expect("fake destinations resolver"),
+        ));
     });
     (h, sender)
 }
@@ -1125,9 +1179,9 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
 
 #[test]
 fn cad771_e2e_schedule_cancel_and_native_http_parity() {
-    let h = Release::new();
-    let (context, run, bundle_digest, install_id) = approved_run(&h, "cancel");
     let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "cancel");
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
     // Future-dated schedule is not yet due; operator cancellation closes it.
     let intent = h
@@ -1405,10 +1459,10 @@ fn cad771_e2e_revoked_binding_holds_despite_matching_recheck() {
     // Daemon-side re-proof: the operator recheck still matches frozen, but
     // the approved material is stale (binding revoked after schedule), so
     // dispatch holds instead of trusting the stale attestation.
-    let h = Release::new();
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
     let (context, run, bundle_digest, install_id) = approved_run(&h, "stale");
     let binding = h.bind(&context, "cad771-e2e-stale-binding");
-    let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
     let intent = h
         .daemon

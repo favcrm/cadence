@@ -333,7 +333,7 @@ pub struct Shared {
     /// record. `None` until shutdown is requested.
     shutdown_facts: Mutex<Option<ShutdownFacts>>,
     provider_log_dir: PathBuf,
-    state_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     /// Captured at boot from the private per-state record. Absent means
     /// the original same-UID socket and caller rule, unchanged.
     agent_uid: Option<u32>,
@@ -465,6 +465,18 @@ pub struct Shared {
     /// adapter lands. Never set from PM, RPC, or worker input.
     social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-979: the retained-media import client, resolved once at attach
+    /// beside the sender from the same `publish.send` credential. Serves the
+    /// operator `social_publish_media_import` verb; absent → `capability_unavailable`.
+    /// Never set from PM, RPC, or worker input.
+    pub(crate) social_media_importer:
+        Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaImporter>>,
+    /// CAD-979 v9: the `provider.read` destinations resolver mapping a local
+    /// custody `conn-<uuid4>` to the remote AOS `connectionId` (the wire
+    /// identity). Separate credential from the importer; absent →
+    /// `capability_unavailable`. Never set from PM, RPC, or worker input.
+    pub(crate) social_media_resolver:
+        Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaResolver>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -673,6 +685,8 @@ impl Shared {
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
+            social_media_importer: opts.social_media_importer.clone(),
+            social_media_resolver: opts.social_media_resolver.clone(),
             app_release_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
@@ -2899,6 +2913,7 @@ impl Shared {
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
+            "social_publish_media_import" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_cancel" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_show" => self.rpc_social_publish(method, params, peer_pid),
@@ -4193,6 +4208,14 @@ pub struct ServeOptions {
     /// adapter lands. Never set from PM, RPC, or worker input.
     pub social_publish_sender:
         Option<std::sync::Arc<dyn crate::platform::agenticos_external::publish::PublishSender>>,
+    /// CAD-979: retained-media import client resolved once at attach (same
+    /// credential as the sender). Never set from PM, RPC, or worker input.
+    pub social_media_importer:
+        Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaImporter>>,
+    /// CAD-979 v9: `provider.read` destinations resolver (local→AOS
+    /// `connectionId` map). Never set from PM, RPC, or worker input.
+    pub social_media_resolver:
+        Option<std::sync::Arc<crate::platform::agenticos_external::media_import::MediaResolver>>,
     /// Trusted test callback after the exact app executing claim, before
     /// Local commit, while the release lock remains held and SQL is dropped.
     /// False preserves executing uncertainty for restart reconciliation.

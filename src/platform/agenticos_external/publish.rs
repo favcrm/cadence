@@ -264,6 +264,29 @@ pub fn media_key_authorizes(
         && digest.starts_with(prefix)
 }
 
+/// CAD-979 v9: bind a key to its resolved remote AOS `connectionId` +
+/// image digest prefix only — NOT the workspace. The key's `parts[1]` is
+/// the send credential's upstream workspace, which Cadence never knows
+/// locally (no local workspace authority); that binding is enforced
+/// upstream at mint/grant (`SendGrant.authorize` `cross_workspace`), not
+/// by a local compare. Freeze-time authorization binds connection+digest.
+pub fn media_key_authorizes_connection(media_key: &str, connection: &str, digest: &str) -> bool {
+    let parts: Vec<&str> = media_key.split('.').collect();
+    if parts.len() != 4 || parts[0] != "dp1" {
+        return false;
+    }
+    if parts[2] != connection {
+        return false;
+    }
+    let prefix = parts[3];
+    prefix.len() == 32
+        && prefix
+            .bytes()
+            .all(|b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && digest.len() == 64
+        && digest.starts_with(prefix)
+}
+
 // ---------- frozen send binding ----------
 
 /// The exact frozen binding one stable key names: one destination, one

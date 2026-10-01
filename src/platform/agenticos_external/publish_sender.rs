@@ -76,6 +76,13 @@ const RESPONSE_CAP: u64 = 1024 * 1024;
 /// Explicit-config surface. Both must be set; neither alone registers.
 pub const PUBLISH_SEND_URL_ENV: &str = "CADENCE_PUBLISH_SEND_URL";
 pub const PUBLISH_SEND_CREDENTIAL_FILE_ENV: &str = "CADENCE_PUBLISH_SEND_CREDENTIAL_FILE";
+/// CAD-979 v9: the `provider.read`/`provider.draft` read credential for the
+/// destinations GET (local→AOS `connectionId` map). A separate credential —
+/// upstream `oneScopeAudience` forbids `provider.*` + `publish.send` on one
+/// token. The send credential's workspace remains the authority; this read
+/// only maps ids.
+pub const PUBLISH_READ_URL_ENV: &str = "CADENCE_PUBLISH_READ_URL";
+pub const PUBLISH_READ_CREDENTIAL_FILE_ENV: &str = "CADENCE_PUBLISH_READ_CREDENTIAL_FILE";
 
 /// Global HTTP bound for door calls. An execution that exceeds it is
 /// ambiguous (the provider may still have accepted), so the caller
@@ -113,7 +120,10 @@ impl DeviceCredential {
         Self(secret)
     }
 
-    fn authorization(&self) -> String {
+    /// Bearer header value; `pub(crate)` so the sibling media-import
+    /// client authenticates the same way. Never logged or returned to a
+    /// caller — the secret only ever reaches this one header.
+    pub(crate) fn authorization(&self) -> String {
         format!("Bearer {}", self.0)
     }
 }
@@ -704,9 +714,37 @@ pub fn attach_publish_sender(
     let resolver = production_resolver(state_dir);
     opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
         url.trim_end_matches('/'),
-        credential,
+        credential.clone(),
         resolver,
     )?));
+    // CAD-979: the retained-media import seam reuses the same configured
+    // `publish.send` credential and base URL — one importer held once on
+    // `opts`, resolved here at attach (never per-call env, never serialized).
+    if opts.social_media_importer.is_none() {
+        opts.social_media_importer = Some(Arc::new(
+            crate::platform::agenticos_external::media_import::MediaImporter::new(
+                url.trim_end_matches('/'),
+                credential,
+            )?,
+        ));
+    }
+    // CAD-979 v9: the destinations resolver is a separate `provider.read`
+    // credential — it maps local→AOS `connectionId` only and never asserts
+    // workspace. Absent/unset → `capability_unavailable` at import (the
+    // resolver is required to place any media on the AOS wire).
+    if opts.social_media_resolver.is_none() {
+        let read_url = std::env::var(PUBLISH_READ_URL_ENV).unwrap_or_default();
+        let read_file = std::env::var(PUBLISH_READ_CREDENTIAL_FILE_ENV).unwrap_or_default();
+        if !read_url.is_empty() && !read_file.is_empty() {
+            let read_credential = read_credential_file(Path::new(&read_file))?;
+            opts.social_media_resolver = Some(Arc::new(
+                crate::platform::agenticos_external::media_import::MediaResolver::new(
+                    read_url.trim_end_matches('/'),
+                    read_credential,
+                )?,
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -779,8 +817,13 @@ fn store_material(
         })?;
     let frozen: Value = serde_json::from_str(&frozen_text)
         .map_err(|_| Refusal::new("bad_effect", "frozen publish intent is corrupt"))?;
+    // v9: `binding.connection_id` is the remote AOS `connectionId` (the
+    // wire identity), persisted as `frozen["aos_connection_id"]` — NOT the
+    // local custody `conn-<uuid4>` in `frozen["connection_id"]`. Compare the
+    // wire field; a historical row without `aos_connection_id` fails closed
+    // (`Some(expected)` never matches an absent field → refuse).
     for (field, expected) in [
-        ("connection_id", binding.connection_id.as_str()),
+        ("aos_connection_id", binding.connection_id.as_str()),
         ("destination_id", binding.destination_id.as_str()),
         ("caption_digest", binding.caption_digest.as_str()),
         ("grant_id", binding.grant_id.as_str()),

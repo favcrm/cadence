@@ -22,6 +22,22 @@ impl Shared {
         strict_fields(
             params,
             match method {
+                // CAD-979: the operator requests a media import against the
+                // approved run's reviewed retained asset — full provenance
+                // triple + scope, never caller bytes/path/URL.
+                "social_publish_media_import" => &[
+                    "request_id",
+                    "install_id",
+                    "context_id",
+                    "run_id",
+                    "artifact_id",
+                    "bundle_digest",
+                    "slot",
+                    // v9: `(toolkit, destination_id)` drive the local→AOS
+                    // `connectionId` resolution before upload.
+                    "destination_id",
+                    "toolkit",
+                ],
                 "social_publish_schedule" => &[
                     "request_id",
                     "install_id",
@@ -49,6 +65,7 @@ impl Shared {
             },
         )?;
         match method {
+            "social_publish_media_import" => self.import_social_media(params),
             "social_publish_schedule" => self.schedule_social_publish(params),
             "social_publish_cancel" => self
                 .store
@@ -73,6 +90,137 @@ impl Shared {
         }
     }
 
+    /// Segment-shaped required param: a nonempty, ≤128-byte ASCII id.
+    fn required_segment<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
+        let value = required_str(params, field)?;
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(Error::rejected(format!("malformed parameter '{field}'")));
+        }
+        Ok(value)
+    }
+
+    /// Strict optional param: absent/null → None; a valid nonempty
+    /// segment string → Some; any other JSON type or an empty/oversize
+    /// string is a rejection, never a silent None.
+    fn strict_optional_segment<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> {
+        match params.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => {
+                if s.is_empty()
+                    || s.len() > 128
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                {
+                    return Err(Error::rejected(format!("malformed parameter '{field}'")));
+                }
+                Ok(Some(s.as_str()))
+            }
+            Some(_) => Err(Error::rejected(format!("malformed parameter '{field}'"))),
+        }
+    }
+
+    /// CAD-979: operator-only retained-media import. Proves the run's
+    /// reviewed asset + this request's exact scope, reads the retained bytes
+    /// by receipt custody, uploads them to the device media door and returns
+    /// the validated `media_key`/`image_digest` for the operator to schedule.
+    /// No grant minted, no send, no persisted row — freeze owns durability.
+    fn import_social_media(&self, params: &Value) -> Result<Value> {
+        // Required request_id: a nonempty, bounded, segment-shaped string,
+        // validated BEFORE any custody read or provider call. import writes
+        // no durable row, so this is an idempotency/receipt shape bound, not
+        // a claimed durable uniqueness (schedule's `request` UNIQUE is).
+        let _request_id = Self::required_segment(params, "request_id")?;
+        let common = |field: &str| required_str(params, field);
+        let request_install = common("install_id")?;
+        // I2 scope pin: `context_id` is strict — absent/null → None; a valid
+        // nonempty string → Some; a number/object/bool/empty/oversize string
+        // refuses rather than silently mapping to None (optional_str would).
+        let request_context = Self::strict_optional_segment(params, "context_id")?;
+        let run_id = common("run_id")?;
+        let artifact_id = common("artifact_id")?;
+        let bundle_digest = common("bundle_digest")?;
+        let slot = common("slot")?;
+        // Reuse the exact provenance re-proof freeze uses: approved completed
+        // run, frozen slot, current binding — keyed by run+artifact+bundle+slot.
+        let material =
+            self.store
+                .app_publication_material(run_id, artifact_id, bundle_digest, slot)?;
+        // I2 scope pin (E3): the request's install/context must equal the
+        // run's OWN scope — `app_publication_material` re-proves only the
+        // run's binding against the run's own scope, so a request naming a
+        // different install/context would still resolve without this compare.
+        // context_id is exact/null-preserving (no wildcard).
+        if material["run"]["install_id"].as_str() != Some(request_install)
+            || material["run"]["context_id"].as_str() != request_context
+        {
+            return Err(Error::rejected(
+                "grant_binding_mismatch: media import request names a different install or context",
+            ));
+        }
+        // The reviewed retained asset for this run.
+        let asset = &material["asset"];
+        let receipt_id = asset["receipt_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("run has no reviewed retained asset"))?;
+        let media_type = asset["media_type"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("run has no reviewed retained asset"))?;
+        // The local custody `conn-<uuid4>` (install/custody identity) and the
+        // send intent's `(toolkit, destination_id)` select the remote AOS
+        // `connectionId` — the upstream wire identity the key must bind.
+        let _local_connection_id = material["binding"]["config"]["connection_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?;
+        let toolkit = common("toolkit")?;
+        let destination_id = common("destination_id")?;
+        // v9: resolve local→AOS `connectionId` under the read credential. The
+        // resolver never asserts workspace — the send credential's workspace is
+        // enforced upstream when the door mints the key and when the grant is
+        // authorized. 0 matches → `grant_binding_mismatch`; >1/full-window →
+        // `capability_unavailable`; unreachable → `capability_unavailable`. A
+        // caller/operator-supplied `connectionId` is never trusted.
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(toolkit, destination_id)
+            .into_result()
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
+        // Read the retained bytes by receipt custody — never a caller
+        // path/URL — and re-verify the digest matches the reviewed asset.
+        let db_path = self.state_dir.join("cadence.sqlite3");
+        let (_receipt, bytes) =
+            crate::store::app_capabilities::read_asset_material(&db_path, receipt_id)?;
+        // The importer re-verifies jpeg/png signature + the 2 MiB bound and
+        // recomputes the digest; the door's receipt must echo all of it. The
+        // resolved remote AOS `connectionId` is sent — never the local
+        // `conn-<uuid4>` — so the minted `dp1.<ws>.<aos_conn>.<digest>` is the
+        // upstream wire binding (the send credential's workspace scopes it).
+        let importer = self.social_media_importer.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media importer configured")
+        })?;
+        let receipt = importer
+            .import(&resolved.aos_connection_id, media_type, &bytes)
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
+        Ok(json!({
+            "ok": true,
+            "media_key": receipt.media_key,
+            "image_digest": receipt.digest,
+            // The wire identity — the remote AOS `connectionId`, not the local
+            // `conn-<uuid4>` custody id.
+            "connection_id": receipt.connection_id,
+            "aos_connection_id": resolved.aos_connection_id,
+            "mime": receipt.mime,
+            "size_bytes": receipt.size_bytes,
+        }))
+    }
+
     /// Schedule freezes from the approved run's reviewed material only:
     /// every digest and the connection derive server-side (explicit
     /// caller-frozen digests are refused — no caller-string trust at
@@ -85,6 +233,33 @@ impl Shared {
             .and_then(Value::as_i64)
             .ok_or_else(|| Error::rejected("Missing or non-integer 'due_epoch'"))?;
         let common = |field: &str| required_str(params, field);
+        let toolkit = common("toolkit")?;
+        let destination_id = common("destination_id")?;
+        let media_key = optional_str(params, "media_key");
+        // Backend refusal order is pinned by tests (run resolution precedes
+        // approval/binding): surface `unknown app run` before any
+        // `capability_unavailable` from a missing resolver. Re-prove the
+        // reviewed material first — the same pure store call freeze makes.
+        self.store.app_publication_material(
+            common("run_id")?,
+            common("artifact_id")?,
+            common("bundle_digest")?,
+            common("slot")?,
+        )?;
+        // v9: the wire identity on `frozen` is the remote AOS `connectionId`,
+        // resolved under the read credential — never the local `conn-<uuid4>`
+        // custody id and never a caller-supplied id. A supplied `media_key`
+        // requires resolution (the key's `parts[2]` is the AOS id); a
+        // text-only schedule without a key still resolves so the AOS wire id
+        // is bound at freeze for the send path. Resolver absent/failed →
+        // `capability_unavailable` (fail closed).
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(toolkit, destination_id)
+            .into_result()
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
         self.store
             .social_publish_freeze_from_artifact(&FreezeFromArtifact {
                 request_id: common("request_id")?,
@@ -95,9 +270,10 @@ impl Shared {
                 bundle_digest: common("bundle_digest")?,
                 slot: common("slot")?,
                 effect_id: common("effect_id")?,
-                destination_id: common("destination_id")?,
-                toolkit: common("toolkit")?,
-                media_key: optional_str(params, "media_key"),
+                destination_id,
+                toolkit,
+                aos_connection_id: &resolved.aos_connection_id,
+                media_key,
                 grant_id: common("grant_id")?,
                 approval_id: common("approval_id")?,
                 due_epoch: due,
@@ -125,9 +301,11 @@ impl Shared {
             return Ok(json!({"claimed": false}));
         };
         let frozen = &due["intent"]["frozen"];
+        // v9: `aos_connection_id` is the wire identity compared at recheck —
+        // the local `connection_id` stays custody, never sent on the wire.
         let matches = [
             "grant_id",
-            "connection_id",
+            "aos_connection_id",
             "destination_id",
             "caption_digest",
         ]
@@ -237,9 +415,12 @@ fn sender_binding(
     request: &Value,
 ) -> Option<crate::platform::agenticos_external::publish::SendBinding> {
     use crate::platform::agenticos_external::publish::{SendBinding, Toolkit};
+    // v9: `aos_connection_id` is the wire identity sent as `connectionId`/
+    // `grant.connectionId` and compared by `check_material` (`parts[2]`).
+    // A pre-v9 `frozen` without it is held, never sent under a local id.
     let binding = SendBinding {
         key: request.as_str()?.to_owned(),
-        connection_id: frozen["connection_id"].as_str()?.to_owned(),
+        connection_id: frozen["aos_connection_id"].as_str()?.to_owned(),
         destination_id: frozen["destination_id"].as_str()?.to_owned(),
         toolkit: Toolkit::parse(frozen["toolkit"].as_str()?)?,
         caption_digest: frozen["caption_digest"].as_str()?.to_owned(),
