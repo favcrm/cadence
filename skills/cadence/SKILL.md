@@ -331,6 +331,29 @@ ownership quality, implementation/resource practice, QA misses or false alarms,
 and acceptance gaps only where evidence warrants it. Do not generate a generic
 checklist report for every trivial edit or spend model turns on empty retros.
 
+## Stress a flaky test in CI
+
+Do not loop a flaky test on the shared host (more than 10 local iterations
+loads every lane). Dispatch `stress.yml` (CAD-958): it builds once per copy on
+ephemeral runners, then runs the nextest filterset `count` times with retries 0.
+It is `workflow_dispatch` only, read-only, and restores (never saves) the
+`gate-test` rust-cache with the read-only sccache key.
+
+```sh
+gh workflow run stress.yml -R favcrm/cadence --ref <branch> \
+  -f filter='test(=my_flaky_test)' \
+  -f features=test-seam -f count=30 -f copies=4 -f load=true -f stop_on_fail=false
+gh run list -R favcrm/cadence --workflow stress.yml --limit 1
+gh run watch <run-id> -R favcrm/cadence --exit-status
+gh run download <run-id> -R favcrm/cadence --pattern 'stress-failures-*'
+```
+
+The code under test is the dispatched `--ref` (the workflow runs from that branch,
+so the branch must contain `stress.yml`). `count` is 1-200 and `copies` is 1-8; each copy
+has a 120-minute cap, so size `count` to fit. `load=true` runs a bounded CPU burner
+beside the tests. Each copy writes passed/failed counts to the run summary, and
+the failing iterations' output is the `stress-failures-*` artifact.
+
 ## Improve memory and this skill
 
 1. Route each lesson to the strongest place that can hold it: a check in code
