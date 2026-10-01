@@ -1072,8 +1072,12 @@ the Host/Origin allowlists), `--read-only` (every write answers `403`,
 the SPA hides its edit controls; `--no-read-only` clears a persisted
 one), `--device-login-issuer <origin> --device-login-org <ws-id>
 --device-login-subject <id>` (remote operator sign-in through the
-AgenticOS device grant, CAD-777 — issuer + org + at least one
-allowlisted subject, or none; default off).
+AgenticOS device grant, CAD-777/841 — issuer + org + at least one
+allowlisted subject, or none; the flags are a thin client that pushes
+the triple to the daemon's store through the operator-secret RPC, so
+they apply live to a running board and never persist in `ui.json`;
+`ui start --reset` does not touch the daemon store either — only
+`cadence ui device-login clear` turns the flow off; default off).
 
 **Signing in (CAD-313, ADR 0004).** Board writes need the operator's
 session. `cadence ui login`, run from your own shell, prints a link —
@@ -1111,20 +1115,27 @@ operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
 
-**Remote sign-in without SSH (CAD-777).** With `--device-login-issuer`,
-`--device-login-org` and at least one `--device-login-subject`
-resolved, `POST /api/session/device/code`
+**Remote sign-in without SSH (CAD-777, daemon-owned since CAD-841).**
+Device login is configured on the *daemon*, never by the board:
+`cadence ui device-login set --issuer <origin> --org <ws-id>
+--subject <id>` writes `<state>/operator/device-login.json` through an
+operator-proof + operator-secret RPC (`show` prints it, `clear`
+removes it; the same pair `--device-login-*` flags on `ui run`/`ui
+start` is a thin client over `set` — pushed by the foreground process
+before any board spawns, and never persisted to `ui.json`). With a
+config resolved, `POST /api/session/device/code`
 requests an AgenticOS device grant for exactly that workspace and
 answers the user code + verification link plus a pending id; `POST
 /api/session/device/poll` exchanges the approval for a session
 with the same cookie shape as `/api/session`. The issuer device code
 lives only in the board's pending map (bounded, TTL-pruned) and the
 `agc_` credential is verified and dropped — neither ever reaches the
-browser. The daemon verifies the presented grant live against its own
-pinned trust root (`<state>/operator/device-login.json`, written at
-board start, removed when the flow is unconfigured) and derives the
+browser. The daemon verifies the presented grant live against the
+daemon-owned config — read again under the mint lock after the issuer
+answer, so a `set`/`clear` landing mid-verify retires the in-flight
+sign-in (`device_authority_changed`, 403) — and derives the
 subject itself — request fields cannot forge it — then mints only
-when that subject is on the pin's allowlist; any other verified
+when that subject is on the config's allowlist; any other verified
 workspace member is refused `device_subject_not_allowed` (403 on the
 poll route, no cookie). The allowlist names the one or few operators
 who sign in remotely — `cadence auth status` prints your subject id
@@ -1132,7 +1143,10 @@ under `principal.subject_id`, and a refusal names the subject it saw.
 Sessions minted this way live 12 h idle, 24 h at most, one per
 verified subject, operator-mapped to the allowlisted subject only;
 agent peers are refused without side effects.
-When device login is configured, the header's Sign in menu offers
+Because the board asks the daemon per request, a `set`/`clear` takes
+effect on a running board at once — no restart — and a stopped or
+restarted board leaves the config untouched. When device login is
+configured, the header's Sign in menu offers
 "Sign in with AgenticOS" — it shows the user code and approval link
 and polls until the grant settles. Unconfigured boards answer both
 routes 404. The login audience

@@ -2951,6 +2951,10 @@ impl Shared {
             "board_session_check" => self.rpc_board_session_check(params),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
+            "device_login_config" => self.rpc_device_login_config(),
+            "operator_device_login_set" => self.rpc_operator_device_login_set(params, peer_pid),
+            "operator_device_login_clear" => self.rpc_operator_device_login_clear(params, peer_pid),
+            "operator_device_login_show" => self.rpc_operator_device_login_show(params, peer_pid),
             "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),
             "operator_secret_rotate" => self.rpc_operator_secret_rotate(params, peer_pid),
             "connection_providers" => self.rpc_connection(method, params, peer_pid),
@@ -3850,6 +3854,8 @@ const OPERATOR_FIELDS: &[&str] = &[
     "pane",
     "recorded_via",
     "attribution",
+    "as",
+    "sub",
 ];
 
 fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
@@ -4224,6 +4230,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
         eprintln!("warning: operator secret unavailable, board logins refused: {e}");
     }
+    // CAD-841: the device-login config is daemon-owned from here on —
+    // sweep away a board-written legacy pin (and its lock) so it can
+    // never mint; best-effort, like `ensure_secret` above.
+    crate::device_login::migrate(state_dir);
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
             Some((path, gid)) => (path.clone(), *gid, true),
