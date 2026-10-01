@@ -388,6 +388,7 @@ fn blog_post_app_demo() {
         dir: TempDir::new().unwrap(),
         state: state.clone(),
         handle: None,
+        stop: None,
         process: None,
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -789,6 +790,7 @@ fn blog_post_installed_is_ready_to_run() {
         dir: TempDir::new().unwrap(),
         state: state.clone(),
         handle: None,
+        stop: None,
         process: None,
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(15);

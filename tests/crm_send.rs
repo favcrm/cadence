@@ -517,6 +517,7 @@ impl Crm {
                 dir: dummy_dir,
                 state: dummy_state,
                 handle: None,
+                stop: None,
                 process: None,
             },
         );
