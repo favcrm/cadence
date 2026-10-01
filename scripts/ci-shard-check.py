@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--dir", type=Path, required=True)
     parser.add_argument("--total", type=int, required=True)
     args = parser.parse_args()
+    if args.total < 1:
+        fail("total must be positive")
 
     shards = {}
     for path in sorted(args.dir.rglob("shard-assignment-*-shard-*.json")):
@@ -34,8 +36,8 @@ def main():
         if doc.get("schema") != 1:
             fail(f"{path}: schema must be 1")
         shard = doc.get("shard")
-        if not isinstance(shard, int) or shard < 1:
-            fail(f"{path}: bad shard {shard!r}")
+        if type(shard) is not int or not 1 <= shard <= args.total:
+            fail(f"{path}: bad shard {shard!r}; expected 1..{args.total}")
         if shard in shards:
             fail(f"shard {shard} reported twice")
         shards[shard] = (path, doc)

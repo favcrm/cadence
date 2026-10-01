@@ -71,6 +71,13 @@ pub trait PlatformAdapter: Send + Sync {
         None
     }
 
+    /// Only the run-bound read/draft broker may use this opt-in. It must also
+    /// verify the live descriptor, builtin connection kind and registration
+    /// receipts. This never exempts legacy grants/defaults from enrollment.
+    fn app_credentialless_account(&self, _account: &str) -> bool {
+        false
+    }
+
     /// Reviewed internal tools require persisted app-artifact authority,
     /// regardless of a legacy account grant held by a worker.
     fn app_artifact_tool(&self, tool: &str) -> bool {

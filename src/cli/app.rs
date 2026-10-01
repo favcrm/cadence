@@ -77,6 +77,7 @@ pub(crate) enum AppAction {
     },
     /// Every installed app: project, name, version, workflows, slots
     /// with bindings, digest and approval state.
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; all projects when absent.
         #[arg(long)]
@@ -195,9 +196,8 @@ pub(crate) enum ContextAction {
         #[arg(long)]
         request_id: String,
     },
-    Ls {
-        install_id: String,
-    },
+    #[command(visible_alias = "list")]
+    Ls { install_id: String },
     Show {
         install_id: String,
         context_id: String,
@@ -236,6 +236,7 @@ pub(crate) enum RecordAction {
         profile: PathBuf,
     },
     /// List customer records in an exact installation context.
+    #[command(visible_alias = "list")]
     Ls {
         install_id: String,
         #[arg(long)]
@@ -444,6 +445,7 @@ pub(crate) enum BindingAction {
         request_id: String,
     },
     /// List bindings, optionally for an exact context.
+    #[command(visible_alias = "list")]
     Ls {
         install_id: String,
         #[arg(long)]
@@ -510,6 +512,7 @@ pub(crate) enum EffectAction {
     /// Inspect the complete staged effect and approval digest.
     Show { effect_id: String },
     /// List release receipts; context filtering requires an installation.
+    #[command(visible_alias = "list")]
     Ls {
         #[arg(long)]
         install_id: Option<String>,
@@ -961,6 +964,7 @@ pub(crate) enum CatalogAction {
         request_id: String,
     },
     /// List catalogued installations. Never migrates on read.
+    #[command(visible_alias = "list")]
     Ls,
     /// Inspect an exact stable installation ID.
     Show { install_id: String },
@@ -1011,6 +1015,7 @@ pub(crate) enum RunAction {
     /// Inspect an exact app-owned run and its output receipts.
     Show { run_id: String },
     /// List app-owned runs, optionally for an exact installation.
+    #[command(visible_alias = "list")]
     Ls {
         #[arg(long)]
         install_id: Option<String>,

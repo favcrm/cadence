@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 #[derive(Subcommand)]
 pub enum WikiAction {
     /// List a wiki directory ("" or omitted = the root).
+    #[command(visible_alias = "list")]
     Ls {
         /// Path inside the wiki — `global`, `projects/<key>/`,
         /// `agents/<alias>/knowledge`, `users/<u>/`.

@@ -9,6 +9,27 @@ Cadence is a local Rust controller coordinating coding agents through durable
 message queues and native provider terminals. If you were launched by cadence,
 your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 
+## Command map
+
+`cadence --help` lists the core verbs only, in groups:
+
+- Me: `self`, `inbox`
+- Work: `issue`, `plan`
+- Agents: `send`, `dispatch`, `join`, `agent`
+- Build: `build-slot`, `secret`
+- Fleet: `status`, `doctor`
+- Knowledge: `memory`, `wiki`
+
+Everything else stays callable: `cadence help operator` lists the operator
+and advanced verbs, `cadence help all` lists every verb with its
+subcommands, and `cadence help <verb>` is one verb's own help. Listers
+answer to both `ls` and `list`; `send` takes the recipient positionally or
+as `--to <alias>`.
+
+`issue` is the one public unit of work. A plan is an epic in the
+`proposed` stage; the operator approves it before its tickets dispatch.
+`job`, `delivery` and `monitor` are PM-internal.
+
 ## Who am I
 
 ```bash
@@ -93,9 +114,38 @@ cadence milestone ls --json
 - `--sort KEY` orders (`-KEY` descending), `--limit N` caps, `--fields a,b`
   keeps only those JSON row keys, `--since/--until` take `24h`/`7d`, an ISO
   date, or an epoch.
+- Output policy: JSON on stdout is one compact line per document when
+  stdout is not a terminal (your case), pretty on a TTY.
+  `CADENCE_JSON=pretty|compact` overrides. `issue ls`, `issue epic
+  ls|show` and `milestone ls|show` print JSON when piped, a table only
+  on a TTY (`CADENCE_JSON=table` forces the table). Field names and
+  order never change.
 - `issue ls --tag` is the one exception: every named tag must be present.
 - `agent list` from your pane still shows only your group — filters narrow
   it, `--all` widens past it.
+
+## Updating a ticket
+
+Use `issue edit` for any update with more than one part. It is one tracker
+commit and all-or-nothing: every part is validated first, and one bad part
+refuses the whole edit with the flag named and nothing written. Pipe a
+comment body on stdin so the shell never expands backticks or `$()`:
+
+```bash
+cadence issue edit CAD-31 --set status=review --tag +needs-review \
+  --ref pr:https://github.com/org/repo/pull/7 --link blocked_by:CAD-30 \
+  --attach ./qa.png --acceptance acc.md --comment-file - <<'EOF'
+Ready for review: `cargo test` passes.
+EOF
+```
+
+Parts: `--set k=v`, `--tag +a,-b`, `--link|--unlink kind:ID`,
+`--ref kind:target` (or a bare URL), `--attach FILE`, `--acceptance FILE|-`,
+`--comment-file FILE|-` (with `--author`). It prints `{id, rev, changed}`.
+Stdin feeds one body per call. `issue new --file -` and
+`issue comment --file -` read stdin too (not for the Pi master, which must
+use a file in its tmp dir). The single-purpose verbs stay for one-part
+updates.
 
 ## Rules
 

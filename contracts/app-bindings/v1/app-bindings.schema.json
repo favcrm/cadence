@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:app-bindings:v1:binding",
+  "title": "App bindings companion (app-bindings/v1)",
+  "description": "A versioned, data-only companion to app-views/v1: it maps view ids the descriptor declares onto a closed set of host read sources (customers, caption-runs) and closed read ops (list, show), and per descriptor field id a dotted key into that source's fixed projection plus the descriptor format the host renders it with. The file is data, never behaviour — keys that name executable surfaces, URLs or navigation, scope or actor identity, credentials, storage internals, authority claims, or any invocation vocabulary (method/call/rpc/tool/command/exec/args/binding/connection/account/slot/request/fetch/body/params/where/order_by/limit/cursor/write/update/delete/send/approve/dispatch/run_id/artifact/artifacts/snapshot/record/store/migration) are forbidden at every level and are enforced by the consumer's recursive scan; this schema additionally forbids them at each object's `propertyNames`. Identifier grammar is [a-z][a-z0-9_-]{0,63}; a field `key` is one or more dot-separated segments of that grammar. Consumers must also enforce the bounds and cross-references documented here (unique view bindings, ops usable by the view's kind, fields naming declared descriptor fields, formats the produced shape can fill, enum domains equal to the produced domain) — JSON Schema alone cannot express them.",
+  "type": "object",
+  "required": ["contract", "app", "title", "bindings"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "app-bindings/v1",
+      "description": "The contract tag. A binding file naming any other version is refused."
+    },
+    "app": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "The workspace-app kind this binding was reviewed with — must equal the bundle's `app` (manifest) and the descriptor's `app`. Provenance only — never an installation id, route, or authority claim."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Human title for the binding file — plain text."
+    },
+    "bindings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/viewBinding" },
+      "description": "Per-view bindings; `view` ids unique within the file (consumer-checked) and each must name a declared table/detail view in the companion descriptor."
+    }
+  },
+  "$defs": {
+    "safeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__proto__", "prototype", "constructor",
+            "script", "scripts", "code", "html", "innerHTML", "css", "style",
+            "javascript", "eval", "import", "module",
+            "url", "uri", "href", "src", "link", "action", "endpoint",
+            "install_id", "installId", "context_id", "contextId",
+            "workspace", "workspace_id", "project", "project_id", "project_link",
+            "actor", "by", "role", "grant", "scope", "scopes",
+            "capability", "capabilities",
+            "secret", "secrets", "credential", "credentials", "token", "password",
+            "sql", "query", "path", "file",
+            "effect", "effects", "verified", "digest", "revision",
+            "method", "call", "rpc", "tool", "command", "exec",
+            "args", "arguments", "binding", "connection", "account", "slot",
+            "request", "request_id", "fetch", "body", "params",
+            "where", "order_by", "limit", "cursor",
+            "write", "update", "delete", "send", "approve", "dispatch",
+            "run_id", "artifact", "artifacts", "snapshot", "record", "store", "migration"
+          ]
+        }
+      }
+    },
+    "fieldBinding": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["field", "key", "format"],
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "Must equal a field id declared on the bound view in the companion descriptor (consumer-checked)."
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)*$",
+          "maxLength": 64,
+          "description": "Dotted path into the source's fixed projection (e.g. display_name, consent.email, snapshot.workflow.title, record_id — the record row's `id`). Must be a member of the source's reviewed key table (consumer-checked)."
+        },
+        "format": {
+          "enum": ["text", "number", "date", "datetime", "enum", "tags"],
+          "description": "Must equal the descriptor field's `format` and be a format the produced shape can honestly fill (consumer-checked): scalar string/digest producers only `text`, the list-shaped `tags` only `format:\"tags\"` with `kind:\"list\"`, consent/run-state only `enum` with the descriptor `values` equal to the produced domain. The produced scalar/list shape must also match the descriptor field's `kind`."
+        }
+      }
+    },
+    "viewBinding": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["view", "source", "ops", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "view": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "The descriptor view id this binding serves. Only `table` and `detail` views may be bound — a `form` view is a disabled preview and can never carry a binding (consumer-checked)."
+        },
+        "source": {
+          "enum": ["customers", "caption-runs"],
+          "description": "The closed set of host read sources. `customers` reads the record store's CustomerProfile; `caption-runs` reads the run row's metadata-only surface."
+        },
+        "ops": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["list", "show"] },
+          "description": "The read operations this binding admits; `list` is a table's op, `show` a detail's (consumer-checked)."
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "$ref": "#/$defs/fieldBinding" },
+          "description": "Per-field projection; `field` ids unique within the binding (consumer-checked)."
+        }
+      }
+    }
+  }
+}

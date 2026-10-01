@@ -2068,7 +2068,7 @@ fn print_json(
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
+        crate::output::json_text(&json!({
             "schema": "cadence.audit/1",
             "repo": repo.display().to_string(),
             "default_ref": default_ref,

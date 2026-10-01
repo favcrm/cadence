@@ -1,6 +1,15 @@
 name: ci
 
 on:
+  # CAD-840: observational full-suite benchmark; automatic events stay 8-way.
+  workflow_dispatch:
+    inputs:
+      test_shards:
+        description: Full-suite shard width for a same-SHA throughput benchmark
+        type: choice
+        options: ["4", "8"]
+        default: "8"
+        required: true
   pull_request:
   # GitHub merge queue (CAD-290): each queued PR is tested on top of main
   # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
@@ -32,7 +41,7 @@ on:
 # GitHub rejects `queue: max` together with `cancel-in-progress: true`, so
 # both are chosen by event and never meet in one run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && format('main-{0}', github.sha)) || github.ref }}
+  group: ci-${{ (github.event_name == 'workflow_dispatch' && format('benchmark-{0}', github.run_id)) || github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && format('main-{0}', github.sha)) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
@@ -42,8 +51,18 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Never let a manual input change PR, merge-group, push or tag coverage.
+  CADENCE_CI_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '4' || '8' }}
 
 jobs:
+  # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
+  # profiles' caches, under the shared keys gate-test, gate-release and
+  # gate-clippy. Every pull_request / merge_group gate job restores the same
+  # key and passes `save-if: false`: a queue ref saved ~1.4 GB per run that no
+  # other ref could read, and the repo sat at 12.7 GB against a 10 GB limit.
+  # release-artifact and release-build keep their own default-keyed caches
+  # (they run on main pushes and tags only). cross-build has no rust-cache. tests/scripts/test_ci_cache_scope.py
+  # pins all of this.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
   # run for that sha would re-test identical content. On a push to main
@@ -127,6 +146,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component rustfmt
       - run: cargo fmt --all -- --check
+      - name: Validate manual benchmark width
+        env:
+          BENCHMARK_SHARDS: ${{ inputs.test_shards }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "$BENCHMARK_SHARDS" in
+              4|8) ;;
+              *) echo 'manual benchmark width must be 4 or 8' >&2; exit 1 ;;
+            esac
+          fi
+      - name: Test CI throughput and manual-width contracts
+        run: python3 tests/scripts/test_ci_throughput.py
       # Metadata-only target/feature validation catches review-recipe drift
       # without compiling another Rust configuration (CAD-635).
       - run: python3 scripts/check-review-recipe
@@ -149,6 +180,42 @@ jobs:
         run: python3 tests/scripts/test_release_publication_policy.py
       - name: Test assertion inventory scanner
         run: python3 tests/scripts/test_assert_inventory.py
+      # CAD-854: shared contracts execute once in the required fmt gate.
+      - name: Test scope selection and execution contracts
+        run: python3 tests/scripts/test_ci_test_plan.py
+      - name: Test suite-shard partition contracts
+        run: python3 tests/scripts/test_ci_rust_tests.py
+      - name: Test shard-assignment coverage gate
+        run: python3 tests/scripts/test_ci_shard_check.py
+      - name: Test nextest cost reporting
+        run: python3 tests/scripts/test_nextest_cost_report.py
+      - name: Test delivery candidate and mutation validation
+        run: |
+          python3 tests/scripts/test_delivery_candidate.py
+          python3 tests/scripts/test_auto_stage.py
+          python3 tests/scripts/test_native_review_observation.py
+      # CAD-562: keep the generated tree and its manifest consistent,
+      # including each declared item and every #[test] fn.
+      - name: Verify doctor/host split-map consistency
+        run: scripts/split-doctor-host --check
+      # CAD-905/CAD-922: the split-map sync tool and the pre-push recipe.
+      - name: Test split-map sync and pre-push recipe
+        run: |
+          scripts/split-map-sync --check
+          python3 tests/scripts/test_split_map_sync.py
+          python3 tests/scripts/test_pre_push.py
+      - name: Test shared CI checks remain required and run once
+        run: python3 tests/scripts/test_ci_shared_checks.py
+      # CAD-904: RW cache secrets are write-gated and the no-secret path is a no-op.
+      - name: Test shared sccache gating and no-op contract
+        run: python3 tests/scripts/test_ci_sccache.py
+      # CAD-926: only cache-warm (push to main) saves the gate rust-cache.
+      - name: Test rust-cache save scope and shared keys
+        run: python3 tests/scripts/test_ci_cache_scope.py
+      # Strict parse: a duplicate mapping key makes GitHub reject the whole
+      # workflow (0 jobs), which the regex-based contracts cannot see.
+      - name: Test workflows parse strictly (no duplicate keys)
+        run: python3 tests/scripts/test_workflows_strict.py
 
   clippy:
     needs: [queue-evidence]
@@ -161,6 +228,9 @@ jobs:
       # Rust build cache (pinned): dependency artifacts keyed on
       # toolchain + lockfile; final binaries always rebuild from sources.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-clippy
+          save-if: false
       - run: cargo clippy --all-targets --locked -- -D warnings
       # CAD-482: the test seam's gated code is dead to a default clippy
       # run — lint the feature-on shape too so it cannot rot.
@@ -184,7 +254,7 @@ jobs:
       # cost evidence): every shard runs to its own verdict.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '[1,2,3,4]' || '[1,2,3,4,5,6,7,8]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -221,16 +291,20 @@ jobs:
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
           fi
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
-      - name: Test scope selection and execution contracts
-        run: python3 tests/scripts/test_ci_test_plan.py
-      - name: Test suite-shard partition contracts
-        run: python3 tests/scripts/test_ci_rust_tests.py
-      - name: Test shard-assignment coverage gate
-        run: python3 tests/scripts/test_ci_shard_check.py
       - run: rustup toolchain install stable --profile minimal
         if: steps.scope.outputs.mode != 'docs'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.scope.outputs.mode != 'docs'
+        with:
+          shared-key: gate-test
+          save-if: false
+      - name: Enable shared sccache (no-op without credentials)
+        if: steps.scope.outputs.mode != 'docs'
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
@@ -246,13 +320,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
         if: steps.scope.outputs.mode != 'docs'
         working-directory: ui
-      - name: Test nextest cost reporting
-        run: python3 tests/scripts/test_nextest_cost_report.py
-      - name: Test delivery candidate and mutation validation
-        run: |
-          python3 tests/scripts/test_delivery_candidate.py
-          python3 tests/scripts/test_auto_stage.py
-          python3 tests/scripts/test_native_review_observation.py
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
@@ -318,11 +385,6 @@ jobs:
             ${{ runner.temp }}/inventory-timings/context.txt
           if-no-files-found: warn
           retention-days: 14
-      # CAD-562: the CAD-536 generated tree must stay consistent with its
-      # manifest — every declared item and every #[test] fn accounted
-      # for (tests/split_map_inventory.rs is the suite-side twin check).
-      - name: Verify doctor/host split-map consistency
-        run: scripts/split-doctor-host --check
       # CAD-771: board-surface Rust tests serve the real SPA build
       # through `ui/dist`. The ui job cannot hand files to this job
       # without artifact transfer, so build here before nextest (non-docs).
@@ -335,7 +397,7 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/8" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/$CADENCE_CI_SHARDS" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
       - name: Keep the shard's test assignment
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -371,6 +433,9 @@ jobs:
             ${{ runner.temp }}/nextest-costs.md
           if-no-files-found: warn
           retention-days: 14
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
   # The proofs that run once, outside the shards: the feature-on suite
   # cannot compile cfg(not(test-seam)) proofs, so the refusal proofs run
   # in the production feature shape, and cargo-nextest intentionally
@@ -386,6 +451,20 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test
+          save-if: false
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      # CAD-904: live proof that the read-only token cannot write. One
+      # PutObject of a throwaway key; the job fails unless R2 answers 403.
+      # A no-op unless this job is in read-only mode.
+      - name: Prove the read-only token cannot write
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache verify-ro
       - name: Install pinned cargo-nextest (PR93 dependency)
         env:
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
@@ -405,6 +484,9 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   # Stable required-check name over the shards and the once-only job
   # above: branch protection requires `test`, and downstream gates read
@@ -424,7 +506,7 @@ jobs:
           [ "${{ needs.test-shard.result }}" = success ]
           [ "${{ needs.test-once.result }}" = success ]
       # Cost-weighted shards carry no nextest partition hash, so coverage
-      # is proven from the assignment artifacts themselves: eight files,
+      # is proven from the assignment artifacts themselves: one file per shard,
       # identical inventory, disjoint tests, union complete (CAD-809).
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -432,7 +514,7 @@ jobs:
           path: ${{ runner.temp }}/shard-assignments
           merge-multiple: false
       - name: Verify shard assignments cover the inventory
-        run: python3 scripts/ci-shard-check.py --dir "${{ runner.temp }}/shard-assignments" --total 8
+        run: python3 scripts/ci-shard-check.py --dir "${{ runner.temp }}/shard-assignments" --total "$CADENCE_CI_SHARDS"
 
   build:
     needs: [queue-evidence]
@@ -443,6 +525,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-release
+          save-if: false
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo build --release --locked
       - name: Rehearse offline hosted migration with the built CLI
         env:
@@ -485,6 +576,9 @@ jobs:
             exit 1
           fi
           echo "probe ok: --release --features test-seam is refused by the seam's own compile_error"
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   ui:
     needs: [queue-evidence]
@@ -511,8 +605,80 @@ jobs:
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-release
+          save-if: false
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-904 / CI-SEC-2: the ONLY job that holds the read-write R2 key. It
+  # runs on push to main alone, under the `sccache-writer` environment
+  # (deployment branch: main only), and compiles merged code. No gate job,
+  # no pull_request and no merge_group job sees the key: a queued PR's build
+  # scripts and tests run in the gates, which only ever read the cache.
+  # Nothing `needs` it and it never fails the run.
+  # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
+  # per profile, each with its own target dir and the shared key the gates
+  # restore (gate-test: test-shard + test-once; gate-release: build + ui;
+  # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
+  # exactly as in the gates, because the cache key hashes RUST* env vars and
+  # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
+  # target dir is the point), but are skipped when the exact cache key already
+  # exists (rust-cache would not save) and sccache has nothing to warm.
+  cache-warm:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    environment: sccache-writer
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [test, release, clippy]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-${{ matrix.profile }}
+          # A lint or test failure on main must not freeze the refresh.
+          cache-on-failure: true
+      # The clippy leg has no sccache: clippy-driver calls are not cacheable
+      # and no gate reads clippy objects from it.
+      - name: Enable shared sccache (read-write; no-op without credentials)
+        id: sccache
+        if: matrix.profile != 'clippy'
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      - name: Warm the test profile (feature-on, as the shards build it)
+        if: matrix.profile == 'test' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --no-run --locked --all-targets --features test-seam
+      - name: Warm the release profile
+        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
+        run: cargo build --release --locked
+      - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
+        if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --features test-seam -- -D warnings
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   # CAD-334: keep the exact tested main build. Runs only on a push to main
   # (never pull_request or merge_group), and only when every gate passed
@@ -967,7 +1133,6 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked
       - run: target/debug/cadence --version
 

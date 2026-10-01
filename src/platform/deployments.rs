@@ -9,9 +9,14 @@ use serde::Deserialize;
 
 const CAP: u64 = 16 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct DeploymentMetadata {
+    providers: Vec<ProviderDeployment>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataFile {
     schema: u32,
     providers: Vec<ProviderDeployment>,
 }
@@ -27,6 +32,35 @@ struct ProviderDeployment {
     #[serde(default)]
     #[allow(dead_code)]
     image_hosts: Vec<String>,
+    // A present null is not absence: deserialize the assertion itself first.
+    #[serde(default, deserialize_with = "parse_transport")]
+    transport: Option<DeploymentTransport>,
+}
+
+#[derive(Clone, Debug)]
+enum DeploymentTransport {
+    HostedMediaLease,
+}
+
+fn parse_transport<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<DeploymentTransport>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match String::deserialize(deserializer)?.as_str() {
+        "hosted-media-lease@1" => Ok(Some(DeploymentTransport::HostedMediaLease)),
+        _ => Err(serde::de::Error::custom(
+            "unknown provider transport assertion",
+        )),
+    }
+}
+
+/// Only validated image metadata can produce this construction proof. It
+/// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedMediaAdmission {
+    _private: (),
 }
 
 fn refused() -> Error {
@@ -67,7 +101,7 @@ impl DeploymentMetadata {
         if bytes.len() as u64 > CAP {
             return Err(refused());
         }
-        let metadata: Self = serde_json::from_slice(bytes).map_err(|_| refused())?;
+        let metadata: MetadataFile = serde_json::from_slice(bytes).map_err(|_| refused())?;
         let mut seen = std::collections::BTreeSet::new();
         if metadata.schema != 1 || metadata.providers.len() > 32 {
             return Err(refused());
@@ -82,6 +116,10 @@ impl DeploymentMetadata {
                 || (entry.provider != crate::platform::agenticos_external::PLATFORM
                     && crate::proto::identifier(&entry.provider, "Provider").is_err())
                 || !valid_authority(authority)
+                || (entry.transport.is_some()
+                    && (entry.provider != crate::platform::agenticos_external::PLATFORM
+                        || entry.origin != "http://api.internal"
+                        || entry.manifest_pin != crate::platform::agenticos_external::MANIFEST_PIN))
                 || entry.manifest_pin.is_empty()
                 || entry.manifest_pin.len() > 256
                 || entry.manifest_pin.chars().any(char::is_control)
@@ -89,7 +127,16 @@ impl DeploymentMetadata {
                 return Err(refused());
             }
         }
-        Ok(metadata)
+        Ok(Self {
+            providers: metadata.providers,
+        })
+    }
+
+    pub(crate) fn hosted_media(&self) -> Option<HostedMediaAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| entry.transport.is_some())
+            .map(|_| HostedMediaAdmission { _private: () })
     }
 
     pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {

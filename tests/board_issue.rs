@@ -2090,7 +2090,12 @@ fn issue_ls_filters_and_epics_match_the_api() {
     assert_eq!(ids(&out), ["X-3", "X-4", "X-5"]);
     assert_eq!(out["total"], 3);
     assert_eq!(out["issues"][1]["tags"], json!(["api", "ui"]));
-    let (ok, table) = cli_raw(pm, state, &["issue", "epic", "show", "X-1"]);
+    let (ok, table) = cli_raw_env(
+        pm,
+        state,
+        &["issue", "epic", "show", "X-1"],
+        &[("CADENCE_JSON", "table".to_string())],
+    );
     assert!(ok, "{table}");
     let row = table.lines().find(|l| l.starts_with("X-4")).unwrap();
     let header = table.lines().find(|l| l.starts_with("ID")).unwrap();

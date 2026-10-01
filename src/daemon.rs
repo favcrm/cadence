@@ -26,6 +26,7 @@ mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_view_read_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -318,6 +319,9 @@ pub struct Shared {
     answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
+    /// CAD-893 test seam: one pause per daemon for
+    /// `CADENCE_TEST_REVALIDATE_PAUSE_MS` (see `revalidate_enrollments`).
+    revalidate_pause_armed: AtomicBool,
     /// CAD-561: the pending update while one drains — `None` when no
     /// update is in progress. Set by `update_drain`, adopted from
     /// `<state>/update.json` (proved against the rollout lease — see
@@ -589,6 +593,7 @@ impl Shared {
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
+            revalidate_pause_armed: AtomicBool::new(true),
             // CAD-561: a pending update recorded by an update that is
             // still running (a restart in the middle of one) keeps the
             // fleet drained across the restart. The marker is adopted on
@@ -2462,8 +2467,35 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                // CAD-879: absent `limit`/`since` keeps the full history
+                // (the board and in-process consumers rely on it); the
+                // CLI sends them to bound what an agent reads.
+                let limit =
+                    match params.get("limit") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(v.as_u64().ok_or_else(|| {
+                            Error::rejected("limit must be a non-negative integer")
+                        })?),
+                    };
+                let since = {
+                    match params.get("since") {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(Value::Number(n)) => Some(n.to_string()),
+                        Some(Value::Null) | None => None,
+                        Some(_) => return Err(Error::rejected("since must be a string or number")),
+                    }
+                };
+                let mut omitted: Option<usize> = None;
                 let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
                     self.store.active_messages(&alias)?
+                } else if limit.is_some() || since.is_some() {
+                    let (rows, left_out) = self.store.messages_window(
+                        &alias,
+                        limit.map(|n| n as usize),
+                        since.as_deref(),
+                    )?;
+                    omitted = Some(left_out);
+                    rows
                 } else {
                     self.store.messages(&alias)?
                 };
@@ -2539,7 +2571,7 @@ impl Shared {
                         }
                     }
                 }
-                Ok(json!({
+                let mut out = json!({
                     "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
                     "event_cursor": self.store.event_cursor(&alias)?,
@@ -2552,7 +2584,13 @@ impl Shared {
                     // agent is fenced and `message reconcile` /
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
-                }))
+                });
+                // CAD-879: how many older rows a `limit`/`since` read
+                // left out; absent when the history was not windowed.
+                if let Some(n) = omitted {
+                    out["messages_omitted"] = json!(n);
+                }
+                Ok(out)
             }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
@@ -2865,6 +2903,7 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_view_read" => self.rpc_app_view_read(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
@@ -2951,6 +2990,10 @@ impl Shared {
             "board_session_check" => self.rpc_board_session_check(params),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
+            "device_login_config" => self.rpc_device_login_config(),
+            "operator_device_login_set" => self.rpc_operator_device_login_set(params, peer_pid),
+            "operator_device_login_clear" => self.rpc_operator_device_login_clear(params, peer_pid),
+            "operator_device_login_show" => self.rpc_operator_device_login_show(params, peer_pid),
             "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),
             "operator_secret_rotate" => self.rpc_operator_secret_rotate(params, peer_pid),
             "connection_providers" => self.rpc_connection(method, params, peer_pid),
@@ -3850,6 +3893,8 @@ const OPERATOR_FIELDS: &[&str] = &[
     "pane",
     "recorded_via",
     "attribution",
+    "as",
+    "sub",
 ];
 
 fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
@@ -4224,6 +4269,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
         eprintln!("warning: operator secret unavailable, board logins refused: {e}");
     }
+    // CAD-841: the device-login config is daemon-owned from here on —
+    // sweep away a board-written legacy pin (and its lock) so it can
+    // never mint; best-effort, like `ensure_secret` above.
+    crate::device_login::migrate(state_dir);
     let shared_socket = if opts.agent_uid.is_some() {
         let (path, gid, fixture) = match &opts.shared_socket {
             Some((path, gid)) => (path.clone(), *gid, true),
@@ -4813,6 +4862,152 @@ mod tests {
             .unwrap();
         assert_eq!(full["messages"].as_array().unwrap().len(), 3);
         assert_eq!(shared.store.event_cursor("w1").unwrap(), before);
+    }
+
+    /// CAD-879: a bounded `agent_show` returns the last `limit` terminal
+    /// rows plus every unfinished one, whatever the history length; a
+    /// request without the fields still returns everything; `since`
+    /// takes a message id or a timestamp; a bounded read never leaks a
+    /// turn token.
+    #[test]
+    fn cad879_agent_show_window_is_bounded_and_keeps_live_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let mut conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        let created = shared.store.agent("w1").unwrap().created;
+        let tx = conn.transaction().unwrap();
+        // An old unfinished row (oldest of all) and 600 finished ones.
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created,turn_id)
+             VALUES ('old-live','w1','b','user','running',?1,'private-token')",
+            [created + 0.5],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('old-unknown','w1','b','user','unknown',?1)",
+            [created + 0.6],
+        )
+        .unwrap();
+        // A previous registration's rows (CAD-304 S4): a finished one is
+        // never listed or counted; an unfinished one is always listed.
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('prev-done','w1','b','user','completed',?1)",
+            [created - 10.0],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('prev-live','w1','b','user','queued',?1)",
+            [created - 9.0],
+        )
+        .unwrap();
+        for i in 0..600 {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,source,state,created)
+                 VALUES (?1,'w1','b','user','completed',?2)",
+                rusqlite::params![format!("h-{i}"), created + 1.0 + i as f64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let show = |params: Value| {
+            shared
+                .dispatch("agent_show", &params, std::process::id())
+                .unwrap()
+        };
+        let ids = |v: &Value| -> Vec<String> {
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // No fields: today's full history, nothing omitted.
+        let full = show(json!({"alias": "w1"}));
+        assert_eq!(full["messages"].as_array().unwrap().len(), 603);
+        assert!(full.get("messages_omitted").is_none());
+        // Default window: the last 20 plus both unfinished rows.
+        let win = show(json!({"alias": "w1", "limit": 20}));
+        let got = ids(&win);
+        assert_eq!(got.len(), 23, "{got:?}");
+        assert!(got.contains(&"prev-live".to_string()));
+        assert!(!got.contains(&"prev-done".to_string()));
+        assert_eq!(got[3], "h-580");
+        assert_eq!(got[22], "h-599");
+        // 580 finished rows left out; the previous registration's
+        // finished row is not counted.
+        assert_eq!(win["messages_omitted"], 580);
+        // The window is the same size whatever the history length.
+        assert!(win.to_string().len() < full.to_string().len() / 10);
+        assert!(!win.to_string().contains("private-token"));
+        // A window wider than the history reaches the previous
+        // registration's finished row and must still stop short of it.
+        let wide = show(json!({"alias": "w1", "limit": 5000}));
+        assert!(!ids(&wide).contains(&"prev-done".to_string()));
+        assert_eq!(ids(&wide).len(), 603);
+        assert_eq!(wide["messages_omitted"], 0);
+        // limit 0: only unfinished work.
+        assert_eq!(ids(&show(json!({"alias": "w1", "limit": 0}))).len(), 3);
+        // since by message id: rows after it, plus unfinished ones.
+        let by_id = ids(&show(json!({"alias": "w1", "since": "h-595"})));
+        assert_eq!(
+            by_id,
+            [
+                "old-live",
+                "old-unknown",
+                "prev-live",
+                "h-596",
+                "h-597",
+                "h-598",
+                "h-599"
+            ]
+        );
+        // since + limit compose.
+        let both = ids(&show(json!({"alias": "w1", "since": "h-595", "limit": 2})));
+        assert_eq!(
+            both,
+            ["old-live", "old-unknown", "prev-live", "h-598", "h-599"]
+        );
+        // since by timestamp.
+        let ts = (created + 1.0 + 597.0).to_string();
+        let by_ts = ids(&show(json!({"alias": "w1", "since": ts})));
+        assert_eq!(
+            by_ts,
+            [
+                "old-live",
+                "old-unknown",
+                "prev-live",
+                "h-597",
+                "h-598",
+                "h-599"
+            ]
+        );
+        // since that is neither an id nor a number is refused.
+        assert!(shared
+            .dispatch(
+                "agent_show",
+                &json!({"alias": "w1", "since": "no-such-id"}),
+                std::process::id()
+            )
+            .is_err());
+        // active_only (what `cadence self` sends) is history-free.
+        let active = show(json!({"alias": "w1", "active_only": true}));
+        assert_eq!(ids(&active), ["old-live", "old-unknown", "prev-live"]);
+        assert!(active.get("messages_omitted").is_none());
+        // A malformed `limit` is refused, never a silent full history.
+        for bad in [json!(-1), json!("20"), json!(5.0), json!(true)] {
+            let err = shared
+                .dispatch(
+                    "agent_show",
+                    &json!({"alias": "w1", "limit": bad}),
+                    std::process::id(),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("limit"), "{bad}: {err}");
+        }
     }
 
     /// CAD-324: a pending compaction whose pack cannot be sent is

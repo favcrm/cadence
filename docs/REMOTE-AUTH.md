@@ -175,22 +175,27 @@ Production flags remain off until a separate rollout approves them.
 ## Board sign-in through the device grant (CAD-777)
 
 The same grant signs a remote operator into the board — no SSH, no
-on-host link. Configure the triple once:
+on-host link. Configure the triple once on the *daemon* (CAD-841):
 
 ```sh
-cadence ui start --device-login-issuer https://your-agenticos-api.example \
-  --device-login-org ws_company \
-  --device-login-subject op_1
+cadence ui device-login set --issuer https://your-agenticos-api.example \
+  --org ws_company \
+  --subject op_1
 ```
 
 Issuer + org + at least one subject, or none (env
 `CADENCE_DEVICE_LOGIN_ISSUER` / `CADENCE_DEVICE_LOGIN_ORG` /
-`CADENCE_DEVICE_LOGIN_SUBJECTS` — the last comma-separated — work
-too); the triple persists in `ui.json` and validates at boot. The
+`CADENCE_DEVICE_LOGIN_SUBJECTS` — the last comma-separated — also feed
+`--device-login-*` flags on `ui run`/`ui start`, a thin client that
+pushes the same `set` before serving). The write goes through the
+operator-secret RPC and lands in the daemon's store at
+`<state>/operator/device-login.json` — it applies live to every board
+on the state dir (no restart) and survives board restarts;
+`cadence ui device-login show` prints it, `clear` removes it. The
 subjects are the operator's allowlist: only those verified issuer
 principals may mint a board session. Find yours with
 `cadence auth status` (it prints `principal.subject_id`); a refusal
-also names the subject it saw. Unconfigured boards answer both routes
+also names the subject it saw. Unconfigured daemons answer both routes
 404.
 `POST /api/session/device/code` requests a `read draft` grant and
 returns the user code, verification link and a pending id.

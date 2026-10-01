@@ -6,7 +6,9 @@
 //! daemon socket.
 
 pub mod app;
+pub mod app_binding;
 pub mod app_catalog;
+pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;
@@ -16,6 +18,7 @@ pub mod context;
 pub mod delivery_policy;
 pub mod dispatch;
 pub mod doctor;
+pub mod edit;
 pub mod finish;
 pub mod groom;
 pub mod history;
@@ -27,6 +30,7 @@ pub mod model;
 pub mod notes;
 pub mod parse;
 pub mod plan;
+mod pmlock;
 pub mod project;
 pub mod project_new;
 pub mod reconcile;
@@ -43,10 +47,15 @@ pub mod work;
 pub mod workflow;
 pub mod write;
 
+pub use pmlock::{LockState, PmLock};
+
+/// The legacy lock path, kept as the new protocol's fence file.
+const MARKER_LOCK_FILE: &str = ".write.lock";
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -229,52 +238,22 @@ impl Pm {
     }
 
     /// Serialise writers: comments/artifacts are create-only and ids are
-    /// allocated under this same lock. Lock file, create-exclusive,
-    /// bounded spin; the holder removes it on drop.
+    /// allocated under this same lock. A kernel `flock` on a stable file
+    /// (see [`pmlock`]); bounded wait. The lock dies with its process.
     pub fn lock(&self) -> Result<PmLock> {
-        self.fence_check()?;
-        let path = self.dir.join(".write.lock");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(PmLock { path: path.clone() }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Instant::now() >= deadline {
-                        // A live writer is not evidence that authority changed.
-                        // In particular, app validation must defer rather than
-                        // revoke approval while capability I/O holds this lock.
-                        return Err(Error::busy(format!(
-                            "PM dir is locked by another writer ({}); remove it \
-                             only if the holder is gone",
-                            path.display()
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        self.acquire_default()
+    }
+
+    /// [`Self::lock`] with a caller-chosen wait.
+    pub fn lock_for(&self, wait: Duration) -> Result<PmLock> {
+        self.acquire_for(wait)
     }
 
     /// [`Self::lock`] without the wait: `None` when another writer holds
     /// it. For a caller that must not stall behind a writer (the daemon
     /// under its own lock, CAD-449) and retries later instead.
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
-        self.fence_check()?;
-        let path = self.dir.join(".write.lock");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(Some(PmLock { path })),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.acquire(None)
     }
 
     /// True when the worktree differs from HEAD.
@@ -634,16 +613,6 @@ fn foreign_listed(foreign: &[String], extra: usize) -> String {
     listed.join(", ")
 }
 
-pub struct PmLock {
-    path: PathBuf,
-}
-
-impl Drop for PmLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Run a git subcommand in `dir`; rejected error carries stderr.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
@@ -679,7 +648,11 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 - Acceptance criteria are authored with cadence issue acceptance <ID>\n\
   --from <file> as an ordered - [ ]/- [x] checklist; dispatch enforcement\n\
   remains a later CAD-159 change.\n\
-- Every write is one git commit, serialised on `.write.lock`.\n";
+- Every write is one git commit, serialised by a kernel lock on\n\
+  `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
+
+#[cfg(test)]
+mod lock_tests;
 
 #[cfg(test)]
 mod tests {

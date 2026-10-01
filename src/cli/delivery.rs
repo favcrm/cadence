@@ -8,6 +8,7 @@ pub(crate) enum DeliveryAction {
     /// repeat and comma-join and match ANY of their values; different
     /// flags AND.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Only this ticket — `delivery ls X-1` is `--issue X-1`.
         issue: Option<String>,

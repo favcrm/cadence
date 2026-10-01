@@ -1648,7 +1648,7 @@ fn master_dispatch_races_dispatch_a_ticket_once() {
         .collect();
     let won: Vec<&String> = results.iter().filter(|t| t.contains("rc=0")).collect();
     assert_eq!(won.len(), 1, "exactly one dispatch succeeds: {results:#?}");
-    assert!(won[0].contains("\"dispatched\": true"), "{}", won[0]);
+    assert!(won[0].contains("\"dispatched\":true"), "{}", won[0]);
     for lost in results.iter().filter(|t| !t.contains("rc=0")) {
         assert!(lost.contains("D-2 is doing"), "{lost}");
     }

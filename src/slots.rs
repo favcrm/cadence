@@ -366,6 +366,23 @@ struct Seniority {
     seen: f64,
 }
 
+/// The unrevoked agent-owned enrollments at one instant: `(id, owner)`.
+/// See [`Slots::enrollment_snapshot`].
+#[derive(Clone, Debug, Default)]
+pub struct EnrollmentSnapshot {
+    members: Vec<(String, String)>,
+}
+
+impl EnrollmentSnapshot {
+    /// The owners whose rows must be read — sorted, once each.
+    pub fn owners(&self) -> Vec<String> {
+        let mut owners: Vec<String> = self.members.iter().map(|(_, o)| o.clone()).collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+}
+
 /// The slot registry. In-memory for queue state (waiters re-poll
 /// after a restart), persisted for holds: `persist_path` is written
 /// on every hold change so a daemon restart can revalidate them
@@ -1787,15 +1804,22 @@ impl Slots {
     /// would read as "owner gone" and revoke it whenever any other
     /// owner is active.
     pub fn enrolled_owners(&self) -> Vec<String> {
-        let mut owners: Vec<String> = self
-            .enrollments
-            .iter()
-            .filter(|e| !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
-            .map(|e| e.owner_actor.clone())
-            .collect();
-        owners.sort();
-        owners.dedup();
-        owners
+        self.enrollment_snapshot().owners()
+    }
+
+    /// The enrollments revalidation will judge: the unrevoked agent-owned
+    /// ones as of now, by id. The daemon reads owner rows after releasing
+    /// the slot lock, so what it reads says nothing about an enrollment
+    /// minted since — only this snapshot may be revalidated against them.
+    pub fn enrollment_snapshot(&self) -> EnrollmentSnapshot {
+        EnrollmentSnapshot {
+            members: self
+                .enrollments
+                .iter()
+                .filter(|e| !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
+                .map(|e| (e.id.clone(), e.owner_actor.clone()))
+                .collect(),
+        }
     }
 
     /// Revalidate each unrevoked enrollment against its owner row as the
@@ -1806,10 +1830,33 @@ impl Slots {
         &mut self,
         current: &HashMap<String, Option<String>>,
     ) -> Vec<SlotEvent> {
+        self.revalidate(current, |_| true)
+    }
+
+    /// [`Self::revalidate_owners`], limited to the enrollments of
+    /// `snapshot` (CAD-893): one minted after the snapshot — a master
+    /// that just started — has no row in `current` to be judged by and is
+    /// left for the next revalidation.
+    pub fn revalidate_snapshot(
+        &mut self,
+        snapshot: &EnrollmentSnapshot,
+        current: &HashMap<String, Option<String>>,
+    ) -> Vec<SlotEvent> {
+        self.revalidate(current, |e| {
+            snapshot.members.iter().any(|(id, _)| *id == e.id)
+        })
+    }
+
+    fn revalidate(
+        &mut self,
+        current: &HashMap<String, Option<String>>,
+        judged: impl Fn(&Enrollment) -> bool,
+    ) -> Vec<SlotEvent> {
         // A runner's owner is the daemon's runner record, not an agent
         // row — it is never revalidated against one (CAD-230b).
         let drifted = |e: &Enrollment| {
             e.runner.is_none()
+                && judged(e)
                 && current.get(&e.owner_actor).and_then(Option::as_deref)
                     != Some(e.owner_generation.as_str())
         };
