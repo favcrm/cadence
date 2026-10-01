@@ -16,6 +16,8 @@ use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::Mutex;
@@ -356,10 +358,94 @@ pub fn await_singleton_released(state: &Path) {
     }
 }
 
+/// How long a fixture daemon gets to answer its first `health`. Daemon
+/// start (store open, recovery, relaunch) is disk-bound; under host
+/// load (1-minute load average ~18 on the CAD-906 review host) it can
+/// pass the 10 s this once was. Shared with the `daemon run` process
+/// path, which already used 30 s. A daemon that has *exited* fails
+/// immediately (`wait_health`), so the longer wait only costs time when
+/// the daemon is alive but slow.
+pub const DAEMON_HEALTH_WAIT: Duration = Duration::from_secs(30);
+
+/// One `health` probe's read bound. `client::rpc` waits up to 700 s,
+/// which let a single unanswered probe outlast `DAEMON_HEALTH_WAIT`.
+/// A stream socket cannot lose a ping: a connect before the bind fails
+/// at once (retried), one after it queues in the listen backlog until
+/// the accept loop runs, so a probe that times out is only a daemon
+/// that has not reached its accept loop yet.
+pub const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on the `shutdown` call a drop makes (a daemon that accepted
+/// the connection but never answers must not hold the drop).
+pub const SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a drop waits for the daemon thread to finish after it was
+/// signalled. A clean shutdown flushes the store and releases the
+/// lease; 60 s is far beyond that, so passing it means the thread is
+/// wedged, and the drop reports it and detaches instead of hanging the
+/// job until its timeout (CAD-972).
+pub const DAEMON_JOIN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What a teardown does; the fields exist so a test can mutate one
+/// guard at a time and show the outer bound catches it (CAD-972).
+#[derive(Clone, Copy)]
+pub struct Teardown {
+    /// Set the daemon's stop flag. Without it a daemon that was still
+    /// starting (socket not bound, so `shutdown` could not be delivered)
+    /// serves forever and the join never returns.
+    pub signal_stop: bool,
+    pub join_deadline: Duration,
+}
+
+impl Teardown {
+    pub const DEFAULT: Teardown = Teardown {
+        signal_stop: true,
+        join_deadline: DAEMON_JOIN_DEADLINE,
+    };
+}
+
+pub enum Joined {
+    Finished,
+    /// The deadline passed; the thread is detached (and reported).
+    Detached,
+}
+
+/// Signal stop, then join with a deadline; on expiry say so loudly and
+/// detach. Never blocks past `policy.join_deadline`.
+pub fn stop_and_join<T>(
+    handle: JoinHandle<T>,
+    stop: Option<&Arc<AtomicBool>>,
+    policy: Teardown,
+    what: &str,
+) -> Joined {
+    if policy.signal_stop {
+        if let Some(stop) = stop {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+    let deadline = Instant::now() + policy.join_deadline;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "TEARDOWN WEDGED: {what} did not finish within {:?} of its stop \
+                 signal; detaching its thread so the test run can end",
+                policy.join_deadline
+            );
+            return Joined::Detached;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = handle.join();
+    Joined::Finished
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,
     pub handle: Option<JoinHandle<cadence_agent::Result<()>>>,
+    /// The daemon's `ServeOptions::stop`: set on drop so a daemon that
+    /// never reached its accept loop still ends.
+    pub stop: Option<Arc<AtomicBool>>,
     /// A `daemon run` process instead of an in-process daemon
     /// ([`TestDaemon::start_process_in`]).
     pub process: Option<std::process::Child>,
@@ -373,20 +459,69 @@ impl TestDaemon {
     /// `start` with explicit daemon options — slot tests shrink the
     /// pools this way.
     pub fn start_opts(opts: daemon::ServeOptions) -> Self {
+        Self::start_opts_waiting(opts, DAEMON_HEALTH_WAIT)
+    }
+
+    /// `start_opts` with a caller-chosen health wait (CAD-972 test).
+    pub fn start_opts_waiting(opts: daemon::ServeOptions, health_wait: Duration) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap();
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
+        Self::start_serving(dir, state, opts, health_wait)
+    }
+
+    /// Spawn `serve_with` and wait for health. `Self` exists before the
+    /// wait, so a panic anywhere after the spawn unwinds through
+    /// `Drop`, which stops and joins the thread.
+    fn start_serving(
+        dir: TempDir,
+        state: PathBuf,
+        mut opts: daemon::ServeOptions,
+        health_wait: Duration,
+    ) -> Self {
+        let stop = opts
+            .stop
+            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
         let owned = state.clone();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
+        Self::adopt_thread(dir, state, handle, stop, health_wait)
+    }
+
+    /// The part of start that does not care what the thread runs.
+    fn adopt_thread(
+        dir: TempDir,
+        state: PathBuf,
+        handle: JoinHandle<cadence_agent::Result<()>>,
+        stop: Arc<AtomicBool>,
+        health_wait: Duration,
+    ) -> Self {
         let mut daemon = Self {
             dir,
             state,
             handle: Some(handle),
+            stop: Some(stop),
             process: None,
         };
-        daemon.wait_health();
+        daemon.wait_health_within(health_wait);
         daemon
+    }
+
+    /// CAD-972 seam: a fixture whose "daemon" thread is `body`, with a
+    /// caller-chosen health wait. `body` models a daemon that never
+    /// answers (slow start); it should end when the stop flag is set.
+    pub fn start_stub_thread(
+        health_wait: Duration,
+        body: impl FnOnce(PathBuf, Arc<AtomicBool>) -> cadence_agent::Result<()> + Send + 'static,
+    ) -> Self {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().to_path_buf();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let owned = state.clone();
+        let handle = thread::spawn(move || body(owned, flag));
+        Self::adopt_thread(dir, state, handle, stop, health_wait)
     }
 
     /// Start a daemon over a pre-seeded state directory.
@@ -400,16 +535,7 @@ impl TestDaemon {
         suite_slot();
         await_singleton_released(&state);
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
-        let owned = state.clone();
-        let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
-        let mut daemon = Self {
-            dir,
-            state,
-            handle: Some(handle),
-            process: None,
-        };
-        daemon.wait_health();
-        daemon
+        Self::start_serving(dir, state, opts, DAEMON_HEALTH_WAIT)
     }
 
     /// CAD-308: a real `cadence daemon run` PROCESS serving a state dir
@@ -448,9 +574,10 @@ impl TestDaemon {
             dir,
             state,
             handle: None,
+            stop: None,
             process: Some(process),
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + DAEMON_HEALTH_WAIT;
         while daemon.rpc("health", json!({})).is_err() {
             assert!(
                 Instant::now() < deadline,
@@ -464,9 +591,13 @@ impl TestDaemon {
     }
 
     pub fn wait_health(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.wait_health_within(DAEMON_HEALTH_WAIT);
+    }
+
+    pub fn wait_health_within(&mut self, wait: Duration) {
+        let deadline = Instant::now() + wait;
         loop {
-            if self.rpc("health", json!({})).is_ok() {
+            if client::rpc_timeout(&self.state, "health", json!({}), HEALTH_PROBE_TIMEOUT).is_ok() {
                 return;
             }
             // A daemon that already returned will never answer: say why
@@ -475,7 +606,10 @@ impl TestDaemon {
                 let exit = self.handle.take().unwrap().join();
                 panic!("daemon exited before it became healthy: {exit:?}");
             }
-            assert!(Instant::now() < deadline, "daemon did not become healthy");
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not become healthy within {wait:?}"
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -802,14 +936,22 @@ impl Drop for TestDaemon {
         // holder's). A test that planted this process as a pane
         // ([`plant_self`]), or a suite run inside an agent pane, is
         // refused by the caller rule — the daemon answered, so stop it
-        // the way an operator shell would.
-        if let Err(e) = self.rpc("shutdown", json!({})) {
+        // the way an operator shell would. The call is read-bounded:
+        // `client::rpc` waits 700 s on a daemon that never answers. The
+        // client stream is dropped (closed) on every path out of it.
+        if let Err(e) =
+            client::rpc_timeout(&self.state, "shutdown", json!({}), SHUTDOWN_RPC_TIMEOUT)
+        {
             if e.to_string().contains("caller rule") {
                 let _ = self.operator_rpc("shutdown", json!({}));
             }
         }
+        // The RPC path keeps the production shutdown semantics for a
+        // daemon that answered. The stop flag needs no socket, so it
+        // also ends a daemon that was still starting, when `shutdown`
+        // had nothing to connect to (the CAD-972 hang).
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            stop_and_join(handle, self.stop.as_ref(), Teardown::DEFAULT, "test daemon");
         }
         // Our own child: waiting on it can never touch another process.
         if let Some(mut process) = self.process.take() {
