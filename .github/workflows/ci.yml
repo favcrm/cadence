@@ -194,6 +194,9 @@ jobs:
           python3 tests/scripts/test_delivery_candidate.py
           python3 tests/scripts/test_auto_stage.py
           python3 tests/scripts/test_native_review_observation.py
+      # CAD-959: enqueue-reviewed refuses unless review, checks and approval hold.
+      - name: Test enqueue-reviewed refusal reasons
+        run: python3 tests/scripts/test_enqueue_reviewed.py
       # CAD-562: keep the generated tree and its manifest consistent,
       # including each declared item and every #[test] fn.
       - name: Verify doctor/host split-map consistency
@@ -475,6 +478,15 @@ jobs:
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      # CAD-968: the wrapper contract, including that a process the suite
+      # leaves behind cannot hold the suite lock (`flock -o`, CAD-955).
+      # Reverting `-o` in scripts/cadence-nextest turns this step red. The
+      # pinned binary is required: a missing one fails instead of skipping.
+      - name: Test the nextest wrapper contract
+        env:
+          CADENCE_NEXTTEST_TEST_BIN: ${{ runner.temp }}/cadence-nextest-0.9.145/cargo-nextest
+          CADENCE_NEXTTEST_REQUIRE_BIN: "1"
+        run: scripts/test-cadence-nextest
       - name: Run default-feature test-seam refusal proofs
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock

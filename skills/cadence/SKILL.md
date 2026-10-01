@@ -288,6 +288,11 @@ cadence send <w> --task <task> --text "follow-up"   # attach, no state drive
 Routed `job_event` notifications are informational like `worker_result` —
 they complete on delivery and carry no turn for you.
 
+Delegated approvals (CAD-918): a designated agent approves a
+`delegated`-class PR from its own pane with `cadence audit approve --pr <n>
+--head <full-sha> --delegated --source "<notes>"` (`--scope <id>` for a
+pre-approved ticket) — never for a PR it authored or reviewed.
+
 Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 `join --no-bootstrap` skips both. An inbox is the right `reply_to`/
 group root when results should accumulate for a non-agent consumer —

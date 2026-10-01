@@ -2740,14 +2740,33 @@ pub(crate) fn inbox_exec_once(
 pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Result<i32> {
     let result = match action {
         AuditAction::Approve {
+            issue: Some(issue),
+            source,
+            action,
+            ..
+        } => {
+            if action != "scope" {
+                return Err(Error::rejected("--issue takes --action scope"));
+            }
+            client::rpc(
+                state_dir,
+                "approval_scope",
+                json!({"issue": issue, "source": source}),
+            )?
+        }
+        AuditAction::Approve {
             pr,
             head,
             source,
             repo,
             action,
             id,
+            delegated,
+            scope,
+            ..
         } => {
-            let head = head.trim().to_ascii_lowercase();
+            let pr = pr.ok_or_else(|| Error::rejected("--pr is required"))?;
+            let head = head.unwrap_or_default().trim().to_ascii_lowercase();
             let repo = match repo {
                 Some(r) => r,
                 None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
@@ -2765,8 +2784,36 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             if let Some(id) = id {
                 params["id"] = json!(id);
             }
-            client::rpc(state_dir, "approval_record", params)?
+            if delegated && action != "merge" {
+                return Err(Error::rejected("--delegated approves a merge only"));
+            }
+            if let Some(scope) = scope {
+                params["scope"] = json!(scope); // clap: only with --delegated
+            }
+            let verb = if delegated {
+                "approval_delegate"
+            } else {
+                "approval_record"
+            };
+            client::rpc(state_dir, verb, params)?
         }
+        // Handled in `cli::audit::run`: a read, not an RPC.
+        // Handled in `cli::audit::run`: reads, not RPCs.
+        AuditAction::Approval { .. } | AuditAction::Verdicts { .. } => {
+            unreachable!("audit approval/verdicts are read-only and handled in cli::audit::run")
+        }
+        AuditAction::Designate {
+            alias,
+            project,
+            source,
+            revoke,
+        } => client::rpc(
+            state_dir,
+            "approval_designate",
+            json!({"alias": alias, "project": project, "source": source, "active": !revoke}),
+        )?,
+        AuditAction::Designations => client::rpc(state_dir, "approval_designations", json!({}))?,
+        AuditAction::Digest { since } => cadence_agent::audit::digest(state_dir, since.as_deref())?,
         AuditAction::Revoke { id, source, reason } => client::rpc(
             state_dir,
             "approval_revoke",

@@ -67,7 +67,7 @@ fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
 /// is what `PiAdapter` derives `state_dir` from, matching the daemon's
 /// `state/agents/<alias>.provider.log` layout.
 fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
     // CAD-559: pi opens only under an operator `[pi]` policy — `own`
     // can still repoint CADENCE_PM_DIR at a test's own pm.yaml.
@@ -753,7 +753,7 @@ fn register_resolves_and_gates_the_model() {
 #[test]
 fn register_refuses_every_model_without_a_pi_policy() {
     let pm = tempfile::tempdir().unwrap();
-    let env = cadence_agent::adapter::ProviderEnv::default();
+    let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
     env.set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
     let mut opts = daemon_opts();
     opts.provider_env = env;
@@ -821,4 +821,64 @@ fn a_provider_reporting_the_wrong_model_fences_the_agent() {
         reason.contains("fake/model-1") && reason.contains("not-the-asked-1"),
         "{reason}"
     );
+}
+
+/// CAD-956: an offline Devin worker must receive metadata before spawning.
+#[test]
+fn offline_devin_bootstrap_precedes_spawn_and_refuses_missing_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let operator_cache = dir.path().join("operator-cache");
+    std::fs::create_dir_all(operator_cache.join("pi-devin")).unwrap();
+    let source = operator_cache.join("pi-devin/models.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let catalog = json!({"version":1,"fetchedAt":now,"catalog":{"families":[{
+        "family_label":"SWE-2","family_uid":"swe-2","slug":"swe-2","variants":[
+        {"model_uid":"swe-2-high","label":"High"},{"model_uid":"swe-2-medium","label":"Medium"},
+        {"model_uid":"swe-2-max","label":"Max"}]}]}});
+    std::fs::write(&source, catalog.to_string()).unwrap();
+    let ad = adapter(
+        "normal",
+        &state,
+        &[(
+            "XDG_CACHE_HOME",
+            operator_cache.to_string_lossy().to_string(),
+        )],
+    );
+    ad.open(&worker(
+        "wseed",
+        dir.path(),
+        json!({"model":"devin/swe-2-high","effort":"max"}),
+    ))
+    .unwrap();
+    ad.close();
+    // The fake also writes cache metadata, so the operator snapshot itself must
+    // remain unchanged and missing source must refuse before a launch record.
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        catalog.to_string()
+    );
+    assert!(state
+        .join("agents/wseed/pi/cache/pi-devin/models.json")
+        .is_file());
+    std::fs::remove_file(&source).unwrap();
+    let ad = adapter(
+        "normal",
+        &state,
+        &[(
+            "XDG_CACHE_HOME",
+            operator_cache.to_string_lossy().to_string(),
+        )],
+    );
+    assert!(ad
+        .open(&worker(
+            "wmissing",
+            dir.path(),
+            json!({"model":"devin/swe-2-high"})
+        ))
+        .is_err());
+    assert!(!state.join("agents/pi-record-wmissing.json").exists());
 }

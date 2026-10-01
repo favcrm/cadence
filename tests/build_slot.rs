@@ -11,6 +11,7 @@ use common::*;
 use cadence_agent::client;
 use serde_json::json;
 use serde_json::Value;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
@@ -2347,4 +2348,88 @@ fn build_slot_cli_wait_then_grant() {
     assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
     assert_eq!(held[0]["lane"], SELF_LANE);
     slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+/// CAD-954: a managed worker that never answers fails with evidence,
+/// not a bare timeout — whether it died, what it printed to stderr,
+/// which command files landed and what the daemon recorded for it. A
+/// live worker still answers inside the same call.
+#[test]
+fn a_silent_managed_worker_fails_with_its_own_evidence() {
+    let d = TestDaemon::start();
+    let mut w = ManagedWorker::start(&d, "w1");
+    // Mocks that are not w1's: a sibling worker under the same script
+    // path, and a same-named script another test or lane runs from its
+    // own dir. Neither may appear in w1's report.
+    let sibling = ManagedWorker::start(&d, "w2");
+    let other = TempDir::new().unwrap();
+    let decoy_script = other.path().join("claude-enroll.py");
+    std::fs::write(&decoy_script, "import time\ntime.sleep(120)\n").unwrap();
+    let decoy = std::process::Command::new("python3")
+        .arg(&decoy_script)
+        .spawn()
+        .unwrap();
+    let _reap = KillOnDrop(decoy);
+    let ping = json!({"how": "self", "frame": {"method": "health", "params": {}}});
+
+    // A live worker answers (the deadline is not what is under test).
+    let n = w.send(ping.clone());
+    assert_eq!(
+        w.answer_within(n, "live health", Duration::from_secs(30))["ok"],
+        true
+    );
+
+    // A live worker's report lists every one of its threads (the mock
+    // has the stdin reader and the request-serving thread), not only
+    // the main one.
+    let live = sibling.silence_report();
+    let own = format!("proc {} ", sibling.pid);
+    let section = live.split(&own).nth(1).unwrap_or_default();
+    assert!(
+        section.matches("\n    thread ").count() >= 2,
+        "live worker's threads not all listed: {live}"
+    );
+
+    // The daemon owns the worker's stderr log; a line there must be
+    // quoted back. Then the worker dies before the next command.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&w.provider_log)
+        .unwrap()
+        .write_all(b"CAD954-STDERR-MARKER\n")
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(w.pid as i32, libc::SIGKILL) }, 0);
+    let n = w.send(ping);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w.answer_within(n, "ping", Duration::from_millis(500))
+    }))
+    .expect_err("a dead worker never answers");
+    let msg = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    for evidence in [
+        "managed worker never answered ping",
+        "gone",
+        "CAD954-STDERR-MARKER",
+        "slot_enrolled",
+        "req-1.json",
+        "test process threads",
+    ] {
+        assert!(msg.contains(evidence), "missing {evidence:?} in: {msg}");
+    }
+    for foreign in [sibling.pid, _reap.0.id()] {
+        assert!(
+            !msg.contains(&format!("proc {foreign} ")),
+            "pid {foreign} is not w1's mock but was listed: {msg}"
+        );
+    }
+}
+
+/// Kills and reaps the child it owns, even while a failed assertion
+/// unwinds.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

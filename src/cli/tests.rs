@@ -354,6 +354,22 @@ fn join_permission_flags_parse_for_devin() {
 }
 
 #[test]
+fn audit_approval_readback_parses() {
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let cli =
+        Cli::try_parse_from(["cadence", "audit", "approval", "--pr", "7", "--head", head]).unwrap();
+    let Commands::Audit {
+        action: Some(AuditAction::Approval { pr, repo, .. }),
+        ..
+    } = cli.command
+    else {
+        panic!("audit approval must parse to AuditAction::Approval");
+    };
+    assert_eq!((pr, repo), (7, None));
+    assert!(Cli::try_parse_from(["cadence", "audit", "approval", "--pr", "7"]).is_err());
+}
+
+#[test]
 fn audit_approve_and_revoke_parse() {
     let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
     let cli = Cli::try_parse_from([
@@ -374,7 +390,10 @@ fn audit_approve_and_revoke_parse() {
     else {
         panic!("audit approve must parse to AuditAction::Approve");
     };
-    assert_eq!((pr, action.as_str(), id, repo), (84, "merge", None, None));
+    assert_eq!(
+        (pr, action.as_str(), id, repo),
+        (Some(84), "merge", None, None)
+    );
     assert!(Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err());
     assert!(matches!(
         Cli::try_parse_from(["cadence", "audit", "--json"])

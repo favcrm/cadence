@@ -60,7 +60,7 @@ const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct AuditOptions {
     /// `--since 24h|7d|YYYY-MM-DD|<epoch>` — drop merges older than this.
     pub since: Option<String>,
-    /// `--class auto|notify|human` — keep rows classified to that class.
+    /// `--class auto|notify|delegated|human` — keep rows of that class.
     pub class: Option<String>,
     /// `--project P` — keep rows whose tracker issue lives under project P.
     pub project: Option<String>,
@@ -153,6 +153,9 @@ struct Row {
     structural: Vec<String>,
     /// Operator approval evidence bound to the landed head (CAD-217).
     approval: ApprovalView,
+    /// CAD-918: a designated agent's delegated approval, bound the same
+    /// way and reported apart — it never stands in for `approval`.
+    delegated: ApprovalView,
     /// `(field, reason)` pairs for every `unknown` rendered.
     unknowns: Vec<(String, String)>,
 }
@@ -169,9 +172,9 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     let class_filter = match opts.class.as_deref() {
         Some(c) => {
             let c = c.to_lowercase();
-            if !["auto", "notify", "human"].contains(&c.as_str()) {
+            if !["auto", "notify", "delegated", "human"].contains(&c.as_str()) {
                 return Err(Error::rejected(format!(
-                    "--class must be auto, notify or human (got '{c}')"
+                    "--class must be auto, notify, delegated or human (got '{c}')"
                 )));
             }
             Some(c)
@@ -711,23 +714,28 @@ fn gh_status(slug: &str, sha: &str) -> std::result::Result<Value, String> {
 // ---------- notes ----------------------------------------------------
 
 /// One note's extracted evidence. Only the fields the audit renders.
+/// CAD-918: delegated approvals read notes through this same parser.
 #[derive(Debug, Default)]
-struct Note {
-    path: PathBuf,
+pub(crate) struct Note {
+    pub(crate) path: PathBuf,
     /// `verdict` | `ops-merge` | `other` — from the filename.
-    kind: String,
+    pub(crate) kind: String,
     /// `From:` identity.
-    from: Option<String>,
+    pub(crate) from: Option<String>,
     /// Full 40-hex tokens seen in the note.
     shas: Vec<String>,
     /// `#NN` PR references seen in the note.
-    prs: Vec<u64>,
+    pub(crate) prs: Vec<u64>,
     /// The `Issue:` header — binds a verdict to one tracker issue.
-    issue: Option<String>,
+    pub(crate) issue: Option<String>,
     /// The sha a `head …` line names — the verdict's reviewed head.
-    head_sha: Option<String>,
-    verdict: Option<String>,
-    class: Option<String>,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) verdict: Option<String>,
+    /// CAD-959: the `## Verdict` section's word and the inline `Verdict:`
+    /// line's word, kept apart so a caller can see them disagree.
+    pub(crate) verdict_section: Option<String>,
+    pub(crate) verdict_inline: Option<String>,
+    pub(crate) class: Option<String>,
     trigger: Option<String>,
     auditor_check: Option<String>,
     gates: Vec<String>,
@@ -852,14 +860,22 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
         ..Default::default()
     };
     let mut in_gates = false;
+    let mut past_header = false;
     for line in text.lines() {
         let t = line.trim();
         let lower = t.to_lowercase();
-        if let Some(rest) = t
-            .strip_prefix("From:")
-            .or_else(|| t.strip_prefix("> From:"))
-        {
-            note.from = Some(rest.trim().trim_matches('`').to_string());
+        // `From:` comes from the header, before the first `## ` heading,
+        // and the first one wins: a body line must not rename the reviewer.
+        if t.starts_with("## ") {
+            past_header = true;
+        }
+        if note.from.is_none() && !past_header {
+            if let Some(rest) = t
+                .strip_prefix("From:")
+                .or_else(|| t.strip_prefix("> From:"))
+            {
+                note.from = Some(rest.trim().trim_matches('`').to_string());
+            }
         }
         if note.issue.is_none() {
             if let Some(rest) = t
@@ -903,7 +919,7 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
             }
         }
         if let Some(rest) = t.to_lowercase().strip_prefix("verdict:") {
-            note.verdict = Some(
+            note.verdict_inline = Some(
                 rest.trim()
                     .trim_matches('`')
                     .split(' ')
@@ -937,7 +953,7 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
                 None => (rest.to_string(), String::new()),
             };
             let class = class.trim_end_matches('*').to_lowercase();
-            if ["auto", "notify", "human"].contains(&class.as_str()) {
+            if ["auto", "notify", "delegated", "human"].contains(&class.as_str()) {
                 note.class = Some(class);
                 if !trigger.is_empty() {
                     note.trigger = Some(trigger);
@@ -1024,27 +1040,30 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
             }
         }
     }
-    // `## Verdict` section fallback — first non-empty line is the verdict.
-    if note.verdict.is_none() {
-        let mut seen = false;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.to_lowercase().starts_with("## verdict") {
-                seen = true;
-                continue;
-            }
-            if seen && !l.is_empty() {
-                note.verdict = Some(
-                    l.trim_matches('`')
-                        .split([' ', '—', '-'])
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                );
-                break;
-            }
+    // The `## Verdict` section (first non-empty line) outranks an inline
+    // `Verdict:` line: a body line must not override the verdict section.
+    let mut seen = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.to_lowercase().starts_with("## verdict") {
+            seen = true;
+            continue;
+        }
+        if seen && !l.is_empty() {
+            note.verdict_section = Some(
+                l.trim_matches('`')
+                    .split([' ', '—', '-'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            break;
         }
     }
+    note.verdict = note
+        .verdict_section
+        .clone()
+        .or_else(|| note.verdict_inline.clone());
     note
 }
 
@@ -1295,6 +1314,12 @@ struct ApprovalRec {
     repo: String,
     pr: u64,
     recorded_via: Option<String>,
+    /// CAD-918: `delegated:<alias>`, its two verdict notes, their
+    /// sha256 at approval time, and the reviewer aliases they name.
+    approver: Option<String>,
+    verdicts: Vec<String>,
+    verdict_sha256: Vec<String>,
+    reviewers: Vec<String>,
     at: f64,
 }
 
@@ -1380,13 +1405,20 @@ fn store_evidence(path: &Path) -> StoreEvidence {
 fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
     use crate::store::{APPROVAL_RECORDED_EVENT, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM};
     let rows: rusqlite::Result<Vec<(String, String, f64)>> = conn
-        .prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq LIMIT 100000")
+        .prepare(
+            "SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq DESC LIMIT 100000",
+        )
         .and_then(|mut st| {
             st.query_map([APPROVAL_STREAM], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect()
         });
+    // Newest-first so the row cap can only drop the oldest history, never
+    // a recent revocation; replayed oldest-first below.
     let rows = match rows {
-        Ok(rows) => rows,
+        Ok(mut rows) => {
+            rows.reverse();
+            rows
+        }
         Err(e) => {
             ev.approvals_gap = Some(format!("approval stream unreadable: {e}"));
             return;
@@ -1418,6 +1450,11 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
                 repo,
                 pr,
                 recorded_via: text("recorded_via"),
+                approver: text("approver"),
+                verdicts: serde_json::from_value(p["verdicts"].clone()).unwrap_or_default(),
+                verdict_sha256: serde_json::from_value(p["verdict_sha256"].clone())
+                    .unwrap_or_default(),
+                reviewers: serde_json::from_value(p["reviewers"].clone()).unwrap_or_default(),
                 at,
             });
         } else if kind == APPROVAL_REVOKED_EVENT {
@@ -1450,6 +1487,78 @@ fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
     }
 }
 
+// ---------- delegated digest (CAD-918) -------------------------------
+
+/// A delegated approval: its action, recorded by the delegated verb
+/// (`recorded_via: delegated:<alias>`) — never the operator's generic one.
+fn is_delegated(a: &ApprovalRec) -> bool {
+    a.action == crate::delegation::DELEGATED_ACTION
+        && a.recorded_via
+            .as_deref()
+            .is_some_and(|v| v.starts_with("delegated:"))
+}
+
+/// `cadence audit digest [--since 24h]`: every delegated approval in
+/// the window, each with the commands that undo it — revoke the record,
+/// and revert the merge if it landed. Read-only over the daemon store.
+pub fn digest(state_dir: &Path, since: Option<&str>) -> Result<Value> {
+    let since = parse_since(since.unwrap_or("24h"))?;
+    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    if let Some(gap) = &ev.approvals_gap {
+        return Err(Error::rejected(format!(
+            "approval records unreadable: {gap}"
+        )));
+    }
+    let rows: Vec<Value> = ev
+        .approvals
+        .iter()
+        .filter(|a| is_delegated(a) && a.at >= since)
+        .map(|a| {
+            let mut j = approval_rec_json(a);
+            j["revoked"] = json!(ev.revocations.contains_key(&a.id));
+            j["revoke"] = json!(format!(
+                "cadence audit revoke {} --source \"<who, where>\" --reason \"<why>\"",
+                a.id
+            ));
+            // Each note must still hash to what the approval recorded.
+            let now: Vec<Option<String>> = a
+                .verdicts
+                .iter()
+                .map(|p| {
+                    std::fs::read(p)
+                        .ok()
+                        .map(|b| crate::delegation::sha256_hex(&b))
+                })
+                .collect();
+            let intact = now.len() == a.verdict_sha256.len()
+                && now
+                    .iter()
+                    .zip(&a.verdict_sha256)
+                    .all(|(n, r)| n.as_ref() == Some(r));
+            j["verdicts_intact"] = json!(intact);
+            // A revert only for a PR that merged, from its merge commit.
+            let args = [
+                "pr",
+                "view",
+                &a.pr.to_string(),
+                "-R",
+                &a.repo,
+                "--json",
+                "state,mergeCommit",
+            ]
+            .map(String::from);
+            let merged = gh_text(&args)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .filter(|v| v["state"] == "MERGED")
+                .and_then(|v| v["mergeCommit"]["oid"].as_str().map(str::to_string));
+            j["revert"] = json!(merged.map(|oid| format!("git revert {oid}")));
+            j
+        })
+        .collect();
+    Ok(json!({"since": iso(since), "delegated": rows}))
+}
+
 // ---------- operator approval (CAD-217) -----------------------------
 
 /// Bind the row to the operator approval in force at merge time for
@@ -1458,6 +1567,12 @@ fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
 /// context and are otherwise `not-required` (or `unknown` without a
 /// risk class).
 fn enrich_approval(ev: &StoreEvidence, slug: Option<&str>, row: &mut Row) {
+    let delegated = bind_approval_for(ev, slug, row, crate::delegation::DELEGATED_ACTION);
+    row.delegated = if delegated.record.is_some() || row.class.as_deref() == Some("delegated") {
+        delegated
+    } else {
+        ApprovalView::default()
+    };
     let view = bind_approval(ev, slug, row);
     row.approval = match row.class.as_deref() {
         Some("human") => {
@@ -1489,6 +1604,19 @@ fn enrich_approval(ev: &StoreEvidence, slug: Option<&str>, row: &mut Row) {
 }
 
 fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalView {
+    bind_approval_for(ev, slug, row, "merge")
+}
+
+/// [`bind_approval`] for one approval action: `merge` (the operator's)
+/// or `delegated-merge` (a designated agent's, CAD-918). A delegated
+/// record carries `recorded_via: delegated:<alias>`; any other is not
+/// one, whatever its action says.
+fn bind_approval_for(
+    ev: &StoreEvidence,
+    slug: Option<&str>,
+    row: &Row,
+    action: &str,
+) -> ApprovalView {
     let unknown = |reason: String| ApprovalView {
         state: "unknown".into(),
         reason: Some(reason),
@@ -1504,8 +1632,11 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
     // checked whenever the audit knows its own: gh's slug, or the
     // checkout's origin in fixture runs).
     let in_scope = |a: &&ApprovalRec| {
-        a.action == "merge"
-            && row.pr == Some(a.pr)
+        (if action == "merge" {
+            a.action == action
+        } else {
+            is_delegated(a)
+        }) && row.pr == Some(a.pr)
             && slug.is_none_or(|s| s.eq_ignore_ascii_case(&a.repo))
     };
     let (bound, other_heads): (Vec<&ApprovalRec>, Vec<&ApprovalRec>) = ev
@@ -1531,7 +1662,12 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         // In force at merge time. A later revocation is shown, but the
         // question is what held when the merge happened.
         let reason = revoked(a).map(|r| format!("revoked after the merge ({})", iso(r.at)));
-        return view("operator-claimed", a, reason);
+        let state = if action == "merge" {
+            "operator-claimed"
+        } else {
+            "delegated"
+        };
+        return view(state, a, reason);
     }
     if let Some(a) = bound.iter().find(before) {
         let reason = format!("approval {} was revoked before the merge", a.id);
@@ -1561,6 +1697,210 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         other_heads,
         ..Default::default()
     }
+}
+
+/// CAD-959: the first whitespace token of a note's `From:`, lower-cased,
+/// minus backticks and trailing punctuation. `From:` is free text
+/// (`cc13-pm standards reviewer`); this is the ONE identity used for both
+/// the author exclusion and the distinct-reviewer count.
+pub(crate) fn reviewer_identity(from: &str) -> String {
+    from.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('`')
+        .trim_end_matches([',', ';', ':', '.', '(', ')'])
+        .to_lowercase()
+}
+
+/// The `YYYYMMDD-HHMMSS` (or `YYYYMMDDTHHMMSSZ`) stamp a note file name
+/// starts with, as 14 digits. `None` when the name carries no stamp.
+fn name_stamp(name: &str) -> Option<String> {
+    let b = name.as_bytes();
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r.clone())
+            .filter(|s| s.iter().all(u8::is_ascii_digit))
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+    };
+    let date = digits(0..8)?;
+    let sep = *b.get(8)?;
+    if sep != b'-' && sep != b'T' {
+        return None;
+    }
+    let time = digits(9..15)?;
+    Some(format!("{date}{time}"))
+}
+
+/// `(kind, result)` from a verdict note's title `# Verdict: <ID> <KIND> — <result>`.
+/// Kind is matched exactly: `standards`, `spec-security`, `browser-qa`,
+/// `combined` (`Review (standards+spec)`), else `other`.
+fn title_kind_and_result(title: &str, issue: &str) -> (&'static str, String) {
+    let body = title.trim_start_matches('#').trim();
+    let body = body.strip_prefix("Verdict:").unwrap_or(body).trim();
+    let body = body.strip_prefix(issue).unwrap_or(body).trim();
+    let (kind, result) = match body.rsplit_once(" — ").or_else(|| body.rsplit_once(" - ")) {
+        Some((k, r)) => (k.trim(), r.trim()),
+        None => (body, ""),
+    };
+    let kind = match kind.to_lowercase().as_str() {
+        "standards" | "standards review" => "standards",
+        "spec/security" | "spec/security review" => "spec-security",
+        "browser qa" | "browser qa review" => "browser-qa",
+        "review (standards+spec)" => "combined",
+        _ => "other",
+    };
+    let result = result
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    (kind, result)
+}
+
+/// CAD-959: head-pinned verdict notes for `issue` / PR `pr` / full `head`,
+/// parsed by [`parse_note`] so there is one parser. Notes of the issue that
+/// do not bind to this PR and head are listed under `skipped` with a
+/// reason, never dropped silently. Symlinks are skipped, never followed.
+/// CAD-918: the delegated approval reads its notes through this too.
+pub(crate) fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
+    let read = std::fs::read_dir(dir).map_err(|e| {
+        Error::rejected(format!("cannot read the notes dir {}: {e}", dir.display()))
+    })?;
+    let mut names: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
+        .filter(|(n, _)| n.ends_with(".md"))
+        .collect();
+    names.sort();
+    let (mut verdicts, mut skipped) = (Vec::new(), Vec::new());
+    for (name, path) in names {
+        let skip = |why: String| json!({"name": name, "reason": why});
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if name.contains("-verdict") {
+                skipped.push(skip(
+                    "a symlink; notes are never followed through links".into(),
+                ));
+            }
+            continue;
+        }
+        if !meta.is_file() || !name.contains("-verdict") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let note = parse_note(&path, &name, &text);
+        if note.issue.as_deref() != Some(issue) {
+            continue;
+        }
+        // An unstamped note is still listed (stamp ""): a caller must be able
+        // to refuse on it, never lose it.
+        let stamp = name_stamp(&name).unwrap_or_default();
+        if !note.prs.contains(&pr) {
+            skipped.push(skip(format!("does not name PR #{pr}")));
+            continue;
+        }
+        match note.head_sha.as_deref() {
+            None => {
+                skipped.push(skip("no `head <sha>` line".into()));
+                continue;
+            }
+            Some(h) if !h.eq_ignore_ascii_case(head) => {
+                skipped.push(skip(format!("names head {h}, not the full head {head}")));
+                continue;
+            }
+            Some(_) => {}
+        }
+        let title = text.lines().next().unwrap_or("");
+        let (kind, title_result) = title_kind_and_result(title, issue);
+        let section = note
+            .verdict_section
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        let inline = note
+            .verdict_inline
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        // Title, section and inline line must agree where present; any
+        // disagreement is a `conflict`, never a pass.
+        let mut words: Vec<&String> = [&title_result, &section, &inline]
+            .into_iter()
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.dedup();
+        let outcome = match words.as_slice() {
+            [one] => (*one).clone(),
+            _ => "conflict".to_string(),
+        };
+        let risk_raw = text
+            .lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix("Risk:"))
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+        verdicts.push(json!({
+            "name": name, "path": path.display().to_string(), "stamp": stamp,
+            "reviewer": reviewer_identity(note.from.as_deref().unwrap_or("")),
+            "from": note.from, "kind": kind, "outcome": outcome,
+            "title_outcome": title_result, "section_outcome": section, "inline_outcome": inline,
+            "risk": risk_raw, "head": head,
+        }));
+    }
+    Ok(json!({"issue": issue, "pr": pr, "head": head,
+              "verdicts": verdicts, "skipped": skipped}))
+}
+
+/// `cadence audit verdicts`: read-only; one JSON document.
+pub fn verdicts_check(notes_dir: Option<&Path>, issue: &str, pr: u64, head: &str) -> Result<Value> {
+    verdicts_in(notes_dir.unwrap_or(Path::new(NOTES_DIR)), issue, pr, head)
+}
+
+/// CAD-959: is an operator approval in force for `head` of PR `pr` right
+/// now? The pre-merge read `scripts/enqueue-reviewed` needs: unlike an
+/// audit row there is no merge time, so "in force" means a `merge`
+/// record naming exactly this repo, PR and full head that no revocation
+/// has withdrawn. An approval for another head never counts. States:
+/// `in-force` (a claim, like every approval until CAD-280), `revoked`,
+/// `missing`, `unknown` (the store could not answer).
+fn approval_in_force(ev: &StoreEvidence, repo: &str, pr: u64, head: &str) -> Value {
+    if let Some(gap) = &ev.approvals_gap {
+        return json!({"state": "unknown", "reason": gap});
+    }
+    let bound: Vec<&ApprovalRec> = ev
+        .approvals
+        .iter()
+        .filter(|a| {
+            a.action == "merge"
+                && a.pr == pr
+                && a.repo.eq_ignore_ascii_case(repo)
+                && a.head_sha.eq_ignore_ascii_case(head)
+        })
+        .collect();
+    if let Some(a) = bound.iter().find(|a| !ev.revocations.contains_key(&a.id)) {
+        return json!({"state": "in-force", "approval_id": a.id, "source": a.source,
+                      "recorded_via": a.recorded_via, "verified": false,
+                      "note": APPROVAL_UNVERIFIED});
+    }
+    if let Some(a) = bound.first() {
+        return json!({"state": "revoked", "approval_id": a.id,
+                      "reason": format!("approval {} was revoked", a.id)});
+    }
+    json!({"state": "missing",
+           "reason": format!("no merge approval names head {} of {repo}#{pr}", short(head))})
+}
+
+/// `cadence audit approval`: read-only, no daemon. Exit 0 only when an
+/// approval is in force for exactly this head.
+pub fn approval_check(state_dir: &Path, repo: &str, pr: u64, head: &str) -> (Value, i32) {
+    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let v = approval_in_force(&ev, repo, pr, head);
+    let code = i32::from(v["state"] != "in-force");
+    (v, code)
 }
 
 fn short(sha: &str) -> &str {
@@ -1818,6 +2158,15 @@ fn flag_row(row: &mut Row) {
             _ => {}
         }
     }
+    // CAD-918: a delegated-class merge needs a delegated approval in
+    // force, or the operator's.
+    if row.class.as_deref() == Some("delegated") && row.approval.state != "operator-claimed" {
+        match row.delegated.state.as_str() {
+            "missing" => row.flags.push("approval-missing".into()),
+            "revoked" => row.flags.push("approval-revoked".into()),
+            _ => {}
+        }
+    }
 }
 
 /// The fleet-level fact behind a structural match (CAD-207).
@@ -1903,6 +2252,8 @@ fn approval_rec_json(a: &ApprovalRec) -> Value {
         "head_sha": a.head_sha,
         "scope": {"repo": a.repo, "pr": a.pr},
         "recorded_via": a.recorded_via, "recorded_at": a.at,
+        "approver": a.approver, "verdicts": a.verdicts,
+        "verdict_sha256": a.verdict_sha256, "reviewers": a.reviewers,
     })
 }
 
@@ -1943,10 +2294,18 @@ fn claimed_count(rows: &[Row]) -> usize {
 /// as proof.
 fn approvals_clause(rows: &[Row]) -> String {
     let claimed = claimed_count(rows);
-    if claimed == 0 && !rows.iter().any(|r| r.class.as_deref() == Some("human")) {
+    if claimed == 0
+        && !rows
+            .iter()
+            .any(|r| matches!(r.class.as_deref(), Some("human" | "delegated")))
+    {
         return String::new();
     }
-    format!(", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED})")
+    let delegated = rows.iter().filter(|r| r.delegated.state == "delegated");
+    let delegated = delegated.count();
+    format!(
+        ", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED}), {delegated} delegated"
+    )
 }
 
 /// The text row's approval line — for human-class rows, and for any
@@ -2030,6 +2389,12 @@ fn row_json(row: &Row) -> Value {
         "flags": row.flags,
         "structural": row.structural,
         "approval": approval_json(row),
+        // CAD-918: apart from the operator's; null when not in play.
+        "delegated_approval": (!row.delegated.state.is_empty()).then(|| json!({
+            "state": row.delegated.state, "reason": row.delegated.reason,
+            "record": row.delegated.record.as_ref().map(approval_rec_json),
+            "revoked": row.delegated.revocation.is_some(),
+        })),
         "evidence_unavailable": if row.evidence_gaps.is_empty() {
             Value::Null
         } else {
@@ -2208,6 +2573,22 @@ fn render_text(
         );
         if let Some(line) = approval_line(row) {
             let _ = writeln!(out, "    {line}");
+        }
+        if !row.delegated.state.is_empty() {
+            let v = &row.delegated;
+            let rec = v.record.as_ref().map_or(String::new(), |a| {
+                let by = a.approver.as_deref().unwrap_or("?");
+                format!(
+                    " · id {} · by {by} · reviewers {}",
+                    a.id,
+                    a.reviewers.join(", ")
+                )
+            });
+            let why = v
+                .reason
+                .as_ref()
+                .map_or(String::new(), |r| format!(" — {r}"));
+            let _ = writeln!(out, "    delegated approval {}{rec}{why}", v.state);
         }
         for (field, reason) in &row.unknowns {
             let _ = writeln!(out, "    unknown[{field}] {reason}");
@@ -2648,8 +3029,42 @@ mod tests {
             repo: "x/y".into(),
             pr: 1,
             recorded_via: Some("operator-connection".into()),
+            approver: None,
+            verdicts: vec![],
+            verdict_sha256: vec![],
+            reviewers: vec![],
             at,
         }
+    }
+
+    /// CAD-918: a delegated record is reported apart from the operator's
+    /// and never clears a human-class merge; an operator-recorded
+    /// `delegated-merge` is no delegated approval at all.
+    #[test]
+    fn delegated_approval_is_reported_apart_and_never_clears_human() {
+        let mut d = rec("d", HEAD, MERGED - 60.0);
+        d.action = crate::delegation::DELEGATED_ACTION.into();
+        d.recorded_via = Some("delegated:pm-d".into());
+        let r = human(&ev(vec![d.clone()], &[]), None);
+        assert_eq!(r.approval.state, "missing");
+        assert_eq!(r.delegated.state, "delegated");
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
+        assert_eq!(row_json(&r)["delegated_approval"]["state"], "delegated");
+        let delegated_row = |e: &StoreEvidence| {
+            let mut r = flagged_row();
+            r.landed_head = Some(HEAD.into());
+            r.merged_at = Some(MERGED);
+            r.class = Some("delegated".into());
+            r.qa_verdict_status = Some("SUCCESS".into());
+            enrich_approval(e, None, &mut r);
+            flag_row(&mut r);
+            r
+        };
+        assert!(delegated_row(&ev(vec![d.clone()], &[])).flags.is_empty());
+        d.recorded_via = Some("operator-connection".into());
+        let r = delegated_row(&ev(vec![d], &[]));
+        assert_eq!(r.delegated.state, "missing");
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
     }
 
     fn revoke(at: f64) -> Revocation {
@@ -2758,6 +3173,244 @@ mod tests {
         assert_eq!(human(&e, Some("other/repo")).approval.state, "missing");
         // The fixture/no-slug path still binds on head + PR.
         assert_eq!(human(&e, None).approval.state, "operator-claimed");
+    }
+
+    fn vnote(dir: &Path, name: &str, title: &str, from: &str, head: &str, risk: &str) {
+        let res = title.rsplit(" — ").next().unwrap_or("pass");
+        let res = res.split_whitespace().next().unwrap_or("pass");
+        let text = format!(
+            "{title}\n> Issue: CAD-9\n> From: {from}\n\n## Verdict\n{res} — PR #5, head {head}\n\n{risk}\n"
+        );
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn verdicts_bind_head_and_pr_and_report_what_they_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let (h, old) = (HEAD, OLD_HEAD);
+        vnote(
+            d,
+            "20261001-070000-a-verdict.md",
+            "# Verdict: CAD-9 Standards review — pass",
+            "cc13-pm standards reviewer (Claude)",
+            h,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070100-b-verdict.md",
+            "# Verdict: CAD-9 Spec/security review — pass",
+            "`rev-b`",
+            h,
+            "Risk: human(3)",
+        );
+        vnote(
+            d,
+            "20261001-070200-c-verdict.md",
+            "# Verdict: CAD-9 Browser QA — revise",
+            "rev-c",
+            h,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070300-d-verdict.md",
+            "# Verdict: CAD-9 Review (standards+spec) — pass",
+            "rev-d",
+            old,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070400-e-verdict.md",
+            "# Verdict: CAD-9 Inspection of respect — pass",
+            "rev-e",
+            h,
+            "",
+        );
+        vnote(
+            d,
+            "nostamp-verdict.md",
+            "# Verdict: CAD-9 Standards review — pass",
+            "rev-f",
+            h,
+            "",
+        );
+        std::fs::write(d.join("20261001-070500-g-verdict.md"),
+            format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: g\n\n## Verdict\npass — head {h}\n")).unwrap();
+        std::fs::write(
+            d.join("20261001-070600-h-verdict.md"),
+            format!("# Verdict: CAD-1 Standards review — pass\n> Issue: CAD-1\n> From: rev-h\n\n## Verdict\npass — PR #5, head {h}\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            d.join("20261001-070000-a-verdict.md"),
+            d.join("20261001-070700-l-verdict.md"),
+        )
+        .unwrap();
+        let v = verdicts_in(d, "CAD-9", 5, h).unwrap();
+        let rows: Vec<(String, String, String, String)> = v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["reviewer"].as_str().unwrap().into(),
+                    r["kind"].as_str().unwrap().into(),
+                    r["outcome"].as_str().unwrap().into(),
+                    r["risk"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        // Prose after the alias never becomes part of the identity.
+        assert_eq!(
+            rows[0],
+            (
+                "cc13-pm".into(),
+                "standards".into(),
+                "pass".into(),
+                "auto".into()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "rev-b".into(),
+                "spec-security".into(),
+                "pass".into(),
+                "human(3)".into()
+            )
+        );
+        assert_eq!(rows[2].1, "browser-qa");
+        assert_eq!(rows[2].2, "revise");
+        // The exact-title rule: a substring never makes a kind.
+        assert_eq!(rows[3].1, "other");
+        assert_eq!(rows[3].3, "");
+        // The unstamped note stays in the list (stamp ""), so a caller can refuse on it.
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["stamp"] == "" && r["reviewer"] == "rev-f"));
+        let why: Vec<String> = v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {}",
+                    r["name"].as_str().unwrap(),
+                    r["reason"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let has = |n: &str, r: &str| why.iter().any(|w| w.contains(n) && w.contains(r));
+        assert!(has("070300", "not the full head"), "{why:?}");
+        assert!(has("070500", "does not name PR #5"), "{why:?}");
+        assert!(has("070700", "symlink"), "{why:?}");
+        // Another issue's note is neither a verdict nor a skip.
+        assert!(!why.iter().any(|w| w.contains("070600")), "{why:?}");
+    }
+
+    #[test]
+    fn verdict_title_and_section_disagreement_is_not_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\nrevise — PR #5, head {HEAD}\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "conflict");
+    }
+
+    #[test]
+    fn a_body_from_line_never_renames_the_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: author\n\n## Verdict\npass — PR #5, head {HEAD}\n\nFrom: rev-y\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["reviewer"], "author");
+    }
+
+    #[test]
+    fn an_inline_verdict_line_cannot_override_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        // title pass, section revise, later inline "Verdict: pass".
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\nrevise — PR #5, head {HEAD}\n\nVerdict: pass (round 1)\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "conflict");
+        assert_eq!(v["verdicts"][0]["section_outcome"], "revise");
+        // Title and inline agree against the section: still a conflict.
+        let n = parse_note(Path::new("/x-verdict.md"), "x-verdict.md", &format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n\n## Verdict\nrevise — head {HEAD}\n\nVerdict: pass\n"));
+        assert_eq!(
+            n.verdict.as_deref(),
+            Some("revise"),
+            "the section outranks an inline line"
+        );
+    }
+
+    #[test]
+    fn title_section_and_inline_that_agree_are_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\npass — PR #5, head {HEAD}\n\nVerdict: pass\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "pass");
+    }
+
+    #[test]
+    fn name_stamps_come_from_the_file_name_only() {
+        assert_eq!(
+            name_stamp("20261001-070151-x.md").as_deref(),
+            Some("20261001070151")
+        );
+        assert_eq!(
+            name_stamp("20261001T065132Z-x.md").as_deref(),
+            Some("20261001065132")
+        );
+        assert_eq!(name_stamp("x-20261001-070151.md"), None);
+        assert_eq!(name_stamp("2026100-070151-x.md"), None);
+    }
+
+    #[test]
+    fn approval_filter_ignores_other_actions() {
+        let mut deploy = rec("a", HEAD, 1.0);
+        deploy.action = "deploy".into();
+        let e = ev(vec![deploy], &[]);
+        assert_eq!(approval_in_force(&e, "x/y", 1, HEAD)["state"], "missing");
+    }
+
+    #[test]
+    fn pre_merge_approval_binds_only_the_exact_head_and_scope() {
+        let in_force = |e: &StoreEvidence, repo: &str, pr: u64, head: &str| {
+            approval_in_force(e, repo, pr, head)["state"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let e = ev(vec![rec("a", HEAD, 1.0)], &[]);
+        let slug = e.approvals[0].repo.clone();
+        assert_eq!(in_force(&e, &slug, 1, HEAD), "in-force");
+        // An approval for an older head never covers a newer one.
+        assert_eq!(in_force(&e, &slug, 1, OLD_HEAD), "missing");
+        // Another PR or repo is out of scope.
+        assert_eq!(in_force(&e, &slug, 2, HEAD), "missing");
+        assert_eq!(in_force(&e, "other/repo", 1, HEAD), "missing");
+        // A revoked approval is not in force, unless another one is.
+        let revoked = ev(vec![rec("a", HEAD, 1.0)], &[("a", revoke(2.0))]);
+        assert_eq!(in_force(&revoked, &slug, 1, HEAD), "revoked");
+        let both = ev(
+            vec![rec("a", HEAD, 1.0), rec("b", HEAD, 3.0)],
+            &[("a", revoke(2.0))],
+        );
+        assert_eq!(in_force(&both, &slug, 1, HEAD), "in-force");
+        // A store that cannot answer is unknown, never in force.
+        let gap = StoreEvidence {
+            approvals_gap: Some("no store".into()),
+            ..Default::default()
+        };
+        assert_eq!(in_force(&gap, &slug, 1, HEAD), "unknown");
     }
 
     #[test]

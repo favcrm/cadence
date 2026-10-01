@@ -63,13 +63,18 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     qa-verdict-status, or risk-class gates.
   - **Risk-sized count (CAD-957):** an exception to the two-reviewer
     default. A PR whose every change qualifies under
-    `docs/roles/one-review-paths.toml` (an allowlist of plain prose guides,
-    with the match rules in its header) needs ONE independent review
-    covering standards and spec, filed as
+    `docs/roles/one-review-paths.toml` (an allowlist of plain prose
+    guides and, per CAD-965, top-level integration test files
+    (`tests/*.rs`); test helpers under tests/common keep two reviews;
+    match rules in its header) needs ONE independent review covering
+    standards and spec, filed as
     `# Verdict: <ID> Review (standards+spec) — pass|revise`. Unlike
     solo-operator scaling, it needs no operator approval for the count.
-    Any other PR keeps two. `human` triggers are unchanged. That file is
-    the only list; scripts read it.
+    For a test-only PR the single reviewer must state in the verdict
+    that no adversarial gate test and no test-isolation or fail-closed
+    default was weakened or deleted, naming what was checked. Any other
+    PR (including any with `src/**`) keeps two. `human` triggers are
+    unchanged. That file is the only list; scripts read it.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in
@@ -86,6 +91,14 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   an operator connection (not an agent pane or endpoint):
   `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
   A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
+- **Delegated approval** (CAD-918) when the reviewers class the PR
+  `delegated` (`docs/roles/risk-classes.md`): the agent designated for
+  the project runs, from its own pane,
+  `cadence audit approve --pr <n> --head <full-sha> --delegated --source "<notes>"`.
+  The daemon records it as `delegated:<alias>` only when every safeguard
+  holds, including an allowlist of the paths a PR may touch
+  (`docs/roles/risk-paths.toml`). Triggers 1, 3, 4, 6 and 7 are never delegated. Until the running daemon
+  is built with CAD-918, delegated-class PRs still need the operator.
 
 Record the evidence so that every merge can be audited:
 - The PR title carries the issue id (`CAD-123: …`). A PR without a
@@ -112,7 +125,8 @@ Record the evidence so that every merge can be audited:
   - <blocking / should-fix / nits>
   ```
 
-  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`.
+  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`;
+  for a `delegated` one, `Risk: delegated (<triggers>)`.
   The `>` header lines must follow the title directly. A bare `Issue:`
   line does not link the note to the ticket. The ticket view takes the
   result from the title, and the audit takes it from the first line
@@ -134,7 +148,13 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
 ### Merging: use the merge queue, never `--admin`
 - A PR merges only after every review that the section above requires
   has passed, pinned to the same head SHA.
-- To enqueue:
+- To enqueue, run `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`
+  (add `--dry-run` to check without enqueueing). It refuses unless the PR
+  is open at that head with auto-merge off, every required check is
+  present and green, the required verdict notes are pinned to the head, a
+  ticket comment lists them and, for a `human` diff, an operator approval
+  is recorded for the head. It never records an approval. The step it
+  wraps is
   `gh pr merge <n> -R favcrm/cadence --auto --squash --match-head-commit <reviewed-sha>`.
   The queue re-tests the PR on the newest main plus every entry ahead of
   it, so you don't need to rebase first. If the head moved after the

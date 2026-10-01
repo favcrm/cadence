@@ -1,0 +1,67 @@
+# The mechanical path lists of docs/roles/risk-classes.md (CAD-918), the
+# single source; a test pins them to the doc both ways. The binary
+# compiles this file in, so the daemon applies its own build's lists,
+# never the PR's. Editing it is trigger 7. Globs: `*` stays within one
+# path component, `**` crosses directories.
+#
+# A delegated approval needs EVERY changed path (both sides of a rename)
+# to match `delegable` and no trigger list. A schema path passes only
+# under a live scope pre-approval. Anything else needs the operator.
+# `delegable` names files, not directories, wherever code is involved:
+# nothing that builds, runs in the browser or acts on the host.
+
+[delegable]
+paths = ["src/issue/blocked.rs", "src/issue/cli.rs", "src/issue/context.rs",
+  "src/issue/groom.rs", "src/issue/history.rs", "src/issue/line_times.rs",
+  "src/issue/lint.rs", "src/issue/retro.rs", "src/issue/sprint.rs",
+  "src/issue/summary.rs", "src/issue/sync.rs", "src/issue/time.rs", "src/issue/write.rs",
+  "src/cli/issue.rs", "src/cli/milestone.rs", "src/cli/project.rs", "src/cli/status.rs",
+  "src/cli/overview.rs", "src/cli/events.rs", "src/cli/help.rs",
+  "tests/board_issue.rs", "tests/tracker_issue.rs", "tests/issue_kickoff.rs",
+  "tests/fixtures/cli/**", "docs/**"]
+
+# Trigger 1: trust boundary and identity. Never delegable.
+[trigger1]
+paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
+  "src/daemon/caller_rule.rs", "src/daemon/slots_rpc.rs", "src/adapter/pty/**",
+  "src/ui.rs", "src/ui/**", "ui/**", "src/operator_auth.rs", "src/tailnet_proof.rs",
+  "src/test_seam.rs", "src/master_perm.rs", "src/agent_uid.rs", "src/cli/agent_uid.rs"]
+
+# Trigger 2, schema and store version. Pre-approvable at ticket time.
+[schema]
+paths = ["src/store/schema.rs", "src/remote_result_outbox.rs"]
+
+# Trigger 3: secret handling, credentials, redaction. Never delegable.
+[trigger3]
+paths = ["src/secret/**", "src/cli/secret.rs", "src/cli/connection.rs"]
+
+# Trigger 4: supply chain and CI. Never delegable.
+[trigger4]
+paths = ["Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", ".cargo/**",
+  ".config/**", "**/package.json", "**/pnpm-lock.yaml", ".github/**", "scripts/**"]
+
+# Trigger 6: outward or fleet actions, installs and rollouts. Never delegable.
+[trigger6]
+paths = ["src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.rs",
+  "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs"]
+
+# Trigger 7: the rules, the gates, their inputs and their proofs. Never delegable.
+[trigger7]
+paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
+  "docs/design/**", "docs/cadence/**", "docs/START-HERE.md",
+  "docs/ARCHITECTURE.md", "docs/BOARD.md",
+  "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
+  "src/audit.rs", "src/audit/**", "src/delegation.rs", "src/delegation/**",
+  "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
+  "src/delivery.rs", "src/issue/delivery_policy.rs", "src/issue/model.rs",
+  "src/issue/board.rs", "src/issue/parse.rs", "src/cli/audit.rs", "src/cli/mod.rs",
+  "scripts/**", "tests/scripts/**", "tests/common/**", "tests/split-map*.toml",
+  "tests/split_map_inventory.rs", "tests/ci_test_plan.rs", "tests/test_seam.rs",
+  "tests/audit_review.rs", "tests/delegated_approval.rs", "tests/fixtures/delegated-gh.py",
+  "tests/operator_lineage.rs", "tests/master_permission.rs", "tests/build_identity.rs"]
+
+# Exactly the "Script allowlist (auto-eligible)" of risk-classes.md:
+# auto-eligible, never delegable.
+[scripts_allowlist]
+paths = ["scripts/measurements/README.md", "scripts/measurements/board-live.mjs",
+  "scripts/test-dup-report", "scripts/test-dup-report.txt", "scripts/auto-stage.py"]

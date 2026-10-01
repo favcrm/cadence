@@ -151,15 +151,32 @@ mod tests {
         let (a_root, a) = listener();
         let (b_root, b) = listener();
         let path = b_root.path().join("accept.sock");
+        let (started_tx, started_rx) = mpsc::channel();
         let sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            UnixStream::connect(path).unwrap()
+            started_tx.send(()).unwrap();
+            UnixStream::connect(path)
         });
-        assert!(wait_for_connections(&[&a, &b]).unwrap());
-        let _client = sender.join().unwrap();
+        started_rx.recv().unwrap();
+        // wait_for_connections returns false on its own 50ms timeout by
+        // design; the outer accept loop simply waits again. On a loaded host
+        // the sender thread can be scheduled later than one timeout, so a
+        // false is not a failure: only readiness on b ends the wait, and
+        // readiness on a (never connected) or an error would fail the test.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let woke = loop {
+            match wait_for_connections(&[&a, &b]) {
+                Ok(false) if Instant::now() < deadline => continue,
+                other => break other,
+            }
+        };
+        // Join before asserting so a failure never leaves the sender behind,
+        // and keep b_root alive until it has connected.
+        let client = sender.join().unwrap();
+        assert!(woke.unwrap(), "no readiness on the second listener");
+        let _client = client.unwrap();
         assert!(b.accept().is_ok());
         assert_eq!(a.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        drop(a_root);
+        drop((a_root, b_root));
     }
 
     #[test]

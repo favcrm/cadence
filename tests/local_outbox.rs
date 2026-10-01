@@ -73,7 +73,7 @@ impl Daemon {
     }
 
     fn serve(&mut self) {
-        let env = cadence_agent::adapter::ProviderEnv::default();
+        let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", self.pm.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = stop.clone();
@@ -1196,7 +1196,7 @@ fn decided_at_restart_never_refires() {
     let crash = Arc::new(AtomicBool::new(false));
 
     let serve = |crash: Arc<AtomicBool>| {
-        let env = cadence_agent::adapter::ProviderEnv::default();
+        let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let mut opts = daemon::ServeOptions {

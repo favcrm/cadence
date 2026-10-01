@@ -58,7 +58,6 @@ mod status_cli;
 pub use status_cli::{status_json, status_table, status_tracker_env};
 
 mod suite;
-pub mod tmux_guard;
 // Each integration binary uses a different subset of the shared API.
 #[allow(unused_imports)]
 pub use suite::{
@@ -1129,17 +1128,21 @@ pub fn run_signal_child(test: &str, limit: Duration) {
 
 // ---- mock Codex provider over real stdio (no model calls) ----
 
-/// CAD-955: the tmux a test daemon runs unless the test installed a mock.
-/// `false` fails every launch loudly. Left unset, a pty agent launched by
-/// a test with no mock started a real tmux server (and the real provider
-/// in it) that nothing killed, holding the suite lock fd past the run.
-pub const NO_REAL_TMUX: &str = "false";
+/// CAD-955/CAD-968: the command a test daemon runs for every provider
+/// (and tmux) unless the test installed a mock. `false` fails every
+/// launch loudly. Left unset, a test with no mock started a real tmux
+/// server or a real, credentialed provider that nothing killed.
+pub use cadence_agent::adapter::REFUSED_COMMAND as NO_REAL_PROVIDER;
+
+/// Put a provider command back to the refusal when its mock goes away.
+/// Never `remove`: an unset name falls through to the real binary.
+pub fn refuse_provider(name: &str) {
+    test_env().set(name, NO_REAL_PROVIDER);
+}
 
 thread_local! {
     static TEST_ENV: ProviderEnv = {
-        let env = ProviderEnv::default();
-        env.set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        env
+        ProviderEnv::refusing_providers()
     };
     static TEST_STALL_SAMPLE: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::default();
@@ -1425,9 +1428,9 @@ impl TestDaemon {
 
 impl Drop for MockCodex {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_CODEX_COMMAND");
-        test_env().remove("CADENCE_CODEX_WS_COMMAND");
-        test_env().remove("CADENCE_CODEX_SANDBOX_COMMAND");
+        refuse_provider("CADENCE_CODEX_COMMAND");
+        refuse_provider("CADENCE_CODEX_WS_COMMAND");
+        refuse_provider("CADENCE_CODEX_SANDBOX_COMMAND");
     }
 }
 
@@ -1673,8 +1676,8 @@ pub fn kill_mock_panes(dir: &Path) {
 impl Drop for MockDevin {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_DEVIN_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_DEVIN_COMMAND");
         test_env().remove("CADENCE_DEVIN_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -1715,7 +1718,7 @@ pub fn install_mock_stub(dir: &Path) -> MockStub {
 impl Drop for MockStub {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
+        refuse_provider("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_STUB_COMMAND");
         test_env().remove("CADENCE_STUB_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
@@ -1785,8 +1788,8 @@ impl TestDaemon {
 impl Drop for MockClaudeTui {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_CLAUDE_TUI_COMMAND");
         test_env().remove("CADENCE_CLAUDE_SESSIONS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -1899,8 +1902,8 @@ impl Drop for MockCursorTui {
             }
         }
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_CURSOR_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_CURSOR_COMMAND");
         test_env().remove("CADENCE_CURSOR_CHATS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -2422,7 +2425,7 @@ impl TestDaemon {
 
 impl Drop for MockClaude {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_CLAUDE_COMMAND");
+        refuse_provider("CADENCE_CLAUDE_COMMAND");
         test_env().remove("CADENCE_MCP_PERMISSION_COMMAND");
     }
 }
@@ -2493,7 +2496,7 @@ impl TestDaemon {
 
 impl Drop for MockPi {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_PI_COMMAND");
+        refuse_provider("CADENCE_PI_COMMAND");
     }
 }
 
@@ -2842,6 +2845,54 @@ impl FakeGh {
 /// fresh `Arc`, not thread-local), so nothing leaks across tests.
 pub fn stall_clock_offset() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
     Default::default()
+}
+
+/// Advance the stall clock to `to` seconds only once the running
+/// turn's idle streak is settled (CAD-983). `turn_silent_end` needs
+/// `silent_end_secs` of logic time since the streak's `idle_since`
+/// stamp, and that stamp reads the clock when it is taken: a jump
+/// before it is baked in (`idle_since = now + to`), elapsed stays 0
+/// and the edge never fires. The stamp is also reset by any non-idle
+/// sample, and the pane is non-idle between the turn starting and the
+/// stub echoing the submission (the paste frame) — so an early stamp is
+/// not the streak. Settled means: the stub's reply is on the screen
+/// (every later frame is idle), two captures have STARTED after that
+/// (captures are serial and a capture starts only after the previous
+/// sample landed, so every earlier sample, stale frames included, has
+/// been folded in, and the first final-frame sample too), and the view
+/// shows the streak (`ended_secs`, present exactly while `idle_since`
+/// is set for the running message). No sleeps as synchronisation:
+/// every wait is on an observed condition; `secs` bounds failure only.
+pub fn advance_stall_clock_after_idle_streak(
+    d: &TestDaemon,
+    mock: &MockStub,
+    alias: &str,
+    offset: &std::sync::atomic::AtomicI64,
+    to: i64,
+    secs: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let screen = d.stub_pane_file(mock, alias, "screen");
+    let captures = d.stub_pane_file(mock, alias, "captures");
+    let poll = |what: &str, ready: &dyn Fn() -> bool| {
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias}: idle streak not settled ({what})"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    poll("stub reply never reached the screen", &|| {
+        std::fs::read_to_string(&screen).is_ok_and(|s| s.contains("STUB_REPLY"))
+    });
+    let len = || std::fs::read_to_string(&captures).unwrap_or_default().len();
+    let from = len();
+    poll("no two captures after the reply", &|| len() >= from + 2);
+    poll("view never showed the streak", &|| {
+        d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"]["ended_secs"].is_u64()
+    });
+    offset.store(to, std::sync::atomic::Ordering::SeqCst);
 }
 
 // ---------- CAD-52: stall detection ----------
@@ -3497,9 +3548,51 @@ pub fn install_script(path: &Path, body: &str) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
+/// `(tid, comm, state, wchan)` of every thread under a `/proc/<pid>/task`
+/// dir. Unreadable fields come back empty or `?`: a thread can exit
+/// between the listing and the read.
+fn task_states(dir: &str) -> Vec<(String, String, String, String)> {
+    let mut rows = Vec::new();
+    for task in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = task.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let stat = read("stat");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".into());
+        rows.push((
+            task.file_name().to_string_lossy().to_string(),
+            read("comm"),
+            state,
+            read("wchan"),
+        ));
+    }
+    rows.sort();
+    rows
+}
+
+/// File name the enrollment mock is installed under.
+const MOCK_SCRIPT_NAME: &str = "claude-enroll.py";
+
+/// How long a test waits for the managed worker to answer one command.
+pub const ANSWER_DEADLINE: Duration = Duration::from_secs(20);
+
 /// The managed provider under test and its request channel.
 pub struct ManagedWorker {
     pub pid: u32,
+    /// The daemon's capture of the worker's stderr (CAD-954), dumped
+    /// when the worker goes silent.
+    pub provider_log: PathBuf,
+    /// The daemon's state dir and this worker's alias, for the events
+    /// its silence report reads.
+    pub state: PathBuf,
+    pub alias: String,
     pub cmd_dir: TempDir,
     pub seq: u64,
     pub _mock: MockClaude,
@@ -3530,7 +3623,7 @@ impl ManagedWorker {
     pub fn install(dir: &Path, state: &Path, alias: &str) -> ManagedWorkerMock {
         let cmd_dir = TempDir::new().unwrap();
         let pidfile = dir.join(format!("claude-{alias}.pid"));
-        let script = dir.join("claude-enroll.py");
+        let script = dir.join(MOCK_SCRIPT_NAME);
         install_script(&script, MOCK_ENROLL_PY);
         test_env().set(
             "CADENCE_CLAUDE_COMMAND",
@@ -3593,6 +3686,9 @@ impl ManagedWorkerMock {
         };
         ManagedWorker {
             pid,
+            provider_log: d.state.join("agents").join(format!("{alias}.provider.log")),
+            state: d.state.clone(),
+            alias: alias.to_string(),
             cmd_dir,
             seq: 0,
             _mock: mock,
@@ -3635,29 +3731,161 @@ impl ManagedWorker {
         n
     }
 
-    /// Wait for command `n`'s answer.
+    /// Wait for command `n`'s answer, up to [`ANSWER_DEADLINE`].
     pub fn answer(&self, n: u64, what: &str) -> Value {
+        self.answer_within(n, what, ANSWER_DEADLINE)
+    }
+
+    /// [`Self::answer`] with an explicit `limit`.
+    pub fn answer_within(&self, n: u64, what: &str, limit: Duration) -> Value {
         let resp = self.cmd_dir.path().join(format!("resp-{n}.json"));
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + limit;
         while !resp.exists() {
             assert!(
                 Instant::now() < deadline,
-                "managed worker never answered {what} (worker pid {} is {}; load {})",
-                self.pid,
-                if !Path::new(&format!("/proc/{}", self.pid)).exists() {
-                    "gone — it died before serving"
-                } else if self._mock.pidfile.exists() {
-                    "running and past its startup, but silent"
-                } else {
-                    "running but never got as far as writing its pidfile"
-                },
-                std::fs::read_to_string("/proc/loadavg")
-                    .map(|l| l.split(' ').take(3).collect::<Vec<_>>().join(" "))
-                    .unwrap_or_default()
+                "managed worker never answered {what} (command {n}; {})",
+                {
+                    // The report quotes process command lines and stderr.
+                    let report = self.silence_report();
+                    cadence_agent::secret::redact_text(&report).unwrap_or(report)
+                }
             );
             thread::sleep(Duration::from_millis(20));
         }
         serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap()
+    }
+
+    /// Why this worker is silent, for the panic of a missed deadline
+    /// (CAD-954): the worker's own state, every process of the mock
+    /// still alive with what it is blocked on, the command files that
+    /// landed, the tail of the stderr the daemon captured, and the load.
+    /// Reads only, and every wait is bounded except the `/proc` and file
+    /// reads themselves (one can block behind a process in disk wait).
+    pub fn silence_report(&self) -> String {
+        // A killed worker the daemon has not yet waited on is a zombie:
+        // its /proc entry stays, but it serves nothing.
+        let alive = std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            })
+            .is_some_and(|state| state != "Z" && state != "X");
+        let mut out = format!(
+            "worker pid {} is {}; load {}",
+            self.pid,
+            if !alive {
+                "gone — it died before serving"
+            } else if self._mock.pidfile.exists() {
+                "running and past its startup, but silent"
+            } else {
+                "running but never got as far as writing its pidfile"
+            },
+            std::fs::read_to_string("/proc/loadavg")
+                .map(|l| l.split(' ').take(3).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+        );
+        // The pid the mock wrote is its own: a different one than the
+        // daemon enrolled means the worker was launched again.
+        out.push_str(&format!(
+            "\npidfile: {:?}",
+            std::fs::read_to_string(&self._mock.pidfile).map(|p| p.trim().to_string())
+        ));
+        let mut files: Vec<String> = std::fs::read_dir(self.cmd_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        out.push_str(&format!("\ncommand dir: {files:?}"));
+        // This worker's mock processes: the worker itself, its children,
+        // and the detached grandchildren the daemon (the subreaper)
+        // adopted. Every one carries this worker's own command dir (as an
+        // argument, or in the response path it lands), which no sibling
+        // worker, parallel test or other lane's mock shares.
+        let cmd_dir = self.cmd_dir.path().to_string_lossy().to_string();
+        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if pid != self.pid && !cmdline.contains(&cmd_dir) {
+                continue;
+            }
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // `pid (comm) S ppid ...` — comm may hold spaces, so split after ')'.
+            let after = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or_default();
+            let mut f = after.split_whitespace();
+            let (state, ppid) = (f.next().unwrap_or("?"), f.next().unwrap_or("?"));
+            let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+            out.push_str(&format!(
+                "\n  proc {pid} ppid {ppid} state {state} wchan {wchan} cmd {}",
+                cmdline.chars().take(160).collect::<String>()
+            ));
+            // Every thread, not just the main one: the mock's main thread
+            // always reads stdin, the thread that serves requests is another.
+            for (tid, comm, state, wchan) in task_states(&format!("/proc/{pid}/task")) {
+                out.push_str(&format!(
+                    "\n    thread {tid} {comm} state {state} wchan {wchan}"
+                ));
+            }
+        }
+        // An in-process daemon's threads are this process's threads: a
+        // handler parked on a lock (futex), on a disk commit (D,
+        // jbd2/fsync) or spinning shows here, by state and wait channel.
+        let mut waits: std::collections::BTreeMap<String, usize> = Default::default();
+        for (_, comm, state, wchan) in task_states("/proc/self/task") {
+            *waits.entry(format!("{comm} {state}/{wchan}")).or_default() += 1;
+        }
+        out.push_str(&format!(
+            "\ntest process threads (name state/wchan): {waits:?}"
+        ));
+        // The daemon's own record of this worker, asked on a thread so
+        // a wedged daemon cannot hang the report.
+        let (state, alias) = (self.state.clone(), self.alias.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(client::rpc(&state, "agent_events", json!({"alias": alias})));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(v)) => {
+                let events = v["events"].as_array().cloned().unwrap_or_default();
+                out.push_str(&format!("\ndaemon events for {} (last 25):", self.alias));
+                for e in events.iter().rev().take(25).rev() {
+                    out.push_str(&format!(
+                        "\n  {} {}",
+                        e["kind"].as_str().unwrap_or("?"),
+                        e["payload"]
+                            .to_string()
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    ));
+                }
+            }
+            Ok(Err(e)) => out.push_str(&format!("\ndaemon events unreadable: {e}")),
+            Err(_) => out.push_str("\ndaemon did not answer agent_events within 5s"),
+        }
+        // Only the last 4 KiB: the log of a long run can be large.
+        let (len, tail) = std::fs::File::open(&self.provider_log)
+            .and_then(|mut f| {
+                use std::io::{Read, Seek, SeekFrom};
+                let len = f.metadata()?.len();
+                f.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+                let mut tail = Vec::new();
+                f.take(4096).read_to_end(&mut tail)?;
+                Ok((len, tail))
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\nprovider stderr ({len} bytes, tail):\n{}",
+            String::from_utf8_lossy(&tail)
+        ));
+        out
     }
 }
 
