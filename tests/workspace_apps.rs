@@ -2725,7 +2725,9 @@ fn full_customer_descriptor() -> String {
                 {"id":"tags","label":"Tags","format":"tags","kind":"list"},
                 {"id":"source","label":"Source","format":"text"},
                 {"id":"consent_email","label":"Email consent","format":"enum","values":["granted","denied","unknown"]},
-                {"id":"consent_sms","label":"SMS consent","format":"enum","values":["granted","denied","unknown"]}
+                {"id":"consent_sms","label":"SMS consent","format":"enum","values":["granted","denied","unknown"]},
+                {"id":"visits","label":"Visits","format":"number"},
+                {"id":"tier","label":"Tier","format":"enum","values":["member","vip","vip_plus"]}
              ],
              "columns":[{"field":"ref"},{"field":"name"},{"field":"email"}]},
             {"id":"customer-detail","title":"Customer","kind":"detail",
@@ -2767,10 +2769,28 @@ fn full_customer_binding() -> String {
 /// what makes the concurrent-upgrade assertions distinguishable
 /// (old "Ada Lovelace" vs new "ada@example.com"), never vacuous.
 fn v2_customer_binding() -> String {
-    full_customer_binding().replace(
-        "{\"field\":\"name\",\"key\":\"display_name\",\"format\":\"text\"}",
-        "{\"field\":\"name\",\"key\":\"email\",\"format\":\"text\"}",
-    )
+    // Structural edit, never a serialization-order-dependent string
+    // replace: `json!` sorts object keys, so a `field,key,format`
+    // literal replace is a silent no-op. Rewrite every `name` mapping's
+    // `key` and assert the exact rename count (2 — `customers` and
+    // `customer-detail` both bind `name`).
+    let mut binding: Value = serde_json::from_str(&full_customer_binding()).unwrap();
+    let mut renamed = 0usize;
+    for b in binding["bindings"].as_array_mut().unwrap() {
+        for f in b["fields"].as_array_mut().unwrap() {
+            if f["field"] == "name" {
+                assert_eq!(
+                    f["key"],
+                    json!("display_name"),
+                    "v2 fixture expected `name` to map `display_name`"
+                );
+                f["key"] = json!("email");
+                renamed += 1;
+            }
+        }
+    }
+    assert_eq!(renamed, 2, "v2 fixture must rename `name` in both bindings");
+    binding.to_string()
 }
 
 /// A caption-runs descriptor/binding on `app` blog-post that binds
@@ -2997,7 +3017,13 @@ fn cad867_view_read_customers_projects_real_values() {
             "absent optional '{absent}' emitted a cell"
         );
     }
-    // Declared-but-unbound fields never appear.
+    // The sparse record DID supply consent.email=unknown: the bound
+    // enum renders a set value (omission is only for ABSENT optionals),
+    // so `consent_email` is present and equals "unknown".
+    assert_eq!(sparse["consent_email"], json!("unknown"));
+    // `visits`/`tier` are genuinely declared on the `customers` view
+    // yet bound to no source key — declared-but-unbound cells never
+    // appear in a produced row.
     for unbound in ["visits", "tier"] {
         assert!(
             !full.as_object().unwrap().contains_key(unbound),
@@ -3574,22 +3600,20 @@ fn cad867_view_read_refuses_corrupt_producer_rows() {
         w.daemon.operator_rpc("app_view_read", show_bad).is_err(),
         "corrupt run snapshot served a show"
     );
-    // A list that includes the corrupt run must not emit a forged or
-    // partial cell for it: either the whole list refuses, or the only
-    // `ref` values emitted belong to valid runs (never `run-corrupt`).
+    // A list that includes the corrupt run must REFUSE wholesale — a
+    // producer-integrity error is never a partial-success skip that
+    // still returns the good row. The refusal is a bounded `rejected`
+    // error, not an internal crash.
     let p = view_read_params(&id, "caption-runs", "list", &digests);
-    match w.daemon.operator_rpc("app_view_read", p) {
-        Ok(v) => {
-            for row in v["rows"].as_array().unwrap() {
-                assert_ne!(
-                    row["ref"],
-                    json!("run-corrupt"),
-                    "corrupt run emitted a partial row"
-                );
-            }
-        }
-        Err(_) => {} // a bounded whole-list refusal is also acceptable
-    }
+    let listed = w
+        .daemon
+        .operator_rpc("app_view_read", p)
+        .expect_err("list over a corrupt run must refuse, never skip it");
+    assert_eq!(
+        listed.kind(),
+        "rejected",
+        "corrupt-run list refusal was not a bounded rejection: {listed}"
+    );
     // A valid ordinary run still shows.
     let mut show_ok = view_read_params(&id, "caption-detail", "show", &digests);
     show_ok["record_id"] = json!("run-ok");
@@ -3697,7 +3721,11 @@ fn cad867_view_read_is_consistent_under_concurrent_reads_and_upgrade() {
             })
         };
         let r = read_handle.join().unwrap();
-        let _ = up_handle.join().unwrap();
+        // The upgrade must actually succeed — `join().unwrap().unwrap()`
+        // propagates a refusal so a failed upgrade can never leave the
+        // post-upgrade new-pinned assertions vacuously satisfied.
+        let upgrade = up_handle.join().unwrap().unwrap();
+        assert_eq!(upgrade["digest"], json!(new_digest));
         r
     });
     match read_res {
@@ -3713,15 +3741,41 @@ fn cad867_view_read_is_consistent_under_concurrent_reads_and_upgrade() {
                 "racing read returned a torn old-pins/new-projection row"
             );
         }
-        Err(_) => { /* refused as stale — also consistent */ }
+        Err(e) => {
+            // A racing read may only refuse as a bounded `rejected`
+            // (stale-pins) error — never an internal/timeout silently
+            // reclassified as consistency.
+            assert_eq!(
+                e.kind(),
+                "rejected",
+                "racing read failed with a non-bounded error: {e}"
+            );
+        }
     }
-    // Post-upgrade: a new-pinned read succeeds; an old-pinned read refuses.
+    // Post-upgrade the receipt pins genuinely moved: the bundle digest
+    // and (the binding bytes changed) the binding digest differ.
     let new_digests = view_read_digests(&w, &id);
+    assert_ne!(
+        new_digests["digest"], old_digests["digest"],
+        "upgrade did not move the bundle pin"
+    );
+    assert_ne!(
+        new_digests["view_binding_digest"], old_digests["view_binding_digest"],
+        "upgrade did not move the binding pin"
+    );
+    // A new-pinned read succeeds and now projects the renamed `name`
+    // cell — `email` under the v2 binding — proving the projection
+    // actually changed under the new pins.
     let mut p = view_read_params(&id, "customer-detail", "show", &new_digests);
     p["context_id"] = json!(context_id);
     p["record_id"] = json!("cust-1");
     let new_read = w.daemon.operator_rpc("app_view_read", p).unwrap();
     assert_view_pins(&new_read, &new_digests);
+    assert_eq!(
+        new_read["rows"][0]["name"],
+        json!("ada@example.com"),
+        "post-upgrade `name` did not project the renamed `email` key"
+    );
     let mut p = view_read_params(&id, "customer-detail", "show", &old_digests);
     p["context_id"] = json!(context_id);
     p["record_id"] = json!("cust-1");
@@ -3854,6 +3908,16 @@ fn cad867_view_read_http_actor_gate_and_parity() {
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
     let (context_id, _) = seed_customer(&w, &id, "Fav Limited", "ctx-1", "cust-1");
+    // A second customer so `limit=1` + cursor continuation is provable
+    // over HTTP with a real no-duplicate `ref` control.
+    w.daemon
+        .operator_rpc(
+            "app_record_create",
+            json!({"install_id":id,"context_id":context_id,"record_id":"cust-2",
+                "profile":{"schema":1,"display_name":"Second","tags":[],
+                    "consent":{"email":"unknown"}}}),
+        )
+        .unwrap();
     // A context-bound caption run for the caption list/show controls.
     let ctx = w
         .daemon
@@ -3929,6 +3993,30 @@ fn cad867_view_read_http_actor_gate_and_parity() {
     let (code, _, body) =
         common::op::raw(port, &session.request("GET", &cust_list("query=Ada"), ""));
     assert_eq!(code, 200, "operator customers list query: {body}");
+    // Cursor continuation over HTTP: `limit=1` returns one row plus a
+    // `next_cursor`; following it returns a DIFFERENT `ref` (no
+    // duplicate of the first page).
+    let (code, _, body) = common::op::raw(port, &session.request("GET", &cust_list("limit=1"), ""));
+    assert_eq!(code, 200, "customers list page1: {body}");
+    let page1: Value = serde_json::from_str(&body).unwrap();
+    let p1_rows = page1["rows"].as_array().unwrap();
+    assert_eq!(p1_rows.len(), 1, "limit=1 must return one row");
+    let first_ref = p1_rows[0]["ref"].as_str().unwrap().to_string();
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("page1 must emit a next_cursor")
+        .to_string();
+    let next = cust_list(&format!("limit=1&cursor={cursor}"));
+    let (code, _, body) = common::op::raw(port, &session.request("GET", &next, ""));
+    assert_eq!(code, 200, "customers list page2: {body}");
+    let page2: Value = serde_json::from_str(&body).unwrap();
+    let p2_rows = page2["rows"].as_array().unwrap();
+    assert_eq!(p2_rows.len(), 1);
+    assert_ne!(
+        p2_rows[0]["ref"].as_str().unwrap(),
+        first_ref,
+        "cursor page duplicated the first row"
+    );
     // customers show (record id in path).
     let mut sp = dig_pairs.clone();
     sp.push(("context_id", context_id.as_str()));
