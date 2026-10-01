@@ -34,6 +34,25 @@ Modes (argv[1]):
   reports `fake/fell-back` — the mid-session silent-fallback shape the
   /model gate's verification exists to catch (CAD-551's set_model is
   held to open()'s rule).
+- `catalog-missing-model`: get_state echoes the requested provider/id
+  (with execution fields) but get_available_models does NOT list it —
+  the cold-cache fabricated custom-model shape CAD-601 exists to
+  catch; the id was never real.
+- `catalog-missing-minimal`: the same absent catalog entry, but the
+  reported model is the minimal `{id,name,provider}` echo with no
+  execution fields — catalog membership is still mandatory, so the
+  open refuses; a guard that waived unlisted bare reports fails this.
+- `catalog-mismatch-model`: the catalog lists the id, but the reported
+  thinkingLevelMap resolves `--effort` onto the paid claude-opus-5
+  family — the fabricated entry a name-only get_state check accepts.
+  `catalog-mismatch-api` / `catalog-mismatch-baseurl` /
+  `catalog-mismatch-reasoning` forge that one field alone, so a guard
+  that skips it still fails a test.
+- `catalog-fail` / `catalog-empty-models` / `catalog-malformed`:
+  get_available_models fails / lists nothing / is malformed — the open
+  must refuse rather than launch an unverifiable model.
+- `catalog-consistent-model`: the positive control — the reported model
+  matches the catalog entry on every compared field.
 
 When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
@@ -240,7 +259,99 @@ MODELS = [
     # the CAD-559 gate tests.
     {"id": "demo-1", "name": "Acme Demo", "provider": "acme",
      "contextWindow": 200000},
+    # The finite, legitimately-allowlisted test ids positive tests
+    # launch on (CAD-601): a bare `--model <id>` echoes provider `fake`
+    # through get_state, a `provider/id` echoes its own namespace. Once
+    # the open cross-checks get_available_models, each configured model
+    # must be a real catalog entry — these are the known-valid entries,
+    # never an echo of whatever was requested.
+    {"id": "pi-base", "name": "Pi Base", "provider": "fake",
+     "contextWindow": 200000},
+    {"id": "pi-qa-model", "name": "Pi QA", "provider": "fake",
+     "contextWindow": 200000},
+    {"id": "swe-2-high", "name": "SWE 2 High", "provider": "devin",
+     "contextWindow": 200000},
 ]
+
+# ---- CAD-601: the cold-cache fabricated-model shapes ----
+#
+# Contract: on a cold pi-devin catalog real Pi fabricates an unknown
+# `--model` entry whose thinkingLevelMap resolves `--effort` onto the
+# paid claude-opus-5 family while get_state still echoes the requested
+# provider/id (evidence: CAD-601 ticket artifact). The catalog entry
+# below is the seeded-catalog truth; each mismatch mode forges exactly
+# one reported field so a field-skipping guard still fails a test.
+
+
+def catalog_entry(provider, mid):
+    """The catalog-side (truthy) model entry for `provider/mid`."""
+    return {
+        "id": mid,
+        "name": "Catalog %s" % mid,
+        "provider": provider,
+        "api": "fake-api",
+        "baseUrl": "https://catalog.example",
+        "reasoning": True,
+        "thinkingLevelMap": {"high": mid, "max": "%s-max" % mid},
+        "cost": {"input": 0, "output": 0},
+        "contextWindow": 256000,
+        "maxTokens": 128000,
+    }
+
+
+# The paid-family map the fabricated entry reported for swe-2-high.
+PAID_MAP = {
+    "low": "claude-opus-5-low",
+    "medium": "claude-opus-5-medium",
+    "high": "claude-opus-5-high",
+    "xhigh": "claude-opus-5-xhigh",
+    "max": "claude-opus-5-max",
+}
+
+
+def reported_with(**overrides):
+    """The reported `acme/demo-1`: every field identical to the catalog
+    entry except the forged ones. Provider/id always echo the request,
+    so the name-only check cannot catch any of these."""
+    model = catalog_entry("acme", "demo-1")
+    model.update(overrides)
+    return model
+
+
+if MODE == "catalog-missing-model":
+    # The catalog does not list the requested id at all — `--model`
+    # fabricated it.
+    MODELS = [catalog_entry("fake", "model-1")]
+    state["model"] = reported_with(thinkingLevelMap=PAID_MAP)
+elif MODE == "catalog-missing-minimal":
+    # The adversarial case for the removed exception: the reported
+    # model carries NO execution fields — the minimal
+    # `{id,name,provider}` shape — yet the catalog still does not list
+    # it. Membership is mandatory, so a bare-but-unlisted report must
+    # refuse exactly like a resolved-but-unlisted one.
+    MODELS = [catalog_entry("fake", "model-1")]
+    # Only the namespace/id echo — no api/baseUrl/thinkingLevelMap/
+    # reasoning — so a guard that accepts an unlisted bare report fails.
+    state["model"] = {"id": "demo-1", "name": "acme/demo-1",
+                      "provider": "acme"}
+elif MODE == "catalog-mismatch-model":
+    # The principal case: id listed, every field intact except the
+    # thinkingLevelMap — the paid-family effort swap itself.
+    MODELS = [catalog_entry("acme", "demo-1")]
+    state["model"] = reported_with(thinkingLevelMap=PAID_MAP)
+elif MODE == "catalog-mismatch-api":
+    MODELS = [catalog_entry("acme", "demo-1")]
+    state["model"] = reported_with(api="forged-api")
+elif MODE == "catalog-mismatch-baseurl":
+    MODELS = [catalog_entry("acme", "demo-1")]
+    state["model"] = reported_with(baseUrl="https://forged.example")
+elif MODE == "catalog-mismatch-reasoning":
+    MODELS = [catalog_entry("acme", "demo-1")]
+    state["model"] = reported_with(reasoning=False)
+elif MODE == "catalog-consistent-model":
+    # Reported fields equal the catalog entry — the positive control.
+    MODELS = [catalog_entry("acme", "demo-1")]
+    state["model"] = catalog_entry("acme", "demo-1")
 usage = {"tokens": 42000, "contextWindow": 200000}
 live_turn = False
 pending_dialog = None
@@ -249,6 +360,7 @@ pending_dialog = None
 def append_session(row):
     if not SESSION_FILE:
         return
+    os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
     with open(SESSION_FILE, "a") as f:
         f.write(json.dumps(row) + "\n")
 
@@ -424,6 +536,22 @@ def main():
                 }
             respond(rid, "set_model", True, data=dict(state["model"]))
         elif rtype == "get_available_models":
+            if MODE == "catalog-fail":
+                # The catalog RPC itself failed — open must refuse
+                # rather than launch on an unverifiable model.
+                respond(rid, "get_available_models", False,
+                        error="synthetic catalog failure")
+                continue
+            if MODE == "catalog-empty-models":
+                respond(rid, "get_available_models", True,
+                        data={"models": []})
+                continue
+            if MODE == "catalog-malformed":
+                # A success envelope with a malformed payload — `models`
+                # is not a list of entries the guard can compare.
+                respond(rid, "get_available_models", True,
+                        data={"models": {"bogus": True}})
+                continue
             respond(rid, "get_available_models", True,
                     data={"models": [dict(m) for m in MODELS]})
         elif rtype == "get_session_stats":
