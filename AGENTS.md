@@ -23,6 +23,14 @@ this workflow exactly.
 - Work in the lane worktree that `cadence issue start <ID>` creates,
   never on main.
 
+### Design contract first (CAD-957)
+A ticket that touches a daemon-enforced rule (gate, lease, lock, fence,
+operator-only action, exactly-once) starts with a filled
+`docs/design/CONTRACT-TEMPLATE.md`, in the ticket or the PR. One
+Spec/security reviewer (not the author) passes the contract BEFORE code.
+The PR links it. The code reviewers check the code against it, and each
+adversarial test it names must exist and fail without its guard.
+
 ### Review: what a merge needs (interim, CAD-815)
 Until the delivery loop enforces a per-project policy (CAD-814), every
 PR needs each of the following as a PASS on the exact head you enqueue:
@@ -43,6 +51,13 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
+- **Risk-sized count (CAD-957):** a PR whose every changed path matches
+  `one_review_include` and no `one_review_exclude` in
+  `docs/roles/one-review-paths.toml` (tests, non-gate docs, ui tests;
+  not `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`, this file) needs
+  ONE independent review covering both standards and spec. Any other PR
+  keeps two. `human` triggers are unchanged. That file is the only list;
+  scripts read it.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in

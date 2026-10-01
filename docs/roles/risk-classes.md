@@ -55,5 +55,11 @@ lowers Browser QA, the `qa-verdict` status binding, or the risk class
 itself. A change to *this* rule is class `human` (trigger 7) and can
 never approve itself.
 
+### Review count by diff (CAD-957)
+A PR whose every changed path is in the one-review set
+(`docs/roles/one-review-paths.toml`) needs one independent review covering
+standards and spec. Everything else keeps two. This changes only the count:
+a `human` trigger still needs the operator, and the file is itself trigger 7.
+
 ## After an auto merge
 ops-1 runs the post-merge list, then a smoke check on the live system (`cadence --version`, `cadence status`, board 200, `cadence doctor`), and sends fable-cc one line: `merged #N <sha> (auto): <title>; tree ok; smoke ok`. If the smoke check fails: open a revert PR immediately (`gh pr create` with `git revert`), mark it `human`, and escalate to fable-cc. Do not merge the revert without approval.
