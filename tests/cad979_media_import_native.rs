@@ -783,8 +783,11 @@ fn cad979_import_same_request_id_schedule_is_idempotent() {
     assert_eq!(second["state"], "queued");
     // A request_id re-used for different frozen content is refused — keep
     // the binding key valid so the failure is the request dedup, not the key.
+    // Different frozen content under the SAME request_id: same toolkit/
+    // destination (still resolves to AOS_CONN), but a different `due_epoch`
+    // produces a different `frozen_digest` → `different frozen` refuse.
     let mut other = schedule_body(&run, &bundle, &install, req, Some(key.clone()));
-    other["destination_id"] = json!("17841400008460057"); // different frozen content
+    other["due_epoch"] = json!(1_750_000_999i64); // different frozen content
     let err = h
         .daemon
         .operator_rpc("social_publish_schedule", other)
@@ -1373,9 +1376,13 @@ fn cad979_mapping_reader_workspace_differs_sender_refuses() {
         )
         .expect_err("a connectionId outside the send credential's workspace must refuse");
     let msg = err.to_string();
+    // The door's `not_found` maps to `wrong_connection` (a definitive
+    // refusal — the send credential's workspace does not scope `connB`),
+    // never a minted key. Any of the fail-closed refusals is correct.
     assert!(
         msg.contains("capability_unavailable")
             || msg.contains("not_found")
+            || msg.contains("wrong_connection")
             || msg.contains("grant_binding_mismatch"),
         "cross-workspace resolved id must refuse, got: {msg}"
     );
