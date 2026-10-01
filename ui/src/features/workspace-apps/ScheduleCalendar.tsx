@@ -38,9 +38,9 @@ import "./schedule-calendar.css";
  *  - Effect linkage needs full install/context/run/effect identity; an absent
  *    or mismatched effect is flagged "linkage unavailable", never satisfied
  *    by a fabricated effect/receipt.
- *  - The list is capped at 100 intents (daemon `ORDER BY intent_id LIMIT 100`
- *    — not creation order); at the cap the view says a returned subset is
- *    shown and history may be incomplete — never claims full coverage.
+ *  - The list is capped at 100 records; at the cap the view says schedule
+ *    history may be incomplete — never claims full coverage or "most recent"
+ *    (the cap order is not chronology).
  *  - Read state is tagged with the scope it belongs to; only the exact current
  *    scope is rendered, so a slow reply can never flash a previous context.
  *  - The read is isolated to this component: a calendar load failure cannot
@@ -394,15 +394,13 @@ export default function ScheduleCalendar({
       <div className="wa-row">
         <h2>Schedule</h2>
         <span className="wa-kicker">
-          {contextId ? "Selected context" : "Context-less"} · local plans
+          {contextId ? "Selected context" : "No brand context"} · local plans
           {canWrite ? "" : " · read-only"}
         </span>
       </div>
       {atCap && (
         <p className="wa-alert" data-tone="warn" role="status">
-          Showing a returned subset of publish intents (limit {LIST_CAP},
-          ordered by intent id — not by date); earlier history may be
-          incomplete.
+          Schedule history may be incomplete (up to {LIST_CAP} records shown).
         </p>
       )}
       {projection.conflictingIds.length > 0 && (
@@ -412,7 +410,7 @@ export default function ScheduleCalendar({
           once and were withheld — the schedule was not guessed.
         </p>
       )}
-      {projection.days.length === 0 && projection.malformed.length === 0 && projection.unplanned.length === 0 ? (
+      {projection.days.length === 0 && projection.malformed.length === 0 && projection.unplanned.length === 0 && projection.conflictingIds.length === 0 ? (
         <p className="wa-empty" role="status">
           No posts are planned. Accepted text stays in Library until it is
           scheduled; runs without a publish intent have no planned date.

@@ -277,8 +277,16 @@ async function main() {
   listResult = [intent({ intent_id: "i-in" })]
     .concat(Array.from({ length: 99 }, (_, i) => intent({ intent_id: `i-x${i}`, run_id: "run-a", context_id: "other-ctx", install_id: INSTALL })));
   await rerender("", [run("run-a", null)], []);
-  assert(text().includes("subset") && text().includes("incomplete"), "cap notice honest: subset/incomplete, no chronology claim");
-  assert(!text().includes("most recent"), "never claims most-recent ordering");
+  assert(text().includes("incomplete") && text().includes("Schedule history"), "cap notice honest about incompleteness");
+  assert(!text().includes("most recent") && !text().includes("intent id") && !text().includes("ordered by"), "no chronology/ordering claim leaks");
+
+  // Conflict-only reply: every duplicated intent_id row withheld AND the
+  // conflict notice shows — never a false "No posts planned".
+  listResult = [intent({ intent_id: "dup", run_id: "run-a" }), intent({ intent_id: "dup", run_id: "run-a", state: "queued" })];
+  await render({ contextId: "", runs: [run("run-a", null)], effects: [] });
+  assert(text().includes("withheld") || text().includes("appear more than once"), "conflict notice shows");
+  assert(!text().includes("No posts are planned"), "conflict-only is NOT claimed empty");
+  assert(dayEls().filter((d) => d.getAttribute("data-date")).length === 0, "conflicting cards withheld — no day row");
 
   // 13. GET-only read surface: installId is route-owned; context passed through.
   assert(listCalls.every((c) => c.installId === INSTALL), "route-owned installId");
