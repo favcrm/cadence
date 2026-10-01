@@ -20,6 +20,7 @@ mod common;
 use std::path::PathBuf;
 
 use board_common::op;
+use cadence_agent::wiki::Caller;
 use common::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1180,11 +1181,208 @@ fn refused_upload_never_deletes_a_shared_blob() {
         )
         .unwrap();
     assert_eq!(out["conflict"], "if_rev", "{out}");
-    assert_eq!(
-        names(&blobs),
-        before,
-        "a refused upload left its created blob behind"
+    // CAD-911: the published object is immutable shared custody — a
+    // refused write may leave the orphan blob behind (its bytes are
+    // addressable by hash; another pointer could already name them).
+    // GC, not this refusal, owns unreferenced blobs. What the refusal
+    // MUST do is leave its private `.upload-` staging name cleaned.
+    let after = names(&blobs);
+    let stray: Vec<_> = after
+        .iter()
+        .filter(|n| n.to_string_lossy().contains(".upload-"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "staging leftovers must not linger: {stray:?}"
     );
+    assert!(
+        after.len() == before.len() + 1,
+        "the refused write's own object is kept as an orphan, not deleted"
+    );
+}
+
+/// CAD-911: two `put_blob` calls carry identical bytes. The first
+/// published `.blobs/<sha>` is shared the moment it exists — a second
+/// call may dedupe it and commit its pointer BEFORE the first hits its
+/// `if_rev`/kind failure. The store must never unlink the published
+/// object on that failure: the accepted writer's pointer must still
+/// resolve to correct bytes, under either ordering.
+///
+/// Here the winner is staged and its pointer committed while a loser
+/// (same bytes, stale `if_rev`) conflicts — the loser's refusal path
+/// must not have deleted the winner's object.
+#[test]
+fn concurrent_same_bytes_upload_never_orphans_an_accepted_pointer() {
+    let fx = fx();
+    let d = &fx.d;
+    let uploads = d.state.join("wiki-uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+
+    // Identical content → identical sha. Two logical names: the
+    // "winner" commits, the "loser" conflicts on a stale if_rev.
+    let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 7, 7, 7, 7];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let results: Vec<Value> = std::thread::scope(|s| {
+        let joins: Vec<_> = ["winner.bin", "loser.bin"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let b = barrier.clone();
+                let tmp = uploads.join(format!("race-{i}.bin"));
+                std::fs::write(&tmp, bytes).unwrap();
+                // The loser carries a stale if_rev so the pointer
+                // write conflicts AFTER the bytes were published —
+                // exactly the ordering the old `created` unlink hit.
+                let if_rev = if *name == "loser.bin" {
+                    Some("fnv1a:deadbeefdeadbeef")
+                } else {
+                    None
+                };
+                s.spawn(move || {
+                    b.wait();
+                    let mut p = json!({"path": format!("global/{name}"), "tmp": tmp});
+                    if let Some(r) = if_rev {
+                        p["if_rev"] = json!(r);
+                    }
+                    d.operator_rpc("wiki_put_blob", p)
+                })
+            })
+            .collect();
+        barrier.wait();
+        joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .collect::<Vec<cadence_agent::Result<Value>>>()
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| json!({"error": e.to_string()})))
+            .collect()
+    });
+
+    let winner = &results[0];
+    let loser = &results[1];
+    assert!(winner["rev"].is_string(), "winner must commit: {winner}");
+    assert_eq!(
+        loser["conflict"].as_str().unwrap_or(""),
+        "if_rev",
+        "loser must conflict, not error or succeed: {loser}"
+    );
+    // The accepted pointer's blob must still exist and be byte-exact —
+    // the loser's refusal must not have unlinked shared bytes.
+    let sha = winner["sha256"].as_str().unwrap();
+    let blob = cadence_agent::wiki::blobs_dir(&vault(&fx)).join(sha);
+    assert_eq!(
+        std::fs::read(&blob)
+            .unwrap_or_else(|e| panic!("accepted pointer's blob is missing/corrupt: {e}")),
+        bytes,
+        "rejected concurrent upload must not delete the accepted blob"
+    );
+    // And the losing pointer was never written.
+    assert!(read_op_err(d, "global/loser.bin").is_err());
+}
+
+/// CAD-911: publication stages bytes on `.blobs/`'s own filesystem and
+/// installs them at `<sha256>` atomically without overwrite — so a
+/// cross-mount upload never exposes a partially copied final object,
+/// and never rewrites an existing one. Uses a private PM whose
+/// `<state>/wiki-uploads/` lives on tmpfs (`/dev/shm`) while the vault
+/// sits on the fixture filesystem — a real EXDEV split.
+#[test]
+fn cross_filesystem_publication_is_atomic_and_never_overwrites() {
+    // Private fixture: tracker in a TempDir on the test fs, uploads on
+    // /dev/shm so the tmp→blob link crosses devices.
+    let root = TempDir::new().unwrap();
+    let pm_dir = root.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    let shm = PathBuf::from("/dev/shm");
+    let state = if shm.exists() {
+        shm.join(format!("cad911-uploads-{}", std::process::id()))
+    } else {
+        root.path().join("state")
+    };
+    let uploads = state.join(cadence_agent::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&uploads).unwrap();
+    let _state_guard = ShmGuard(state.clone());
+
+    let vault = cadence_agent::wiki::vault_dir(&pm).unwrap();
+    let blobs = cadence_agent::wiki::blobs_dir(&vault);
+    let bytes: &[u8] = b"cross-device blob payload - publish me atomically";
+
+    // An upload whose tmp sits on a different mount from the vault
+    // stages (copy) onto `.blobs/`'s filesystem, then publishes the
+    // verified bytes under the hash name — byte-exact.
+    let tmp_a = uploads.join("a.bin");
+    std::fs::write(&tmp_a, bytes).unwrap();
+    let out = cadence_agent::wiki::put_blob(
+        &pm,
+        &state,
+        &Caller::Operator,
+        "global/x.bin",
+        &tmp_a,
+        None,
+        None,
+    )
+    .unwrap();
+    let sha = out["sha256"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read(blobs.join(&sha)).unwrap(), bytes);
+
+    // An existing object at the destination hash is deduped — never
+    // rewritten, even when a hostile/mistaken writer put different
+    // bytes under that name. Upload bytes_b once to learn its hash,
+    // plant foreign bytes at that name, then upload the real bytes
+    // again: the published object keeps the planted content (the
+    // no-overwrite publish never touches an existing name).
+    let bytes_b: &[u8] = b"different bytes, same path family";
+    let tmp_b0 = uploads.join("b0.bin");
+    std::fs::write(&tmp_b0, bytes_b).unwrap();
+    let first = cadence_agent::wiki::put_blob(
+        &pm,
+        &state,
+        &Caller::Operator,
+        "global/b0.bin",
+        &tmp_b0,
+        None,
+        None,
+    )
+    .unwrap();
+    let sha_b = first["sha256"].as_str().unwrap().to_string();
+    let object = blobs.join(&sha_b);
+    std::fs::write(&object, b"PRE-EXISTING - must never be overwritten").unwrap();
+    let tmp_b = uploads.join("b.bin");
+    std::fs::write(&tmp_b, bytes_b).unwrap();
+    let out = cadence_agent::wiki::put_blob(
+        &pm,
+        &state,
+        &Caller::Operator,
+        "global/y.bin",
+        &tmp_b,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(out["sha256"], sha_b);
+    assert_eq!(
+        std::fs::read(&object).unwrap(),
+        b"PRE-EXISTING - must never be overwritten",
+        "publication must never rewrite an existing hash object"
+    );
+    // The pointer still committed the real hash/size of the upload.
+    assert_eq!(out["size"], bytes_b.len() as u64);
+    // No staging leftovers under .blobs/.
+    let stray: Vec<_> = std::fs::read_dir(&blobs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".upload-"))
+        .collect();
+    assert!(stray.is_empty(), "staging leftovers: {stray:?}");
+}
+
+/// Removes a `/dev/shm` staging dir on drop (a TempDir can't hold it).
+struct ShmGuard(PathBuf);
+impl Drop for ShmGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]

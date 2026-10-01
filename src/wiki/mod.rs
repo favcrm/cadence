@@ -1319,9 +1319,18 @@ fn sniff_mime(head: &[u8]) -> &'static str {
 /// `wiki_put_blob` — verify a staged upload and land it: re-hash the
 /// tmp file (the caller's `sha256` is advisory and must match),
 /// enforce the cap BEFORE the move, sniff MIME, secret-scan text
-/// content, then move the file into `.blobs/<sha256>` and commit the
+/// content, then publish the bytes at `.blobs/<sha256>` and commit the
 /// `<path>.blob` pointer. The tracker write lock is taken only for
 /// the pointer's commit — never while the upload is being checked.
+///
+/// Blob bytes are immutable and content-addressed: publication stages
+/// the verified tmp to a unique sibling on the blob filesystem and
+/// then links it in under the hash name without ever overwriting or
+/// partially exposing an existing object. Once staged this call
+/// NEVER unlinks `.blobs/<sha256>` — another pointer, history or a
+/// trash entry may already reference it; a refusal removes only this
+/// call's own unpublished staging file (unreferenced blob cleanup is
+/// GC work, not this op's).
 ///
 /// `tmp` must sit under `<state_dir>/wiki-uploads/` — a tmp anywhere
 /// else is refused (the daemon never renames an arbitrary caller
@@ -1397,29 +1406,33 @@ pub fn put_blob(
         }
     }
 
-    // Land the blob — hard-link the verified tmp into `.blobs/<sha>`
-    // (atomic, never overwrites), copy+unlink only across mounts
-    // (state dir and vault may differ). `created` marks whether THIS
-    // call made the blob: a refusal below removes only what it
-    // created — a deduped `.blobs/<sha>` is another page's content.
+    // Land the blob: stage the verified tmp to a unique sibling name
+    // on `.blobs/`'s own filesystem, then publish it at `<sha256>`
+    // atomically and without overwrite. A partial copy never appears
+    // under the hash name; an already-published object is deduped,
+    // never replaced. From here on this call may only unlink `stage` —
+    // `dest` is shared content another pointer may already reference.
     ensure_layout(pm)?;
-    let dest = blobs_dir(&vault).join(&actual);
-    let mut created = false;
-    match std::fs::hard_link(&tmp_canon, &dest) {
+    let blobs = blobs_dir(&vault);
+    let stage = blobs.join(format!(
+        ".{actual}.upload-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::hard_link(&tmp_canon, &stage) {
         Ok(()) => {
-            created = true;
             let _ = std::fs::remove_file(&tmp_canon);
         }
-        Err(_) if dest.exists() => {
-            // Already addressable — deduped.
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // The state dir and the vault may live on different
+            // mounts: copy bytes onto the blob filesystem. A failed
+            // copy leaves the tmp in place and `dest` untouched.
+            std::fs::copy(&tmp_canon, &stage)?;
             let _ = std::fs::remove_file(&tmp_canon);
         }
-        Err(_) => {
-            std::fs::copy(&tmp_canon, &dest)?;
-            created = true;
-            let _ = std::fs::remove_file(&tmp_canon);
-        }
+        Err(e) => return Err(e.into()),
     }
+    let dest = blobs.join(&actual);
+    publish_blob(&stage, &dest)?;
 
     // The pointer file — a normal tracker text write under the lock.
     let pointer = vault.join(format!("{norm}.blob"));
@@ -1431,17 +1444,15 @@ pub fn put_blob(
     let cur = rev_of(&pointer)?;
     if let Some(want) = if_rev {
         if want != cur {
-            if created {
-                let _ = std::fs::remove_file(&dest);
-            }
+            // Conflict: drop only this call's staging file. `dest`
+            // stays — it may already back another committed pointer.
+            let _ = std::fs::remove_file(&stage);
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
     }
     if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
         // A text page already sits at the logical name.
-        if created {
-            let _ = std::fs::remove_file(&dest);
-        }
+        let _ = std::fs::remove_file(&stage);
         return Err(Error::rejected(format!(
             "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
         )));
@@ -1469,6 +1480,7 @@ pub fn put_blob(
         None,
     ) {
         restore(&pointer, before);
+        let _ = std::fs::remove_file(&stage);
         return Err(e);
     }
     let mut out = json!({
@@ -1484,6 +1496,32 @@ pub fn put_blob(
         out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
     }
     Ok(out)
+}
+
+/// Publish staged blob bytes at `dest` — atomically, and never over an
+/// existing object. `stage` already sits on `dest`'s filesystem (it is
+/// the unique sibling name `put_blob` staged onto `.blobs/` itself), so
+/// a `hard_link` lands the complete bytes at the hash name in one
+/// atomic, no-overwrite step: an existing `dest` is identical content
+/// (the name is its verified sha256) and is deduped, never rewritten.
+/// On success or dedupe `stage` is consumed and `dest` is left in place
+/// either way — after publication those bytes may already back another
+/// committed pointer, so a failed caller never unlinks `dest`.
+fn publish_blob(stage: &Path, dest: &Path) -> Result<()> {
+    match std::fs::hard_link(stage, dest) {
+        Ok(()) => {}
+        // Same-hash object already published — dedupe, not overwrite.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            // The staging name is ours alone — never leave it behind.
+            let _ = std::fs::remove_file(stage);
+            return Err(e.into());
+        }
+    }
+    // Whether the link landed or an equal object was already there,
+    // our private staging name is ours alone — always removed.
+    let _ = std::fs::remove_file(stage);
+    Ok(())
 }
 
 /// Search the derived index. The caller and path checks remain the wiki's
