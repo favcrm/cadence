@@ -176,13 +176,51 @@ fn try_lock_is_nonblocking_while_held() {
     assert!(pm.try_lock().unwrap().is_some());
 }
 
+/// Kills and reaps the child on every exit path, panics included.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn a_child_exec_does_not_inherit_the_lock() {
     let (_tmp, pm) = tracker();
     let held = pm.lock().unwrap();
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut guard = ReapOnDrop(
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = guard.0.id();
+    // `spawn` returns once the child's exec has swapped its address space,
+    // but the kernel closes the O_CLOEXEC descriptors a moment later, so an
+    // immediate scan can see the not-yet-closed copy. Wait (bounded) until
+    // `/proc/<pid>/exe` is no longer this test binary: the exec is complete.
+    // This waits only for the exec; a descriptor that survives it still fails
+    // the scan below.
+    let me = std::fs::read_link("/proc/self/exe").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(exe) if exe != me => break,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {pid} did not finish exec within 1s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     // No descriptor of the child may point at a tracker lock file.
-    for e in std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap() {
+    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
         let target = std::fs::read_link(e.unwrap().path()).unwrap_or_default();
         let t = target.to_string_lossy().into_owned();
         assert!(
@@ -192,8 +230,8 @@ fn a_child_exec_does_not_inherit_the_lock() {
     }
     drop(held);
     let got = pm.try_lock().unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    guard.0.kill().unwrap();
+    guard.0.wait().unwrap();
     assert!(got.is_some(), "an inherited fd kept the lock past release");
 }
 
