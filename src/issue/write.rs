@@ -5,7 +5,6 @@
 //! `actor = "operator (ui)"`, or a pane's alias (CAD-254).
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -127,6 +126,50 @@ pub(crate) fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> R
     )])
 }
 
+/// [`blocked_warnings`] for a write that already committed (CAD-908):
+/// the commit landed, so a failed lookup must not turn the write into
+/// a reported failure — a retry would repeat a comment or attachment.
+/// The failure is printed to stderr and recorded in `post` for the
+/// JSON's `post_commit_warnings`; the warnings list is empty then.
+pub(crate) fn blocked_warnings_best_effort(
+    pm: &Pm,
+    id: &str,
+    state_dir: Option<&Path>,
+    post: &mut Vec<String>,
+) -> Vec<String> {
+    match blocked_warnings(pm, id, state_dir) {
+        Ok(w) => w,
+        Err(e) => {
+            post_commit_warning(post, format!("blocked-by warnings unavailable: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Record one post-commit failure: stderr now, JSON later.
+pub(crate) fn post_commit_warning(post: &mut Vec<String>, message: String) {
+    eprintln!("warning: {message} (the write itself committed)");
+    post.push(message);
+}
+
+/// Fold the post-commit warnings into the write's JSON result —
+/// present only when a post-commit step failed.
+pub(crate) fn attach_post_warnings(out: &mut Value, post: &[String]) {
+    if !post.is_empty() {
+        out["post_commit_warnings"] = json!(post);
+    }
+}
+
+/// `key=value` pairs that set `status=done` — the one test `issue set`
+/// and `issue edit` share for the worktree-open hint.
+pub(crate) fn sets_done(pairs: &[String]) -> bool {
+    pairs.iter().any(|p| {
+        p.split_once('=').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("status") && v.trim().eq_ignore_ascii_case("done")
+        })
+    })
+}
+
 /// Write `text` to `path` atomically (temp file + rename).
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
     let tmp = path.with_extension("md.tmp");
@@ -165,8 +208,40 @@ pub(crate) fn attach_foreign(out: &mut Value, foreign: &[String]) {
     }
 }
 
+/// Write `bytes` to a new file at `path`, never leaving a partial one
+/// (CAD-908): the bytes go to a hidden temp file in the same directory
+/// first, then a hard link claims `path` — atomic, and it fails with
+/// `AlreadyExists` instead of overwriting, like `create_new`. A failed
+/// write leaves no file at `path`; the temp file is removed either way.
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    let claimed = staged.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    claimed
+}
+
 /// Create a file exclusively; on a name collision try `-2`, `-3`…
-/// before the extension. Returns the created path.
+/// before the extension. Returns the created path. The file appears
+/// whole or not at all ([`write_new`]).
 pub(crate) fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
@@ -179,16 +254,8 @@ pub(crate) fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<P
             format!("{stem}-{n}{ext}")
         };
         let path = dir.join(&candidate);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(bytes)?;
-                return Ok(path);
-            }
+        match write_new(&path, bytes) {
+            Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -1061,7 +1128,12 @@ pub(crate) fn commit_staged(
 /// this gate. Only the close direction is gated: `done` → anything
 /// reopens freely, `dropped` is exempt by design, and a `done` →
 /// `done` rewrite never asked a question it could fail.
-fn check_done_evidence(pm: &Pm, front: &Front, force: Option<&str>) -> Result<()> {
+fn check_done_evidence(
+    pm: &Pm,
+    front: &Front,
+    force: Option<&str>,
+    staged_artifacts: &[String],
+) -> Result<()> {
     if let Some(reason) = force {
         return if reason.trim().is_empty() {
             Err(Error::rejected(
@@ -1086,14 +1158,19 @@ fn check_done_evidence(pm: &Pm, front: &Front, force: Option<&str>) -> Result<()
         return Ok(());
     }
     let (_project, dir) = issue_dir(pm, &front.id)?;
-    let verdictish = std::fs::read_dir(dir.join("artifacts"))
-        .map(|rd| {
-            rd.flatten().any(|e| {
-                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-                n.starts_with("review") || n.contains("verdict")
+    let is_verdictish = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n.starts_with("review") || n.contains("verdict")
+    };
+    // CAD-908: an attachment staged in the same `issue edit` counts,
+    // like a same-edit `--ref pr:` — it lands in the same commit.
+    let verdictish = staged_artifacts.iter().any(|n| is_verdictish(n))
+        || std::fs::read_dir(dir.join("artifacts"))
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| is_verdictish(&e.file_name().to_string_lossy()))
             })
-        })
-        .unwrap_or(false);
+            .unwrap_or(false);
     if verdictish {
         return Ok(());
     }
@@ -1110,19 +1187,22 @@ fn check_done_evidence(pm: &Pm, front: &Front, force: Option<&str>) -> Result<()
 /// edited `front` against `prev` (the front as loaded). Shared by
 /// `issue set` and `issue edit`, so neither can skip one. Returns the
 /// recorded `--force` reason when the done-evidence gate was overridden.
+/// `staged_artifacts` names attachments the same write is about to add
+/// (only `issue edit` has any); they count as done-evidence.
 pub(crate) fn check_set_gates(
     pm: &Pm,
     project: &project::Project,
     prev: &Front,
     front: &Front,
     force: Option<&str>,
+    staged_artifacts: &[String],
 ) -> Result<Option<String>> {
     let mut forced = None;
     if front.status != prev.status {
         // CAD-360: an unapproved plan's tickets stay in backlog.
         crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
         if front.status == "done" {
-            check_done_evidence(pm, front, force)?;
+            check_done_evidence(pm, front, force, staged_artifacts)?;
             forced = force.map(|r| r.trim().to_string());
         }
         // CAD-757: `ready` is the dispatch queue — a blocked ticket
@@ -1190,7 +1270,7 @@ pub fn set_fields_if_rev(
     let staged = stage(pm, ids, |project, front| {
         let prev = front.clone();
         changed = apply_pairs(project, front, pairs)?;
-        if let Some(reason) = check_set_gates(pm, project, &prev, front, force)? {
+        if let Some(reason) = check_set_gates(pm, project, &prev, front, force, &[])? {
             forced = Some(reason);
         }
         Ok(true)
@@ -1203,11 +1283,7 @@ pub fn set_fields_if_rev(
     // The post-merge reminder (CAD-94): when this set marks an issue
     // done while a worktree ref is still open, the CLI prints the
     // one-line `issue finish` hint for each of these ids.
-    let worktree_open: Vec<&String> = if pairs.iter().any(|p| {
-        p.split_once('=').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("status") && v.trim().eq_ignore_ascii_case("done")
-        })
-    }) {
+    let worktree_open: Vec<&String> = if sets_done(pairs) {
         staged
             .iter()
             .filter(|s| {
@@ -1607,8 +1683,10 @@ pub fn patch_issue(
             return Err(e);
         }
     };
-    let warnings = blocked_warnings(pm, id, state_dir)?;
+    let mut post = Vec::new();
+    let warnings = blocked_warnings_best_effort(pm, id, state_dir, &mut post);
     let mut out = json!({"id": id, "set": changed, "committed": true, "warnings": warnings});
+    attach_post_warnings(&mut out, &post);
     attach_foreign(&mut out, &foreign);
     Ok(out)
 }
@@ -1736,9 +1814,11 @@ pub fn link(
             return Err(e);
         }
     };
-    let warnings = blocked_warnings(pm, id, state_dir)?;
+    let mut post = Vec::new();
+    let warnings = blocked_warnings_best_effort(pm, id, state_dir, &mut post);
     let mut out = json!({"id": id, "link": kind, "target": target,
               "unlink": unlink, "committed": true, "warnings": warnings});
+    attach_post_warnings(&mut out, &post);
     // CAD-757: a new blocker on an active issue tells its holders —
     // by name, best-effort, never blocking the link itself.
     if kind == "blocked_by" && !unlink {
@@ -2131,15 +2211,8 @@ pub fn attach_bytes(
         create_exclusive(&artifacts, name, bytes)?
     } else {
         let target = artifacts.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                target
-            }
+        match write_new(&target, bytes) {
+            Ok(()) => target,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Ok(json!({"id": id, "conflict": "exists", "artifact": name}));
             }
@@ -2168,6 +2241,39 @@ pub fn attach_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAD-908: a created file is whole, a collision renames, and no
+    /// temp file survives either outcome.
+    #[test]
+    fn create_exclusive_leaves_no_temp_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = create_exclusive(dir.path(), "note.md", b"first").unwrap();
+        let b = create_exclusive(dir.path(), "note.md", b"second").unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(b.file_name().unwrap(), "note-1.md");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        let err = write_new(&a, b"third").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["note-1.md", "note.md"], "a temp file survived");
+    }
+
+    /// A write that cannot complete leaves no file under the final
+    /// name: the target directory is missing, so staging fails first.
+    #[test]
+    fn write_new_failure_leaves_nothing_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gone").join("x.md");
+        assert!(write_new(&target, b"x").is_err());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     /// A tracker with project `cadence` and one ticket, CAD-1.
     fn tracker() -> (tempfile::TempDir, Pm) {

@@ -512,3 +512,340 @@ fn bare_comment_stdin_is_capped() {
     );
     assert_eq!(commits(pm), n);
 }
+
+/// Run the CLI with explicit env, keeping stdout and stderr apart.
+fn run_split(f: &Fx, env: &[(&str, &Path)], args: &[&str]) -> (bool, Value, String) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--state-dir")
+        .arg(f.state.path())
+        .args(args)
+        .env("CADENCE_PM_DIR", f.pm.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                Path::new(bin()).parent().unwrap().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let json: Value =
+        serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}"));
+    (
+        out.status.success(),
+        json,
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A post-commit hook that corrupts a second project's `project.yaml`:
+/// the edit commits cleanly, then every board load fails.
+fn break_the_board_after_commit(pm: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = pm.join(".git/hooks/post-commit");
+    // Prepend: the installed hook exits early when no remote exists.
+    let text = format!(
+        "#!/bin/sh\nmkdir -p BAD && printf 'key: [unclosed\\n' > BAD/project.yaml\n{}",
+        std::fs::read_to_string(&hook)
+            .unwrap()
+            .trim_start_matches("#!/bin/sh\n")
+    );
+    std::fs::write(&hook, text).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn comment_files(pm: &Path, id: &str) -> usize {
+    std::fs::read_dir(pm.join("cadence").join(id).join("comments"))
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_post_commit_failure_never_reports_a_landed_edit_as_failed() {
+    let f = fx();
+    let pm = f.pm.path();
+    let body = f.file("c.md", "landed once\n");
+    break_the_board_after_commit(pm);
+    let n = commits(pm);
+    let (ok, out, stderr) = run_split(
+        &f,
+        &[],
+        &[
+            "issue",
+            "edit",
+            "CAD-3",
+            "--set",
+            "priority=P1",
+            "--comment-file",
+            &body,
+        ],
+    );
+    assert!(ok, "a landed edit reported failure: {out} / {stderr}");
+    assert_eq!(out["committed"], true, "{out}");
+    assert_eq!(commits(pm), n + 1, "one commit");
+    assert_eq!(comment_files(pm, "CAD-3"), 1, "exactly one comment");
+    let warns = out["post_commit_warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        warns.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("blocked-by warnings unavailable")),
+        "{out}"
+    );
+    assert!(stderr.contains("warning:"), "stderr names it: {stderr}");
+    assert_eq!(out["warnings"], serde_json::json!([]), "{out}");
+
+    // `issue link` has the same shape: committed, exit 0, warned.
+    let f = fx();
+    break_the_board_after_commit(f.pm.path());
+    let n = commits(f.pm.path());
+    let (ok, out, stderr) = run_split(&f, &[], &["issue", "link", "CAD-3", "relates", "CAD-1"]);
+    assert!(ok, "a landed link reported failure: {out} / {stderr}");
+    assert_eq!(commits(f.pm.path()), n + 1);
+    assert!(out["post_commit_warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("unavailable"));
+}
+
+#[test]
+fn link_then_unlink_in_one_edit_notifies_nobody() {
+    let f = fx();
+    // seed leaves CAD-2 `doing`, owned by `me` — a holder to notify.
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-2",
+        "--link",
+        "blocked_by:CAD-3",
+        "--unlink",
+        "blocked_by:CAD-3",
+        "--set",
+        "priority=P0",
+    ]);
+    assert!(ok, "{out}");
+    assert!(
+        out.get("blocker_notices").is_none(),
+        "the target is not in the final blocked_by: {out}"
+    );
+    let (_, shown) = f.cli(&["issue", "show", "CAD-2", "--json"]);
+    assert!(
+        shown["blocked_by"].as_array().is_none_or(|a| a.is_empty()),
+        "{shown}"
+    );
+}
+
+/// A daemon stand-in on `<state>/cadence.sock` that logs each method.
+fn fake_daemon(state: &Path) -> std::sync::mpsc::Receiver<String> {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            if let Ok(req) = serde_json::from_str::<Value>(&line) {
+                let _ = tx.send(req["method"].as_str().unwrap_or("").to_string());
+            }
+            let mut w = &stream;
+            let _ = writeln!(
+                w,
+                r#"{{"ok":true,"result":{{"jobs":[],"duplicate":false}}}}"#
+            );
+        }
+    });
+    rx
+}
+
+#[test]
+fn link_unlink_and_edit_use_the_state_dir_they_were_given() {
+    let f = fx();
+    let rx = fake_daemon(f.state.path());
+    // The ambient default points somewhere with no daemon at all.
+    let other = TempDir::new().unwrap();
+    let env: [(&str, &Path); 2] = [("HOME", other.path()), ("CADENCE_STATE_DIR", other.path())];
+    let seen = |rx: &std::sync::mpsc::Receiver<String>| -> Vec<String> { rx.try_iter().collect() };
+
+    let (ok, out, _) = run_split(&f, &env, &["issue", "link", "CAD-2", "blocked_by", "CAD-3"]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["blocker_notice"]["notified"][0]["sent"], true,
+        "the notice reached --state-dir's daemon: {out}"
+    );
+    assert!(seen(&rx).contains(&"agent_send".to_string()));
+
+    let (ok, out, _) = run_split(
+        &f,
+        &env,
+        &["issue", "unlink", "CAD-2", "blocked_by", "CAD-3"],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        seen(&rx).contains(&"job_list".to_string()),
+        "unlink looked jobs up on --state-dir's daemon"
+    );
+
+    let (ok, out, _) = run_split(
+        &f,
+        &env,
+        &[
+            "issue",
+            "edit",
+            "CAD-2",
+            "--link",
+            "blocked_by:CAD-3",
+            "--set",
+            "priority=P0",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["blocker_notices"][0]["notified"][0]["sent"], true,
+        "{out}"
+    );
+    let methods = seen(&rx);
+    assert!(
+        methods.contains(&"agent_send".to_string()) && methods.contains(&"job_list".to_string()),
+        "{methods:?}"
+    );
+}
+
+#[test]
+fn a_verdict_attachment_in_the_same_edit_is_evidence_for_done() {
+    let f = fx();
+    let pm = f.pm.path();
+    let plain = f.file("notes.txt", "n\n");
+    let n = commits(pm);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-3",
+        "--set",
+        "status=done",
+        "--attach",
+        &plain,
+    ]);
+    assert!(
+        !ok && out["error"].as_str().unwrap().contains("needs evidence"),
+        "{out}"
+    );
+    assert_eq!(commits(pm), n, "a refused edit commits nothing");
+    let verdict = f.file("review-r1.md", "pass\n");
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-3",
+        "--set",
+        "status=done",
+        "--attach",
+        &verdict,
+    ]);
+    assert!(ok, "{out}");
+    let (_, shown) = f.cli(&["issue", "show", "CAD-3", "--json"]);
+    assert_eq!(shown["status"], "done");
+}
+
+#[test]
+fn the_worktree_hint_follows_any_status_done_like_issue_set() {
+    let f = fx();
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-3",
+        "--ref",
+        "worktree:/tmp/cad908-wt",
+        "--ref",
+        "pr:https://example.com/pr/1",
+        "--set",
+        "status=done",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["worktree_open"][0], "CAD-3", "{out}");
+    // Already done: `issue set status=done` still prints the hint, so
+    // an edit that restates it does too.
+    let (ok, set) = f.cli(&["issue", "set", "CAD-3", "status=done", "priority=P2"]);
+    assert!(ok, "{set}");
+    assert_eq!(set["worktree_open"][0], "CAD-3", "{set}");
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-3",
+        "--set",
+        "status=done",
+        "--set",
+        "priority=P1",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["worktree_open"], set["worktree_open"], "{out}");
+    // Without a status=done the hint stays quiet.
+    let (ok, out) = f.cli(&["issue", "edit", "CAD-3", "--set", "priority=P0"]);
+    assert!(ok, "{out}");
+    assert!(out.get("worktree_open").is_none(), "{out}");
+}
+
+/// `edit --comment-file -` on a terminal refuses instead of hanging.
+#[test]
+fn edit_comment_file_stdin_on_a_terminal_is_refused() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let f = fx();
+    let pm = f.pm.path();
+    let (mut m, mut s) = (0, 0);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    let n = commits(pm);
+    let out = Command::new(bin())
+        .arg("--state-dir")
+        .arg(f.state.path())
+        .args(["issue", "edit", "CAD-3", "--comment-file", "-"])
+        .env("CADENCE_PM_DIR", pm)
+        .env_remove("CADENCE_ALIAS")
+        .stdin(Stdio::from(slave))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("stdin is a terminal"), "{text}");
+    assert_eq!(commits(pm), n);
+}
+
+#[test]
+fn edit_comment_file_stdin_is_capped_at_4_mib() {
+    let f = fx();
+    let pm = f.pm.path();
+    let n = commits(pm);
+    let big = "x".repeat((4 << 20) + 10);
+    let (ok, out) = f.stdin(&big, &["issue", "edit", "CAD-3", "--comment-file", "-"]);
+    assert!(
+        !ok && out["kind"] == "rejected" && out["error"].as_str().unwrap().contains("4 MiB"),
+        "{out}"
+    );
+    assert_eq!(commits(pm), n);
+    assert_eq!(comment_files(pm, "CAD-3"), 0);
+    // Exactly at the cap is fine.
+    let at_cap = "y".repeat(4 << 20);
+    let (ok, out) = f.stdin(&at_cap, &["issue", "edit", "CAD-3", "--comment-file", "-"]);
+    assert!(ok, "{}", out.to_string().len());
+}

@@ -222,9 +222,18 @@ pub fn edit(
         changed.push("acceptance".to_string());
     }
     // The gates `issue set` runs, over the final front: a `--ref pr:`
-    // in the same edit counts as evidence for `status=done`.
+    // or an `--attach` named review*/…verdict… in the same edit counts
+    // as evidence for `status=done` — both land in this one commit.
+    let staged_names: Vec<String> = attachments.iter().map(|(n, _)| n.clone()).collect();
     let forced = part("--set", || {
-        write::check_set_gates(pm, &project, &prev, &front, spec.force.as_deref())
+        write::check_set_gates(
+            pm,
+            &project,
+            &prev,
+            &front,
+            spec.force.as_deref(),
+            &staged_names,
+        )
     })?;
     if !links.is_empty() {
         part("--link", || {
@@ -330,18 +339,39 @@ pub fn edit(
             return Err(e);
         }
     };
+    // The commit landed. Everything below is best-effort (CAD-908): a
+    // failing step warns on stderr and in `post_commit_warnings`, and
+    // never turns a landed edit into a reported failure — a retry
+    // would post the comment twice.
+    let mut post: Vec<String> = Vec::new();
+    let rev = match write::issue_rev(&dir) {
+        Ok(rev) => json!(rev),
+        Err(e) => {
+            write::post_commit_warning(&mut post, format!("rev unavailable: {e}"));
+            Value::Null
+        }
+    };
     let mut out = json!({
         "id": id,
-        "rev": write::issue_rev(&dir)?,
+        "rev": rev,
         "changed": changed,
         "committed": true,
     });
     // `issue link` parity: lint-style warnings, and the CAD-757 notice
     // to the holders of a held ticket for each new blocked_by edge.
-    out["warnings"] = json!(write::blocked_warnings(pm, id, state_dir)?);
+    out["warnings"] = json!(write::blocked_warnings_best_effort(
+        pm, id, state_dir, &mut post
+    ));
+    // Notices follow the FINAL blocked_by: a target linked and unlinked
+    // in this one edit is not a blocker, and its holders hear nothing.
     let notices: Vec<Value> = links
         .iter()
-        .filter(|(unlink, kind, _)| !unlink && *kind == "blocked_by")
+        .filter(|(unlink, kind, target)| {
+            !unlink
+                && *kind == "blocked_by"
+                && front.blocked_by.iter().any(|t| t == target)
+                && !prev.blocked_by.iter().any(|t| t == target)
+        })
         .map(|(_, _, target)| {
             let mut n = crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
             n["target"] = json!(target);
@@ -351,10 +381,10 @@ pub fn edit(
     if !notices.is_empty() {
         out["blocker_notices"] = json!(notices);
     }
-    // `issue set` parity: a done ticket whose worktree ref is still
-    // open tells the CLI to print the `issue finish` hint.
-    if front.status == "done"
-        && prev.status != "done"
+    // `issue set` parity: any `status=done` over a ticket whose
+    // worktree ref is still open tells the CLI to print the
+    // `issue finish` hint, even when it was already done.
+    if write::sets_done(&spec.set)
         && front
             .refs
             .iter()
@@ -370,6 +400,7 @@ pub fn edit(
             out["secret_warnings"] = crate::secret::warnings_json(warnings);
         }
     }
+    write::attach_post_warnings(&mut out, &post);
     write::attach_foreign(&mut out, &foreign);
     Ok(out)
 }
