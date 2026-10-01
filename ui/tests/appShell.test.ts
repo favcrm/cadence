@@ -163,6 +163,7 @@ const generic = {
 };
 const social = { ...generic, install_id: "install-social", title: "Social Content", name: "social-content" };
 const second = { ...generic, install_id: "install-second", title: "Second", name: "reports" };
+const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" };
 const contextsFor: Record<string, unknown> = {
   "install-shell": { contexts: [
     { id: "ctx-a", install_id: "install-shell", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -174,6 +175,9 @@ const contextsFor: Record<string, unknown> = {
   "install-social": { contexts: [
     { id: "ctx-brand", install_id: "install-social", revision: 1, state: "active", digest: "cs", config: { schema: 1, label: "Brand", input_defaults: {} } },
     { id: "ctx-beta", install_id: "install-social", revision: 1, state: "active", digest: "cb2", config: { schema: 1, label: "Beta brand", input_defaults: {} } },
+  ] },
+  "install-crm": { contexts: [
+    { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
   ] },
 };
 const thread = {
@@ -199,7 +203,22 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/api/app-installations/install-shell/contexts") return json(contextsFor["install-shell"]);
   if (path === "/api/app-installations/install-second/contexts") return json(contextsFor["install-second"]);
   if (path === "/api/app-installations/install-social/contexts") return json(contextsFor["install-social"]);
+  if (path === "/api/app-installations/install-crm") return json(crm);
+  if (path === "/api/app-installations/install-crm/contexts") return json(contextsFor["install-crm"]);
   if (path.startsWith("/api/threads/master")) return json(thread);
+  // CRM section reads: empty server receipts only — the mounted
+  // dedupe assertions below exercise real list/new/detail paths, so
+  // every section must answer its own read with the host's shape.
+  const url = new URL(path, "http://localhost");
+  if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
+  if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
+  if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
+  if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });
+  if (url.pathname.endsWith("/exclusions/list")) return json({ exclusions: [] });
+  if (url.pathname.endsWith("/suppressions/list")) return json({ suppressions: [] });
+  if (url.pathname.endsWith("/content/campaigns/list")) return json({ contents: [] });
+  if (url.pathname.endsWith("/content/proposals/list")) return json({ proposals: [] });
+  if (url.pathname.endsWith("/sender-bindings/list")) return json({ bindings: [] });
   throw new Error(`Unexpected read ${path}`);
 }) as typeof fetch;
 
@@ -414,6 +433,62 @@ await click(betaEntry);
 assert(location.search.includes("ctx=ctx-b"), "the switch rebinds the new scope in the URL");
 assert(!location.search.includes("appview=") && !location.search.includes("record="), "the switch clears any stale record/view");
 assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the header label follows the switched context");
+
+// The bound context's own link is a same-URL no-op: re-selecting the
+// already-bound scope is not a context switch, so the URL, the open
+// New view and an unsaved draft all survive the click. The href is
+// still a real link to the current page — never a dead control.
+const selfNewTab = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
+await click(selfNewTab);
+assert(location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"), "New view opens on the bound context");
+await fill("#app-outlet-draft", "same-context draft survives");
+equal(
+  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("href"),
+  "/app-installations/install-shell?ctx=ctx-b&appview=new",
+  "the bound context's link resolves to the current URL",
+);
+await click(host.querySelector('[data-scope-link="ctx-b"]'));
+assert(
+  location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"),
+  "clicking the bound context keeps the query and the New view",
+);
+equal(
+  (host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value,
+  "same-context draft survives",
+  "the unsaved draft survives the same-context click",
+);
+assert(
+  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("aria-current") === "page",
+  "the bound link keeps aria-current after the no-op click",
+);
+// A different context still switches and clears both view and draft.
+await click(host.querySelector('[data-scope-link="ctx-a"]'));
+assert(location.search.includes("ctx=ctx-a"), "switching to ctx-a rebinds the scope");
+assert(!location.search.includes("appview=") && !location.search.includes("record="), "the different-context switch clears view and record");
+const selfNewTab2 = Array.from(host.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "New");
+await click(selfNewTab2);
+equal(
+  (host.querySelector("#app-outlet-draft") as HTMLInputElement)?.value,
+  "",
+  "the draft died on the real context switch",
+);
+// The same no-op holds with a record open: an authored record link
+// under the bound scope keeps its drawer through a self-click.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-7"); });
+await flush(); await flush();
+assert(location.search.includes("record=rec-7"), "record link lands under the bound context");
+assert(text().includes("Record details"), "the record drawer opens");
+equal(
+  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("href"),
+  "/app-installations/install-shell?ctx=ctx-a&record=rec-7",
+  "the bound link still resolves to the current URL with a record open",
+);
+await click(host.querySelector('[data-scope-link="ctx-a"]'));
+assert(
+  location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-7"),
+  "same-context click keeps the record selection",
+);
+assert(text().includes("Record details"), "the record drawer stays open");
 
 // A remembered context (sessionStorage) no longer traps the operator:
 // the switch stays rendered and clicking through clears stale state.
@@ -675,6 +750,97 @@ async function mountColdCold(url: string, install: string) {
   assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "operator false→true cold link adopts the context");
   assert(!(hostEl.textContent ?? "").includes("No context ·"), "operator transition does not fall back to the scope picker");
   assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-3"), "operator transition keeps the authored link");
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+
+// CAD-863 release blocker: a CRM install renders the shell's one
+// Apps → App crumb row and each section renders its own real
+// heading — the duplicate inner "Apps / CRM / <section>" breadcrumb
+// nav is gone. One mounted assertion per section, each on a fresh
+// cold mount so an un-remounted leftover nav can never pass. The
+// shared mountColdCold above waits on the generic install's "Reports"
+// title, so the CRM mount waits on its own section paint instead.
+async function mountCrm(url: string) {
+  const hostEl = document.createElement("div");
+  document.body.append(hostEl);
+  const cold = createRoot(hostEl);
+  history.pushState(null, "", url);
+  await React.act(async () => {
+    cold.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
+  });
+  await settle(() => assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), `crm mount binds ctx-a: ${url}`));
+  await flush(); await flush();
+  return { hostEl, cold };
+}
+const appsLinks = (hostEl: HTMLElement) =>
+  Array.from(hostEl.querySelectorAll<HTMLAnchorElement>("a[href='/apps']"));
+// The shell row renders the one back-link as "← All apps"; a second
+// "Apps" crumb entry was the duplication. Count every /apps anchor.
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No customers yet in this context"), "customers list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "customers renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on customers");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Customers",
+    "customers keeps a real section heading",
+  );
+  assert(
+    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Customers",
+    "the submenu still marks the current customers section",
+  );
+  // New view is an independent page: its own heading, still one link.
+  await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&appview=new"); });
+  await settle(() => assert(hostEl.querySelector("#crm-display-name"), "customers new page opens"));
+  equal(appsLinks(hostEl).length, 1, "customers new page still renders exactly one Apps link");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on customers new");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "New customer",
+    "customers new keeps its own page heading",
+  );
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a&crm=segments",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No segments yet in this context"), "segments list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "segments renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on segments");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Segments",
+    "segments keeps a real section heading",
+  );
+  assert(
+    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Segments",
+    "the submenu still marks the current segments section",
+  );
+  await React.act(async () => { cold.unmount(); });
+  hostEl.remove();
+}
+{
+  const { hostEl, cold } = await mountCrm(
+    "/app-installations/install-crm?ctx=ctx-a&crm=campaigns",
+  );
+  await settle(() => assert((hostEl.textContent ?? "").includes("No campaigns yet in this context"), "campaigns list paints its server-driven empty state"));
+  equal(appsLinks(hostEl).length, 1, "campaigns renders exactly one Apps link — the shell row only");
+  assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on campaigns");
+  equal(
+    hostEl.querySelector("[data-outlet-heading]")?.textContent?.trim(),
+    "Campaigns",
+    "campaigns keeps a real section heading",
+  );
+  assert(
+    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Campaigns",
+    "the submenu still marks the current campaigns section",
+  );
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }

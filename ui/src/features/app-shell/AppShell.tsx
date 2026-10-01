@@ -497,8 +497,12 @@ export default function AppShell({
                   the URL — the regression the header picker's removal
                   introduced. The bound context keeps its link but
                   carries `aria-current`, so the current scope is still
-                  announced and never a dead control. Single-context
-                  installs keep the entry hidden — no link clutter. */}
+                  announced and never a dead control — and its href is
+                  the current URL itself, so following it is a
+                  `navigate` no-op that keeps the open record, the New
+                  view and any unsaved draft instead of resetting the
+                  outlet. Single-context installs keep the entry hidden
+                  — no link clutter. */}
               {!isSocial && activeIds.length > 1 && (
                 <nav
                   className={
@@ -529,7 +533,7 @@ export default function AppShell({
                       .map((c) => (
                         <li key={c.id}>
                           <Link
-                            href={scopedEntryHref(href, c.id)}
+                            href={scopedEntryHref(href, c.id, contextId)}
                             className="lnk text-label"
                             data-scope-link={c.id}
                             aria-current={c.id === contextId ? "page" : undefined}
@@ -624,8 +628,14 @@ function contextLabel(contexts: AppContext[], contextId: string): string | null 
 
 /** A scoped-entry link: sets `ctx` and clears any carried record /
  *  new-view / section state so entering a scope never lands on the
- *  prior scope's drawer or draft. Pure — unit-tested via the shell. */
-export function scopedEntryHref(href: string, contextId: string): string {
+ *  prior scope's drawer or draft. Re-entering the already-bound
+ *  scope keeps the outlet exactly as it is: the link resolves to the
+ *  current URL, so `navigate` no-ops and an open record, the New
+ *  view and unsaved drafts survive — the link stays real (copiable,
+ *  openable in a new tab), never a dead control. Pure — unit-tested
+ *  via the shell. */
+export function scopedEntryHref(href: string, contextId: string, boundId: string): string {
+  if (contextId === boundId) return href;
   const [path, search] = href.split("?");
   const q = new URLSearchParams(search ?? "");
   q.set("ctx", contextId);
