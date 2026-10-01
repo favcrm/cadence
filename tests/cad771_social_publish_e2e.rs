@@ -639,6 +639,25 @@ fn approved_run(h: &Release, tag: &str) -> (Value, Value, String, String) {
 /// A daemon with the fake dispatch sender registered: claims execute
 /// daemon-side and persist provider evidence, exactly the path posted
 /// reports verify against.
+/// A daemon with ONLY the read-credential destinations resolver configured
+/// (no publish sender). The schedule path still resolves the remote AOS
+/// `connectionId` via the fake door; dispatch/sender is absent so the
+/// cancel/revoke/parity assertions keep their no-sender semantics.
+fn resolver_only_release(door: &FakeDoor) -> Release {
+    let dest_base = format!("http://{}", door.addr);
+    Release::with_options(move |opts, _| {
+        opts.social_media_resolver = Some(std::sync::Arc::new(
+            cadence_agent::platform::agenticos_external::media_import::MediaResolver::new(
+                &dest_base,
+                cadence_agent::platform::agenticos_external::publish_sender::DeviceCredential::new(
+                    "cad-test-read".to_owned(),
+                ),
+            )
+            .expect("fake destinations resolver"),
+        ));
+    })
+}
+
 fn e2e_release(door: &FakeDoor) -> (Release, Arc<HttpSender>) {
     let sender = Arc::new(HttpSender::new(format!("http://{}", door.addr)));
     let registered = Arc::clone(&sender);
@@ -1160,9 +1179,9 @@ fn cad771_e2e_lost_response_reconciles_without_second_send() {
 
 #[test]
 fn cad771_e2e_schedule_cancel_and_native_http_parity() {
-    let h = Release::new();
-    let (context, run, bundle_digest, install_id) = approved_run(&h, "cancel");
     let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
+    let (context, run, bundle_digest, install_id) = approved_run(&h, "cancel");
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
     // Future-dated schedule is not yet due; operator cancellation closes it.
     let intent = h
@@ -1440,10 +1459,10 @@ fn cad771_e2e_revoked_binding_holds_despite_matching_recheck() {
     // Daemon-side re-proof: the operator recheck still matches frozen, but
     // the approved material is stale (binding revoked after schedule), so
     // dispatch holds instead of trusting the stale attestation.
-    let h = Release::new();
+    let door = FakeDoor::start();
+    let h = resolver_only_release(&door);
     let (context, run, bundle_digest, install_id) = approved_run(&h, "stale");
     let binding = h.bind(&context, "cad771-e2e-stale-binding");
-    let door = FakeDoor::start();
     door.grants.lock().unwrap().issue(GRANT_FB, 3);
     let intent = h
         .daemon

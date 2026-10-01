@@ -817,8 +817,13 @@ fn store_material(
         })?;
     let frozen: Value = serde_json::from_str(&frozen_text)
         .map_err(|_| Refusal::new("bad_effect", "frozen publish intent is corrupt"))?;
+    // v9: `binding.connection_id` is the remote AOS `connectionId` (the
+    // wire identity), persisted as `frozen["aos_connection_id"]` — NOT the
+    // local custody `conn-<uuid4>` in `frozen["connection_id"]`. Compare the
+    // wire field; a historical row without `aos_connection_id` fails closed
+    // (`Some(expected)` never matches an absent field → refuse).
     for (field, expected) in [
-        ("connection_id", binding.connection_id.as_str()),
+        ("aos_connection_id", binding.connection_id.as_str()),
         ("destination_id", binding.destination_id.as_str()),
         ("caption_digest", binding.caption_digest.as_str()),
         ("grant_id", binding.grant_id.as_str()),

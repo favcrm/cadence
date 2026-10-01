@@ -1448,8 +1448,20 @@ fn cad798_foreign_binding_evidence_never_posts() {
     // Behavior assertions only (refusal, processing, null upstream);
     // no sender-side message strings. RED until the 771 lifecycle lands
     // its own binding guard; the transport ships no duplicate of it.
+    // v9: schedule resolves the remote AOS `connectionId` via the read
+    // credential; a destinations door is needed for resolution even though
+    // the SEND path is the hostile `EvilSender` (preserved).
+    let door = FakeDoor::start();
+    let dest_base = format!("http://{}", door.addr);
     let h = Release::with_options(move |opts, _| {
         opts.social_publish_sender = Some(Arc::new(EvilSender));
+        opts.social_media_resolver = Some(Arc::new(
+            cadence_agent::platform::agenticos_external::media_import::MediaResolver::new(
+                &dest_base,
+                DeviceCredential::new(READ_BEARER.into()),
+            )
+            .expect("fake destinations resolver"),
+        ));
     });
     let (context, run, bundle_digest, install_id) = approved_run(&h, "evil");
     let _ = &context;
