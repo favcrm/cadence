@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -30,9 +31,9 @@ use crate::client;
 use crate::inbox;
 use crate::issue::line_times::LineTimes;
 use crate::issue::{self, board, claim, project, report};
-use crate::proc::run_bounded;
 
 mod commands;
+mod github;
 mod github_cache;
 mod main_ci;
 mod monitoring;
@@ -42,12 +43,15 @@ pub use commands::{
     cmd_issue_set_ready, cmd_issue_show, CMD_DELIVERY_SYNC, CMD_ISSUE_SYNC, CMD_RESTART_WHEN_IDLE,
     CMD_UPGRADE_LATEST_MAIN,
 };
+use github::{build_repo_match, compute_drift, gh_repo, git_text, GH_TIMEOUT};
 #[cfg(test)]
 use github_cache::write_cache;
 use github_cache::{cache_file, github, github_bounded, read_cache};
+use main_ci::main_ci_view;
 #[allow(unused_imports)] // Preserve the existing crate-visible type path.
 pub(crate) use main_ci::MainCiAlerts;
-pub(crate) use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
+#[cfg(test)]
+use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -76,10 +80,6 @@ fn gh_cache_secs(raw: Option<&str>) -> i64 {
         .filter(|n| (GH_CACHE_SECS..=GH_CACHE_MAX_SECS).contains(n))
         .unwrap_or(GH_CACHE_SECS)
 }
-const GH_TIMEOUT: Duration = Duration::from_secs(20);
-const GIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// `git log` subjects surfaced in the drift tile.
-const DRIFT_SUBJECTS: usize = 20;
 /// Read bound on each daemon RPC the overview makes (CAD-249).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The per-agent probe pass starts no probe past this budget; agents
@@ -700,399 +700,7 @@ impl Options {
     }
 }
 
-fn git_text(repo: &Path, args: &[String]) -> Result<String, String> {
-    let out = run_bounded(
-        Command::new("git").arg("-C").arg(repo).args(args),
-        GIT_TIMEOUT,
-    )
-    .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-fn gh_text(args: &[String]) -> Result<String, String> {
-    let out =
-        run_bounded(Command::new("gh").args(args), GH_TIMEOUT).map_err(|e| format!("gh: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(format!("gh {}: {}", args.join(" "), err));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-/// The default-branch ref to count drift against: `origin/HEAD`'s
-/// target when the symref exists, else origin/main, origin/master,
-/// then the local names.
-fn default_ref(repo: &Path) -> Result<String, String> {
-    if let Ok(sym) = git_text(
-        repo,
-        &[
-            "rev-parse".into(),
-            "--abbrev-ref".into(),
-            "origin/HEAD".into(),
-        ],
-    ) {
-        let sym = sym.trim();
-        if sym.starts_with("origin/") {
-            return Ok(sym.to_string());
-        }
-    }
-    for cand in ["origin/main", "origin/master", "main", "master"] {
-        if git_text(repo, &["rev-parse".into(), "--verify".into(), cand.into()])
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return Ok(cand.to_string());
-        }
-    }
-    Err("no default branch ref".to_string())
-}
-
-/// Commits on the repo's default branch after `build_commit`: the
-/// count plus subjects bounded to [`DRIFT_SUBJECTS`], each with the
-/// squash-merged `(#n)` parsed out. `build_commit` "unknown" — or one
-/// git cannot place — is `known:false`, "cannot tell", never zero.
-fn compute_drift(repo: &Path, build_commit: &str) -> Value {
-    let mut base = json!({"known": false, "repo": repo});
-    if build_commit == "unknown" || build_commit.is_empty() {
-        base["reason"] = json!("build commit unknown — cannot tell");
-        return base;
-    }
-    let dref = match default_ref(repo) {
-        Ok(r) => r,
-        Err(e) => {
-            base["reason"] = json!(format!("cannot tell — {e}"));
-            return base;
-        }
-    };
-    let range = format!("{build_commit}..{dref}");
-    let count = match git_text(repo, &["rev-list".into(), "--count".into(), range.clone()]) {
-        Ok(c) => match c.trim().parse::<i64>() {
-            Ok(n) => n,
-            Err(_) => {
-                base["reason"] = json!("cannot tell — unreadable count");
-                return base;
-            }
-        },
-        Err(e) => {
-            base["reason"] = json!(format!("cannot tell — {e}"));
-            return base;
-        }
-    };
-    let subjects = git_text(
-        repo,
-        &[
-            "log".into(),
-            format!("-{DRIFT_SUBJECTS}"),
-            "--format=%s".into(),
-            range,
-        ],
-    )
-    .unwrap_or_default();
-    let commits: Vec<Value> = subjects
-        .lines()
-        .map(|s| json!({"subject": s, "pr": pr_number(s)}))
-        .collect();
-    json!({
-        "known": true, "repo": repo, "ref": dref,
-        "build_commit": build_commit,
-        "count": count, "commits": commits,
-    })
-}
-
-/// `gh pr list` plus the default branch's `ci.yml` push runs for one
-/// repo slug, fetched concurrently into one cache entry (CAD-267). The
-/// legacy commit-status API is not read here: Actions reports check
-/// runs, so `commits/HEAD/status` stays `pending, total_count: 0` on a
-/// red main. `qa-verdict` still rides the PR rollup. A failing runs
-/// fetch never costs the PR rows — it lands as `main_ci.error`.
-fn gh_repo(slug: &str) -> Result<Value, String> {
-    let (prs, main_ci) = std::thread::scope(|s| {
-        let ci = s.spawn(|| gh_main_ci(slug));
-        let prs = gh_prs(slug);
-        let main_ci = ci
-            .join()
-            .unwrap_or_else(|_| json!({"error": "ci runs fetch panicked"}));
-        (prs, main_ci)
-    });
-    Ok(json!({"prs": prs?, "main_ci": main_ci}))
-}
-
-fn gh_prs(slug: &str) -> Result<Value, String> {
-    let prs = gh_text(&[
-        "pr".into(),
-        "list".into(),
-        "--repo".into(),
-        slug.into(),
-        "--state".into(),
-        "open".into(),
-        "--limit".into(),
-        "50".into(),
-        "--json".into(),
-        "number,title,url,headRefOid,headRefName,updatedAt,statusCheckRollup".into(),
-    ])?;
-    serde_json::from_str::<Value>(&prs).map_err(|e| format!("gh pr list: unreadable ({e})"))
-}
-
-/// The run fields [`classify_main_ci`] and the rows read — the rest of
-/// the API object is dropped before it reaches the cache.
-const RUN_FIELDS: [&str; 9] = [
-    "id",
-    "head_sha",
-    "status",
-    "conclusion",
-    "event",
-    "path",
-    "head_branch",
-    "html_url",
-    "created_at",
-];
-
-/// `{branch, runs}` for the repo's default branch: the newest
-/// [`CI_RUNS_PAGE`] `ci.yml` push runs. A repo without a `ci.yml`
-/// workflow is `{absent: true}` — no CI to read, not an error; any
-/// other failure is `{error}`.
-fn gh_main_ci(slug: &str) -> Value {
-    let branch = match gh_text(&["api".into(), format!("repos/{slug}")])
-        .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("unreadable ({e})")))
-    {
-        Ok(repo) => match repo["default_branch"].as_str() {
-            Some(b) if is_plain_ref(b) => b.to_string(),
-            _ => return json!({"error": format!("repos/{slug}: no readable default_branch")}),
-        },
-        Err(e) => return json!({"error": e}),
-    };
-    let path = format!(
-        "repos/{slug}/actions/workflows/{CI_WORKFLOW}/runs?branch={branch}&event=push&per_page={CI_RUNS_PAGE}"
-    );
-    let body = match gh_text(&["api".into(), path]) {
-        Ok(t) => t,
-        Err(e) if e.contains("HTTP 404") => return json!({"branch": branch, "absent": true}),
-        Err(e) => return json!({"branch": branch, "error": e}),
-    };
-    let parsed: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => return json!({"branch": branch, "error": format!("ci runs: unreadable ({e})")}),
-    };
-    let Some(runs) = parsed["workflow_runs"].as_array() else {
-        return json!({"branch": branch, "error": "ci runs: no workflow_runs array"});
-    };
-    let runs: Vec<Value> = runs
-        .iter()
-        .map(|r| {
-            RUN_FIELDS
-                .iter()
-                .map(|f| (f.to_string(), r[*f].clone()))
-                .collect::<serde_json::Map<_, _>>()
-                .into()
-        })
-        .collect();
-    json!({"branch": branch, "runs": runs})
-}
-
-/// A branch name safe to put in a query string and a git revision
-/// unquoted.
-fn is_plain_ref(b: &str) -> bool {
-    !b.is_empty()
-        && !b.starts_with('-')
-        && b.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
-}
-
 // ---------- default-branch CI (CAD-267) ----------
-
-/// The workflow whose push runs are the default branch's CI verdict.
-/// Runs of any other workflow (Handover, …) never count.
-const CI_WORKFLOW: &str = "ci.yml";
-/// Push runs fetched per refresh — one per pushed SHA under the
-/// `queue: max` policy, so a page covers more SHAs than we classify.
-const CI_RUNS_PAGE: usize = 30;
-/// First-parent SHAs read from the local clone to place each run.
-const MAIN_CI_LOG: usize = 60;
-
-fn short(sha: &str) -> &str {
-    sha.get(..7).unwrap_or(sha)
-}
-
-/// `git log --first-parent` of `branch` in the local clone, newest
-/// first — `origin/<branch>` when the clone tracks it, else the local
-/// branch. Local refs only, never a fetch.
-fn first_parent_log(repo: &Path, branch: &str) -> Result<Vec<String>, String> {
-    let rev = [format!("origin/{branch}"), branch.to_string()]
-        .into_iter()
-        .find(|r| {
-            git_text(
-                repo,
-                &[
-                    "rev-parse".into(),
-                    "--verify".into(),
-                    "-q".into(),
-                    r.clone(),
-                ],
-            )
-            .is_ok()
-        })
-        .ok_or_else(|| format!("no {branch} ref in {}", repo.display()))?;
-    let text = git_text(
-        repo,
-        &[
-            "log".into(),
-            "--first-parent".into(),
-            format!("-{MAIN_CI_LOG}"),
-            "--format=%H".into(),
-            rev,
-        ],
-    )?;
-    Ok(text.lines().map(str::to_string).collect())
-}
-
-/// The `main_ci` block for one slug plus its needs-me rows.
-fn main_ci_view(
-    slug: &str,
-    project: &str,
-    data: &Value,
-    clone: Option<&Path>,
-    now: i64,
-) -> (Value, Vec<Item>) {
-    let block = &data["main_ci"];
-    // A cache body written before CAD-267 has no block — nothing to say.
-    if block.is_null() {
-        return (Value::Null, Vec::new());
-    }
-    let Some(branch) = block["branch"].as_str() else {
-        return (
-            json!({"slug": slug, "project": project, "error": block["error"]}),
-            Vec::new(),
-        );
-    };
-    if block["absent"].as_bool() == Some(true) {
-        return (Value::Null, Vec::new());
-    }
-    let Some(runs) = block["runs"].as_array() else {
-        return (
-            json!({"slug": slug, "project": project, "branch": branch, "error": block["error"]}),
-            Vec::new(),
-        );
-    };
-    let (first_parent, log_error) = match clone.map(|c| first_parent_log(c, branch)) {
-        Some(Ok(log)) => (log, None),
-        Some(Err(e)) => (Vec::new(), Some(e)),
-        None => (Vec::new(), Some("no local clone declared".to_string())),
-    };
-    let shas = classify_main_ci(runs, &first_parent);
-    let alerts = main_ci_alerts(&shas);
-    let subject = format!("{slug}@{branch}");
-    let run_at = |s: &ShaCi| s.created_at.as_deref().and_then(parse_iso);
-    let run_age = |s: &ShaCi| run_at(s).map(|t| now - t).unwrap_or(0);
-    let mut rows = Vec::new();
-    if let Some(s) = alerts.red {
-        let command = match s.run_id {
-            Some(id) => format!("gh run view {id} --repo {slug}"),
-            None => format!("gh run list --repo {slug} --workflow {CI_WORKFLOW} --branch {branch}"),
-        };
-        rows.push(
-            item(
-                90,
-                "ci_red",
-                &format!("{branch} CI failed at {} — {slug}", short(&s.sha)),
-                run_age(s),
-                project,
-                s.run_url.as_deref(),
-                &command,
-            )
-            .about("ci", &subject)
-            .since(run_at(s)),
-        );
-    }
-    if let Some(newest) = alerts.unverified.first() {
-        let n = alerts.unverified.len();
-        let what = format!("{} {}", short(&newest.sha), newest.state.as_str());
-        let desc = if n == 1 {
-            what
-        } else {
-            format!("{n} SHAs, newest {what}")
-        };
-        // Re-running the newest cancelled run covers every older one
-        // once it passes; a missing run has nothing to re-run.
-        let command = match (newest.state, newest.run_id) {
-            (CiState::Cancelled, Some(id)) => format!("gh run rerun {id} --repo {slug}"),
-            _ => format!("gh run list --repo {slug} --workflow {CI_WORKFLOW} --branch {branch}"),
-        };
-        rows.push(
-            item(
-                92,
-                "ci_unverified",
-                &format!("{branch} CI unverified: {desc}, no later SHA passed yet — {slug}"),
-                run_age(newest),
-                project,
-                newest.run_url.as_deref(),
-                &command,
-            )
-            .about("ci", &subject)
-            .since(run_at(newest)),
-        );
-    }
-    let view = json!({
-        "slug": slug,
-        "project": project,
-        "branch": branch,
-        "workflow": CI_WORKFLOW,
-        "order": if first_parent.is_empty() { "runs" } else { "first_parent" },
-        "log_error": log_error,
-        "shas": shas.iter().map(ShaCi::to_json).collect::<Vec<_>>(),
-    });
-    (view, rows)
-}
-
-/// The tracker project matching the repo this binary was built from:
-/// remote first (normalised both sides), then declared path against
-/// the build checkout. Returns the project key and the local clone to
-/// walk — the declared `path`, else the build root itself.
-fn build_repo_match(projects: &[project::Project]) -> Option<(String, PathBuf)> {
-    let build_remote = if BUILD_REMOTE == "unknown" {
-        None
-    } else {
-        Some(project::normalize_remote(BUILD_REMOTE))
-    };
-    let build_root = if BUILD_ROOT == "unknown" {
-        None
-    } else {
-        Some(
-            PathBuf::from(BUILD_ROOT)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(BUILD_ROOT)),
-        )
-    };
-    for p in projects {
-        for r in &p.repos {
-            let remote_hit = match (&build_remote, &r.remote) {
-                (Some(want), Some(have)) => project::normalize_remote(have) == *want,
-                _ => false,
-            };
-            let declared = r.path.as_deref().map(project::expand_home);
-            let path_hit = match (&build_root, &declared) {
-                (Some(want), Some(have)) => {
-                    have.canonicalize().unwrap_or_else(|_| have.clone()) == *want
-                }
-                _ => false,
-            };
-            if remote_hit || path_hit {
-                let repo = declared
-                    .clone()
-                    .or_else(|| build_root.clone())
-                    .unwrap_or_else(|| PathBuf::from("."));
-                return Some((p.key.clone(), repo));
-            }
-        }
-    }
-    None
-}
 
 /// The whole screen. `pm_dir` names the tracker dir (it may not exist
 /// — that just empties the tracker sections); `state_dir` names the
