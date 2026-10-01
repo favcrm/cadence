@@ -390,6 +390,7 @@ mod tests {
             "tests/delegated_approval.rs",
             "tests/daemon.rs",
             "docs/design/CONTRACT-TEMPLATE.md",
+            "docs/design/hosted-migration.md",
             "docs/cadence/project-context.yaml",
             "docs/START-HERE.md",
             "docs/ARCHITECTURE.md",
@@ -434,6 +435,19 @@ mod tests {
     fn risk_classes_doc_matches_the_compiled_lists() {
         let doc = include_str!("../docs/roles/risk-classes.md");
         let rp = RiskPaths::load();
+        // Every document the context manifest serves agents at runtime
+        // needs the operator, including any entry added later.
+        let manifest: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../docs/cadence/project-context.yaml")).unwrap();
+        let docs = manifest["documents"].as_sequence().unwrap();
+        assert!(!docs.is_empty());
+        for d in docs {
+            let path = d["path"].as_str().unwrap();
+            assert!(
+                matches!(rp.classify(path), PathClass::Operator(_)),
+                "context manifest entry {path} must need the operator"
+            );
+        }
         let ticks = |l: &str| -> Vec<String> {
             l.split('`')
                 .skip(1)

@@ -48,7 +48,7 @@ paths = ["src/rollout.rs", "src/update.rs", "src/upgrade.rs", "src/cli/rollout.r
 # Trigger 7: the rules, the gates, their inputs and their proofs. Never delegable.
 [trigger7]
 paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
-  "docs/design/CONTRACT-TEMPLATE.md", "docs/cadence/**", "docs/START-HERE.md",
+  "docs/design/**", "docs/cadence/**", "docs/START-HERE.md",
   "docs/ARCHITECTURE.md", "docs/BOARD.md",
   "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
   "src/audit.rs", "src/audit/**", "src/delegation.rs", "src/delegation/**",
