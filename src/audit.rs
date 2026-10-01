@@ -727,6 +727,10 @@ struct Note {
     /// The sha a `head …` line names — the verdict's reviewed head.
     head_sha: Option<String>,
     verdict: Option<String>,
+    /// CAD-959: the `## Verdict` section's word and the inline `Verdict:`
+    /// line's word, kept apart so a caller can see them disagree.
+    verdict_section: Option<String>,
+    verdict_inline: Option<String>,
     class: Option<String>,
     trigger: Option<String>,
     auditor_check: Option<String>,
@@ -852,14 +856,22 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
         ..Default::default()
     };
     let mut in_gates = false;
+    let mut past_header = false;
     for line in text.lines() {
         let t = line.trim();
         let lower = t.to_lowercase();
-        if let Some(rest) = t
-            .strip_prefix("From:")
-            .or_else(|| t.strip_prefix("> From:"))
-        {
-            note.from = Some(rest.trim().trim_matches('`').to_string());
+        // `From:` comes from the header, before the first `## ` heading,
+        // and the first one wins: a body line must not rename the reviewer.
+        if t.starts_with("## ") {
+            past_header = true;
+        }
+        if note.from.is_none() && !past_header {
+            if let Some(rest) = t
+                .strip_prefix("From:")
+                .or_else(|| t.strip_prefix("> From:"))
+            {
+                note.from = Some(rest.trim().trim_matches('`').to_string());
+            }
         }
         if note.issue.is_none() {
             if let Some(rest) = t
@@ -903,7 +915,7 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
             }
         }
         if let Some(rest) = t.to_lowercase().strip_prefix("verdict:") {
-            note.verdict = Some(
+            note.verdict_inline = Some(
                 rest.trim()
                     .trim_matches('`')
                     .split(' ')
@@ -1024,27 +1036,30 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
             }
         }
     }
-    // `## Verdict` section fallback — first non-empty line is the verdict.
-    if note.verdict.is_none() {
-        let mut seen = false;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.to_lowercase().starts_with("## verdict") {
-                seen = true;
-                continue;
-            }
-            if seen && !l.is_empty() {
-                note.verdict = Some(
-                    l.trim_matches('`')
-                        .split([' ', '—', '-'])
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                );
-                break;
-            }
+    // The `## Verdict` section (first non-empty line) outranks an inline
+    // `Verdict:` line: a body line must not override the verdict section.
+    let mut seen = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.to_lowercase().starts_with("## verdict") {
+            seen = true;
+            continue;
+        }
+        if seen && !l.is_empty() {
+            note.verdict_section = Some(
+                l.trim_matches('`')
+                    .split([' ', '—', '-'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            break;
         }
     }
+    note.verdict = note
+        .verdict_section
+        .clone()
+        .or_else(|| note.verdict_inline.clone());
     note
 }
 
@@ -1665,10 +1680,9 @@ fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
         if note.issue.as_deref() != Some(issue) {
             continue;
         }
-        let Some(stamp) = name_stamp(&name) else {
-            skipped.push(skip("the file name has no YYYYMMDD-HHMMSS stamp".into()));
-            continue;
-        };
+        // An unstamped note is still listed (stamp ""): a caller must be able
+        // to refuse on it, never lose it.
+        let stamp = name_stamp(&name).unwrap_or_default();
         if !note.prs.contains(&pr) {
             skipped.push(skip(format!("does not name PR #{pr}")));
             continue;
@@ -1686,11 +1700,26 @@ fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
         }
         let title = text.lines().next().unwrap_or("");
         let (kind, title_result) = title_kind_and_result(title, issue);
-        let section = note.verdict.clone().unwrap_or_default().to_lowercase();
-        let outcome = if title_result == section {
-            title_result.clone()
-        } else {
-            "disagree".to_string()
+        let section = note
+            .verdict_section
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        let inline = note
+            .verdict_inline
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        // Title, section and inline line must agree where present; any
+        // disagreement is a `conflict`, never a pass.
+        let mut words: Vec<&String> = [&title_result, &section, &inline]
+            .into_iter()
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.dedup();
+        let outcome = match words.as_slice() {
+            [one] => (*one).clone(),
+            _ => "conflict".to_string(),
         };
         let risk_raw = text
             .lines()
@@ -1703,7 +1732,7 @@ fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
             "name": name, "path": path.display().to_string(), "stamp": stamp,
             "reviewer": reviewer_identity(note.from.as_deref().unwrap_or("")),
             "from": note.from, "kind": kind, "outcome": outcome,
-            "title_outcome": title_result, "section_outcome": section,
+            "title_outcome": title_result, "section_outcome": section, "inline_outcome": inline,
             "risk": risk_raw, "head": head,
         }));
     }
@@ -3068,7 +3097,13 @@ mod tests {
         // The exact-title rule: a substring never makes a kind.
         assert_eq!(rows[3].1, "other");
         assert_eq!(rows[3].3, "");
-        assert_eq!(rows.len(), 4, "{rows:?}");
+        // The unstamped note stays in the list (stamp ""), so a caller can refuse on it.
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["stamp"] == "" && r["reviewer"] == "rev-f"));
         let why: Vec<String> = v["skipped"]
             .as_array()
             .unwrap()
@@ -3083,7 +3118,6 @@ mod tests {
             .collect();
         let has = |n: &str, r: &str| why.iter().any(|w| w.contains(n) && w.contains(r));
         assert!(has("070300", "not the full head"), "{why:?}");
-        assert!(has("nostamp", "no YYYYMMDD-HHMMSS"), "{why:?}");
         assert!(has("070500", "does not name PR #5"), "{why:?}");
         assert!(has("070700", "symlink"), "{why:?}");
         // Another issue's note is neither a verdict nor a skip.
@@ -3096,7 +3130,43 @@ mod tests {
         let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\nrevise — PR #5, head {HEAD}\n");
         std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
         let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
-        assert_eq!(v["verdicts"][0]["outcome"], "disagree");
+        assert_eq!(v["verdicts"][0]["outcome"], "conflict");
+    }
+
+    #[test]
+    fn a_body_from_line_never_renames_the_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: author\n\n## Verdict\npass — PR #5, head {HEAD}\n\nFrom: rev-y\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["reviewer"], "author");
+    }
+
+    #[test]
+    fn an_inline_verdict_line_cannot_override_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        // title pass, section revise, later inline "Verdict: pass".
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\nrevise — PR #5, head {HEAD}\n\nVerdict: pass (round 1)\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "conflict");
+        assert_eq!(v["verdicts"][0]["section_outcome"], "revise");
+        // Title and inline agree against the section: still a conflict.
+        let n = parse_note(Path::new("/x-verdict.md"), "x-verdict.md", &format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n\n## Verdict\nrevise — head {HEAD}\n\nVerdict: pass\n"));
+        assert_eq!(
+            n.verdict.as_deref(),
+            Some("revise"),
+            "the section outranks an inline line"
+        );
+    }
+
+    #[test]
+    fn title_section_and_inline_that_agree_are_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\npass — PR #5, head {HEAD}\n\nVerdict: pass\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "pass");
     }
 
     #[test]

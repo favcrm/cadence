@@ -472,6 +472,51 @@ class EnqueueReviewedTest(unittest.TestCase):
         dup['name'] = 'other-name-verdict.md'
         self.refused('cannot order two verdicts')
 
+    def test_a_later_revise_with_a_non_standard_title_still_refuses(self):
+        # P13: "Spec/security review round 2 — revise" has no recognised kind.
+        later = self.add_note('Spec/security review round 2', 'rev-spec', result='revise',
+                              stamp='20261001090000')
+        self.assertEqual(later['kind'], 'other')
+        self.refused('verdict by rev-spec on this head is not a pass', later['name'])
+
+    def test_an_unstamped_revise_always_refuses(self):
+        odd = self.add_note('Spec/security', 'rev-spec', result='revise', stamp='')
+        odd['stamp'] = ''
+        odd['name'] = 'rev-spec-verdict.md'
+        self.refused('has no stamp, so it cannot be ordered', 'rev-spec-verdict.md')
+
+    def test_an_unstamped_pass_counts_for_nothing(self):
+        self.drop(self.spec)
+        odd = self.add_note('Spec/security', 'rev-spec')
+        odd['stamp'] = ''
+        self.refused('no pass Spec/security verdict')
+
+    def test_a_later_pass_supersedes_a_non_standard_revise(self):
+        self.add_note('Spec/security review round 2', 'rev-spec', result='revise', stamp='20261001090000')
+        self.add_note('Spec/security', 'rev-spec', stamp='20261001100000')
+        self.comment()
+        self.assertEqual(self.run_script('--dry-run').returncode, 0)
+
+    def test_a_later_pass_of_an_unknown_kind_does_not_supersede(self):
+        self.spec['outcome'] = 'revise'
+        self.spec['stamp'] = '20261001060000'
+        self.add_note('Inspection', 'rev-spec', stamp='20261001090000')
+        self.refused('verdict by rev-spec on this head is not a pass')
+
+    def test_a_tie_older_than_the_reviewers_newest_stamp_is_not_reported(self):
+        a = self.add_note('Spec/security', 'rev-spec', result='revise', stamp='20261001060000')
+        b = self.add_note('Spec/security', 'rev-spec', result='revise', stamp='20261001060000')
+        b['name'] = 'twin-verdict.md'
+        self.add_note('Spec/security', 'rev-spec', stamp='20261001110000')
+        self.drop(self.spec)
+        self.comment()
+        r = self.run_script('--dry-run')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_conflicting_outcome_is_refused(self):
+        self.spec.update(outcome='conflict', title_outcome='pass', section_outcome='revise', inline_outcome='pass')
+        self.refused("outcome 'conflict'")
+
     def test_a_note_with_an_unknown_kind_counts_for_nothing(self):
         self.drop(self.spec)
         self.add_note('Browser QA inspection', 'rev-spec')

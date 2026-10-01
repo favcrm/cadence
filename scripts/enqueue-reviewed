@@ -265,34 +265,47 @@ def read_verdicts(notes_dir, issue, pr, head):
         raise RuntimeError(f"cannot read the verdict notes via `cadence audit verdicts` (rc {rc}): {(err or out).strip()[:200]}")
 
 
-def latest_per_reviewer_kind(verdicts):
-    """Latest note per (reviewer, kind), ordered by the file-name stamp (never
-    mtime). Returns (latest, ties): two files with one stamp for one
-    reviewer and kind cannot be ordered."""
-    best, ties = {}, []
-    for v in verdicts:
-        key = (v["reviewer"], v["kind"])
-        cur = best.get(key)
-        if cur is None or v["stamp"] > cur["stamp"]:
-            best[key] = v
-        elif v["stamp"] == cur["stamp"] and v["name"] != cur["name"]:
-            ties.append(f"{cur['name']} and {v['name']}")
-    return list(best.values()), ties
-
-
 def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
-    """(reasons, counted notes)."""
+    """(reasons, counted notes).
+
+    Every head-pinned note counts toward a refusal, whatever its kind or file
+    name: a non-pass note refuses unless the SAME reviewer has a later-stamped
+    pass of a recognised kind, and an unstamped non-pass note always refuses.
+    Notes are ordered by the file-name stamp, never mtime."""
     reasons, counted = [], []
-    latest, ties = latest_per_reviewer_kind([v for v in verdicts if v["kind"] != "other"])
-    for t in ties:
-        reasons.append(f"cannot order two verdicts by one reviewer with the same file-name stamp: {t}")
-    for n in latest:
+    by_reviewer = {}
+    for v in verdicts:
+        by_reviewer.setdefault(v["reviewer"], []).append(v)
+    for who, notes in sorted(by_reviewer.items()):
+        stamped = [n for n in notes if n["stamp"]]
+        passes = [n for n in stamped if n["outcome"] == "pass" and n["kind"] != "other"]
+        for n in notes:
+            if n["outcome"] == "pass":
+                continue
+            if n["stamp"] and any(p["stamp"] > n["stamp"] for p in passes):
+                continue  # superseded by a later pass of this reviewer
+            why = "" if n["stamp"] else "; the file name has no stamp, so it cannot be ordered"
+            reasons.append(
+                f"verdict by {who or '(no reviewer)'} on this head is not a pass "
+                f"(outcome '{n['outcome']}', title '{n['title_outcome']}', section '{n['section_outcome']}'){why}: {n['name']}")
+        if stamped:
+            newest = max(n["stamp"] for n in stamped)
+            names = sorted({n["name"] for n in stamped if n["stamp"] == newest})
+            if len(names) > 1:
+                reasons.append(f"cannot order two verdicts by one reviewer with the same file-name stamp: {' and '.join(names)}")
+    # Counted: the latest recognised, stamped note per (reviewer, kind), when it passes.
+    latest = {}
+    for v in verdicts:
+        if v["kind"] == "other" or not v["stamp"]:
+            continue
+        cur = latest.get((v["reviewer"], v["kind"]))
+        if cur is None or v["stamp"] > cur["stamp"]:
+            latest[(v["reviewer"], v["kind"])] = v
+    for n in latest.values():
         who = n["reviewer"]
         if n["outcome"] != "pass":
-            reasons.append(
-                f"verdict by {who} on this head is not a pass "
-                f"(title '{n['title_outcome']}', section '{n['section_outcome']}'): {n['name']}")
-        elif not who:
+            continue  # already refused above unless superseded
+        if not who:
             reasons.append(f"verdict note has no 'From:' reviewer: {n['name']}")
         elif who in authors:
             reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
