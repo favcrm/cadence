@@ -1,0 +1,35 @@
+{
+  "contract": "app-actions/v1",
+  "app": "ledger",
+  "title": "Ledger — account record actions",
+  "summary": "A second, synthetic app's action declarations — included to prove the grammar is not keyed to the CRM: a different app name, a different record kind and a different field set all validate identically.",
+  "actions": [
+    {
+      "id": "account.open",
+      "title": "Open account",
+      "operation": "record.create",
+      "record": "account",
+      "input": {
+        "fields": [
+          { "id": "holder", "label": "Account holder", "required": true },
+          { "id": "currency", "label": "Currency", "type": "enum", "values": ["usd", "eur", "gbp"] },
+          { "id": "opened_on", "label": "Opened on", "type": "date" },
+          { "id": "memo", "label": "Memo" }
+        ]
+      }
+    },
+    {
+      "id": "account.adjust",
+      "title": "Adjust account",
+      "operation": "record.update",
+      "record": "account",
+      "input": {
+        "fields": [
+          { "id": "memo", "label": "Memo" },
+          { "id": "reviewed_at", "label": "Reviewed at", "type": "datetime" },
+          { "id": "flags", "label": "Flags", "type": "tags", "maxItems": 4 }
+        ]
+      }
+    }
+  ]
+}
