@@ -5004,6 +5004,101 @@ fn cad378_bad_areas_config_is_reported_not_fatal() {
     assert!(!ok && err.to_string().contains("file-level"), "{err}");
 }
 
+/// CAD-874: PROJECT.md is agent-writable. A control or bidi byte
+/// planted (as a YAML escape, so the parsed value really carries it) in
+/// an area name and a milestone status must not reach any rendered
+/// diagnostic: `issue lint`, `overview --json` (`areas_error` and
+/// `config_error`) or `issue start` (`leases.config_error`). The walk
+/// checks every JSON string value and key — `Value::to_string()` would
+/// escape ESC as `\u001b` and never trip.
+#[test]
+fn cad874_project_md_diagnostics_are_scrubbed() {
+    fn dirty(c: char) -> bool {
+        (c.is_control() && !matches!(c, '\n' | '\t'))
+            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+    }
+    fn walk(v: &Value, at: &str, what: &str) {
+        match v {
+            Value::String(s) => {
+                if let Some(c) = s.chars().find(|c| dirty(*c)) {
+                    panic!("{what}: U+{:04X} survived at {at}: {s:?}", c as u32);
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, at, what)),
+            Value::Object(m) => m.iter().for_each(|(k, x)| {
+                walk(&Value::String(k.clone()), at, what);
+                walk(x, &format!("{at}.{k}"), what);
+            }),
+            _ => {}
+        }
+    }
+    let f = PlanFixture::start();
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "new", "Epic", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-2", "type=epic"]);
+    assert!(ok, "{out}");
+    // Literal backslash escapes in the file: the YAML parser turns them
+    // into ESC, RLO and BEL inside the area name and the status.
+    std::fs::write(
+        f.pm_dir.join("demo/PROJECT.md"),
+        concat!(
+            "---\n",
+            "areas:\n",
+            "  \"x\\e[2J\\u202e\\a\":\n",
+            "    paths: [src/a.rs]\n",
+            "    owner: pm-own\n",
+            "milestones: [{id: m, status: \"bo\\e[31m\\u202egus\\a\"}]\n",
+            "---\n",
+        ),
+    )
+    .unwrap();
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "a bad config is a warning: {lint}");
+    let text = lint.to_string();
+    assert!(text.contains("unknown variant"), "{lint}");
+    walk(&lint, "lint", "issue lint");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    assert!(
+        start["leases"]["config_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("PROJECT.md areas")),
+        "{start}"
+    );
+    walk(&start, "start", "issue start");
+    let (ok, view) = f.cli(&["overview", "--json"]);
+    assert!(ok, "{view}");
+    let demo = view["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "demo")
+        .unwrap();
+    assert!(
+        demo["areas_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("PROJECT.md areas")),
+        "{demo}"
+    );
+    walk(&view, "overview", "overview --json");
+    // The work-config side: an epic's work block carries `config_error`.
+    let (ok, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    assert!(ok, "{show}");
+    assert!(
+        show["work"]["config_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unknown variant")),
+        "the work config_error must be present, not vacuously clean: {show}"
+    );
+    walk(&show["work"], "work", "issue show --json work");
+    let (ok, epics) = f.cli(&["issue", "epic", "ls", "--json"]);
+    assert!(ok, "{epics}");
+    walk(&epics, "epic ls", "issue epic ls --json");
+}
+
 /// A lane with a PR that changes files in an area owned by someone
 /// else is a Needs-you `area_ack` row, for the owner's PM, until the
 /// owner acks it through the daemon. Adversarial: a tracker comment of

@@ -1263,6 +1263,18 @@ mod tests {
         .to_string();
         assert!(err.contains("PROJECT.md areas"), "{err}");
         dirty(&err);
+        // The echoes the review proved vacuous before: libyaml rejects a
+        // raw control byte, so plant them as YAML escapes — the parsed
+        // key carries RLO or ESC, and serde echoes it in `unknown field`.
+        for areas in [
+            "  x:\n    paths: [a]\n    \"own\\u202eer\": 1\n",
+            "  \"x\\e[2J\":\n    paths: [a]\n    owner: 'pm'\n    bogus: 1\n",
+        ] {
+            let err = parse_config(&cfg(areas)).unwrap_err().to_string();
+            assert!(err.contains("PROJECT.md areas"), "{areas}: {err}");
+            assert!(err.contains("unknown field"), "{areas}: {err}");
+            dirty(&err);
+        }
         // A semantic field error echoes the rejected area name/path/owner.
         for areas in [
             "  x:\n    paths: [src/a\u{7}.rs]\n    owner: pm\n",
