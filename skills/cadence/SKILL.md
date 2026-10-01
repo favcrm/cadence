@@ -239,6 +239,20 @@ cadence agent probe <worker>                        # is the pane idle? (pty)
 cadence agent set <worker> auto_ready=verified      # daemon verifies idle
                                                     #  itself before pasting
 cadence message ask <worker> --text "q" --wait 60   # send + wait for done
+cadence agent wait <worker>                       # block until it reports,
+                                                    #  idles or needs attention
+                                                    #  (default --until any;
+                                                    #  --until reported|idle|
+                                                    #  attention; --timeout 10m;
+                                                    #  exit 0 met, 75 timeout).
+                                                    #  Never poll `agent show`/
+                                                    #  `capture`/`probe` in a loop
+                                                    #  asking "is it done yet" —
+                                                    #  one `wait` replaces the loop.
+                                                    #  A turn that ends without a
+                                                    #  report (interrupted/unknown/
+                                                    #  cancelled) returns
+                                                    #  `reason: settled`, never hangs.
 cadence events <worker> --follow                    # watch results land
 cadence attach [name]                               # open a live terminal
 cadence resume <group>                              # PM-first group resume + attach

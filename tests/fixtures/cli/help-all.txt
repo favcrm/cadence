@@ -57,6 +57,7 @@ All commands (one line per path):
     agent list
     agent show
     agent requests
+    agent wait
     agent respond
     agent unfence
     agent stop
