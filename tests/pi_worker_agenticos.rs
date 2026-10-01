@@ -177,7 +177,7 @@ fn agenticos_worker_refuses_existing_auth_without_deleting_it_or_launching() {
     let config = root.path().join("state/agents/w/pi");
     std::fs::create_dir_all(&config).unwrap();
     let auth = config.join("auth.json");
-    let original = b"synthetic-existing-worker-login";
+    let original = br#"{"openrouter":{"key":"synthetic-existing-worker-login"}}"#;
     std::fs::write(&auth, original).unwrap();
     let result = open_worker(root.path());
     if let Ok(ad) = &result {
@@ -187,4 +187,18 @@ fn agenticos_worker_refuses_existing_auth_without_deleting_it_or_launching() {
     assert_eq!(std::fs::read(&auth).unwrap(), original);
     assert!(!config.join("models.json").exists());
     assert!(!root.path().join("state/agents/pi-record-w.json").exists());
+}
+
+#[test]
+fn agenticos_worker_can_resume_with_pis_empty_auth_store() {
+    let root = tempfile::tempdir().unwrap();
+    operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
+    let config = root.path().join("state/agents/w/pi");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("auth.json"), b"{}").unwrap();
+    for _ in 0..2 {
+        let ad = open_worker(root.path()).unwrap();
+        ad.close();
+    }
+    assert_eq!(std::fs::read(config.join("auth.json")).unwrap(), b"{}");
 }
