@@ -29,6 +29,7 @@ use common::in_own_process;
 use cadence_agent::issue::app_source::{resolve, SelectedGitSource};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -842,4 +843,60 @@ fn resolve_writes_no_tracker_state() {
         .collect();
     assert_eq!(before, after, "resolver mutated the fixture repo");
     drop(bundle);
+}
+
+#[test]
+fn aggregate_bundle_bytes_refuse() {
+    if !in_own_process("aggregate_bundle_bytes_refuse", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    // Each file is below 256 KiB and count is below 128, but their
+    // aggregate exceeds the independent 2 MiB snapshot bound.
+    let f = GitFixture::new(|repo| {
+        let body = "x".repeat(240 * 1024);
+        for i in 0..9 {
+            put(repo, &format!("templates/large-{i}.txt"), &body);
+        }
+    });
+    use_bin(&f, &orig_path);
+    assert!(resolve(&f.source(&f.sha2)).is_err());
+}
+
+#[test]
+fn non_utf8_member_name_refuses() {
+    if !in_own_process("non_utf8_member_name_refuses", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    let f = GitFixture::new(|repo| {
+        put(repo, "workflows/triage.md", "# triage\nwf-v2\n");
+        let dir = repo.join(FIXTURE_DIR).join("templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(OsString::from_vec(vec![b'x', 0xff])), "text\n").unwrap();
+    });
+    use_bin(&f, &orig_path);
+    assert!(resolve(&f.source(&f.sha2)).is_err());
+}
+
+#[test]
+fn resolved_bundle_owns_and_cleans_its_temporary_files() {
+    if !in_own_process("resolved_bundle_owns_and_cleans_its_temporary_files", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    let f = GitFixture::basic();
+    let resolver_temp = f._dir.path().join("resolver-temp");
+    std::fs::create_dir(&resolver_temp).unwrap();
+    std::env::set_var("TMPDIR", &resolver_temp);
+    use_bin(&f, &orig_path);
+
+    let bundle = resolve(&f.source(&f.sha1)).unwrap();
+    assert!(std::fs::read_dir(&resolver_temp).unwrap().count() > 0);
+    assert!(bundle.files["workflows/triage.md"].contains("wf-v1"));
+    drop(bundle);
+    assert_eq!(std::fs::read_dir(&resolver_temp).unwrap().count(), 0);
+
+    assert!(resolve(&f.source(&"1".repeat(40))).is_err());
+    assert_eq!(std::fs::read_dir(&resolver_temp).unwrap().count(), 0);
 }
