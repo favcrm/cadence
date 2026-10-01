@@ -3278,12 +3278,15 @@ impl Shared {
                     "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
                 );
                 write_failed_shutdown_marker(&self.state_dir, &self.instance, &e.to_string());
-                // A drain refused by an already-tripped lease fence is
-                // the fence's own consequence, not a new fault: writes
-                // have been refused since the trip and the fence reason
-                // already reports why. The marker still carries the
-                // evidence; the stop itself exits cleanly (CAD-538).
-                if self.store.fence_reason().is_some() {
+                // A drain the lease fence itself refused is the fence's
+                // consequence, not a new fault: writes have been
+                // refused since the trip and the fence reason already
+                // reports why. The marker still carries the evidence;
+                // the stop exits cleanly (CAD-538). The cause is the
+                // typed refusal on THIS error — never the fence's
+                // later state, which a real fault followed by a trip
+                // or TTL expiry would also satisfy.
+                if e.is_fenced() {
                     return Ok(());
                 }
                 return Err(Error::internal(format!("shutdown entries failed: {e}")));
@@ -4218,6 +4221,11 @@ pub struct ServeOptions {
     /// before the checkpoint — park it to hold the flush open while the
     /// exit tail's budget lapses. Production leaves it unset.
     pub flush_gate_for_test: Option<FlushGate>,
+    /// Test seam (CAD-694): runs as the flush worker's last act — its
+    /// completion receipt, so a test that parks the worker can wait for
+    /// its late completion instead of racing it. Production leaves it
+    /// unset.
+    pub flush_done_for_test: Option<FlushGate>,
     /// Test seam (CAD-694): replaces the flush bound the exit tail
     /// waits on — a test proves the withheld-release path without
     /// paying a real lease `flush_timeout`. Production leaves it unset.
@@ -4674,6 +4682,7 @@ fn release_lease_tail(
             .unwrap_or_else(|| flush_budget(hosted, shared.lease.as_deref())),
         opts.flush_delay_for_test.unwrap_or_default(),
         opts.flush_gate_for_test.clone(),
+        opts.flush_done_for_test.clone(),
     );
     if let Some(heartbeat) = &mut heartbeat {
         heartbeat.stop();

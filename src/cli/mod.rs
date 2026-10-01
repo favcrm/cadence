@@ -2154,13 +2154,20 @@ pub(crate) fn daemon_restart(
     }
     let started = client::daemon_start_as(state_dir, Some(&caller.identity))?;
     // CAD-694: the recovery-record verdict binds to the instance THIS
-    // start returned — the health answer pid-matched to the spawned
-    // child — never to whatever instance/record files a later boot or a
-    // failed write left on disk. A restart that raced us past this
-    // point can only replace the files, and the record then names a
-    // different run than the one we asked for: fail closed, never clean
-    // on another run's evidence.
+    // start spawned. Only a `started` receipt pid-matches its health
+    // answer to the spawned child; an `already_running` receipt carries
+    // whichever daemon held the socket (a concurrent restart's), so it
+    // binds nothing: the restart fails closed on it, never clean on
+    // another run's evidence.
     let started_instance = started_instance(&started);
+    let start_unbound = started["state"].as_str() != Some("started");
+    if start_unbound {
+        eprintln!(
+            "restart: the start answered {} — that daemon is not the one this restart \
+             spawned, so its recovery evidence is not bound to this restart",
+            started["state"].as_str().unwrap_or("with no state")
+        );
+    }
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
     // and `offline` (actor exited under shutdown). Stopped and fenced
@@ -2242,7 +2249,7 @@ pub(crate) fn daemon_restart(
         .filter_map(|a| a["alias"].as_str().map(|al| (al, a)))
         .collect();
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
-    let mut bad = false;
+    let mut bad = start_unbound;
     // CAD-694: the successor's recovery record is drain evidence the
     // cursors cannot always carry — a predecessor already dead gave
     // none, and non-pty endpoints were never scanned. The record is
@@ -2458,16 +2465,25 @@ fn recovery_record_verdict(state_dir: &Path, started_id: Option<&str>) -> Option
                 .to_string(),
         );
     };
-    let current = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
-        .ok()
-        .map(|s| s.trim().to_string());
-    let record = std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok());
-    let (Some(current), Some(record)) = (current, record) else {
+    let Some(current) =
+        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::INSTANCE_FILE))
+            .ok()
+            .map(|s| s.trim().to_string())
+    else {
         return Some(
-            "the new daemon left no readable recovery record — the predecessor's \
+            "the new daemon left no readable instance file — the predecessor's \
              drain cannot be verified"
+                .to_string(),
+        );
+    };
+    let Some(record) =
+        std::fs::read_to_string(state_dir.join(cadence_agent::daemon::LAST_RECOVERY_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<RecoveryRecordView>(&raw).ok())
+    else {
+        return Some(
+            "the new daemon left no readable recovery record (missing or malformed) — \
+             the predecessor's drain cannot be verified"
                 .to_string(),
         );
     };

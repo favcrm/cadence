@@ -3487,8 +3487,12 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
                 rusqlite::ffi::SQLITE_LOCKED,
             ])));
         let pending = std::sync::Arc::clone(&faults);
+        // When each attempt reached the hook — the observable backoff.
+        let stamps = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let stamped = std::sync::Arc::clone(&stamps);
         let d = TestDaemon::start_opts(daemon::ServeOptions {
             shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+                stamped.lock().unwrap().push(std::time::Instant::now());
                 match pending.lock().unwrap().pop_front() {
                     Some(code) => Err(injected_sqlite_err(code)),
                     None => Ok(()),
@@ -3542,6 +3546,21 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
             faults.lock().unwrap().len() < 3,
             "no injected fault was reached: the drain never ran its retry bound"
         );
+        // The backoff schedule is the production one (50ms x attempt):
+        // consecutive attempts are separated by at least that sleep.
+        // Contention only adds time, so these are lower bounds; a zero
+        // backoff would fail here.
+        let stamps = stamps.lock().unwrap();
+        for (i, pair) in stamps.windows(2).enumerate() {
+            let floor = std::time::Duration::from_millis(50 * (i as u64 + 1));
+            assert!(
+                pair[1].duration_since(pair[0]) >= floor,
+                "attempt {} followed attempt {} sooner than the {floor:?} backoff",
+                i + 2,
+                i + 1
+            );
+        }
+        drop(stamps);
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         let refusals: i64 = conn
             .query_row(

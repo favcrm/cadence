@@ -1091,6 +1091,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // No flush gate/budget override, relaunch fault, or shutdown
         // backoff unless a test pins them — production never sets any.
         flush_gate_for_test: None,
+        flush_done_for_test: None,
         flush_budget_for_test: None,
         relaunch_fault_for_test: None,
         shutdown_backoff_ms_for_test: None,

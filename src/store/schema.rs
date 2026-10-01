@@ -1265,10 +1265,15 @@ impl Store {
     /// would roll the agent row back to the old generation — instead
     /// the row is refused now and fences on restart like any other
     /// refusal.
+    ///
+    /// The error's cause is typed at its source: [`ShutdownDrainError::Fenced`]
+    /// only when the write fence refused the write, so a caller never
+    /// re-reads the (mutable, time-dependent) fence to guess why a
+    /// drain failed.
     pub fn shutdown_entries(
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
-    ) -> Result<Vec<AdoptEntry>> {
+    ) -> std::result::Result<Vec<AdoptEntry>, ShutdownDrainError> {
         // The drain must not lose its adoption evidence to a racing
         // writer: a rollout/audit commit landing between the in-flight
         // scan and the event writes fails the write upgrade as BUSY —
@@ -1278,7 +1283,9 @@ impl Store {
         let mut attempt = 0u32;
         loop {
             let result = {
-                let conn = self.write_conn()?;
+                // `write_conn` fails only on the fence: that refusal is
+                // the one typed-fenced cause.
+                let conn = self.write_conn().map_err(ShutdownDrainError::Fenced)?;
                 self.shutdown_entries_tx(&conn, facts)
             };
             match result {
@@ -1292,7 +1299,7 @@ impl Store {
                         self.shutdown_backoff_ms * u64::from(attempt),
                     ));
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(ShutdownDrainError::Failed(e.into())),
             }
         }
     }
@@ -1380,6 +1387,39 @@ impl Store {
         }
         tx.commit()?;
         Ok(entries)
+    }
+}
+
+/// Why [`Store::shutdown_entries`] failed, decided where the error is
+/// produced (CAD-694): the lease fence refusing the write, or a fault
+/// of the drain itself.
+#[derive(Debug)]
+pub enum ShutdownDrainError {
+    /// The hosted-lease fence refused the write — the fence's own
+    /// consequence, not a new fault (CAD-538).
+    Fenced(crate::Error),
+    /// The store failed the drain: a real fault, whatever the fence
+    /// says afterwards.
+    Failed(crate::Error),
+}
+
+impl ShutdownDrainError {
+    pub fn is_fenced(&self) -> bool {
+        matches!(self, Self::Fenced(_))
+    }
+
+    pub fn into_error(self) -> crate::Error {
+        match self {
+            Self::Fenced(e) | Self::Failed(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for ShutdownDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fenced(e) | Self::Failed(e) => e.fmt(f),
+        }
     }
 }
 

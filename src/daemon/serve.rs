@@ -434,11 +434,15 @@ pub(super) fn lease_flush(
     budget: Duration,
     slow: Duration,
     gate: Option<crate::daemon::FlushGate>,
+    done: Option<crate::daemon::FlushGate>,
 ) -> bool {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let leased = shared.lease.is_some();
     let shared = Arc::clone(shared);
-    thread::spawn(move || {
+    let cancel = Arc::new(crate::issue::FlushCancel::default());
+    let worker_cancel = Arc::clone(&cancel);
+    let worker = thread::spawn(move || {
+        let cancel = worker_cancel;
         // Test seam (CAD-694): a parked gate models a flush still in
         // flight when the budget lapses — the tail must then keep the
         // lease rather than release under a live writer.
@@ -456,13 +460,21 @@ pub(super) fn lease_flush(
             Err(e) => eprintln!("cadence: shutdown flush — WAL checkpoint failed: {e}"),
         }
         if leased {
-            match shared.pm().map(|pm| pm.flush_pending(DAEMON_ALIAS)) {
+            match shared
+                .pm()
+                .map(|pm| pm.flush_pending_cancellable(DAEMON_ALIAS, &cancel))
+            {
                 Err(e) => eprintln!("cadence: shutdown flush — tracker flush skipped: {e}"),
                 Ok(Err(e)) => eprintln!("cadence: shutdown flush — tracker flush refused: {e}"),
                 Ok(Ok(_)) => {}
             }
         }
         let _ = tx.send(());
+        // Test seam (CAD-694): the worker's completion receipt, so a
+        // test owns the late completion instead of racing it.
+        if let Some(done) = done {
+            done();
+        }
     });
     // The send is the worker's completion proof — every write it owns
     // (checkpoint, the synchronous `git commit`) finished by then.
@@ -470,10 +482,31 @@ pub(super) fn lease_flush(
     // release the lease under it.
     if rx.recv_timeout(budget).is_err() {
         eprintln!("cadence: shutdown flush exceeded {budget:?} — completion unproven");
+        // The budget lapsed: the worker may still own a `git commit`.
+        // Cancel it and wait (bounded) for the worker to unwind, so no
+        // commit of ours can land after the lease transfers by TTL.
+        // Release stays withheld either way: completion is unproven.
+        cancel.cancel();
+        let unwind = Instant::now() + FLUSH_CANCEL_JOIN;
+        while !worker.is_finished() && Instant::now() < unwind {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        } else {
+            eprintln!(
+                "cadence: shutdown flush worker still running after cancel — \
+                 it is outside the tracker commit (checkpoint or a parked seam)"
+            );
+        }
         return false;
     }
     true
 }
+
+/// How long the tail waits for a cancelled flush worker to unwind: the
+/// commit's SIGTERM grace plus its reap, with margin.
+const FLUSH_CANCEL_JOIN: Duration = Duration::from_millis(2500);
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
 /// `[host]` in the repo's pm.yaml, then the built-in defaults.
