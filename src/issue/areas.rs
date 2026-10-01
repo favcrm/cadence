@@ -187,7 +187,12 @@ pub fn parse_config(text: &str) -> Result<Vec<Area>> {
         return Ok(vec![]);
     }
     let (yaml, _) = parse::split_front(trimmed)?;
-    let bad = |m: String| Error::rejected(format!("PROJECT.md areas: {m}"));
+    // Rejected section text (the area name, a path, an owner, a
+    // serde_yaml echo) is embedded in these messages; scrub it so a
+    // control character or a bidi/format mark can never reach a lint
+    // warning or a `project ls` note. Matching stays raw — this is
+    // display only.
+    let bad = |m: String| Error::rejected(format!("PROJECT.md areas: {}", scrub(&m)));
     let raw: Raw = serde_yaml::from_str(yaml).map_err(|e| bad(e.to_string()))?;
     let mut out = Vec::new();
     for (name, a) in raw.areas.unwrap_or_default() {
@@ -224,23 +229,28 @@ pub fn parse_config(text: &str) -> Result<Vec<Area>> {
 fn parse_owner(owner: &str) -> std::result::Result<(Option<String>, Option<String>), String> {
     let (mut epic, mut pm) = (None, None);
     let parts: Vec<&str> = owner.split('/').map(str::trim).collect();
+    // `owner`/`part` are agent-writable echoes; the display copies are
+    // scrubbed while the checks below read the raw strings.
     if owner.trim().is_empty() || parts.len() > 2 {
         return Err(format!(
-            "owner '{owner}' — an epic id, a PM alias, or 'EPIC/pm-alias'"
+            "owner '{}' — an epic id, a PM alias, or 'EPIC/pm-alias'",
+            scrub(owner)
         ));
     }
     for part in parts {
         if model::valid_id(part) {
             if epic.replace(part.to_string()).is_some() {
-                return Err(format!("owner '{owner}' names two epics"));
+                return Err(format!("owner '{}' names two epics", scrub(owner)));
             }
         } else if crate::issue::claim::check_alias(part, "owner").is_ok() {
             if pm.replace(part.to_string()).is_some() {
-                return Err(format!("owner '{owner}' names two PMs"));
+                return Err(format!("owner '{}' names two PMs", scrub(owner)));
             }
         } else {
             return Err(format!(
-                "owner '{owner}': '{part}' is neither an issue id nor an alias"
+                "owner '{}': '{}' is neither an issue id nor an alias",
+                scrub(owner),
+                scrub(part)
             ));
         }
     }
@@ -252,7 +262,10 @@ fn parse_owner(owner: &str) -> std::result::Result<(Option<String>, Option<Strin
 /// segments, and a trailing `/` (or a plain directory path) everything
 /// under it.
 pub fn check_path(p: &str) -> Result<()> {
-    let bad = |why: &str| Err(Error::rejected(format!("path '{p}' {why}")));
+    // `p` is agent-writable and echoed raw into the message; scrub the
+    // display copy so a control/format byte never reaches a warning —
+    // the match below still reads `p` itself.
+    let bad = |why: &str| Err(Error::rejected(format!("path '{}' {why}", scrub(p))));
     if p.is_empty() {
         return bad("is empty");
     }
@@ -1230,6 +1243,37 @@ mod tests {
         assert!(err.contains("PROJECT.md areas"), "{err}");
     }
 
+    /// CAD-874: a planted control or bidi/format mark inside a YAML
+    /// echo or a semantic field is display-scrubbed — the parse still
+    /// fails closed, the message still names the field and why, but no
+    /// control/format byte reaches a lint warning or `project ls` note.
+    #[test]
+    fn bad_areas_config_is_display_scrubbed() {
+        // `scrub` is the display filter — a clean message is unchanged
+        // by it; this test fails while any path echoes raw bytes.
+        let dirty = |s: &str| {
+            assert_eq!(scrub(s), s, "unscrubbed bytes in {s:?}");
+        };
+        // A serde_yaml echo carries the offending line (with its control
+        // byte and bidi mark) into the message raw.
+        let err = parse_config(
+            "---\nareas:\n  x:\n    paths: [a]\n    owner: \"pm\u{7}\u{202e}\"\n---\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("PROJECT.md areas"), "{err}");
+        dirty(&err);
+        // A semantic field error echoes the rejected area name/path/owner.
+        for areas in [
+            "  x:\n    paths: [src/a\u{7}.rs]\n    owner: pm\n",
+            "  x:\n    paths: [a]\n    owner: 'pm\u{202e}'\n",
+        ] {
+            let err = parse_config(&cfg(areas)).unwrap_err().to_string();
+            assert!(err.contains("PROJECT.md areas"), "{areas}: {err}");
+            dirty(&err);
+        }
+    }
+
     #[test]
     fn planned_paths_parse_and_refuse() {
         assert_eq!(
@@ -1570,6 +1614,19 @@ mod tests {
         }
         // The lease comment path is the same lines.
         for line in warning_lines(&json!({"warnings": ws, "config_error": null})) {
+            assert!(
+                !line.chars().any(|c| c.is_control() || is_format(c)),
+                "{line:?}"
+            );
+        }
+        // CAD-874: the same boundary defends a caller-built block whose
+        // config_error was planted unscrubbed — the reader scrubs at
+        // construction, but a hand-made or replayed block must not leak
+        // a control/format byte into the comment/terminal line either.
+        for line in warning_lines(&json!({
+            "warnings": [],
+            "config_error": "k/PROJECT.md areas: area 'x\u{7}\u{202e}' bad",
+        })) {
             assert!(
                 !line.chars().any(|c| c.is_control() || is_format(c)),
                 "{line:?}"

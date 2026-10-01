@@ -199,8 +199,12 @@ pub fn parse_config(text: &str) -> Result<WorkConfig> {
         return Ok(WorkConfig::default());
     }
     let (yaml, _) = parse::split_front(trimmed)?;
-    let raw: Raw = serde_yaml::from_str(yaml)
-        .map_err(|e| Error::rejected(format!("PROJECT.md frontmatter: {e}")))?;
+    let raw: Raw = serde_yaml::from_str(yaml).map_err(|e| {
+        Error::rejected(format!(
+            "PROJECT.md frontmatter: {}",
+            crate::issue::areas::scrub(&e.to_string())
+        ))
+    })?;
     let mut cfg = WorkConfig::default();
     if let Some(stages) = raw.stages {
         cfg.stages = stages
@@ -266,16 +270,20 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
         if !model::valid_tag(&s.id) {
             return bad(format!(
                 "stage '{}' — 1-32 lowercase letters, digits or hyphens",
-                s.id
+                crate::issue::areas::scrub(&s.id)
             ));
         }
         if !seen.insert(s.id.as_str()) {
-            return bad(format!("stage '{}' is listed twice", s.id));
+            return bad(format!(
+                "stage '{}' is listed twice",
+                crate::issue::areas::scrub(&s.id)
+            ));
         }
     }
     if let Some(op) = cfg.operator_stages.iter().find(|o| cfg.index(o).is_none()) {
         return bad(format!(
-            "operator_stages names '{op}', which is not a stage"
+            "operator_stages names '{}', which is not a stage",
+            crate::issue::areas::scrub(op)
         ));
     }
     if cfg.stage_limit_days == 0 {
@@ -286,11 +294,14 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
         if !model::valid_tag(&m.id) {
             return bad(format!(
                 "milestone '{}' — 1-32 lowercase letters, digits or hyphens",
-                m.id
+                crate::issue::areas::scrub(&m.id)
             ));
         }
         if !seen.insert(m.id.as_str()) {
-            return bad(format!("milestone '{}' is listed twice", m.id));
+            return bad(format!(
+                "milestone '{}' is listed twice",
+                crate::issue::areas::scrub(&m.id)
+            ));
         }
         for (field, date) in [
             ("start_date", &m.start_date),
@@ -301,7 +312,7 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
                 if date_epoch(date).is_none() {
                     return bad(format!(
                         "milestone '{}' {field} must be a real YYYY-MM-DD date",
-                        m.id
+                        crate::issue::areas::scrub(&m.id)
                     ));
                 }
             }
@@ -310,21 +321,25 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
             if start > target {
                 return bad(format!(
                     "milestone '{}' start_date is after target_date",
-                    m.id
+                    crate::issue::areas::scrub(&m.id)
                 ));
             }
         }
         if m.completed_date.is_some() && m.status != MilestoneStatus::Achieved {
             return bad(format!(
                 "milestone '{}' completed_date requires status: achieved",
-                m.id
+                crate::issue::areas::scrub(&m.id)
             ));
         }
     }
     for m in &cfg.milestones {
         for dependency in &m.depends_on {
             if !seen.contains(dependency.as_str()) || dependency == &m.id {
-                return bad(format!("milestone '{}' depends_on must name another declared milestone: '{dependency}'", m.id));
+                return bad(format!(
+                    "milestone '{}' depends_on must name another declared milestone: '{}'",
+                    crate::issue::areas::scrub(&m.id),
+                    crate::issue::areas::scrub(dependency)
+                ));
             }
         }
     }
@@ -1284,6 +1299,43 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "{yaml}: {err}");
+        }
+    }
+
+    /// CAD-874: a planted control or bidi/format mark inside a YAML
+    /// echo or a semantic field is display-scrubbed — the parse still
+    /// fails closed and the message still names the field and why, but
+    /// no control/format byte reaches a lint warning or `project ls`
+    /// note.
+    #[test]
+    fn bad_work_config_is_display_scrubbed() {
+        // `areas::scrub` is the shared display filter — a clean message
+        // is unchanged by it.
+        let dirty = |s: &str| {
+            assert_eq!(
+                crate::issue::areas::scrub(s),
+                s,
+                "unscrubbed bytes in {s:?}"
+            );
+        };
+        // A serde_yaml echo carries the offending line (with its control
+        // byte and bidi mark) into the message raw.
+        let err = parse_config("---\nstages: [a, \"b\u{7}\u{202e}\"]\n---\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PROJECT.md"), "{err}");
+        dirty(&err);
+        // A semantic field error echoes the rejected stage/milestone id.
+        for yaml in [
+            "stages: [a, 'b\u{7}']",
+            "stages: [a, 'b\u{202e}']",
+            "milestones: [{id: 'm\u{202e}'}]",
+        ] {
+            let err = parse_config(&format!("---\n{yaml}\n---\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("PROJECT.md"), "{yaml}: {err}");
+            dirty(&err);
         }
     }
 
