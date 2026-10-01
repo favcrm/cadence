@@ -720,24 +720,47 @@ fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
     assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
 }
 
-/// CAD-694: a short but valid lease (TTL 2s, renew 1s) must still get
-/// its stop flush. The commit floor derives from the lease's own margin;
-/// a fixed floor above the validity one missed beat leaves would refuse
-/// every commit (CAD-538 regression).
+/// CAD-694: a lease with a short MARGIN (TTL 6s, renew 5s: one missed
+/// beat leaves 1s) must still get its stop flush. The commit floor
+/// derives from that margin (500ms); a fixed 2s floor would refuse every
+/// commit made in the last 2s before a renewal (CAD-538 regression).
+/// The TTL leaves startup room (the heartbeat starts after recovery);
+/// the stop is requested only once the lease is inside that last 2s
+/// window, so the short-margin floor path is what decides the commit.
 #[test]
-fn cad694_short_ttl_lease_still_flushes_on_stop() {
+fn cad694_short_margin_lease_still_flushes_on_stop() {
     suite_slot();
     let dir = TempDir::new().unwrap();
-    let pm_dir = hosted_pm(dir.path(), 2, 1);
+    let pm_dir = hosted_pm(dir.path(), 6, 5);
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
-    let mut opts = leased_opts(dir.path(), 2);
+    let mut opts = daemon_opts();
+    opts.lease = Some(Hosted {
+        lease: Some(format!("file:{}", lease_file(dir.path()).display())),
+        lease_ttl_secs: Some(6),
+        lease_renew_secs: Some(5),
+        flush_timeout_secs: Some(15),
+    });
     opts.stop = Some(stop.clone());
     opts.provider_deployments =
         Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
     let d = TestDaemon::start_opts(opts);
     std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
     git(&pm_dir, &["add", "pending.md"]);
+    // Wait for the window where validity is under the fixed 2s floor but
+    // still well above the derived 500ms one.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        let left = body["expires_unix"].as_f64().unwrap_or(0.0) - now_unix();
+        if (1.2..1.8).contains(&left) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never saw the short window");
+        thread::sleep(Duration::from_millis(10));
+    }
     stop.store(true, Ordering::SeqCst);
     drop(d);
     let log = git(&pm_dir, &["log", "-1", "--format=%B"]);
