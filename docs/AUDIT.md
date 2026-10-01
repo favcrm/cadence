@@ -273,7 +273,8 @@ without `CADENCE_ALIAS`) and unproven callers are refused. The daemon
 checks the repo against the designated project first, then reads every
 fact through its own `gh` (an absolute path fixed at boot): the PR, its
 diff (an allowlist covers every path, both sides of a rename), and the
-base branch's required check runs. It records `action: delegated-merge`,
+base branch's required check runs, counted only inside a `pull_request`
+run of `.github/workflows/ci.yml` for that head. It records `action: delegated-merge`,
 `recorded_via: delegated:<alias>`, the two notes' sha256 and reviewer
 aliases, exactly once per `(repo, PR, head)`; after a revoke, that head
 is the operator's alone. No reader counts it as an operator approval.

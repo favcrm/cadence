@@ -75,7 +75,7 @@ impl Fx {
             home: TempDir::new().unwrap(),
             _gh_tmp: gh_tmp,
         };
-        fx.pr(&["src/cli/job.rs"]);
+        fx.pr(&["src/cli/status.rs"]);
         fx
     }
 
@@ -96,7 +96,10 @@ impl Fx {
             "branch": {"protection": {"required_status_checks":
                 {"checks": [{"context": "test", "app_id": 15368}]}}},
             "runs": {"total_count": 1, "check_runs": [{"name": "test", "status": "completed",
-                "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"}}]},
+                "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"},
+                "check_suite": {"id": 500}}]},
+            "workflows": {"total_count": 1, "workflow_runs": [{"path": ".github/workflows/ci.yml",
+                "event": "pull_request", "head_sha": HEAD, "check_suite_id": 500}]},
         });
         self.write_gh(&state);
     }
@@ -363,7 +366,7 @@ fn cad918_delegated_approval_ci_counts_only_required_actions_checks() {
     fx.designate("pm-d", true);
     fx.note("01-r1", "r1", HEAD, "delegated (5)");
     fx.note("02-r2", "r2", HEAD, "delegated (5)");
-    let run = |name: &str, status: &str, app: u64| json!({"name": name, "status": status, "conclusion": "success", "app": {"id": app}});
+    let run = |name: &str, status: &str, app: u64| json!({"name": name, "status": status, "conclusion": "success", "app": {"id": app}, "check_suite": {"id": 500}});
     let runs = |r: Vec<Value>| json!({"total_count": r.len(), "check_runs": r});
     let status = json!([{"__typename": "StatusContext", "context": "test", "state": "SUCCESS"}]);
     fx.set("/runs", runs(vec![]));
@@ -389,12 +392,48 @@ fn cad918_delegated_approval_ci_counts_only_required_actions_checks() {
     fx.refuse(&mut pm, "", "'fmt' has no run");
     fx.set("/branch", json!({}));
     fx.refuse(&mut pm, "", "declares no required checks");
-    fx.pr(&["src/cli/job.rs"]);
+    fx.pr(&["src/cli/status.rs"]);
     let qa = json!([{"__typename": "StatusContext", "context": "qa-verdict", "state": "FAILURE"}]);
     fx.set("/view/statusCheckRollup", qa);
     fx.refuse(&mut pm, "", "qa-verdict is FAILURE");
+    // A forged Actions run: right name and app, but not from a
+    // pull_request run of ci.yml for this head.
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set("/runs/check_runs/0/check_suite/id", json!(900));
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set("/workflows/workflow_runs/0/event", json!("push"));
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set(
+        "/workflows/workflow_runs/0/path",
+        json!(".github/workflows/mine.yml"),
+    );
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set("/workflows/workflow_runs/0/head_sha", json!(OLD));
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set("/workflows/total_count", json!(3));
+    fx.refuse(&mut pm, "", "did not list every workflow run");
     assert!(fx.delegated().is_empty());
-    fx.pr(&["src/cli/job.rs"]);
+    fx.pr(&["src/cli/status.rs"]);
     let (rc, out) = fx.approve(&mut pm, "");
     assert_eq!(rc, 0, "{out}");
 }
@@ -470,19 +509,19 @@ fn cad918_delegated_approval_path_allowlist_overrides_reviewers() {
         ("src/peer.rs", "trigger 1"),
         ("src/daemon/jobs_rpc.rs", "outside the delegable allowlist"),
     ] {
-        fx.pr(&["src/cli/job.rs", path]);
+        fx.pr(&["src/cli/status.rs", path]);
         fx.refuse(
             &mut pm,
             &with_scope,
             &format!("{path} needs operator ({why}"),
         );
     }
-    fx.pr(&["src/cli/moved.rs"]);
+    fx.pr(&["src/cli/status.rs"]);
     fx.set(
         "/diff",
         json!(
-            "diff --git a/src/audit.rs b/src/cli/moved.rs\nsimilarity index 98%\n\
-               rename from src/audit.rs\nrename to src/cli/moved.rs\n"
+            "diff --git a/src/audit.rs b/src/cli/status.rs\nsimilarity index 98%\n\
+               rename from src/audit.rs\nrename to src/cli/status.rs\n"
         ),
     );
     fx.refuse(
@@ -510,6 +549,7 @@ fn cad918_delegated_approval_path_allowlist_overrides_reviewers() {
     // Single use: a second PR cannot ride the same pre-approval.
     fx.set("/pr", json!("8"));
     fx.set("/view/headRefOid", json!(OLD));
+    fx.set("/workflows/workflow_runs/0/head_sha", json!(OLD));
     fx.note_pr("03-r1", "r1", OLD, &risk, 8);
     fx.note_pr("04-r2", "r2", OLD, &risk, 8);
     let (rc, out) = fx.approve_pr(&mut pm, 8, OLD, &with_scope);

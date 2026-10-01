@@ -30,7 +30,9 @@ pub struct RiskPaths {
     delegable: List,
     trigger1: List,
     schema: List,
+    trigger3: List,
     trigger4: List,
+    trigger6: List,
     trigger7: List,
     scripts_allowlist: List,
 }
@@ -53,12 +55,14 @@ impl RiskPaths {
     }
 
     /// The named lists, for the doc-pinning test and reporting.
-    pub fn lists(&self) -> [(&'static str, &[String]); 6] {
+    pub fn lists(&self) -> [(&'static str, &[String]); 8] {
         [
             ("delegable", &self.delegable.paths),
             ("trigger1", &self.trigger1.paths),
             ("schema", &self.schema.paths),
+            ("trigger3", &self.trigger3.paths),
             ("trigger4", &self.trigger4.paths),
+            ("trigger6", &self.trigger6.paths),
             ("trigger7", &self.trigger7.paths),
             ("scripts_allowlist", &self.scripts_allowlist.paths),
         ]
@@ -70,7 +74,9 @@ impl RiskPaths {
         let hit = |l: &List| l.paths.iter().any(|g| crate::review::glob_match(g, path));
         let triggers: Vec<&'static str> = [
             ("1", &self.trigger1),
+            ("3", &self.trigger3),
             ("4", &self.trigger4),
+            ("6", &self.trigger6),
             ("7", &self.trigger7),
         ]
         .into_iter()
@@ -144,20 +150,45 @@ pub fn repo_slug(raw: &str) -> Option<String> {
     (ok(owner) && ok(name)).then(|| raw.to_ascii_lowercase())
 }
 
+/// The workflow whose `pull_request` runs carry the required checks.
+pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
 /// CI is green only from GitHub check runs: every check the base branch
 /// requires (`protection.required_status_checks.checks`) must have a
-/// completed, successful run from the required app. Commit statuses
-/// count for nothing, except that a `qa-verdict` in any state but
-/// SUCCESS refuses.
-pub fn ci_green(branch: &Value, runs: &Value, rollup: &[Value]) -> std::result::Result<(), String> {
+/// completed, successful run from the required app, inside the check
+/// suite of a `pull_request` run of [`CI_WORKFLOW`] for `head` (from
+/// `workflows`, `actions/runs?head_sha=`). A same-named run any other
+/// workflow posts counts for nothing; so do commit statuses, except
+/// that a `qa-verdict` in any state but SUCCESS refuses.
+pub fn ci_green(
+    branch: &Value,
+    runs: &Value,
+    workflows: &Value,
+    head: &str,
+    rollup: &[Value],
+) -> std::result::Result<(), String> {
     let required = branch["protection"]["required_status_checks"]["checks"]
         .as_array()
         .filter(|r| !r.is_empty())
         .ok_or("the base branch declares no required checks")?;
-    let listed = runs["check_runs"].as_array().map_or(0, Vec::len);
-    if runs["total_count"].as_u64() != Some(listed as u64) {
-        return Err("gh did not list every check run".into());
+    for (what, list, key) in [
+        ("check run", runs, "check_runs"),
+        ("workflow run", workflows, "workflow_runs"),
+    ] {
+        let listed = list[key].as_array().map_or(0, Vec::len);
+        if list["total_count"].as_u64() != Some(listed as u64) {
+            return Err(format!("gh did not list every {what}"));
+        }
     }
+    let suites: Vec<u64> = workflows["workflow_runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| {
+            w["path"] == CI_WORKFLOW && w["event"] == "pull_request" && w["head_sha"] == head
+        })
+        .filter_map(|w| w["check_suite_id"].as_u64())
+        .collect();
     for req in required {
         let name = req["context"].as_str().unwrap_or_default();
         let app = req["app_id"].as_u64();
@@ -170,9 +201,17 @@ pub fn ci_green(branch: &Value, runs: &Value, rollup: &[Value]) -> std::result::
                 Some(id) => r["app"]["id"].as_u64() == Some(id),
                 None => r["app"]["slug"] == "github-actions",
             })
+            .filter(|r| {
+                r["check_suite"]["id"]
+                    .as_u64()
+                    .is_some_and(|id| suites.contains(&id))
+            })
             .collect();
         if mine.is_empty() {
-            return Err(format!("required check '{name}' has no run from its app"));
+            return Err(format!(
+                "required check '{name}' has no run from its app in a pull_request run of \
+                 {CI_WORKFLOW}"
+            ));
         }
         if !mine
             .iter()
@@ -301,27 +340,56 @@ mod tests {
     fn classify_is_an_allowlist_that_fails_closed() {
         let rp = RiskPaths::load();
         let op = |p: &str| matches!(rp.classify(p), PathClass::Operator(_));
+        // Every path the round-2 review named, and the round-1 ones.
         for p in [
             ".github/workflows/ci.yml",
             "docs/roles/risk-paths.toml",
             "src/peer.rs",
             "src/audit/mod.rs",
-            "src/cli/mod.rs",
-            "tests/scripts/test_ci_gate_evidence.py",
             "build.rs",
             ".cargo/config.toml",
-            "ui/package.json",
+            "tests/scripts/test_ci_gate_evidence.py",
             "src/daemon/jobs_rpc.rs",
             "scripts/auto-stage.py",
+            "ui/package.json",
+            "ui/vite.config.ts",
+            "ui/scripts/check-module-names.mjs",
+            "ui/.npmrc",
+            "ui/.pnpmfile.cjs",
+            "ui/pnpm-workspace.yaml",
+            "ui/src/App.svelte",
+            "ui/tests/board.test.ts",
+            "src/cli/job.rs",
+            "src/cli/mod.rs",
+            "src/cli/audit.rs",
+            "src/cli/upgrade.rs",
+            "src/cli/update.rs",
+            "src/cli/rollout.rs",
+            "src/cli/daemon.rs",
+            "src/cli/agent_uid.rs",
+            "src/cli/secret.rs",
+            "src/cli/connection.rs",
+            "src/cli/platform.rs",
+            "src/cli/remote_result.rs",
+            "src/cli/master.rs",
+            "src/issue/model.rs",
+            "src/issue/board.rs",
+            "src/issue/parse.rs",
+            "tests/operator_lineage.rs",
+            "tests/master_permission.rs",
+            "tests/build_identity.rs",
+            "tests/delegated_approval.rs",
+            "tests/daemon.rs",
+            "docs/design/CONTRACT-TEMPLATE.md",
         ] {
-            assert!(op(p), "{p}");
+            assert!(op(p), "{p} must need the operator");
         }
         assert_eq!(rp.classify("src/store/schema.rs"), PathClass::Schema);
         for p in [
-            "src/cli/job.rs",
-            "src/issue/board.rs",
+            "src/cli/status.rs",
+            "src/issue/write.rs",
             "tests/board_issue.rs",
-            "ui/src/App.svelte",
+            "docs/BOARD.md",
         ] {
             assert_eq!(rp.classify(p), PathClass::Delegable, "{p}");
         }
@@ -381,7 +449,14 @@ mod tests {
             .lines()
             .filter_map(|l| l.strip_prefix("- `")?.split('`').next())
             .collect();
-        assert_eq!(listed, rp.lists()[5].1);
+        assert_eq!(
+            listed,
+            rp.lists()
+                .iter()
+                .find(|(k, _)| *k == "scripts_allowlist")
+                .unwrap()
+                .1
+        );
         let pathlike = |t: &str| {
             !t.contains(' ')
                 && !t.contains('(')
@@ -393,7 +468,9 @@ mod tests {
         for (n, name) in [
             ("1.", "trigger1"),
             ("2.", "schema"),
+            ("3.", "trigger3"),
             ("4.", "trigger4"),
+            // Trigger 6's prose names `docs/CHARTER.md` only as a "see also".
             ("7.", "trigger7"),
         ] {
             let para = doc.lines().find(|l| l.starts_with(n)).unwrap();

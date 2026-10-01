@@ -294,11 +294,15 @@ impl Shared {
             "api",
             &format!("repos/{repo}/commits/{head}/check-runs?per_page=100"),
         ])?;
+        let workflows = gh(&[
+            "api",
+            &format!("repos/{repo}/actions/runs?head_sha={head}&event=pull_request&per_page=100"),
+        ])?;
         let rollup = view["statusCheckRollup"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        dg::ci_green(&branch, &runs, &rollup)
+        dg::ci_green(&branch, &runs, &workflows, head, &rollup)
             .map_err(|why| deny(format!("CI is not green on {head}: {why}")))?;
         let notes_dir = pm.config.notes_dir();
         let notes = crate::audit::note_index(&notes_dir)
