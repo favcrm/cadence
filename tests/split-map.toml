@@ -430,6 +430,7 @@ tests = [
     "pty_cursor_allowlist_merged_into_cli_config",
     "pty_cursor_malformed_cli_config_refuses_launch",
     "pty_cursor_unresumable_chat_clears_and_mints_fresh",
+    "pty_cursor_argv_alone_is_not_ownership_while_a_doomed_tui_starts",
     "pty_cursor_proven_chat_deleted_mints_fresh",
     "pty_cursor_cleared_session_leaves_foreign_chat",
     "pty_claude_resume_timeout_keeps_session",

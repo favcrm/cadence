@@ -4614,17 +4614,21 @@ fn pty_cursor_malformed_cli_config_refuses_launch() {
 fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
     let d = TestDaemon::start();
     let mock = d.mock_cursor_tui();
-    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat"));
-    d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
+    mock_knob(
+        &mock.dir,
+        "MOCK_CURSOR_DIE_ON",
+        Some("dead-chat-unresumable"),
+    );
+    d.register_cursor_pty("cu", json!({"session": "dead-chat-unresumable"}));
     let agent = d.wait_agent("cu", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
     assert!(err.contains("pane exited during TUI startup"), "{err}");
     // The failure is operator-visible until the next open: the error
     // names the cleared id and says what happens next.
-    assert!(err.contains("'dead-chat'"), "{err}");
+    assert!(err.contains("'dead-chat-unresumable'"), "{err}");
     assert!(err.contains("was cleared"), "{err}");
     let ev = d.wait_event("cu", "session_resume_failed", 5);
-    assert_eq!(ev["payload"]["session"], "dead-chat", "{ev}");
+    assert_eq!(ev["payload"]["session"], "dead-chat-unresumable", "{ev}");
     // The stored session is cleared — a resume attempt must not find
     // the dead id again.
     let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
@@ -4638,9 +4642,44 @@ fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
         .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap();
-    assert_ne!(native, "dead-chat");
+    assert_ne!(native, "dead-chat-unresumable");
     let minted = d.wait_event("cu", "session_minted", 5);
     assert_eq!(minted["payload"]["session"], native, "{minted}");
+}
+
+/// CAD-872: the doomed TUI's argv names the dead chat from exec, and
+/// stays visible for as long as its startup takes (node boot under
+/// load). That argv is a claim, not a proof: only the open `store.db`
+/// fd shows the TUI actually holds the chat. A pane that lingers on
+/// the dead chat with argv alone and then exits must fail the open as
+/// an unresumable chat — never report an open, go idle, and fence
+/// later as "Provider process disconnected while idle" with the dead
+/// id still stored. The delay makes the startup window deterministic.
+#[test]
+fn pty_cursor_argv_alone_is_not_ownership_while_a_doomed_tui_starts() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat-argv"));
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_DELAY", Some("2"));
+    d.register_cursor_pty("cu", json!({"session": "dead-chat-argv"}));
+    let agent = d.wait_agent("cu", "attention", 30);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("pane exited during TUI startup"), "{err}");
+    assert!(err.contains("'dead-chat-argv'"), "{err}");
+    assert!(err.contains("was cleared"), "{err}");
+    let ev = d.wait_event("cu", "session_resume_failed", 5);
+    assert_eq!(ev["payload"]["session"], "dead-chat-argv", "{ev}");
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert!(
+        show["agent"]["params"]["session"].is_null(),
+        "session not cleared: {show}"
+    );
+    // The unwedged alias mints fresh once the dead id is gone.
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_DELAY", None);
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    assert_ne!(agent["thread_id"].as_str().unwrap(), "dead-chat-argv");
 }
 
 /// A chat that WAS proven once and then dies still unwedges: the
@@ -4706,8 +4745,8 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
         ])
         .spawn()
         .unwrap();
-    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat"));
-    d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat-foreign"));
+    d.register_cursor_pty("cu", json!({"session": "dead-chat-foreign"}));
     d.wait_agent("cu", "attention", 20);
     let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
     assert!(
@@ -4720,7 +4759,7 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
         .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap();
-    assert_ne!(native, "dead-chat");
+    assert_ne!(native, "dead-chat-foreign");
     assert_ne!(native, "foreign-chat");
     holder.kill().unwrap();
     let _ = holder.wait();
