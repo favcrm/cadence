@@ -26,14 +26,16 @@ this workflow exactly.
 ### Design contract first (CAD-957)
 A ticket needs a design contract when it touches a daemon-enforced rule
 (gate, lease, lock, fence, operator-only action, exactly-once) or a
-`docs/roles/risk-classes.md` trigger 1-3 or 7. The PM or ticket author
+`docs/roles/risk-classes.md` trigger 1-3, or trigger 7 when it changes a
+gate or who approves what. The PM or ticket author
 declares it, a reviewer may add it, and when unsure it counts.
 - The assignee writes it from `docs/design/CONTRACT-TEMPLATE.md`, in the
   ticket or the PR, before code.
 - One Spec/security reviewer (not the author) passes it BEFORE code, in a
   verdict note titled `# Verdict: <ID> Design contract review — pass|revise`,
   pinned to the contract's commit or blob SHA (for a contract kept in a
-  ticket, the ticket comment's id or timestamp). A changed contract voids it.
+  ticket, the sha256 of the contract text). A changed contract has a
+  changed hash and voids the pass.
 - The code PR links the contract and cites that note. Its reviewers check
   the code against the contract, and each adversarial test it names must
   exist and fail without its guard. The contract reviewer MAY also do the
@@ -59,13 +61,15 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
-- **Risk-sized count (CAD-957):** a PR whose every change qualifies under
-  `docs/roles/one-review-paths.toml` (an allowlist of plain prose guides,
-  with the match rules in its header) needs ONE independent review
-  covering standards and spec, filed as
-  `# Verdict: <ID> Review (standards+spec) — pass|revise`. Any other PR
-  keeps two. `human` triggers are unchanged. That file is the only list;
-  scripts read it.
+  - **Risk-sized count (CAD-957):** an exception to the two-reviewer
+    default. A PR whose every change qualifies under
+    `docs/roles/one-review-paths.toml` (an allowlist of plain prose guides,
+    with the match rules in its header) needs ONE independent review
+    covering standards and spec, filed as
+    `# Verdict: <ID> Review (standards+spec) — pass|revise`. Unlike
+    solo-operator scaling, it needs no operator approval for the count.
+    Any other PR keeps two. `human` triggers are unchanged. That file is
+    the only list; scripts read it.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in

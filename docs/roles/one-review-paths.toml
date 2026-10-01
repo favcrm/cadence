@@ -12,11 +12,11 @@
 #   `one_review_exclude` glob. Exclude wins.
 # - Matching is case-sensitive and byte-exact, with no normalisation. A path
 #   that starts with `./`, contains `..` or contains a backslash disqualifies.
-# - Globs are repo-root-relative with `/` separators: `*` matches within one
-#   segment, `**` across segments; no other wildcards.
-# - An empty diff, an unreadable file or malformed TOML disqualifies.
-# A disqualified PR keeps two reviews. `human` triggers apply on top, and a
-# test named by a passed design contract should keep two reviews.
+# - Globs are repo-root-relative with `/` separators. `*` matches zero or
+#   more non-`/` characters. `**` as a whole segment matches zero or more
+#   whole segments. `?` and `[` are literal. No other wildcards.
+# - An empty diff, an unreadable or malformed TOML file disqualifies.
+# A disqualified PR keeps two reviews. `human` triggers apply on top.
 #
 # Tests (tests/*.rs, src/**/tests.rs, tests/scripts/**, fixtures, split maps)
 # are NOT listed: they can hold adversarial gate tests or decide what CI runs.

@@ -2,9 +2,8 @@
 
 One page. Fill it before code, put it in the ticket or the PR, and have one
 Spec/security reviewer (not the author) pass it. Code reviewers then check the
-code against it. Required for any change to a daemon-enforced rule: gate,
-lease, lock, fence, operator-only action, exactly-once. Delete none of the
-headings; write "none, because ..." where a section is empty.
+code against it. When a contract is required and how its pass is recorded:
+AGENTS.md "Design contract first". Delete none of the headings; write "none, because ..." where a section is empty.
 
 ## Invariants
 What must always hold, as testable sentences. Name the actor allowed to act,
@@ -17,8 +16,10 @@ Mark each: the invariant it threatens (I#), how the guard holds, or "n/a" with a
 reason. A bare "n/a" fails review.
 - [ ] Crash or SIGKILL between any two steps (leaves what on disk? does recovery re-run or skip?)
 - [ ] Loaded host (slow step, timeout, retry: can a late or duplicate action land?)
+- [ ] Wrong caller (agent pane, endpoint or detached child instead of the permitted actor)
 - [ ] Concurrent callers (same request twice, two different requests racing)
 - [ ] Forked, detached or `setsid` child (outlives the caller, inherits the fd, token or lock)
+- [ ] Relay paths (a board or HTTP peer at least as strict as the daemon RPC it relays)
 - [ ] Forged field (caller-supplied id, actor, head, token, path or timestamp)
 - [ ] Partial write (torn file, half-applied multi-record update, event without its effect)
 - [ ] Clock or TTL edges (expiry at the boundary, clock step, restart mid-lease)

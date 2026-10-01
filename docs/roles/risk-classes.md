@@ -57,8 +57,8 @@ never approve itself.
 
 ### Review count by diff (CAD-957)
 A PR whose every change qualifies under the one-review allowlist
-(`docs/roles/one-review-paths.toml`, match rules in its header) needs one independent review covering
-standards and spec. Everything else keeps two. This changes only the count:
+(`docs/roles/one-review-paths.toml`, match rules in its header) needs
+one independent review covering standards and spec. Everything else keeps two. This changes only the count:
 a `human` trigger still needs the operator, and the file is itself trigger 7.
 
 ## After an auto merge
