@@ -66,6 +66,27 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
+/// Every variable that names a provider's launch command. The test
+/// harness points all of them at [`REFUSED_COMMAND`] (CAD-968), so a test
+/// that forgets a mock fails loudly instead of launching a real,
+/// credentialed provider (or a real tmux server holding the suite lock).
+/// `tests/provider_commands.rs` fails when a new `CADENCE_*_COMMAND` read
+/// appears in `src/` without being listed here or named as a non-provider.
+pub const PROVIDER_COMMAND_VARS: [&str; 9] = [
+    "CADENCE_CLAUDE_COMMAND",
+    "CADENCE_CLAUDE_TUI_COMMAND",
+    "CADENCE_CODEX_COMMAND",
+    "CADENCE_CODEX_WS_COMMAND",
+    "CADENCE_CODEX_SANDBOX_COMMAND",
+    "CADENCE_DEVIN_COMMAND",
+    "CADENCE_CURSOR_COMMAND",
+    "CADENCE_PI_COMMAND",
+    "CADENCE_TMUX_COMMAND",
+];
+
+/// A command that exists everywhere and exits non-zero at once.
+pub const REFUSED_COMMAND: &str = "false";
+
 /// Per-daemon values for the provider launch variables
 /// (`CADENCE_CLAUDE_COMMAND`, `CADENCE_TMUX_COMMAND`, …). A name set
 /// here wins; an unset one falls back to the process environment,
@@ -76,6 +97,16 @@ use crate::store::Agent;
 pub struct ProviderEnv(Arc<RwLock<BTreeMap<String, String>>>);
 
 impl ProviderEnv {
+    /// An env whose every provider command is [`REFUSED_COMMAND`]: for
+    /// test daemons, where launching a real provider is always a bug.
+    pub fn refusing_providers() -> Self {
+        let env = Self::default();
+        for name in PROVIDER_COMMAND_VARS {
+            env.set(name, REFUSED_COMMAND);
+        }
+        env
+    }
+
     pub fn set(&self, name: &str, value: impl Into<String>) {
         self.0
             .write()

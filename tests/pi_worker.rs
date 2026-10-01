@@ -67,7 +67,7 @@ fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
 /// is what `PiAdapter` derives `state_dir` from, matching the daemon's
 /// `state/agents/<alias>.provider.log` layout.
 fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
     // CAD-559: pi opens only under an operator `[pi]` policy — `own`
     // can still repoint CADENCE_PM_DIR at a test's own pm.yaml.
@@ -753,7 +753,7 @@ fn register_resolves_and_gates_the_model() {
 #[test]
 fn register_refuses_every_model_without_a_pi_policy() {
     let pm = tempfile::tempdir().unwrap();
-    let env = cadence_agent::adapter::ProviderEnv::default();
+    let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
     env.set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
     let mut opts = daemon_opts();
     opts.provider_env = env;

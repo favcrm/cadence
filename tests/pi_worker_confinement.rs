@@ -66,7 +66,7 @@ fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
 /// An adapter whose state dir is `state` — the log's grandparent is
 /// what `PiAdapter` derives `state_dir` from.
 fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
     // CAD-559: pi opens only under an operator `[pi]` policy — `own`
     // can still repoint CADENCE_PM_DIR at a test's own pm.yaml.
@@ -238,7 +238,7 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
     )
     .unwrap();
 
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
@@ -403,7 +403,7 @@ fn devin_model_workers_do_not_get_the_credential_grant() {
     )
     .unwrap();
 
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
@@ -653,7 +653,7 @@ fn confined_policy_allows_work_and_denies_the_rest() {
     let tmp = worker_dir.join("tmp");
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
@@ -1166,7 +1166,7 @@ fn confined_devin_provider_auth_is_denied() {
     std::fs::write(home.join(".cargo/credentials.toml"), "token = \"nope\"\n").unwrap();
     std::fs::write(home.join(".pi/agent/auth.json"), "{}\n").unwrap();
 
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
@@ -1277,7 +1277,7 @@ fn confined_non_devin_worker_cannot_read_devin_auth() {
     )
     .unwrap();
 
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());

@@ -564,7 +564,7 @@ impl UiDaemon {
     pub fn serve(state: PathBuf, tmp: Option<TempDir>, pm: Option<&Path>) -> Self {
         let owned = state.clone();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider_env = cadence_agent::adapter::ProviderEnv::default();
+        let provider_env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         if let Some(pm) = pm {
             provider_env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
         }

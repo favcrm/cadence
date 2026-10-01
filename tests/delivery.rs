@@ -1225,7 +1225,7 @@ fn confined_master_in_a_sandbox_can_run_cadence() {
     std::fs::create_dir_all(&home).unwrap();
     let exe = env!("CARGO_BIN_EXE_cadence");
     std::os::unix::fs::symlink(exe, bin_dir.join("cadence")).unwrap();
-    let env = cadence_agent::adapter::ProviderEnv::default();
+    let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
     env.set("PATH", bin_dir.to_string_lossy().to_string());
     env.set("HOME", home.to_string_lossy().to_string());
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());

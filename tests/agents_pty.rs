@@ -5281,7 +5281,7 @@ fn failed_open_writes_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_agent("w-bad", "attention", 15);
-    test_env().remove("CADENCE_CLAUDE_COMMAND");
+    test_env().set("CADENCE_CLAUDE_COMMAND", NO_REAL_PROVIDER);
 
     assert_eq!(git_porcelain(&repo), "", "failed open touched the repo");
     assert!(!repo.join(".cadence").exists());
@@ -6213,19 +6213,19 @@ fn agent_remove_force_notifies_reply_to() {
 fn cad955_a_test_without_a_mock_has_no_real_tmux() {
     assert_eq!(
         test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
-        Some(NO_REAL_TMUX)
+        Some(NO_REAL_PROVIDER)
     );
     let dir = tempfile::tempdir().unwrap();
     let mock = install_mock_devin(dir.path());
     assert_ne!(
         test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
-        Some(NO_REAL_TMUX),
+        Some(NO_REAL_PROVIDER),
         "the mock replaces the refusal"
     );
     drop(mock);
     assert_eq!(
         test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
-        Some(NO_REAL_TMUX),
+        Some(NO_REAL_PROVIDER),
         "dropping the mock restores the refusal, not the real tmux"
     );
 }

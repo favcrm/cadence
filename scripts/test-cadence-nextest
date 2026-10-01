@@ -4,6 +4,10 @@
 # execution checks; trust-rejection checks still run when it is unavailable.
 set -eu
 
+# The checks set the suite lock env themselves; an inherited one (a lane
+# shell, pre-push) must not change what they prove.
+unset CADENCE_SUITE_LOCK CADENCE_REVIEW_SUITE_LOCK_HELD
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUNNER="$ROOT/scripts/cadence-nextest"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-contract.XXXXXX")
@@ -17,7 +21,7 @@ die() {
 contains() {
     needle=$1
     file=$2
-    rg -F -q -- "$needle" "$file" || {
+    grep -F -q -- "$needle" "$file" || {
         echo "--- $file ---" >&2
         cat "$file" >&2
         die "expected '$needle'"
@@ -57,6 +61,10 @@ else
     PINNED_BIN=/tmp/cadence-nextest-0.9.145/cargo-nextest
 fi
 if [ ! -x "$PINNED_BIN" ]; then
+    # CAD-968: CI sets this so a missing binary can never turn the
+    # execution checks (the `flock -o` regression among them) into a skip.
+    [ -z "${CADENCE_NEXTTEST_REQUIRE_BIN:-}" ] ||
+        die "CADENCE_NEXTTEST_REQUIRE_BIN is set but $PINNED_BIN is not executable"
     printf '%s\n' 'nextest contract checks passed (trusted binary unavailable; execution checks skipped)'
     exit 0
 fi
@@ -127,6 +135,19 @@ PATH="$TMP/bin:/usr/bin:/bin" \
 [ ! -e "$TMP/flock.log" ] || die "review child nested the outer flock"
 contains "Usage: cargo nextest run" "$TMP/review-help.out"
 
+# The fixture workspaces below are not the cadence package, so the repo
+# profile's overrides (which name cadence-agent binaries and fail on a
+# workspace that has none) cannot load there. Run them through a copy of
+# the wrapper rooted at a scratch tree whose profile is the same base
+# settings without those overrides (CAD-968). The wrapper logic under test
+# (retry neutralisation, the outer flock) is identical in the copy.
+FX="$TMP/fxroot"
+mkdir -p "$FX/scripts" "$FX/.config"
+cp "$RUNNER" "$FX/scripts/cadence-nextest"
+cp "$ROOT/.config/cargo-nextest.sha256" "$FX/.config/cargo-nextest.sha256"
+printf '%s\n' '[profile.cadence]' 'retries = 0' 'fail-fast = false' >"$FX/.config/nextest.toml"
+FXRUNNER="$FX/scripts/cadence-nextest"
+
 # Regression: NEXTEST_RETRIES=3 must not override the profile. The fixture
 # fails once and records each process execution; --retries 0 plus env clearing
 # must leave exactly one record.
@@ -161,7 +182,7 @@ mod tests {
 EOF
 if NEXTEST_RETRIES=3 CADENCE_RETRY_COUNT="$TMP/retry.count" \
     CARGO_BUILD_JOBS=4 CADENCE_NEXTTEST_BIN="$PINNED_BIN" \
-    CADENCE_SUITE_LOCK="$TMP/retry.lock" "$RUNNER" \
+    CADENCE_SUITE_LOCK="$TMP/retry.lock" "$FXRUNNER" \
     --manifest-path "$TMP/retry-workspace/Cargo.toml" --no-fail-fast \
     >"$TMP/retry.out" 2>"$TMP/retry.err"; then
     die "intentional retry fixture unexpectedly passed"
@@ -200,7 +221,7 @@ mod tests {
 EOF
 startup_lock="$TMP/startup.lock"
 CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$startup_lock" \
-    CARGO_BUILD_JOBS=4 "$RUNNER" \
+    CARGO_BUILD_JOBS=4 "$FXRUNNER" \
     --manifest-path "$TMP/startup-workspace/Cargo.toml" \
     >"$TMP/startup.out" 2>"$TMP/startup.err" &
 runner_pid=$!
@@ -276,7 +297,7 @@ count_marked() {
 trap 'count_marked kill >/dev/null; rm -rf "$TMP"' EXIT HUP INT TERM
 CADENCE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
     CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$leak_lock" \
-    "$RUNNER" --manifest-path "$TMP/leak-workspace/Cargo.toml" --no-fail-fast \
+    "$FXRUNNER" --manifest-path "$TMP/leak-workspace/Cargo.toml" --no-fail-fast \
     >"$TMP/leak.out" 2>"$TMP/leak.err" || :
 leaked=$(count_marked)
 [ "$leaked" -ge 2 ] || {

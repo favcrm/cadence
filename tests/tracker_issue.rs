@@ -134,6 +134,7 @@ fn daemon_run_refreshes_skill_on_start() {
         .arg(&state)
         .args(["daemon", "run"])
         .env("HOME", home.path())
+        .envs(test_env().vars())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

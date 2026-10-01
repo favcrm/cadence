@@ -578,7 +578,7 @@ impl CallDaemon {
         let pm = dir.path().join("pm");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(&pm).unwrap();
-        let env = cadence_agent::adapter::ProviderEnv::default();
+        let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let opts = cadence_agent::daemon::ServeOptions {
