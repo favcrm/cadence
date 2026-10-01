@@ -71,6 +71,11 @@ impl Host {
         ] {
             cmd.env_remove(var);
         }
+        // CAD-968: the sandbox daemon and board inherit this env. A test
+        // that forgets a mock must fail, not launch a real provider.
+        for name in cadence_agent::adapter::PROVIDER_COMMAND_VARS {
+            cmd.env(name, cadence_agent::adapter::REFUSED_COMMAND);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -695,6 +700,37 @@ case "$1" in
   kill-server) rm -f "$dir/$sock" ;;
 esac
 "#;
+
+/// CAD-968: a sandbox daemon is a subprocess the test env does not
+/// reach. Every provider command in its environment must be `false`, so a
+/// test that forgets a mock fails instead of launching a real provider,
+/// and a command the test names is the only thing that wins.
+#[test]
+fn cad968_a_sandbox_daemon_refuses_every_provider_unless_the_test_names_one() {
+    let mut host = Host::new();
+    let mock = "/tmp/cad968-the-test-named-this";
+    let v = host.up_free("refuse", &[("CADENCE_PI_COMMAND", mock)]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let health = client::rpc(&state, "health", json!({})).unwrap();
+    let pid = health["pid"].as_u64().unwrap();
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let vars: std::collections::BTreeMap<String, String> = environ
+        .split(|b| *b == 0)
+        .filter_map(|kv| {
+            let kv = String::from_utf8_lossy(kv);
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    for name in cadence_agent::adapter::PROVIDER_COMMAND_VARS {
+        let want = if name == "CADENCE_PI_COMMAND" {
+            mock
+        } else {
+            "false"
+        };
+        assert_eq!(vars.get(name).map(String::as_str), Some(want), "{name}");
+    }
+}
 
 /// A daemon stop keeps pty panes for a hot restart; `down` and
 /// `reset` must not leave them running on the sandbox's tmux server —

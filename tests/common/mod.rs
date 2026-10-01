@@ -58,7 +58,6 @@ mod status_cli;
 pub use status_cli::{status_json, status_table, status_tracker_env};
 
 mod suite;
-pub mod tmux_guard;
 // Each integration binary uses a different subset of the shared API.
 #[allow(unused_imports)]
 pub use suite::{
@@ -1129,17 +1128,21 @@ pub fn run_signal_child(test: &str, limit: Duration) {
 
 // ---- mock Codex provider over real stdio (no model calls) ----
 
-/// CAD-955: the tmux a test daemon runs unless the test installed a mock.
-/// `false` fails every launch loudly. Left unset, a pty agent launched by
-/// a test with no mock started a real tmux server (and the real provider
-/// in it) that nothing killed, holding the suite lock fd past the run.
-pub const NO_REAL_TMUX: &str = "false";
+/// CAD-955/CAD-968: the command a test daemon runs for every provider
+/// (and tmux) unless the test installed a mock. `false` fails every
+/// launch loudly. Left unset, a test with no mock started a real tmux
+/// server or a real, credentialed provider that nothing killed.
+pub use cadence_agent::adapter::REFUSED_COMMAND as NO_REAL_PROVIDER;
+
+/// Put a provider command back to the refusal when its mock goes away.
+/// Never `remove`: an unset name falls through to the real binary.
+pub fn refuse_provider(name: &str) {
+    test_env().set(name, NO_REAL_PROVIDER);
+}
 
 thread_local! {
     static TEST_ENV: ProviderEnv = {
-        let env = ProviderEnv::default();
-        env.set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        env
+        ProviderEnv::refusing_providers()
     };
     static TEST_STALL_SAMPLE: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::default();
@@ -1425,9 +1428,9 @@ impl TestDaemon {
 
 impl Drop for MockCodex {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_CODEX_COMMAND");
-        test_env().remove("CADENCE_CODEX_WS_COMMAND");
-        test_env().remove("CADENCE_CODEX_SANDBOX_COMMAND");
+        refuse_provider("CADENCE_CODEX_COMMAND");
+        refuse_provider("CADENCE_CODEX_WS_COMMAND");
+        refuse_provider("CADENCE_CODEX_SANDBOX_COMMAND");
     }
 }
 
@@ -1673,8 +1676,8 @@ pub fn kill_mock_panes(dir: &Path) {
 impl Drop for MockDevin {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_DEVIN_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_DEVIN_COMMAND");
         test_env().remove("CADENCE_DEVIN_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -1715,7 +1718,7 @@ pub fn install_mock_stub(dir: &Path) -> MockStub {
 impl Drop for MockStub {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
+        refuse_provider("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_STUB_COMMAND");
         test_env().remove("CADENCE_STUB_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
@@ -1785,8 +1788,8 @@ impl TestDaemon {
 impl Drop for MockClaudeTui {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_CLAUDE_TUI_COMMAND");
         test_env().remove("CADENCE_CLAUDE_SESSIONS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -1899,8 +1902,8 @@ impl Drop for MockCursorTui {
             }
         }
         kill_mock_panes(&self.dir);
-        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
-        test_env().remove("CADENCE_CURSOR_COMMAND");
+        refuse_provider("CADENCE_TMUX_COMMAND");
+        refuse_provider("CADENCE_CURSOR_COMMAND");
         test_env().remove("CADENCE_CURSOR_CHATS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
@@ -2422,7 +2425,7 @@ impl TestDaemon {
 
 impl Drop for MockClaude {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_CLAUDE_COMMAND");
+        refuse_provider("CADENCE_CLAUDE_COMMAND");
         test_env().remove("CADENCE_MCP_PERMISSION_COMMAND");
     }
 }
@@ -2493,7 +2496,7 @@ impl TestDaemon {
 
 impl Drop for MockPi {
     fn drop(&mut self) {
-        test_env().remove("CADENCE_PI_COMMAND");
+        refuse_provider("CADENCE_PI_COMMAND");
     }
 }
 

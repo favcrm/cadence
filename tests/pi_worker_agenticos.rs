@@ -37,7 +37,7 @@ fn open_worker(root: &Path) -> cadence_agent::Result<PiAdapter> {
     std::fs::create_dir_all(&pm).unwrap();
     std::fs::write(pm.join("pm.yaml"), "pi:\n  models:\n    allow: [\"agenticos/z-ai/glm-5.3-flash\"]\n    default: {worker: \"agenticos/z-ai/glm-5.3-flash\"}\n").unwrap();
     std::fs::create_dir_all(state.join("agents")).unwrap();
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     env.set(
         "PI_CODING_AGENT_DIR",

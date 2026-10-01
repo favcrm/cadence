@@ -134,6 +134,7 @@ fn daemon_run_refreshes_skill_on_start() {
         .arg(&state)
         .args(["daemon", "run"])
         .env("HOME", home.path())
+        .envs(test_env().vars())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1113,6 +1114,7 @@ fn run_session_env(
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
+        .envs(test_env().vars())
         .current_dir(cwd);
     for (k, v) in envs {
         cmd.env(k, v);

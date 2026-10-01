@@ -77,7 +77,7 @@ fn adapter_env(
     dir: &Path,
     own: &[(&str, String)],
 ) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
     // CAD-559: pi opens only under an operator `[pi]` policy — `own`
     // can still point CADENCE_PM_DIR at a test's own pm.yaml.
@@ -118,7 +118,7 @@ fn collect(rx: &mpsc::Receiver<(String, Value)>, wait: Duration) -> Vec<(String,
 /// `state_dir` as the log's grandparent) — this is the same code path
 /// `master start` launches: guard written, lockdown argv, env posture.
 fn master_adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
     // CAD-559: the tracker's `[pi]` table governs what this master may
     // launch on — `own` can repoint CADENCE_PM_DIR at a custom policy.
@@ -593,7 +593,7 @@ fn confined_master_runs_fake_pi_under_the_policy() {
 fn the_emitted_pi_policy_is_pis_own_dirs_never_claudes() {
     let state = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("HOME", home.path().to_string_lossy().to_string());
     env.set(
@@ -1345,6 +1345,8 @@ fn status_prompt_probe() {
         Err(e) => panic!("probe could not provision pi login: {e}"),
         _ => {}
     }
+    // CAD-968: the one deliberate exception. This #[ignore]d probe opts in
+    // (CADENCE_PI_PROBE=1) to a real Pi turn, so it must not refuse pi.
     let env = ProviderEnv::default();
     if let Ok(pm) = std::env::var("CADENCE_PM_DIR") {
         env.set("CADENCE_PM_DIR", pm);
@@ -2084,7 +2086,7 @@ fn pinned_provider_packages_extend_argv_and_the_read_set() {
 
     // The same resolution feeds confinement: the package dir is in the
     // read set (never write), nothing wider than it.
-    let env = ProviderEnv::default();
+    let env = ProviderEnv::refusing_providers();
     env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
     env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     env.set(

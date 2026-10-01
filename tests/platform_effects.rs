@@ -72,7 +72,7 @@ impl Daemon {
     }
 
     fn serve(&mut self) {
-        let env = cadence_agent::adapter::ProviderEnv::default();
+        let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", self.pm.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = stop.clone();

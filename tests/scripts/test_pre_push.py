@@ -186,6 +186,29 @@ class PrePush(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("[FAIL] contract test_fake_contract.py", r.stdout)
 
+    def test_nextest_wrapper_change_runs_its_contract_test(self):
+        # CAD-968: reverting `flock -o` must be caught before CI.
+        self.edit("scripts/test-cadence-nextest", STUB)
+        (self.repo / "scripts/test-cadence-nextest").chmod(0o755)
+        self.edit("scripts/cadence-nextest", STUB + "# touched\n")
+        r = self.pp()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("test-cadence-nextest  [jobs=4]", self.calls())
+        self.assertIn("[ OK ] nextest wrapper", r.stdout)
+
+    def test_failing_nextest_wrapper_test_fails_the_run(self):
+        self.edit("scripts/test-cadence-nextest", "#!/bin/sh\necho clean\nexit 4\n")
+        (self.repo / "scripts/test-cadence-nextest").chmod(0o755)
+        r = self.pp()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("[FAIL] nextest wrapper: exit 4", r.stdout)
+
+    def test_unrelated_change_skips_the_nextest_wrapper_test(self):
+        self.edit("src/lib.rs", "pub fn x() {}\n")
+        r = self.pp()
+        self.assertIn("[SKIP] nextest wrapper", r.stdout)
+        self.assertFalse(any("test-cadence-nextest" in c for c in self.calls()))
+
     def test_list_runs_nothing(self):
         self.edit("src/lib.rs", "pub fn x() {}\n")
         r = self.pp("--list")
