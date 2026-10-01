@@ -439,7 +439,6 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-    use std::io::Read as _;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -835,7 +834,10 @@ mod tests {
     /// and the client never re-POSTs to "confirm".
     #[test]
     fn cad979_import_forged_receipt_fails_closed_single_post() {
-        for (label, mutate) in [
+        // Each closure coerces to a `fn(&mut Value)` pointer — a plain array
+        // of distinct closure types cannot unify (E0308), so the element
+        // type is named explicitly.
+        let cases: [(&str, fn(&mut Value)); 10] = [
             ("wrong connection", |d: &mut Value| {
                 d["connectionId"] = json!("con_other");
             }),
@@ -866,7 +868,8 @@ mod tests {
             ("missing readBack", |d: &mut Value| {
                 d.as_object_mut().unwrap().remove("readBack");
             }),
-        ] {
+        ];
+        for (label, mutate) in cases {
             let door = FakeDoor::start();
             door.state().connections.push("con_ig".into());
             let bytes = png_bytes();
