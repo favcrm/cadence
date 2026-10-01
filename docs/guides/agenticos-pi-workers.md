@@ -3,7 +3,7 @@
 Hosted startup supplies AgenticOS's model catalog to the master. Pi workers
 use separate private configuration directories, so they need their own catalog
 before Pi starts. For the explicit model `agenticos/z-ai/glm-5.3-flash`, Cadence
-checks the daemon's configured `models.json` against its reviewed AgenticOS
+checks `<state>/master/pi/models.json` against its reviewed AgenticOS
 provider definition and writes only that definition to the worker's private
 `models.json` at mode 0600. Every open refreshes this daemon-owned file.
 
@@ -19,6 +19,11 @@ or rewriting its login. Use a fresh worker directory when switching from another
 provider. Pi's normal empty `{}` auth store is allowed for resume; malformed,
 nonempty, oversized or symlinked auth stores are refused. Store values never
 appear in errors or the generated model catalog.
+
+Live `/model` switches to AgenticOS are refused for workers. Select the model
+for the next launch and reopen so the current master catalog and worker auth
+store are checked before Pi loads them. The operator's separate Pi catalog
+does not substitute for the hosted master's catalog.
 
 The existing operator model allowlist still has to admit the model. This change
 does not alter that policy or authorize a paid turn. Pi's reported model and

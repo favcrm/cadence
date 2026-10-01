@@ -1632,6 +1632,13 @@ impl PiAdapter {
             "worker"
         };
         crate::pi_policy::require_allowed(pi_policy.as_ref(), role, &want)?;
+        // Pi has already loaded its catalog and auth. Reopening performs the
+        // credentialless AgenticOS admission before either can be used.
+        if role == "worker" && provider == "agenticos" {
+            return Err(Error::rejected(
+                "select AgenticOS for the next worker launch and reopen; live model switching is unavailable",
+            ));
+        }
         let model = match self.checked(
             "set_model",
             json!({"provider": provider, "modelId": model_id}),
@@ -2054,7 +2061,7 @@ impl ProviderAdapter for PiAdapter {
                 self.env.var("HOME"),
             );
             if want.starts_with("agenticos/") {
-                agenticos::seed(&config, operator.as_deref(), want)?;
+                agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
             } else if let Some(operator) = operator.as_deref() {
                 copy_pi_auth(&config, operator)?;
             } else {

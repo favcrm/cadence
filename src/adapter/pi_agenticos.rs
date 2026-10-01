@@ -11,14 +11,12 @@ const MODEL: &str = "agenticos/z-ai/glm-5.3-flash";
 /// Selecting this provider is still subject to the operator's model allowlist.
 /// Require the reviewed catalog in the daemon's own config, then write our
 /// literal credentialless projection, never arbitrary provider keys or auth.
-pub(super) fn seed(dir: &Path, operator: Option<&Path>, model: &str) -> Result<()> {
+pub(super) fn seed(dir: &Path, master: &Path, model: &str) -> Result<()> {
     if model != MODEL {
         return Err(Error::rejected("unsupported AgenticOS worker model"));
     }
     require_empty_auth(dir)?;
-    let source = operator
-        .ok_or_else(|| Error::rejected("AgenticOS worker requires the reviewed operator catalog"))?
-        .join("models.json");
+    let source = master.join("models.json");
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

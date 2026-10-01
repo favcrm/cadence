@@ -25,7 +25,7 @@ fn agenticos_worker_live_model_switch_requires_reopening() {
     let root = tempfile::tempdir().unwrap();
     operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
     let ad = open_worker(root.path()).unwrap();
-    std::fs::remove_file(root.path().join("operator/models.json")).unwrap();
+    std::fs::remove_file(root.path().join("state/master/pi/models.json")).unwrap();
     let result = ad.session_command("model", Some("agenticos/z-ai/glm-5.3-flash"));
     ad.close();
     assert!(result.is_err(), "live switch bypassed catalog admission");
@@ -93,6 +93,13 @@ fn open_worker(root: &Path) -> cadence_agent::Result<PiAdapter> {
 fn operator(root: &Path, catalog: &Value) {
     let dir = root.join("operator");
     std::fs::create_dir_all(&dir).unwrap();
+    let master = root.join("state/master/pi");
+    std::fs::create_dir_all(&master).unwrap();
+    std::fs::write(
+        master.join("models.json"),
+        serde_json::to_vec(catalog).unwrap(),
+    )
+    .unwrap();
     std::fs::write(
         dir.join("models.json"),
         serde_json::to_vec(catalog).unwrap(),
@@ -153,7 +160,7 @@ fn agenticos_worker_refuses_missing_symlinked_and_oversized_catalogs() {
     for case in ["missing", "symlink", "oversized"] {
         let root = tempfile::tempdir().unwrap();
         operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
-        let path = root.path().join("operator/models.json");
+        let path = root.path().join("state/master/pi/models.json");
         match case {
             "missing" => std::fs::remove_file(&path).unwrap(),
             "symlink" => {
