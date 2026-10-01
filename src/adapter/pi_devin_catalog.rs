@@ -281,6 +281,38 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     serde_json::to_vec(&value).map_err(|_| refusal())
 }
 
+fn usable_private_snapshot(bytes: &[u8], model: &str, now: u64) -> Result<()> {
+    let normalized = validate(bytes, model, now)?;
+    // Worker-owned snapshots must already match the pinned provider cache
+    // contract. Source normalization never authorizes overwriting them.
+    if serde_json::from_slice::<Value>(bytes).ok()
+        != serde_json::from_slice::<Value>(&normalized).ok()
+    {
+        return Err(refusal());
+    }
+    Ok(())
+}
+fn install_snapshot(dir: &File, temporary: &str, model: &str, now: u64) -> Result<()> {
+    let temporary = cname(temporary)?;
+    let target = cname("models.json")?;
+    if unsafe {
+        libc::linkat(
+            dir.as_raw_fd(),
+            temporary.as_ptr(),
+            dir.as_raw_fd(),
+            target.as_ptr(),
+            0,
+        )
+    } < 0
+        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(refusal());
+    }
+    usable_private_snapshot(&read(dir, "models.json")?.ok_or_else(refusal)?, model, now)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
 /// Seed before spawning, never exposing the operator cache to the worker.
 /// Existing valid private snapshots win. Offline freshness is deliberately
 /// fail-closed at six hours; neither seeding nor reuse renews fetchedAt.
@@ -297,15 +329,7 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
         return Err(refusal());
     }
     if let Some(bytes) = read(&dir, "models.json")? {
-        let normalized = validate(&bytes, model, now)?;
-        // Preserve only already usable private caches: null display fields
-        // need source normalization, not an overwrite of worker-owned state.
-        if serde_json::from_slice::<Value>(&bytes).ok()
-            != serde_json::from_slice::<Value>(&normalized).ok()
-        {
-            return Err(refusal());
-        }
-        return Ok(());
+        return usable_private_snapshot(&bytes, model, now);
     }
     let parent = directory(source.parent().ok_or_else(refusal)?)?;
     let bytes = read(
@@ -319,7 +343,6 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
     let bytes = validate(&bytes, model, now)?;
     let temporary = format!("catalog-{}.tmp", uuid::Uuid::new_v4());
     let temporary_c = cname(&temporary)?;
-    let target = cname("models.json")?;
     let result = (|| -> Result<()> {
         let mut file = open_at(
             &dir,
@@ -330,23 +353,9 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
         .map_err(|_| refusal())?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        // Atomic no-clobber install. A concurrent winner is reread and validated.
-        if unsafe {
-            libc::linkat(
-                dir.as_raw_fd(),
-                temporary_c.as_ptr(),
-                dir.as_raw_fd(),
-                target.as_ptr(),
-                0,
-            )
-        } < 0
-            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(refusal());
-        }
-        validate(&read(&dir, "models.json")?.ok_or_else(refusal)?, model, now)?;
-        dir.sync_all()?;
-        Ok(())
+        // Atomic no-clobber install. Reread winners using the same private
+        // usability predicate as startup's existing-cache path.
+        install_snapshot(&dir, &temporary, model, now)
     })();
     unsafe {
         libc::unlinkat(dir.as_raw_fd(), temporary_c.as_ptr(), 0);
@@ -533,6 +542,29 @@ mod tests {
             assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
             assert!(!cache.join("pi-devin/models.json").exists());
         }
+    }
+
+    #[test]
+    fn concurrent_nullable_winner_cannot_bypass_private_cache_usability() {
+        let (_dir, _source, cache) = fixture();
+        let private = cache.join("pi-devin");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("candidate.tmp"), catalog().to_string()).unwrap();
+        let mut winner = catalog();
+        winner["catalog"]["families"][0]["variants"][0]["max_context_tokens"] = Value::Null;
+        std::fs::write(private.join("models.json"), winner.to_string()).unwrap();
+        // Deterministically model a winner installed after the initial absent
+        // read and before linkat. Do not overwrite that worker-owned snapshot.
+        let opened = directory(&private).unwrap();
+        assert!(install_snapshot(&opened, "candidate.tmp", "devin/swe-2-high", NOW).is_err());
+        assert_eq!(
+            std::fs::read_to_string(private.join("models.json")).unwrap(),
+            winner.to_string()
+        );
+        assert!(
+            usable_private_snapshot(winner.to_string().as_bytes(), "devin/swe-2-high", NOW)
+                .is_err()
+        );
     }
 
     #[test]
