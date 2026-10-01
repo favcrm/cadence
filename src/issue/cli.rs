@@ -75,6 +75,7 @@ pub enum IssueAction {
     /// different flags AND; `--tag` is the exception — all must be
     /// present. See PROTOCOL.md "List grammar".
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable — issues in any of them.
         #[arg(long, value_delimiter = ',')]
@@ -581,6 +582,7 @@ pub enum EpicAction {
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable — epics in any of them.
         #[arg(long, value_delimiter = ',')]
@@ -638,6 +640,7 @@ pub enum MilestoneAction {
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable — milestones in any of them.
         #[arg(long, value_delimiter = ',')]
@@ -703,6 +706,7 @@ pub enum ProjectAction {
     },
     /// List registered projects.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Sort by key prefix default_owner; `-KEY` descending.
         #[arg(long, allow_hyphen_values = true)]

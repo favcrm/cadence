@@ -2917,7 +2917,14 @@ fn send_email_flags_print_real_usage() {
     let state = TempDir::new().unwrap();
     for verb in [&["message", "send"][..], &["send"][..]] {
         let usage = format!("cadence {} <ALIAS> --text <body>", verb.join(" "));
-        for flag in ["--to", "--subject", "--body", "--cc"] {
+        // CAD-888: the top-level `send` takes `--to <alias>` as the
+        // recipient; `message send` still refuses it.
+        let flags: &[&str] = if verb == ["send"] {
+            &["--subject", "--body", "--cc"]
+        } else {
+            &["--to", "--subject", "--body", "--cc"]
+        };
+        for &flag in flags {
             for tail in [&[flag, "x"][..], &["pm", "--text", "hi", flag, "x"][..]] {
                 let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
                     .arg("--state-dir")

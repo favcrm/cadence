@@ -12,6 +12,7 @@ pub(crate) enum ReportAction {
     /// Value flags repeat and comma-join and match ANY of their
     /// values; different flags AND.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// question|feedback|idea|bug (intake) or done|question|
         /// blocked|answer|verdict (task reports); repeatable.

@@ -54,6 +54,7 @@ pub(crate) enum AgentAction {
     /// it. Value flags repeat and comma-join and match ANY of their
     /// values; different flags AND.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "ls")]
     List {
         /// Show every agent even inside a cadence pane.
         #[arg(long)]

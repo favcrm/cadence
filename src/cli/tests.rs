@@ -780,7 +780,7 @@ fn send_verb_and_ask_flags_parse() {
             ready: true,
             alias,
             ..
-        } if alias == "w1"
+        } if alias.as_deref() == Some("w1")
     ));
     let cli = Cli::try_parse_from([
         "cadence",

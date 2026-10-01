@@ -53,6 +53,7 @@ pub enum SandboxAction {
     /// the sandbox base that holds this sandbox's marker.
     Reset { name: String },
     /// List the sandboxes under the base with running status.
+    #[command(visible_alias = "list")]
     Ls,
 }
 

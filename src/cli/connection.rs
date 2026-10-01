@@ -6,6 +6,7 @@ pub(crate) enum ConnectionAction {
     /// List reviewed provider descriptors and supported connection shapes.
     Providers,
     /// List exact authorized account references and built-in Local outbox.
+    #[command(visible_alias = "list")]
     Ls,
     /// Show one durable connection incarnation.
     Show { connection_id: String },
