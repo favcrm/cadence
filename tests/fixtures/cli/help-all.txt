@@ -243,6 +243,8 @@ All commands (one line per path):
     app add-worker
   audit          Reconstruct every merge on the default branch from stored data — verdict notes, commit...
     audit approve
+    audit approval
+    audit verdicts
     audit revoke
   review         Review a PR end-to-end: detached checkout under `.cadence/wt/review-<pr>` (the merge...
     review flakes

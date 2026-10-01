@@ -31,6 +31,20 @@ cadence audit --json --limit 50        # machine form for digests/tiles
 `--since` accepts `24h`, `7d`, `2w`, `YYYY-MM-DD` or a unix epoch.
 `--limit 0` means no cap (default 200).
 
+Two read-only verbs serve `scripts/enqueue-reviewed` (CAD-959), which
+decides before a merge what the audit reports after it:
+
+```bash
+cadence audit approval --pr 84 --head <full-sha>   # JSON; exit 0 only when an approval is in force for exactly that head
+cadence audit verdicts --issue CAD-92 --pr 84 --head <full-sha>   # head-pinned verdict notes, plus why others were skipped
+```
+
+`audit verdicts` uses the same note parser as the audit. A reviewer is the
+first whitespace token of `From:`, lower-cased (the rest is prose). Its kind
+comes from the exact title (`Standards`, `Spec/security`, `Browser QA`,
+`Review (standards+spec)`); anything else is `other`. Symlinked notes are
+skipped, never followed. Neither verb writes anything or talks to the daemon.
+
 Two operator verbs write the approval evidence the report reads (see
 [Operator approval evidence](#operator-approval-evidence-the-human-class-gate)):
 
