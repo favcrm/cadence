@@ -731,6 +731,25 @@ pub fn validate_against(
                     ),
                 ));
             }
+            // The produced shape must also match the descriptor's
+            // scalar/list kind: `tags` is the only list-shaped
+            // producer, everything else is scalar. A scalar mapped to
+            // a descriptor `kind:"list"` would hand the cell
+            // consumer a string where it demands an array.
+            let kind_ok = match produced(&binding.source, &field.key) {
+                Some(Produced::Tags) => descriptor_field.kind == "list",
+                Some(_) => descriptor_field.kind == "scalar",
+                None => false,
+            };
+            if !kind_ok {
+                return Err(fail(
+                    &fpath,
+                    format!(
+                        "field '{}' maps '{}:{}' — its produced shape is not descriptor kind '{}'",
+                        field.field, binding.source, field.key, descriptor_field.kind
+                    ),
+                ));
+            }
             // Enum domains are closed at both ends: the descriptor's
             // declared `values` must equal the produced domain exactly,
             // so a package can neither widen nor rename the host's
