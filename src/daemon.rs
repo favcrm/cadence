@@ -483,10 +483,6 @@ pub struct Shared {
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
     lease: Option<Arc<crate::lease::LeaseCtl>>,
-    /// CAD-702: stops the hosted-lease heartbeat. Set only after the
-    /// shutdown flush completes, so exactly one renewal poster covers
-    /// the WAL checkpoint and tracker flush — never zero, never two.
-    lease_heartbeat_stop: AtomicBool,
     /// CAD-482: the test-only caller seam's armed credential — `Some`
     /// only when a fixture asked for it ([`ServeOptions::test_seam`])
     /// on a `test-seam` build. Request frames carrying `test_caller`
@@ -555,6 +551,9 @@ impl Shared {
         // one trip refuses every later write.
         if let Some(lease) = &lease {
             store.install_write_fence(lease.fence());
+        }
+        if let Some(delay) = opts.startup_delay_for_test {
+            std::thread::sleep(delay);
         }
         // Same-build crash restart is allowed with no lease. A different
         // build must already hold one — `daemon start` checks before
@@ -668,7 +667,6 @@ impl Shared {
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
             lease,
-            lease_heartbeat_stop: AtomicBool::new(false),
             seam,
             #[cfg(feature = "test-seam")]
             after_done_write_failure: opts.after_done_write_failure.clone(),
@@ -4156,6 +4154,11 @@ pub struct ServeOptions {
     /// test can prove renewal spans a slow flush. In-process fixtures
     /// only; production leaves it unset.
     pub flush_delay_for_test: Option<Duration>,
+    /// CAD-947: test-only dwell inside startup, after the store opens
+    /// and the lease fence is installed but before the first startup
+    /// write — a recovery that outlives the lease TTL. In-process
+    /// fixtures only; production leaves it unset.
+    pub startup_delay_for_test: Option<Duration>,
     /// CAD-482: arm the test-only caller seam. Honored only in
     /// `test-seam` builds; a daemon asked for it on any other build
     /// refuses to start rather than fall back to ambient identity.
@@ -4258,8 +4261,18 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         &hosted,
         opts.lease_http_endpoint_override.as_deref(),
     )?;
+    // CAD-947: renewal starts the moment the lease is held, before the
+    // store opens or recovery runs — startup of any length rides a
+    // renewed lease. The guard stops and joins it if startup fails; the
+    // lease is then left to expire.
+    let mut lease_heartbeat = lease
+        .as_ref()
+        .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
+    if let Some(heartbeat) = &lease_heartbeat {
+        heartbeat.attach(&shared);
+    }
     // CAD-313: the operator secret exists from the first start, so an
     // upgrade needs no manual step. An existing file is never touched —
     // a wrong mode is refused at use, naming the fix — and a failure
@@ -4381,12 +4394,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // never outlives the daemon.
     let wiki_index_worker = shared.wiki_index.spawn();
     // CAD-538 heartbeat under CAD-702 shutdown order: the single renewal
-    // poster from now until after the shutdown flush — stopped and
-    // joined only once the flush has completed, then the lease releases.
-    let lease_heartbeat = shared.lease.clone().map(|lease| {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_lease_heartbeat(&lease))
-    });
+    // poster (started right after acquire, CAD-947) runs until after the
+    // shutdown flush — stopped and joined only once the flush has
+    // completed, then the lease releases.
     while !shared.closing.load(Ordering::SeqCst) {
         if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
             shared.begin_closing();
@@ -4449,9 +4459,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         flush_budget(&hosted, shared.lease.as_deref()),
         opts.flush_delay_for_test.unwrap_or_default(),
     );
-    shared.lease_heartbeat_stop.store(true, Ordering::SeqCst);
-    if let Some(heartbeat) = lease_heartbeat {
-        let _ = heartbeat.join();
+    if let Some(heartbeat) = &mut lease_heartbeat {
+        heartbeat.stop();
     }
     if let Some(lease) = &shared.lease {
         if let Err(e) = lease.release() {

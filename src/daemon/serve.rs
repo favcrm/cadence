@@ -14,23 +14,71 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-impl Shared {
-    /// CAD-538 heartbeat under CAD-702 renewal policy: renew every
-    /// `renew_every` until `lease_heartbeat_stop` — which serve sets
-    /// only after the shutdown flush completes, so the WAL checkpoint
-    /// and tracker flush (and a deliberately slow test flush) always
-    /// run under exactly one renewal poster. A permanent failure trips
-    /// the fence and ends the loop; a transient blip — marked by the
-    /// HTTP provider while the local deadline stays open — is logged
-    /// and retried on the next beat without fencing.
-    pub(super) fn run_lease_heartbeat(self: &Arc<Self>, lease: &Arc<crate::lease::LeaseCtl>) {
-        while !self.lease_heartbeat_stop.load(Ordering::SeqCst) {
+/// CAD-538 heartbeat under CAD-702 renewal policy, started by CAD-947
+/// immediately after the lease is acquired — before the store opens or
+/// recovery runs — so startup work of any length rides a renewed lease.
+///
+/// Renews every `renew_every` until stopped. `serve` stops it only
+/// after the shutdown flush completes, so the WAL checkpoint and
+/// tracker flush (and a deliberately slow test flush) always run under
+/// exactly one renewal poster; dropping it (an early startup failure)
+/// stops and joins it too, so a failed start leaves no poster behind
+/// and the lease simply expires. A permanent failure trips the fence
+/// and ends the loop; a transient blip — marked by the HTTP provider
+/// while the local deadline stays open — is logged and retried on the
+/// next beat without fencing.
+pub(super) struct LeaseHeartbeat {
+    stop: Arc<AtomicBool>,
+    /// Set once `Shared` exists, so a trip can also wait out the
+    /// in-flight store writer; before that the shared fence alone
+    /// refuses every write the store will make.
+    shared: Arc<OnceLock<Arc<Shared>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LeaseHeartbeat {
+    pub(super) fn start(state_dir: &Path, lease: &Arc<crate::lease::LeaseCtl>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared: Arc<OnceLock<Arc<Shared>>> = Arc::new(OnceLock::new());
+        let handle = {
+            let (stop, shared, lease) = (Arc::clone(&stop), Arc::clone(&shared), Arc::clone(lease));
+            let state_dir = state_dir.to_path_buf();
+            thread::spawn(move || Self::run(&state_dir, &lease, &stop, &shared))
+        };
+        Self {
+            stop,
+            shared,
+            handle: Some(handle),
+        }
+    }
+
+    /// Hand the heartbeat the daemon it keeps leased.
+    pub(super) fn attach(&self, shared: &Arc<Shared>) {
+        let _ = self.shared.set(Arc::clone(shared));
+    }
+
+    /// Stop renewing and wait for the poster to exit. Idempotent.
+    pub(super) fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn run(
+        state_dir: &Path,
+        lease: &Arc<crate::lease::LeaseCtl>,
+        stop: &AtomicBool,
+        shared: &OnceLock<Arc<Shared>>,
+    ) {
+        while !stop.load(Ordering::SeqCst) {
             let deadline = Instant::now() + lease.renew_every;
-            while !self.lease_heartbeat_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if self.lease_heartbeat_stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) {
                 break;
             }
             match lease.renew() {
@@ -40,29 +88,50 @@ impl Shared {
                     tracing::warn!("hosted lease renewal blip — retrying: {error}");
                 }
                 Err(error) => {
-                    self.trip_lease(format!("lease renewal failed: {error}"));
+                    let why = format!("lease renewal failed: {error}");
+                    match shared.get() {
+                        Some(shared) => shared.trip_lease(why),
+                        None => {
+                            lease.fence().trip(why.clone());
+                            record_lease_loss(state_dir, lease, &why);
+                        }
+                    }
                     return;
                 }
             }
         }
     }
+}
 
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The forensic record of a lost lease, in the state dir — the daemon's
+/// own file, not the leased store: every store write including the
+/// event stream is refused once the fence trips.
+fn record_lease_loss(state_dir: &Path, lease: &crate::lease::LeaseCtl, why: &str) {
+    let fact = json!({"reason": why, "epoch": lease.epoch(), "at": epoch_secs()});
+    let _ = std::fs::write(
+        state_dir.join("lease-fence.json"),
+        serde_json::to_string_pretty(&fact).unwrap_or_default(),
+    );
+    eprintln!("cadence: hosted lease lost — daemon fenced: {why}");
+    tracing::warn!("hosted lease lost — daemon fenced: {why}");
+}
+
+impl Shared {
     /// CAD-538: the moment the lease is known lost — trip the shared
     /// fence (`fence_writes` waits out the in-flight writer so no write
     /// ordered after this can still run ungated), then leave the
-    /// forensic record in the state dir — the daemon's own file, not
-    /// the leased store: every store write including the event stream
-    /// is refused from here on.
+    /// forensic record in the state dir.
     fn trip_lease(&self, why: String) {
         self.store.fence_writes(why.clone());
-        let epoch = self.lease.as_ref().and_then(|l| l.epoch());
-        let fact = json!({"reason": why, "epoch": epoch, "at": epoch_secs()});
-        let _ = std::fs::write(
-            self.state_dir.join("lease-fence.json"),
-            serde_json::to_string_pretty(&fact).unwrap_or_default(),
-        );
-        eprintln!("cadence: hosted lease lost — daemon fenced: {why}");
-        tracing::warn!("hosted lease lost — daemon fenced: {why}");
+        if let Some(lease) = &self.lease {
+            record_lease_loss(&self.state_dir, lease, &why);
+        }
     }
 }
 
