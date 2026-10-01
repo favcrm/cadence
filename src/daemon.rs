@@ -318,6 +318,9 @@ pub struct Shared {
     answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
+    /// CAD-893 test seam: one pause per daemon for
+    /// `CADENCE_TEST_REVALIDATE_PAUSE_MS` (see `revalidate_enrollments`).
+    revalidate_pause_armed: AtomicBool,
     /// CAD-561: the pending update while one drains — `None` when no
     /// update is in progress. Set by `update_drain`, adopted from
     /// `<state>/update.json` (proved against the rollout lease — see
@@ -589,6 +592,7 @@ impl Shared {
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
+            revalidate_pause_armed: AtomicBool::new(true),
             // CAD-561: a pending update recorded by an update that is
             // still running (a restart in the middle of one) keeps the
             // fleet drained across the restart. The marker is adopted on

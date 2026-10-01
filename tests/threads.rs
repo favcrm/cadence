@@ -2506,6 +2506,9 @@ fn cad893_master_enrolled_during_a_revalidation_is_not_revoked() {
         assert_eq!(paused["payload"]["ms"], 4000, "{paused}");
         // Enrolls inside the gap: the paused call has already snapshotted.
         let master = f.start_master();
+        // Non-vacuous: the master enrolled while the call was still paused.
+        f.d.wait_event("master", "slot_enrolled", 5);
+        assert!(!call.is_finished(), "the master enrolled after the pause");
         let _ = call.join().unwrap();
         master
     });
