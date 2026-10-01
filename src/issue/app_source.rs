@@ -173,7 +173,10 @@ fn check_url(url: &str) -> Result<()> {
             "git source url is empty or over {MAX_URL_BYTES} bytes"
         )));
     }
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
         return Err(Error::rejected(
             "git source url must be https://… — credential-free public HTTPS only",
         ));
