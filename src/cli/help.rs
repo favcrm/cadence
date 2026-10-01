@@ -77,6 +77,44 @@ const OPERATOR: &[&str] = &[
     "session",
 ];
 
+/// Visible verbs that are neither core nor operator.
+const ADVANCED: &[&str] = &[
+    "agent-uid",
+    "attach",
+    "auth",
+    "claude",
+    "codex",
+    "cursor",
+    "delivery",
+    "devin",
+    "events",
+    "idea",
+    "intake",
+    "interrupt",
+    "job",
+    "login",
+    "message",
+    "milestone",
+    "monitor",
+    "overview",
+    "project",
+    "remote",
+    "report",
+    "resume",
+    "rollout",
+    "setup",
+    "skill",
+    "stop",
+    "test",
+    "thread",
+    "upgrade",
+    "workflow",
+];
+
+/// Verbs clap hides on purpose: plumbing no help view lists.
+#[cfg(test)]
+const INTERNAL: &[&str] = &["confine", "mcp-agent", "mcp-permission"];
+
 const MORE_OUTSIDE_PANE: &str = "More: cadence help operator | cadence help all";
 /// Inside a pane the operator list is left out of the pointers.
 const MORE_IN_PANE: &str = "More: cadence help all";
@@ -148,105 +186,78 @@ fn summary(cmd: &Command) -> String {
     format!("{cut}...")
 }
 
-fn verb_line(out: &mut String, cmd: &Command, with_children: bool) {
+fn verb_line(out: &mut String, cmd: &Command) {
     out.push_str(&format!("  {:<14} {}\n", cmd.get_name(), summary(cmd)));
-    if !with_children {
-        return;
-    }
-    let kids: Vec<&str> = cmd
-        .get_subcommands()
-        .map(|c| c.get_name())
-        .filter(|n| *n != "help")
-        .collect();
-    let mut line = String::new();
-    for k in kids {
-        if !line.is_empty() && line.len() + k.len() + 1 > 88 {
-            out.push_str(&format!("      {line}\n"));
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(k);
-    }
-    if !line.is_empty() {
-        out.push_str(&format!("      {line}\n"));
+}
+
+/// Every non-hidden descendant path of `cmd`, one per line. Hiding is
+/// judged on the plain command tree, so deliberately hidden plumbing
+/// never shows.
+fn tree_lines(out: &mut String, cmd: &Command, path: &str) {
+    for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+        let here = format!("{path} {}", sub.get_name());
+        out.push_str(&format!("    {here}\n"));
+        tree_lines(out, sub, &here);
     }
 }
 
 /// `cadence help operator`: the operator's verbs, then the advanced
-/// ones (everything that is neither core nor operator).
+/// ones.
 pub(super) fn operator_help_text() -> String {
     let cmd = Cli::command();
     let mut out = String::from("Operator commands:\n");
     for name in OPERATOR {
         if let Some(c) = cmd.find_subcommand(name) {
-            verb_line(&mut out, c, false);
+            verb_line(&mut out, c);
         }
     }
     out.push_str("\nAdvanced commands:\n");
-    let mut rest: Vec<&Command> = cmd
-        .get_subcommands()
-        .filter(|c| {
-            let n = c.get_name();
-            n != "help" && !is_core(n) && !OPERATOR.contains(&n)
-        })
-        .collect();
-    rest.sort_by_key(|c| c.get_name().to_string());
-    for c in rest {
-        verb_line(&mut out, c, false);
+    let mut adv: Vec<&str> = ADVANCED.to_vec();
+    adv.sort_unstable();
+    for name in adv {
+        if let Some(c) = cmd.find_subcommand(name) {
+            verb_line(&mut out, c);
+        }
     }
     out.push_str("\nDetails for one verb: cadence help <verb>\n");
-    out.push_str("Everything with its subcommands: cadence help all\n");
+    out.push_str("Every command path: cadence help all\n");
     out
 }
 
-/// `cadence help all`: every top-level verb, with its subcommands.
+/// `cadence help all`: the full tree, one line per command path.
 pub(super) fn all_help_text() -> String {
     let cmd = Cli::command();
-    let mut out = String::from("All commands (subcommands indented):\n");
-    let mut seen = Vec::new();
+    let mut out = String::from("All commands (one line per path):\n");
     let core = CORE.iter().flat_map(|(_, v)| v.iter().map(|(n, _)| *n));
-    for name in core.chain(OPERATOR.iter().copied()) {
-        seen.push(name);
+    let mut adv: Vec<&str> = ADVANCED.to_vec();
+    adv.sort_unstable();
+    for name in core.chain(OPERATOR.iter().copied()).chain(adv) {
         if let Some(c) = cmd.find_subcommand(name) {
-            verb_line(&mut out, c, true);
+            verb_line(&mut out, c);
+            tree_lines(&mut out, c, name);
         }
-    }
-    let mut rest: Vec<&Command> = cmd
-        .get_subcommands()
-        .filter(|c| c.get_name() != "help" && !seen.contains(&c.get_name()))
-        .collect();
-    rest.sort_by_key(|c| c.get_name().to_string());
-    for c in rest {
-        verb_line(&mut out, c, true);
     }
     out.push_str("\nDetails for one verb: cadence help <verb> [<subcommand>]\n");
     out
 }
 
 /// `cadence help operator|advanced|all` as typed (with an optional
-/// leading `--state-dir <dir>`): the text to print, else `None` and
+/// `--state-dir <dir>` anywhere): the text to print, else `None` and
 /// clap handles the line — `cadence help <verb>` stays clap's own.
 pub(super) fn help_section(args: &[String]) -> Option<String> {
-    let mut rest = args.iter().skip(1).map(String::as_str);
-    let mut first = rest.next()?;
-    if first == "--state-dir" {
-        rest.next()?;
-        first = rest.next()?;
-    } else if first.starts_with("--state-dir=") {
-        first = rest.next()?;
+    // The global `--state-dir` may sit anywhere: drop it and its value.
+    let mut rest: Vec<&str> = Vec::new();
+    let mut it = args.iter().skip(1).map(String::as_str);
+    while let Some(a) = it.next() {
+        if a == "--state-dir" {
+            it.next()?;
+        } else if !a.starts_with("--state-dir=") {
+            rest.push(a);
+        }
     }
-    if first != "help" {
-        return None;
-    }
-    let which = rest.next()?;
-    if rest.next().is_some() {
-        return None;
-    }
-    match which {
-        "operator" | "advanced" => Some(operator_help_text()),
-        "all" => Some(all_help_text()),
+    match rest.as_slice() {
+        ["help", "operator" | "advanced"] => Some(operator_help_text()),
+        ["help", "all"] => Some(all_help_text()),
         _ => None,
     }
 }
@@ -318,6 +329,8 @@ mod tests {
         assert!(help_section(&a(&["cadence", "--state-dir", "/x", "help", "all"])).is_some());
         assert!(help_section(&a(&["cadence", "--state-dir=/x", "help", "operator"])).is_some());
         // A verb's own help stays clap's.
+        assert!(help_section(&a(&["cadence", "help", "all", "--state-dir", "/x"])).is_some());
+        assert!(help_section(&a(&["cadence", "help", "--state-dir=/x", "operator"])).is_some());
         assert!(help_section(&a(&["cadence", "help", "issue"])).is_none());
         assert!(help_section(&a(&["cadence", "help", "all", "x"])).is_none());
         assert!(help_section(&a(&["cadence", "issue", "help", "all"])).is_none());
@@ -419,5 +432,96 @@ mod tests {
         let cmd = Cli::command();
         let p = cmd.find_subcommand("platform").unwrap();
         assert!(p.get_about().is_some());
+    }
+
+    /// Paths of every command clap hides on purpose, at any depth.
+    fn originally_hidden() -> Vec<String> {
+        fn walk(cmd: &Command, path: &str, out: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let here = if path.is_empty() {
+                    sub.get_name().to_string()
+                } else {
+                    format!("{path} {}", sub.get_name())
+                };
+                if sub.is_hide_set() {
+                    out.push(here);
+                } else {
+                    walk(sub, &here, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&Cli::command(), "", &mut out);
+        out
+    }
+
+    #[test]
+    fn deliberately_hidden_commands_appear_in_no_help_view() {
+        let hidden = originally_hidden();
+        assert_eq!(hidden.len(), 6, "{hidden:?}");
+        for view in [
+            render_root(false),
+            render_root(true),
+            operator_help_text(),
+            all_help_text(),
+        ] {
+            for line in view.lines().map(str::trim) {
+                for h in &hidden {
+                    assert!(
+                        line != h && !line.starts_with(&format!("{h} ")),
+                        "hidden `{h}` listed: {line}"
+                    );
+                }
+            }
+        }
+        // They still parse.
+        for h in &hidden {
+            let mut argv = vec!["cadence"];
+            argv.extend(h.split(' '));
+            argv.push("--help");
+            let err = root_command(false).try_get_matches_from(&argv).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{h}");
+        }
+    }
+
+    /// Core, operator, advanced and internal are an exact partition of
+    /// the top-level verbs: a new verb fails here until it is filed.
+    #[test]
+    fn buckets_partition_the_top_level_verbs() {
+        let mut filed: Vec<&str> = CORE
+            .iter()
+            .flat_map(|(_, v)| v.iter().map(|(n, _)| *n))
+            .chain(OPERATOR.iter().copied())
+            .chain(ADVANCED.iter().copied())
+            .chain(INTERNAL.iter().copied())
+            .collect();
+        filed.sort_unstable();
+        let mut dup = filed.clone();
+        dup.dedup();
+        assert_eq!(dup, filed, "a verb is filed in two buckets");
+        let mut verbs: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        verbs.sort_unstable();
+        assert_eq!(
+            verbs, filed,
+            "file each new top-level verb in CORE, OPERATOR, ADVANCED or INTERNAL"
+        );
+        let mut hidden: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|c| c.is_hide_set())
+            .map(|c| c.get_name().to_string())
+            .collect();
+        hidden.sort_unstable();
+        let mut internal: Vec<String> = INTERNAL.iter().map(|s| s.to_string()).collect();
+        internal.sort_unstable();
+        assert_eq!(hidden, internal);
+    }
+
+    #[test]
+    fn help_all_lists_nested_paths() {
+        let all = all_help_text();
+        assert!(all.contains("    issue epic stage\n"), "{all}");
     }
 }

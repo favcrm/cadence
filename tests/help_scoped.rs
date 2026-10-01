@@ -73,3 +73,18 @@ fn help_for_a_verb_is_clap_help_and_hidden_verbs_run() {
     assert_eq!(code, 0);
     assert!(help.contains("--keep"), "{help}");
 }
+
+#[test]
+fn state_dir_may_follow_the_section_and_hidden_plumbing_stays_hidden() {
+    let (code, all) = run(&["help", "all", "--state-dir", "/tmp/cad888-none"], None);
+    assert_eq!(code, 0);
+    assert!(all.contains("    issue epic stage"), "{all}");
+    for hidden in [
+        "confine",
+        "mcp-agent",
+        "mcp-permission",
+        "master peek-grant",
+    ] {
+        assert!(!all.contains(hidden), "{hidden} listed");
+    }
+}
