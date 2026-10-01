@@ -3908,7 +3908,7 @@ fn cad867_view_read_is_consistent_under_concurrent_reads_and_upgrade() {
 /// `setsid -f`-detached agent-shaped child (carrying the enrolled
 /// lane's `CADENCE_ALIAS`, never a bare unmarked residual), and an
 /// unproven caller each refuse a fully-valid bound read (valid context
-/// + all digests) — while the operator's identical request succeeds.
+/// and all digests) — while the operator's identical request succeeds.
 /// The detached child hands its response back through a durable
 /// response-file (the `operator_rpc.py` script shape), never a
 /// parent-exited stdout race.
