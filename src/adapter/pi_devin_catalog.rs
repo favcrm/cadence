@@ -82,7 +82,11 @@ impl<'de> serde::Deserialize<'de> for UniqueValue {
     }
 }
 
-const LIMIT: u64 = 1_048_576;
+// Input byte cap, enforced before parsing. The live catalog has a family
+// with hundreds of variants, so these bounds sit well above its real shape.
+const LIMIT: u64 = 8 * 1_048_576;
+const MAX_FAMILIES: usize = 1024;
+const MAX_VARIANTS: usize = 4096;
 const MAX_AGE: u64 = 21_600_000;
 fn refusal() -> Error {
     Error::rejected("Offline Devin catalog unavailable or invalid; refresh the operator catalog and use a valid private worker cache")
@@ -180,7 +184,7 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     let families = value["catalog"]["families"]
         .as_array()
         .ok_or_else(refusal)?;
-    if families.is_empty() || families.len() > 256 {
+    if families.is_empty() || families.len() > MAX_FAMILIES {
         return Err(refusal());
     }
     let mut selected = false;
@@ -201,7 +205,7 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
             return Err(refusal());
         }
         let variants = family["variants"].as_array().ok_or_else(refusal)?;
-        if variants.is_empty() || variants.len() > 128 {
+        if variants.is_empty() || variants.len() > MAX_VARIANTS {
             return Err(refusal());
         }
         for variant in variants {
@@ -383,6 +387,64 @@ mod tests {
         std::fs::create_dir(&cache).unwrap();
         (dir, source, cache)
     }
+
+    fn family(uid: &str, count: usize) -> Value {
+        let variants: Vec<Value> = (0..count)
+            .map(|i| json!({"model_uid": format!("{uid}-v{i}"), "label": format!("{uid} v{i}")}))
+            .collect();
+        json!({"family_label":uid,"family_uid":uid,"slug":uid,"variants":variants})
+    }
+    fn seed_doc(doc: &Value) -> Result<()> {
+        let (_dir, source, cache) = fixture();
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW)
+    }
+    fn with_families(mut extra: Vec<Value>) -> Value {
+        let mut doc = catalog();
+        doc["catalog"]["families"]
+            .as_array_mut()
+            .unwrap()
+            .append(&mut extra);
+        doc
+    }
+    #[test]
+    fn accepts_live_sized_family_and_refuses_just_over_each_bound() {
+        // CAD-993: the live catalog's Fusion family has 460 variants.
+        seed_doc(&with_families(vec![family("fusion", 460)])).unwrap();
+        seed_doc(&with_families(vec![family("big", MAX_VARIANTS)])).unwrap();
+        assert!(seed_doc(&with_families(vec![family("big", MAX_VARIANTS + 1)])).is_err());
+        let many = |n: usize| (0..n - 1).map(|i| family(&format!("f{i}"), 1)).collect();
+        seed_doc(&with_families(many(MAX_FAMILIES))).unwrap();
+        assert!(seed_doc(&with_families(many(MAX_FAMILIES + 1))).is_err());
+    }
+    #[test]
+    fn accepts_shape_faithful_sample_of_the_live_catalog() {
+        let mut fusion = family("fusion", 460);
+        for (i, v) in fusion["variants"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            v["description"] = json!("Synthetic description of a routed model variant.");
+            v["cost_tier"] = if i % 2 == 0 {
+                Value::Null
+            } else {
+                json!("Free")
+            };
+            v["cost_summary"] = json!("Synthetic cost");
+            v["max_context_tokens"] = json!(262000);
+            v["max_output_tokens"] = Value::Null;
+            v["is_new"] = json!(i % 3 == 0);
+            v["is_beta"] = json!(false);
+        }
+        fusion["aliases"] = json!(["fusion-alias"]);
+        let doc = with_families(vec![fusion, family("deepseek-v4-1", 12), family("kimi", 3)]);
+        let (_dir, source, cache) = fixture();
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/fusion-v459", NOW).unwrap();
+        assert!(cache.join("pi-devin/models.json").exists());
+    }
     #[test]
     fn seeds_only_catalog_and_preserves_private_existing_snapshot() {
         let (_dir, source, cache) = fixture();
@@ -429,7 +491,7 @@ mod tests {
         let (dir, source, cache) = fixture();
         std::fs::remove_file(&source).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
-        std::fs::write(&source, vec![b' '; 1_048_577]).unwrap();
+        std::fs::write(&source, vec![b' '; 8 * 1_048_576 + 1]).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
         std::fs::remove_file(&source).unwrap();
         let real = dir.path().join("real.json");
