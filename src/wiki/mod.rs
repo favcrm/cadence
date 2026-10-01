@@ -1326,11 +1326,14 @@ fn sniff_mime(head: &[u8]) -> &'static str {
 /// Blob bytes are immutable and content-addressed: publication stages
 /// the verified tmp to a unique sibling on the blob filesystem and
 /// then links it in under the hash name without ever overwriting or
-/// partially exposing an existing object. Once staged this call
-/// NEVER unlinks `.blobs/<sha256>` — another pointer, history or a
-/// trash entry may already reference it; a refusal removes only this
-/// call's own unpublished staging file (unreferenced blob cleanup is
-/// GC work, not this op's).
+/// partially exposing an existing object. A name collision is not
+/// trusted — the existing entry must prove it is a confined regular
+/// file holding exactly the upload's sha256 bytes before the upload
+/// dedupes to it, else the call refuses. Once staged this call NEVER
+/// unlinks `.blobs/<sha256>` — another pointer, history or a trash
+/// entry may already reference it; a refusal removes only this call's
+/// own unpublished staging file (unreferenced blob cleanup is GC
+/// work, not this op's).
 ///
 /// `tmp` must sit under `<state_dir>/wiki-uploads/` — a tmp anywhere
 /// else is refused (the daemon never renames an arbitrary caller
@@ -1409,9 +1412,11 @@ pub fn put_blob(
     // Land the blob: stage the verified tmp to a unique sibling name
     // on `.blobs/`'s own filesystem, then publish it at `<sha256>`
     // atomically and without overwrite. A partial copy never appears
-    // under the hash name; an already-published object is deduped,
-    // never replaced. From here on this call may only unlink `stage` —
-    // `dest` is shared content another pointer may already reference.
+    // under the hash name; an already-published object is verified
+    // byte-for-byte before it is deduped — never blindly trusted by
+    // name and never rewritten. From here on this call may only
+    // unlink `stage` — `dest` is shared content another pointer may
+    // already reference.
     ensure_layout(pm)?;
     let blobs = blobs_dir(&vault);
     let stage = blobs.join(format!(
@@ -1425,8 +1430,13 @@ pub fn put_blob(
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             // The state dir and the vault may live on different
             // mounts: copy bytes onto the blob filesystem. A failed
-            // copy leaves the tmp in place and `dest` untouched.
-            std::fs::copy(&tmp_canon, &stage)?;
+            // copy leaves the tmp in place and `dest` untouched — but
+            // the private `stage` it may have partially written is
+            // ours alone, so it is always removed.
+            if let Err(e) = std::fs::copy(&tmp_canon, &stage) {
+                let _ = std::fs::remove_file(&stage);
+                return Err(e.into());
+            }
             let _ = std::fs::remove_file(&tmp_canon);
         }
         Err(e) => return Err(e.into()),
@@ -1444,15 +1454,14 @@ pub fn put_blob(
     let cur = rev_of(&pointer)?;
     if let Some(want) = if_rev {
         if want != cur {
-            // Conflict: drop only this call's staging file. `dest`
-            // stays — it may already back another committed pointer.
-            let _ = std::fs::remove_file(&stage);
+            // Conflict. `publish_blob` already consumed this call's
+            // private stage; `dest` is shared custody another pointer
+            // may already reference — nothing here unlinks it.
             return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
         }
     }
     if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
         // A text page already sits at the logical name.
-        let _ = std::fs::remove_file(&stage);
         return Err(Error::rejected(format!(
             "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
         )));
@@ -1480,7 +1489,6 @@ pub fn put_blob(
         None,
     ) {
         restore(&pointer, before);
-        let _ = std::fs::remove_file(&stage);
         return Err(e);
     }
     let mut out = json!({
@@ -1498,29 +1506,84 @@ pub fn put_blob(
     Ok(out)
 }
 
-/// Publish staged blob bytes at `dest` — atomically, and never over an
-/// existing object. `stage` already sits on `dest`'s filesystem (it is
-/// the unique sibling name `put_blob` staged onto `.blobs/` itself), so
-/// a `hard_link` lands the complete bytes at the hash name in one
-/// atomic, no-overwrite step: an existing `dest` is identical content
-/// (the name is its verified sha256) and is deduped, never rewritten.
-/// On success or dedupe `stage` is consumed and `dest` is left in place
-/// either way — after publication those bytes may already back another
-/// committed pointer, so a failed caller never unlinks `dest`.
+/// Publish staged blob bytes at `dest` — atomically, never over an
+/// existing object, and never trusting a name as proof of content.
+/// `stage` already sits on `dest`'s filesystem (it is the unique
+/// sibling name `put_blob` staged onto `.blobs/` itself), so a
+/// `hard_link` lands the complete bytes at the hash name in one
+/// atomic, no-overwrite step.
+///
+/// `AlreadyExists` is a collision claim, not a byte proof: the
+/// existing entry is verified to be a confined regular non-symlink
+/// file whose size and sha256 match the hash name exactly before the
+/// upload is deduped to it. Foreign bytes, a directory, a symlink or
+/// any size/hash mismatch refuse the upload — the existing object is
+/// left byte-for-byte as found, no pointer is committed by this
+/// caller, and only the private `stage` name is removed. A
+/// `hard_link` that lands means `stage`'s own verified bytes now own
+/// the name, so no re-check is needed.
+///
+/// Publication is link-based on purpose: it makes the no-overwrite
+/// guarantee atomic on every filesystem the vault deploys to here
+/// (Linux ext4/tmpfs). A filesystem without hard links cannot promise
+/// that, so `publish_blob` surfaces the link error rather than
+/// falling back to a copy or a rename that could overwrite or expose
+/// partial bytes at the hash name.
 fn publish_blob(stage: &Path, dest: &Path) -> Result<()> {
     match std::fs::hard_link(stage, dest) {
         Ok(()) => {}
-        // Same-hash object already published — dedupe, not overwrite.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_existing_blob(stage, dest)?;
+        }
         Err(e) => {
             // The staging name is ours alone — never leave it behind.
             let _ = std::fs::remove_file(stage);
             return Err(e.into());
         }
     }
-    // Whether the link landed or an equal object was already there,
-    // our private staging name is ours alone — always removed.
+    // Whether the link landed or the existing object verified as the
+    // same content, our private staging name is ours alone — removed.
     let _ = std::fs::remove_file(stage);
+    Ok(())
+}
+
+/// The `AlreadyExists` half of [`publish_blob`]: prove the entry at
+/// `dest` is a regular, non-symlink file holding exactly `stage`'s
+/// bytes — the same sha256 the name claims — before the upload
+/// dedupes to it. Any other shape or content refuses. `stage` is
+/// removed on EVERY failing exit — refusal or I/O error alike —
+/// because it is this call's private name, while `dest` is shared
+/// custody a failure must never touch.
+fn verify_existing_blob(stage: &Path, dest: &Path) -> Result<()> {
+    let out = verify_existing_blob_inner(stage, dest);
+    if out.is_err() {
+        let _ = std::fs::remove_file(stage);
+    }
+    out
+}
+
+fn verify_existing_blob_inner(stage: &Path, dest: &Path) -> Result<()> {
+    let refuse = |why: String| -> Error {
+        Error::rejected(format!(
+            "wiki put_blob refused: existing blob object {} {why}",
+            dest.display()
+        ))
+    };
+    let meta = dest.symlink_metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(refuse("is not a regular file".to_string()));
+    }
+    let staged = stage.symlink_metadata()?;
+    if meta.len() != staged.len() {
+        return Err(refuse(format!(
+            "holds {} bytes, expected {}",
+            meta.len(),
+            staged.len()
+        )));
+    }
+    if sha256_file(dest)? != sha256_file(stage)? {
+        return Err(refuse("content does not match its hash name".to_string()));
+    }
     Ok(())
 }
 
