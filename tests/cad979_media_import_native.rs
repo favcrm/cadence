@@ -573,6 +573,74 @@ fn sha_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Build a harness whose daemon already carries a `MediaImporter` against a
+/// fake door, plus the synthetic-PNG media adapter.
+fn importer_harness(door: &FakeImportDoor, bearer: &str) -> Release {
+    let media = h_png();
+    let importer = MediaImporter::new(
+        &format!("http://{}", door.addr),
+        DeviceCredential::new(bearer.to_owned()),
+    )
+    .expect("fake-door importer");
+    Release::with_social_image(move |opts, _| {
+        opts.provider_deployments = Some(
+            DeploymentMetadata::parse(
+                br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#,
+            )
+            .unwrap(),
+        );
+        agenticos_external::attach(opts).unwrap();
+        let inner = opts.platforms.remove("agenticos_external").unwrap();
+        opts.platforms.insert(
+            "agenticos_external".into(),
+            Arc::new(SyntheticMedia { inner, png: media }),
+        );
+        opts.social_media_importer = Some(Arc::new(importer));
+    })
+}
+
+/// Positive path: operator import against a real configured importer mints a
+/// media_key that then passes the freeze guard for the same reviewed asset.
+#[test]
+fn cad979_import_then_schedule_binds_reviewed_asset() {
+    // The daemon derives a fresh workspace per store; the door binds first
+    // (the importer needs its address), then learns `h`'s workspace and the
+    // `publication`-slot connection via shared cells before any request.
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "imp");
+
+    // The importer uploads the retained PNG; the door mints the key.
+    let imported = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-imp-1"),
+        )
+        .expect("operator import against the configured fake door must succeed");
+    assert_eq!(imported["ok"], json!(true));
+    let key = imported["media_key"].as_str().unwrap().to_owned();
+    assert_eq!(imported["image_digest"], json!(image_digest));
+    assert_eq!(
+        door.calls.load(Ordering::SeqCst),
+        1,
+        "exactly one import call"
+    );
+
+    // That key must satisfy the freeze guard for the same run/asset.
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            schedule_body(&run, &bundle, &install, "cad979-imp-sched", Some(key)),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(intent["state"], "queued");
+}
+
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
 /// identical 1×1 PNG, so this is deterministic.
 fn h_png() -> Vec<u8> {
