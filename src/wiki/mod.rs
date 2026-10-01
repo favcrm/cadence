@@ -1702,7 +1702,12 @@ mod test_pause {
     fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
         match release.recv_timeout(bound) {
             Ok(()) => WaitOutcome::Released,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Timeout,
+            // COUNTERFACTUAL MUTANT (temporary — not for merge): the
+            // pre-R4 seam swallowed a Timeout and resumed the parked
+            // call exactly like a real release. Mapping Timeout back
+            // to Released reproduces that silent-resume so the new
+            // lifecycle tests go RED under the old semantics.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Released,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Disconnected,
         }
     }
