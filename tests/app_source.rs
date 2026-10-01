@@ -942,3 +942,66 @@ fn resolved_bundle_owns_and_cleans_its_temporary_files() {
     assert!(resolve(&f.source(&"1".repeat(40))).is_err());
     assert_eq!(std::fs::read_dir(&resolver_temp).unwrap().count(), 0);
 }
+
+/// A private timeout wrapper observes production's fixed deadline argv,
+/// then runs the real timeout with a shorter TEST-ONLY deadline. Each
+/// Git phase stalls and ignores TERM so finite KILL escalation is exercised
+/// without waiting 130 seconds or introducing a runtime bypass parameter.
+#[test]
+fn every_git_step_has_a_finite_deadline() {
+    if !in_own_process("every_git_step_has_a_finite_deadline", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    let real_timeout = which("timeout");
+    let python = which("python3");
+    for phase in ["clone", "verify", "checkout", "head"] {
+        std::env::set_var("PATH", &orig_path);
+        let f = GitFixture::basic();
+        let git = f.bin.join("git");
+        let script = std::fs::read_to_string(&git).unwrap();
+        let predicate = match phase {
+            "clone" => "'clone' in argv",
+            "verify" => "'rev-parse' in argv and '--verify' in argv",
+            "checkout" => "'checkout' in argv",
+            "head" => "'rev-parse' in argv and 'HEAD' in argv",
+            _ => unreachable!(),
+        };
+        let stall = format!(
+            "argv = sys.argv[1:]\nif {predicate}:\n    import signal, time\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n    time.sleep(30)"
+        );
+        std::fs::write(&git, script.replace("argv = sys.argv[1:]", &stall)).unwrap();
+        let timeout_log = f._dir.path().join("timeout-argv.jsonl");
+        let timeout_script = format!(
+            "#!{python}\nimport json, os, sys\nargv = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(argv) + '\\n')\nassert argv[:3] == ['--kill-after=10', '120', 'git'], argv\nos.execv({real}, [{real}, '--kill-after=0.1', '0.75'] + argv[2:])\n",
+            log = serde_json::to_string(&timeout_log.to_str().unwrap()).unwrap(),
+            real = serde_json::to_string(&real_timeout).unwrap(),
+        );
+        let timeout = f.bin.join("timeout");
+        std::fs::write(&timeout, timeout_script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        use_bin(&f, &orig_path);
+        let selected = SelectedGitSource::new(FIXTURE_URL, &f.sha1, FIXTURE_DIR).unwrap();
+        let started = std::time::Instant::now();
+        let error = resolve(&selected).unwrap_err().to_string();
+        assert!(error.contains(&format!("git {phase} exceeded")), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let calls = std::fs::read_to_string(timeout_log).unwrap();
+        let expected_steps = match phase {
+            "clone" => 1,
+            "verify" => 2,
+            "checkout" => 3,
+            "head" => 4,
+            _ => unreachable!(),
+        };
+        assert_eq!(calls.lines().count(), expected_steps);
+        for call in calls.lines() {
+            let args: Vec<String> = serde_json::from_str(call).unwrap();
+            assert_eq!(&args[..3], &["--kill-after=10", "120", "git"]);
+        }
+    }
+    std::env::set_var("PATH", orig_path);
+}

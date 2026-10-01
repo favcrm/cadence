@@ -45,6 +45,12 @@
 //! and only the HTTPS transport can run. No shell is involved — argv
 //! stays argv.
 //!
+//! `PATH` is a trusted caller input: this module does not authenticate
+//! executables found there. Clone disk/network bytes and captured git
+//! output are not byte-bounded; the content caps apply to the snapshot.
+//! The temporary-directory path must have no symlinked ancestors;
+//! paths such as macOS's `/var/...` alias refuse rather than follow it.
+//!
 //! **Snapshot containment.** The clone root and the selected
 //! directory's every component are opened descriptor-relative with
 //! `O_NOFOLLOW`/`O_DIRECTORY`; children are listed through those
@@ -173,7 +179,7 @@ fn check_url(url: &str) -> Result<()> {
         ));
     };
     for b in rest.bytes() {
-        if b < 0x21 || b >= 0x7f || matches!(b, b'%' | b'@' | b'?' | b'#' | b'\\') {
+        if !(0x21..0x7f).contains(&b) || matches!(b, b'%' | b'@' | b'?' | b'#' | b'\\') {
             return Err(Error::rejected(
                 "git source url carries a control, space, percent, userinfo, query, \
                  fragment or backslash — it is a plain https://host/path",
