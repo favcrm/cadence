@@ -1124,7 +1124,7 @@ impl FakeDestinationsDoor {
     fn start(workspace: &str) -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
-        let rows = Arc::new(Mutex::new(Vec::new()));
+        let rows = Arc::new(Mutex::new(Vec::<DestinationRow>::new()));
         let dead = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let w = workspace.to_owned();
