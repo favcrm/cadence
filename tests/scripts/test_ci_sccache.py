@@ -20,7 +20,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 SCRIPT = ROOT / "scripts/ci-sccache"
-RUST_JOBS = ("clippy", "test-shard", "test-once", "build", "ui")
+RUST_JOBS = ("test-shard", "test-once", "build", "ui")
+# clippy's calls go through clippy-driver and are all non-cacheable (the
+# CI run showed 231 non-cacheable calls, 0 executed), so it stays out.
+NO_CACHE_JOBS = ("clippy", "release-artifact", "release-gate", "release-publish", "fmt", "test", "queue-evidence")
+COMPILE_MARKERS = ("cargo build", "cargo test", "cargo check", "cargo clippy", "--phase",
+                   "scripts/cadence-nextest", "scripts/nextest-inventory")
 RW_SECRET = re.compile(r"secrets\.SCCACHE_R2_RW_")
 ENV_NAME = "sccache-writer"
 
@@ -42,11 +47,16 @@ def job_names(workflow):
 
 def guard_allows(expr, event, ref):
     """Evaluate the ${{ ... }} guard in front of `&& secret/'sccache-writer'`."""
+    # Supported grammar: ==, != , &&, ||, parentheses and string literals.
+    # GitHub compares strings case-insensitively, so both sides are
+    # lowered. Anything else (functions, contains, !) raises: fail closed.
     py = expr.replace("&&", " and ").replace("||", " or ")
     py = py.replace("github.event_name", "EV").replace("github.ref", "REF")
+    py = re.sub(r"'[^']*'", lambda m: m.group(0).lower(), py)
+    event, ref = event.lower(), ref.lower()
     # Test-only: the input is the checked-in workflow text, and eval runs
     # only after it is reduced to the known comparison grammar.
-    rest = re.sub(r"EV|REF|and|or|==|[()\s]|'[A-Za-z_/.:*-]+'", "", py)
+    rest = re.sub(r"EV|REF|and|or|==|!=|[()\s]|'[A-Za-z_/.:*-]+'", "", py)
     if rest:
         raise AssertionError(f"unsupported guard expression: {expr!r}")
     return bool(eval(py, {"__builtins__": {}}, {"EV": event, "REF": ref}))
@@ -69,6 +79,12 @@ def assert_rw_gated(case, workflow):
     """CI-SEC-2: only cache-warm, only push to main, holds the RW key."""
     case.assertNotIn("pull_request_target", workflow)
     case.assertNotRegex(workflow, r"secrets:\s*inherit")
+    # Obfuscation bypasses: a computed secret name or environment would
+    # defeat every textual check below, so forbid the constructs.
+    case.assertNotRegex(workflow, r"(?i)secrets\s*\[")
+    case.assertNotRegex(workflow, r"(?i)tojson\(\s*secrets")
+    case.assertNotRegex(workflow, r"(?im)^\s*environment:\s*\$\{\{")
+    case.assertNotRegex(workflow, r"(?im)^\s*environment:\s*$")
     # Never at workflow level or in any job but cache-warm.
     head = workflow.split("\njobs:\n", 1)[0]
     case.assertNotRegex(head, r"SCCACHE_R2_RW")
@@ -101,6 +117,23 @@ def assert_rw_gated(case, workflow):
                 case.assertRegex(line, r"secrets\.SCCACHE_R2_RO_(ACCESS_KEY_ID|SECRET_ACCESS_KEY) \}\}$")
 
 
+def steps_of(body):
+    """Steps of a job, comment lines dropped."""
+    body = "\n".join(l for l in body.split("\n") if not l.lstrip().startswith("#"))
+    return re.split(r"(?m)^      - ", body)[1:]
+
+
+def assert_enable_before_compile(case, workflow):
+    """The cache only helps compiles that run after it is enabled."""
+    for job in RUST_JOBS + (WARM,):
+        steps = steps_of(job_body(workflow, job))
+        enable = [i for i, st in enumerate(steps) if "scripts/ci-sccache enable" in st]
+        case.assertEqual(len(enable), 1, job)
+        compiling = [i for i, st in enumerate(steps) if any(m in st for m in COMPILE_MARKERS)]
+        case.assertTrue(compiling, job)
+        case.assertLess(enable[0], compiling[0], f"{job}: sccache must be enabled before the first compile step")
+
+
 def assert_no_secret_path_has_no_wrapper(case, workflow):
     # Only the script may set the wrapper, and only after credentials resolve.
     case.assertNotRegex(workflow, r"(?m)^\s*RUSTC_WRAPPER:|RUSTC_WRAPPER=sccache|export RUSTC_WRAPPER")
@@ -112,11 +145,12 @@ def assert_no_secret_path_has_no_wrapper(case, workflow):
     warm = job_body(workflow, WARM)
     case.assertIn("id: sccache", warm)
     builds = [st for st in re.split(r"(?m)^      - ", warm) if re.search(r"run: cargo ", st)]
-    case.assertEqual(len(builds), 3)
+    case.assertEqual(len(builds), 2)
+    case.assertNotIn("clippy", warm.replace("--component clippy", ""))
     for st in builds:
         case.assertIn("if: steps.sccache.outputs.enabled == 'true'", st)
     # release-artifact is attested: it never uses the shared cache.
-    for job in ("release-artifact", "release-gate", "release-publish", "fmt", "test", "queue-evidence"):
+    for job in NO_CACHE_JOBS:
         body = job_body(workflow, job)
         case.assertNotIn("ci-sccache", body, job)
         case.assertNotRegex(body, r"SCCACHE_R2_R[WO]_")
@@ -176,6 +210,41 @@ class WorkflowContract(unittest.TestCase):
         self.assertNotEqual(mutated, self.workflow)
         with self.assertRaises(AssertionError):
             assert_rw_gated(self, mutated)
+
+    def test_enable_precedes_every_compile_step(self):
+        assert_enable_before_compile(self, self.workflow)
+        # The pre-fix order: test-shard enabled sccache after the inventory
+        # build, its only compile.
+        blk = re.search(r"      - name: Enable shared sccache \(no-op without credentials\)\n        if: steps\.scope\.outputs\.mode != 'docs'\n(?:        .*\n)+?        run: sh \$GITHUB_WORKSPACE/scripts/ci-sccache enable\n", self.workflow)[0]
+        moved = self.workflow.replace(blk, "", 1).replace(
+            "      - name: Keep inventory compiler timings\n", blk + "      - name: Keep inventory compiler timings\n", 1)
+        self.assertNotEqual(moved, self.workflow)
+        with self.assertRaises(AssertionError):
+            assert_enable_before_compile(self, moved)
+
+    def test_obfuscated_secret_or_environment_is_rejected(self):
+        for extra in ("      - run: echo ${{ secrets[format('SCCACHE_R2_{0}_X', 'RW')] }}\n",
+                      "      - run: echo ${{ toJSON(secrets) }}\n"):
+            mutated = self.workflow.replace("  cross-build:\n", "  cross-build:\n    steps:\n" + extra, 1) if "  cross-build:\n" in self.workflow \
+                else self.workflow.replace("  fmt:\n", "  fmt:\n    steps:\n" + extra, 1)
+            with self.subTest(extra=extra), self.assertRaises(AssertionError):
+                assert_rw_gated(self, mutated)
+        mutated = self.workflow.replace("  fmt:\n", "  fmt:\n    environment: ${{ format('sccache-{0}', 'writer') }}\n", 1)
+        with self.assertRaises(AssertionError):
+            assert_rw_gated(self, mutated)
+
+    def test_guard_evaluator_is_case_insensitive_and_supports_not_equal(self):
+        self.assertTrue(guard_allows("github.event_name == 'PUSH' && github.ref == 'REFS/HEADS/MAIN'", "push", "refs/heads/main"))
+        self.assertFalse(guard_allows("github.event_name != 'pull_request'", "pull_request", "x"))
+        self.assertTrue(guard_allows("github.event_name != 'pull_request'", "push", "x"))
+        with self.assertRaises(AssertionError):
+            guard_allows("contains(github.ref, 'main')", "push", "main")
+
+    def test_read_only_proof_step_runs_in_a_read_only_job(self):
+        body = job_body(self.workflow, "test-once")
+        self.assertEqual(body.count("scripts/ci-sccache verify-ro"), 1)
+        self.assertLess(body.index("scripts/ci-sccache enable"), body.index("scripts/ci-sccache verify-ro"))
+        self.assertNotIn("verify-ro", job_body(self.workflow, WARM))
 
     def test_pull_request_target_is_rejected(self):
         with self.assertRaises(AssertionError):
@@ -373,6 +442,58 @@ class ScriptBehaviour(unittest.TestCase):
     def test_unknown_command_is_rejected(self):
         h = Harness(self)
         self.assertEqual(h.run("bogus").returncode, 2)
+
+
+class VerifyReadOnly(unittest.TestCase):
+    ENV = dict(RUSTC_WRAPPER="sccache", SCCACHE_S3_RW_MODE="READ_ONLY", SCCACHE_BUCKET="cadence-ci-sccache",
+               SCCACHE_ENDPOINT=ENDPOINT, AWS_ACCESS_KEY_ID="roid", AWS_SECRET_ACCESS_KEY="rosecret")
+
+    def stub(self, h, code, rc=0):
+        log = h.dir / "curl.log"
+        stdin = h.dir / "curl.stdin"
+        script = h.bin / "curl"
+        script.write_text(f'#!/bin/sh\necho "$@" >> {log}\ncat > {stdin}\nprintf {code}\nexit {rc}\n')
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        return log, stdin
+
+    def test_403_proves_the_token_cannot_write_without_secrets_in_argv(self):
+        h = Harness(self)
+        log, stdin = self.stub(h, "403")
+        result = h.run("verify-ro", **self.ENV)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("HTTP 403", result.stdout)
+        argv = log.read_text()
+        self.assertNotIn("rosecret", argv)
+        self.assertNotIn("roid", argv)
+        self.assertIn("--aws-sigv4", argv)
+        self.assertIn("roid:rosecret", stdin.read_text())
+        self.assertNotIn("rosecret", result.stdout + result.stderr)
+
+    def test_a_successful_write_fails_the_job(self):
+        h = Harness(self)
+        self.stub(h, "200")
+        result = h.run("verify-ro", **self.ENV)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::", result.stdout)
+        self.assertNotIn("rosecret", result.stdout + result.stderr)
+
+    def test_inconclusive_answers_warn_but_pass(self):
+        for code, rc in (("500", 0), ("400", 0), ("000", 7)):
+            h = Harness(self)
+            self.stub(h, code, rc)
+            result = h.run("verify-ro", **self.ENV)
+            with self.subTest(code=code):
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("::warning::", result.stdout)
+
+    def test_noop_without_read_only_mode_or_credentials(self):
+        for override in ({"SCCACHE_S3_RW_MODE": "READ_WRITE"}, {"RUSTC_WRAPPER": ""}, {"AWS_SECRET_ACCESS_KEY": ""}):
+            h = Harness(self)
+            log, _ = self.stub(h, "200")
+            result = h.run("verify-ro", **{**self.ENV, **override})
+            with self.subTest(override=override):
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse(log.exists(), "curl must not be called")
 
 
 class PinnedTool(unittest.TestCase):

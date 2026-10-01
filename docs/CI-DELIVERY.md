@@ -62,12 +62,18 @@ installer. A separate staging branch is unnecessary.
 
 ## Shared sccache on Cloudflare R2 (CAD-904)
 
-Rust jobs (`clippy`, `test-shard`, `test-once`, `build`, `ui`) can share
+Rust jobs (`test-shard`, `test-once`, `build`, `ui`) can share
 compiled artifacts through an sccache backend on the R2 bucket
 `cadence-ci-sccache` (30-day object expiry). GitHub caches are scoped per
 branch, so merge-queue refs could not read each other's rust-cache; R2 is
-not. rust-cache stays for the registry and git dependencies and is not
-changed here (its save scope is a separate ticket).
+not. rust-cache stays: it caches the registry, git dependencies and the
+compiled dependency artifacts in `target/`, and is not changed here (its
+save scope is a separate ticket). Expect a modest gain: the `cadence`
+crate and the test binaries depend on the changed library, so they always
+miss on a PR. The win is dependency crates when rust-cache misses, mainly
+`merge_group` runs. The real number comes from the post-merge measurement
+(the ticket's acceptance), not from this change. `clippy` is left out: its
+calls go through clippy-driver and are all non-cacheable.
 
 The feature is a strict no-op without credentials. With no secrets (fork
 PRs, or before setup) `scripts/ci-sccache enable` exits 0 without touching
@@ -84,11 +90,15 @@ let that code poison the cache or exfiltrate the key. Therefore:
 - `cache-warm` has `if: push && ref == refs/heads/main`, the static
   `environment: sccache-writer`, `continue-on-error: true`, and nothing
   `needs` it. It builds the profiles the gates use (the feature-on test
-  profile, the release profile, clippy dependencies) so main fills the
+  profile and the release profile) so main fills the
   cache. It skips the builds when sccache did not enable.
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
+- The guard evaluator in `tests/scripts/test_ci_sccache.py` compares
+  strings case-insensitively like GitHub and supports `==` and `!=`; any
+  other expression form (functions, `!`) is rejected. The test also rejects
+  `secrets[...]`, `toJSON(secrets)` and any computed `environment:`.
 - `tests/scripts/test_ci_sccache.py` (run in `fmt`) fails if an RW secret
   appears anywhere but `cache-warm`, if its `if` admits any event but push
   to main, if the writer environment is attached to another job, or if
@@ -109,7 +119,21 @@ How it works:
 - Settings: `SCCACHE_BUCKET=cadence-ci-sccache`, `SCCACHE_REGION=auto`,
   `SCCACHE_ENDPOINT` from the repo variable `SCCACHE_R2_ENDPOINT`,
   `SCCACHE_S3_KEY_PREFIX=v1/rustc-<version>`, `CARGO_INCREMENTAL=0`.
-  Each Rust job prints `sccache --show-stats` (and to the step summary).
+  Each Rust job prints `sccache --show-stats` (and to the step summary),
+  plus the tail of `SCCACHE_ERROR_LOG` when it is non-empty.
+- `enable` runs before the first compiling step of every job (a contract
+  test checks the order): in `test-shard` the inventory build is the shard's
+  only compile.
+- Credentials are exported to later steps of the job as `AWS_ACCESS_KEY_ID`
+  and `AWS_SECRET_ACCESS_KEY` through `GITHUB_ENV`. That is the one way a
+  restarted sccache server can still authenticate, but it means test
+  processes inherit those names, and cadence treats `AWS_*` as provider
+  credentials. The cadence tests plant their own values and pass; remember
+  it when debugging an env-leak test.
+- Live read-only proof: `test-once` runs `scripts/ci-sccache verify-ro`, one
+  SigV4 `PutObject` of a throwaway key with the read-only credentials. R2
+  must answer 403; a 2xx fails the job, an inconclusive answer only warns.
+  It is a no-op without credentials or in read-write mode.
 - Residual risk: PR jobs run PR code with the read-only token in their
   environment; the token is scoped to this one bucket and cannot write.
 
@@ -137,8 +161,8 @@ How it works:
    `https://<account-id>.r2.cloudflarestorage.com`.
 7. Verify: a PR's `sccache` step summary shows mode READ_ONLY. After the
    first main push, `cache-warm` shows mode READ_WRITE and later PR and
-   queue runs show cache hits. To turn the feature off, delete the six
-   values; CI returns to today's behaviour with no workflow change.
+   queue runs show cache hits. To turn the feature off, delete the five
+   values (four secrets and the variable); CI returns to today's behaviour with no workflow change.
 
 `cache-warm` is the only job that references the environment, and only on
 main pushes, so the environment never affects which jobs run on which event.

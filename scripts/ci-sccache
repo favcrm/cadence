@@ -4,6 +4,7 @@
 #   ci-sccache enable   decide a mode from the credentials the workflow
 #                       passed, install the pinned sccache and export the
 #                       cache environment to later steps
+#   ci-sccache verify-ro  prove the read-only token cannot write (HTTP 403)
 #   ci-sccache stats    print `sccache --show-stats` (no-op when disabled)
 #
 # Contract: this is a strict no-op unless credentials resolve. `enable`
@@ -77,7 +78,7 @@ cmd_enable() {
     dl="${RUNNER_TEMP:-/tmp}/sccache-$VERSION-download"
     mkdir -p "$dir" "$dl" || off "cannot create $dir"
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --retry 2 --output "$dl/$ARCHIVE" "$URL" || off "download failed"
+        --retry 2 --max-time 120 --output "$dl/$ARCHIVE" "$URL" || off "download failed"
     printf '%s  %s\n' "$want" "$dl/$ARCHIVE" | sha256sum -c - >/dev/null \
         || off "archive checksum mismatch"
     tar -xzf "$dl/$ARCHIVE" -C "$dir" --strip-components=1 \
@@ -108,6 +109,7 @@ cmd_enable() {
         echo "SCCACHE_S3_KEY_PREFIX=$prefix"
         echo "SCCACHE_S3_USE_SSL=true"
         echo "SCCACHE_S3_RW_MODE=$mode"
+        echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP:-/tmp}/sccache-error.log"
         echo "AWS_ACCESS_KEY_ID=$key_id"
         echo "AWS_SECRET_ACCESS_KEY=$key_secret"
     } >> "$GITHUB_ENV"
@@ -123,13 +125,50 @@ cmd_stats() {
     fi
     out=$(sccache --show-stats 2>&1) || true
     printf '%s\n' "$out"
+    if [ -s "${SCCACHE_ERROR_LOG:-}" ]; then
+        echo "sccache error log (last 20 lines):"
+        tail -n 20 "$SCCACHE_ERROR_LOG"
+    fi
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         { echo '```'; printf '%s\n' "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
     fi
 }
 
+# CAD-904: prove the read-only key cannot write. One SigV4 PutObject of a
+# throwaway key with the read-only credentials; R2 must answer 403. The key
+# is passed to curl on stdin (`-K -`), never in argv. Fails the job only on a
+# 2xx (the token can write) -- network trouble or an unexpected status is a
+# warning, so an R2 outage cannot redden CI.
+cmd_verify_ro() {
+    if [ "${RUSTC_WRAPPER:-}" != sccache ] || [ "${SCCACHE_S3_RW_MODE:-}" != READ_ONLY ]; then
+        note "verify-ro: not in read-only mode; nothing to prove"
+        exit 0
+    fi
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -n "${SCCACHE_ENDPOINT:-}" ] \
+        || { note "verify-ro: no credentials in the environment"; exit 0; }
+    url="$SCCACHE_ENDPOINT/$SCCACHE_BUCKET/ro-write-probe/${GITHUB_RUN_ID:-0}-$$"
+    code=$(printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+        | curl -K - --silent --show-error --max-time 30 --proto '=https' \
+            --aws-sigv4 "aws:amz:auto:s3" --request PUT --data 'cad904' \
+            --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null) || code=000
+    case "$code" in
+        403)
+            note "verify-ro: PutObject with the read-only token was refused (HTTP 403), as required"
+            [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "sccache read-only token: PutObject refused (HTTP 403)" >> "$GITHUB_STEP_SUMMARY"
+            ;;
+        2??)
+            echo "::error::the read-only R2 token WROTE an object (HTTP $code); revoke it and fix its policy"
+            exit 1
+            ;;
+        *)
+            echo "::warning::verify-ro inconclusive: PutObject answered HTTP $code (expected 403)"
+            ;;
+    esac
+}
+
 case "${1:-}" in
+    verify-ro) cmd_verify_ro ;;
     enable) cmd_enable ;;
     stats) cmd_stats ;;
-    *) echo "usage: ci-sccache enable|stats" >&2; exit 2 ;;
+    *) echo "usage: ci-sccache enable|stats|verify-ro" >&2; exit 2 ;;
 esac
