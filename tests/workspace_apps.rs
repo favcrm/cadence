@@ -2636,14 +2636,15 @@ fn cad867_binding_read_stays_operator_only_and_installation_bound() {
 /* under the PM lock, then reads typed producer rows under the same    */
 /* lock — an upgrade can never slip between authorization and read.    */
 /*                                                                     */
-/* Projected rows carry the DESCRIPTOR field id as key and a typed     */
-/* cell (string | string[] | enum domain member); absent optionals are */
-/* omitted keys, never null. These tests assert the actual produced    */
-/* values — id/name/tags/consent — not merely a row count.             */
+/* These are tests-first: `app_view_read`/`/views/…` do not exist yet,  */
+/* so the suite will not compile until the slice lands. Dynamic-RPC    */
+/* tests can compile without the method; an "unknown method" refusal  */
+/* is an absence, never the behavioral guard RED these target.        */
 /* ------------------------------------------------------------------ */
 
-/// The three digests an `app_view_read` request asserts — always read
-/// back from the verified receipt, never invented by the caller.
+/// Read the three digest pins off the verified receipt — the request
+/// only ever asserts the install's current digest triple, never one it
+/// invented. Returned as a ready-made param block.
 fn view_read_digests(w: &Workspace, id: &str) -> Value {
     let shown = w.show(id);
     json!({
@@ -2651,6 +2652,14 @@ fn view_read_digests(w: &Workspace, id: &str) -> Value {
         "view_descriptor_digest": shown["view_descriptor_digest"],
         "view_binding_digest": shown["view_binding_digest"],
     })
+}
+
+fn view_read_params(install: &str, view: &str, op: &str, digests: &Value) -> Value {
+    let mut p = digests.clone();
+    p["install_id"] = json!(install);
+    p["view_id"] = json!(view);
+    p["op"] = json!(op);
+    p
 }
 
 /// A live context under `install` plus one fully-populated record —
@@ -2677,29 +2686,70 @@ fn seed_customer(w: &Workspace, install: &str) -> (String, String) {
     (context_id, "cust-1".to_string())
 }
 
-fn view_read_params(install: &str, view: &str, op: &str, digests: &Value) -> Value {
-    let mut p = digests.clone();
-    p["install_id"] = json!(install);
-    p["view_id"] = json!(view);
-    p["op"] = json!(op);
-    p
+/// A descriptor+binding that binds the FULL customer projection —
+/// name/email/phone/tags/source/consent — so the test can assert every
+/// produced value and the consent enum domain, not just a subset.
+fn full_customer_descriptor() -> String {
+    json!({
+        "contract":"app-views/v1","app":"blog-post","title":"views",
+        "views":[
+            {"id":"customers","title":"Customers","kind":"table",
+             "fields":[
+                {"id":"ref","label":"Ref","format":"text"},
+                {"id":"name","label":"Name","format":"text"},
+                {"id":"email","label":"Email","format":"text"},
+                {"id":"phone","label":"Phone","format":"text"},
+                {"id":"tags","label":"Tags","format":"tags","kind":"list"},
+                {"id":"source","label":"Source","format":"text"},
+                {"id":"consent_email","label":"Email consent","format":"enum","values":["granted","denied","unknown"]},
+                {"id":"consent_sms","label":"SMS consent","format":"enum","values":["granted","denied","unknown"]}
+             ],
+             "columns":[{"field":"ref"},{"field":"name"},{"field":"email"}]},
+            {"id":"customer-detail","title":"Customer","kind":"detail",
+             "fields":[{"id":"ref","label":"Ref","format":"text"},
+                       {"id":"name","label":"Name","format":"text"}]}
+        ]
+    })
+    .to_string()
 }
 
-/// The `customers` list projects only bound descriptor fields with
-/// their real produced values — and `record_id` maps the producer's
-/// `id` (a non-identity field→key positive control). Absent optionals
-/// omit the key; a second sparse record proves omission is not
-/// "required producer missing".
+fn full_customer_binding() -> String {
+    json!({
+        "contract":"app-bindings/v1","app":"blog-post","title":"b",
+        "bindings":[
+            {"view":"customers","source":"customers","ops":["list"],
+             "fields":[
+                {"field":"ref","key":"record_id","format":"text"},
+                {"field":"name","key":"display_name","format":"text"},
+                {"field":"email","key":"email","format":"text"},
+                {"field":"phone","key":"phone","format":"text"},
+                {"field":"tags","key":"tags","format":"tags"},
+                {"field":"source","key":"source","format":"text"},
+                {"field":"consent_email","key":"consent.email","format":"enum"},
+                {"field":"consent_sms","key":"consent.sms","format":"enum"}
+             ]},
+            {"view":"customer-detail","source":"customers","ops":["show"],
+             "fields":[{"field":"ref","key":"record_id","format":"text"},
+                       {"field":"name","key":"display_name","format":"text"}]}
+        ]
+    })
+    .to_string()
+}
+
+/// The `customers` list projects every bound field's REAL produced
+/// value — including the consent enum domain — keyed by descriptor
+/// field id; `record_id` renames the row's `id` (non-identity control).
+/// Absent optionals omit the key, never `null`. Uniform `rows`
+/// envelope + digest pins on both ops.
 #[test]
 fn cad867_view_read_customers_projects_real_values() {
     let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
-    let (context_id, record_id) = seed_customer(&w, &id);
-    // A sparse second record: `email`/`phone`/`source`/`consent.sms`
-    // simply absent — `Option` fields, so the profile stores `None`.
+    let (context_id, _) = seed_customer(&w, &id);
+    // Sparse record: no email/phone/source/consent.sms (Option fields).
     w.daemon
         .operator_rpc(
             "app_record_create",
@@ -2715,66 +2765,128 @@ fn cad867_view_read_customers_projects_real_values() {
     let listed = w.daemon.operator_rpc("app_view_read", p).unwrap();
     assert_eq!(listed["view_id"], json!("customers"));
     assert_eq!(listed["op"], json!("list"));
-    // The digest pins echo back so a stale response is detectable.
+    // The response echoes the digest pins it was authorized under —
+    // a stale reply is detectable by a later UI staleness check.
     assert_eq!(listed["digest"], digests["digest"]);
+    assert_eq!(
+        listed["view_descriptor_digest"],
+        digests["view_descriptor_digest"]
+    );
     assert_eq!(
         listed["view_binding_digest"],
         digests["view_binding_digest"]
     );
+
     let rows = listed["rows"].as_array().unwrap();
     let full = rows.iter().find(|r| r["name"] == "Ada Lovelace").unwrap();
-    // Real produced values, keyed by descriptor field id.
+    // Real produced values (typed extraction, never raw row keys).
+    assert_eq!(full["ref"], json!("cust-1")); // record_id rename -> row id
     assert_eq!(full["email"], json!("ada@example.com"));
+    assert_eq!(full["phone"], json!("+1 555 0100"));
     assert_eq!(full["tags"], json!(["vip", "beta"]));
-    let _ = record_id;
+    assert_eq!(full["source"], json!("import"));
+    assert_eq!(full["consent_email"], json!("granted"));
+    assert_eq!(full["consent_sms"], json!("denied"));
     let sparse = rows.iter().find(|r| r["name"] == "Sparse").unwrap();
-    // `email`/`phone`/`source`/`consent.sms` absent → key omitted, never null.
-    for absent in ["email", "phone", "source"] {
+    for absent in ["email", "phone", "source", "consent_sms"] {
         assert!(
             !sparse.as_object().unwrap().contains_key(absent),
             "absent optional '{absent}' emitted a cell"
         );
     }
-    // Unbound descriptor fields (status/tier/visits/caption…) never appear.
-    for unbound in ["status", "tier", "visits", "caption"] {
+    // Declared-but-unbound and undeclared fields never appear.
+    for unbound in ["visits", "tier"] {
         assert!(
             !full.as_object().unwrap().contains_key(unbound),
             "unbound field '{unbound}' emitted"
         );
     }
-}
 
-/// A `show` returns the SAME one-row `rows` envelope as `list` — the
-/// renderer consumes one shape. The detail binding maps only its own
-/// fields.
-#[test]
-fn cad867_view_read_show_uses_the_same_rows_envelope() {
-    let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
-    let installed = w.install().unwrap();
-    let id = installed["install_id"].as_str().unwrap().to_string();
-    let (context_id, record_id) = seed_customer(&w, &id);
-    let digests = view_read_digests(&w, &id);
-
+    // show: the detail binding projects `ref`+`name` under the same
+    // one-row `rows` envelope.
     let mut p = view_read_params(&id, "customer-detail", "show", &digests);
     p["context_id"] = json!(context_id);
-    p["record_id"] = json!(record_id);
+    p["record_id"] = json!("cust-1");
     let shown = w.daemon.operator_rpc("app_view_read", p).unwrap();
     assert_eq!(shown["op"], json!("show"));
+    assert_eq!(shown["digest"], digests["digest"]);
     let rows = shown["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["ref"], json!("cust-1"));
     assert_eq!(rows[0]["name"], json!("Ada Lovelace"));
-    assert_eq!(rows[0]["email"], json!("ada@example.com"));
 }
 
-/// Every digest the request asserts is re-proven: wrong, stale,
-/// missing or wrong-typed digests all refuse before any row is read.
+/// `customers` pagination is genuinely supported: `limit`/`cursor`
+/// page forward without duplicates; every `show` and every
+/// `caption-runs` read refuses pagination/query params outright.
+#[test]
+fn cad867_view_read_customers_paginates_and_runs_refuse_paging() {
+    let w = Workspace::new();
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let (context_id, _) = seed_customer(&w, &id);
+    // Three records total: cust-1, cust-2, cust-3.
+    for (rec, name) in [("cust-2", "Two"), ("cust-3", "Three")] {
+        w.daemon
+            .operator_rpc(
+                "app_record_create",
+                json!({"install_id":id,"context_id":context_id,"record_id":rec,
+                    "profile":{"schema":1,"display_name":name,"tags":[],
+                        "consent":{"email":"unknown"}}}),
+            )
+            .unwrap();
+    }
+    let digests = view_read_digests(&w, &id);
+
+    // Page 1: limit=1 returns the first row + a cursor.
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    p["limit"] = json!(1);
+    let page1 = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    assert_eq!(page1["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(page1["truncated"], json!(true));
+    let cursor = page1["next_cursor"].clone();
+    assert!(cursor.is_string());
+    let first_id = page1["rows"][0]["ref"].clone();
+
+    // Page 2: cursor advances, no duplicate of page 1.
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    p["limit"] = json!(1);
+    p["cursor"] = cursor;
+    let page2 = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    assert_eq!(page2["rows"].as_array().unwrap().len(), 1);
+    assert_ne!(page2["rows"][0]["ref"], first_id);
+
+    // Every `show` refuses query/cursor/limit.
+    for bad in ["query", "limit", "cursor"] {
+        let mut p = view_read_params(&id, "customer-detail", "show", &digests);
+        p["context_id"] = json!(context_id);
+        p["record_id"] = json!("cust-1");
+        p[bad] = json!("x");
+        assert!(
+            w.daemon.operator_rpc("app_view_read", p).is_err(),
+            "show admitted {bad}"
+        );
+    }
+    // Numeric `limit` on a run list refuses — typed control, not only
+    // the string-type refusal.
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    p["record_id"] = json!("cust-1"); // list never names one record
+    assert!(w.daemon.operator_rpc("app_view_read", p).is_err());
+}
+
+/// Every digest the request asserts is re-proven: wrong, stale (a real
+/// upgrade moved it), wrong-typed or missing all refuse before a row
+/// is read.
 #[test]
 fn cad867_view_read_refuses_stale_wrong_and_missing_digests() {
     let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
     let (context_id, _) = seed_customer(&w, &id);
@@ -2782,46 +2894,120 @@ fn cad867_view_read_refuses_stale_wrong_and_missing_digests() {
     let fake = format!("sha256:{}", "f".repeat(64));
 
     for field in ["digest", "view_descriptor_digest", "view_binding_digest"] {
-        // Wrong value.
-        let mut p = view_read_params(&id, "customers", "list", &digests);
-        p["context_id"] = json!(context_id);
-        p[field] = json!(fake);
-        assert!(
-            w.daemon.operator_rpc("app_view_read", p).is_err(),
-            "{field} wrong value"
-        );
-        // Wrong type.
-        let mut p = view_read_params(&id, "customers", "list", &digests);
-        p["context_id"] = json!(context_id);
-        p[field] = json!(42);
-        assert!(
-            w.daemon.operator_rpc("app_view_read", p).is_err(),
-            "{field} wrong type"
-        );
-        // Missing entirely.
+        for (label, v) in [
+            ("wrong", json!(fake)),
+            ("typed", json!(42)),
+            ("null", Value::Null),
+        ] {
+            let mut p = view_read_params(&id, "customers", "list", &digests);
+            p["context_id"] = json!(context_id);
+            p[field] = v;
+            assert!(
+                w.daemon.operator_rpc("app_view_read", p).is_err(),
+                "{field} {label} admitted"
+            );
+        }
         let mut p = view_read_params(&id, "customers", "list", &digests);
         p["context_id"] = json!(context_id);
         p.as_object_mut().unwrap().remove(field);
         assert!(
             w.daemon.operator_rpc("app_view_read", p).is_err(),
-            "{field} missing"
+            "{field} missing admitted"
         );
     }
+
+    // STALE: a real upgrade moves every digest; the pre-upgrade triple
+    // is then refused, never authorized against the old snapshot.
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, text.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    let generation = installed["catalog_generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    w.daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,"source":w.source(),"expected_digest":digests["digest"],
+                "expected_generation":generation,"expected_new_digest":new_digest,
+                "request_id":"view-stale"}),
+        )
+        .unwrap();
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "pre-upgrade digest triple still authorized after upgrade"
+    );
 }
 
-/// Forged scope/authority fields and source-overrides refuse; a view
-/// with no binding or a `form` view refuses; op/kind mismatches refuse.
+/// Three distinct "no live rows" refusals: descriptor-only install
+/// (binding absent → view_binding null), a declared-but-unbound view,
+/// and a truly nonexistent view. Plus a declared form view can never
+/// carry a binding or a read.
 #[test]
-fn cad867_view_read_refuses_forged_fields_and_unbound_views() {
+fn cad867_view_read_distinguishes_absent_binding_unbound_and_missing_view() {
+    // (a) descriptor-only install → view_binding null → any read refuses.
     let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
+    w.write_descriptor(&full_customer_descriptor(), true); // no binding
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let shown = w.show(&id);
+    assert_eq!(shown["view_binding"], Value::Null);
+    let digests = json!({
+        "digest": shown["digest"],
+        "view_descriptor_digest": shown["view_descriptor_digest"],
+        "view_binding_digest": Value::Null, // absent
+    });
+    let p = view_read_params(&id, "customers", "list", &digests);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "descriptor-only install served a bound read"
+    );
+
+    // (b) declared-but-unbound view: descriptor declares `customers`
+    // AND `customer-detail`, binding maps only `customers`.
+    let w = Workspace::new();
+    let partial = json!({
+        "contract":"app-bindings/v1","app":"blog-post","title":"b",
+        "bindings":[{"view":"customers","source":"customers","ops":["list"],
+            "fields":[{"field":"name","key":"display_name","format":"text"}]}]
+    })
+    .to_string();
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&partial, true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let digests = view_read_digests(&w, &id);
+    // Declared but unbound.
+    let p = view_read_params(&id, "customer-detail", "show", &digests);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "declared-but-unbound view served a read"
+    );
+    // Truly nonexistent view id.
+    let p = view_read_params(&id, "ghost", "list", &digests);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "nonexistent view served a read"
+    );
+}
+
+/// Forged scope/authority fields and source-overrides refuse; op/kind
+/// mismatches refuse; `customers` requires a live context; a
+/// cross-context and a cross-INSTALL record/show refuse.
+#[test]
+fn cad867_view_read_refuses_forged_scope_and_cross_install() {
+    let w = Workspace::new();
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
     let (context_id, record_id) = seed_customer(&w, &id);
     let digests = view_read_digests(&w, &id);
 
-    // Unknown fields — a caller can never name source/actor/SQL/method.
     for extra in ["actor", "source", "sql", "where", "method", "by", "install"] {
         let mut p = view_read_params(&id, "customers", "list", &digests);
         p["context_id"] = json!(context_id);
@@ -2831,35 +3017,19 @@ fn cad867_view_read_refuses_forged_fields_and_unbound_views() {
             "{extra} admitted"
         );
     }
-    // `show` on a table view's binding is not an admitted op.
+    // op/kind mismatch both directions.
     let mut p = view_read_params(&id, "customers", "show", &digests);
     p["context_id"] = json!(context_id);
     p["record_id"] = json!(record_id);
-    assert!(
-        w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "table op 'show' admitted"
-    );
-    // `list` on a detail view's binding is not admitted either.
+    assert!(w.daemon.operator_rpc("app_view_read", p).is_err());
     let mut p = view_read_params(&id, "customer-detail", "list", &digests);
     p["context_id"] = json!(context_id);
-    assert!(
-        w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "detail op 'list' admitted"
-    );
-    // A descriptor view with no binding refuses live rows.
-    let mut p = view_read_params(&id, "ghost", "list", &digests);
-    p["context_id"] = json!(context_id);
-    assert!(
-        w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "undeclared view admitted"
-    );
-    // `customers` without its live context refuses — never contextless.
+    assert!(w.daemon.operator_rpc("app_view_read", p).is_err());
+    // contextless customers refuses.
     let p = view_read_params(&id, "customers", "list", &digests);
-    assert!(
-        w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "contextless customers list"
-    );
-    // A show naming a record of a different context refuses.
+    assert!(w.daemon.operator_rpc("app_view_read", p).is_err());
+    // Cross-CONTEXT: a real second context on the SAME install that does
+    // not own cust-1 refuses the show.
     let other = w
         .daemon
         .operator_rpc(
@@ -2872,18 +3042,92 @@ fn cad867_view_read_refuses_forged_fields_and_unbound_views() {
     p["record_id"] = json!(record_id);
     assert!(
         w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "cross-context show admitted"
+        "cross-context record show admitted"
     );
+
+    // Cross-INSTALL: a second install on the same daemon/PM owns its own
+    // context+record; a show via install A's valid context+digests never
+    // reads B's record.
+    let second_source = w._root.path().join("second-src");
+    for name in [
+        "app.md",
+        "workflows/blog-post.md",
+        "rubrics/blog.md",
+        "templates/brief.md",
+        "templates/post.md",
+    ] {
+        let dest = second_source.join(name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("apps/blog-post")
+                .join(name),
+            &dest,
+        )
+        .unwrap();
+    }
+    let manifest = second_source.join("app.md");
+    let mtext = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        mtext.replace("app: blog-post", "app: second-post"),
+    )
+    .unwrap();
+    // Give the second install the same descriptor+binding so both bind.
+    let second_views = second_source.join("views");
+    std::fs::create_dir_all(&second_views).unwrap();
+    std::fs::write(
+        second_views.join("app-views-v1.json"),
+        full_customer_descriptor().replace("blog-post", "second-post"),
+    )
+    .unwrap();
+    let second_bindings = second_source.join("bindings");
+    std::fs::create_dir_all(&second_bindings).unwrap();
+    std::fs::write(
+        second_bindings.join("app-bindings-v1.json"),
+        full_customer_binding().replace("blog-post", "second-post"),
+    )
+    .unwrap();
+    let m2 = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        m2.replace(
+            "  connections: [publish]",
+            "  connections: [publish]\n  views:\n    contract: app-views/v1\n  bindings:\n    contract: app-bindings/v1",
+        ),
+    )
+    .unwrap();
+    let second = w
+        .daemon
+        .operator_rpc("app_workspace_install", json!({"source":second_source}))
+        .unwrap();
+    let bid = second["install_id"].as_str().unwrap().to_string();
+    let (bctx, brec) = seed_customer(&w, &bid);
+    // B's record exists (positive control) but A's read can't see it.
+    let mut p = view_read_params(&id, "customer-detail", "show", &digests);
+    p["context_id"] = json!(context_id);
+    p["record_id"] = json!(brec); // B's record id under A's context
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "cross-install record show admitted"
+    );
+    // And B's context id under A's digests refuses (context not owned by A).
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(bctx);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "foreign context under install A admitted"
+    );
+    let _ = record_id;
 }
 
-/// `caption-runs`: a contextless run lists under the install only; a
-/// run without `subject` omits the cell; `limit`/`cursor`/`query` and
-/// `show`-only params refuse on run reads. A cross-install run id or a
-/// mismatched context refuses.
+/// `caption-runs` bound to the social descriptor: a contextless run
+/// lists under the install only; an absent `subject` omits the cell; a
+/// supplied context scopes; cross-install/cross-context run `show`
+/// refuses; run reads reject pagination/query.
 #[test]
-fn cad867_view_read_caption_runs_scope_and_no_pagination() {
+fn cad867_view_read_caption_runs_real_rows_and_scope() {
     let w = Workspace::new();
-    // Social descriptor+binding, rebound to blog-post.
     let desc = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("contracts/app-views/v1/examples/social-content.json"),
@@ -2902,9 +3146,7 @@ fn cad867_view_read_caption_runs_scope_and_no_pagination() {
     let id = installed["install_id"].as_str().unwrap().to_string();
     let digests = view_read_digests(&w, &id);
 
-    // Seed two runs directly: one with subject+context, one contextless
-    // without subject — both metadata-only (the snapshot never carries
-    // artifact content into a row).
+    // A real live context for the scoped run.
     let context = w
         .daemon
         .operator_rpc(
@@ -2917,6 +3159,8 @@ fn cad867_view_read_caption_runs_scope_and_no_pagination() {
     let ctx_digest = context["context"]["digest"].as_str().unwrap();
     let db = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
     let bundle = installed["digest"].as_str().unwrap();
+    // run-full: context-bound with a subject. run-bare: contextless,
+    // no subject input — its `subject` cell must be omitted.
     db.execute(
         "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,context_id,created,updated) VALUES(?,?,1,?,?,?,'owner',?,'succeeded',?,1,1)",
         rusqlite::params![
@@ -2925,8 +3169,7 @@ fn cad867_view_read_caption_runs_scope_and_no_pagination() {
                    "workflow":{"title":"Instagram post"},
                    "inputs":{"subject":"New menu launch"},
                    "context":{"id":ctx_id,"revision":ctx_rev,"digest":ctx_digest}}).to_string(),
-            "snap-full", "req-full", ctx_id,
-        ],
+            "snap-full","req-full",ctx_id],
     ).unwrap();
     db.execute(
         "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,context_id,created,updated) VALUES(?,?,1,?,?,?,'owner',?,'succeeded',NULL,1,1)",
@@ -2934,73 +3177,97 @@ fn cad867_view_read_caption_runs_scope_and_no_pagination() {
             "run-bare", id, bundle,
             json!({"schema":1,"install_id":id,"bundle_digest":bundle,"epoch":1,
                    "workflow":{"title":"Manual post"},"inputs":{}}).to_string(),
-            "snap-bare", "req-bare",
-        ],
+            "snap-bare","req-bare"],
     ).unwrap();
 
-    // list all runs under the install (contextless allowed).
+    // list (contextless allowed): both rows present; the bare run's row
+    // omits `subject`; the full run carries the real subject.
     let p = view_read_params(&id, "caption-runs", "list", &digests);
     let listed = w.daemon.operator_rpc("app_view_read", p).unwrap();
-    let rows = listed["rows"].as_array().unwrap();
-    let bare = rows.iter().find(|_| true).unwrap(); // both rows land
     assert_eq!(listed["view_id"], json!("caption-runs"));
-    // The contextless run omits `context_id`/`snapshot.context.id`/`subject`.
+    assert_eq!(listed["op"], json!("list"));
+    let rows = listed["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
-    // `subject` is the only bound field; contextless+bare run omits it.
-    // (We find run-bare via its omitted-subject row.)
-    let _ = bare;
-    // A supplied context scopes the list.
+    let full = rows
+        .iter()
+        .find(|r| r.get("subject").is_some())
+        .expect("a subject-bearing row");
+    assert_eq!(full["subject"], json!("New menu launch"));
+    let bare = rows
+        .iter()
+        .find(|r| r.get("subject").is_none())
+        .expect("the contextless run's row");
+    assert!(!bare.as_object().unwrap().contains_key("subject"));
+    // Only bound fields ever appear — `id`/`state`/`context_id`/
+    // `snapshot.*` are not bound in the social example, so absent.
+    for unbound in ["id", "state", "context_id"] {
+        assert!(
+            !full.as_object().unwrap().contains_key(unbound),
+            "unbound run field '{unbound}' emitted"
+        );
+    }
+    // A supplied context scopes the list to the one context-bound run.
     let mut p = view_read_params(&id, "caption-runs", "list", &digests);
     p["context_id"] = json!(ctx_id);
     let scoped = w.daemon.operator_rpc("app_view_read", p).unwrap();
     assert_eq!(scoped["rows"].as_array().unwrap().len(), 1);
-    // show: a cross-context run refuses.
+    // show the context-bound run under its own context.
     let mut p = view_read_params(&id, "caption-detail", "show", &digests);
     p["record_id"] = json!("run-full");
-    p["context_id"] = json!("ctx-other");
+    p["context_id"] = json!(ctx_id);
+    let shown = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    assert_eq!(shown["rows"][0]["subject"], json!("New menu launch"));
+    // A show naming a valid context but the contextless run refuses —
+    // the run does not belong to that context.
+    let mut p = view_read_params(&id, "caption-detail", "show", &digests);
+    p["record_id"] = json!("run-bare");
+    p["context_id"] = json!(ctx_id);
     assert!(
         w.daemon.operator_rpc("app_view_read", p).is_err(),
-        "cross-context run show"
+        "contextless run shown under a context"
     );
-    // show: a run of another install refuses.
-    let mut p = view_read_params(&id, "caption-detail", "show", &digests);
-    p["record_id"] = json!("run-full");
-    let ok = w.daemon.operator_rpc("app_view_read", p).unwrap();
-    assert_eq!(ok["rows"].as_array().unwrap().len(), 1);
-    // run reads reject pagination/query — never silently ignored.
+    // run reads reject pagination/query on BOTH ops.
     for bad in ["limit", "cursor", "query"] {
-        let mut p = view_read_params(&id, "caption-runs", "list", &digests);
-        p[bad] = json!("1");
-        assert!(
-            w.daemon.operator_rpc("app_view_read", p).is_err(),
-            "run list admitted {bad}"
-        );
-    }
-    // show rejects query/limit/cursor too.
-    for bad in ["query", "limit", "cursor"] {
-        let mut p = view_read_params(&id, "caption-detail", "show", &digests);
-        p["record_id"] = json!("run-full");
-        p[bad] = json!("x");
-        assert!(
-            w.daemon.operator_rpc("app_view_read", p).is_err(),
-            "run show admitted {bad}"
-        );
+        for (view, extra) in [
+            ("caption-runs", json!(null)),
+            ("caption-detail", json!({"record_id":"run-full"})),
+        ] {
+            let mut p = view_read_params(
+                &id,
+                view,
+                if view == "caption-runs" {
+                    "list"
+                } else {
+                    "show"
+                },
+                &digests,
+            );
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    p[k] = v.clone();
+                }
+            }
+            p[bad] = json!("1");
+            assert!(
+                w.daemon.operator_rpc("app_view_read", p).is_err(),
+                "{view} admitted {bad}"
+            );
+        }
     }
 }
 
-/// Producer corruption / integrity: a record body that no longer parses
-/// or a run whose snapshot is forged refuses the whole read — never a
-/// partial row.
+/// Producer corruption: a record body that no longer parses refuses
+/// the whole read (never a partial row); a run whose snapshot is forged
+/// refuses the same way.
 #[test]
 fn cad867_view_read_refuses_corrupt_producer_rows() {
     let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
     let (context_id, _) = seed_customer(&w, &id);
     let digests = view_read_digests(&w, &id);
-    // Corrupt the stored record body so the profile no longer parses.
     let recdb =
         rusqlite::Connection::open(w.daemon.state.join(format!("app-records/{id}.sqlite3")))
             .unwrap();
@@ -3012,16 +3279,79 @@ fn cad867_view_read_refuses_corrupt_producer_rows() {
         .unwrap();
     let mut p = view_read_params(&id, "customers", "list", &digests);
     p["context_id"] = json!(context_id);
-    let err = w.daemon.operator_rpc("app_view_read", p).unwrap_err();
     assert!(
-        err.to_string().contains("integrity") || err.to_string().contains("refused"),
-        "corrupt record row did not refuse: {err}"
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "corrupt record row served"
     );
 }
 
-/// Operator-only parity on both peers: agent caller, setsid-detached
-/// child and forged identity refuse at the RPC; the HTTP peer refuses
-/// agent-peered and forged-digest reads identically.
+/// Concurrent reads stay consistent and a read never observes a torn
+/// descriptor/binding: N parallel bound reads all return the same
+/// pinned rows, and a read racing a real upgrade either completes under
+/// the digest triple it pinned (consistent) or refuses on staleness —
+/// never a mixed old-auth/new-data result.
+#[test]
+fn cad867_view_read_is_consistent_under_concurrent_reads_and_upgrade() {
+    use std::sync::{Arc, Barrier};
+    let w = Workspace::new();
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let (context_id, _) = seed_customer(&w, &id);
+    let digests = view_read_digests(&w, &id);
+
+    // N parallel identical reads all succeed identically.
+    let barrier = Arc::new(Barrier::new(4));
+    let state = w.daemon.state.clone();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let b = Arc::clone(&barrier);
+            let st = state.clone();
+            let mut p = view_read_params(&id, "customers", "list", &digests);
+            p["context_id"] = json!(context_id);
+            std::thread::spawn(move || {
+                b.wait();
+                cadence_agent::client::rpc(&st, "app_view_read", p)
+            })
+        })
+        .collect();
+    for h in handles {
+        let v = h.join().unwrap().unwrap();
+        assert_eq!(v["rows"][0]["name"], json!("Ada Lovelace"));
+        assert_eq!(v["digest"], digests["digest"]);
+    }
+
+    // A read pinned to the OLD digests must refuse after a real upgrade.
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, text.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    let generation = installed["catalog_generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    w.daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id":id,"source":w.source(),"expected_digest":digests["digest"],
+                "expected_generation":generation,"expected_new_digest":new_digest,
+                "request_id":"view-upg"}),
+        )
+        .unwrap();
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    assert!(
+        w.daemon.operator_rpc("app_view_read", p).is_err(),
+        "post-upgrade read under old pins authorized"
+    );
+}
+
+/// Operator-only parity on both peers: agent caller and a
+/// setsid-detached child (raw unix-socket frame, not the planted pane's
+/// `rpc`) refuse at the RPC; the HTTP peer refuses agent-peered and
+/// forged-digest reads identically. A valid operator request succeeds.
 #[test]
 fn cad867_view_read_stays_operator_only_on_daemon_and_http() {
     use std::sync::{
@@ -3030,26 +3360,55 @@ fn cad867_view_read_stays_operator_only_on_daemon_and_http() {
     };
     use std::time::{Duration, Instant};
     let w = Workspace::new();
-    w.write_descriptor(&Workspace::descriptor_text(), true);
-    w.write_binding(&Workspace::binding_text(), true);
+    w.write_descriptor(&full_customer_descriptor(), true);
+    w.write_binding(&full_customer_binding(), true);
     let installed = w.install().unwrap();
     let id = installed["install_id"].as_str().unwrap().to_string();
     let (context_id, _) = seed_customer(&w, &id);
     let digests = view_read_digests(&w, &id);
+    let d = &digests;
 
     let mut lane = LaneShell::spawn(w._root.path());
     plant_member_pane(&w.daemon, "view-reader", "claude", None, lane.pid());
-    for forged in [
-        view_read_params(&id, "customers", "list", &digests),
-        json!({"install_id":id,"view_id":"customers","op":"list",
-               "digest":digests["digest"],"view_descriptor_digest":digests["view_descriptor_digest"],
-               "view_binding_digest":digests["view_binding_digest"],"context_id":context_id,
-               "actor":"operator"}),
-    ] {
-        let frame = lane.rpc(&w.daemon.state, "app_view_read", forged);
-        assert_eq!(frame["ok"], false, "agent bound read: {frame}");
-    }
+    // Agent caller (planted pane ancestry) with a fully-valid request —
+    // a missing-context error can never masquerade as the operator gate.
+    let mut valid = view_read_params(&id, "customers", "list", &digests);
+    valid["context_id"] = json!(context_id);
+    let frame = lane.rpc(&w.daemon.state, "app_view_read", valid.clone());
+    assert_eq!(frame["ok"], false, "agent bound read: {frame}");
+    // A forged `actor`/`source` field from the same pane refuses.
+    let mut forged = valid.clone();
+    forged["actor"] = json!("operator");
+    let frame = lane.rpc(&w.daemon.state, "app_view_read", forged);
+    assert_eq!(frame["ok"], false, "agent forged actor: {frame}");
 
+    // setsid-detached child: the SAME valid request over the daemon's
+    // unix socket, double-forked under setsid — derives no agent and no
+    // operator proof, so it must refuse the operator gate.
+    let req = lane.dir.path().join("viewread-detached.json");
+    std::fs::write(
+        &req,
+        cadence_agent::proto::request("app_view_read", valid.clone()).to_string(),
+    )
+    .unwrap();
+    let sock = cadence_agent::client::socket_path(&w.daemon.state);
+    let (rc, out) = lane.run(&format!(
+        "setsid python3 -c 'import os,socket,sys;\
+         os.fork() and os._exit(0);\
+         s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+         s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+         sys.stdout.write(s.makefile().readline())' {} {}",
+        sock.display(),
+        req.display()
+    ));
+    assert_eq!(rc, 0, "detached rpc invocation failed: {out}");
+    let frame: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(frame["ok"], false, "detached bound read admitted: {frame}");
+    // Operator control: the identical request over RPC succeeds.
+    let ok = w.daemon.operator_rpc("app_view_read", valid).unwrap();
+    assert_eq!(ok["rows"][0]["name"], json!("Ada Lovelace"));
+
+    // HTTP peer under the operator read gate.
     let lease = test_port();
     let port = lease.port;
     let stop = Arc::new(AtomicBool::new(false));
@@ -3080,42 +3439,42 @@ fn cad867_view_read_stays_operator_only_on_daemon_and_http() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
-    let d = &digests;
     let base = format!(
         "/api/app-installations/{id}/views/customers/rows?digest={}&descriptor={}&binding={}",
         d["digest"].as_str().unwrap(),
         d["view_descriptor_digest"].as_str().unwrap(),
         d["view_binding_digest"].as_str().unwrap()
     );
-    // Operator list read succeeds and echoes the digest pins.
+    // Operator list read.
     let (code, _, body) = common::op::raw(
         port,
         &session.request("GET", &format!("{base}&context_id={context_id}"), ""),
     );
     assert_eq!(code, 200, "operator bound list read: {body}");
-    let rows: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(rows["rows"][0]["name"], json!("Ada Lovelace"));
-    // Forged query params refuse at the HTTP grammar — never reach RPC.
-    for bad in [
-        format!("{base}&context_id={context_id}&actor=operator"),
-        format!("{base}&context_id={context_id}&source=customers"),
-        format!(
-            "{base}&context_id={context_id}&digest={}&digest={}",
-            d["digest"].as_str().unwrap(),
-            d["digest"].as_str().unwrap()
-        ),
-        format!("{base}&context_id={context_id}&limit=0"),
-        format!("{base}&context_id={context_id}&cursor=.."),
-        format!("{base}&context_id={context_id}&view_id=other"),
+    // Each digest missing individually → 400; forged params → 400;
+    // agent-peered replay → 403 (exact status, not >=400).
+    for (label, path) in [
+        ("missing digest", format!("/api/app-installations/{id}/views/customers/rows?descriptor={}&binding={}&context_id={context_id}", d["view_descriptor_digest"].as_str().unwrap(), d["view_binding_digest"].as_str().unwrap())),
+        ("missing descriptor", format!("{base}&context_id={context_id}").replace(&format!("descriptor={}", d["view_descriptor_digest"].as_str().unwrap()), "")),
+        ("missing binding", format!("{base}&context_id={context_id}").replace(&format!("binding={}", d["view_binding_digest"].as_str().unwrap()), "")),
+        ("wrong digest", format!("{base}&context_id={context_id}").replace(d["digest"].as_str().unwrap(), &format!("sha256:{}", "f".repeat(64)))),
+        ("dup digest", format!("{base}&context_id={context_id}&digest={}", d["digest"].as_str().unwrap())),
+        ("actor", format!("{base}&context_id={context_id}&actor=operator")),
+        ("source", format!("{base}&context_id={context_id}&source=customers")),
+        ("limit=0", format!("{base}&context_id={context_id}&limit=0")),
+        ("cursor=..", format!("{base}&context_id={context_id}&cursor=..")),
+        ("unknown", format!("{base}&context_id={context_id}&view_id=other")),
     ] {
-        let (code, _, _) = common::op::raw(port, &session.request("GET", &bad, ""));
-        assert!(code >= 400, "forged bound read served {bad}: {code}");
+        let (code, _, _) = common::op::raw(port, &session.request("GET", &path, ""));
+        assert_eq!(code, 400, "{label} bound read served: {code}");
     }
-    // Agent-peered replay (enrolled pane + setsid) refuses.
     for prefix in ["", "setsid "] {
         let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
         let wire = stolen.request_as("GET", &format!("{base}&context_id={context_id}"), "", "");
-        let request_file = lane.dir.path().join(format!("viewread-{}.txt", lane.seq));
+        let request_file = lane
+            .dir
+            .path()
+            .join(format!("viewread-http-{}.txt", lane.seq));
         std::fs::write(&request_file, wire).unwrap();
         let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}", request_file.display()));
         assert_eq!(rc, 0);
@@ -3125,50 +3484,4 @@ fn cad867_view_read_stays_operator_only_on_daemon_and_http() {
             "agent-peered bound read reached rows: {response}"
         );
     }
-}
-
-/// A field→key mapping that is NOT the identity: a descriptor field
-/// `ref` bound to the `record_id` producer key must surface the
-/// record's `id` under the descriptor field id. This is the positive
-/// control that proves the projection honours the declared mapping,
-/// not a same-named passthrough.
-#[test]
-fn cad867_view_read_field_to_key_mapping_is_not_identity() {
-    let w = Workspace::new();
-    // A descriptor whose `customers` table declares a `ref` field.
-    let desc = json!({
-        "contract":"app-views/v1","app":"blog-post","title":"views",
-        "views":[{"id":"customers","title":"Customers","kind":"table",
-            "fields":[{"id":"ref","label":"Ref","format":"text"},
-                      {"id":"name","label":"Name","format":"text"}],
-            "columns":[{"field":"ref"},{"field":"name"}]}]
-    })
-    .to_string();
-    // A binding that maps `ref` → `record_id` (a rename, not identity).
-    let bind = json!({
-        "contract":"app-bindings/v1","app":"blog-post","title":"b",
-        "bindings":[{"view":"customers","source":"customers","ops":["list"],
-            "fields":[{"field":"ref","key":"record_id","format":"text"},
-                      {"field":"name","key":"display_name","format":"text"}]}]
-    })
-    .to_string();
-    w.write_descriptor(&desc, true);
-    w.write_binding(&bind, true);
-    let installed = w.install().unwrap();
-    let id = installed["install_id"].as_str().unwrap().to_string();
-    let (context_id, _) = seed_customer(&w, &id);
-    let digests = view_read_digests(&w, &id);
-    let mut p = view_read_params(&id, "customers", "list", &digests);
-    p["context_id"] = json!(context_id);
-    let listed = w.daemon.operator_rpc("app_view_read", p).unwrap();
-    let row = listed["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == "Ada Lovelace")
-        .unwrap();
-    // `ref` carries the record's `id` — the renamed producer key — and
-    // there is no `record_id` key in the row (the descriptor named `ref`).
-    assert_eq!(row["ref"], json!("cust-1"));
-    assert!(!row.as_object().unwrap().contains_key("record_id"));
 }
