@@ -32,7 +32,18 @@
 //!
 //! A `.write.lock` whose content is exactly [`MARKER`] is taken for a
 //! dead new-protocol writer's marker once the flock is ours; liveness
-//! comes from the flock alone. A tracker whose `.git` is a gitfile
+//! comes from the flock alone.
+//!
+//! `flock` belongs to the open file description, which a `fork` copies:
+//! a thread spawning a process while another holds the lock leaves the
+//! child a copy until it execs (the `O_CLOEXEC` close happens there).
+//! The lock can therefore read as held for that window after its guard
+//! dropped, tens of milliseconds under load. That is inherent to
+//! `flock`, never loses exclusion, and is why a non-waiting acquire
+//! retries and a waiting one polls; see
+//! `lock_tests::a_forked_child_holds_the_lock_until_it_execs` (CAD-948).
+//!
+//! A tracker whose `.git` is a gitfile
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
 
