@@ -67,7 +67,11 @@ pub(crate) fn classify_lane(f: &LaneFacts<'_>) -> &'static str {
     "idle"
 }
 
-fn pressure_label(quota: &Value, usage: &Value, error: &str) -> Option<&'static str> {
+/// Shared with `agent_wait` (CAD-886): the rate-limit arm of the lane
+/// classifier, applied to one agent's error text. Quota/usage blobs are
+/// `Value::Null` at agent scope, which degrades exactly to the
+/// error-text check (`"rate" + "limit"`, or quota wording).
+pub(crate) fn pressure_label(quota: &Value, usage: &Value, error: &str) -> Option<&'static str> {
     for blob in [quota, usage] {
         if blob.is_null() {
             continue;
