@@ -4945,3 +4945,81 @@ fn delivery_approve_records_tailscale_actor() {
     );
     assert_eq!(out["approved_by"], "fable@example.com (tailscale)", "{out}");
 }
+
+/// CAD-907: every mock a test installs shares one script path, and the
+/// daemon spawns each interpreter asynchronously. Installing the next
+/// mock must therefore never rewrite a script an earlier mock may still
+/// be opening: an identical script stays byte-for-byte and mtime-for-
+/// mtime untouched, and the interpreter's already-open handle still reads
+/// the whole script afterwards. An in-place `fs::write` (truncate, then
+/// write) fails both — the torn-script window behind "managed worker
+/// never answered".
+#[test]
+fn cad907_installing_the_next_mock_never_rewrites_a_script_a_launching_mock_has_open() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let _w1 = ManagedWorker::install(dir.path(), &state, "w1");
+    let script = dir.path().join("claude-enroll.py");
+
+    // Plant an mtime no rewrite could reproduce, then open the script the
+    // way a just-spawned interpreter does before it reads it.
+    let planted = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&script)
+        .unwrap()
+        .set_modified(planted)
+        .unwrap();
+    let mut launching = std::fs::File::open(&script).unwrap();
+
+    let _r1 = ManagedWorker::install(dir.path(), &state, "r1");
+    let _r2 = ManagedWorker::install(dir.path(), &state, "r2");
+
+    assert_eq!(
+        std::fs::metadata(&script).unwrap().modified().unwrap(),
+        planted,
+        "installing a sibling mock rewrote an identical script in place"
+    );
+    let mut seen = String::new();
+    std::io::Read::read_to_string(&mut launching, &mut seen).unwrap();
+    assert_eq!(seen, MOCK_ENROLL_PY, "the launching mock saw a torn script");
+}
+
+/// CAD-907: a script that does change is replaced as one complete
+/// version. A handle opened before the replacement keeps the old text in
+/// full, a handle opened after sees the new text in full, and no reader
+/// ever sees an empty or half-written file, however the writer races it.
+#[test]
+fn cad907_a_changed_script_is_replaced_whole_never_torn() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("claude-enroll.py");
+    let (old, new) = ("old\n".repeat(2_000), "new!\n".repeat(3_000));
+    install_script(&script, &old);
+    let mut before = std::fs::File::open(&script).unwrap();
+    install_script(&script, &new);
+    let mut seen = String::new();
+    std::io::Read::read_to_string(&mut before, &mut seen).unwrap();
+    assert_eq!(seen, old, "a replaced script tore a handle opened earlier");
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), new);
+
+    // Racing: a writer flips between the two versions while a reader
+    // opens and reads the path over and over.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                install_script(&script, &old);
+                install_script(&script, &new);
+            }
+        });
+        for _ in 0..2_000 {
+            let text = std::fs::read_to_string(&script).unwrap();
+            assert!(
+                text == old || text == new,
+                "a reader saw a torn script of {} bytes",
+                text.len()
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}

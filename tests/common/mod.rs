@@ -3268,6 +3268,34 @@ pub fn slot_acquire_pid(d: &TestDaemon, kind: &str, lane: &str, pid: u32, req: &
 /// `"$PID"` pid param means the performing process.
 pub const MOCK_ENROLL_PY: &str = include_str!("../fixtures/providers/enroll.py");
 
+/// Put `body` at `path` for an interpreter to run, without ever showing
+/// a launching interpreter a torn file (CAD-907).
+///
+/// One test installs several mocks (w1, r1, r2, ...) into one directory,
+/// all under the same script path, and the daemon spawns each interpreter
+/// asynchronously: `enrolled` returns when the daemon records the child's
+/// pid, not when python has read its script. A plain `fs::write` truncates
+/// the file in place, so a sibling install landing between an earlier
+/// mock's `open` and `read` (a window a loaded host stretches to seconds)
+/// handed that mock an empty script. It exited at once with no pidfile and
+/// never served a request: "managed worker never answered".
+///
+/// So an identical script is left untouched (same inode, same mtime), and
+/// a different one is written beside the path and renamed over it, so
+/// every reader sees one complete version.
+pub fn install_script(path: &Path, body: &str) {
+    if std::fs::read(path).is_ok_and(|current| current == body.as_bytes()) {
+        return;
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
 /// The managed provider under test and its request channel.
 pub struct ManagedWorker {
     pub pid: u32,
@@ -3302,7 +3330,7 @@ impl ManagedWorker {
         let cmd_dir = TempDir::new().unwrap();
         let pidfile = dir.join(format!("claude-{alias}.pid"));
         let script = dir.join("claude-enroll.py");
-        std::fs::write(&script, MOCK_ENROLL_PY).unwrap();
+        install_script(&script, MOCK_ENROLL_PY);
         test_env().set(
             "CADENCE_CLAUDE_COMMAND",
             format!(
@@ -3413,7 +3441,18 @@ impl ManagedWorker {
         while !resp.exists() {
             assert!(
                 Instant::now() < deadline,
-                "managed worker never answered {what}"
+                "managed worker never answered {what} (worker pid {} is {}; load {})",
+                self.pid,
+                if !Path::new(&format!("/proc/{}", self.pid)).exists() {
+                    "gone — it died before serving"
+                } else if self._mock.pidfile.exists() {
+                    "running and past its startup, but silent"
+                } else {
+                    "running but never got as far as writing its pidfile"
+                },
+                std::fs::read_to_string("/proc/loadavg")
+                    .map(|l| l.split(' ').take(3).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default()
             );
             thread::sleep(Duration::from_millis(20));
         }
