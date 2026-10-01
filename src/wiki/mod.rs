@@ -1634,8 +1634,8 @@ mod test_pause {
     ///   still connected — the parked call did not wait for its partner,
     ///   so the strict ordering the test set up did not happen. Failing
     ///   loudly (rather than resuming as if success) is what keeps a
-    ///   >BOUND controller stall from silently re-sequencing the race
-    ///   into a passing-by-accident sequential run.
+    ///   controller stall past the bound from silently re-sequencing
+    ///   the race into a passing-by-accident sequential run.
     /// - `Disconnected`: the controller was dropped — the test's
     ///   controller thread panicked or finished early — so the parked
     ///   call resumes for bounded teardown rather than stranding.
@@ -1702,12 +1702,7 @@ mod test_pause {
     pub(super) fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
         match release.recv_timeout(bound) {
             Ok(()) => WaitOutcome::Released,
-            // COUNTERFACTUAL MUTANT (temporary — not for merge): the
-            // pre-R4 seam swallowed a Timeout and resumed the parked
-            // call exactly like a real release. Mapping Timeout back
-            // to Released reproduces that silent-resume so the new
-            // lifecycle tests go RED under the old semantics.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Released,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Timeout,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Disconnected,
         }
     }
