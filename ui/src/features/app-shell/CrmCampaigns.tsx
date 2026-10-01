@@ -52,6 +52,7 @@ import {
 } from "./sendClient";
 import { PreviewPanel, parsePreview, type AudiencePreview } from "./CrmSegments";
 import { friendlyAudienceError, newAudienceId } from "./segmentGrammar";
+import Field from "./shared/Field";
 
 /**
  * Campaign screens inside the trusted CRM shell (CAD-784 over the
@@ -2017,51 +2018,62 @@ function CampaignWorkspace({
           Content {doc === null ? "— unsaved draft" : `— revision r${doc.revision}`}
         </h4>
         <div className="crm-field-row">
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="cmp-subject">
-              Subject (required, plain text)
-            </label>
-            <input
-              id="cmp-subject"
-              className="field"
-              value={subject}
-              onChange={(e) => setSubject(e.target.value)}
-              maxLength={150}
-              autoComplete="off"
-              disabled={!canWrite || pending}
-              required
-            />
-          </div>
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="cmp-preheader">
-              Preheader (optional, plain text)
-            </label>
-            <input
-              id="cmp-preheader"
-              className="field"
-              value={preheader}
-              onChange={(e) => setPreheader(e.target.value)}
-              maxLength={200}
-              autoComplete="off"
-              disabled={!canWrite || pending}
-            />
-          </div>
+          <Field
+            label="Subject"
+            id="cmp-subject"
+            hint="Plain text"
+            required
+            disabled={!canWrite || pending}
+            className="crm-field"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={subject}
+                onChange={(e) => setSubject(e.target.value)}
+                maxLength={150}
+                autoComplete="off"
+              />
+            )}
+          </Field>
+          <Field
+            label="Preheader"
+            id="cmp-preheader"
+            hint="Optional, plain text"
+            disabled={!canWrite || pending}
+            className="crm-field"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={preheader}
+                onChange={(e) => setPreheader(e.target.value)}
+                maxLength={200}
+                autoComplete="off"
+              />
+            )}
+          </Field>
         </div>
         <div className="crm-field-row">
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="cmp-fallback">
-              First-name fallback for the token
-            </label>
-            <input
-              id="cmp-fallback"
-              className="field"
-              value={fallback}
-              onChange={(e) => setFallback(e.target.value)}
-              maxLength={40}
-              autoComplete="off"
-              disabled={!canWrite || pending}
-            />
-          </div>
+          <Field
+            label="First-name fallback for the token"
+            id="cmp-fallback"
+            disabled={!canWrite || pending}
+            className="crm-field"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={fallback}
+                onChange={(e) => setFallback(e.target.value)}
+                maxLength={40}
+                autoComplete="off"
+              />
+            )}
+          </Field>
           <p className="text-micro text-ink-500">
             The only approved personalization is {"{{first_name|Fallback}}"}. Paste carrying HTML,
             scripts or other merge fields is refused and nothing is mutated.
@@ -2071,100 +2083,117 @@ function CampaignWorkspace({
           {blocks.map((block, index) => (
             <li key={block.key} className="card px-3 py-3">
               <div className="crm-field-row">
-                <div className="crm-field">
-                  <label className="text-label text-ink-300" htmlFor={`cmp-block-type-${block.key}`}>
-                    Block {index + 1} type
-                  </label>
-                  <Select
-                    id={`cmp-block-type-${block.key}`}
-                    value={block.kind}
-                    onChange={(value) =>
-                      isBlockType(value) && updateBlock(block.key, { kind: value })
-                    }
-                    options={BLOCK_TYPES.map((entry) => ({ value: entry.value, label: entry.label }))}
-                    aria-label={`Block ${index + 1} type`}
-                    disabled={!canWrite || pending}
-                    full
-                  />
-                </div>
-                {block.kind === "button" ? (
-                  <div className="crm-field">
-                    <label className="text-label text-ink-300" htmlFor={`cmp-block-label-${block.key}`}>
-                      Button label
-                    </label>
-                    <input
-                      id={`cmp-block-label-${block.key}`}
-                      className="field"
-                      value={block.label}
-                      onChange={(e) => updateBlock(block.key, { label: e.target.value })}
-                      maxLength={60}
-                      autoComplete="off"
-                      disabled={!canWrite || pending}
+                <Field
+                  label={`Block ${index + 1} type`}
+                  id={`cmp-block-type-${block.key}`}
+                  disabled={!canWrite || pending}
+                  className="crm-field"
+                >
+                  {(c) => (
+                    <Select
+                      id={c.id}
+                      value={block.kind}
+                      onChange={(value) =>
+                        isBlockType(value) && updateBlock(block.key, { kind: value })
+                      }
+                      options={BLOCK_TYPES.map((entry) => ({ value: entry.value, label: entry.label }))}
+                      aria-label={`Block ${index + 1} type`}
+                      disabled={c.disabled}
+                      full
                     />
-                  </div>
+                  )}
+                </Field>
+                {block.kind === "button" ? (
+                  <Field
+                    label="Button label"
+                    id={`cmp-block-label-${block.key}`}
+                    disabled={!canWrite || pending}
+                    className="crm-field"
+                  >
+                    {(c) => (
+                      <input
+                        {...c}
+                        className="field"
+                        value={block.label}
+                        onChange={(e) => updateBlock(block.key, { label: e.target.value })}
+                        maxLength={60}
+                        autoComplete="off"
+                      />
+                    )}
+                  </Field>
                 ) : (
                   <div className="crm-field">
                     <span className="text-label text-ink-300" id={`cmp-block-token-${block.key}`}>
-                      First-name token
+                      First-name personalization
                     </span>
-                    <div>
+                    <div
+                      className="crm-toolbar"
+                      role="group"
+                      aria-labelledby={`cmp-block-token-${block.key}`}
+                    >
                       <Button
                         type="button"
                         size="sm"
                         disabled={!canWrite || pending}
-                        aria-labelledby={`cmp-block-token-${block.key}`}
-                        title="Append {{first_name|Fallback}} to this block"
+                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to this block`}
                         onClick={() =>
                           updateBlock(block.key, { text: withToken(block.text, fallback) })
                         }
                       >
-                        + {"{{first_name}}"}
+                        Add to block
                       </Button>
                       <Button
                         type="button"
                         size="sm"
                         disabled={!canWrite || pending}
-                        title="Append {{first_name|Fallback}} to the subject"
+                        title={`Append {{first_name|${fallback.trim() === "" ? "Friend" : fallback.trim()}}} to the subject`}
                         onClick={() => setSubject((prev) => withToken(prev, fallback))}
                       >
-                        + subject
+                        Add to subject
                       </Button>
                     </div>
                   </div>
                 )}
               </div>
               {block.kind === "button" ? (
-                <div className="crm-field mt-2">
-                  <label className="text-label text-ink-300" htmlFor={`cmp-block-url-${block.key}`}>
-                    Button URL (https only)
-                  </label>
-                  <input
-                    id={`cmp-block-url-${block.key}`}
-                    className="field"
-                    value={block.url}
-                    onChange={(e) => updateBlock(block.key, { url: e.target.value })}
-                    maxLength={500}
-                    autoComplete="off"
-                    disabled={!canWrite || pending}
-                    placeholder="https://example.com/offer"
-                  />
-                </div>
+                <Field
+                  label="Button URL"
+                  id={`cmp-block-url-${block.key}`}
+                  hint="https only"
+                  disabled={!canWrite || pending}
+                  className="crm-field mt-2"
+                >
+                  {(c) => (
+                    <input
+                      {...c}
+                      className="field"
+                      value={block.url}
+                      onChange={(e) => updateBlock(block.key, { url: e.target.value })}
+                      maxLength={500}
+                      autoComplete="off"
+                      placeholder="https://example.com/offer"
+                    />
+                  )}
+                </Field>
               ) : (
-                <div className="crm-field mt-2">
-                  <label className="text-label text-ink-300" htmlFor={`cmp-block-text-${block.key}`}>
-                    {block.kind === "heading" ? "Heading text" : "Paragraph text"}
-                  </label>
-                  <textarea
-                    id={`cmp-block-text-${block.key}`}
-                    className="field"
-                    rows={block.kind === "heading" ? 2 : 4}
-                    value={block.text}
-                    onChange={(e) => updateBlock(block.key, { text: e.target.value })}
-                    maxLength={block.kind === "heading" ? 120 : 2000}
-                    autoComplete="off"
-                    disabled={!canWrite || pending}
-                  />
-                </div>
+                <Field
+                  label={block.kind === "heading" ? "Heading text" : "Paragraph text"}
+                  id={`cmp-block-text-${block.key}`}
+                  disabled={!canWrite || pending}
+                  className="crm-field mt-2"
+                >
+                  {(c) => (
+                    <textarea
+                      {...c}
+                      className="field"
+                      rows={block.kind === "heading" ? 2 : 4}
+                      value={block.text}
+                      onChange={(e) => updateBlock(block.key, { text: e.target.value })}
+                      maxLength={block.kind === "heading" ? 120 : 2000}
+                      autoComplete="off"
+                    />
+                  )}
+                </Field>
               )}
               {blocks.length > 1 && canWrite && (
                 <p className="mt-2">
@@ -2871,20 +2900,24 @@ function CampaignNew({
         </p>
       ) : (
         <>
-          <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="cmp-id">
-              Campaign ID (letters, digits, - _)
-            </label>
-            <input
-              id="cmp-id"
-              className="field"
-              value={campaignId}
-              onChange={(e) => setCampaignId(e.target.value)}
-              maxLength={128}
-              autoComplete="off"
-              disabled={doc !== null}
-            />
-          </div>
+          <Field
+            label="Campaign ID"
+            id="cmp-id"
+            hint="Letters, digits, - _"
+            disabled={doc !== null}
+            className="crm-field"
+          >
+            {(c) => (
+              <input
+                {...c}
+                className="field"
+                value={campaignId}
+                onChange={(e) => setCampaignId(e.target.value)}
+                maxLength={128}
+                autoComplete="off"
+              />
+            )}
+          </Field>
           <AudienceSection
             scope={scope}
             viewer={viewer}

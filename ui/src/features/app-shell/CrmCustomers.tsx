@@ -421,7 +421,7 @@ function CustomerForm({
         onSubmit(fields);
       }}
     >
-      <Field label="Display name (required)" id="crm-display-name" required className="crm-field">
+      <Field label="Display name" id="crm-display-name" required className="crm-field">
         {(c) => (
           <input
             {...c}
@@ -463,7 +463,7 @@ function CustomerForm({
         </Field>
       </div>
       <div className="crm-field-row">
-        <Field label="Tags (optional, comma separated)" id="crm-tags" className="crm-field">
+        <Field label="Tags (optional)" id="crm-tags" hint="Comma separated" className="crm-field">
           {(c) => (
             <input
               {...c}
