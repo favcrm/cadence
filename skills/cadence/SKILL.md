@@ -124,6 +124,29 @@ cadence milestone ls --json
 - `agent list` from your pane still shows only your group — filters narrow
   it, `--all` widens past it.
 
+## Updating a ticket
+
+Use `issue edit` for any update with more than one part. It is one tracker
+commit and all-or-nothing: every part is validated first, and one bad part
+refuses the whole edit with the flag named and nothing written. Pipe a
+comment body on stdin so the shell never expands backticks or `$()`:
+
+```bash
+cadence issue edit CAD-31 --set status=review --tag +needs-review \
+  --ref pr:https://github.com/org/repo/pull/7 --link blocked_by:CAD-30 \
+  --attach ./qa.png --acceptance acc.md --comment-file - <<'EOF'
+Ready for review: `cargo test` passes.
+EOF
+```
+
+Parts: `--set k=v`, `--tag +a,-b`, `--link|--unlink kind:ID`,
+`--ref kind:target` (or a bare URL), `--attach FILE`, `--acceptance FILE|-`,
+`--comment-file FILE|-` (with `--author`). It prints `{id, rev, changed}`.
+Stdin feeds one body per call. `issue new --file -` and
+`issue comment --file -` read stdin too (not for the Pi master, which must
+use a file in its tmp dir). The single-purpose verbs stay for one-part
+updates.
+
 ## Rules
 
 - Messages must be **single line**, no control characters (pty transport).

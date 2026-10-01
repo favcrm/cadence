@@ -15,7 +15,18 @@ fn bin() -> Command {
 }
 
 fn run(pm: &Path, state: &Path, master: bool, args: &[&str]) -> (bool, String) {
+    run_env(pm, state, master, &[], args)
+}
+
+fn run_env(
+    pm: &Path,
+    state: &Path,
+    master: bool,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> (bool, String) {
     let mut cmd = bin();
+    cmd.envs(env.iter().copied());
     cmd.arg("--state-dir")
         .arg(state)
         .args(args)
@@ -111,6 +122,8 @@ fn master_stdin_is_refused_on_every_allowlisted_file_command() {
         &["report", "--file", "-"],
         &["report"],
         &["master", "escalate", "D-1", "q.md", "--file", "-"],
+        // CAD-887: `issue new --file -` stays refused for the master.
+        &["issue", "new", "t", "--project", "demo", "--file", "-"],
     ];
     for args in cases {
         let (ok, text) = run(&pm, &state, true, args);
@@ -143,5 +156,47 @@ fn master_stdin_is_refused_on_every_allowlisted_file_command() {
     assert!(
         !text.contains(cadence_agent::master::NO_STDIN),
         "worker stdin was refused: {text}"
+    );
+}
+
+/// CAD-887: `issue comment` and `issue edit` read stdin for everyone but
+/// the master. A grant token skips the daemon-side permission replay, so
+/// these verbs run locally and reach their own refusal.
+#[test]
+fn master_stdin_and_file_reads_are_refused_on_comment_and_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pm = tmp.path().join("pm");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(state.join("home")).unwrap();
+    let init = cadence_agent::reaper::output(
+        bin()
+            .args(["--state-dir", state.to_str().unwrap(), "issue", "init"])
+            .env("CADENCE_PM_DIR", &pm)
+            .env("HOME", state.join("home"))
+            .env_remove("CADENCE_ALIAS"),
+    )
+    .unwrap();
+    assert!(init.status.success());
+    let env = [("CADENCE_GRANT_TOKEN", "x")];
+    let cases: &[&[&str]] = &[
+        &["issue", "comment", "D-1", "--file", "-"],
+        &["issue", "comment", "D-1"],
+        &["issue", "edit", "D-1", "--comment-file", "-"],
+        &["issue", "edit", "D-1", "--acceptance", "-"],
+        &["issue", "edit", "D-1", "--attach", "/etc/hostname"],
+    ];
+    for args in cases {
+        let (ok, text) = run_env(&pm, &state, true, &env, args);
+        assert!(!ok, "{args:?} ran for the master: {text}");
+        assert!(
+            text.contains(cadence_agent::master::NO_STDIN)
+                || text.contains("not available to the master"),
+            "{args:?}: {text}"
+        );
+        assert!(!text.contains(SECRET), "{args:?} echoed stdin: {text}");
+    }
+    assert!(
+        contains_secret(&pm).is_none(),
+        "stdin stored in the tracker"
     );
 }

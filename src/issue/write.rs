@@ -96,7 +96,7 @@ fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value>> {
 /// Lint parity at write time: an issue whose status is ready|doing|
 /// review while a blocked_by target is unfinished succeeds but the
 /// response carries this warning.
-fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
+pub(crate) fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
     let issues = board::load_all(&pm.dir, None)?;
     let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
     let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
@@ -139,13 +139,13 @@ fn atomic_write(path: &Path, text: &str) -> Result<()> {
 /// it does not exist. Feeds [`restore_preimage`] when the commit
 /// fails, so a refused write leaves neither an index entry (the
 /// commit unstages its own paths) nor a half-written file (CAD-454).
-fn file_preimage(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn file_preimage(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
 /// Undo what a write did to `path`: the old bytes go back where they
 /// were; a file this write created is removed.
-fn restore_preimage(path: &Path, prev: Option<Vec<u8>>) {
+pub(crate) fn restore_preimage(path: &Path, prev: Option<Vec<u8>>) {
     match prev {
         Some(bytes) => {
             let _ = std::fs::write(path, bytes);
@@ -167,7 +167,7 @@ pub(crate) fn attach_foreign(out: &mut Value, foreign: &[String]) {
 
 /// Create a file exclusively; on a name collision try `-2`, `-3`…
 /// before the extension. Returns the created path.
-fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (name.to_string(), String::new()),
@@ -256,7 +256,7 @@ pub(crate) fn check_tags(project: &project::Project, tags: &[String]) -> Result<
 
 /// `a,b` → `[a, b]`; blanks between commas are dropped, so `tags=`
 /// clears.
-fn split_tags(value: &str) -> Vec<String> {
+pub(crate) fn split_tags(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -876,7 +876,7 @@ fn check_parent(by_id: &HashMap<&str, &board::Issue>, this: &board::Issue) -> Re
 /// Apply `key=value` pairs to one front in memory; returns the
 /// `key=value` summary tokens. Nothing is written here, so a bulk edit
 /// can validate every issue before it touches a file.
-fn apply_pairs(
+pub(crate) fn apply_pairs(
     project: &project::Project,
     front: &mut Front,
     pairs: &[String],
@@ -1106,6 +1106,40 @@ fn check_done_evidence(pm: &Pm, front: &Front, force: Option<&str>) -> Result<()
     )))
 }
 
+/// The gates a `set` runs after its pairs applied, comparing the
+/// edited `front` against `prev` (the front as loaded). Shared by
+/// `issue set` and `issue edit`, so neither can skip one. Returns the
+/// recorded `--force` reason when the done-evidence gate was overridden.
+pub(crate) fn check_set_gates(
+    pm: &Pm,
+    project: &project::Project,
+    prev: &Front,
+    front: &Front,
+    force: Option<&str>,
+) -> Result<Option<String>> {
+    let mut forced = None;
+    if front.status != prev.status {
+        // CAD-360: an unapproved plan's tickets stay in backlog.
+        crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
+        if front.status == "done" {
+            check_done_evidence(pm, front, force)?;
+            forced = force.map(|r| r.trim().to_string());
+        }
+        // CAD-757: `ready` is the dispatch queue — a blocked ticket
+        // cannot sit in it.
+        if front.status == "ready" {
+            crate::issue::blocked::check_ready(&pm.dir, front)?;
+        }
+    }
+    if front.milestone != prev.milestone {
+        check_milestone(pm, project, front.milestone.as_deref())?;
+    }
+    if front.item_type != prev.item_type {
+        check_type_change(pm, front)?;
+    }
+    Ok(forced)
+}
+
 /// `issue set <ID>… key=value…` — the writable frontmatter fields, on
 /// one issue or several. All-or-nothing: every id and every pair is
 /// validated before any file changes, and the batch is one commit.
@@ -1154,28 +1188,10 @@ pub fn set_fields_if_rev(
     let mut changed = Vec::new();
     let mut forced: Option<String> = None;
     let staged = stage(pm, ids, |project, front| {
-        let before = front.status.clone();
-        let milestone = front.milestone.clone();
-        let item_type = front.item_type.clone();
+        let prev = front.clone();
         changed = apply_pairs(project, front, pairs)?;
-        if front.status != before {
-            // CAD-360: an unapproved plan's tickets stay in backlog.
-            crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
-            if front.status == "done" {
-                check_done_evidence(pm, front, force)?;
-                forced = force.map(|r| r.trim().to_string());
-            }
-            // CAD-757: `ready` is the dispatch queue — a blocked ticket
-            // cannot sit in it.
-            if front.status == "ready" {
-                crate::issue::blocked::check_ready(&pm.dir, front)?;
-            }
-        }
-        if front.milestone != milestone {
-            check_milestone(pm, project, front.milestone.as_deref())?;
-        }
-        if front.item_type != item_type {
-            check_type_change(pm, front)?;
+        if let Some(reason) = check_set_gates(pm, project, &prev, front, force)? {
+            forced = Some(reason);
         }
         Ok(true)
     })?;
@@ -1597,28 +1613,18 @@ pub fn patch_issue(
     Ok(out)
 }
 
-/// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
-/// fields; `parent`/`duplicate_of` are scalars.
-#[allow(clippy::too_many_arguments)]
-pub fn link(
+/// One link/unlink applied to `front` in memory — every check `issue
+/// link` makes except the structural one over the whole board. Shared
+/// with `issue edit`.
+pub(crate) fn apply_link(
     pm: &Pm,
-    id: &str,
+    front: &mut Front,
     kind: &str,
     target: &str,
     unlink: bool,
-    if_rev: Option<&str>,
-    actor: &str,
-    state_dir: Option<&Path>,
-) -> Result<Value> {
-    model::check_link_kind(kind)?;
-    model::check_id(target)?;
-    let (_project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
-    if let Some(conflict) = check_rev(&dir, if_rev)? {
-        return Ok(conflict);
-    }
-    let (mut front, body) = load_front(&dir)?;
-    let verb = if unlink { "unlink" } else { "link" };
+) -> Result<()> {
+    let id = front.id.clone();
+    let id = id.as_str();
     match kind {
         "blocked_by" | "relates" => {
             let list = if kind == "blocked_by" {
@@ -1653,7 +1659,7 @@ pub fn link(
                 // a plan by link.
                 crate::issue::plan::check_parent_change(
                     &pm.dir,
-                    &front,
+                    front,
                     (!unlink).then_some(target),
                 )?;
             }
@@ -1680,6 +1686,32 @@ pub fn link(
         }
         _ => unreachable!(),
     }
+    Ok(())
+}
+
+/// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
+/// fields; `parent`/`duplicate_of` are scalars.
+#[allow(clippy::too_many_arguments)]
+pub fn link(
+    pm: &Pm,
+    id: &str,
+    kind: &str,
+    target: &str,
+    unlink: bool,
+    if_rev: Option<&str>,
+    actor: &str,
+    state_dir: Option<&Path>,
+) -> Result<Value> {
+    model::check_link_kind(kind)?;
+    model::check_id(target)?;
+    let (_project, dir) = issue_dir(pm, id)?;
+    let _lock = pm.lock()?;
+    if let Some(conflict) = check_rev(&dir, if_rev)? {
+        return Ok(conflict);
+    }
+    let (mut front, body) = load_front(&dir)?;
+    let verb = if unlink { "unlink" } else { "link" };
+    apply_link(pm, &mut front, kind, target, unlink)?;
     // Structural check before the file is written — a rejected link
     // leaves the folder untouched.
     let issues = board::load_all(&pm.dir, None)?;
@@ -1717,6 +1749,28 @@ pub fn link(
     Ok(out)
 }
 
+/// A ref as `issue ref` stores it: an http(s) target is a `url`,
+/// anything else a `path`. Shared with `issue edit`.
+pub(crate) fn new_ref(
+    kind: &str,
+    target: &str,
+    label: Option<&str>,
+    worktree: Option<&str>,
+    agent: Option<&str>,
+) -> Ref {
+    let is_url = target.starts_with("http://") || target.starts_with("https://");
+    Ref {
+        kind: kind.to_string(),
+        url: is_url.then(|| target.to_string()),
+        path: (!is_url).then(|| target.to_string()),
+        label: label.map(str::to_string),
+        closed: None,
+        worktree: worktree.map(str::to_string),
+        cargo_target: None,
+        agent: agent.map(str::to_string),
+    }
+}
+
 /// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
 /// `url:`; everything else is a `path:` (previews store publish paths).
 /// `worktree` scopes a `message` ref to the pair it was dispatched
@@ -1741,18 +1795,9 @@ pub fn add_ref(
         return Ok(conflict);
     }
     let (mut front, body) = load_front(&dir)?;
-    let is_url = target.starts_with("http://") || target.starts_with("https://");
-    let r = Ref {
-        kind: kind.to_string(),
-        url: is_url.then(|| target.to_string()),
-        path: (!is_url).then(|| target.to_string()),
-        label: label.map(str::to_string),
-        closed: None,
-        worktree: worktree.map(str::to_string),
-        cargo_target: None,
-        agent: agent.map(str::to_string),
-    };
-    front.refs.push(r);
+    front
+        .refs
+        .push(new_ref(kind, target, label, worktree, agent));
     let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
@@ -1810,20 +1855,11 @@ pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Re
     Ok(())
 }
 
-/// `issue comment <ID> -m|--file` — one create-only file under
-/// `comments/`, named by UTC time + author.
-pub fn add_comment(
-    pm: &Pm,
-    id: &str,
-    body: &str,
-    author: Option<&str>,
-    kind: Option<&str>,
-    if_rev: Option<&str>,
-    actor: &str,
-) -> Result<Value> {
-    let (_project, dir) = issue_dir(pm, id)?;
-    let author_opt = author;
-    let author = author_opt
+/// The author a comment is recorded under: `--author`, else
+/// `CADENCE_ALIAS`, else `operator` — one derivation for `issue
+/// comment` and `issue edit`, so neither opens a way to forge identity.
+pub(crate) fn comment_author(author: Option<&str>) -> Result<String> {
+    let author = author
         .map(str::to_string)
         .or_else(|| std::env::var("CADENCE_ALIAS").ok())
         .unwrap_or_else(|| "operator".to_string());
@@ -1837,6 +1873,23 @@ pub fn add_comment(
             "Bad comment author '{author}' — letters, digits, '-' or '_'"
         )));
     }
+    Ok(author)
+}
+
+/// `issue comment <ID> -m|--file` — one create-only file under
+/// `comments/`, named by UTC time + author.
+pub fn add_comment(
+    pm: &Pm,
+    id: &str,
+    body: &str,
+    author: Option<&str>,
+    kind: Option<&str>,
+    if_rev: Option<&str>,
+    actor: &str,
+) -> Result<Value> {
+    let (_project, dir) = issue_dir(pm, id)?;
+    let author_opt = author;
+    let author = comment_author(author_opt)?;
     if body.trim().is_empty() {
         return Err(Error::rejected("Comment body is empty — pass -m or --file"));
     }
@@ -2156,6 +2209,79 @@ mod tests {
     fn clean(pm: &Pm) -> bool {
         crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok()
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+    }
+
+    /// A forced done over several ids keeps its reason in the commit
+    /// subject even when a later id was already done (CAD-887 review).
+    #[test]
+    fn forced_done_keeps_its_reason_when_a_later_id_is_already_done() {
+        let (tmp, pm) = tracker();
+        new_issue(
+            &pm,
+            tmp.path(),
+            Some("cadence"),
+            "second",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        set_fields(
+            &pm,
+            &["CAD-2".to_string()],
+            &["status=done".to_string()],
+            "t",
+            Some("first"),
+        )
+        .unwrap();
+        set_fields(
+            &pm,
+            &["CAD-1".to_string(), "CAD-2".to_string()],
+            &["status=done".to_string()],
+            "t",
+            Some("because reasons"),
+        )
+        .unwrap();
+        let subject = crate::issue::git(&pm.dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert!(subject.contains("forced: because reasons"), "{subject}");
+    }
+
+    /// `issue edit` whose commit is refused leaves issue.md as it was
+    /// and removes the attachment and comment files it created.
+    #[test]
+    fn edit_commit_failure_rolls_everything_back() {
+        let (tmp, pm) = tracker();
+        let before = std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap();
+        let attach = tmp.path().join("a.txt");
+        std::fs::write(&attach, "x").unwrap();
+        let hook = failing_hook(&pm);
+        let spec = crate::issue::edit::EditSpec {
+            set: vec!["priority=P0".to_string()],
+            attach: vec![attach],
+            comment: Some("a comment".to_string()),
+            ..Default::default()
+        };
+        assert!(crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).is_err());
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap(),
+            before
+        );
+        let count = |sub: &str| {
+            std::fs::read_dir(pm.dir.join("cadence/CAD-1").join(sub))
+                .map(|rd| rd.count())
+                .unwrap_or(0)
+        };
+        assert_eq!(count("artifacts"), 0);
+        assert_eq!(count("comments"), 0);
+        assert!(clean(&pm));
+        std::fs::remove_file(hook).unwrap();
+        crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
     }
 
     #[test]

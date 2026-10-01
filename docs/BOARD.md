@@ -399,6 +399,16 @@ cadence issue unlink CAD-16 blocked_by CAD-12
 cadence issue ref CAD-16 pr https://… --label "PR #16"
 cadence issue comment CAD-16 -m "text" --author me
 cadence issue attach CAD-16 ./shot.png      # copies into artifacts/, 1 MiB cap
+cadence issue edit CAD-16 --set status=review --tag +ui,-wip \
+  --link blocked_by:CAD-12 --ref pr:https://… --attach ./shot.png \
+  --acceptance acc.md --comment-file -      # many parts, ONE commit, all-or-
+                                            # nothing: every part is validated
+                                            # first, a bad one refuses the whole
+                                            # edit naming its flag. `-` reads
+                                            # stdin (one body per call). Prints
+                                            # {id, rev, changed}. Same writers,
+                                            # lock, lint and Actor rules as the
+                                            # single-purpose verbs above
 cadence issue lint                          # schema, links, depth, sizes, symlinks
                                             # → exit !=0 on errors; warnings
                                             #   (e.g. ready/doing/review with an

@@ -34,6 +34,7 @@ All commands (one line per path):
     issue ref
     issue comment
     issue attach
+    issue edit
     issue lint
     issue reconcile
     issue sync

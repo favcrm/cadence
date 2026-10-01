@@ -443,6 +443,50 @@ pub enum IssueAction {
     /// Attach a file into `artifacts/` (basename only, size cap,
     /// create-only).
     Attach { id: String, file: PathBuf },
+    /// Several updates to one issue as ONE tracker commit: set, tag,
+    /// link, ref, attach, acceptance and a comment. Every part is
+    /// validated first — one bad part refuses the whole edit and writes
+    /// nothing. `-` reads stdin for `--comment-file` and `--acceptance`
+    /// (one of the two). Prints `{id, rev, changed}`.
+    Edit {
+        id: String,
+        /// `key=value`, as `issue set`. Repeatable.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// `+tag` adds, `-tag` removes, a bare `tag` adds; comma-separated
+        /// or repeated: `--tag +a,-b`.
+        #[arg(
+            long = "tag",
+            value_name = "+TAG|-TAG",
+            value_delimiter = ',',
+            allow_hyphen_values = true
+        )]
+        tag: Vec<String>,
+        /// `kind:ID`, as `issue link` (`blocked_by:CAD-2`). Repeatable.
+        #[arg(long = "link", value_name = "KIND:ID")]
+        link: Vec<String>,
+        /// `kind:ID`, as `issue unlink`. Repeatable.
+        #[arg(long = "unlink", value_name = "KIND:ID")]
+        unlink: Vec<String>,
+        /// `kind:target` (`pr:https://…`) or a bare http(s) URL. Repeatable.
+        #[arg(long = "ref", value_name = "KIND:TARGET")]
+        refs: Vec<String>,
+        /// Attach a file, as `issue attach`. Repeatable.
+        #[arg(long = "attach", value_name = "FILE")]
+        attach: Vec<PathBuf>,
+        /// Replace the Acceptance checklist from FILE (`-` = stdin).
+        #[arg(long, value_name = "FILE|-")]
+        acceptance: Option<PathBuf>,
+        /// Add a comment from FILE (`-` = stdin).
+        #[arg(long = "comment-file", value_name = "FILE|-")]
+        comment_file: Option<PathBuf>,
+        /// Recorded author of the comment; needs `--comment-file`.
+        #[arg(long)]
+        author: Option<String>,
+        /// Override the `status=done` evidence gate, as `issue set --force`.
+        #[arg(long, value_name = "REASON")]
+        force: Option<String>,
+    },
     /// Check the whole PM dir: schema, id/folder mismatch, dangling and
     /// cyclic links, depth > 2, oversize artifacts, unknown status/kind.
     /// Non-zero exit on any error.
@@ -830,9 +874,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 status.as_deref(),
             )?;
             let body = match file {
-                Some(ref f) if f.as_os_str() == "-" => {
+                // The refusal is the master's confinement (CAD-614): its
+                // body must be a file under master/tmp. Everyone else
+                // may pipe it.
+                Some(ref f) if f.as_os_str() == "-" && caller_is_master => {
                     return Err(Error::rejected(crate::master::NO_STDIN));
                 }
+                Some(ref f) if f.as_os_str() == "-" => Some(read_stdin_body("issue new --file")?),
                 Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
                     |e| {
                         Error::rejected(format!(
@@ -1625,14 +1673,21 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         } => {
             let body = match (text, file) {
                 (Some(t), _) => t.clone(),
+                (None, Some(f)) if f.as_os_str() == "-" => {
+                    if crate::master::caller_is_master() {
+                        return Err(Error::rejected(crate::master::NO_STDIN));
+                    }
+                    read_stdin_body("issue comment --file")?
+                }
                 (None, Some(f)) => std::fs::read_to_string(f)?,
                 (None, None) => {
+                    if crate::master::caller_is_master() {
+                        return Err(Error::rejected(crate::master::NO_STDIN));
+                    }
                     if atty_stdin() {
                         return Err(Error::rejected("Provide -m or --file"));
                     }
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf
+                    read_stdin_body("issue comment")?
                 }
             };
             let pm = open_pm()?;
@@ -1645,6 +1700,63 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 None,
                 "",
             )?);
+            Ok(0)
+        }
+        IssueAction::Edit {
+            id,
+            set,
+            tag,
+            link,
+            unlink,
+            refs,
+            attach,
+            acceptance,
+            comment_file,
+            author,
+            force,
+        } => {
+            // The master has no stdin and no free file reads (CAD-614),
+            // and `edit` is not on its allowlist; refuse here too so a
+            // widened allowlist cannot open the stdin path.
+            if crate::master::caller_is_master() {
+                return Err(Error::rejected(
+                    "issue edit is not available to the master — use the single-purpose verbs",
+                ));
+            }
+            let is_stdin = |f: &Option<PathBuf>| f.as_ref().is_some_and(|p| p.as_os_str() == "-");
+            if is_stdin(acceptance) && is_stdin(comment_file) {
+                return Err(Error::rejected(
+                    "edit: stdin can feed only one of --acceptance and --comment-file",
+                ));
+            }
+            let read = |flag: &str, f: &Option<PathBuf>| -> Result<Option<String>> {
+                match f {
+                    None => Ok(None),
+                    Some(p) if p.as_os_str() == "-" => Ok(Some(read_stdin_body(flag)?)),
+                    Some(p) => std::fs::read_to_string(p).map(Some).map_err(|e| {
+                        Error::rejected(format!("edit {flag}: cannot read {}: {e}", p.display()))
+                    }),
+                }
+            };
+            let spec = crate::issue::edit::EditSpec {
+                set: set.clone(),
+                tags: tag.clone(),
+                link: link.clone(),
+                unlink: unlink.clone(),
+                refs: refs.clone(),
+                attach: attach.clone(),
+                acceptance: read("--acceptance", acceptance)?,
+                comment: read("--comment-file", comment_file)?,
+                author: author.clone(),
+                force: force.clone(),
+            };
+            let pm = open_pm()?;
+            let sd = crate::client::state_dir().ok();
+            let out = crate::issue::edit::edit(&pm, id, &spec, "", sd.as_deref())?;
+            print_json(&out);
+            if out["worktree_open"].is_array() {
+                eprintln!("{id}: worktree open: run cadence issue finish {id}");
+            }
             Ok(0)
         }
         IssueAction::Attach { id, file } => {
@@ -1791,6 +1903,24 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// Read a body from stdin for a `--file -` / `--comment-file -` flag.
+/// A terminal is refused (it would hang waiting for input); the size
+/// is capped so a runaway pipe cannot fill memory.
+fn read_stdin_body(flag: &str) -> Result<String> {
+    const MAX: u64 = 4 << 20;
+    if atty_stdin() {
+        return Err(Error::rejected(format!(
+            "{flag} -: stdin is a terminal — pipe the body in"
+        )));
+    }
+    let mut buf = String::new();
+    std::io::stdin().take(MAX + 1).read_to_string(&mut buf)?;
+    if buf.len() as u64 > MAX {
+        return Err(Error::rejected(format!("{flag} -: stdin is over 4 MiB")));
+    }
+    Ok(buf)
 }
 
 fn atty_stdin() -> bool {
