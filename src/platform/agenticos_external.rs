@@ -3,6 +3,7 @@
 //! External tokens stay in custody; the upstream door derives their company.
 //! Trusted hosted media instead uses the fixed lease-owned door with no bearer.
 mod image;
+pub mod media_import;
 pub mod publish;
 pub mod publish_sender;
 mod source;

@@ -113,7 +113,10 @@ impl DeviceCredential {
         Self(secret)
     }
 
-    fn authorization(&self) -> String {
+    /// Bearer header value; `pub(crate)` so the sibling media-import
+    /// client authenticates the same way. Never logged or returned to a
+    /// caller — the secret only ever reaches this one header.
+    pub(crate) fn authorization(&self) -> String {
         format!("Bearer {}", self.0)
     }
 }
