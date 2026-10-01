@@ -16,6 +16,7 @@ pub mod context;
 pub mod delivery_policy;
 pub mod dispatch;
 pub mod doctor;
+pub mod edit;
 pub mod finish;
 pub mod groom;
 pub mod history;

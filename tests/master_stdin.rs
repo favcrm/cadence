@@ -111,6 +111,11 @@ fn master_stdin_is_refused_on_every_allowlisted_file_command() {
         &["report", "--file", "-"],
         &["report"],
         &["master", "escalate", "D-1", "q.md", "--file", "-"],
+        // CAD-887: `issue new --file -` stays refused for the master.
+        // (`issue comment` and `issue edit` sit behind the master's
+        // daemon-side grant check, so they never reach this refusal
+        // without a daemon.)
+        &["issue", "new", "t", "--project", "demo", "--file", "-"],
     ];
     for args in cases {
         let (ok, text) = run(&pm, &state, true, args);
