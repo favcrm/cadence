@@ -44,6 +44,7 @@ mod app_contexts;
 mod app_records;
 mod app_release;
 mod app_runs;
+mod app_view_read;
 mod apps;
 mod connections;
 mod crm_send;
@@ -4027,6 +4028,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
                 let response = app_release::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
+            }
+            // `/api/app-installations/<id>/views/<view>/rows[/<record>]`
+            // — the bound live view read (CAD-867). Routed before the
+            // generic `/api/app-installations/<id>` show so `/views/…`
+            // is never swallowed by the bare-id branch.
+            if let Some(route) = app_view_read::route(&path) {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_view_read::handle(&mut request, state_dir, route, false);
                 send(request, response);
                 return;
             }

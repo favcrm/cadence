@@ -26,6 +26,7 @@ mod app_contexts_rpc;
 mod app_effects_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_view_read_rpc;
 mod approvals_rpc;
 mod area_rpc;
 mod caller_rule;
@@ -2865,6 +2866,7 @@ impl Shared {
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
+            "app_view_read" => self.rpc_app_view_read(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_show" => self.rpc_app_audience(method, params, peer_pid),
             "app_segment_list" => self.rpc_app_audience(method, params, peer_pid),
