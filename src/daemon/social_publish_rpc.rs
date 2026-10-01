@@ -22,6 +22,18 @@ impl Shared {
         strict_fields(
             params,
             match method {
+                // CAD-979: the operator requests a media import against the
+                // approved run's reviewed retained asset — full provenance
+                // triple + scope, never caller bytes/path/URL.
+                "social_publish_media_import" => &[
+                    "request_id",
+                    "install_id",
+                    "context_id",
+                    "run_id",
+                    "artifact_id",
+                    "bundle_digest",
+                    "slot",
+                ],
                 "social_publish_schedule" => &[
                     "request_id",
                     "install_id",
@@ -49,6 +61,7 @@ impl Shared {
             },
         )?;
         match method {
+            "social_publish_media_import" => self.import_social_media(params),
             "social_publish_schedule" => self.schedule_social_publish(params),
             "social_publish_cancel" => self
                 .store
@@ -71,6 +84,71 @@ impl Shared {
             ),
             _ => Err(Error::rejected("unknown social publish method")),
         }
+    }
+
+    /// CAD-979: operator-only retained-media import. Proves the run's
+    /// reviewed asset + this request's exact scope, reads the retained bytes
+    /// by receipt custody, uploads them to the device media door and returns
+    /// the validated `media_key`/`image_digest` for the operator to schedule.
+    /// No grant minted, no send, no persisted row — freeze owns durability.
+    fn import_social_media(&self, params: &Value) -> Result<Value> {
+        let common = |field: &str| required_str(params, field);
+        let request_install = common("install_id")?;
+        let request_context = optional_str(params, "context_id");
+        let run_id = common("run_id")?;
+        let artifact_id = common("artifact_id")?;
+        let bundle_digest = common("bundle_digest")?;
+        let slot = common("slot")?;
+        // Reuse the exact provenance re-proof freeze uses: approved completed
+        // run, frozen slot, current binding — keyed by run+artifact+bundle+slot.
+        let material = self
+            .store
+            .app_publication_material(run_id, artifact_id, bundle_digest, slot)?;
+        // I2 scope pin (E3): the request's install/context must equal the
+        // run's OWN scope — `app_publication_material` re-proves only the
+        // run's binding against the run's own scope, so a request naming a
+        // different install/context would still resolve without this compare.
+        // context_id is exact/null-preserving (no wildcard).
+        if material["run"]["install_id"].as_str() != Some(request_install)
+            || material["run"]["context_id"].as_str() != request_context
+        {
+            return Err(Error::rejected(
+                "grant_binding_mismatch: media import request names a different install or context",
+            ));
+        }
+        // The reviewed retained asset for this run.
+        let asset = &material["asset"];
+        let receipt_id = asset["receipt_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("run has no reviewed retained asset"))?;
+        let media_type = asset["media_type"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("run has no reviewed retained asset"))?;
+        let connection_id = material["binding"]["config"]["connection_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?
+            .to_owned();
+        // Read the retained bytes by receipt custody — never a caller
+        // path/URL — and re-verify the digest matches the reviewed asset.
+        let db_path = self.state_dir.join("cadence.sqlite3");
+        let (_receipt, bytes) =
+            crate::store::app_capabilities::read_asset_material(&db_path, receipt_id)?;
+        // The importer re-verifies jpeg/png signature + the 2 MiB bound and
+        // recomputes the digest; the door's receipt must echo all of it.
+        let importer = self.social_media_importer.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media importer configured")
+        })?;
+        let receipt = importer
+            .import(&connection_id, media_type, &bytes)
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
+        Ok(json!({
+            "ok": true,
+            "media_key": receipt.media_key,
+            "image_digest": receipt.digest,
+            "connection_id": receipt.connection_id,
+            "mime": receipt.mime,
+            "size_bytes": receipt.size_bytes,
+        }))
     }
 
     /// Schedule freezes from the approved run's reviewed material only:

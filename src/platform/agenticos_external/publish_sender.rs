@@ -707,9 +707,20 @@ pub fn attach_publish_sender(
     let resolver = production_resolver(state_dir);
     opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
         url.trim_end_matches('/'),
-        credential,
+        credential.clone(),
         resolver,
     )?));
+    // CAD-979: the retained-media import seam reuses the same configured
+    // `publish.send` credential and base URL — one importer held once on
+    // `opts`, resolved here at attach (never per-call env, never serialized).
+    if opts.social_media_importer.is_none() {
+        opts.social_media_importer = Some(Arc::new(
+            crate::platform::agenticos_external::media_import::MediaImporter::new(
+                url.trim_end_matches('/'),
+                credential,
+            )?,
+        ));
+    }
     Ok(())
 }
 

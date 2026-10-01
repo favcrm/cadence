@@ -695,6 +695,25 @@ impl Store {
         let connection_id = material["binding"]["config"]["connection_id"]
             .as_str()
             .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?;
+        // CAD-979 (I4): a supplied `media_key` must bind THIS run's reviewed
+        // asset — `dp1.<workspace>.<connection_id>.<image_digest[..32]>` — all
+        // derived from the material, never the caller's word. A key for a
+        // foreign connection or digest is refused here at freeze (send-time
+        // `check_material` remains a second layer). The workspace comes from
+        // the same frozen binding config.
+        if let Some(key) = row.media_key {
+            let workspace_id = material["binding"]["config"]["workspace_id"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("reviewed binding names no workspace"))?;
+            let bound = image_digest.as_deref().is_some_and(|digest| {
+                device::media_key_authorizes(key, workspace_id, connection_id, digest)
+            });
+            if !bound {
+                return Err(Error::rejected(
+                    "grant_binding_mismatch: media key does not bind this connection and reviewed image",
+                ));
+            }
+        }
         self.social_publish_schedule(&NewSocialPublish {
             request_id: row.request_id,
             install_id: row.install_id,

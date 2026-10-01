@@ -22,6 +22,8 @@ pub(super) enum Route<'a> {
     List,
     Show(&'a str),
     Cancel(&'a str),
+    /// CAD-979: `POST /api/social-media-imports` → `social_publish_media_import`.
+    MediaImport,
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -31,6 +33,11 @@ fn segment(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 pub(super) fn route(path: &str) -> Option<Route<'_>> {
+    // CAD-979: the operator media-import write route is a distinct path so a
+    // mistaken GET on it cannot be read as a `Show` by `is_read`.
+    if path == "/api/social-media-imports" {
+        return Some(Route::MediaImport);
+    }
     if path == "/api/social-publishes" {
         return Some(Route::List);
     }
@@ -95,6 +102,25 @@ struct Schedule {
     approval_id: String,
     due_epoch: i64,
     timezone: String,
+}
+/// CAD-979: operator media-import body — the approved run's exact
+/// provenance + scope. Unknown fields refused; `context_id` is the
+/// exact/null-preserving scope bound.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MediaImport {
+    request_id: String,
+    install_id: String,
+    #[serde(
+        default,
+        deserialize_with = "present_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+    run_id: String,
+    artifact_id: String,
+    bundle_digest: String,
+    slot: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +254,20 @@ pub(super) fn handle(
                 return response;
             }
             ("social_publish_cancel", json!({"intent_id": id}))
+        }
+        Route::MediaImport => {
+            let bytes = match read_body(request, BODY_CAP) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let value: MediaImport = match parse_json(&bytes) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (
+                "social_publish_media_import",
+                serde_json::to_value(value).expect("typed media import serializes"),
+            )
         }
     };
     match client::rpc(state, method, params) {

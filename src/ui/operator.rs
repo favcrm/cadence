@@ -167,6 +167,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/app-runs/*/cancel", RouteClass::OperatorOnly),
     route("POST", "/api/app-runs/*/dispatch", RouteClass::OperatorOnly),
     route("POST", "/api/social-publishes", RouteClass::OperatorOnly),
+    // CAD-979: the operator relay for `social_publish_media_import`. Writes a
+    // cross-connection upstream media import — proven-operator-only, relayed
+    // with the same `operator_connection` gate the underlying verb enforces.
+    route(
+        "POST",
+        "/api/social-media-imports",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/social-publishes/*/cancel",
