@@ -262,7 +262,7 @@ class WorkflowContract(unittest.TestCase):
             assert_no_secret_path_has_no_wrapper(self, mutated)
 
     def test_warm_builds_without_the_profile_guard_are_rejected(self):
-        old = "        if: matrix.profile == 'release'\n        run: cargo build --release --locked"
+        old = "        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')\n        run: cargo build --release --locked"
         self.assertIn(old, self.workflow)
         with self.assertRaises(AssertionError):
             assert_no_secret_path_has_no_wrapper(self, self.workflow.replace(old, "        run: cargo build --release --locked", 1))

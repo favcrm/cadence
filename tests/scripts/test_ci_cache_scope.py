@@ -27,8 +27,9 @@ GATE_KEYS = {
     "build": "gate-release",
     "ui": "gate-release",
 }
-# Jobs that run on pull_request / merge_group but are not gates: restore only.
-OTHER_RESTORE_ONLY = ("cross-build",)
+# Non-gate pull_request / merge_group jobs with a restoring cache (none:
+# cross-build has no rust-cache, since nothing on main would save its key).
+OTHER_RESTORE_ONLY = ()
 # Release jobs never run on pull_request / merge_group (main push / v* tag),
 # keep their own default-keyed cache and are deliberately untouched.
 UNTOUCHED = ("release-artifact", "release-build")
@@ -79,7 +80,8 @@ def assert_cache_scope(case, workflow):
     uses = set(re.findall(r"Swatinem/rust-cache@\S+", workflow))
     case.assertEqual(uses, {ACTION}, uses)
 
-    # Every gate and every other pull_request/merge_group job: restore-only.
+    case.assertEqual(cache_steps(job_body(workflow, "cross-build")), [], "cross-build restores a key nothing saves")
+    # Every gate: restore-only.
     for job in (*GATE_KEYS, *OTHER_RESTORE_ONLY):
         steps = cache_steps(job_body(workflow, job))
         case.assertEqual(len(steps), 1, job)
@@ -105,6 +107,7 @@ def assert_cache_scope(case, workflow):
     warm = job_body(workflow, WARM)
     case.assertIn("if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}", warm)
     for st in cache_steps(warm):
+        case.assertEqual(field(st, "cache-on-failure"), "true")
         case.assertIsNone(field(st, "save-if"), "cache-warm must use the default (save)")
     saved = warm_keys(workflow)
     case.assertEqual(saved, set(GATE_KEYS.values()))
@@ -158,6 +161,19 @@ class CacheScope(unittest.TestCase):
 
     def test_a_warm_leg_dropped_is_rejected(self):
         mutated = self.workflow.replace("profile: [test, release, clippy]", "profile: [test, release]", 1)
+        self.assertNotEqual(mutated, self.workflow)
+        with self.assertRaises(AssertionError):
+            assert_cache_scope(self, mutated)
+
+    def test_cross_build_restoring_a_key_nothing_saves_is_rejected(self):
+        body = job_body(self.workflow, "cross-build")
+        mutated = body.replace("    steps:\n", f"    steps:\n      - uses: {ACTION} # v2.9.2\n        with:\n          save-if: false\n", 1)
+        self.assertNotEqual(body, mutated)
+        with self.assertRaises(AssertionError):
+            assert_cache_scope(self, self.workflow.replace(body, mutated, 1))
+
+    def test_warm_without_cache_on_failure_is_rejected(self):
+        mutated = self.workflow.replace("          cache-on-failure: true\n", "", 1)
         self.assertNotEqual(mutated, self.workflow)
         with self.assertRaises(AssertionError):
             assert_cache_scope(self, mutated)

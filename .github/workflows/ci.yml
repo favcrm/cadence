@@ -61,7 +61,7 @@ jobs:
   # key and passes `save-if: false`: a queue ref saved ~1.4 GB per run that no
   # other ref could read, and the repo sat at 12.7 GB against a 10 GB limit.
   # release-artifact and release-build keep their own default-keyed caches
-  # (they run on main pushes and tags only). tests/scripts/test_ci_cache_scope.py
+  # (they run on main pushes and tags only). cross-build has no rust-cache. tests/scripts/test_ci_cache_scope.py
   # pins all of this.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
@@ -212,6 +212,10 @@ jobs:
       # CAD-926: only cache-warm (push to main) saves the gate rust-cache.
       - name: Test rust-cache save scope and shared keys
         run: python3 tests/scripts/test_ci_cache_scope.py
+      # Strict parse: a duplicate mapping key makes GitHub reject the whole
+      # workflow (0 jobs), which the regex-based contracts cannot see.
+      - name: Test workflows parse strictly (no duplicate keys)
+        run: python3 tests/scripts/test_workflows_strict.py
 
   clippy:
     needs: [queue-evidence]
@@ -294,7 +298,6 @@ jobs:
         with:
           shared-key: gate-test
           save-if: false
-        if: steps.scope.outputs.mode != 'docs'
       - name: Enable shared sccache (no-op without credentials)
         if: steps.scope.outputs.mode != 'docs'
         env:
@@ -628,8 +631,9 @@ jobs:
   # restore (gate-test: test-shard + test-once; gate-release: build + ui;
   # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
   # exactly as in the gates, because the cache key hashes RUST* env vars and
-  # enable exports RUSTC_WRAPPER. The builds run whether or not sccache is
-  # enabled: the saved target dir is the point.
+  # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
+  # target dir is the point), but are skipped when the exact cache key already
+  # exists (rust-cache would not save) and sccache has nothing to warm.
   cache-warm:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
@@ -643,26 +647,32 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-${{ matrix.profile }}
+          # A lint or test failure on main must not freeze the refresh.
+          cache-on-failure: true
+      # The clippy leg has no sccache: clippy-driver calls are not cacheable
+      # and no gate reads clippy objects from it.
       - name: Enable shared sccache (read-write; no-op without credentials)
         id: sccache
+        if: matrix.profile != 'clippy'
         env:
           SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
           SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - name: Warm the test profile (feature-on, as the shards build it)
-        if: matrix.profile == 'test'
+        if: matrix.profile == 'test' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --no-run --locked --all-targets --features test-seam
       - name: Warm the release profile
-        if: matrix.profile == 'release'
+        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')
         run: cargo build --release --locked
       - name: Warm the clippy profile (not sccache-cacheable; rust-cache only)
-        if: matrix.profile == 'clippy'
+        if: matrix.profile == 'clippy' && steps.cache.outputs.cache-hit != 'true'
         run: |
           cargo clippy --all-targets --locked -- -D warnings
           cargo clippy --all-targets --locked --features test-seam -- -D warnings
@@ -1123,9 +1133,6 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: false
       - run: cargo build --locked
       - run: target/debug/cadence --version
 
