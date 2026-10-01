@@ -1136,7 +1136,7 @@ pub use cadence_agent::adapter::REFUSED_COMMAND as NO_REAL_PROVIDER;
 
 /// Put a provider command back to the refusal when its mock goes away.
 /// Never `remove`: an unset name falls through to the real binary.
-fn refuse_provider(name: &str) {
+pub fn refuse_provider(name: &str) {
     test_env().set(name, NO_REAL_PROVIDER);
 }
 

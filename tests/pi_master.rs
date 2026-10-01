@@ -1345,7 +1345,9 @@ fn status_prompt_probe() {
         Err(e) => panic!("probe could not provision pi login: {e}"),
         _ => {}
     }
-    let env = ProviderEnv::refusing_providers();
+    // CAD-968: the one deliberate exception. This #[ignore]d probe opts in
+    // (CADENCE_PI_PROBE=1) to a real Pi turn, so it must not refuse pi.
+    let env = ProviderEnv::default();
     if let Ok(pm) = std::env::var("CADENCE_PM_DIR") {
         env.set("CADENCE_PM_DIR", pm);
     }

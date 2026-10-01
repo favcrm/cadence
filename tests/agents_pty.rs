@@ -5281,7 +5281,7 @@ fn failed_open_writes_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_agent("w-bad", "attention", 15);
-    test_env().set("CADENCE_CLAUDE_COMMAND", NO_REAL_PROVIDER);
+    refuse_provider("CADENCE_CLAUDE_COMMAND");
 
     assert_eq!(git_porcelain(&repo), "", "failed open touched the repo");
     assert!(!repo.join(".cadence").exists());

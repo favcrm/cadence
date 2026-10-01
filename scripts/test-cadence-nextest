@@ -141,8 +141,9 @@ contains "Usage: cargo nextest run" "$TMP/review-help.out"
 # The fixture workspaces below are not the cadence package, so the repo
 # profile's overrides (which name cadence-agent binaries and fail on a
 # workspace that has none) cannot load there. Run them through a copy of
-# the wrapper rooted at a scratch tree whose profile is the same base
-# settings without those overrides (CAD-968). The wrapper logic under test
+# the wrapper rooted at a scratch tree whose profile keeps only retries=0
+# and fail-fast=false: it omits the overrides, slow-timeout and
+# [test-groups] (CAD-968). The wrapper logic under test
 # (retry neutralisation, the outer flock) is identical in the copy.
 FX="$TMP/fxroot"
 mkdir -p "$FX/scripts" "$FX/.config"

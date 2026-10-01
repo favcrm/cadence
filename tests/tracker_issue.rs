@@ -1114,6 +1114,7 @@ fn run_session_env(
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
+        .envs(test_env().vars())
         .current_dir(cwd);
     for (k, v) in envs {
         cmd.env(k, v);
