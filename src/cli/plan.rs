@@ -58,6 +58,7 @@ pub(crate) enum PlanAction {
     /// repeat and comma-join and match ANY of their values; different
     /// flags AND.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Plan state (proposed approved rejected); repeatable.
         #[arg(long, value_delimiter = ',')]

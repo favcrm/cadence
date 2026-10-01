@@ -60,6 +60,7 @@ pub(crate) enum JobAction {
     /// `--state` selection does too (it names states the default
     /// hides). Repeatable — any of the values.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "ls")]
     List {
         /// draft open done failed cancelled; repeatable — any of them.
         #[arg(long, value_delimiter = ',')]

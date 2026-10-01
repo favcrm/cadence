@@ -111,6 +111,7 @@ pub enum MemoryAction {
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable.
         #[arg(long, value_delimiter = ',')]

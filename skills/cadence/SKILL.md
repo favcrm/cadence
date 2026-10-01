@@ -9,6 +9,27 @@ Cadence is a local Rust controller coordinating coding agents through durable
 message queues and native provider terminals. If you were launched by cadence,
 your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 
+## Command map
+
+`cadence --help` lists the core verbs only, in groups:
+
+- Me: `self`, `inbox`
+- Work: `issue`, `plan`
+- Agents: `send`, `dispatch`, `join`, `agent`
+- Build: `build-slot`, `secret`
+- Fleet: `status`, `doctor`
+- Knowledge: `memory`, `wiki`
+
+Everything else stays callable: `cadence help operator` lists the operator
+and advanced verbs, `cadence help all` lists every verb with its
+subcommands, and `cadence help <verb>` is one verb's own help. Listers
+answer to both `ls` and `list`; `send` takes the recipient positionally or
+as `--to <alias>`.
+
+`issue` is the one public unit of work. A plan is an epic in the
+`proposed` stage; the operator approves it before its tickets dispatch.
+`job`, `delivery` and `monitor` are PM-internal.
+
 ## Who am I
 
 ```bash
