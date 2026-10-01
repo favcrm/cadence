@@ -11,6 +11,57 @@ use std::time::{Duration, Instant};
 use super::write::{new_issue, project_add};
 use super::*;
 
+/// CAD-948: why every test below runs in a process of its own.
+///
+/// `flock(2)` belongs to the open file description, and a `fork` copies
+/// the descriptor table. A thread that spawns a process (any `git`, in
+/// any test, in any module of this binary) while another thread holds
+/// the tracker lock gives the child a copy of that description; the
+/// copy is closed at `exec`, and until then the kernel lock stays held
+/// after the owner dropped its guard. Under load that window is tens of
+/// milliseconds, so "held" appeared right after a release and failed
+/// the "free after drop" assertions, 3 in 4 runs at `--test-threads 8`.
+/// That is a property of flock, not a defect in the lock: the bounded
+/// retry in `acquire` and the blocking wait already tolerate it, and
+/// `a_forked_child_holds_the_lock_until_it_execs` pins it down
+/// deterministically. These tests assert an instant, so they must run
+/// where nobody else forks: each re-executes this binary on exactly one
+/// test (the `lock_helper` pattern) and the child runs the body.
+const QUIET_ENV: &str = "CAD948_QUIET";
+
+fn run_quiet(path: &str, body: fn()) {
+    if std::env::var_os(QUIET_ENV).is_some() {
+        return body();
+    }
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", path, "--test-threads", "1", "--nocapture"])
+        .env(QUIET_ENV, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{path} failed in its own process:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+macro_rules! quiet_tests {
+    ($($name:ident),* $(,)?) => {
+        mod quiet {
+            $(
+                #[test]
+                fn $name() {
+                    super::run_quiet(
+                        concat!("issue::lock_tests::quiet::", stringify!($name)),
+                        super::$name,
+                    );
+                }
+            )*
+        }
+    };
+}
+
 fn tracker() -> (tempfile::TempDir, Pm) {
     let dir = tempfile::tempdir().unwrap();
     let pm = Pm::init(&dir.path().join("pm")).unwrap();
@@ -113,7 +164,6 @@ fn poll_try_lock(pm: &Pm, within: Duration) -> Result<Option<PmLock>> {
     }
 }
 
-#[test]
 fn sigkilled_writer_does_not_block_the_next_writer() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", false);
@@ -129,7 +179,6 @@ fn sigkilled_writer_does_not_block_the_next_writer() {
     assert_eq!(mk(&pm, pm.dir.parent().unwrap(), "after"), "CAD-1");
 }
 
-#[test]
 fn live_detached_setsid_writer_still_blocks() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", true);
@@ -143,7 +192,6 @@ fn live_detached_setsid_writer_still_blocks() {
         .is_some());
 }
 
-#[test]
 fn concurrent_writers_serialize_with_unique_ids() {
     let (tmp, pm) = tracker();
     let ids: Vec<String> = std::thread::scope(|s| {
@@ -165,7 +213,6 @@ fn concurrent_writers_serialize_with_unique_ids() {
     assert_eq!(sorted.len(), 8, "duplicate ids: {ids:?}");
 }
 
-#[test]
 fn try_lock_is_nonblocking_while_held() {
     let (_tmp, pm) = tracker();
     let held = pm.lock().unwrap();
@@ -176,7 +223,6 @@ fn try_lock_is_nonblocking_while_held() {
     assert!(pm.try_lock().unwrap().is_some());
 }
 
-#[test]
 fn a_child_exec_does_not_inherit_the_lock() {
     let (_tmp, pm) = tracker();
     let held = pm.lock().unwrap();
@@ -197,7 +243,6 @@ fn a_child_exec_does_not_inherit_the_lock() {
     assert!(got.is_some(), "an inherited fd kept the lock past release");
 }
 
-#[test]
 fn a_legacy_existence_lock_fails_closed_and_is_left_alone() {
     let (_tmp, pm) = tracker();
     let legacy = pm.dir.join(".write.lock");
@@ -219,7 +264,6 @@ fn a_legacy_existence_lock_fails_closed_and_is_left_alone() {
     assert_eq!(std::fs::read(&legacy).unwrap(), b"");
 }
 
-#[test]
 fn a_new_holder_blocks_a_legacy_style_writer() {
     let (_tmp, pm) = tracker();
     let _held = pm.lock().unwrap();
@@ -231,7 +275,6 @@ fn a_new_holder_blocks_a_legacy_style_writer() {
     assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
 }
 
-#[test]
 fn a_symlinked_coordination_file_fails_closed() {
     let (tmp, pm) = tracker();
     drop(pm.lock().unwrap());
@@ -248,7 +291,6 @@ fn a_symlinked_coordination_file_fails_closed() {
     assert_eq!(std::fs::read(&target).unwrap(), b"x");
 }
 
-#[test]
 fn a_crashed_writers_staged_work_is_refused_not_committed() {
     let (_tmp, pm) = tracker();
     let head = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
@@ -274,7 +316,6 @@ fn a_crashed_writers_staged_work_is_refused_not_committed() {
     assert!(pm.try_lock().unwrap().is_some());
 }
 
-#[test]
 fn a_tripped_lease_stops_a_writer_waiting_for_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
@@ -309,7 +350,6 @@ fn a_tripped_lease_stops_a_writer_waiting_for_the_lock() {
     );
 }
 
-#[test]
 fn lock_state_tells_held_free_legacy_and_io_unknown_apart() {
     let (_tmp, pm) = tracker();
     assert_eq!(pm.lock_state(), LockState::Free);
@@ -328,7 +368,6 @@ fn lock_state_tells_held_free_legacy_and_io_unknown_apart() {
     assert!(matches!(pm.lock_state(), LockState::IoUnknown(_)));
 }
 
-#[test]
 fn a_crash_after_commit_leaves_a_clean_tracker_the_next_writer_reuses() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", false);
@@ -341,7 +380,6 @@ fn a_crash_after_commit_leaves_a_clean_tracker_the_next_writer_reuses() {
     assert!(!pm.dir.join(".write.lock").exists(), "released cleanly");
 }
 
-#[test]
 fn a_waiting_writer_is_admitted_when_the_holder_dies() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", false);
@@ -354,7 +392,6 @@ fn a_waiting_writer_is_admitted_when_the_holder_dies() {
     assert!(got);
 }
 
-#[test]
 fn doctor_reports_the_write_lock_state() {
     let (_tmp, pm) = tracker();
     let r = crate::issue::doctor::run(&pm).unwrap();
@@ -374,7 +411,6 @@ fn mkfifo(path: &Path) {
 
 /// Production always has long-lived foreign untracked files. A crash
 /// must not turn them into "interrupted" state.
-#[test]
 fn a_crash_with_a_preexisting_foreign_file_is_admitted_once_its_own_state_is_resolved() {
     let (_tmp, pm) = tracker();
     std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
@@ -407,7 +443,6 @@ fn a_crash_with_a_preexisting_foreign_file_is_admitted_once_its_own_state_is_res
 }
 
 /// The crashed writer's own untracked leftovers stay refused.
-#[test]
 fn a_crashed_writers_own_untracked_leftovers_are_still_refused() {
     let (_tmp, pm) = tracker();
     std::fs::write(pm.dir.join("foreign.txt"), "x").unwrap();
@@ -423,7 +458,6 @@ fn a_crashed_writers_own_untracked_leftovers_are_still_refused() {
 
 /// Doctor and the write path share one classifier: while every write
 /// is refused, doctor is not ok and names the paths.
-#[test]
 fn doctor_reports_an_interrupted_write_with_the_paths() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold_dirty", false);
@@ -441,7 +475,6 @@ fn doctor_reports_an_interrupted_write_with_the_paths() {
     assert_eq!(r["ok"], false, "{r}");
 }
 
-#[test]
 fn doctor_stays_ok_after_a_crash_that_left_only_foreign_files() {
     let (_tmp, pm) = tracker();
     std::fs::write(pm.dir.join("foreign.txt"), "x").unwrap();
@@ -452,7 +485,6 @@ fn doctor_stays_ok_after_a_crash_that_left_only_foreign_files() {
     assert_eq!(r["write_lock"]["ok"], true, "{r}");
 }
 
-#[test]
 fn doctor_gives_legacy_unknown_a_next_step_that_is_not_deletion() {
     let (_tmp, pm) = tracker();
     std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
@@ -465,7 +497,6 @@ fn doctor_gives_legacy_unknown_a_next_step_that_is_not_deletion() {
     assert!(next.contains("rollout owner"), "{r}");
 }
 
-#[test]
 fn a_pm_dir_without_git_is_a_clear_not_a_repository_refusal() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -487,7 +518,6 @@ fn a_pm_dir_without_git_is_a_clear_not_a_repository_refusal() {
 
 /// `Pm::init` accepts a gitfile tracker (`--separate-git-dir`, a
 /// worktree); it must keep writing.
-#[test]
 fn a_gitfile_tracker_is_supported() {
     let (tmp, pm) = tracker();
     let store = tmp.path().join("gitstore");
@@ -503,7 +533,6 @@ fn a_gitfile_tracker_is_supported() {
 }
 
 /// A delayed guard must not unlink a file a successor created.
-#[test]
 fn a_late_guard_does_not_unlink_a_successors_fence_file() {
     let (_tmp, pm) = tracker();
     let held = pm.lock().unwrap();
@@ -521,7 +550,6 @@ fn a_late_guard_does_not_unlink_a_successors_fence_file() {
     );
 }
 
-#[test]
 fn a_fifo_or_directory_at_the_coordination_path_fails_closed() {
     for kind in ["fifo", "dir"] {
         let (_tmp, pm) = tracker();
@@ -547,7 +575,6 @@ fn a_fifo_or_directory_at_the_coordination_path_fails_closed() {
 
 /// A probe racing a non-waiting `try_lock` must not make it see
 /// "busy" when nobody holds the lock.
-#[test]
 fn a_state_probe_does_not_make_try_lock_spuriously_busy() {
     let (_tmp, pm) = tracker();
     let stop = std::sync::atomic::AtomicBool::new(false);
@@ -573,7 +600,6 @@ fn a_state_probe_does_not_make_try_lock_spuriously_busy() {
 
 /// The temp marker is created exclusively without following links,
 /// and stale ones from a crashed writer are swept under the lock.
-#[test]
 fn the_temp_marker_never_follows_a_symlink_and_stale_ones_are_swept() {
     let (tmp, pm) = tracker();
     let target = tmp.path().join("victim");
@@ -603,7 +629,6 @@ fn the_temp_marker_never_follows_a_symlink_and_stale_ones_are_swept() {
 
 /// `.write.lock` as a FIFO or a symlink is a legacy lock of unknown
 /// owner; classifying it neither blocks nor follows.
-#[test]
 fn a_fifo_or_symlink_at_the_fence_path_is_legacy_unknown_and_never_blocks() {
     for kind in ["fifo", "symlink"] {
         let (tmp, pm) = tracker();
@@ -645,3 +670,78 @@ fn a_legacy_lock_refusal_is_a_gate_and_a_live_writer_is_busy() {
     assert!(legacy.to_string().contains(".write.lock"), "{legacy}");
     assert!(legacy.to_string().contains("rollout owner"), "{legacy}");
 }
+
+/// The cause of the flake, made deterministic: a child that has forked
+/// but not yet exec'd holds a copy of the lock, so the lock outlives its
+/// guard until the child execs; then it is free again.
+fn a_forked_child_holds_the_lock_until_it_execs() {
+    let (_tmp, pm) = tracker();
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+    }
+    let (ready_w, go_r) = (ready[1], go[0]);
+    let held = pm.lock().unwrap();
+    let spawner = std::thread::spawn(move || {
+        let mut cmd = Command::new("true");
+        unsafe {
+            // Async-signal-safe only: tell the parent we forked, then
+            // park before exec until told to go.
+            cmd.pre_exec(move || {
+                let mut b = 1u8;
+                libc::write(ready_w, (&b as *const u8).cast(), 1);
+                libc::read(go_r, (&mut b as *mut u8).cast(), 1);
+                Ok(())
+            });
+        }
+        cmd.status().unwrap()
+    });
+    let mut b = 0u8;
+    assert_eq!(
+        unsafe { libc::read(ready[0], (&mut b as *mut u8).cast(), 1) },
+        1
+    );
+    drop(held);
+    assert_eq!(pm.lock_state(), LockState::Held, "the forked copy holds it");
+    assert!(pm.try_lock().unwrap().is_none());
+    unsafe { libc::write(go[1], (&b as *const u8).cast(), 1) };
+    assert!(spawner.join().unwrap().success());
+    assert_eq!(pm.lock_state(), LockState::Free);
+    assert!(pm.try_lock().unwrap().is_some());
+    unsafe {
+        for fd in [ready[0], ready[1], go[0], go[1]] {
+            libc::close(fd);
+        }
+    }
+}
+
+quiet_tests!(
+    sigkilled_writer_does_not_block_the_next_writer,
+    live_detached_setsid_writer_still_blocks,
+    concurrent_writers_serialize_with_unique_ids,
+    try_lock_is_nonblocking_while_held,
+    a_child_exec_does_not_inherit_the_lock,
+    a_legacy_existence_lock_fails_closed_and_is_left_alone,
+    a_new_holder_blocks_a_legacy_style_writer,
+    a_symlinked_coordination_file_fails_closed,
+    a_crashed_writers_staged_work_is_refused_not_committed,
+    a_tripped_lease_stops_a_writer_waiting_for_the_lock,
+    lock_state_tells_held_free_legacy_and_io_unknown_apart,
+    a_crash_after_commit_leaves_a_clean_tracker_the_next_writer_reuses,
+    a_waiting_writer_is_admitted_when_the_holder_dies,
+    doctor_reports_the_write_lock_state,
+    a_crash_with_a_preexisting_foreign_file_is_admitted_once_its_own_state_is_resolved,
+    a_crashed_writers_own_untracked_leftovers_are_still_refused,
+    doctor_reports_an_interrupted_write_with_the_paths,
+    doctor_stays_ok_after_a_crash_that_left_only_foreign_files,
+    doctor_gives_legacy_unknown_a_next_step_that_is_not_deletion,
+    a_pm_dir_without_git_is_a_clear_not_a_repository_refusal,
+    a_gitfile_tracker_is_supported,
+    a_late_guard_does_not_unlink_a_successors_fence_file,
+    a_fifo_or_directory_at_the_coordination_path_fails_closed,
+    a_state_probe_does_not_make_try_lock_spuriously_busy,
+    the_temp_marker_never_follows_a_symlink_and_stale_ones_are_swept,
+    a_fifo_or_symlink_at_the_fence_path_is_legacy_unknown_and_never_blocks,
+    a_forked_child_holds_the_lock_until_it_execs,
+);
