@@ -702,6 +702,7 @@ impl Store {
         // `check_material` remains a second layer). The workspace comes from
         // the same frozen binding config.
         if let Some(key) = row.media_key {
+            use crate::platform::agenticos_external::publish as device;
             let workspace_id = material["binding"]["config"]["workspace_id"]
                 .as_str()
                 .ok_or_else(|| Error::rejected("reviewed binding names no workspace"))?;
