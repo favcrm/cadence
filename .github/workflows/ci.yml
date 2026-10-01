@@ -190,6 +190,12 @@ jobs:
       # including each declared item and every #[test] fn.
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
+      # CAD-905/CAD-922: the split-map sync tool and the pre-push recipe.
+      - name: Test split-map sync and pre-push recipe
+        run: |
+          scripts/split-map-sync --check
+          python3 tests/scripts/test_split_map_sync.py
+          python3 tests/scripts/test_pre_push.py
       - name: Test shared CI checks remain required and run once
         run: python3 tests/scripts/test_ci_shared_checks.py
 

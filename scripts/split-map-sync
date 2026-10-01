@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""CAD-905: keep tests/split-map*.toml in step with the integration test sources.
+
+The `#[test]` fns in tests/<binary>.rs are the source of truth. Each
+`[binaries.<binary>]` section of tests/split-map.toml and
+tests/split-map-board.toml carries a `tests = [...]` list that
+tests/split_map_inventory.rs requires to equal that file's `#[test]` fns.
+This script derives those lists, so nobody registers a new test by hand.
+
+    scripts/split-map-sync --check   # exit 1 and name file + section to fix
+    scripts/split-map-sync           # write the missing entries, drop stale ones
+
+New names are appended to their section in source order; names whose test
+no longer exists are removed. Nothing else in the manifest is touched (the
+[common] helper lists are not test registrations). Runs in well under a
+second and needs no build. The scanner mirrors `test_fn_names` in
+tests/split_map_inventory.rs, which stays the CI contract.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+MAPS = ("tests/split-map.toml", "tests/split-map-board.toml")
+SECTION_RE = re.compile(r"^\[binaries\.([A-Za-z0-9_]+)\]\s*$")
+TESTS_OPEN_RE = re.compile(r"^tests\s*=\s*\[\s*$")
+ENTRY_RE = re.compile(r'^\s*"([^"]+)",?\s*$')
+FN_PREFIXES = ("fn ", "pub fn ", "async fn ", "pub async fn ")
+
+
+def test_fn_names(src):
+    """`#[test]` fn names in file order (same reading as the Rust guard)."""
+    out, is_test = [], False
+    for line in src.splitlines():
+        t = line.strip()
+        if t.startswith("#[test"):
+            is_test = True
+            continue
+        if t.startswith("#[") or not t:
+            continue
+        if is_test:
+            for prefix in FN_PREFIXES:
+                if t.startswith(prefix):
+                    m = re.match(r"\w+", t[len(prefix):])
+                    if m:
+                        out.append(m.group(0))
+                    break
+        is_test = False
+    return out
+
+
+def find_lists(lines):
+    """Yield (binary, open_idx, close_idx) for every [binaries.X] tests list."""
+    binary = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = SECTION_RE.match(line)
+        if m:
+            binary = m.group(1)
+        elif line.startswith("["):
+            binary = None
+        elif binary and TESTS_OPEN_RE.match(line):
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != "]":
+                j += 1
+            if j == len(lines):
+                raise SystemExit(f"unterminated tests list in [binaries.{binary}]")
+            yield binary, i, j
+            i = j
+        i += 1
+
+
+def sync_map(root, rel, write):
+    """Return the problems found; with `write`, fix the file in place."""
+    path = os.path.join(root, rel)
+    with open(path) as f:
+        text = f.read()
+    lines = text.split("\n")
+    problems, edits = [], []
+    for binary, lo, hi in find_lists(lines):
+        src_path = os.path.join(root, "tests", f"{binary}.rs")
+        if not os.path.exists(src_path):
+            problems.append(
+                f"{rel} [binaries.{binary}]: tests/{binary}.rs does not exist; "
+                f"remove the section or restore the file")
+            continue
+        with open(src_path) as f:
+            want = test_fn_names(f.read())
+        have = [ENTRY_RE.match(l).group(1) for l in lines[lo + 1:hi]
+                if ENTRY_RE.match(l)]
+        missing = [n for n in dict.fromkeys(want) if n not in have]
+        stale = [n for n in have if n not in set(want)]
+        if missing:
+            problems.append(
+                f"{rel} [binaries.{binary}] tests: add " +
+                ", ".join(f'"{n}"' for n in missing))
+        if stale:
+            problems.append(
+                f"{rel} [binaries.{binary}] tests: remove " +
+                ", ".join(f'"{n}"' for n in stale) +
+                f" (no #[test] fn in tests/{binary}.rs)")
+        if missing or stale:
+            edits.append((lo, hi, missing, set(stale)))
+    if write and edits:
+        for lo, hi, missing, stale in reversed(edits):
+            kept = [l for l in lines[lo + 1:hi]
+                    if not (ENTRY_RE.match(l) and ENTRY_RE.match(l).group(1) in stale)]
+            kept += [f'    "{n}",' for n in missing]
+            lines[lo + 1:hi] = kept
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+    return problems
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--check", action="store_true",
+                    help="verify only; exit 1 naming the file and section to edit")
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), help="repo root (default: this checkout)")
+    args = ap.parse_args(argv)
+    problems = []
+    for rel in MAPS:
+        problems += sync_map(args.root, rel, write=not args.check)
+    if args.check:
+        if problems:
+            for p in problems:
+                print(f"split-map out of sync: {p}", file=sys.stderr)
+            print("fix: run scripts/split-map-sync (writes these entries)",
+                  file=sys.stderr)
+            return 1
+        print("split-map in sync")
+        return 0
+    for p in problems:
+        print(f"fixed: {p}")
+    print(f"split-map synced ({len(problems)} change(s))")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

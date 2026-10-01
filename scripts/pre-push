@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""CAD-922: one local command that catches the cheap failures before CI.
+
+    scripts/pre-push              # run every step the diff calls for
+    scripts/pre-push --tests      # also run filtered tests of changed tests/*.rs
+    scripts/pre-push --list       # print the plan, run nothing
+    scripts/pre-push --base REF   # diff base (default origin/main, else main)
+
+Steps run in order and stop at the first failure:
+
+  1. fmt          cargo fmt --all -- --check                 (always)
+  2. split-map    scripts/split-map-sync --check             (always; seconds)
+  3. clippy       cargo clippy --all-targets --locked -- -D warnings, and again with
+                  --features test-seam                       (Rust changed)
+  4. ui typecheck pnpm --dir ui run typecheck                (ui/ changed)
+  5. contracts    the tests/scripts/*.py contracts CI's fmt job runs
+                                                              (scripts/, .github/ or tests/scripts/ changed)
+  6. tests        scripts/cadence-nextest --test <binary> for each changed
+                  top-level tests/*.rs                       (--tests only)
+
+Every step is judged by its exit code alone and gets one summary line. Host
+limits from AGENTS.md apply: CARGO_BUILD_JOBS defaults to 4 and tests run with
+--test-threads 2. This never runs the full suite; CI does that. "Changed" is
+the union of commits since the base, working-tree edits and untracked files;
+if git cannot tell, everything counts as changed.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def git_lines(root, *args):
+    try:
+        r = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return [l for l in r.stdout.splitlines() if l]
+
+
+def default_base(root):
+    for ref in ("origin/main", "main"):
+        if git_lines(root, "rev-parse", "--verify", "--quiet", ref) is not None:
+            return ref
+    return None
+
+
+def changed_files(root, base):
+    """Set of changed paths, or None when git cannot say (treat all as changed)."""
+    if base is None:
+        return None
+    committed = git_lines(root, "diff", "--name-only", f"{base}...HEAD")
+    worktree = git_lines(root, "diff", "--name-only", "HEAD")
+    untracked = git_lines(root, "ls-files", "--others", "--exclude-standard")
+    if committed is None or worktree is None or untracked is None:
+        return None
+    return set(committed) | set(worktree) | set(untracked)
+
+
+def touched(changed, *prefixes):
+    return changed is None or any(p.startswith(prefixes) for p in changed)
+
+
+def rust_changed(changed):
+    if changed is None:
+        return True
+    return any(p.endswith(".rs") or p in ("Cargo.toml", "Cargo.lock", "build.rs")
+               or p.endswith("/Cargo.toml") for p in changed)
+
+
+def contract_scripts(root):
+    """The python contract tests CI's fmt job runs, in workflow order."""
+    try:
+        with open(os.path.join(root, ".github/workflows/ci.yml")) as f:
+            text = f.read()
+    except OSError:
+        return []
+    fmt = text.split("\n  fmt:\n", 1)[-1].split("\n  clippy:\n", 1)[0]
+    seen = []
+    for m in re.finditer(r"python3 (tests/scripts/test_\w+\.py)", fmt):
+        if m.group(1) not in seen and os.path.exists(os.path.join(root, m.group(1))):
+            seen.append(m.group(1))
+    return seen
+
+
+def plan(root, changed, with_tests):
+    """[(name, argv or None, skip reason)] in run order."""
+    rs = rust_changed(changed)
+    steps = [
+        ("fmt", ["cargo", "fmt", "--all", "--", "--check"], None),
+        ("split-map", ["python3", "scripts/split-map-sync", "--check"], None),
+    ]
+    why = None if rs else "no Rust changes"
+    steps.append(("clippy", ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"], why))
+    steps.append(("clippy test-seam", ["cargo", "clippy", "--all-targets", "--locked",
+                                      "--features", "test-seam", "--", "-D", "warnings"], why))
+    ui = touched(changed, "ui/")
+    steps.append(("ui typecheck", ["pnpm", "--dir", "ui", "run", "typecheck"],
+                  None if ui else "ui/ unchanged"))
+    cs = contract_scripts(root)
+    need = touched(changed, "scripts/", ".github/", "tests/scripts/")
+    if not need:
+        steps.append(("contracts", None, "scripts/, .github/, tests/scripts/ unchanged"))
+    elif not cs:
+        steps.append(("contracts", ["false"], None))  # ci.yml unreadable: fail closed
+    else:
+        steps += [(f"contract {os.path.basename(c)}", ["python3", c], None) for c in cs]
+    bins = sorted({p[len("tests/"):-3] for p in (changed or ())
+                   if re.fullmatch(r"tests/[A-Za-z0-9_]+\.rs", p)})
+    if with_tests:
+        if bins:
+            for b in bins:
+                steps.append((f"tests {b}", ["scripts/cadence-nextest", "--test", b,
+                                             "--test-threads", "2"], None))
+        else:
+            steps.append(("tests", None, "no tests/*.rs changed"))
+    else:
+        steps.append(("tests", None, "pass --tests to run changed binaries"))
+    return steps
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--tests", action="store_true",
+                    help="also run filtered tests for changed tests/*.rs binaries")
+    ap.add_argument("--list", action="store_true", help="print the plan and exit")
+    ap.add_argument("--base", help="diff base ref (default origin/main, else main)")
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), help="repo root (default: this checkout)")
+    args = ap.parse_args(argv)
+    root = args.root
+    changed = changed_files(root, args.base or default_base(root))
+    steps = plan(root, changed, args.tests)
+    env = dict(os.environ)
+    env.setdefault("CARGO_BUILD_JOBS", "4")
+
+    ran = skipped = 0
+    for name, argv_, skip in steps:
+        if skip or args.list:
+            label = "SKIP" if skip else "PLAN"
+            print(f"[{label}] {name}: {skip or ' '.join(argv_)}")
+            skipped += bool(skip)
+            continue
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(argv_, cwd=root, env=env, capture_output=True, text=True)
+            rc, out = r.returncode, (r.stdout + r.stderr)
+        except OSError as e:
+            rc, out = 127, f"{argv_[0]}: {e}\n"
+        dt = time.monotonic() - t0
+        if rc == 0:
+            ran += 1
+            print(f"[ OK ] {name} ({dt:.1f}s)")
+            continue
+        print(f"[FAIL] {name}: exit {rc} ({dt:.1f}s): {' '.join(argv_)}")
+        sys.stdout.write("".join(out.splitlines(True)[-40:]))
+        print(f"pre-push: FAILED at {name} ({ran} passed, {skipped} skipped)")
+        return 1
+    if args.list:
+        return 0
+    print(f"pre-push: all ok ({ran} passed, {skipped} skipped)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
