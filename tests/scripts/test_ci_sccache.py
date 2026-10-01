@@ -99,7 +99,10 @@ def assert_rw_gated(case, workflow):
         case.assertEqual(guard_allows(expr, event, ref), (event, ref) in WRITERS,
                          f"cache-warm if for {event} {ref}")
     case.assertRegex(warm, rf"(?m)^    environment: {ENV_NAME}$")
-    case.assertNotRegex(warm, r"(?m)^    (strategy|needs):")
+    # CAD-926: one leg per rust-cache profile is the only strategy allowed.
+    case.assertNotRegex(warm, r"(?m)^    needs:")
+    case.assertIn("      matrix:\n        profile: [test, release, clippy]\n", warm)
+    case.assertEqual(len(re.findall(r"(?m)^    strategy:", warm)), 1)
     case.assertNotRegex(warm, r"merge_group|pull_request")
     # The writer environment is attached to no other job, and no job waits
     # for cache-warm (a skipped or failed warm must never gate anything).
@@ -141,14 +144,17 @@ def assert_no_secret_path_has_no_wrapper(case, workflow):
         body = job_body(workflow, job)
         case.assertEqual(body.count("scripts/ci-sccache enable"), 1, job)
         case.assertEqual(body.count("scripts/ci-sccache stats"), 1, job)
-    # The warm builds run only when the script reports it enabled.
+    # CAD-926: the warm builds fill the saved rust-cache, so they run with or
+    # without sccache; each runs only in its own matrix leg. clippy is not
+    # sccache-cacheable, so only its own leg runs it.
     warm = job_body(workflow, WARM)
     case.assertIn("id: sccache", warm)
-    builds = [st for st in re.split(r"(?m)^      - ", warm) if re.search(r"run: cargo ", st)]
-    case.assertEqual(len(builds), 2)
-    case.assertNotIn("clippy", warm.replace("--component clippy", ""))
+    builds = [st for st in re.split(r"(?m)^      - ", warm) if re.search(r"run: (cargo |\|)", st)]
+    case.assertEqual(len(builds), 3)
     for st in builds:
-        case.assertIn("if: steps.sccache.outputs.enabled == 'true'", st)
+        case.assertRegex(st, r"if: matrix\.profile == '(test|release|clippy)'")
+    case.assertEqual(sum("clippy" in st for st in builds), 1)
+    case.assertIn("matrix.profile == 'clippy'", [b for b in builds if "cargo clippy" in b][0])
     # release-artifact is attested: it never uses the shared cache.
     for job in NO_CACHE_JOBS:
         body = job_body(workflow, job)
@@ -255,8 +261,8 @@ class WorkflowContract(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_no_secret_path_has_no_wrapper(self, mutated)
 
-    def test_warm_builds_without_the_enabled_guard_are_rejected(self):
-        old = "        if: steps.sccache.outputs.enabled == 'true'\n        run: cargo build --release --locked"
+    def test_warm_builds_without_the_profile_guard_are_rejected(self):
+        old = "        if: matrix.profile == 'release' && (steps.cache.outputs.cache-hit != 'true' || steps.sccache.outputs.enabled == 'true')\n        run: cargo build --release --locked"
         self.assertIn(old, self.workflow)
         with self.assertRaises(AssertionError):
             assert_no_secret_path_has_no_wrapper(self, self.workflow.replace(old, "        run: cargo build --release --locked", 1))
