@@ -1446,3 +1446,21 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
     .unwrap();
     assert_eq!(verdict(dir.path()), None);
 }
+
+/// CAD-694: an `already_running` start answer names whichever daemon
+/// held the socket, not the one this restart spawned — it must never
+/// supply the instance the recovery verdict binds to.
+#[test]
+fn started_instance_binds_only_to_a_spawned_daemon() {
+    let health = json!({"instance": "run-x", "pid": 7});
+    assert_eq!(
+        super::started_instance(&json!({"state": "started", "health": health})),
+        Some("run-x".to_string())
+    );
+    assert_eq!(
+        super::started_instance(&json!({"state": "already_running", "health": health})),
+        None
+    );
+    assert_eq!(super::started_instance(&json!({"health": health})), None);
+    assert_eq!(super::started_instance(&json!({"state": "started"})), None);
+}

@@ -1304,7 +1304,13 @@ impl Store {
         conn: &Connection,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
-        let tx = conn.unchecked_transaction()?;
+        // IMMEDIATE: take the write lock up front so `busy_timeout`
+        // waits for it. A deferred transaction upgrades its read lock
+        // on the first write and gets SQLITE_BUSY at once, burning a
+        // retry on contention the lock wait would have absorbed. The
+        // bounded retry stays as the backstop.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
              WHERE state IN ('running','submitting') AND source != 'nudge'",

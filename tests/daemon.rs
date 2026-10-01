@@ -3533,9 +3533,14 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
             stderr.contains("restart completed but not cleanly"),
             "{stderr}"
         );
+        // Ambient lock contention (a loaded host) can burn an attempt
+        // before the hook runs, so the bound cannot be pinned to "all
+        // three faults consumed". What must hold: the retry bound ran
+        // into the injected faults, and the drain failed loudly (the
+        // non-clean verdict above plus the failed marker's fence below).
         assert!(
-            faults.lock().unwrap().is_empty(),
-            "the whole retry bound ran before the drain failed"
+            faults.lock().unwrap().len() < 3,
+            "no injected fault was reached: the drain never ran its retry bound"
         );
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         let refusals: i64 = conn

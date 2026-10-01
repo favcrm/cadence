@@ -2160,7 +2160,7 @@ pub(crate) fn daemon_restart(
     // point can only replace the files, and the record then names a
     // different run than the one we asked for: fail closed, never clean
     // on another run's evidence.
-    let started_instance = started["health"]["instance"].as_str().map(str::to_string);
+    let started_instance = started_instance(&started);
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
     // and `offline` (actor exited under shutdown). Stopped and fenced
@@ -2426,6 +2426,17 @@ struct FencedRowView {
     /// Required for shape completeness; the report lists aliases only.
     #[allow(dead_code)]
     message_id: String,
+}
+
+/// The instance id of the daemon a `daemon start` answer spawned.
+/// Only the `started` branch pid-matches its health answer to the
+/// child it spawned; `already_running` carries whichever daemon held
+/// the socket, so it binds nothing and the verdict fails closed.
+fn started_instance(started: &Value) -> Option<String> {
+    if started["state"].as_str() != Some("started") {
+        return None;
+    }
+    started["health"]["instance"].as_str().map(str::to_string)
 }
 
 /// CAD-694: evaluate the successor daemon's recovery record — drain

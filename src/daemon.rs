@@ -4259,6 +4259,8 @@ pub struct ServeOptions {
 /// shared socket a pass can sleep twice plus the accept poll, so the
 /// loop is silent for ~450ms at worst before it checks `closing`.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
+/// Minimum gap between repeated transient-accept log lines.
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
 /// Earlier setup exits (lease acquire, socket bind, signal hooks) return
@@ -4518,6 +4520,11 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // marker it writes are the next start's adoption evidence.
     let mut serve_error: Option<Error> = None;
     let mut accept_backoff = Duration::ZERO;
+    // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
+    // log the first failure, then at most one line per
+    // ACCEPT_LOG_INTERVAL carrying the count it summarises.
+    let mut accept_log_at: Option<std::time::Instant> = None;
+    let mut accept_suppressed = 0u64;
     while !shared.closing.load(Ordering::SeqCst) && serve_error.is_none() {
         if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
             shared.begin_closing();
@@ -4557,10 +4564,17 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                     accept_backoff = (accept_backoff * 2)
                         .max(Duration::from_millis(5))
                         .min(ACCEPT_BACKOFF_MAX);
-                    eprintln!(
-                        "cadence: listener accept failed ({e}); retrying in {}ms",
-                        accept_backoff.as_millis()
-                    );
+                    if accept_log_at.is_none_or(|at| at.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                        eprintln!(
+                            "cadence: listener accept failed ({e}); retrying in {}ms \
+                             ({accept_suppressed} similar failures not logged)",
+                            accept_backoff.as_millis()
+                        );
+                        accept_log_at = Some(std::time::Instant::now());
+                        accept_suppressed = 0;
+                    } else {
+                        accept_suppressed += 1;
+                    }
                     std::thread::sleep(accept_backoff);
                 }
                 Err(e) => {
@@ -4571,6 +4585,8 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         }
         if accepted {
             accept_backoff = Duration::ZERO;
+            accept_log_at = None;
+            accept_suppressed = 0;
         } else if serve_error.is_none() {
             if let Err(e) = serve::accept_wait::wait_for_connections(&listeners) {
                 serve_error = Some(e.into());
