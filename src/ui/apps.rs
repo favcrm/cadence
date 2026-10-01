@@ -95,7 +95,10 @@ impl<'de> Deserialize<'de> for UploadBody {
                     if files.is_some() {
                         return Err(serde::de::Error::duplicate_field("files"));
                     }
-                    files = Some(read_files_map::<A>(&mut map)?);
+                    // Deserialize the VALUE as the inner {path: text} map —
+                    // `next_value` consumes only this field's value; a nested
+                    // visitor reads its entries with duplicate-path rejection.
+                    files = Some(map.next_value::<FilesMap>()?.0);
                 }
                 let files = files.ok_or_else(|| serde::de::Error::missing_field("files"))?;
                 if files.is_empty() {
@@ -108,78 +111,99 @@ impl<'de> Deserialize<'de> for UploadBody {
     }
 }
 
-/// Read `files`' inner `{path: text}` map with duplicate-path rejection, file
-/// count and per-file byte bounds. Runs during `visit_map` so a duplicate path
-/// fails before the value is committed.
-fn read_files_map<'de, A>(map: &mut A) -> std::result::Result<Vec<(String, String)>, A::Error>
-where
-    A: MapAccess<'de>,
-{
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut files: Vec<(String, String)> = Vec::new();
-    while let Some((key, value)) = map.next_entry::<String, String>()? {
-        if !seen.insert(key.clone()) {
-            return Err(serde::de::Error::custom(format!("duplicate path '{key}'")));
+/// The inner `{path: text}` map as a value — its own `Deserialize` so the
+/// outer visitor can `next_value::<FilesMap>()`. Duplicate inner path keys are
+/// rejected here (a `Value`/derived map would silently keep the last one and
+/// still stage a bundle), and per-file/count bounds apply during the read.
+struct FilesMap(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for FilesMap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilesVisitor;
+        impl<'de> Visitor<'de> for FilesVisitor {
+            type Value = FilesMap;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of bundle path to UTF-8 text")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<FilesMap, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut files: Vec<(String, String)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!("duplicate path '{key}'")));
+                    }
+                    if value.len() as u64 > UPLOAD_FILE_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "file '{key}' is over the {UPLOAD_FILE_BYTES}-byte per-file cap"
+                        )));
+                    }
+                    files.push((key, value));
+                    if files.len() > UPLOAD_MAX_FILES {
+                        return Err(serde::de::Error::custom(format!(
+                            "bundle exceeds the {UPLOAD_MAX_FILES}-file cap"
+                        )));
+                    }
+                }
+                Ok(FilesMap(files))
+            }
         }
-        if value.len() as u64 > UPLOAD_FILE_BYTES {
-            return Err(serde::de::Error::custom(format!(
-                "file '{key}' is over the {UPLOAD_FILE_BYTES}-byte per-file cap"
-            )));
-        }
-        files.push((key, value));
-        if files.len() > UPLOAD_MAX_FILES {
-            return Err(serde::de::Error::custom(format!(
-                "bundle exceeds the {UPLOAD_MAX_FILES}-file cap"
-            )));
-        }
+        deserializer.deserialize_map(FilesVisitor)
     }
-    Ok(files)
 }
 
-/// One uploaded relative path is admitted only if it names a flat bundle
-/// entry the installer allows: `app.md`, `workflows/<tag>.md`, or a leaf in
-/// `rubrics/`/`templates/`. Rejects `..`, leading `/`, `.`-segments, dotfiles
-/// and any other top-level entry — `snapshot`/`validate_texts` re-check this
-/// daemon-side, but the schema refuses bad keys before any byte is staged.
+/// A leaf file name is a visible flat name — non-empty, ASCII, no `.`-lead
+/// (dotfile), no `..`, no embedded `\`/`\0`. `seg` is already a single raw
+/// segment (the caller split on literal `/`). `workflows/` leaves additionally
+/// need a `valid_tag` `.md` stem — the same rule the installer's `snapshot`
+/// enforces, so an upload cannot stage a workflow the validator would reject.
+fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
+    if seg.is_empty()
+        || !seg.is_ascii()
+        || seg.starts_with('.')
+        || seg == ".."
+        || seg.contains('\\')
+        || seg.contains('\0')
+    {
+        return false;
+    }
+    if need_md_tag {
+        seg.ends_with(".md") && crate::issue::model::valid_tag(seg.trim_end_matches(".md"))
+    } else {
+        true
+    }
+}
+
+/// One uploaded path is admitted only by an EXACT lexical grammar — we split
+/// on literal `/` and never normalize. `Path::components` folds `a//b`,
+/// `a/./b` and `a/../b` together, which would let two distinct raw JSON keys
+/// alias the same staged file and defeat duplicate detection; this grammar
+/// refuses them instead. Admitted shapes (the only flat entries the bundle
+/// allows):
+///   `app.md`                          (exactly)
+///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
+///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
+/// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
+/// any other top-level name are refused. `snapshot`/`validate_texts` re-check
+/// daemon-side; this schema refuses bad keys before a single byte is staged.
 fn upload_path_ok(path: &str) -> bool {
-    if path.is_empty() || !path.is_ascii() {
+    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
         return false;
     }
-    let rel = std::path::Path::new(path);
-    if rel.is_absolute() {
+    let segs: Vec<&str> = path.split('/').collect();
+    // Any empty segment means a doubled, leading or trailing slash.
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
         return false;
     }
-    // Only Normal components — rejects `..`, `.`, prefixes and separators that
-    // are not a forward slash between two names.
-    let mut parts = rel.components();
-    let top = match parts.next() {
-        Some(std::path::Component::Normal(n)) => n,
-        _ => return false,
-    };
-    let leaf = parts.next();
-    if parts.next().is_some() {
-        return false; // deeper than one level
-    }
-    let leaf_is = |allowed_dotfile: bool, need_md: bool| -> bool {
-        match leaf {
-            Some(std::path::Component::Normal(n)) => {
-                let s = n.to_string_lossy();
-                if !allowed_dotfile && s.starts_with('.') {
-                    return false;
-                }
-                if need_md {
-                    s.ends_with(".md") && crate::issue::model::valid_tag(s.trim_end_matches(".md"))
-                } else {
-                    !s.is_empty() && !s.contains('\\')
-                }
-            }
-            _ => false,
-        }
-    };
-    match top.to_str() {
-        Some("app.md") => leaf.is_none(),
-        Some("workflows") => leaf_is(false, true),
-        Some("rubrics") | Some("templates") => leaf_is(false, false),
+    match segs.as_slice() {
+        ["app.md"] => true,
+        ["workflows", leaf] => leaf_ok(leaf, true),
+        ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
         _ => false,
     }
 }
@@ -232,7 +256,25 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
                 return err_response(500, &format!("staging mkdir failed: {e}"));
             }
         }
-        if let Err(e) = std::fs::write(&dest, text) {
+        // Refuse to follow a pre-existing or symlinked staging target: the
+        // strict raw-key grammar already makes every `path` unique, so an
+        // existing `dest` (or a planted link) is a defect/attack, never an
+        // overwrite. `create_new(true)` is O_EXCL and `O_NOFOLLOW` refuses a
+        // symlinked leaf at open — no TOCTOU between check and write.
+        if dest.symlink_metadata().is_ok() {
+            return err_response(400, &format!("staging path '{path}' collides"));
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW);
+        }
+        let wrote = open
+            .open(&dest)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        if let Err(e) = wrote {
             return err_response(500, &format!("staging write failed: {e}"));
         }
     }
