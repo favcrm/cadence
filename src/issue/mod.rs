@@ -6,6 +6,7 @@
 //! daemon socket.
 
 pub mod app;
+pub mod app_binding;
 pub mod app_catalog;
 pub mod app_view;
 pub mod areas;

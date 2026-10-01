@@ -86,6 +86,48 @@ impl Workspace {
         .unwrap();
         text.replace("\"app\": \"crm\"", "\"app\": \"blog-post\"")
     }
+    /// CAD-867: write an `app-bindings/v1` companion into the source
+    /// bundle and declare it in the manifest (`needs.bindings.contract`).
+    /// The binding is the contracts crate's CRM example with `app`
+    /// rebound — real CustomerProfile projections, not a stub.
+    fn write_binding(&self, binding: &str, declare: bool) {
+        let dir = self.source().join("bindings");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app-bindings-v1.json"), binding).unwrap();
+        if declare {
+            let manifest = self.source().join("app.md");
+            let text = std::fs::read_to_string(&manifest).unwrap();
+            assert!(
+                !text.contains("bindings:"),
+                "source manifest already declares bindings"
+            );
+            // The declaration must sit under `needs:` beside any views
+            // declaration — insert after the views block when present.
+            let anchor = if text.contains("  views:") {
+                "  views:\n    contract: app-views/v1"
+            } else {
+                "  connections: [publish]"
+            };
+            std::fs::write(
+                &manifest,
+                text.replace(
+                    anchor,
+                    &format!("{anchor}\n  bindings:\n    contract: app-bindings/v1"),
+                ),
+            )
+            .unwrap();
+        }
+    }
+    /// The binding bytes a companion-bearing source carries: the CRM
+    /// binding example with `app` rebound to `blog-post`.
+    fn binding_text() -> String {
+        let text = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/app-bindings/v1/examples/crm.json"),
+        )
+        .unwrap();
+        text.replace("\"app\": \"crm\"", "\"app\": \"blog-post\"")
+    }
     fn show(&self, id: &str) -> Value {
         self.daemon
             .operator_rpc("app_workspace_show", json!({"install_id": id}))
@@ -2231,4 +2273,354 @@ fn cad864_descriptor_read_stays_operator_only_and_installation_bound() {
         &session.request("GET", &format!("/api/app-installations/{fake}"), ""),
     );
     assert!(code >= 400, "unknown installation read served: {code}");
+}
+
+/* ------------------------------------------------------------------ */
+/* CAD-867: the app-bindings/v1 companion contract seam.               */
+/*                                                                     */
+/* A bundle carrying `needs.bindings.contract` +                       */
+/* `bindings/app-bindings-v1.json` installs only when the file parses, */
+/* its `app` matches the manifest's, every bound view/field is one the */
+/* SAME bundle's descriptor declares, and every mapping is honest      */
+/* about the produced shape. Undeclared/orphaned bindings, forged      */
+/* authority keys, tampered installed bytes and descriptor-less        */
+/* bindings all refuse before any journal/pending write. The verified  */
+/* receipt serves `view_binding` + `view_binding_digest` from the same */
+/* snapshot as the descriptor — never a stale pair.                    */
+/* ------------------------------------------------------------------ */
+
+/// A descriptor+binding bundle installs and the receipt serves both
+/// validated documents plus their digests — descriptor and binding
+/// come from the same verified snapshot, bound by `app` and view ids.
+#[test]
+fn cad867_descriptor_and_binding_install_and_ride_the_verified_receipt() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding(&Workspace::binding_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let shown = w.show(&id);
+    // Both documents ride the receipt together.
+    let descriptor = &shown["view_descriptor"];
+    let binding = &shown["view_binding"];
+    assert_eq!(descriptor["contract"], "app-views/v1");
+    assert_eq!(binding["contract"], "app-bindings/v1");
+    assert_eq!(binding["app"], "blog-post");
+    assert!(binding["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["view"] == "customers" && b["source"] == "customers"));
+    for key in ["view_descriptor_digest", "view_binding_digest"] {
+        assert!(shown[key].as_str().unwrap().starts_with("sha256:"));
+    }
+    assert_eq!(shown["digest"], installed["digest"]);
+    assert!(shown["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("bindings/app-bindings-v1.json")));
+}
+
+/// A descriptor-only `app-views/v1` bundle still installs byte-identical
+/// — the companion is optional, never required, and the receipt's
+/// binding fields stay null.
+#[test]
+fn cad867_descriptor_only_package_still_installs_unchanged() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let shown = w.show(&id);
+    assert_eq!(shown["view_descriptor"]["contract"], "app-views/v1");
+    assert_eq!(shown["view_binding"], Value::Null);
+    assert_eq!(shown["view_binding_digest"], Value::Null);
+}
+
+/// The binding file and its declaration pair up exactly like the
+/// descriptor's: either alone refuses before any catalog write.
+#[test]
+fn cad867_binding_declaration_file_pairing_is_exact() {
+    // Declared without the file.
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "  views:\n    contract: app-views/v1",
+            "  views:\n    contract: app-views/v1\n  bindings:\n    contract: app-bindings/v1",
+        ),
+    )
+    .unwrap();
+    let head = w.head();
+    assert!(
+        w.install().is_err(),
+        "declared bindings with no binding file installed"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+
+    // File present but undeclared.
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding(&Workspace::binding_text(), false);
+    let head = w.head();
+    assert!(w.install().is_err(), "undeclared binding file installed");
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+}
+
+/// A binding requires its descriptor: `needs.bindings` without
+/// `needs.views` refuses — the companion can never stand alone.
+#[test]
+fn cad867_binding_requires_its_descriptor() {
+    let w = Workspace::new();
+    w.write_binding(&Workspace::binding_text(), true);
+    let m = w.source().join("app.md");
+    let mtext = std::fs::read_to_string(&m).unwrap();
+    assert!(mtext.contains("bindings:"), "write_binding must declare");
+    assert!(
+        !mtext.contains("views:"),
+        "this bundle must not declare views"
+    );
+    let head = w.head();
+    assert!(
+        w.install().is_err(),
+        "needs.bindings without needs.views installed"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+}
+
+/// Malformed, forbidden-key, undeclared-view/field and forged
+/// cross-reference bindings all refuse install before publication.
+#[test]
+fn cad867_malformed_and_forged_bindings_refuse_before_install() {
+    let good = Workspace::binding_text();
+    let cases: Vec<String> = vec![
+        "not json".to_string(),
+        good.replace("\"app-bindings/v1\"", "\"app-bindings/v2\""),
+        good.replace("\"app\": \"blog-post\"", "\"app\": \"other\""),
+        // Forbidden authority/invocation keys at root and nested.
+        good.replace("\"title\":", "\"install_id\": \"forged\", \"title\":"),
+        good.replace(
+            "\"view\": \"customers\"",
+            "\"view\": \"customers\", \"method\": \"app_record_delete\"",
+        ),
+        good.replace(
+            "\"field\": \"name\", \"key\": \"display_name\"",
+            "\"field\": \"name\", \"key\": \"display_name\", \"token\": \"x\"",
+        ),
+        // Undeclared view id the descriptor never declared.
+        good.replace("\"view\": \"customers\"", "\"view\": \"ghosts\""),
+        // A bound form view — disabled previews can never be bound.
+        good.replace(
+            "\"view\": \"customer-detail\"",
+            "\"view\": \"customer-form\"",
+        ),
+        // A field the view does not declare.
+        good.replace("\"field\": \"tags\"", "\"field\": \"ghost\""),
+        // A key outside the source's reviewed projection.
+        good.replace("\"key\": \"email\"", "\"key\": \"password\""),
+        // Format lying about the descriptor's declared format.
+        good.replace(
+            "\"field\": \"tags\", \"key\": \"tags\", \"format\": \"tags\"",
+            "\"field\": \"tags\", \"key\": \"tags\", \"format\": \"number\"",
+        ),
+        // Unknown source name.
+        good.replace("\"source\": \"customers\"", "\"source\": \"orders\""),
+        // An op the view kind cannot use (detail cannot list).
+        good.replace(
+            "\"view\": \"customer-detail\",\n      \"source\": \"customers\",\n      \"ops\": [\"show\"]",
+            "\"view\": \"customer-detail\",\n      \"source\": \"customers\",\n      \"ops\": [\"list\"]",
+        ),
+    ];
+    for (i, binding) in cases.into_iter().enumerate() {
+        let w = Workspace::new();
+        w.write_descriptor(&Workspace::descriptor_text(), true);
+        w.write_binding(&binding, true);
+        let head = w.head();
+        let err = w.install().expect_err(&format!("case {i} must refuse"));
+        let _ = err;
+        assert_eq!(w.head(), head, "case {i} moved HEAD on refusal");
+        assert!(
+            !w.pm.dir.join(".apps").exists(),
+            "case {i} published catalog state on refusal"
+        );
+    }
+}
+
+/// Binding bytes are identity: a byte change moves the bundle digest,
+/// the upgraded receipt serves the new pair from one snapshot, and a
+/// stale pre-change digest can never upgrade again.
+#[test]
+fn cad867_binding_bytes_are_identity_and_upgrade_pinned() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding(&Workspace::binding_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let old_digest = installed["digest"].as_str().unwrap().to_string();
+    let generation = installed["catalog_generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Change one label inside the binding (still valid) + version bump.
+    let file = w.source().join("bindings/app-bindings-v1.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("\"CRM bindings — customers\"", "\"CRM bindings v2\""),
+    )
+    .unwrap();
+    let manifest = w.source().join("app.md");
+    let mtext = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, mtext.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+    let proposed = w.upgrade_check(&installed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    assert_ne!(new_digest, old_digest);
+    assert!(proposed["structural_diff"]["changed"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("bindings/app-bindings-v1.json")));
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id": id, "source": w.source(),
+                "expected_digest": old_digest, "expected_generation": generation,
+                "expected_new_digest": new_digest, "request_id": "bind-upgrade"}),
+        )
+        .unwrap();
+    assert_eq!(upgraded["digest"], json!(new_digest));
+    let shown = w.show(&id);
+    assert_eq!(shown["view_binding"]["title"], json!("CRM bindings v2"));
+    // Stale pre-change digest can never upgrade again.
+    assert!(w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id": id, "source": w.source(),
+                "expected_digest": old_digest, "expected_generation": generation,
+                "expected_new_digest": new_digest, "request_id": "bind-stale"}),
+        )
+        .is_err());
+}
+
+/// Tampered installed bytes refuse on read: a hand-edited installed
+/// binding, a dropped declaration or a descriptor/binding that no
+/// longer pair all fail `describe` rather than serve stale bytes.
+#[test]
+fn cad867_tampered_installed_binding_refuses_on_readback() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding(&Workspace::binding_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let bundle =
+        w.pm.dir
+            .join(".apps/installations")
+            .join(&id)
+            .join("bundle");
+    // Tamper the installed binding's key — readback must refuse.
+    let bfile = bundle.join("bindings/app-bindings-v1.json");
+    let original = std::fs::read_to_string(&bfile).unwrap();
+    std::fs::write(&bfile, original.replace("display_name", "password")).unwrap();
+    assert!(
+        w.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id": id}))
+            .is_err(),
+        "tampered installed binding served"
+    );
+    std::fs::write(&bfile, &original).unwrap();
+    // Drop the manifest's bindings declaration — undeclared file refuses.
+    let mfile = bundle.join("app.md");
+    let mtext = std::fs::read_to_string(&mfile).unwrap();
+    std::fs::write(
+        &mfile,
+        mtext.replace("  bindings:\n    contract: app-bindings/v1\n", ""),
+    )
+    .unwrap();
+    assert!(
+        w.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id": id}))
+            .is_err(),
+        "undeclared installed binding served"
+    );
+    std::fs::write(&mfile, &mtext).unwrap();
+}
+
+/// The binding receipt is served only over the operator gate — an agent
+/// caller and an agent-peered HTTP read both refuse; the binding never
+/// names its own scope, actor, or installation.
+#[test]
+fn cad867_binding_read_stays_operator_only_and_installation_bound() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    w.write_binding(&Workspace::binding_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "bind-reader", "claude", None, lane.pid());
+    for forged in [
+        json!({"install_id": id}),
+        json!({"install_id": id, "actor": "operator"}),
+    ] {
+        let frame = lane.rpc(&w.daemon.state, "app_workspace_show", forged);
+        assert_eq!(frame["ok"], false, "agent read binding receipt: {frame}");
+    }
+    let lease = test_port();
+    let port = lease.port;
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let path = format!("/api/app-installations/{id}");
+    let (code, _, body) = common::op::raw(port, &session.request("GET", &path, ""));
+    assert_eq!(code, 200, "operator binding read: {body}");
+    let row: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(row["view_binding"]["app"], json!("blog-post"));
+    for prefix in ["", "setsid "] {
+        let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+        let wire = stolen.request_as("GET", &path, "", "");
+        let request_file = lane.dir.path().join(format!("bind-http-{}.txt", lane.seq));
+        std::fs::write(&request_file, wire).unwrap();
+        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}", request_file.display()));
+        assert_eq!(rc, 0);
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("403"),
+            "agent-peered HTTP binding read reached {path}: {response}"
+        );
+    }
 }

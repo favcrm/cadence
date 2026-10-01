@@ -1,0 +1,26 @@
+{
+  "contract": "app-bindings/v1",
+  "app": "crm",
+  "title": "CRM bindings — customers",
+  "bindings": [
+    {
+      "view": "customers",
+      "source": "customers",
+      "ops": ["list"],
+      "fields": [
+        { "field": "name", "key": "display_name", "format": "text" },
+        { "field": "email", "key": "email", "format": "text" },
+        { "field": "tags", "key": "tags", "format": "tags" }
+      ]
+    },
+    {
+      "view": "customer-detail",
+      "source": "customers",
+      "ops": ["show"],
+      "fields": [
+        { "field": "name", "key": "display_name", "format": "text" },
+        { "field": "email", "key": "email", "format": "text" }
+      ]
+    }
+  ]
+}

@@ -2,10 +2,13 @@
 //! one kind of work — `app.md` (frontmatter `app`, `title`, `version`,
 //! `needs.connections: [<slot>…]`; the body is the guide agents read),
 //! `workflows/*.md` (the same plan templates CAD-487 ships), optional
-//! flat `rubrics/` and `templates/` dirs, and — CAD-864 — an optional
+//! flat `rubrics/` and `templates/` dirs, — CAD-864 — an optional
 //! `views/app-views-v1.json` data-only view descriptor declared by
-//! `needs.views.contract`. `records`, `actions`, `ui`, `settings` stay
-//! gated for later stages.
+//! `needs.views.contract`, and — CAD-867 — an optional
+//! `bindings/app-bindings-v1.json` companion declared by
+//! `needs.bindings.contract` that maps descriptor views onto closed
+//! host read sources (the companion requires the descriptor it maps).
+//! `records`, `actions`, `ui`, `settings` stay gated for later stages.
 //!
 //! `cadence app install <path|git-url> --project <key>` copies a
 //! verified bundle to `<pm>/<project>/apps/<name>/` and writes the
@@ -48,7 +51,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::parse;
-use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
+use crate::issue::{app_binding, app_view, board, plan, project, workflow, write, Pm};
 
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
@@ -73,8 +76,12 @@ const GATED_KEYS: &[&str] = &["records", "actions", "ui", "settings", "actors"];
 /// The only directories an app folder may carry at top level.
 /// `views/` (CAD-864) holds exactly one file —
 /// `views/app-views-v1.json`, the app-views/v1 descriptor — and only
-/// when `app.md` declares `needs.views.contract` for it.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "views"];
+/// when `app.md` declares `needs.views.contract` for it. `bindings/`
+/// (CAD-867) likewise holds exactly `bindings/app-bindings-v1.json`,
+/// the app-bindings/v1 companion that maps descriptor views onto host
+/// read sources — declared by `needs.bindings.contract`, and admitted
+/// only when the descriptor it maps is itself declared and present.
+const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "views", "bindings"];
 
 /// Largest single file in a bundle — workflows render to plans, so the
 /// plan cap applies; the same bound keeps every other file small.
@@ -104,6 +111,11 @@ pub struct Manifest {
     /// when the manifest declared it; the file and declaration pair up
     /// at `validate`/`validate_texts` (either alone refuses).
     pub view_contract: Option<String>,
+    /// CAD-867: `needs.bindings.contract` — the companion contract
+    /// this bundle's `bindings/app-bindings-v1.json` declares. A
+    /// binding file asks the host to serve live verified data through
+    /// descriptor views; it requires the descriptor it maps.
+    pub binding_contract: Option<String>,
     pub guide: String,
 }
 
@@ -377,6 +389,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let mut connections = Vec::new();
     let mut capabilities = BTreeMap::new();
     let mut view_contract: Option<String> = None;
+    let mut binding_contract: Option<String> = None;
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
             return Err(Error::rejected(
@@ -385,10 +398,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities" | "views") {
+            if !matches!(k, "connections" | "capabilities" | "views" | "bindings") {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
-                     `needs.capabilities`, `needs.views`"
+                     `needs.capabilities`, `needs.views`, `needs.bindings`"
                 )));
             }
         }
@@ -413,6 +426,34 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                     return Err(Error::rejected(
                         "app.md `needs.views.contract` is exactly `app-views/v1` — \
                          the contract the bundle's `views/app-views-v1.json` declares",
+                    ));
+                }
+            }
+        }
+        // CAD-867: the bindings companion pairs its declaration and file
+        // exactly like `needs.views` — `contract: app-bindings/v1` is the
+        // only key and the only value; anything else refuses.
+        if let Some(value) = needs.get(serde_yaml::Value::String("bindings".into())) {
+            let serde_yaml::Value::Mapping(bindings) = value else {
+                return Err(Error::rejected(
+                    "app.md `needs.bindings` is a mapping — `contract: app-bindings/v1`",
+                ));
+            };
+            for key in bindings.keys() {
+                if key.as_str() != Some("contract") {
+                    return Err(Error::rejected(
+                        "app.md `needs.bindings` knows only `contract`",
+                    ));
+                }
+            }
+            match bindings.get(serde_yaml::Value::String("contract".into())) {
+                Some(serde_yaml::Value::String(c)) if c == app_binding::CONTRACT => {
+                    binding_contract = Some(app_binding::CONTRACT.to_string());
+                }
+                _ => {
+                    return Err(Error::rejected(
+                        "app.md `needs.bindings.contract` is exactly `app-bindings/v1` — \
+                         the contract the bundle's `bindings/app-bindings-v1.json` declares",
                     ));
                 }
             }
@@ -476,6 +517,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         capabilities,
         summary,
         view_contract,
+        binding_contract,
         guide: body.to_string(),
     })
 }
@@ -613,6 +655,13 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                 return Err(entry_err(
                     &format!("{top}/{name}"),
                     "views/ holds exactly app-views-v1.json",
+                ));
+            }
+            if top == "bindings" && name != app_binding::FILE {
+                // Same pinning for the CAD-867 companion contract.
+                return Err(entry_err(
+                    &format!("{top}/{name}"),
+                    "bindings/ holds exactly app-bindings-v1.json",
                 ));
             }
             files.push((format!("{top}/{name}"), entry.path()));
@@ -770,6 +819,7 @@ fn validate_contents(
                     capabilities: BTreeMap::new(),
                     summary: None,
                     view_contract: None,
+                    binding_contract: None,
                     guide: String::new(),
                 }
             }
@@ -782,6 +832,7 @@ fn validate_contents(
             capabilities: BTreeMap::new(),
             summary: None,
             view_contract: None,
+            binding_contract: None,
             guide: String::new(),
         },
     };
@@ -796,9 +847,15 @@ fn validate_contents(
         .iter()
         .find(|(rel, _)| rel == app_view::REL_PATH)
         .map(|(_, text)| text.as_str());
+    // The parsed descriptor the bindings cross-check needs — kept from
+    // the same file bytes the pairing below just proved, never a
+    // second read.
+    let mut parsed_descriptor: Option<app_view::Descriptor> = None;
     match (manifest.view_contract.as_deref(), descriptor_file) {
         (Some(app_view::CONTRACT), Some(text)) => match app_view::parse_descriptor(text) {
-            Ok(descriptor) if descriptor.app == manifest.app => {}
+            Ok(descriptor) if descriptor.app == manifest.app => {
+                parsed_descriptor = Some(descriptor);
+            }
             Ok(descriptor) => errors.push(format!(
                 "{}: descriptor `app` is '{}' — it must be this bundle's '{}'",
                 app_view::REL_PATH,
@@ -819,6 +876,53 @@ fn validate_contents(
         )),
         (None, None) => {}
         // An unknown contract value already failed `parse_manifest`.
+        (Some(_), Some(_)) => {}
+    }
+    // CAD-867: `needs.bindings.contract` and `bindings/app-bindings-v1.json`
+    // pair up exactly like the descriptor — either alone refuses. On top
+    // of the pairing, the binding file requires the descriptor it maps:
+    // `needs.bindings` without `needs.views`, or a binding file with no
+    // descriptor, can never install. The binding is then validated
+    // against THIS bundle's manifest and parsed descriptor — unknown
+    // view/field ids, wrong op for the view kind, a bound `form` view,
+    // a format the produced value cannot fill, or a mismatched `app`
+    // all refuse.
+    let binding_file = files
+        .iter()
+        .find(|(rel, _)| rel == app_binding::REL_PATH)
+        .map(|(_, text)| text.as_str());
+    match (manifest.binding_contract.as_deref(), binding_file) {
+        (Some(app_binding::CONTRACT), Some(text)) => {
+            if manifest.view_contract.is_none() {
+                errors.push(format!(
+                    "app.md declares `needs.bindings` but not `needs.views` — a \
+                     bindings companion requires the descriptor it maps"
+                ));
+            }
+            match app_binding::parse_binding(text) {
+                Ok(binding) => {
+                    if let Err(e) = app_binding::validate_against(
+                        &binding,
+                        &manifest,
+                        parsed_descriptor.as_ref(),
+                    ) {
+                        errors.push(format!("{}: {e}", app_binding::REL_PATH));
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {e}", app_binding::REL_PATH)),
+            }
+        }
+        (Some(_), None) => errors.push(format!(
+            "app.md declares `needs.bindings` but the bundle carries no {} — the \
+             declaration and the binding file install together or not at all",
+            app_binding::REL_PATH
+        )),
+        (None, Some(_)) => errors.push(format!(
+            "{} is present but app.md never declares `needs.bindings.contract` — an \
+             undeclared binding file can never install",
+            app_binding::REL_PATH
+        )),
+        (None, None) => {}
         (Some(_), Some(_)) => {}
     }
     let mut notes = Vec::new();

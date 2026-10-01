@@ -50,17 +50,25 @@ cadence app catalog show <install-id>
 ```
 
 The source must be an A1 bundle: `app.md`, checked workflow Markdown under
-`workflows/`, and supported optional `rubrics/`, `templates/` and `views/`
-files. `views/` may carry exactly one file — `views/app-views-v1.json`, a
-data-only [app-views/v1](../../contracts/app-views/v1/README.md) descriptor —
-and only when `app.md` declares it with `needs.views.contract: app-views/v1`.
-The declaration and the file pair up: either alone refuses install, and the
-descriptor's `app` must be the bundle's own `app` name. Descriptor bytes are
+`workflows/`, and supported optional `rubrics/`, `templates/`, `views/` and
+`bindings/` files. `views/` may carry exactly one file —
+`views/app-views-v1.json`, a data-only
+[app-views/v1](../../contracts/app-views/v1/README.md) descriptor — and only
+when `app.md` declares it with `needs.views.contract: app-views/v1`.
+`bindings/` (CAD-867) may likewise carry exactly `bindings/app-bindings-v1.json`,
+the data-only [app-bindings/v1](../../contracts/app-bindings/v1/README.md)
+companion that maps descriptor views onto closed host read sources — only when
+`app.md` declares `needs.bindings.contract: app-bindings/v1`, and only when the
+bundle also declares and ships its `app-views/v1` descriptor. Declarations and
+files pair up: either alone refuses install, and the descriptor's, binding's
+and manifest's `app` names must all match. Descriptor and binding bytes are
 inside the installed bundle's digest, so a byte change re-gates approval like
 any other structural change; the verified `app catalog show` receipt serves
-the validated descriptor as `view_descriptor` (plus `view_descriptor_digest`),
-or `null` on bundles without one. Descriptors are declarations only — they do
-not render live data or carry actions. See the existing
+the validated descriptor as `view_descriptor` (plus
+`view_descriptor_digest`) and, when a companion ships, `view_binding` plus
+`view_binding_digest` — re-parsed from the same installed snapshot on every
+read. Descriptors and bindings are declarations only — they do not render
+live data or carry actions. See the existing
 [Blog post bundle](../../apps/blog-post/app.md) and
 [Social Content bundle](../../apps/social-content/app.md).
 
