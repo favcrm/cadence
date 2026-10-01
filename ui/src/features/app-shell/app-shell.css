@@ -298,6 +298,20 @@
   min-width: 0;
 }
 
+/* Narrow toolbar actions (CAD-910 token refinement): below the 720px
+   form breakpoint toolbar buttons keep the board's 44px narrow-context
+   tap target — the same 2.75rem floor `.section-nav-link` and
+   checkpoint links already use — with label-size text. `min-height`
+   grows the fixed-height `.btn`/`.btn-sm` box without touching its
+   inline-flex centring; at ≥720px the Button sm/md contract is
+   unchanged and no nav/chat button is affected. */
+@media (width < 720px) {
+  .crm-toolbar .btn {
+    min-height: 2.75rem;
+    font-size: var(--text-label);
+  }
+}
+
 .crm-search {
   flex: 1 1 14rem;
   min-width: 0;
@@ -344,7 +358,9 @@
 .crm-table th,
 .crm-table td {
   text-align: left;
-  padding: 0.55rem 0.75rem;
+  /* Equal block/inline padding (12px scale): rows breathe enough to
+     scan without losing the compact density (CAD-910). */
+  padding: 0.75rem;
   border-bottom: 1px solid var(--color-ink-700);
   vertical-align: top;
   /* Long unbreakable tokens (emails, digests) wrap instead of
@@ -354,10 +370,22 @@
 }
 
 .crm-table thead th {
-  font-size: var(--text-micro);
+  /* Label-size caps at secondary weight: readable at table density,
+     a step quieter than the body text below them (CAD-910). */
+  font-size: var(--text-label);
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
+  /* A header band one step below the wrap surface separates the
+     column labels from the first row. */
+  background: var(--color-ink-875);
+}
+
+/* Quiet row tint for scanning; hover adds ink only — no pointer
+   cursor, no click affordance (CAD-910). */
+.crm-table tbody tr:hover {
+  background: var(--color-ink-875);
 }
 
 .crm-table tbody tr:last-child th,
@@ -375,7 +403,9 @@
 
 .crm-field {
   display: grid;
-  gap: 0.3rem;
+  /* Same gap as the shared .sfield owner below so a hand-rolled
+     .crm-field block and a real Field land identically (CAD-910). */
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -624,7 +654,10 @@
    the field/table/detail/state chrome now lives here once. */
 .sfield {
   display: grid;
-  gap: 0.3rem;
+  /* Label/hint/error sit as one unit (8px spacing scale); control
+     heights, rows-driven textareas and required/error/readonly
+     semantics are untouched (CAD-910). */
+  gap: 0.5rem;
   min-width: 0;
 }
 
@@ -636,8 +669,18 @@
   max-width: 100%;
 }
 
-.sfield-hint {
+.sfield-label {
+  /* Mid weight lifts the label above its hint without reaching the
+     semibold reserved for selected tabs/headings (CAD-910). */
+  font-weight: 500;
+}
+
+/* Shared hint typography overrides the compact utilities emitted by Field. */
+p.sfield-hint {
   margin: 0;
+  font-size: var(--text-label);
+  line-height: 1.5;
+  color: var(--color-ink-400);
 }
 
 .sfield-error {
@@ -672,7 +715,9 @@
 .stable th,
 .stable td {
   text-align: left;
-  padding: 0.55rem 0.75rem;
+  /* Same 12px block/inline padding as .crm-table: both owners read
+     identically wherever DataTable or a bare table renders (CAD-910). */
+  padding: 0.75rem;
   border-bottom: 1px solid var(--color-ink-700);
   vertical-align: top;
   /* Long unbreakable tokens wrap; horizontal scrolling stays inside
@@ -681,10 +726,16 @@
 }
 
 .stable thead th {
-  font-size: var(--text-micro);
+  font-size: var(--text-label);
+  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-ink-500);
+  color: var(--color-ink-400);
+  background: var(--color-ink-875);
+}
+
+.stable tbody tr:hover {
+  background: var(--color-ink-875);
 }
 
 .stable tbody tr:last-child td,
