@@ -167,15 +167,34 @@ fn text(value: &Value) -> bool {
             && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')
     })
 }
-// Display-only strings (labels, cost text, aliases) are free Unicode such as
-// the live catalog's U+00B7 separator; control characters stay refused.
+// Display-only strings (labels, cost text, aliases) accept Unicode such as
+// the live catalog's U+00B7 separator. Refused: control characters,
+// U+2028/2029 line/paragraph separators, and bidi overrides (U+202A-202E,
+// U+2066-2069). Still at most 512 bytes. (CAD-992)
+fn is_display_char(c: char) -> bool {
+    if c.is_control() {
+        return false;
+    }
+    !matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
 fn display(value: &Value) -> bool {
     value
         .as_str()
-        .is_some_and(|t| !t.is_empty() && t.len() <= 512 && t.chars().all(|c| !c.is_control()))
+        .is_some_and(|t| !t.is_empty() && t.len() <= 512 && t.chars().all(is_display_char))
 }
 fn optional_display(value: &Value, key: &str) -> bool {
     value.get(key).is_none_or(|v| v.is_null() || display(v))
+}
+/// Wire `description`: same display charset, still at most 4096 bytes.
+/// Empty is allowed; the charset excludes controls and bidi overrides
+/// (previously only NUL was rejected). (CAD-992)
+fn description_text(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| s.len() <= 4096 && s.chars().all(is_display_char))
 }
 fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     let mut value = serde_json::from_slice::<UniqueValue>(bytes)
@@ -235,11 +254,9 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
                 || !display(&variant["label"])
                 || !optional_display(variant, "cost_summary")
                 || !optional_display(variant, "cost_tier")
-                || !variant.get("description").is_none_or(|v| {
-                    v.is_null()
-                        || v.as_str()
-                            .is_some_and(|s| s.len() <= 4096 && !s.contains('\0'))
-                })
+                || !variant
+                    .get("description")
+                    .is_none_or(|v| v.is_null() || description_text(v))
                 || !["max_context_tokens", "max_output_tokens"]
                     .iter()
                     .all(|key| {
@@ -325,10 +342,40 @@ fn install_snapshot(dir: &File, temporary: &str, model: &str, now: u64) -> Resul
     dir.sync_all()?;
     Ok(())
 }
+/// Replace a stale invalid private snapshot with validated operator bytes
+/// already staged at `temporary` (0600, O_EXCL). A concurrent fix that is
+/// now valid wins and is kept; only a still-invalid snapshot is replaced
+/// via atomic rename (which replaces a regular file in place, never
+/// following a symlink). Missing target renames into place as a move.
+fn replace_invalid_snapshot(dir: &File, temporary: &str, model: &str, now: u64) -> Result<()> {
+    if let Some(current) = read(dir, "models.json")? {
+        if usable_private_snapshot(&current, model, now).is_ok() {
+            return Ok(());
+        }
+    }
+    let temporary = cname(temporary)?;
+    let target = cname("models.json")?;
+    if unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            temporary.as_ptr(),
+            dir.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } < 0
+    {
+        return Err(refusal());
+    }
+    usable_private_snapshot(&read(dir, "models.json")?.ok_or_else(refusal)?, model, now)?;
+    dir.sync_all()?;
+    Ok(())
+}
 
 /// Seed before spawning, never exposing the operator cache to the worker.
-/// Existing valid private snapshots win. Offline freshness is deliberately
-/// fail-closed at six hours; neither seeding nor reuse renews fetchedAt.
+/// Existing valid private snapshots win without touching the operator file.
+/// A stale invalid snapshot does not block forever: it is re-seeded from a
+/// valid operator file. Offline freshness is deliberately fail-closed at six
+/// hours; neither seeding nor reuse renews fetchedAt.
 pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result<()> {
     let cache = directory(cache)?;
     let name = cname("pi-devin")?;
@@ -341,9 +388,18 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
     if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } < 0 {
         return Err(refusal());
     }
-    if let Some(bytes) = read(&dir, "models.json")? {
-        return usable_private_snapshot(&bytes, model, now);
-    }
+    let had_invalid = match read(&dir, "models.json")? {
+        Some(bytes) => {
+            if usable_private_snapshot(&bytes, model, now).is_ok() {
+                return Ok(());
+            }
+            // Invalid stale snapshot: fall through to re-seed from the
+            // operator file. Valid snapshots win above and never touch the
+            // operator file.
+            true
+        }
+        None => false,
+    };
     let parent = directory(source.parent().ok_or_else(refusal)?)?;
     let bytes = read(
         &parent,
@@ -366,9 +422,15 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
         .map_err(|_| refusal())?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        // Atomic no-clobber install. Reread winners using the same private
-        // usability predicate as startup's existing-cache path.
-        install_snapshot(&dir, &temporary, model, now)
+        if had_invalid {
+            // Stale invalid snapshot: a now-valid concurrent fix wins and
+            // is kept; otherwise atomically replace the stale file.
+            replace_invalid_snapshot(&dir, &temporary, model, now)
+        } else {
+            // Atomic no-clobber install. Reread winners using the same
+            // private usability predicate as startup's existing-cache path.
+            install_snapshot(&dir, &temporary, model, now)
+        }
     })();
     unsafe {
         libc::unlinkat(dir.as_raw_fd(), temporary_c.as_ptr(), 0);
@@ -592,18 +654,100 @@ mod tests {
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
     }
     #[test]
-    fn refuses_symlinked_ancestor_and_existing_invalid_private_cache() {
+    fn refuses_symlinked_ancestor() {
         let (dir, source, cache) = fixture();
         let alias = dir.path().join("cache-alias");
         std::os::unix::fs::symlink(&cache, &alias).unwrap();
         assert!(seed(&alias, &source, "devin/swe-2-high", NOW).is_err());
+    }
+    #[test]
+    fn invalid_stale_private_snapshot_reseeds_from_valid_operator() {
+        let (_dir, source, cache) = fixture();
         std::fs::create_dir(cache.join("pi-devin")).unwrap();
         std::fs::write(cache.join("pi-devin/models.json"), b"invalid").unwrap();
+        // CAD-992: a stale invalid snapshot must not block forever — a valid
+        // operator file re-seeds and replaces it.
+        seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(cache.join("pi-devin/models.json")).unwrap()
+            )
+            .unwrap(),
+            catalog()
+        );
+        // The re-seeded valid snapshot now wins without the operator file.
+        std::fs::remove_file(&source).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
+    }
+    #[test]
+    fn invalid_stale_private_with_invalid_operator_still_refuses() {
+        let (_dir, source, cache) = fixture();
+        std::fs::create_dir(cache.join("pi-devin")).unwrap();
+        std::fs::write(cache.join("pi-devin/models.json"), b"invalid").unwrap();
+        let mut bad = catalog();
+        bad["version"] = json!(2);
+        std::fs::write(&source, bad.to_string()).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
         assert_eq!(
             std::fs::read(cache.join("pi-devin/models.json")).unwrap(),
             b"invalid"
         );
+    }
+    #[test]
+    fn real_shaped_cost_summary_with_middle_dot_passes() {
+        let (_dir, source, cache) = fixture();
+        let mut doc = catalog();
+        // Real-shaped entry mirroring ~/.cache/pi-devin/models.json:
+        // cost_summary carries U+00B7 MIDDLE DOT separators.
+        doc["catalog"]["families"][0]["variants"][0]["cost_summary"] =
+            json!("$0.5 / 1M Input \u{00b7} $0.1 / 1M Cached input \u{00b7} $2 / 1M Output");
+        doc["catalog"]["families"][0]["variants"][0]["description"] =
+            json!("Automatically balances quality and cost");
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(cache.join("pi-devin/models.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved, doc);
+    }
+    #[test]
+    fn control_and_bidi_overrides_in_display_are_refused() {
+        for bad in [
+            "cost \u{0000} summary",
+            "cost\nsummary",
+            "cost\u{007f}summary",
+            "cost\u{2028}summary",
+            "cost\u{2029}summary",
+            "cost\u{202A}summary",
+            "cost\u{202E}summary",
+            "cost\u{2066}summary",
+            "cost\u{2069}summary",
+        ] {
+            let (_dir, source, cache) = fixture();
+            let mut doc = catalog();
+            doc["catalog"]["families"][0]["variants"][0]["cost_summary"] = json!(bad);
+            std::fs::write(&source, doc.to_string()).unwrap();
+            assert!(
+                seed(&cache, &source, "devin/swe-2-high", NOW).is_err(),
+                "accepted {bad:?}"
+            );
+            assert!(!cache.join("pi-devin/models.json").exists());
+        }
+        // Same guards apply to label and description.
+        for (key, bad) in [
+            ("label", "x\u{202E}y"),
+            ("description", "x\u{0000}y"),
+            ("description", "x\u{2066}y"),
+        ] {
+            let (_dir, source, cache) = fixture();
+            let mut doc = catalog();
+            doc["catalog"]["families"][0]["variants"][0][key] = json!(bad);
+            std::fs::write(&source, doc.to_string()).unwrap();
+            assert!(
+                seed(&cache, &source, "devin/swe-2-high", NOW).is_err(),
+                "accepted {key} {bad:?}"
+            );
+        }
     }
 
     #[test]
