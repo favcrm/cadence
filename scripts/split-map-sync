@@ -21,6 +21,7 @@ import argparse
 import os
 import re
 import sys
+import tomllib
 
 MAPS = ("tests/split-map.toml", "tests/split-map-board.toml")
 SECTION_RE = re.compile(r"^\[binaries\.([A-Za-z0-9_]+)\]\s*$")
@@ -50,6 +51,10 @@ def test_fn_names(src):
     return out
 
 
+class Unsupported(Exception):
+    """The manifest has a shape the line editor will not touch (exit 2)."""
+
+
 def find_lists(lines):
     """Yield (binary, open_idx, close_idx) for every [binaries.X] tests list."""
     binary = None
@@ -64,9 +69,15 @@ def find_lists(lines):
         elif binary and TESTS_OPEN_RE.match(line):
             j = i + 1
             while j < len(lines) and lines[j].strip() != "]":
+                if lines[j].startswith("[") or not (
+                        ENTRY_RE.match(lines[j]) or not lines[j].strip()):
+                    raise Unsupported(
+                        f"[binaries.{binary}] tests line {j + 1} is not one quoted "
+                        f"entry per line (no comments, no several entries, no "
+                        f'closing `"x"]`): {lines[j].strip()[:60]!r}')
                 j += 1
             if j == len(lines):
-                raise SystemExit(f"unterminated tests list in [binaries.{binary}]")
+                raise Unsupported(f"unterminated tests list in [binaries.{binary}]")
             yield binary, i, j
             i = j
         i += 1
@@ -79,7 +90,19 @@ def sync_map(root, rel, write):
         text = f.read()
     lines = text.split("\n")
     problems, edits = [], []
-    for binary, lo, hi in find_lists(lines):
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise Unsupported(f"{rel} does not parse: {e}")
+    declared = {b: sec["tests"] for b, sec in doc.get("binaries", {}).items()
+                if isinstance(sec, dict) and "tests" in sec}
+    located = list(find_lists(lines))
+    for b in declared:
+        if b not in {x[0] for x in located}:
+            raise Unsupported(
+                f"{rel} [binaries.{b}] tests is not a multi-line list with one "
+                f"quoted entry per line; reformat it that way")
+    for binary, lo, hi in located:
         src_path = os.path.join(root, "tests", f"{binary}.rs")
         if not os.path.exists(src_path):
             problems.append(
@@ -90,6 +113,10 @@ def sync_map(root, rel, write):
             want = test_fn_names(f.read())
         have = [ENTRY_RE.match(l).group(1) for l in lines[lo + 1:hi]
                 if ENTRY_RE.match(l)]
+        if have != declared[binary]:
+            raise Unsupported(
+                f"{rel} [binaries.{binary}] tests: line scan disagrees with TOML "
+                f"({len(have)} vs {len(declared[binary])} entries); fix by hand")
         missing = [n for n in dict.fromkeys(want) if n not in have]
         stale = [n for n in have if n not in set(want)]
         if missing:
@@ -122,8 +149,12 @@ def main(argv=None):
         os.path.abspath(__file__))), help="repo root (default: this checkout)")
     args = ap.parse_args(argv)
     problems = []
-    for rel in MAPS:
-        problems += sync_map(args.root, rel, write=not args.check)
+    try:
+        for rel in MAPS:
+            problems += sync_map(args.root, rel, write=not args.check)
+    except Unsupported as e:
+        print(f"split-map-sync: cannot handle manifest: {e}", file=sys.stderr)
+        return 2
     if args.check:
         if problems:
             for p in problems:

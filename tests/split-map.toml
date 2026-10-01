@@ -225,7 +225,11 @@ helpers = [
 ]
 
 [binaries.idea_pipeline]
-tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children", "board_idea_decisions_bind_the_shown_issue_and_decide", "board_idea_decision_records_tailscale_actor"]
+tests = [
+    "idea_pipeline_stops_at_the_gate_and_approval_creates_children",
+    "board_idea_decisions_bind_the_shown_issue_and_decide",
+    "board_idea_decision_records_tailscale_actor",
+]
 
 [binaries.daemon]
 tests = [

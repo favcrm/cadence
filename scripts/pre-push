@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 
 
 def git_lines(root, *args):
@@ -83,9 +84,20 @@ def contract_scripts(root):
     fmt = text.split("\n  fmt:\n", 1)[-1].split("\n  clippy:\n", 1)[0]
     seen = []
     for m in re.finditer(r"python3 (tests/scripts/test_\w+\.py)", fmt):
-        if m.group(1) not in seen and os.path.exists(os.path.join(root, m.group(1))):
+        if m.group(1) not in seen:  # a missing file fails its step
             seen.append(m.group(1))
     return seen
+
+
+def required_features(root):
+    """{test target: required-features} from Cargo.toml [[test]] tables."""
+    try:
+        with open(os.path.join(root, "Cargo.toml"), "rb") as f:
+            doc = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return {t["name"]: set(t.get("required-features", []))
+            for t in doc.get("test", []) if "name" in t}
 
 
 def plan(root, changed, with_tests):
@@ -110,17 +122,27 @@ def plan(root, changed, with_tests):
         steps.append(("contracts", ["false"], None))  # ci.yml unreadable: fail closed
     else:
         steps += [(f"contract {os.path.basename(c)}", ["python3", c], None) for c in cs]
-    bins = sorted({p[len("tests/"):-3] for p in (changed or ())
-                   if re.fullmatch(r"tests/[A-Za-z0-9_]+\.rs", p)})
-    if with_tests:
-        if bins:
-            for b in bins:
-                steps.append((f"tests {b}", ["scripts/cadence-nextest", "--test", b,
-                                             "--test-threads", "2"], None))
-        else:
-            steps.append(("tests", None, "no tests/*.rs changed"))
-    else:
+    if not with_tests:
         steps.append(("tests", None, "pass --tests to run changed binaries"))
+    elif changed is None:
+        steps.append(("tests", None, "unknown changes: cannot pick binaries"))
+    else:
+        bins = sorted({p[len("tests/"):-3] for p in changed
+                       if re.fullmatch(r"tests/[A-Za-z0-9_]+\.rs", p)})
+        needs = required_features(root)
+        for b in bins:
+            if not os.path.exists(os.path.join(root, "tests", b + ".rs")):
+                steps.append((f"tests {b}", None, "file deleted or renamed"))
+            elif needs.get(b, set()) - {"test-seam"}:
+                steps.append((f"tests {b}", None, "needs features CI builds separately: "
+                              + ",".join(sorted(needs[b] - {"test-seam"}))))
+            else:
+                # Same build shape as scripts/ci-rust-tests.py.
+                steps.append((f"tests {b}", ["scripts/cadence-nextest", "--test", b,
+                                             "--locked", "--features", "test-seam",
+                                             "--test-threads", "2"], None))
+        if not bins:
+            steps.append(("tests", None, "no tests/*.rs changed"))
     return steps
 
 

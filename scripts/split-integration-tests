@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""CAD-426: deterministic split of tests/integration.rs into per-area binaries.
+"""RETIRED (CAD-905): never edit this script or its PINNED tables; they are not run
+and their source file is gone. tests/split-map.toml is the only live list, kept
+by scripts/split-map-sync.
+
+CAD-426: deterministic split of tests/integration.rs into per-area binaries.
 
 Reads tests/integration.rs and writes:
 

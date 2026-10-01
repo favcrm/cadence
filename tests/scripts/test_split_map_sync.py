@@ -118,6 +118,40 @@ class SplitMapSync(unittest.TestCase):
         self.assertIn("tests/split-map-board.toml", r.stderr)
         self.assertIn("[binaries.board_x]", r.stderr)
 
+    def put_map(self, body):
+        (self.root / "tests/split-map.toml").write_text(MAP.split("[binaries.foo]")[0] + body)
+
+    def test_single_line_list_fails_closed_naming_the_section(self):
+        self.put_map('[binaries.foo]\ntests = ["alpha", "beta"]\n')
+        for args in (("--check",), ()):
+            r = run(self.root, *args)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("[binaries.foo]", r.stderr)
+
+    def test_several_entries_on_a_line_fail_closed(self):
+        self.put_map('[binaries.foo]\ntests = [\n    "alpha", "beta",\n]\n')
+        r = run(self.root, "--check")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("[binaries.foo]", r.stderr)
+
+    def test_trailing_comment_fails_closed(self):
+        self.put_map('[binaries.foo]\ntests = [\n    "alpha", # why\n    "beta",\n]\n')
+        self.assertEqual(run(self.root, "--check").returncode, 2)
+
+    def test_malformed_close_does_not_run_into_next_section(self):
+        self.put_map('[binaries.foo]\ntests = [\n    "alpha",\n    "beta"]\n\n'
+                     '[binaries.bar]\ntests = [\n    "gamma",\n]\n')
+        before = (self.root / "tests/split-map.toml").read_text()
+        for args in (("--check",), ()):
+            r = run(self.root, *args)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("[binaries.foo]", r.stderr)
+        self.assertEqual((self.root / "tests/split-map.toml").read_text(), before)
+
+    def test_unparseable_manifest_fails_closed(self):
+        self.put_map('[binaries.foo\n')
+        self.assertEqual(run(self.root, "--check").returncode, 2)
+
     def test_repo_manifests_are_in_sync(self):
         r = run(ROOT, "--check")
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -152,12 +152,39 @@ class PrePush(unittest.TestCase):
         self.edit("tests/foo.rs", "#[test]\nfn alpha() {}\n// touched\n")
         r = self.pp("--tests")
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertIn("cadence-nextest --test foo --test-threads 2 [jobs=4]", self.calls())
+        self.assertIn("cadence-nextest --test foo --locked --features test-seam "
+                      "--test-threads 2 [jobs=4]", self.calls())
         # Without the flag the binary is not run.
         self.log.unlink()
         r = self.pp()
         self.assertFalse(any("cadence-nextest" in c for c in self.calls()))
         self.assertIn("pass --tests", r.stdout)
+
+    def test_tests_flag_skips_feature_gated_deleted_and_unknown(self):
+        self.edit("Cargo.toml", '[[test]]\nname = "gated"\npath = "tests/gated.rs"\n'
+                  'required-features = ["e2e"]\n')
+        self.edit("tests/gated.rs", "#[test]\nfn g() {}\n")
+        (self.repo / "tests/foo.rs").unlink()
+        self.edit("tests/split-map.toml", "[common]\nhelpers = []\n")
+        r = self.pp("--tests")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("[SKIP] tests gated: needs features CI builds separately: e2e", r.stdout)
+        self.assertIn("[SKIP] tests foo: file deleted or renamed", r.stdout)
+        self.assertFalse(any("cadence-nextest" in c for c in self.calls()))
+
+    def test_tests_flag_with_unknown_changes_is_not_no_tests_changed(self):
+        r = subprocess.run([sys.executable, str(ROOT / "scripts/pre-push"), "--root",
+                            str(self.repo), "--base", "nope", "--tests", "--list"],
+                           capture_output=True, text=True)
+        self.assertIn("[SKIP] tests: unknown changes", r.stdout)
+        self.assertNotIn("no tests/*.rs changed", r.stdout)
+
+    def test_contract_listed_in_ci_but_missing_fails(self):
+        self.edit("scripts/foo.py", "x = 1\n")
+        (self.repo / "tests/scripts/test_fake_contract.py").unlink()
+        r = self.pp()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("[FAIL] contract test_fake_contract.py", r.stdout)
 
     def test_list_runs_nothing(self):
         self.edit("src/lib.rs", "pub fn x() {}\n")
