@@ -958,12 +958,13 @@ impl Drop for TestDaemon {
         if let Err(e) =
             client::rpc_timeout(&self.state, "shutdown", json!({}), SHUTDOWN_RPC_TIMEOUT)
         {
-            if e.to_string().contains("caller rule") {
-                // Signal before the fallback: if it panics during an
-                // unwind the daemon is already told to stop.
-                if let Some(stop) = &self.stop {
-                    stop.store(true, Ordering::SeqCst);
-                }
+            // An in-process daemon (it has a stop flag, CAD-471) ends
+            // through `stop_and_join` below: the accept loop leaves
+            // within ~50 ms and a queued operator-helper connection
+            // would be reset, so the fallback would panic "never
+            // answered" inside Drop. Only a `daemon run` process has no
+            // flag and needs the operator's `shutdown`.
+            if self.stop.is_none() && e.to_string().contains("caller rule") {
                 let _ = self.operator_rpc("shutdown", json!({}));
             }
         }

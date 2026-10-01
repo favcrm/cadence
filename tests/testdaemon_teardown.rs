@@ -177,23 +177,75 @@ fn a_daemon_that_accepts_but_never_answers_does_not_hold_the_fixture() {
     assert!(text.contains("did not become healthy within"), "{text}");
 }
 
-/// The real daemon, given no time to start: whatever interleaving the
-/// start loses or wins, the teardown ends with a CLEAN join (a detach
-/// would panic TEARDOWN WEDGED, which fails this test).
+/// The real daemon, given no time to start. The start usually panics
+/// and `Drop` then runs during the unwind, where a wedge only detaches
+/// (no second panic). So the check is on time: a detach waits the whole
+/// injected join deadline, a clean join comes in well under it.
 #[test]
 fn real_daemon_start_that_gives_up_early_tears_down() {
+    const DEADLINE: Duration = Duration::from_secs(20);
+    let policy = Teardown {
+        join_deadline: DEADLINE,
+        ..Teardown::DEFAULT
+    };
     for _ in 0..5 {
-        let done = within(Duration::from_secs(90), || {
-            catch_unwind(AssertUnwindSafe(|| {
-                TestDaemon::start_opts_waiting(daemon_opts(), Duration::ZERO)
-            }))
+        let (done, took) = within(Duration::from_secs(90), move || {
+            let begin = Instant::now();
+            let done = with_teardown(policy, || {
+                catch_unwind(AssertUnwindSafe(|| {
+                    TestDaemon::start_opts_waiting(daemon_opts(), Duration::ZERO)
+                }))
+            });
+            (done, begin.elapsed())
         })
         .expect("real-daemon teardown hung past the outer bound");
+        assert!(
+            took < DEADLINE,
+            "teardown waited out the join deadline: {took:?}"
+        );
         if let Err(e) = done {
             let text = panic_text(e);
             assert!(text.contains("did not become healthy"), "{text}");
         }
     }
+}
+
+/// An in-process daemon whose `shutdown` the caller rule refuses (an
+/// agent pane) must still tear down quickly through its stop flag: the
+/// operator-helper fallback is for `daemon run` processes only. Without
+/// the skip, Drop runs the detached helper against a daemon that is
+/// leaving and panics "never answered" after ~20 s.
+#[test]
+fn caller_rule_refused_shutdown_does_not_run_the_operator_fallback() {
+    use std::io::{BufRead, BufReader, Write};
+    let begin = Instant::now();
+    within(Duration::from_secs(60), || {
+        let d = TestDaemon::start_stub_thread(Duration::from_secs(5), |state, stop| {
+            let l = UnixListener::bind(state.join("cadence.sock"))?;
+            l.set_nonblocking(true)?;
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok((mut c, _)) = l.accept() {
+                    let mut line = String::new();
+                    let _ = BufReader::new(&c).read_line(&mut line);
+                    let reply = if line.contains("health") {
+                        r#"{"ok":true,"result":{}}"#
+                    } else {
+                        r#"{"ok":false,"error":{"kind":"rejected","message":"refused by the caller rule"}}"#
+                    };
+                    let _ = writeln!(c, "{reply}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        });
+        drop(d);
+    })
+    .expect("Drop hung or panicked (operator fallback?) within the outer bound");
+    assert!(
+        begin.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        begin.elapsed()
+    );
 }
 
 /// A daemon that ignores stop must FAIL its owning test with
