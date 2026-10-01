@@ -1,0 +1,43 @@
+# CAD-957: the ALLOWLIST of paths whose PRs need ONE independent review
+# (standards + spec). Read by AGENTS.md "Review" and by scripts (CAD-959).
+# Changing this file is class `human` (risk-classes.md trigger 7).
+#
+# Match semantics (a script must implement exactly this):
+# - Diff source: `git diff --raw -z --no-renames <merge-base> <head>` (two-dot).
+# - Every entry must have status A or M. Any other status disqualifies the PR.
+#   Both modes (old and new) must be 100644 or 100755 (absent side of an A is
+#   fine); any other mode (symlink 120000, submodule 160000) or any mode change
+#   disqualifies.
+# - Every path must match at least one `one_review_include` glob and no
+#   `one_review_exclude` glob. Exclude wins.
+# - Matching is case-sensitive and byte-exact, with no normalisation. A path
+#   that starts with `./`, contains `..` or contains a backslash disqualifies.
+# - Globs are repo-root-relative with `/` separators. `*` matches zero or
+#   more non-`/` characters. `**` as a whole segment matches zero or more
+#   whole segments. `?` and `[` are literal. No other wildcards.
+# - An empty diff, an unreadable or malformed TOML file disqualifies.
+# A disqualified PR keeps two reviews. `human` triggers apply on top.
+#
+# Tests (tests/*.rs, src/**/tests.rs, tests/scripts/**, fixtures, split maps)
+# are NOT listed: they can hold adversarial gate tests or decide what CI runs.
+one_review_include = [
+  "docs/guides/**",
+  "docs/ui/**",
+]
+# Redundant with the allowlist on purpose: these stay two-review even if an
+# include glob is ever widened.
+one_review_exclude = [
+  "tests/scripts/**",
+  "tests/split-map*.toml",
+  "tests/split_map_inventory.rs",
+  "tests/shard-weights.json",
+  "tests/fixtures/**",
+  "docs/cadence/**",
+  "docs/AUDIT.md",
+  "docs/design/**",
+  "docs/roles/**",
+  "docs/TEAM.md",
+  "docs/CHARTER.md",
+  "AGENTS.md",
+  ".gitignore",
+]
