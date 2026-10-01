@@ -302,6 +302,34 @@ async function main() {
   assert(listCalls.length === callsBefore + 1, "token change re-reads intents (one extra list call)");
   assert(text().includes("Posted") && !text().includes("Queued"), "refreshed status shown, no stale queued");
 
+  // cap-history honesty: raw=100 is a truncated subset, so an intent-free
+  // run's plan state is UNKNOWN, never 'Unplanned'/'no publish intent'.
+  listResult = Array.from({ length: 99 }, (_, i) => intent({ intent_id: `x-${i}`, run_id: `foreign-${i}`, context_id: "other-ctx", install_id: INSTALL }))
+    .concat([intent({ intent_id: "cap-pad", run_id: "foreign-x", context_id: "other-ctx", install_id: INSTALL })]); // raw=100
+  await render({ contextId: "ctx-a", runs: [run("run-own", "ctx-a")], effects: [] });
+  assert(text().includes("Schedule unknown") || text().includes("Not in returned history"), `at-cap intent-free run reads unknown, got: ${text().slice(0, 200)}`);
+  assert(!text().includes("No publish intent — no planned date") && !dayEls().some((d) => d.querySelector("strong")?.textContent === "Unplanned"), "never labels an at-cap intent-free run 'Unplanned'");
+
+  // cap-filtered-empty: 100 returned, all filtered out → must NOT claim empty.
+  listResult = Array.from({ length: 100 }, (_, i) => intent({ intent_id: `fx-${i}`, run_id: `foreign-${i}`, context_id: "other-ctx", install_id: INSTALL }));
+  await render({ contextId: "ctx-a", runs: [], effects: [] });
+  assert(!text().includes("No posts are planned"), "cap-filtered-empty never claims empty schedule");
+  assert(text().includes("incomplete") || text().includes("unknown"), "bounded-history honesty shown");
+
+  // genuine raw<100 intent-free run still labels Unplanned (unchanged).
+  listResult = [];
+  await render({ contextId: "ctx-a", runs: [run("run-solo", "ctx-a")], effects: [] });
+  assert(dayEls().some((d) => d.querySelector("strong")?.textContent === "Unplanned"), "complete reply → real Unplanned retained");
+
+  // held intent suffix is state-aware: reason verbatim, never 'refused'.
+  listResult = [intent({ intent_id: "i-held", state: "held", refusal: { code: "", message: "Reconnect requires human" } })];
+  await render({ contextId: "", runs: [run("run-a", null)], effects: [effect("eff-a", "run-a", null)] });
+  assert(text().includes("needs human") && text().includes("Reconnect requires human"), `held shows reason, got: ${text()}`);
+  assert(!/refused/i.test(text()), "held is never labelled refused");
+  listResult = [intent({ intent_id: "i-ref", state: "refused", refusal: { code: "bad_grant", message: "x" } })];
+  await render({ contextId: "", runs: [run("run-a", null)], effects: [effect("eff-a", "run-a", null)] });
+  assert(text().includes("bad_grant"), "refused keeps its refusal code");
+
   console.log("scheduleCalendar QA: PASS");
 }
 

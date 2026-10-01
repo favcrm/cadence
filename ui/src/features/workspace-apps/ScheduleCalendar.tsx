@@ -89,8 +89,15 @@ interface Projection {
   malformed: MalformedPlan[];
   /** intent_ids withheld because a second row reused them (conflict). */
   conflictingIds: string[];
-  /** in-scope runs that carry no valid matching intent → Unplanned. */
+  /** in-scope runs with no matching RETURNED intent. Under a full (raw < cap)
+   *  reply these are genuinely Unplanned; under a truncated (raw >= cap) reply
+   *  an omitted older intent may exist, so they are "schedule unknown" — see
+   *  `unplannedDefinite`. */
   unplanned: WorkspaceRun[];
+  /** True only when the returned set is complete (raw < cap): the Unplanned
+   *  label is then trustworthy. At the cap the absence is only "not in the
+   *  returned history" — never a claim that nothing is planned. */
+  unplannedDefinite: boolean;
   /** intents whose claimed effect is absent/mismatched under full identity. */
   unresolvedEffects: string[]; // intent_ids
   /** Exact in-scope runs resolved by full identity — for open-run-detail, so a
@@ -112,6 +119,11 @@ export function projectSchedule(args: {
   contextId: string;
   runs: WorkspaceRun[];
   effects: AppEffect[];
+  /** Raw returned count BEFORE local filtering (the cap signal). When ≥
+   *  LIST_CAP the reply is a truncated subset and an absent intent does NOT
+   *  prove a run is unplanned. Optional for pure callers; defaults to the
+   *  filtered count (treated as complete). */
+  rawCount?: number;
   intents: PublishIntent[];
 }): Projection {
   const { installId, contextId, runs, effects, intents } = args;
@@ -201,8 +213,11 @@ export function projectSchedule(args: {
   for (const day of days) day.intents.sort((a, b) => a.due_epoch - b.due_epoch);
 
   const unplanned = [...runById.values()].filter((run) => !runsWithIntent.has(run.id));
+  // The Unplanned label is only honest when the returned set is complete.
+  const rawCount = args.rawCount ?? intents.length;
+  const unplannedDefinite = rawCount < LIST_CAP;
 
-  return { days, malformed, conflictingIds, unplanned, unresolvedEffects, runById: resolvedRunById };
+  return { days, malformed, conflictingIds, unplanned, unplannedDefinite, unresolvedEffects, runById: resolvedRunById };
 }
 
 /** The read's scope tag — results render only while it still matches the
@@ -342,7 +357,14 @@ export default function ScheduleCalendar({
           })}{" "}
           {intent.timezone}
           {unresolvedFlag ? " · linkage unavailable" : ""}
-          {intent.refusal ? ` · ${intent.refusal.code || "refused"}` : ""}
+          {/* state-aware suffix: `held` carries its reason verbatim (it is
+              never a "refused" label); only a real `refused`/`cancelled`
+              intent may show a refusal reason. */}
+          {intent.state === "held" && intent.refusal
+            ? ` · needs human · ${intent.refusal.message}`
+            : (intent.state === "refused" || intent.state === "cancelled") && intent.refusal
+              ? ` · ${intent.refusal.code || "refused"}`
+              : ""}
         </span>
       </button>
     );
@@ -355,14 +377,20 @@ export default function ScheduleCalendar({
       className="wa-post-card wa-cal-card"
       data-tone="muted"
       onClick={() => onOpenRun(run)}
-      aria-label={`Unplanned · ${plainTitle(run.snapshot.inputs, run.id)}`}
+      aria-label={`${projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown"} · ${plainTitle(run.snapshot.inputs, run.id)}`}
     >
       <div className="wa-card-meta">
-        <span className="wa-status" data-tone="muted">Unplanned</span>
+        <span className="wa-status" data-tone="muted">
+          {projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown"}
+        </span>
         <span className="wa-kicker">{run.state}</span>
       </div>
       <strong>{plainTitle(run.snapshot.inputs, run.snapshot.workflow.title)}</strong>
-      <span className="wa-kicker">No publish intent — no planned date</span>
+      <span className="wa-kicker">
+        {projection?.unplannedDefinite
+          ? "No publish intent — no planned date"
+          : "Not in returned history — schedule unknown"}
+      </span>
     </button>
   );
 
@@ -411,10 +439,17 @@ export default function ScheduleCalendar({
         </p>
       )}
       {projection.days.length === 0 && projection.malformed.length === 0 && projection.unplanned.length === 0 && projection.conflictingIds.length === 0 ? (
-        <p className="wa-empty" role="status">
-          No posts are planned. Accepted text stays in Library until it is
-          scheduled; runs without a publish intent have no planned date.
-        </p>
+        projection.unplannedDefinite ? (
+          <p className="wa-empty" role="status">
+            No posts are planned. Accepted text stays in Library until it is
+            scheduled; runs without a publish intent have no planned date.
+          </p>
+        ) : (
+          <p className="wa-empty" role="status">
+            No matching plans in the returned history — the full schedule is
+            unknown (history is bounded).
+          </p>
+        )
       ) : (
         <div className="wa-cal-agenda" role="region" aria-label="Planned posts by day">
           {projection.days.map((day) => (
@@ -456,7 +491,7 @@ export default function ScheduleCalendar({
             <section className="wa-cal-day wa-cal-unplanned" data-unplanned="true">
               <header className="wa-cal-head">
                 <span className="wa-kicker">—</span>
-                <strong>Unplanned</strong>
+                <strong>{projection.unplannedDefinite ? "Unplanned" : "Schedule unknown"}</strong>
                 <span className="wa-status">{projection.unplanned.length}</span>
               </header>
               <HorizontalStrip label="Runs with no planned date" className="wa-cal-posts" scrollStep={248}>
