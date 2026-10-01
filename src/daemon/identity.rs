@@ -426,6 +426,27 @@ impl Shared {
         }
     }
 
+    /// CAD-506 visibility for one agent's pending provider requests,
+    /// shared by `agent_requests` and `agent_wait` (CAD-886) so the two
+    /// cannot drift: the operator, the agent itself, and its PM
+    /// (CAD-370's authorised reviewer). Anyone else — including
+    /// unproven callers and error paths — sees nothing (fail closed).
+    /// `agent_requests` maps `false` to a refusal; `agent_wait` maps it
+    /// to skipping the `approval_pending` cause.
+    pub(super) fn may_see_requests(&self, alias: &str, peer_pid: u32) -> bool {
+        match self.agent_caller(peer_pid, "pending request visibility") {
+            Ok(AgentCaller::Operator) => true,
+            Ok(AgentCaller::Agent(ref a)) if a == alias => true,
+            Ok(AgentCaller::Agent(ref a)) => self
+                .store
+                .agent(alias)
+                .and_then(|target| self.effective_pm(&target))
+                .map(|pm| pm.as_deref() == Some(a.as_str()))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// The connection's caller for the one caller rule (CAD-149,
     /// CAD-384) — see [`Self::agent_caller`] for the derivation. A pane
     /// whose agent cannot be named, or no agent identity without

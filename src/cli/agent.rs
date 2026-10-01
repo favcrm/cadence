@@ -48,6 +48,26 @@ mod show_params_tests {
     }
 }
 
+/// `--until` condition for `agent wait` (CAD-886).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum WaitUntil {
+    Reported,
+    Idle,
+    Attention,
+    Any,
+}
+
+impl WaitUntil {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::Idle => "idle",
+            Self::Attention => "attention",
+            Self::Any => "any",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum AgentAction {
     /// Register an agent and start its actor.
@@ -155,6 +175,33 @@ pub(crate) enum AgentAction {
     },
     /// List pending provider requests (approvals, input).
     Requests { alias: String },
+    /// Block until the agent reports, idles or needs attention. The
+    /// wait happens on the daemon side (no CLI polling): one RPC that
+    /// returns one JSON line
+    /// `{alias, state, reason, message?, turn?, waited_secs}`. Exit 0
+    /// when the condition is met, 75 on timeout, an error kind
+    /// otherwise. `attention` covers a fence/`unknown`, a pending
+    /// approval menu, a provider rate-limit stall, and the agent
+    /// stopping. `reported` fires when a turn files a result
+    /// (`completed|failed`); a turn that ends without one
+    /// (`interrupted|unknown|cancelled`) ends the wait as `settled` so
+    /// it never hangs on a terminal state. Default `any` fires on
+    /// attention first, then reported, settled, idle.
+    Wait {
+        alias: String,
+        /// Condition to wait for [default: any].
+        #[arg(long, value_enum, default_value_t = WaitUntil::Any)]
+        until: WaitUntil,
+        /// Max wait: seconds or an s/m/h/d-suffixed duration
+        /// (default 10m). The daemon clamps to 1h; 0 checks once
+        /// without blocking.
+        #[arg(long, default_value = "10m")]
+        timeout: String,
+        /// Only wait for this message's terminal state (narrows
+        /// reported|any; refused with idle|attention).
+        #[arg(long)]
+        message: Option<String>,
+    },
     /// Answer a pending provider request.
     Respond {
         alias: String,
@@ -471,6 +518,26 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         }
         AgentAction::Requests { alias } => {
             client::rpc(&state_dir, "agent_requests", json!({"alias": alias}))?
+        }
+        AgentAction::Wait {
+            alias,
+            until,
+            timeout,
+            message,
+        } => {
+            // The wait lives on the daemon: pass the bound through and
+            // keep this request's deadline above it (bound + 60 s) so a
+            // met condition is never cut short and misread as a timeout.
+            let bound = parse_duration(&timeout)? as u64;
+            let out = client::rpc_timeout(
+                &state_dir,
+                "agent_wait",
+                json!({"alias": alias, "until": until.as_str(),
+                       "timeout": bound, "message": message}),
+                Duration::from_secs(bound.saturating_add(60)),
+            )?;
+            print_json(&out);
+            return Ok(0);
         }
         AgentAction::Respond {
             alias,

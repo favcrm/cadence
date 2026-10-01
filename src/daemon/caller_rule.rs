@@ -111,6 +111,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("agent_list", Rule::Read),
     ("agent_show", Rule::Read),
+    // CAD-886: `agent_wait` answers a strict subset of what `agent_show`
+    // discloses (state/reason/message/turn/waited_secs) — same visibility.
+    ("agent_wait", Rule::Read),
     (
         "agent_identity",
         Rule::Handler("caller_identity (verified agent endpoint only, CAD-744)"),

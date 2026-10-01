@@ -36,6 +36,7 @@ import {
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
+import ScheduleCalendar from "./ScheduleCalendar";
 import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
@@ -742,18 +743,16 @@ export default function WorkspaceApp({
               />
             )}
             {section === "Schedule" && (
-              <section className="wa-panel wa-stack">
-                <h2>Schedule</h2>
-                <p className="wa-muted">
-                  Scheduling isn’t available in this version. Posts have no
-                  planned dates yet. Your accepted text stays in Library until
-                  you explicitly release it to Local.
-                </p>
-                <p className="wa-kicker">
-                  Instagram and Facebook publishing aren’t connected.
-                  {imageEnabled ? " Image drafts can be reviewed and released to Local." : " Generated images aren’t connected."}
-                </p>
-              </section>
+              <ScheduleCalendar
+                installId={installId}
+                contextId={contextId}
+                runs={postRuns}
+                effects={effects}
+                canWrite={canWrite}
+                onOpenRun={openRun}
+                onDenied={clearPrivate}
+                refreshToken={data}
+              />
             )}
             {section === "Sources" && sourceEnabled && (
               <SourcesPanel

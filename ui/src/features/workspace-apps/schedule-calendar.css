@@ -1,0 +1,104 @@
+/* CAD-980 — installed Schedule date-row calendar. App-owned scope; kept out of
+ * shared workspace-apps.css to avoid ownership contention. Approved geometry:
+ * fixed date column on the left, fixed 240px horizontal cards, gap 8, never
+ * wrapping into another day row. Reuses kit/wa-* tokens; no shared primitive
+ * edits (HorizontalStrip default step retained). */
+
+.wa-cal-agenda {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  gap: 6px;
+}
+
+/* Date-left anchor: fixed 76px column + the card strip that fills the row. */
+.wa-cal-day {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 12px;
+  flex: 1 0 auto;
+  min-height: 84px;
+  padding: 3px;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.25rem;
+}
+
+.wa-cal-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.wa-cal-head > strong {
+  font-size: var(--text-section);
+  color: var(--color-ink-200);
+}
+
+/* Horizontal card strip: never wraps; cards are a fixed 240px.
+ * `.wa-cal-posts` is applied to HorizontalStrip's `.wa-strip` element — make
+ * it an explicit horizontal flex row so cards lay out side-by-side and scroll
+ * (the shared `.wa-strip` is display:block by default). `.wa-post-card`'s
+ * `width:100%` in workspace-apps.css loads later and would otherwise win, so
+ * these rules use `.wa-strip.wa-cal-posts` / `.wa-cal-posts > .wa-cal-card`
+ * for higher specificity. Shared .wa-strip scrolling behaviour is unchanged.
+ */
+.wa-strip.wa-cal-posts {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: flex-start;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.wa-cal-posts > .wa-cal-card {
+  flex: 0 0 240px;
+  width: 240px;
+  min-width: 240px;
+  max-width: 240px;
+  height: 80px;
+  min-height: 80px;
+  margin: 0;
+  padding: 4px;
+  gap: 2px;
+  overflow: hidden;
+}
+
+/* Keep the .wa-cal-card block form for non-strip contexts (malformed list). */
+.wa-cal-card {
+  flex: 0 0 240px;
+  width: 240px;
+  height: 80px;
+  min-height: 80px;
+  margin: 0;
+  padding: 4px;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.wa-cal-card strong {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Unplanned + unresolved rows keep the date-anchor grid for visual rhythm. */
+.wa-cal-unplanned .wa-cal-head > strong,
+.wa-cal-malformed .wa-cal-head > strong {
+  font-size: var(--text-body);
+  color: var(--color-ink-400);
+}
+
+.wa-cal-malformed-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  align-items: flex-start;
+}

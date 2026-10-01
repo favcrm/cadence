@@ -16,6 +16,7 @@
 // the `Shared` struct, the actor loop / wake / lifecycle, the
 // constants, the RPC dispatch and the test suites.
 
+mod agent_wait;
 mod agents_rpc;
 mod answer_rpc;
 mod app_audiences_rpc;
@@ -2608,6 +2609,8 @@ impl Shared {
             "thread_read" => self.rpc_thread_read(params),
             "thread_send" => self.rpc_thread_send(params, peer_pid),
             "agent_events" => self.rpc_events(params),
+            // CAD-886: read-only wait with `agent_show` visibility.
+            "agent_wait" => self.rpc_wait(params, peer_pid),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 // A retained app endpoint can hold private run inputs in
@@ -2627,14 +2630,10 @@ impl Shared {
                 // input). A peer agent or an unproven caller is refused;
                 // before this, Rule::Read exposed every agent's pending
                 // input to any caller (the CAD-366 review flag).
-                let may_see = match self.agent_caller(peer_pid, "agent requests")? {
-                    AgentCaller::Operator => true,
-                    AgentCaller::Agent(ref a) if *a == alias => true,
-                    AgentCaller::Agent(ref a) => {
-                        let target = self.store.agent(&alias)?;
-                        self.effective_pm(&target)?.as_deref() == Some(a.as_str())
-                    }
-                };
+                // CAD-886 shares the predicate (`may_see_requests`) so
+                // `agent_wait`'s `approval_pending` cause cannot drift
+                // from this gate.
+                let may_see = self.may_see_requests(&alias, peer_pid);
                 if !may_see {
                     return Err(Error::rejected(format!(
                         "agent requests refused: '{alias}'s pending rows disclose \
@@ -3857,11 +3856,12 @@ const ID_FIELDS: &[&str] = &[
 ];
 
 /// Withhold `tokens` from `value` (CAD-375). Only token-bearing places
-/// change: a `turn_id` field holding one becomes `null`, and prose
-/// quoting a [`quotable`] token has it masked — in any field, except an
-/// [`ID_FIELDS`] value that is exactly the token (an id collision). A short schemeless token (a codex
-/// `t-1`, a fake `fake-turn-1`) is withheld only as a `turn_id` value —
-/// elsewhere the same text is someone else's data.
+/// change: a `turn_id` — or CAD-886's `agent_wait` `turn` — field holding
+/// one becomes `null`, and prose quoting a [`quotable`] token has it
+/// masked — in any field, except an [`ID_FIELDS`] value that is exactly
+/// the token (an id collision). A short schemeless token (a codex
+/// `t-1`, a fake `fake-turn-1`) is withheld only as a `turn_id`/`turn`
+/// value — elsewhere the same text is someone else's data.
 fn redact_tokens(value: &mut Value, tokens: &[&str]) {
     match value {
         Value::String(text) => {
@@ -3876,10 +3876,13 @@ fn redact_tokens(value: &mut Value, tokens: &[&str]) {
         Value::Array(items) => items.iter_mut().for_each(|v| redact_tokens(v, tokens)),
         Value::Object(map) => {
             for (key, v) in map.iter_mut() {
-                if key == "turn_id" {
-                    if v.as_str().is_some_and(|t| tokens.contains(&t)) {
-                        *v = Value::Null;
-                    }
+                // An exact token text under a token-bearing key is the
+                // credential — anything else there (an object, prose)
+                // still recurses below.
+                if (key == "turn_id" || key == "turn")
+                    && v.as_str().is_some_and(|t| tokens.contains(&t))
+                {
+                    *v = Value::Null;
                 } else if !(ID_FIELDS.contains(&key.as_str())
                     && v.as_str().is_some_and(|t| tokens.contains(&t)))
                 {
@@ -3895,14 +3898,19 @@ fn redact_tokens(value: &mut Value, tokens: &[&str]) {
 }
 
 /// The fail-closed form of [`redact_tokens`] when the running turns
-/// cannot be read: every `turn_id` value is withheld.
+/// cannot be read: every `turn_id` — and every `turn` string — value is
+/// withheld.
 fn withhold_all_turn_ids(mut value: Value) -> Value {
     fn walk(value: &mut Value) {
         match value {
             Value::Array(items) => items.iter_mut().for_each(walk),
             Value::Object(map) => {
                 for (key, v) in map.iter_mut() {
-                    if key == "turn_id" {
+                    // `turn` joins `turn_id`: CAD-886's `agent_wait`
+                    // answers the live token under `turn`, and only an
+                    // exact string there is the credential — objects
+                    // (the master session's `turn` summary) still recurse.
+                    if (key == "turn_id" || key == "turn") && v.is_string() {
                         *v = Value::Null;
                     } else {
                         walk(v);
@@ -6319,6 +6327,35 @@ mod tests {
         assert_eq!(ev["message"], "done, token is [turn token withheld]");
         let all = withhold_all_turn_ids(json!({"m": [{"turn_id": "x", "id": "m1"}]}));
         assert!(all["m"][0]["turn_id"].is_null() && all["m"][0]["id"] == "m1");
+    }
+
+    /// CAD-886: `agent_wait` answers the live token under `turn`, so the
+    /// withhold treats it exactly like `turn_id` — including short
+    /// schemeless tokens the prose rule would otherwise leave. Objects
+    /// under `turn` (the master session's turn summary) still recurse.
+    #[test]
+    fn redact_tokens_withholds_the_wait_turn_key() {
+        let tok = "pty-g1-0123456789abcdef";
+        let short = "fake-turn-1";
+        let mut v = json!({"alias": "w", "reason": "approval_pending",
+                           "message": "m1", "turn": tok});
+        redact_tokens(&mut v, &[tok]);
+        assert!(v["turn"].is_null(), "{v}");
+        assert_eq!(v["message"], "m1");
+        let mut v = json!({"turn": short});
+        redact_tokens(&mut v, &[short]);
+        assert!(v["turn"].is_null(), "{v}");
+        // A non-token string under `turn` is untouched.
+        let mut v = json!({"turn": "idle"});
+        redact_tokens(&mut v, &[tok, short]);
+        assert_eq!(v["turn"], "idle");
+        // Objects still recurse: prose inside is masked.
+        let mut v = json!({"turn": {"state": "working",
+                                      "summary": format!("did {tok} ok")}});
+        redact_tokens(&mut v, &[tok]);
+        assert_eq!(v["turn"]["summary"], "did [turn token withheld] ok");
+        let all = withhold_all_turn_ids(json!({"turn": "x", "turn_id": "y"}));
+        assert!(all["turn"].is_null() && all["turn_id"].is_null(), "{all}");
     }
 
     /// The notice's live exit works: a reconcile while the actor holds
