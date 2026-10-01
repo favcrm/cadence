@@ -25,8 +25,23 @@ WORKFLOW = ROOT / ".github/workflows/stress.yml"
 CI = ROOT / ".github/workflows/ci.yml"
 SHA_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 INPUTS = {"filter", "features", "count", "copies", "load", "stop_on_fail"}
-FORBIDDEN_RUN = re.compile(
-    r"\$\{\{[^}]*(\binputs\.|github\.event\.inputs|\bsecrets\b|toJSON\s*\(\s*secrets|github\.token)")
+# Allowlist: every ${{ ... }} expression in the file must match one of these
+# (anchored) and a `run:` body may hold none. Anything else, such as
+# inputs['x'], format(), github['token'], toJSON(secrets) or fromJSON(inputs),
+# is rejected.
+ALLOWED_EXPR = tuple(re.compile(p) for p in (
+    r"always\(\)",
+    r"always\(\) && inputs\.load",
+    r"inputs\.(count|copies|features|filter|load|stop_on_fail)",
+    r"matrix\.copy",
+    r"fromJSON\(needs\.plan\.outputs\.copies\)",
+    r"steps\.validate\.outputs\.copies",
+    r"github\.(run_id|run_attempt)",
+    r"runner\.temp",
+    r"secrets\.SCCACHE_R2_RO_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)",
+    r"vars\.SCCACHE_R2_ENDPOINT",
+))
+EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 
 
 def triggers(doc):
@@ -80,8 +95,11 @@ def check(text):
     for secret in set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)):
         if not secret.startswith("SCCACHE_R2_RO_"):
             bad.append(f"secret {secret} is not the read-only sccache key")
-    if re.search(r"secrets\s*\[|toJSON\s*\(\s*secrets|secrets:\s*inherit|github\.token", text):
-        bad.append("secrets are reached by index, toJSON, inherit or github.token")
+    for expr in EXPR.findall(text):
+        if not any(a.fullmatch(expr.strip()) for a in ALLOWED_EXPR):
+            bad.append(f"expression not on the allowlist: {expr.strip()}")
+    if re.search(r"secrets:\s*inherit", text):
+        bad.append("secrets: inherit is not allowed")
     for step in steps_of(doc):
         uses = step.get("uses")
         if uses and not SHA_PIN.match(uses):
@@ -99,9 +117,9 @@ def check(text):
                 bad.append("checkout must use the dispatched ref (github.sha), not a ref input")
             if step.get("with", {}).get("persist-credentials") is not False:
                 bad.append("checkout must set persist-credentials: false")
-        # Untrusted inputs and secrets may not be interpolated into a shell script.
-        if "run" in step and FORBIDDEN_RUN.search(step["run"]):
-            bad.append("an input, secret or token is interpolated into a run script; pass it through env")
+        # Nothing is interpolated into a shell script; values arrive via env.
+        if "run" in step and "${{" in step["run"]:
+            bad.append("a run script interpolates an expression; pass it through env")
     if "scripts/cadence-nextest" not in step_named(doc, "Run the filter in a loop").get("run", ""):
         bad.append("the loop step must run the pinned scripts/cadence-nextest wrapper")
     if "scripts/cadence-nextest" not in step_named(doc, "Build test binaries once").get("run", ""):
@@ -213,19 +231,28 @@ class StressWorkflow(unittest.TestCase):
     def test_mutation_unpinned_action(self):
         self.assertRejects(re.sub(r"actions/checkout@[0-9a-f]{40}", "actions/checkout@v4", self.text, count=1), "SHA-pinned")
 
-    def test_mutation_injection_into_run(self):
+    def test_mutation_expression_in_run_body(self):
         marker = '          set -eu\n          case "$COUNT"'
         for expr in ("${{ inputs.filter }}", "${{ github.event.inputs.filter }}",
-                     "${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}", "${{ secrets['X'] }}",
-                     "${{ toJSON(secrets) }}", "${{ github.token }}"):
+                     "${{ inputs['filter'] }}", "${{ format('{0}', inputs.filter) }}",
+                     "${{ github['event']['inputs']['filter'] }}",
+                     "${{ fromJSON(toJSON(inputs)).filter }}", "${{ matrix.copy }}",
+                     "${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}", "${{ github.token }}"):
             with self.subTest(expr=expr):
                 mutated = self.text.replace(marker, f"          set -eu\n          echo {expr}\n          case \"$COUNT\"", 1)
-                self.assertRejects(mutated, "interpolated")
+                self.assertRejects(mutated, "interpolates an expression")
+
+    def test_mutation_expression_not_on_the_allowlist_anywhere(self):
+        anchor = "          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}\n"
+        for expr in ("github.token", "github['token']", "secrets['X']", "toJSON(secrets)",
+                     "secrets.GITHUB_PAT", "secrets.SCCACHE_R2_RW_ACCESS_KEY_ID",
+                     "inputs['filter']", "format('{0}', inputs.filter)",
+                     "github.event.inputs.filter", "vars.OTHER"):
+            with self.subTest(expr=expr):
+                self.assertRejects(self.text.replace(anchor, anchor + f"          T: ${{{{ {expr} }}}}\n", 1), "allowlist")
 
     def test_mutation_secret_reach(self):
         self.assertRejects(self.text.replace("secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY", "secrets.GITHUB_PAT", 1), "not the read-only")
-        self.assertRejects(self.text.replace("          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}\n", "          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}\n          T: ${{ github.token }}\n", 1), "github.token")
-        self.assertRejects(self.text.replace("          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}\n", "          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}\n          T: ${{ toJSON(secrets) }}\n", 1), "toJSON")
 
     def test_mutation_job_level_uses_or_secrets(self):
         self.assertRejects(self.text.replace("  plan:\n", "  plan:\n    uses: ./.github/workflows/ci.yml\n    secrets: inherit\n", 1), "reusable workflow")

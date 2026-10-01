@@ -63,8 +63,8 @@ jobs:
     outputs:
       copies: ${{ steps.validate.outputs.copies }}
     steps:
-      # Inputs reach the shell only through env, never through ${{ }} in the
-      # script body, so a crafted filter or ref cannot inject commands.
+      # Inputs reach the shell only through env, never through an expression in
+      # the script body, so a crafted filter cannot inject commands.
       - name: Validate inputs
         id: validate
         env:
@@ -159,7 +159,7 @@ jobs:
           set -eu
           : > "$RUNNER_TEMP/burner.pids"
           for _ in $(seq 1 "$(nproc)"); do
-            setsid timeout 7000 sh -c 'while :; do :; done' > /dev/null 2>&1 &
+            setsid timeout 7200 sh -c 'while :; do :; done' > /dev/null 2>&1 &
             echo $! >> "$RUNNER_TEMP/burner.pids"
           done
       - name: Run the filter in a loop
