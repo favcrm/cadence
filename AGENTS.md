@@ -71,8 +71,8 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     `# Verdict: <ID> Review (standards+spec) — pass|revise`. Unlike
     solo-operator scaling, it needs no operator approval for the count.
     For a test-only PR the single reviewer must state in the verdict
-    that no adversarial gate test was weakened or deleted, naming the
-    tests checked. Any other PR (including any with `src/**`) keeps two.
+    that no adversarial gate test and no test-isolation or fail-closed
+    default was weakened or deleted, naming what was checked. Any other PR (including any with `src/**`) keeps two.
     `human` triggers are unchanged. That file is the only list; scripts
     read it.
 - **Browser QA** at desktop and narrow widths when the PR changes

@@ -22,8 +22,11 @@
 # which `*` keeps to one segment) and `tests/common/**` need one review.
 # Not listed, so they keep two: `src/**` (including src/**/tests.rs) and the
 # excluded tests/scripts/**, fixtures and split maps, which decide what CI runs.
+# tests/common/{mod,port,suite,tmux_guard}.rs hold host-safety defaults
+# (NO_REAL_TMUX, PM dir/HOME isolation, port lease, suite lock) and stay at two.
 # The single reviewer must state in the verdict that no adversarial gate test
-# was weakened or deleted, naming the tests checked (AGENTS.md).
+# and no test-isolation or fail-closed default was weakened or deleted,
+# naming what was checked (AGENTS.md).
 one_review_include = [
   "docs/guides/**",
   "docs/ui/**",
@@ -38,6 +41,10 @@ one_review_exclude = [
   "tests/split_map_inventory.rs",
   "tests/shard-weights.json",
   "tests/fixtures/**",
+  "tests/common/mod.rs",
+  "tests/common/port.rs",
+  "tests/common/suite.rs",
+  "tests/common/tmux_guard.rs",
   "docs/cadence/**",
   "docs/AUDIT.md",
   "docs/design/**",
