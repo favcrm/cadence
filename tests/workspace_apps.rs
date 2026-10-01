@@ -2841,7 +2841,6 @@ fn seed_run(
     subject: Option<&str>,
     context: Option<(&str, i64, &str)>,
 ) {
-    let db = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
     let bundle = w.show(install)["digest"].as_str().unwrap().to_string();
     let mut inputs = serde_json::Map::new();
     if let Some(s) = subject {
@@ -2856,12 +2855,28 @@ fn seed_run(
             "schema":1,"install_id":install,"bundle_digest":bundle,"epoch":1,
             "workflow":{"title":"Manual post"},"inputs":Value::Object(inputs)}),
     };
+    seed_run_snapshot(w, install, run_id, snapshot, context.map(|(c, _, _)| c));
+}
+
+/// Insert a run row carrying an arbitrary `snapshot` `Value` — used to
+/// seed canonical objects with a deliberately wrong-typed optional
+/// field (`subject`/`workflow.title`/`context.id`), still with a real
+/// `material_digest` so the row is honestly stored. Owned test SQL
+/// only; never touches production.
+fn seed_run_snapshot(
+    w: &Workspace,
+    install: &str,
+    run_id: &str,
+    snapshot: Value,
+    context_id: Option<&str>,
+) {
+    let db = rusqlite::Connection::open(w.daemon.state.join("cadence.sqlite3")).unwrap();
+    let bundle = w.show(install)["digest"].as_str().unwrap().to_string();
     let digest = cadence_agent::store::app_runs::material_digest(&snapshot);
-    let ctx_id = context.map(|(cid, _, _)| cid);
     db.execute(
         "INSERT INTO app_runs(id,install_id,epoch,bundle_digest,snapshot,snapshot_digest,owner_pm,request_id,state,context_id,created,updated) VALUES(?,?,1,?,?,?,'owner',?,'succeeded',?,1,1)",
         rusqlite::params![run_id, install, bundle, snapshot.to_string(), digest,
-            format!("req-{run_id}"), ctx_id],
+            format!("req-{run_id}"), context_id],
     )
     .unwrap();
 }
@@ -3645,6 +3660,84 @@ fn cad867_view_read_refuses_corrupt_producer_rows() {
     show_ok["record_id"] = json!("run-ok");
     let ok = w.daemon.operator_rpc("app_view_read", show_ok).unwrap();
     assert_eq!(ok["rows"][0]["subject"], json!("ok"));
+}
+
+/// An optional run field that is PRESENT but the wrong type must
+/// refuse — `subject`/`workflow.title`/`context.id`/`context_id` are
+/// optional cells only when ABSENT or null; a present number/object
+/// is a corrupt producer shape, never a silent omission. Each case
+/// uses a real canonical snapshot object with an honest
+/// `material_digest`, so the refusal lands at the read guard, not in
+/// setup. A contextless run and an absent-subject run remain valid
+/// positive controls.
+#[test]
+fn cad867_view_read_refuses_wrong_typed_optional_run_fields() {
+    let w = Workspace::new();
+    w.write_descriptor(&caption_descriptor(), true);
+    w.write_binding(&caption_binding(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let bundle = installed["digest"].as_str().unwrap().to_string();
+    let digests = view_read_digests(&w, &id);
+
+    // Positive controls: an absent-subject contextless run (subject
+    // omitted) and a subject-bearing run both read fine.
+    seed_run(&w, &id, "run-ok", Some("ok"), None);
+    seed_run(&w, &id, "run-nosubj", None, None);
+
+    // (1) inputs.subject present but a NUMBER.
+    let snap = json!({"schema":1,"install_id":id,"bundle_digest":bundle,"epoch":1,
+        "workflow":{"title":"x"},"inputs":{"subject":42}});
+    seed_run_snapshot(&w, &id, "run-subj-num", snap, None);
+    // (2) workflow.title present but a NUMBER.
+    let snap = json!({"schema":1,"install_id":id,"bundle_digest":bundle,"epoch":1,
+        "workflow":{"title":42},"inputs":{"subject":"s"}});
+    seed_run_snapshot(&w, &id, "run-title-num", snap, None);
+    // (3) snapshot.context.id present but a NUMBER (schema-2 run needs
+    //     a real context; use a fresh owned context's shape).
+    let ctx = w
+        .daemon
+        .operator_rpc(
+            "app_context_create",
+            json!({"install_id":id,"label":"C","input_defaults":{},"request_id":"ctx-wt"}),
+        )
+        .unwrap();
+    let cid = ctx["context"]["id"].as_str().unwrap();
+    let snap = json!({"schema":2,"install_id":id,"bundle_digest":bundle,"epoch":1,
+        "workflow":{"title":"x"},"inputs":{"subject":"s"},
+        "context":{"id":42,"revision":ctx["context"]["revision"],"digest":ctx["context"]["digest"]}});
+    seed_run_snapshot(&w, &id, "run-ctxid-num", snap, Some(cid));
+
+    // Each wrong-typed run refuses on both list and show.
+    for run_id in ["run-subj-num", "run-title-num", "run-ctxid-num"] {
+        let mut p = view_read_params(&id, "caption-detail", "show", &digests);
+        p["record_id"] = json!(run_id);
+        let err = w
+            .daemon
+            .operator_rpc("app_view_read", p)
+            .expect_err("a present-but-wrong-typed optional field must refuse");
+        assert_eq!(err.kind(), "rejected", "{run_id} non-bounded error: {err}");
+    }
+    // The list containing a wrong-typed run refuses wholesale.
+    let p = view_read_params(&id, "caption-runs", "list", &digests);
+    let err = w
+        .daemon
+        .operator_rpc("app_view_read", p)
+        .expect_err("list over a wrong-typed run must refuse");
+    assert_eq!(err.kind(), "rejected", "list non-bounded error: {err}");
+
+    // Valid controls still read: subject-bearing and subject-absent.
+    let mut p = view_read_params(&id, "caption-detail", "show", &digests);
+    p["record_id"] = json!("run-ok");
+    let ok = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    assert_eq!(ok["rows"][0]["subject"], json!("ok"));
+    let mut p = view_read_params(&id, "caption-detail", "show", &digests);
+    p["record_id"] = json!("run-nosubj");
+    let ok = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    assert!(
+        !ok["rows"][0].as_object().unwrap().contains_key("subject"),
+        "absent subject emitted a cell"
+    );
 }
 
 /// Concurrent reads stay consistent and a read never observes a torn
