@@ -2126,9 +2126,8 @@ mod tests {
             "loser conflicts, never an error or success: {loser_out}"
         );
         assert_eq!(
-            std::fs::read(blobs.join(&sha)).unwrap_or_else(|e| panic!(
-                "the accepted pointer's blob is missing/corrupt: {e}"
-            )),
+            std::fs::read(blobs.join(&sha))
+                .unwrap_or_else(|e| panic!("the accepted pointer's blob is missing/corrupt: {e}")),
             bytes,
             "a rejected same-bytes upload must never delete the accepted blob"
         );
@@ -2212,9 +2211,8 @@ mod tests {
         assert!(winner_out["rev"].is_string(), "winner commits");
         let sha = winner_out["sha256"].as_str().unwrap();
         assert_eq!(
-            std::fs::read(blobs.join(sha)).unwrap_or_else(|e| panic!(
-                "the accepted pointer's blob is missing/corrupt: {e}"
-            )),
+            std::fs::read(blobs.join(sha))
+                .unwrap_or_else(|e| panic!("the accepted pointer's blob is missing/corrupt: {e}")),
             bytes,
             "the loser's conflict must not delete bytes the winner deduped"
         );
@@ -2253,15 +2251,31 @@ mod tests {
             "the plant must be same-length — only the digest discriminates"
         );
         let tmp_a = cad911_stage_tmp(&uploads, "a.bin", bytes);
-        let out = put_blob(&pm, &state, &Caller::Operator, "global/a.bin", &tmp_a, None, None)
-            .unwrap();
+        let out = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/a.bin",
+            &tmp_a,
+            None,
+            None,
+        )
+        .unwrap();
         let sha = out["sha256"].as_str().unwrap().to_string();
         let object = blobs.join(&sha);
         std::fs::write(&object, foreign).unwrap();
 
         let tmp_b = cad911_stage_tmp(&uploads, "b.bin", bytes);
-        let err = put_blob(&pm, &state, &Caller::Operator, "global/b.bin", &tmp_b, None, None)
-            .expect_err("same-length foreign bytes at the hash name must refuse");
+        let err = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/b.bin",
+            &tmp_b,
+            None,
+            None,
+        )
+        .expect_err("same-length foreign bytes at the hash name must refuse");
         assert!(
             err.to_string().contains("content does not match"),
             "the digest guard names its refusal: {err}"
@@ -2272,10 +2286,7 @@ mod tests {
             "the refused upload leaves the planted object byte-exact"
         );
         assert!(
-            vault
-                .join("global/b.bin.blob")
-                .symlink_metadata()
-                .is_err(),
+            vault.join("global/b.bin.blob").symlink_metadata().is_err(),
             "no pointer commits against unverified bytes"
         );
         cad911_no_stage_left(&blobs);
@@ -2321,7 +2332,10 @@ mod tests {
                 uuid::Uuid::new_v4().simple()
             ));
             std::fs::create_dir(&dir).unwrap_or_else(|e| {
-                panic!("exclusive shm state dir {} must not exist: {e}", dir.display())
+                panic!(
+                    "exclusive shm state dir {} must not exist: {e}",
+                    dir.display()
+                )
             });
             Self { dir }
         }
@@ -2356,16 +2370,22 @@ mod tests {
         // so the capped child writes nothing before the copy itself.
         let kept_bytes: &[u8] = b"the already-accepted blob, byte-exact";
         let kept_tmp = cad911_stage_tmp(&uploads, "kept.bin", kept_bytes);
-        let kept = put_blob(&pm, &shm_state.dir, &Caller::Operator, "global/kept.bin", &kept_tmp, None, None)
-            .unwrap();
+        let kept = put_blob(
+            &pm,
+            &shm_state.dir,
+            &Caller::Operator,
+            "global/kept.bin",
+            &kept_tmp,
+            None,
+            None,
+        )
+        .unwrap();
         let kept_sha = kept["sha256"].as_str().unwrap().to_string();
 
         // The failing upload's tmp: created on tmpfs NOW, before any
         // limit exists — and sized over the child's 512-byte cap so
         // the copy fails mid-write with a partial stage on disk.
-        let fail_bytes: Vec<u8> = (0..4096u32)
-            .map(|i| (i % 251) as u8 ^ 0x5a)
-            .collect();
+        let fail_bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8 ^ 0x5a).collect();
         let fail_tmp = cad911_stage_tmp(&uploads, "failed.bin", &fail_bytes);
         let fail_sha = sha256_file(&fail_tmp).unwrap();
 
