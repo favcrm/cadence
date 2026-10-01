@@ -879,7 +879,7 @@ fn cad979_import_http_typed_input_matrix_no_import() {
         ("context_id", json!("bad id!")),
     ] {
         let mut b = import_body(&run, &install, None, "cad979-t1");
-        b[field] = badval;
+        b[field] = badval.clone();
         let code = post(b);
         assert!((400..500).contains(&code), "{field}={badval}: {code}");
     }
