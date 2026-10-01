@@ -1434,6 +1434,11 @@ pub fn put_blob(
             // the private `stage` it may have partially written is
             // ours alone, so it is always removed.
             if let Err(e) = std::fs::copy(&tmp_canon, &stage) {
+                // CAD-911 MUTANT (counterfactual, this commit only):
+                // the private-stage cleanup is compiled out of test
+                // builds so `failed_partial_copy_cleans_only_its_
+                // private_stage` proves it red. Shipped builds keep it.
+                #[cfg(not(test))]
                 let _ = std::fs::remove_file(&stage);
                 return Err(e.into());
             }
@@ -1442,6 +1447,13 @@ pub fn put_blob(
         Err(e) => return Err(e.into()),
     }
     let dest = blobs.join(&actual);
+    // CAD-911 MUTANT (counterfactual, this commit only): the legacy
+    // `created` flag the R1/R2 fix removed — test builds track whether
+    // THIS call published the object so the conflict path below can
+    // restore the deleted-shared-blob behavior and prove the
+    // publish-seam interleaving tests red. Shipped builds keep no flag.
+    #[cfg(test)]
+    let cad911_legacy_created = !dest.exists();
     publish_blob(&stage, &dest)?;
     // CAD-911 test seam — compiled ONLY into test builds (`cfg(test)`;
     // shipped daemons and libraries never carry it): a unit test that
@@ -1461,6 +1473,14 @@ pub fn put_blob(
     let cur = rev_of(&pointer)?;
     if let Some(want) = if_rev {
         if want != cur {
+            // CAD-911 MUTANT (counterfactual, this commit only): the
+            // legacy loser's unlink — a test build deletes the shared
+            // object it published when its pointer conflicts. Shipped
+            // builds never unlink `dest` here.
+            #[cfg(test)]
+            if cad911_legacy_created {
+                let _ = std::fs::remove_file(&dest);
+            }
             // Conflict. `publish_blob` already consumed this call's
             // private stage; `dest` is shared custody another pointer
             // may already reference — nothing here unlinks it.
@@ -1588,6 +1608,12 @@ fn verify_existing_blob_inner(stage: &Path, dest: &Path) -> Result<()> {
             staged.len()
         )));
     }
+    // CAD-911 MUTANT (counterfactual, this commit only): the digest
+    // comparison is compiled out of test builds so `same_length_
+    // foreign_bytes_at_the_hash_name_refuse` proves it red — the size
+    // check alone cannot discriminate a same-length plant. Shipped
+    // builds keep the comparison.
+    #[cfg(not(test))]
     if sha256_file(dest)? != sha256_file(stage)? {
         return Err(refuse("content does not match its hash name".to_string()));
     }
