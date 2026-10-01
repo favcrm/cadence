@@ -307,6 +307,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-217)"),
     ),
     (
+        "approval_designate",
+        Rule::Handler("operator_connection_on_agent (CAD-918)"),
+    ),
+    ("approval_designations", Rule::Read),
+    (
+        "approval_scope",
+        Rule::Handler("operator_connection (CAD-918)"),
+    ),
+    (
+        "approval_delegate",
+        Rule::Handler(
+            "connection_caller: a designated agent only — the operator and unproven \
+             callers are refused (CAD-918)",
+        ),
+    ),
+    (
         "plan_propose",
         Rule::Handler("connection_caller: a derived agent or the operator (CAD-422)"),
     ),

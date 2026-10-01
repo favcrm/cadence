@@ -347,9 +347,11 @@ fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'stat
     if cadence
         && tokens
             .windows(2)
-            .any(|w| w[0] == "audit" && w[1] == "approve")
+            .any(|w| w[0] == "audit" && matches!(w[1], "approve" | "designate"))
     {
-        return Some("audit approve is never requestable");
+        // CAD-918: a granted child runs with operator authority, so
+        // neither an approval nor a designation can be requested.
+        return Some("audit approve and audit designate are never requestable");
     }
     if argv.iter().any(|a| protected_file(a)) || edit_target_protected(argv) {
         return Some("the master's SOUL.md, AGENT.md and permissions.yaml are never requestable");
@@ -1315,6 +1317,7 @@ mod tests {
             vec!["cadence".into(), "daemon".into(), "restart".into()],
             vec!["cadence".into(), "secret".into(), "ls".into()],
             vec!["cadence".into(), "audit".into(), "approve".into()],
+            vec!["cadence".into(), "audit".into(), "designate".into()],
             vec![
                 "cadence".into(),
                 "master".into(),

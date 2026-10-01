@@ -1,6 +1,10 @@
 //! CAD-826 (CAD-814 slice 1): the per-project delivery policy —
 //! validated, operator-approved data in `<pm>/<key>/PROJECT.md`
-//! frontmatter under a `delivery:` key. Nothing in the delivery loop
+//! frontmatter under a `delivery:` key.
+//! WARNING (CAD-918): `delegated-merge` approvals are evidence only —
+//! their verdict notes are agent-writable — and nothing may enforce on
+//! them until CAD-814 slice 2 lands daemon-attested receipts.
+//! Nothing in the delivery loop
 //! reads it yet (`src/delivery.rs` is unchanged); slice 2 consumes the
 //! resolved policy. This module owns the types, the strict parse, the
 //! defaults (the same constants the loop uses today), the canonical

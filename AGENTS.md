@@ -91,6 +91,14 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   an operator connection (not an agent pane or endpoint):
   `cadence audit approve --pr <n> --head <full-sha> --source "<who decided, where>"`.
   A note or ticket comment is not approval evidence (`docs/AUDIT.md`).
+- **Delegated approval** (CAD-918) when the reviewers class the PR
+  `delegated` (`docs/roles/risk-classes.md`): the agent designated for
+  the project runs, from its own pane,
+  `cadence audit approve --pr <n> --head <full-sha> --delegated --source "<notes>"`.
+  The daemon records it as `delegated:<alias>` only when every safeguard
+  holds, including an allowlist of the paths a PR may touch
+  (`docs/roles/risk-paths.toml`). Triggers 1, 3, 4, 6 and 7 are never delegated. Until the running daemon
+  is built with CAD-918, delegated-class PRs still need the operator.
 
 Record the evidence so that every merge can be audited:
 - The PR title carries the issue id (`CAD-123: …`). A PR without a
@@ -117,7 +125,8 @@ Record the evidence so that every merge can be audited:
   - <blocking / should-fix / nits>
   ```
 
-  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`.
+  For a `human`-class PR, write `Risk: human (<trigger numbers>) — <reason>`;
+  for a `delegated` one, `Risk: delegated (<triggers>)`.
   The `>` header lines must follow the title directly. A bare `Issue:`
   line does not link the note to the ticket. The ticket view takes the
   result from the title, and the audit takes it from the first line

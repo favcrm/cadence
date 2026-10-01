@@ -41,6 +41,7 @@ docs/roles/*
 !docs/design/CONTRACT-TEMPLATE.md
 !docs/roles/risk-classes.md
 !docs/roles/one-review-paths.toml
+!docs/roles/risk-paths.toml
 
 # Operator connection guide is a maintained public CLI contract.
 !docs/guides/

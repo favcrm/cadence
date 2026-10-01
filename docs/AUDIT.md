@@ -263,6 +263,50 @@ to this machine in agent-written markdown are never clickable, and
 there is no failed-login rate limit (a shared budget let an agent lock
 the operator out). These audit verbs do not take the secret yet (ADR 0004 §12, Q7).
 
+**Delegated approvals (CAD-918).** `cadence audit designate` and
+`cadence audit approve --issue <ID> --action scope` are operator-connection
+verbs with the proof above, and the master can never request either. A
+designated agent records `cadence audit approve --delegated` from its own
+pane: the approver is `delegated:<alias>` from `connection_caller`, never
+a flag or field, so the operator, a detached child (`setsid -f`, with or
+without `CADENCE_ALIAS`) and unproven callers are refused. The daemon
+checks the repo against the designated project first, then reads every
+fact through its own `gh` (an absolute path fixed at boot): the PR, its
+diff (an allowlist covers every path, both sides of a rename), and the
+base branch's required check runs, counted only inside a `pull_request`
+run of `.github/workflows/ci.yml` for that head. The verdict notes are
+read by the one reader `cadence audit verdicts` and `scripts/enqueue-reviewed`
+use, `audit::verdicts_in`: its per-note outcome (a note whose title,
+`## Verdict` section and inline `Verdict:` line disagree is a conflict,
+and refuses), its reviewer identity (`reviewer_identity`) for the author,
+approver and distinct-reviewer checks, its Risk word, and its symlink
+skip. It records `action: delegated-merge`,
+`recorded_via: delegated:<alias>`, the two notes' sha256 and reviewer
+aliases, exactly once per `(repo, PR, head)`; after a revoke, that head
+is the operator's alone. No reader counts it as an operator approval:
+`cadence audit approval` (`approval_in_force`, which
+`scripts/enqueue-reviewed` reads) counts only `action == "merge"`, so a
+delegated approval does not satisfy `enqueue-reviewed` yet — consistent
+with evidence only until CAD-814 slice 2.
+
+Residual, stated plainly: the verdict notes are files the agents' uid
+can write. The author or the approver can write both notes, under any
+reviewer names, and the daemon cannot tell. The two-reviewer check
+catches honest mistakes; it is not a security boundary. So delegated
+approvals are evidence only: nothing may drive runtime enforcement
+(CAD-814) from them until daemon-attested receipts (CAD-814 slice 2)
+land. `cadence audit digest` shows both reviewers and whether each note
+still hashes to what was recorded. The operator-proof residual above
+carries over to `designate`.
+
+A second residual: delegable client code (`src/cli/status.rs`,
+`src/cli/overview.rs`, the issue CLI) runs with operator authority
+whenever the operator later runs that command from their own shell. A
+delegated change could add an operator-only RPC call (`approval_designate`,
+`approval_record`, …) there. The path check classifies paths, not code
+content, so the mitigation is review: reviewers must flag any new
+`client::rpc` verb in a delegable file, and such a PR is not delegated.
+
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
 
