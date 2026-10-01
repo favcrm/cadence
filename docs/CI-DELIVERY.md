@@ -60,6 +60,82 @@ The workflow uses read-only repository/Actions permissions and holds no
 production deployment credentials. The rollout owner remains the sole
 installer. A separate staging branch is unnecessary.
 
+## Shared sccache on Cloudflare R2 (CAD-904)
+
+Rust jobs (`clippy`, `test-shard`, `test-once`, `build`, `ui`) can share
+compiled artifacts through an sccache backend on the R2 bucket
+`cadence-ci-sccache` (30-day object expiry). GitHub caches are scoped per
+branch, so merge-queue refs could not read each other's rust-cache; R2 is
+not. rust-cache stays for the registry and git dependencies.
+
+The feature is a strict no-op until the operator adds credentials. With no
+secrets (fork PRs, or before setup) `scripts/ci-sccache enable` exits 0
+without touching the job, `RUSTC_WRAPPER` stays unset and the job compiles
+exactly as before. Any failure after credentials resolve (download, checksum
+mismatch, unreachable bucket, bad token) also fails open to the same state.
+`release-artifact` (the attested build) never uses the cache.
+
+How it works:
+
+- sccache 0.18.0 is pinned by version and archive SHA-256
+  (`.config/sccache.sha256`, same shape as `.config/cargo-nextest.sha256`).
+- Modes: `push` to `main` and `merge_group` get the read-write pair; every
+  other event (PRs, tags, dispatch) gets only the read-only pair, or nothing.
+  Read-only is enforced twice: a read-only bucket-scoped token, and
+  `SCCACHE_S3_RW_MODE=READ_ONLY` (sccache `docs/S3.md`, v0.18.0; the
+  alternative `SCCACHE_S3_NO_CREDENTIALS` means anonymous public access, not
+  read-only, so it is not used).
+- The RW secrets are referenced only behind
+  `(merge_group || push to refs/heads/main) && secrets.X || ''`, and only in
+  jobs whose `environment:` is the same guard selecting `sccache-writer`
+  (empty string, so no environment, on every other event, including `v*`
+  tags). `tests/scripts/test_ci_sccache.py` evaluates that guard for each
+  event and fails if any other path can see an RW secret.
+- Settings: `SCCACHE_BUCKET=cadence-ci-sccache`, `SCCACHE_REGION=auto`,
+  `SCCACHE_ENDPOINT` from the repo variable `SCCACHE_R2_ENDPOINT`,
+  `SCCACHE_S3_KEY_PREFIX=v1/rustc-<version>`, `CARGO_INCREMENTAL=0`.
+  Each job prints `sccache --show-stats` (also in the step summary).
+- Residual risk: the credentials reach later steps through the job
+  environment, so test processes see them. RW exists only on `merge_group`
+  and main pushes, where the code is the reviewed PR content; a PR job holds
+  only the read-only token. Both tokens are scoped to this one bucket.
+
+### Operator setup (once; nothing here is done by the agent)
+
+1. Create two R2 API tokens scoped to the bucket `cadence-ci-sccache`
+   (Cloudflare dashboard, R2, Manage API tokens, "Create API token", specify
+   bucket): one **Object Read & Write**, one **Object Read only**.
+2. Derive each S3 key pair from its token. The dashboard shows both values
+   when you create a token. Otherwise: Access Key ID is the token's `id`
+   (`GET /user/tokens/verify` or the create response), and the Secret Access
+   Key is the lowercase hex SHA-256 of the token value. In a shell (the token
+   stays out of argv):
+   `read -rs TOKEN; printf %s "$TOKEN" | sha256sum | cut -d' ' -f1`.
+3. Settings, Environments, New environment `sccache-writer`. Under
+   Deployment branches and tags choose "Selected branches and tags" and add
+   two patterns: `main` and `gh-readonly-queue/main/*`. Add no tag rule,
+   and no required reviewers (they would stall every queue run).
+4. Add the environment secrets `SCCACHE_R2_RW_ACCESS_KEY_ID` and
+   `SCCACHE_R2_RW_SECRET_ACCESS_KEY` to `sccache-writer`.
+5. Add the repository secrets `SCCACHE_R2_RO_ACCESS_KEY_ID` and
+   `SCCACHE_R2_RO_SECRET_ACCESS_KEY` (Settings, Secrets and variables,
+   Actions, Secrets). Fork PRs never receive them and fall back cleanly.
+6. Add the repository variable `SCCACHE_R2_ENDPOINT` =
+   `https://<account-id>.r2.cloudflarestorage.com`.
+7. Verify: open a PR and read the `sccache` step summary (mode READ_ONLY,
+   hits after the first main run). Then watch the first `merge_group` run.
+   Environment branch rules are evaluated against the queue ref
+   `gh-readonly-queue/main/...`; if the jobs fail with "Branch ... is not
+   allowed to deploy to sccache-writer", correct the pattern in step 3 (the
+   environment is only attached to `merge_group` and main pushes, so PRs are
+   unaffected). To turn the feature off, delete the six values; CI returns to
+   today's behaviour with no workflow change.
+
+Job-level `environment:` does not change which jobs run on which event,
+only whether a deployment record is created for the writer events. The
+environment is created automatically, unprotected and without secrets, the
+first time a main or queue run references it, which is also a no-op.
+
 ## Mutation experiments
 
 Feature-branch pushes no longer trigger the entire ordinary CI suite.

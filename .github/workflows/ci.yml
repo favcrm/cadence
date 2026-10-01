@@ -192,11 +192,15 @@ jobs:
         run: scripts/split-doctor-host --check
       - name: Test shared CI checks remain required and run once
         run: python3 tests/scripts/test_ci_shared_checks.py
+      # CAD-904: RW cache secrets are write-gated and the no-secret path is a no-op.
+      - name: Test shared sccache gating and no-op contract
+        run: python3 tests/scripts/test_ci_sccache.py
 
   clippy:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -204,10 +208,21 @@ jobs:
       # Rust build cache (pinned): dependency artifacts keyed on
       # toolchain + lockfile; final binaries always rebuild from sources.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo clippy --all-targets --locked -- -D warnings
       # CAD-482: the test seam's gated code is dead to a default clippy
       # run — lint the feature-on shape too so it cannot rot.
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   # The suite runs partitioned across shards for wall time (CAD-809):
   # each shard compiles everything (warm rust-cache) and runs the tests
@@ -221,6 +236,7 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     strategy:
       # A shard failure must never hide the others' signal (or their
@@ -337,6 +353,15 @@ jobs:
             echo 'Unit durations are cumulative work, not elapsed critical path or common-module attribution.'
             echo 'Compare later existing steps using their Finished profile log lines; only the first inventory build is captured here.'
           } > "$dir/context.txt"
+      - name: Enable shared sccache (no-op without credentials)
+        if: steps.scope.outputs.mode != 'docs'
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - name: Keep inventory compiler timings
         continue-on-error: true
         if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
@@ -396,6 +421,9 @@ jobs:
             ${{ runner.temp }}/nextest-costs.md
           if-no-files-found: warn
           retention-days: 14
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
   # The proofs that run once, outside the shards: the feature-on suite
   # cannot compile cfg(not(test-seam)) proofs, so the refusal proofs run
   # in the production feature shape, and cargo-nextest intentionally
@@ -406,11 +434,20 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - name: Install pinned cargo-nextest (PR93 dependency)
         env:
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
@@ -430,6 +467,9 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   # Stable required-check name over the shards and the once-only job
   # above: branch protection requires `test`, and downstream gates read
@@ -463,11 +503,20 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo build --release --locked
       - name: Rehearse offline hosted migration with the built CLI
         env:
@@ -510,11 +559,15 @@ jobs:
             exit 1
           fi
           echo "probe ok: --release --features test-seam is refused by the seam's own compile_error"
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   ui:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     defaults:
       run:
@@ -536,8 +589,19 @@ jobs:
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
   # CAD-334: keep the exact tested main build. Runs only on a push to main
   # (never pull_request or merge_group), and only when every gate passed
