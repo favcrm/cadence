@@ -247,7 +247,9 @@ fn read_import_envelope(
     let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Ambiguous)?;
     // MUTANT(witness): the 2xx success gate and the IMPORT_RESPONSE_CAP were
     // removed — a forged ok:true body mints a receipt on ANY status, `data`
-    // need not be present, and an unbounded body is parsed.
+    // need not be present, and an unbounded body is parsed. The cap const is
+    // referenced (discarded) so -D warnings still compiles the witness.
+    let _ = IMPORT_RESPONSE_CAP;
     if envelope.get("ok") == Some(&Value::Bool(true)) {
         return Ok(envelope["data"].clone());
     }
@@ -265,6 +267,9 @@ fn read_import_envelope(
             // MUTANT(witness): the fixed-vocabulary map removed — the
             // untrusted upstream code AND message are echoed verbatim, so a
             // hostile door can leak a credential/URL/text into the refusal.
+            // `import_refusal` is still a live fn: call and discard it so the
+            // file compiles under -D warnings (a compile error is not a red).
+            let _ = import_refusal(code);
             let message = envelope
                 .get("error")
                 .and_then(|error| error.get("message"))
