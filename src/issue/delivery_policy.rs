@@ -112,8 +112,11 @@ pub struct RiskRule {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskWhen {
-    /// Repo-relative path globs (`*`, `**`, `?`); slice 3 owns
-    /// matching, this slice only validates the syntax.
+    /// Repo-relative, file-level globs — the same grammar as the
+    /// `areas:` reader and `paths=` ([`crate::issue::areas::check_path`]):
+    /// `*` and `?` match inside one segment, a `**` segment any number,
+    /// a trailing `/` everything under it. Slice 3 matches them with
+    /// `areas::matches`, so the two grammars must agree.
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -189,7 +192,13 @@ struct RawSize {
 }
 
 fn err(msg: impl std::fmt::Display) -> Error {
-    Error::rejected(format!("PROJECT.md delivery: {msg}"))
+    // Rejected section text is embedded in these messages; scrub it so
+    // a control character or a bidi/format mark can never reach a lint
+    // warning or a `project ls` note.
+    Error::rejected(format!(
+        "PROJECT.md delivery: {}",
+        crate::issue::areas::scrub(&format!("{msg}"))
+    ))
 }
 
 impl RawReview {
@@ -197,7 +206,7 @@ impl RawReview {
         let refused = |key: &str, has: &Option<String>| -> Result<()> {
             if has.is_some() {
                 return Err(err(format!(
-                    "reviews.{name}: a '{}' review takes no '{key}'",
+                    "reviews.{name:?}: a {:?} review takes no '{key}'",
                     self.kind
                 )));
             }
@@ -208,11 +217,13 @@ impl RawReview {
                 refused("app", &self.app)?;
                 refused("mode", &self.mode)?;
                 let focus = self.focus.ok_or_else(|| {
-                    err(format!("reviews.{name}: an 'agent' review needs a 'focus'"))
+                    err(format!(
+                        "reviews.{name:?}: an 'agent' review needs a 'focus'"
+                    ))
                 })?;
                 if !FOCI.contains(&focus.as_str()) {
                     return Err(err(format!(
-                        "reviews.{name}.focus '{focus}': not a known focus ({})",
+                        "reviews.{name:?}.focus {focus:?}: not a known focus ({})",
                         FOCI.join(", ")
                     )));
                 }
@@ -221,25 +232,27 @@ impl RawReview {
             "check" => {
                 refused("focus", &self.focus)?;
                 let app = self.app.ok_or_else(|| {
-                    err(format!("reviews.{name}: a 'check' review needs an 'app'"))
+                    err(format!("reviews.{name:?}: a 'check' review needs an 'app'"))
                 })?;
                 if !valid_app(&app) {
                     return Err(err(format!(
-                        "reviews.{name}.app '{app}': not a GitHub App slug \
+                        "reviews.{name:?}.app {app:?}: not a GitHub App slug \
                          (^[a-z0-9][a-z0-9-]{{0,99}}$) or an App id (all digits)"
                     )));
                 }
                 let mode = match self.mode.as_deref() {
                     None => {
                         return Err(err(format!(
-                            "reviews.{name}: a 'check' review needs a 'mode' \
+                            "reviews.{name:?}: a 'check' review needs a 'mode' \
                              (advisory|required)"
                         )))
                     }
                     Some("advisory") => CheckMode::Advisory,
                     Some("required") => CheckMode::Required,
                     Some(m) => {
-                        return Err(err(format!("reviews.{name}.mode '{m}': advisory|required")))
+                        return Err(err(format!(
+                            "reviews.{name:?}.mode {m:?}: advisory|required"
+                        )))
                     }
                 };
                 Ok(Review::Check { app, mode })
@@ -251,7 +264,7 @@ impl RawReview {
                 Ok(Review::Operator)
             }
             other => Err(err(format!(
-                "reviews.{name}.kind '{other}': unknown kind (agent|check|operator)"
+                "reviews.{name:?}.kind {other:?}: unknown kind (agent|check|operator)"
             ))),
         }
     }
@@ -341,8 +354,12 @@ pub fn parse(text: &str) -> Result<Option<DeliveryPolicy>> {
         return Ok(None);
     }
     let (yaml, _) = parse::split_front(trimmed)?;
-    let front: Front = serde_yaml::from_str(yaml)
-        .map_err(|e| Error::rejected(format!("PROJECT.md frontmatter: {e}")))?;
+    let front: Front = serde_yaml::from_str(yaml).map_err(|e| {
+        Error::rejected(format!(
+            "PROJECT.md frontmatter: {}",
+            crate::issue::areas::scrub(&e.to_string())
+        ))
+    })?;
     let Some(value) = front.delivery else {
         return Ok(None);
     };
@@ -549,30 +566,23 @@ fn valid_app(app: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A `when.paths` entry: a repo-relative glob — non-empty, no leading
-/// `/`, no `..` segment, no `\`, no control characters and none of
-/// `[` `]` `{` `}`; `*`, `**` and `?` are the only wildcards (slice 3
-/// owns their semantics).
+/// A `when.paths` entry: the same repo-relative, file-level glob
+/// grammar `areas:` and `paths=` use — slice 3 matches with
+/// `areas::matches`, so the two must accept exactly the same strings.
+/// On top of that, an entry carrying a control or format mark is
+/// refused outright: its text would be scrubbed on display anyway,
+/// never a valid glob.
 fn check_glob(path: &str) -> Result<()> {
-    // Callers add the `PROJECT.md delivery:` prefix (and the rule index).
-    let bad = |msg: &str| Error::rejected(format!("when.paths entry '{path}': {msg}"));
-    if path.is_empty() {
-        return Err(bad("empty"));
-    }
-    if path.starts_with('/') {
-        return Err(bad("absolute — paths are repo-relative"));
-    }
-    if path.contains('\\') {
-        return Err(bad("a '\\' — repo-relative paths use '/'"));
-    }
-    if path.chars().any(|c| c.is_control()) {
-        return Err(bad("a control character"));
-    }
-    if path.contains('[') || path.contains(']') || path.contains('{') || path.contains('}') {
-        return Err(bad("only '*', '**' and '?' wildcards are allowed"));
-    }
-    if path.split('/').any(|seg| seg == "..") {
-        return Err(bad("a '..' segment"));
+    crate::issue::areas::check_path(path).map_err(|e| {
+        Error::rejected(format!(
+            "when.paths {}",
+            crate::issue::areas::scrub(&e.to_string())
+        ))
+    })?;
+    if crate::issue::areas::scrub(path) != path {
+        return Err(Error::rejected(format!(
+            "when.paths entry {path:?} carries a control or format mark"
+        )));
     }
     Ok(())
 }
@@ -586,7 +596,7 @@ impl DeliveryPolicy {
         }
         for name in self.reviews.keys() {
             if !model::valid_tag(name) {
-                return Err(err(format!("reviews.{name}: not a valid name")));
+                return Err(err(format!("reviews.{name:?}: not a valid name")));
             }
         }
         if self.risk.is_empty() {
@@ -602,17 +612,17 @@ impl DeliveryPolicy {
             let mut seen = std::collections::HashSet::new();
             for req in &rule.require {
                 if !seen.insert(req) {
-                    return Err(err(format!("risk[{i}].require names '{req}' twice")));
+                    return Err(err(format!("risk[{i}].require names {req:?} twice")));
                 }
                 match self.reviews.get(req) {
                     None => {
                         return Err(err(format!(
-                            "risk[{i}].require names undefined review '{req}'"
+                            "risk[{i}].require names undefined review {req:?}"
                         )))
                     }
                     Some(r) if !r.blocking() => {
                         return Err(err(format!(
-                            "risk[{i}].require names '{req}', an advisory check — \
+                            "risk[{i}].require names {req:?}, an advisory check — \
                              advisory reviews never block: use mode: required or drop \
                              it from require"
                         )))
@@ -622,7 +632,15 @@ impl DeliveryPolicy {
             }
             match &rule.when {
                 None => {
-                    if rule.require.iter().any(|r| self.reviews[r].blocking()) {
+                    // The floor is a human-or-peer gate: only an agent
+                    // or operator review counts — a `check` is a bot
+                    // and never satisfies it, even `mode: required`
+                    // (which still blocks where a rule names it).
+                    if rule
+                        .require
+                        .iter()
+                        .any(|r| matches!(self.reviews[r], Review::Agent { .. } | Review::Operator))
+                    {
                         floor = true;
                     }
                 }
@@ -653,7 +671,8 @@ impl DeliveryPolicy {
         if !floor {
             return Err(err(
                 "risk must hold one unconditional rule (no `when`) whose require \
-                 includes a blocking review (agent, operator or a required check)",
+                 includes an agent or operator review — a bot check never \
+                 satisfies the floor",
             ));
         }
         if !(1..=10).contains(&self.max_revise) {
@@ -908,7 +927,7 @@ mod tests {
             ),
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [nope]}]}",
-                "undefined review 'nope'",
+                "undefined review \"nope\"",
             ),
             // 7: require may not name an advisory check.
             (
@@ -935,12 +954,12 @@ mod tests {
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['']}, require: [r]}]}",
-                "'': empty",
+                "is empty",
             ),
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['/abs']}, require: [r]}]}",
-                "absolute",
+                "relative to the repo root",
             ),
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
@@ -950,17 +969,7 @@ mod tests {
             (
                 "delivery: {reviews: {r: {kind: operator}}, \
                            risk: [{require: [r]}, {when: {paths: ['a\\\\b']}, require: [r]}]}",
-                "a '\\'",
-            ),
-            (
-                "delivery: {reviews: {r: {kind: operator}}, \
-                           risk: [{require: [r]}, {when: {paths: ['a[bc]']}, require: [r]}]}",
-                "wildcards",
-            ),
-            (
-                "delivery: {reviews: {r: {kind: operator}}, \
-                           risk: [{require: [r]}, {when: {paths: ['a{b}']}, require: [r]}]}",
-                "wildcards",
+                "backslash",
             ),
             (
                 // A control character (a tab) in a path entry.
@@ -968,7 +977,7 @@ mod tests {
                            risk: [{require: [r]}, {when: {paths: [\"a\\tb\"]}, require: [r]}]}",
                 "a control character",
             ),
-            // 9: the safety floor — no unconditional blocking require.
+            // 9: the safety floor — an unconditional rule must require an agent or operator review.
             (
                 "delivery: {reviews: {r: {kind: agent, focus: general}}, \
                            risk: [{when: {paths: [a]}, require: [r]}]}",
@@ -978,6 +987,20 @@ mod tests {
                 "delivery: {reviews: {r: {kind: operator}, d: {kind: check, app: a, mode: required}}, \
                            risk: [{when: {paths: [x]}, require: [d]}]}",
                 "unconditional rule",
+            ),
+            // The floor needs an agent or operator review — a bot
+            // check never satisfies it, even `required`: alone
+            // unconditionally, or beside a conditional agent rule.
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, \
+                           risk: [{require: [c]}]}",
+                "a bot check never satisfies the floor",
+            ),
+            (
+                "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                           r: {kind: agent, focus: general}}, \
+                           risk: [{require: [c]}, {when: {lines_over: 1}, require: [r]}]}",
+                "a bot check never satisfies the floor",
             ),
             // 10: max_revise in 1..=10.
             (
@@ -1024,16 +1047,108 @@ mod tests {
             assert!(e.contains(why), "{yaml} -> {e}");
             assert!(e.starts_with("PROJECT.md delivery:"), "{yaml} -> {e}");
         }
-        // …and the floor accepts an agent, an operator or a required
-        // check; `?`, `*` and `**` are all legal wildcards.
+        // …and the floor accepts an agent or an operator — a required
+        // check may join them, but never stands alone.
         for yaml in [
             "delivery: {reviews: {g: {kind: operator}}, risk: [{require: [g]}]}",
-            "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}}, risk: [{require: [c]}]}",
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, risk: [{require: [r]}]}",
+            "delivery: {reviews: {c: {kind: check, app: '12345', mode: required}, \
+                        r: {kind: agent, focus: general}}, risk: [{require: [c, r]}]}",
             "delivery: {reviews: {r: {kind: agent, focus: general}}, \
-                       risk: [{require: [r]}, {when: {paths: ['a?b', '**', 'x/**/y']}, require: [r]}]}",
+                       risk: [{require: [r]}, {when: {paths: ['**', 'x/**/y']}, require: [r]}]}",
         ] {
             assert!(parse_delivery(yaml).unwrap().is_some(), "{yaml}");
         }
+    }
+
+    /// `when.paths` uses the same file-level glob grammar as `areas:`
+    /// and `paths=` — slice 3 matches with `areas::matches`, so both
+    /// must accept exactly the same strings.
+    #[test]
+    fn paths_use_the_areas_glob_grammar() {
+        let accepted = [
+            "src/**", "**/x.rs", "src/*.rs", "a/**/b", "*", "**", "a?b", "ui/",
+        ];
+        let refused = [
+            ("", "is empty"),
+            ("/abs", "relative to the repo root"),
+            ("~/x", "relative to the repo root"),
+            ("a//b", "empty, '.' or '..' segment"),
+            ("a/./b", "empty, '.' or '..' segment"),
+            ("a/../b", "empty, '.' or '..' segment"),
+            ("a\\b", "backslash"),
+            ("a,b", "comma"),
+            ("a#sym", "names a symbol"),
+        ];
+        let parse_paths = |paths: &str| {
+            parse_delivery(&format!(
+                "delivery: {{reviews: {{r: {{kind: agent, focus: general}}}}, \
+                 risk: [{{require: [r]}}, {{when: {{paths: [{paths}]}}, require: [r]}}]}}"
+            ))
+        };
+        for path in accepted {
+            assert!(
+                parse_paths(&format!("'{path}'")).unwrap().is_some(),
+                "{path}"
+            );
+        }
+        for (path, why) in refused {
+            let e = parse_paths(&format!("'{path}'")).unwrap_err().to_string();
+            assert!(e.contains(why), "{path} -> {e}");
+        }
+        // `check_glob` and `areas::check_path` agree on every entry.
+        for path in accepted
+            .iter()
+            .copied()
+            .chain(refused.iter().map(|(p, _)| *p))
+        {
+            assert_eq!(
+                check_glob(path).is_ok(),
+                crate::issue::areas::check_path(path).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    /// Rejected text never reaches an error raw — control characters
+    /// and bidi/format marks (U+202E & co) are scrubbed from every
+    /// error a section can produce. YAML refuses raw control
+    /// characters at the lexer, so the direct `check_glob`/`validate`
+    /// calls stand in for the file path.
+    #[test]
+    fn rejected_text_is_scrubbed_in_errors() {
+        let e = check_glob("a\u{7}b").unwrap_err().to_string();
+        assert!(e.contains("a control character"), "{e}");
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // A bidi mark in a paths entry is refused, unechoed.
+        let e = check_glob("a\u{202E}b").unwrap_err().to_string();
+        assert!(!e.contains('\u{202E}'), "{e:?}");
+        assert!(e.chars().all(|c| !c.is_control()), "{e:?}");
+        // A review name carrying a control or bidi character scrubs the
+        // same.
+        for name in ["r\u{7}", "r\u{202E}"] {
+            let mut p = default_policy();
+            p.reviews.insert(
+                name.to_string(),
+                Review::Agent {
+                    focus: "general".into(),
+                },
+            );
+            let e = p.validate().unwrap_err().to_string();
+            assert!(e.chars().all(|c| !c.is_control()), "{name:?}: {e:?}");
+            assert!(!e.contains('\u{202E}'), "{name:?}: {e:?}");
+        }
+        // And serde_yaml's own echo of a rejected key is scrubbed.
+        let e = parse_delivery(
+            "delivery: {reviews: {r: {kind: agent, focus: general}}, \
+             risk: [{require: [r]}], bogus\u{7}: 1}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'),
+            "{e:?}"
+        );
     }
 
     #[test]
