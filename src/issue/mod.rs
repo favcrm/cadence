@@ -660,6 +660,39 @@ fn leader_exited(group: i32) -> bool {
     }
 }
 
+/// The commit's own process group is out of reach of group signals sent
+/// to the daemon, so a SIGKILLed daemon would leave it running to land a
+/// late `cadence flush on stop` carrying an old lease epoch. Ask the
+/// kernel to kill it with its parent (Linux), and exit at once if the
+/// parent already died before the request took effect.
+///
+/// Residual: `PR_SET_PDEATHSIG` fires when the spawning THREAD exits,
+/// which here is the flush worker — alive for the whole commit. On other
+/// platforms (macOS) there is no equivalent and a crash can orphan the
+/// commit; the successor's lease epoch still orders it, but the commit
+/// itself is not prevented.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run
+    // between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
+
 /// [`git`] that the owning thread polls against `cancel` AND the lease:
 /// a lost lease or one with less than the lease's [`commit_floor`](crate::lease::PmLease::commit_floor) of validity
 /// left cancels the commit like an explicit cancel. The child runs in
@@ -693,6 +726,7 @@ fn git_cancellable(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    die_with_parent(&mut cmd);
     let mut child = crate::reaper::spawn(&mut cmd)
         .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     let drain = |pipe: Option<Box<dyn Read + Send>>| {

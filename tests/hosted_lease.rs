@@ -680,11 +680,13 @@ fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
     use cadence_agent::lease::{FileProvider, Provider};
     suite_slot();
     let dir = TempDir::new().unwrap();
-    let pm_dir = hosted_pm(dir.path(), 5, 1);
+    // TTL 10 / renew 1: validity stays near 10s, far above the 2s commit
+    // floor even when renewals lag on a loaded host.
+    let pm_dir = hosted_pm(dir.path(), 10, 1);
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let marks = park_commit_hook(&pm_dir, false);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut opts = leased_opts(dir.path(), 5);
+    let mut opts = leased_opts(dir.path(), 10);
     opts.stop = Some(stop.clone());
     opts.flush_budget_for_test = Some(Duration::from_secs(120));
     opts.provider_deployments =
@@ -692,6 +694,19 @@ fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
     let d = TestDaemon::start_opts(opts);
     std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
     git(&pm_dir, &["add", "pending.md"]);
+    // Request the stop only while the lease has ample validity, so the
+    // commit is admitted before any floor could matter.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        if body["expires_unix"].as_f64().unwrap_or(0.0) - now_unix() > 3.5 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lease never showed headroom");
+        thread::sleep(Duration::from_millis(10));
+    }
     stop.store(true, Ordering::SeqCst);
     wait_entered(marks.path());
     // Wedge renewal: the heartbeat fails closed and the lease lapses.
@@ -701,9 +716,9 @@ fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
         .open(dir.path().join("lease.json.lock"))
         .unwrap();
     assert_eq!(unsafe { libc::flock(wedged.as_raw_fd(), libc::LOCK_EX) }, 0);
-    thread::sleep(Duration::from_secs(6));
+    thread::sleep(Duration::from_secs(11));
     drop(wedged);
-    let successor = FileProvider::new(lease_file(dir.path()), Duration::from_secs(5))
+    let successor = FileProvider::new(lease_file(dir.path()), Duration::from_secs(10))
         .acquire("successor", 0)
         .expect("the lapsed lease is takeable");
     assert!(successor.epoch.unwrap_or(0) >= 2, "{successor:?}");
@@ -766,6 +781,39 @@ fn cad694_short_margin_lease_still_flushes_on_stop() {
     let log = git(&pm_dir, &["log", "-1", "--format=%B"]);
     assert!(log.contains("cadence flush on stop"), "{log}");
     assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "");
+}
+
+/// CAD-694: the crash path. A daemon SIGKILLed mid-flush leaves its
+/// `git commit` child (own process group, out of reach of group
+/// signals) running; it would land `cadence flush on stop` with the OLD
+/// lease epoch long after the write was declared interrupted. The child
+/// must die with its parent: SIGKILL the daemon while the commit is
+/// parked in a hook, release the hook, and nothing may land.
+#[test]
+fn cad694_sigkilled_daemon_does_not_leave_an_orphan_commit() {
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 30, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let marks = park_commit_hook(&pm_dir, false);
+    let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    d.register("w1");
+    d.wait_agent("w1", "idle", 15);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    let pid = d.process.as_ref().unwrap().id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    wait_entered(marks.path());
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = d.process.as_mut().unwrap().wait();
+    // The hook is released only after the daemon is dead.
+    std::fs::write(marks.path().join("release"), "").unwrap();
+    thread::sleep(Duration::from_secs(2));
+    let log = git(&pm_dir, &["log", "--format=%B", "-3"]);
+    assert!(
+        !log.contains("cadence flush on stop"),
+        "an orphaned flush commit landed after its daemon was killed: {log}"
+    );
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
 }
 
 /// CAD-694 (r4 B5): the exit decision itself. A real, non-retryable
