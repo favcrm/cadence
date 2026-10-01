@@ -340,15 +340,17 @@ It is `workflow_dispatch` only, read-only, and restores (never saves) the
 `gate-test` rust-cache with the read-only sccache key.
 
 ```sh
-gh workflow run stress.yml -R favcrm/cadence \
-  -f ref=<branch-or-sha> -f filter='test(=my_flaky_test)' \
+gh workflow run stress.yml -R favcrm/cadence --ref <branch> \
+  -f filter='test(=my_flaky_test)' \
   -f features=test-seam -f count=30 -f copies=4 -f load=true -f stop_on_fail=false
 gh run list -R favcrm/cadence --workflow stress.yml --limit 1
 gh run watch <run-id> -R favcrm/cadence --exit-status
 gh run download <run-id> -R favcrm/cadence --pattern 'stress-failures-*'
 ```
 
-`count` is 1-200 and `copies` is 1-8. `load=true` runs a bounded CPU burner
+The code under test is the dispatched `--ref` (the workflow runs from that branch,
+so the branch must contain `stress.yml`). `count` is 1-200 and `copies` is 1-8; each copy
+has a 120-minute cap, so size `count` to fit. `load=true` runs a bounded CPU burner
 beside the tests. Each copy writes passed/failed counts to the run summary, and
 the failing iterations' output is the `stress-failures-*` artifact.
 

@@ -4,18 +4,18 @@ name: stress
 # flake loops leave the shared host. Manual dispatch only: this workflow must
 # never run on pull_request, merge_group or push (tests/scripts/test_ci_stress.py).
 #
-#   gh workflow run stress.yml -f ref=<branch-or-sha> -f filter='test(=name)' \
+#   gh workflow run stress.yml --ref <branch> -f filter='test(=name)' \
 #     -f count=30 -f copies=4 -f load=true
+#
+# The code under test is the dispatched ref itself (github.sha), so the code
+# and the cache scope are both the branch's. A worst-case dispatch is 8 copies
+# x 120 minutes; keep count x iteration time inside that cap.
 #
 # Every copy builds once, then runs the filter `count` times with retries 0
 # (scripts/cadence-nextest pins the cadence profile and zero retries).
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: Branch, tag or full SHA to check out
-        type: string
-        required: true
       filter:
         description: cargo-nextest filterset expression, for example 'test(=name)'
         type: string
@@ -49,6 +49,13 @@ on:
 permissions:
   contents: read
 
+# Same as ci.yml: rust-cache hashes every CARGO*/RUST* variable into its
+# restore key and sccache hashes the rustc flags, so these must match for the
+# gate-test cache and the shared sccache to hit.
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -65,7 +72,6 @@ jobs:
           COPIES: ${{ inputs.copies }}
           FEATURES: ${{ inputs.features }}
           FILTER: ${{ inputs.filter }}
-          REF: ${{ inputs.ref }}
         run: |
           set -eu
           case "$COUNT" in ''|*[!0-9]*) echo "count must be an integer 1-200" >&2; exit 1 ;; esac
@@ -76,11 +82,12 @@ jobs:
           if [ "${#COPIES}" -gt 1 ] || [ "$COPIES" -lt 1 ] || [ "$COPIES" -gt 8 ]; then
             echo "copies must be 1-8, got $COPIES" >&2; exit 1
           fi
-          if ! printf '%s' "$FEATURES" | grep -Eq '^[A-Za-z0-9_,/:.-]*$'; then
-            echo "features may hold only letters, digits and _ , / : . -" >&2; exit 1
-          fi
-          if [ -z "$FILTER" ] || [ -z "$REF" ]; then
-            echo "ref and filter are required" >&2; exit 1
+          # An empty features value is allowed (no --features flag is passed).
+          case "$FEATURES" in
+            *[!A-Za-z0-9_,/:.-]*) echo "features may hold only letters, digits and _ , / : . -" >&2; exit 1 ;;
+          esac
+          if [ -z "$FILTER" ]; then
+            echo "filter is required" >&2; exit 1
           fi
           matrix=$(seq 1 "$COPIES" | paste -sd, -)
           echo "copies=[$matrix]" >> "$GITHUB_OUTPUT"
@@ -88,7 +95,7 @@ jobs:
   stress:
     needs: [plan]
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 120
     strategy:
       # One copy's failure must never hide the others' counts.
       fail-fast: false
@@ -97,7 +104,6 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       # Restore only: a stress run must never write the shared cache.
@@ -120,8 +126,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
@@ -144,7 +148,7 @@ jobs:
           FILTER: ${{ inputs.filter }}
         run: |
           set -eu
-          scripts/cadence-nextest list --locked --features "$FEATURES" -E "$FILTER" --message-format oneline > "$RUNNER_TEMP/selected.txt"
+          scripts/cadence-nextest list --locked ${FEATURES:+--features "$FEATURES"} -E "$FILTER" --message-format oneline > "$RUNNER_TEMP/selected.txt"
           if [ ! -s "$RUNNER_TEMP/selected.txt" ]; then
             echo "filter selects no tests" >&2; exit 1
           fi
@@ -155,7 +159,7 @@ jobs:
           set -eu
           : > "$RUNNER_TEMP/burner.pids"
           for _ in $(seq 1 "$(nproc)"); do
-            setsid timeout 18000 sh -c 'while :; do :; done' > /dev/null 2>&1 &
+            setsid timeout 7000 sh -c 'while :; do :; done' > /dev/null 2>&1 &
             echo $! >> "$RUNNER_TEMP/burner.pids"
           done
       - name: Run the filter in a loop
@@ -179,7 +183,10 @@ jobs:
           i=1
           while [ "$i" -le "$COUNT" ]; do
             log="$RUNNER_TEMP/iter-$i.log"
-            if scripts/cadence-nextest --locked --features "$FEATURES" -E "$FILTER" > "$log" 2>&1; then
+            # A failing iteration that writes no report must not inherit the
+            # previous iteration's.
+            rm -f target/nextest/cadence/junit.xml
+            if scripts/cadence-nextest --locked ${FEATURES:+--features "$FEATURES"} -E "$FILTER" > "$log" 2>&1; then
               pass=$((pass + 1))
             else
               fail=$((fail + 1))
@@ -188,20 +195,37 @@ jobs:
             fi
             rm -f "$log"
             ran=$i
+            # Counts are persisted every iteration so a timeout or cancel
+            # still reports them (see the always() summary step).
+            printf '%s %s %s\n' "$ran" "$pass" "$fail" > "$RUNNER_TEMP/stress-counts"
             if [ "$fail" -gt 0 ] && [ "$STOP_ON_FAIL" = true ]; then
               break
             fi
             i=$((i + 1))
           done
+          echo "failed=$fail" >> "$GITHUB_OUTPUT"
+          [ "$fail" -eq 0 ]
+      - name: Summarize this copy
+        if: ${{ always() }}
+        env:
+          COUNT: ${{ inputs.count }}
+          COPY: ${{ matrix.copy }}
+          FILTER: ${{ inputs.filter }}
+          LOAD: ${{ inputs.load }}
+        run: |
+          set -u
+          ran=0 pass=0 fail=0
+          if [ -s "$RUNNER_TEMP/stress-counts" ]; then
+            read -r ran pass fail < "$RUNNER_TEMP/stress-counts"
+          fi
+          safe=$(printf '%s' "$FILTER" | sed -e 's/[|`]/\\&/g')
           {
             echo "### stress copy $COPY"
             echo
             echo "| copy | iterations run | requested | passed | failed | load | filter |"
             echo "| --- | --- | --- | --- | --- | --- | --- |"
-            printf '| %s | %s | %s | %s | %s | %s | `%s` |\n' "$COPY" "$ran" "$COUNT" "$pass" "$fail" "$LOAD" "$FILTER"
+            printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$COPY" "$ran" "$COUNT" "$pass" "$fail" "$LOAD" "$safe"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "failed=$fail" >> "$GITHUB_OUTPUT"
-          [ "$fail" -eq 0 ]
       - name: Stop the CPU burner
         if: ${{ always() && inputs.load }}
         run: |
