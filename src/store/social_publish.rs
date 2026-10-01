@@ -719,14 +719,7 @@ impl Store {
         // foreign connection or digest is refused here at freeze (send-time
         // `check_material` remains a second layer). The workspace comes from
         // the same frozen binding config.
-        if let Some(key) = row.media_key {
-            use crate::platform::agenticos_external::publish as device;
-            // v9: the key's `parts[2]` is the remote AOS `connectionId` —
-            // validate connection+digest against the resolved wire id, not
-            // the local custody `connection_id`. The workspace (`parts[1]`)
-            // is the send credential's upstream workspace which Cadence
-            // never asserts locally — enforced upstream at mint/grant
-            // (`SendGrant.authorize` `cross_workspace`), not here.
+        if let Some(_key) = row.media_key {
             // WITNESS MUTANT (isolated, not the real fix): drop the
             // freeze-time connection+digest authorization — a media_key for
             // a foreign AOS connection freezes anyway.

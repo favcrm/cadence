@@ -588,6 +588,7 @@ impl MediaResolver {
             .collect();
         // WITNESS MUTANT (isolated): trust any/first row — no exactly-one
         // enforcement, so 0/multiple/cap-100 cases all "resolve".
+        let _ = &matches;
         let picked = rows
             .first()
             .map(|r| r.connection_id.clone())
