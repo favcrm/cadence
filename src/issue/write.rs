@@ -1258,7 +1258,7 @@ pub fn mark_done_on_merge(
     let result = (|| -> Result<Option<String>> {
         let Some(_lock) = pm.try_lock()? else {
             return Err(Error::rejected(
-                "the tracker is locked by another writer (.write.lock)",
+                "the tracker is locked by another writer (write lock)",
             ));
         };
         let (_project, dir) = issue_dir(pm, id)?;

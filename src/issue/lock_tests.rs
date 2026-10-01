@@ -80,7 +80,10 @@ fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
     let child = cmd.spawn().unwrap();
     let start = Instant::now();
     while !ready.exists() {
-        assert!(start.elapsed() < Duration::from_secs(20), "writer not ready");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "writer not ready"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     (child, ready)
@@ -112,7 +115,10 @@ fn sigkilled_writer_does_not_block_the_next_writer() {
     assert!(pm.try_lock().unwrap().is_none(), "live writer must block");
     sigkill(child);
     let got = poll_try_lock(&pm, Duration::from_secs(3)).unwrap();
-    assert!(got.is_some(), "the next writer must be admitted after SIGKILL");
+    assert!(
+        got.is_some(),
+        "the next writer must be admitted after SIGKILL"
+    );
     drop(got);
     // And the id allocator still works afterwards.
     assert_eq!(mk(&pm, pm.dir.parent().unwrap(), "after"), "CAD-1");
@@ -193,9 +199,16 @@ fn a_legacy_existence_lock_fails_closed_and_is_left_alone() {
     std::fs::write(&legacy, "").unwrap();
     assert!(pm.try_lock().unwrap().is_none());
     let start = Instant::now();
-    let e = pm.lock().err().unwrap().to_string();
+    let e = pm
+        .lock_for(Duration::from_millis(300))
+        .err()
+        .unwrap()
+        .to_string();
     assert!(start.elapsed() < Duration::from_secs(20));
-    assert!(e.contains("legacy"), "diagnostic must name the legacy lock: {e}");
+    assert!(
+        e.contains("legacy"),
+        "diagnostic must name the legacy lock: {e}"
+    );
     assert!(!e.contains("only if the holder is gone"), "{e}");
     assert!(legacy.exists(), "the legacy lock must never be removed");
     assert_eq!(std::fs::read(&legacy).unwrap(), b"");
@@ -232,12 +245,10 @@ fn a_crashed_writers_staged_work_is_refused_not_committed() {
     let head = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
     let (child, _) = spawn_writer(&pm, "hold_dirty", false);
     sigkill(child);
-    let e = loop {
-        match poll_try_lock(&pm, Duration::from_secs(3)) {
-            Err(e) => break e.to_string(),
-            Ok(Some(_)) => panic!("a crashed writer's staged index was admitted"),
-            Ok(None) => panic!("lock never freed after SIGKILL"),
-        }
+    let e = match poll_try_lock(&pm, Duration::from_secs(3)) {
+        Err(e) => e.to_string(),
+        Ok(Some(_)) => panic!("a crashed writer's staged index was admitted"),
+        Ok(None) => panic!("lock never freed after SIGKILL"),
     };
     assert!(e.contains("interrupted"), "{e}");
     assert!(e.contains("crashed/issue.md"), "{e}");
@@ -283,5 +294,64 @@ fn a_tripped_lease_stops_a_writer_waiting_for_the_lock() {
     drop(held);
     let e = e.expect("a revoked waiter must not be admitted");
     assert!(e.contains("lease"), "{e}");
-    assert!(start.elapsed() < Duration::from_secs(5), "waited out the lock");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "waited out the lock"
+    );
+}
+
+#[test]
+fn lock_state_tells_held_free_legacy_and_io_unknown_apart() {
+    let (_tmp, pm) = tracker();
+    assert_eq!(pm.lock_state(), LockState::Free);
+    let held = pm.lock().unwrap();
+    assert_eq!(pm.lock_state(), LockState::Held);
+    drop(held);
+    assert_eq!(pm.lock_state(), LockState::Free);
+    std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    assert_eq!(pm.lock_state(), LockState::LegacyUnknown);
+    // Forged "owner" content in a legacy file is still unknown.
+    std::fs::write(pm.dir.join(".write.lock"), "pid 1 age 999999\n").unwrap();
+    assert_eq!(pm.lock_state(), LockState::LegacyUnknown);
+    std::fs::remove_file(pm.dir.join(".write.lock")).unwrap();
+    std::fs::remove_file(pm.dir.join(".git/cadence-write.flock")).ok();
+    std::os::unix::fs::symlink("/nonexistent", pm.dir.join(".git/cadence-write.flock")).unwrap();
+    assert!(matches!(pm.lock_state(), LockState::IoUnknown(_)));
+}
+
+#[test]
+fn a_crash_after_commit_leaves_a_clean_tracker_the_next_writer_reuses() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold", false);
+    sigkill(child);
+    // The stale marker names no interrupted write: clean git state.
+    assert!(pm.dir.join(".write.lock").exists());
+    assert!(poll_try_lock(&pm, Duration::from_secs(3))
+        .unwrap()
+        .is_some());
+    assert!(!pm.dir.join(".write.lock").exists(), "released cleanly");
+}
+
+#[test]
+fn a_waiting_writer_is_admitted_when_the_holder_dies() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold", false);
+    let got = std::thread::scope(|s| {
+        let w = s.spawn(|| pm.lock_for(Duration::from_secs(10)).is_ok());
+        std::thread::sleep(Duration::from_millis(300));
+        sigkill(child);
+        w.join().unwrap()
+    });
+    assert!(got);
+}
+
+#[test]
+fn doctor_reports_the_write_lock_state() {
+    let (_tmp, pm) = tracker();
+    let r = crate::issue::doctor::run(&pm).unwrap();
+    assert_eq!(r["write_lock"]["state"], "free", "{r}");
+    std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    let r = crate::issue::doctor::run(&pm).unwrap();
+    assert_eq!(r["write_lock"]["state"], "legacy_unknown", "{r}");
+    assert_eq!(r["ok"], false, "{r}");
 }

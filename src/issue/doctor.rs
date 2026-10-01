@@ -183,7 +183,15 @@ pub fn run(pm: &Pm) -> Result<Value> {
         .unwrap_or(true);
     let foreign = foreign_dirty(&pm.dir);
     let foreign_ok = foreign["ok"] == true;
-    let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok;
+    let (lock_kind, lock_ok) = match pm.lock_state() {
+        crate::issue::LockState::Held => ("held", true),
+        crate::issue::LockState::Free => ("free", true),
+        crate::issue::LockState::LegacyUnknown => ("legacy_unknown", false),
+        crate::issue::LockState::IoUnknown(_) => ("io_unknown", false),
+    };
+    let write_lock =
+        json!({"ok": lock_ok, "state": lock_kind, "detail": pm.lock_state().to_string()});
+    let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok && lock_ok;
     Ok(json!({
         "ok": ok,
         "pm_dir": pm.dir,
@@ -199,6 +207,7 @@ pub fn run(pm: &Pm) -> Result<Value> {
         "push_failures": git_dir.as_deref().map(push_failures).unwrap_or(Value::Null),
         "trailers": trailer_share(&pm.dir),
         "foreign": foreign,
+        "write_lock": write_lock,
     }))
 }
 
