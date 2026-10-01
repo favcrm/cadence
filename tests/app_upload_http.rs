@@ -163,7 +163,10 @@ fn cad996_upload_requires_operator_only_admission() {
         let wire = stolen.request_as("POST", UPLOAD_PATH, &body, "");
         assert!(!wire.contains(cadence_agent::test_seam::AS_HEADER));
         assert!(!wire.contains(cadence_agent::test_seam::TOKEN_HEADER));
-        let request = lane.dir.path().join(format!("upload-peer-{}.txt", lane.seq));
+        let request = lane
+            .dir
+            .path()
+            .join(format!("upload-peer-{}.txt", lane.seq));
         std::fs::write(&request, &wire).unwrap();
         let (rc, response) = lane.run(&format!(
             "{prefix}python3 -c 'import socket,sys;\
@@ -213,7 +216,7 @@ fn cad996_upload_body_is_strict_files_map() {
     for bad in [
         json!({"files": []}),
         json!({"files": "app.md"}),
-        json!({}),          // missing files
+        json!({}),            // missing files
         json!({"files": {}}), // empty map
         json!([]),
         Value::Null,
@@ -306,7 +309,10 @@ fn cad996_upload_installs_unapproved_and_cleans_temp() {
     assert!(digest.starts_with("sha256:"), "no host digest: {row}");
     // The installation landed + catalog persisted.
     let id = row["install_id"].as_str().unwrap();
-    assert!(u.catalog_exists(), "install did not write .apps/catalog.yaml");
+    assert!(
+        u.catalog_exists(),
+        "install did not write .apps/catalog.yaml"
+    );
     assert!(
         u.pm.dir
             .join(format!(".apps/installations/{id}/bundle/app.md"))
@@ -317,10 +323,15 @@ fn cad996_upload_installs_unapproved_and_cleans_temp() {
     // (We cannot know the random temp path, but the catalog must NOT point into
     //  a live source the operator could mutate: the record's source is a temp
     //  that no longer exists ⇒ it cannot be a reusable update URL.)
-    let record =
-        std::fs::read_to_string(u.pm.dir.join(format!(".apps/installations/{id}/record.yaml")))
-            .unwrap();
-    assert!(record.contains("kind: path"), "expected Source::Path record: {record}");
+    let record = std::fs::read_to_string(
+        u.pm.dir
+            .join(format!(".apps/installations/{id}/record.yaml")),
+    )
+    .unwrap();
+    assert!(
+        record.contains("kind: path"),
+        "expected Source::Path record: {record}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -334,14 +345,22 @@ fn cad996_upload_concurrent_same_app_refuses() {
     // First install succeeds.
     let (code, _, response) = operator_upload(port, &u, &body);
     assert_eq!(code, 200, "first upload failed: {response}");
-    // A second upload of the SAME app is refused (same-app identity rule), and
-    // the catalog still holds exactly one installation.
-    let (code, _, _) = operator_upload(port, &u, &body);
-    assert_eq!(code, 400, "duplicate app upload was admitted");
+    // A second upload of the SAME app is refused by the same-app identity
+    // rule — the daemon returns "already has workspace installation", which
+    // `rpc_err` maps to 409 (decided). Either way it must NOT be a 200 and the
+    // catalog still holds exactly one installation.
+    let (code, _, resp) = operator_upload(port, &u, &body);
+    assert!(
+        matches!(code, 400 | 409),
+        "duplicate app upload was admitted ({code}): {resp}"
+    );
     let (code, _, list) = common::op::raw(
         port,
-        &common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &u.daemon.state, port)
-            .request("GET", "/api/app-installations", ""),
+        &common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &u.daemon.state, port).request(
+            "GET",
+            "/api/app-installations",
+            "",
+        ),
     );
     assert_eq!(code, 200, "list after uploads: {list}");
     let list: Value = serde_json::from_str(&list).unwrap();
@@ -350,5 +369,8 @@ fn cad996_upload_concurrent_same_app_refuses() {
         .map(|a| a.len())
         .or_else(|| list.as_array().map(|a| a.len()))
         .unwrap_or(0);
-    assert_eq!(count, 1, "duplicate app produced a second installation: {list}");
+    assert_eq!(
+        count, 1,
+        "duplicate app produced a second installation: {list}"
+    );
 }

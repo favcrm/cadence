@@ -183,6 +183,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/app-installations", RouteClass::OperatorOnly),
+    // CAD-996: bounded manual `{files}` bundle upload — operator-only like the
+    // sibling install route it stages into.
+    route(
+        "POST",
+        "/api/app-installations/upload",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-installations/migrate",
