@@ -9,6 +9,79 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Component;
 
+// Reject duplicate members before metadata validation; serde_json::Value
+// alone would silently retain the last member and hide malformed input.
+struct UniqueValue(Value);
+impl<'de> serde::Deserialize<'de> for UniqueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueValue;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON with unique object members")
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                v: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Bool(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(|n| UniqueValue(Value::Number(n)))
+                    .ok_or_else(|| E::custom("invalid number"))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                v: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(v.into()))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(v) = a.next_element::<UniqueValue>()? {
+                    values.push(v.0);
+                }
+                Ok(UniqueValue(Value::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = a.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate object member"));
+                    }
+                    values.insert(key, a.next_value::<UniqueValue>()?.0);
+                }
+                Ok(UniqueValue(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 const LIMIT: u64 = 1_048_576;
 const MAX_AGE: u64 = 21_600_000;
 fn refusal() -> Error {
@@ -88,10 +161,12 @@ fn text(value: &Value) -> bool {
     })
 }
 fn optional_text(value: &Value, key: &str) -> bool {
-    value.get(key).is_none_or(text)
+    value.get(key).is_none_or(|v| v.is_null() || text(v))
 }
-fn validate(bytes: &[u8], model: &str, now: u64) -> Result<()> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| refusal())?;
+fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
+    let mut value = serde_json::from_slice::<UniqueValue>(bytes)
+        .map_err(|_| refusal())?
+        .0;
     let uid = model.strip_prefix("devin/").ok_or_else(refusal)?;
     let fetched = value["fetchedAt"].as_u64().ok_or_else(refusal)?;
     if !keys(&value, &["version", "fetchedAt", "catalog"])
@@ -137,6 +212,7 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<()> {
                     "label",
                     "cost_summary",
                     "cost_tier",
+                    "description",
                     "max_context_tokens",
                     "max_output_tokens",
                     "is_new",
@@ -146,6 +222,11 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<()> {
                 || !text(&variant["label"])
                 || !optional_text(variant, "cost_summary")
                 || !optional_text(variant, "cost_tier")
+                || !variant.get("description").is_none_or(|v| {
+                    v.is_null()
+                        || v.as_str()
+                            .is_some_and(|s| s.len() <= 4096 && !s.contains('\0'))
+                })
                 || !["max_context_tokens", "max_output_tokens"]
                     .iter()
                     .all(|key| {
@@ -174,7 +255,23 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<()> {
     if !selected {
         return Err(refusal());
     }
-    Ok(())
+    // The CLI wire catalog may carry nullable optional display metadata.
+    // pi-devin0.2.1 rejects null cost fields in its cache; omit those fields
+    // while preserving family/variant membership and original fetchedAt.
+    for family in value["catalog"]["families"]
+        .as_array_mut()
+        .ok_or_else(refusal)?
+    {
+        for variant in family["variants"].as_array_mut().ok_or_else(refusal)? {
+            let object = variant.as_object_mut().ok_or_else(refusal)?;
+            for key in ["cost_tier", "cost_summary", "description"] {
+                if object.get(key).is_some_and(Value::is_null) {
+                    object.remove(key);
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&value).map_err(|_| refusal())
 }
 
 /// Seed before spawning, never exposing the operator cache to the worker.
@@ -193,7 +290,15 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
         return Err(refusal());
     }
     if let Some(bytes) = read(&dir, "models.json")? {
-        return validate(&bytes, model, now);
+        let normalized = validate(&bytes, model, now)?;
+        // Preserve only already usable private caches: null display fields
+        // need source normalization, not an overwrite of worker-owned state.
+        if serde_json::from_slice::<Value>(&bytes).ok()
+            != serde_json::from_slice::<Value>(&normalized).ok()
+        {
+            return Err(refusal());
+        }
+        return Ok(());
     }
     let parent = directory(source.parent().ok_or_else(refusal)?)?;
     let bytes = read(
@@ -204,7 +309,7 @@ pub(super) fn seed(cache: &Path, source: &Path, model: &str, now: u64) -> Result
             .ok_or_else(refusal)?,
     )?
     .ok_or_else(refusal)?;
-    validate(&bytes, model, now)?;
+    let bytes = validate(&bytes, model, now)?;
     let temporary = format!("catalog-{}.tmp", uuid::Uuid::new_v4());
     let temporary_c = cname(&temporary)?;
     let target = cname("models.json")?;
@@ -333,6 +438,78 @@ mod tests {
             std::fs::read(cache.join("pi-devin/models.json")).unwrap(),
             b"invalid"
         );
+    }
+
+    #[test]
+    fn representative_wire_metadata_accepts_description_and_normalizes_null_cost() {
+        let (_dir, source, cache) = fixture();
+        let mut doc = catalog();
+        let variant = &mut doc["catalog"]["families"][0]["variants"][0];
+        variant["description"] =
+            json!("Synthetic model description matching the CLI metadata contract.");
+        variant["cost_tier"] = Value::Null;
+        variant["cost_summary"] = json!("Synthetic display cost");
+        variant["max_context_tokens"] = json!(262000);
+        variant["max_output_tokens"] = json!(128000);
+        variant["is_new"] = json!(false);
+        variant["is_beta"] = json!(false);
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(cache.join("pi-devin/models.json")).unwrap())
+                .unwrap();
+        doc["catalog"]["families"][0]["variants"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cost_tier");
+        assert_eq!(saved, doc);
+        assert_eq!(saved["fetchedAt"], NOW);
+    }
+    #[test]
+    fn distinct_workers_are_isolated_and_write_failure_leaves_no_partial_catalog() {
+        let (dir, source, cache) = fixture();
+        let second = dir.path().join("second");
+        std::fs::create_dir(&second).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
+        seed(&second, &source, "devin/swe-2-high", NOW).unwrap();
+        std::fs::write(cache.join("pi-devin/models.json"), b"changed privately").unwrap();
+        seed(&second, &source, "devin/swe-2-high", NOW).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(second.join("pi-devin/models.json")).unwrap()
+            )
+            .unwrap(),
+            catalog()
+        );
+        // Deterministic ENOTDIR works for root as well; chmod is not a
+        // meaningful write-failure fixture when tests run as root.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("pi-devin"), b"owned obstruction").unwrap();
+        assert!(seed(&blocked, &source, "devin/swe-2-high", NOW).is_err());
+        assert_eq!(
+            std::fs::read(blocked.join("pi-devin")).unwrap(),
+            b"owned obstruction"
+        );
+    }
+
+    #[test]
+    fn duplicate_catalog_and_nested_variant_keys_are_rejected_without_copying() {
+        for nested in [false, true] {
+            let (_dir, source, cache) = fixture();
+            let good = catalog().to_string();
+            let wire = if nested {
+                good.replace(
+                    "\"model_uid\":\"swe-2-high\"",
+                    "\"model_uid\":\"synthetic-secret\",\"model_uid\":\"swe-2-high\"",
+                )
+            } else {
+                good.replacen("{", "{\"catalog\":{\"apiKey\":\"synthetic-secret\"},", 1)
+            };
+            std::fs::write(&source, wire).unwrap();
+            assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
+            assert!(!cache.join("pi-devin/models.json").exists());
+        }
     }
 
     #[test]
