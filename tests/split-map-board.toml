@@ -100,6 +100,7 @@ tests = [
     "plan_commit_stages_only_its_issue_files",
     "tracker_failed_commit_leaves_nothing_staged",
     "pm_commit_stages_only_the_named_paths",
+    "board_patch_done_needs_the_same_evidence_as_the_cli",
 ]
 helpers = [
     "pm_git",

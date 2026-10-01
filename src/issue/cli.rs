@@ -1021,9 +1021,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 }
                 None => {
                     let issues = board::load_all(&pm.dir, None)?;
-                    let jobs = crate::client::state_dir()
-                        .map(|d| board::fetch_job_outcomes(&d))
-                        .unwrap_or_default();
+                    let jobs = board::fetch_job_outcomes(state_dir);
                     (
                         board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs),
                         None,
@@ -1374,9 +1372,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             let pm = open_pm()?;
             model::check_id(id)?;
             let issues = board::load_all(&pm.dir, None)?;
-            let jobs = crate::client::state_dir()
-                .map(|d| board::fetch_job_outcomes(&d))
-                .unwrap_or_default();
+            let jobs = board::fetch_job_outcomes(state_dir);
             let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
             let by_id: std::collections::HashMap<String, &board::View> = views
                 .iter()
@@ -1486,9 +1482,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             // Every project loads so cross-project children count.
             let issues = board::load_all(&pm.dir, None)?;
-            let jobs = crate::client::state_dir()
-                .map(|d| board::fetch_job_outcomes(&d))
-                .unwrap_or_default();
+            let jobs = board::fetch_job_outcomes(state_dir);
             let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
             let now = crate::issue::time::now_epoch();
             let by_id: std::collections::HashMap<String, &board::View> = views

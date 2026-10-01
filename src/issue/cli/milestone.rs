@@ -70,9 +70,7 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
         }
     }
     let issues = board::load_all(&pm.dir, None)?;
-    let jobs = crate::client::state_dir()
-        .map(|d| board::fetch_job_outcomes(&d))
-        .unwrap_or_default();
+    let jobs = board::fetch_job_outcomes(state_dir);
     let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
     let by_id: std::collections::HashMap<String, &board::View> = views
         .iter()

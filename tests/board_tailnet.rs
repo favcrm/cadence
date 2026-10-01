@@ -753,6 +753,12 @@ fn forged_tailscale_headers_not_attributed() {
         .copied()
         .filter(|h| !h.starts_with("Origin:"))
         .collect();
+    // CAD-971: the board PATCH rides the done-evidence gate, so give
+    // CAD-2 real evidence (a review artifact) — this test is about
+    // attribution, not about the gate.
+    let artifacts = pm.path().join("cadence/CAD-2/artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    std::fs::write(artifacts.join("review-r1.md"), "pass\n").unwrap();
     let (code, _, _) = op_http_write(
         &op,
         port,
