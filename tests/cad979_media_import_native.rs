@@ -678,10 +678,13 @@ fn cad979_import_writes_no_intent_row() {
     );
 }
 
-/// I4 concurrency: the same `request_id` re-scheduled is refused by the
-/// `request` UNIQUE column — the durable idempotency bound lives at freeze.
+/// I4 concurrency: the durable idempotency bound lives at freeze. The
+/// internal `request` is `uuid5(install_id:request_id)`, so an identical
+/// re-schedule under the same `request_id` is an idempotent success that
+/// returns the SAME intent — while a request_id re-used for DIFFERENT
+/// frozen content is refused by the `request` UNIQUE + digest compare.
 #[test]
-fn cad979_import_same_request_id_schedule_refused() {
+fn cad979_import_same_request_id_schedule_is_idempotent() {
     let door = FakeImportDoor::start();
     let h = importer_harness(&door, "cad979-test-bearer");
     *door.workspace.lock().unwrap() = Some(workspace(&h));
@@ -690,23 +693,34 @@ fn cad979_import_same_request_id_schedule_refused() {
     let ws = workspace(&h);
     let key = format!("dp1.{ws}.{}.{:.32}", h.connection, image_digest);
     let req = "cad979-dup-sched";
-    h.daemon
+    let first = h
+        .daemon
         .operator_rpc(
             "social_publish_schedule",
             schedule_body(&run, &bundle, &install, req, Some(key.clone())),
         )
-        .expect("first schedule queues");
-    let err = h
+        .expect("first schedule queues")["intent"]
+        .clone();
+    // Identical re-schedule: idempotent — same intent_id, still queued.
+    let second = h
         .daemon
         .operator_rpc(
             "social_publish_schedule",
-            schedule_body(&run, &bundle, &install, req, Some(key)),
+            schedule_body(&run, &bundle, &install, req, Some(key.clone())),
         )
-        .expect_err("same request_id re-schedule must be refused");
-    assert!(
-        err.to_string().contains("request") || err.to_string().contains("idempotent"),
-        "{err}"
-    );
+        .expect("identical re-schedule is idempotent")["intent"]
+        .clone();
+    assert_eq!(first["intent_id"], second["intent_id"]);
+    assert_eq!(second["state"], "queued");
+    // A request_id re-used for different frozen content is refused — keep
+    // the binding key valid so the failure is the request dedup, not the key.
+    let mut other = schedule_body(&run, &bundle, &install, req, Some(key.clone()));
+    other["destination_id"] = json!("17841400008460057"); // different frozen content
+    let err = h
+        .daemon
+        .operator_rpc("social_publish_schedule", other)
+        .expect_err("request_id for different frozen content must refuse");
+    assert!(err.to_string().contains("different frozen"), "{err}");
 }
 
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
