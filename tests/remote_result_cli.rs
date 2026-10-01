@@ -207,6 +207,36 @@ fn exact_retry_retains_original_receipt_bytes_and_destination_conflicts() {
     assert_eq!(foreign["receipts"], json!([]));
 }
 #[test]
+fn hosted_identifier_boundaries_retain_and_reopen_through_cli() {
+    for length in [128usize, 129, 200] {
+        let f = Fixture::new();
+        let id = "x".repeat(length);
+        let pin = [
+            id.as_str(),
+            "https://gateway.example.invalid",
+            id.as_str(),
+            id.as_str(),
+        ];
+        let mut value = wire(&id);
+        for field in ["commandId", "assignmentId", "taskId", "turnId"] {
+            value[field] = json!(id);
+        }
+        let input = value.to_string();
+        let first = receipt(&f.run_pin("retain", &f.path("outbox"), pin, input.as_bytes(), true));
+        assert_eq!(first["commandId"], id);
+        assert_eq!(first["destination"]["org"], id);
+        assert_eq!(first["destination"]["subject"], id);
+        assert_eq!(first["destination"]["agent"], id);
+        assert_eq!(
+            receipt(&f.run_pin("retain", &f.path("outbox"), pin, input.as_bytes(), false)),
+            first
+        );
+        let pending = receipt(&f.run_pin("pending", &f.path("outbox"), pin, b"", false));
+        assert_eq!(pending["receipts"], json!([first]));
+        assert!(fs::read_dir(f.path("state")).unwrap().next().is_none());
+    }
+}
+#[test]
 fn malformed_oversized_and_duplicate_stdin_refuse_before_creating_custody() {
     let f = Fixture::new();
     let duplicate = wire("command-1")
@@ -231,7 +261,7 @@ fn malformed_oversized_and_duplicate_stdin_refuse_before_creating_custody() {
     refusal(&f.run(
         "retain",
         &f.path("outbox"),
-        &"x".repeat(129),
+        &"x".repeat(201),
         wire("command-1").to_string().as_bytes(),
         false,
     ));

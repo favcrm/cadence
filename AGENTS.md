@@ -29,11 +29,26 @@ PR needs each of the following as a PASS on the exact head you enqueue:
 - **Standards** and **Spec/security** reviews, by two different
   independent reviewers. Neither may be the author. Prefer a reviewer
   whose model vendor differs from the author's.
+  - **Reviewer-count scaling (CAD-814):** the default is two distinct
+    reviewers. When the project runs a solo-operator lane — the author is
+    the only registered reviewer-capable identity on the project — a
+    single independent registered-identity reviewer (not the author) may
+    satisfy both axes only if the operator approves that head through the
+    operator-connection-bound `cadence audit approve --pr <n> --head <full
+    sha> --action merge` event on `audit:approvals` (the same channel every
+    human-class approval uses). A ticket comment or note is not approval
+    evidence. The operator approval substitutes for the second reviewer,
+    not for independence: the single reviewer still must not be the author.
+    Solo-operator scaling is declared per project in the `delivery:`
+    policy, not per PR; it does not apply to any `human` trigger other
+    than reviewer count, and it never lowers the Browser QA,
+    qa-verdict-status, or risk-class gates.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in
   `docs/roles/risk-classes.md` applies. That includes, but is not
-  limited to, every change to `.github/**`, `scripts/**`, `Cargo.toml`,
+  limited to, every change to `.github/**`, `scripts/**` (except the
+  allowlist in `docs/roles/risk-classes.md`), `Cargo.toml`,
   `Cargo.lock`, `ui/package.json`, `cadence-review.toml`,
   `src/review.rs`, `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`
   and this file. Most gates on a PR run from the PR's
@@ -121,6 +136,10 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
 - Never skip, ignore or weaken a test or check to get green.
 
 ### Local builds and tests
+- Before every push run `scripts/pre-push` (fmt, split-map sync, clippy,
+  ui typecheck and script contracts for what you changed; add `--tests` for
+  the changed integration binaries). After adding a `#[test]` to an
+  integration binary run `scripts/split-map-sync` to register it.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
   Don't override `RUSTC_WRAPPER`. If a build fails in a strange way, rerun
   it once with `RUSTC_WRAPPER=` to rule sccache out.

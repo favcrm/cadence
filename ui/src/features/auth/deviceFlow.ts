@@ -38,11 +38,16 @@ export function startDelaySecs(display: Pick<DeviceDisplay, "interval">): number
 }
 
 /** What the sign-in surface tells the user when a poll is refused.
- *  `device_subject_not_allowed` passes the server's message through —
- *  it names the subject id and the flag the operator adds. */
+ *  `device_subject_not_allowed` and `device_authority_changed` pass the
+ *  server's message through — it names the subject id and the flag the
+ *  operator adds, or explains the sign-in raced a config change. */
 export function describeRefusal(err: unknown): string {
   if (err instanceof ApiError) {
-    if (err.code === "device_subject_not_allowed" || err.code === "device_sign_in_refused") {
+    if (
+      err.code === "device_subject_not_allowed" ||
+      err.code === "device_sign_in_refused" ||
+      err.code === "device_authority_changed"
+    ) {
       return err.message;
     }
     if (err.check === "session_from_agent" || err.code === "session_from_agent") {

@@ -13,6 +13,9 @@ use crate::issue::{
     retro, sprint, start, sync, work, write, Pm,
 };
 
+mod milestone;
+pub use milestone::{run_milestone, MilestoneAction};
+
 #[derive(Subcommand)]
 pub enum IssueAction {
     /// Create the PM dir skeleton (pm.yaml, README, .gitignore, git
@@ -70,11 +73,12 @@ pub enum IssueAction {
         #[arg(long)]
         status: Option<String>,
     },
-    /// List issues — a compact table on a TTY, `--json` for agents.
+    /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
     /// present. See PROTOCOL.md "List grammar".
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable — issues in any of them.
         #[arg(long, value_delimiter = ',')]
@@ -439,6 +443,50 @@ pub enum IssueAction {
     /// Attach a file into `artifacts/` (basename only, size cap,
     /// create-only).
     Attach { id: String, file: PathBuf },
+    /// Several updates to one issue as ONE tracker commit: set, tag,
+    /// link, ref, attach, acceptance and a comment. Every part is
+    /// validated first — one bad part refuses the whole edit and writes
+    /// nothing. `-` reads stdin for `--comment-file` and `--acceptance`
+    /// (one of the two). Prints `{id, rev, changed}`.
+    Edit {
+        id: String,
+        /// `key=value`, as `issue set`. Repeatable.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// `+tag` adds, `-tag` removes, a bare `tag` adds; comma-separated
+        /// or repeated: `--tag +a,-b`.
+        #[arg(
+            long = "tag",
+            value_name = "+TAG|-TAG",
+            value_delimiter = ',',
+            allow_hyphen_values = true
+        )]
+        tag: Vec<String>,
+        /// `kind:ID`, as `issue link` (`blocked_by:CAD-2`). Repeatable.
+        #[arg(long = "link", value_name = "KIND:ID")]
+        link: Vec<String>,
+        /// `kind:ID`, as `issue unlink`. Repeatable.
+        #[arg(long = "unlink", value_name = "KIND:ID")]
+        unlink: Vec<String>,
+        /// `kind:target` (`pr:https://…`) or a bare http(s) URL. Repeatable.
+        #[arg(long = "ref", value_name = "KIND:TARGET")]
+        refs: Vec<String>,
+        /// Attach a file, as `issue attach`. Repeatable.
+        #[arg(long = "attach", value_name = "FILE")]
+        attach: Vec<PathBuf>,
+        /// Replace the Acceptance checklist from FILE (`-` = stdin).
+        #[arg(long, value_name = "FILE|-")]
+        acceptance: Option<PathBuf>,
+        /// Add a comment from FILE (`-` = stdin).
+        #[arg(long = "comment-file", value_name = "FILE|-")]
+        comment_file: Option<PathBuf>,
+        /// Recorded author of the comment; needs `--comment-file`.
+        #[arg(long)]
+        author: Option<String>,
+        /// Override the `status=done` evidence gate, as `issue set --force`.
+        #[arg(long, value_name = "REASON")]
+        force: Option<String>,
+    },
     /// Check the whole PM dir: schema, id/folder mismatch, dangling and
     /// cyclic links, depth > 2, oversize artifacts, unknown status/kind.
     /// Non-zero exit on any error.
@@ -581,6 +629,7 @@ pub enum EpicAction {
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; repeatable — epics in any of them.
         #[arg(long, value_delimiter = ',')]
@@ -630,53 +679,6 @@ pub enum EpicAction {
     },
 }
 
-/// `cadence milestone` — milestones from PROJECT.md and the issues'
-/// `milestone` field or `m<n>-…` tag, with rolled-up progress. Read-only.
-#[derive(Subcommand)]
-pub enum MilestoneAction {
-    /// Every milestone: configured first, then any an issue names.
-    /// Value flags repeat and comma-join and match ANY of their values;
-    /// different flags AND.
-    #[command(after_long_help = crate::filter::GRAMMAR)]
-    Ls {
-        /// Project key; repeatable — milestones in any of them.
-        #[arg(long, value_delimiter = ',')]
-        project: Vec<String>,
-        /// Milestone id; repeatable — any of them.
-        #[arg(long, value_delimiter = ',')]
-        milestone: Vec<String>,
-        /// Only milestones with at least one epic in this stage;
-        /// repeatable.
-        #[arg(long, value_delimiter = ',')]
-        stage: Vec<String>,
-        /// Health (on_track at_risk stalled); repeatable.
-        #[arg(long, value_delimiter = ',')]
-        health: Vec<String>,
-        /// Sort by id project title configured progress health;
-        /// `-KEY` descending.
-        #[arg(long, allow_hyphen_values = true)]
-        sort: Option<String>,
-        /// Keep only the first N rows.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Keep only these keys in each --json row (comma-joined).
-        #[arg(long, value_delimiter = ',', requires = "json")]
-        fields: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// One milestone: exit test, epics (stage, progress, health) and
-    /// its loose issues.
-    Show {
-        /// Milestone id, e.g. `m2`.
-        id: String,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 #[derive(Subcommand)]
 pub enum ProjectAction {
     /// Register a project.
@@ -703,6 +705,7 @@ pub enum ProjectAction {
     },
     /// List registered projects.
     #[command(after_long_help = crate::filter::GRAMMAR)]
+    #[command(visible_alias = "list")]
     Ls {
         /// Sort by key prefix default_owner; `-KEY` descending.
         #[arg(long, allow_hyphen_values = true)]
@@ -730,10 +733,7 @@ pub enum ProjectAction {
 }
 
 pub(crate) fn print_json(value: &Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+    println!("{}", crate::output::json_text(value).unwrap_or_default());
 }
 
 fn open_pm() -> Result<Pm> {
@@ -874,9 +874,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 status.as_deref(),
             )?;
             let body = match file {
-                Some(ref f) if f.as_os_str() == "-" => {
+                // The refusal is the master's confinement (CAD-614): its
+                // body must be a file under master/tmp. Everyone else
+                // may pipe it.
+                Some(ref f) if f.as_os_str() == "-" && caller_is_master => {
                     return Err(Error::rejected(crate::master::NO_STDIN));
                 }
+                Some(ref f) if f.as_os_str() == "-" => Some(read_stdin_body("issue new --file")?),
                 Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
                     |e| {
                         Error::rejected(format!(
@@ -937,6 +941,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             summary,
             json: json_flag,
         } => {
+            // CAD-877: a table only on a TTY; piped output is JSON.
+            let json_flag = &(*json_flag || !crate::output::stdout_table());
             crate::filter::fields_need_json(fields, *json_flag)?;
             if *summary && !fields.is_empty() {
                 return Err(Error::rejected(
@@ -1500,6 +1506,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     json,
                     ..
                 } => {
+                    let json = &(*json || !crate::output::stdout_table());
                     crate::filter::fields_need_json(fields, *json)?;
                     let ctx =
                         work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir));
@@ -1571,6 +1578,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     }
                 }
                 EpicAction::Show { id, json } => {
+                    let json = &(*json || !crate::output::stdout_table());
                     model::check_id(id)?;
                     let epic = by_id.get(id).ok_or_else(|| {
                         Error::rejected(format!(
@@ -1665,14 +1673,21 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         } => {
             let body = match (text, file) {
                 (Some(t), _) => t.clone(),
+                (None, Some(f)) if f.as_os_str() == "-" => {
+                    if crate::master::caller_is_master() {
+                        return Err(Error::rejected(crate::master::NO_STDIN));
+                    }
+                    read_stdin_body("issue comment --file")?
+                }
                 (None, Some(f)) => std::fs::read_to_string(f)?,
                 (None, None) => {
+                    if crate::master::caller_is_master() {
+                        return Err(Error::rejected(crate::master::NO_STDIN));
+                    }
                     if atty_stdin() {
                         return Err(Error::rejected("Provide -m or --file"));
                     }
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf
+                    read_stdin_body("issue comment")?
                 }
             };
             let pm = open_pm()?;
@@ -1685,6 +1700,63 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 None,
                 "",
             )?);
+            Ok(0)
+        }
+        IssueAction::Edit {
+            id,
+            set,
+            tag,
+            link,
+            unlink,
+            refs,
+            attach,
+            acceptance,
+            comment_file,
+            author,
+            force,
+        } => {
+            // The master has no stdin and no free file reads (CAD-614),
+            // and `edit` is not on its allowlist; refuse here too so a
+            // widened allowlist cannot open the stdin path.
+            if crate::master::caller_is_master() {
+                return Err(Error::rejected(
+                    "issue edit is not available to the master — use the single-purpose verbs",
+                ));
+            }
+            let is_stdin = |f: &Option<PathBuf>| f.as_ref().is_some_and(|p| p.as_os_str() == "-");
+            if is_stdin(acceptance) && is_stdin(comment_file) {
+                return Err(Error::rejected(
+                    "edit: stdin can feed only one of --acceptance and --comment-file",
+                ));
+            }
+            let read = |flag: &str, f: &Option<PathBuf>| -> Result<Option<String>> {
+                match f {
+                    None => Ok(None),
+                    Some(p) if p.as_os_str() == "-" => Ok(Some(read_stdin_body(flag)?)),
+                    Some(p) => std::fs::read_to_string(p).map(Some).map_err(|e| {
+                        Error::rejected(format!("edit {flag}: cannot read {}: {e}", p.display()))
+                    }),
+                }
+            };
+            let spec = crate::issue::edit::EditSpec {
+                set: set.clone(),
+                tags: tag.clone(),
+                link: link.clone(),
+                unlink: unlink.clone(),
+                refs: refs.clone(),
+                attach: attach.clone(),
+                acceptance: read("--acceptance", acceptance)?,
+                comment: read("--comment-file", comment_file)?,
+                author: author.clone(),
+                force: force.clone(),
+            };
+            let pm = open_pm()?;
+            let sd = crate::client::state_dir().ok();
+            let out = crate::issue::edit::edit(&pm, id, &spec, "", sd.as_deref())?;
+            print_json(&out);
+            if out["worktree_open"].is_array() {
+                eprintln!("{id}: worktree open: run cadence issue finish {id}");
+            }
             Ok(0)
         }
         IssueAction::Attach { id, file } => {
@@ -1831,6 +1903,24 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// Read a body from stdin for a `--file -` / `--comment-file -` flag.
+/// A terminal is refused (it would hang waiting for input); the size
+/// is capped so a runaway pipe cannot fill memory.
+fn read_stdin_body(flag: &str) -> Result<String> {
+    const MAX: u64 = 4 << 20;
+    if atty_stdin() {
+        return Err(Error::rejected(format!(
+            "{flag} -: stdin is a terminal — pipe the body in"
+        )));
+    }
+    let mut buf = String::new();
+    std::io::stdin().take(MAX + 1).read_to_string(&mut buf)?;
+    if buf.len() as u64 > MAX {
+        return Err(Error::rejected(format!("{flag} -: stdin is over 4 MiB")));
+    }
+    Ok(buf)
 }
 
 fn atty_stdin() -> bool {
@@ -2052,219 +2142,6 @@ fn print_stage_and_health(w: &Value) {
     if let Some(e) = w["config_error"].as_str() {
         println!("config: {e} — using the defaults");
     }
-}
-
-/// `cadence milestone ls|show` — read-only.
-pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> Result<i32> {
-    let pm = open_pm()?;
-    let wanted: Vec<String> = match action {
-        MilestoneAction::Ls { project, .. } => project.clone(),
-        MilestoneAction::Show { project, .. } => project.iter().cloned().collect(),
-    };
-    for want in &wanted {
-        model::check_key(want)?;
-        if !project::list(&pm.dir)?.iter().any(|p| &p.key == want) {
-            return Err(project::unknown_project(want, &pm.dir));
-        }
-    }
-    let issues = board::load_all(&pm.dir, None)?;
-    let jobs = crate::client::state_dir()
-        .map(|d| board::fetch_job_outcomes(&d))
-        .unwrap_or_default();
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-    let by_id: std::collections::HashMap<String, &board::View> = views
-        .iter()
-        .map(|v| (v.issue.front.id.clone(), v))
-        .collect();
-    let ctx = work::Ctx::new(
-        &pm.dir,
-        &by_id,
-        crate::issue::time::now_epoch(),
-        &work::fetch_approvals(state_dir),
-    );
-    let one = wanted.first().map(String::as_str);
-    match action {
-        MilestoneAction::Ls {
-            milestone,
-            stage,
-            health,
-            sort,
-            limit,
-            fields,
-            json,
-            ..
-        } => {
-            crate::filter::fields_need_json(fields, *json)?;
-            if !stage.is_empty() {
-                let mut valid: Vec<String> = ctx
-                    .configs
-                    .values()
-                    .flat_map(|w| w.cfg.stage_ids().into_iter().map(str::to_string))
-                    .collect();
-                valid.push("rejected".to_string());
-                valid.sort();
-                valid.dedup();
-                for s in stage {
-                    if !valid.contains(s) {
-                        let list = valid.iter().map(String::as_str).collect::<Vec<_>>();
-                        return Err(crate::filter::unknown("stage", s, &list));
-                    }
-                }
-            }
-            crate::filter::check_set("health", health, work::HEALTH_STATES)?;
-            let mut rows: Vec<Value> = work::milestones_json(&ctx, &views, None)
-                .into_iter()
-                .filter(|r| crate::filter::any_of(&wanted, r["project"].as_str()))
-                .filter(|r| crate::filter::any_of(milestone, r["id"].as_str()))
-                .filter(|r| crate::filter::any_of(health, r["health"]["state"].as_str()))
-                .filter(|r| {
-                    stage.is_empty()
-                        || r["epics"].as_array().is_some_and(|epics| {
-                            epics.iter().any(|e| {
-                                stage
-                                    .iter()
-                                    .any(|s| e["stage"].as_str() == Some(s.as_str()))
-                            })
-                        })
-                })
-                .collect();
-            const MILESTONE_SORTS: &[(&str, &str)] = &[
-                ("id", "id"),
-                ("project", "project"),
-                ("title", "title"),
-                ("configured", "configured"),
-                ("status", "status"),
-                ("owner", "owner"),
-                ("target_date", "target_date"),
-                ("progress", "progress.ratio"),
-                ("health", "health.state"),
-            ];
-            if let Some(spec) = sort {
-                crate::filter::sort_rows(&mut rows, spec, MILESTONE_SORTS, "id")?;
-            }
-            crate::filter::apply_limit(&mut rows, *limit);
-            crate::filter::apply_fields(&mut rows, fields)?;
-            if *json {
-                print_json(&json!({"milestones": rows}));
-            } else {
-                print_milestones_table(&rows);
-            }
-        }
-        MilestoneAction::Show { id, json, .. } => {
-            let row = work::milestone_show(&ctx, &views, id, one)?;
-            if *json {
-                print_json(&row);
-            } else {
-                print_milestones_table(std::slice::from_ref(&row));
-                if let Some(exit) = row["exit"].as_str() {
-                    println!("exit: {exit}");
-                }
-                for field in [
-                    "description",
-                    "start_date",
-                    "completed_date",
-                    "config_error",
-                ] {
-                    if let Some(value) = row[field].as_str() {
-                        println!("{field}: {value}");
-                    }
-                }
-                for field in ["depends_on", "evidence"] {
-                    for value in row[field].as_array().into_iter().flatten() {
-                        println!("{field}: {}", value.as_str().unwrap_or(""));
-                    }
-                }
-                for r in row["health"]["reasons"].as_array().into_iter().flatten() {
-                    println!(
-                        "  {} — {} (next: {})",
-                        r["cause"].as_str().unwrap_or("?"),
-                        r["detail"].as_str().unwrap_or(""),
-                        r["next"].as_str().unwrap_or("")
-                    );
-                }
-                let mut rows = vec![
-                    ["ID", "KIND", "STAGE/STATUS", "PROGRESS", "HEALTH", "TITLE"]
-                        .map(str::to_string)
-                        .to_vec(),
-                ];
-                for e in row["epics"].as_array().into_iter().flatten() {
-                    rows.push(vec![
-                        e["id"].as_str().unwrap_or_default().to_string(),
-                        "epic".to_string(),
-                        e["stage"].as_str().unwrap_or("-").to_string(),
-                        format!("{:.0}%", e["progress"].as_f64().unwrap_or(0.0) * 100.0),
-                        e["health"].as_str().unwrap_or("-").replace('_', " "),
-                        e["title"].as_str().unwrap_or_default().to_string(),
-                    ]);
-                }
-                for i in row["issues"].as_array().into_iter().flatten() {
-                    rows.push(vec![
-                        i["id"].as_str().unwrap_or_default().to_string(),
-                        i["type"].as_str().unwrap_or_default().to_string(),
-                        i["status"].as_str().unwrap_or_default().to_string(),
-                        String::new(),
-                        if i["blocked"].as_bool() == Some(true) {
-                            "blocked".to_string()
-                        } else {
-                            String::new()
-                        },
-                        i["title"].as_str().unwrap_or_default().to_string(),
-                    ]);
-                }
-                println!();
-                print_table(&rows);
-            }
-        }
-    }
-    Ok(0)
-}
-
-fn print_milestones_table(rows: &[Value]) {
-    if rows.is_empty() {
-        eprintln!(
-            "no milestones — declare them in <pm>/<project>/PROJECT.md or set \
-             `cadence issue set <ID> milestone=m1`"
-        );
-        return;
-    }
-    let mut table = vec![[
-        "PROJECT",
-        "MILESTONE",
-        "STATUS",
-        "OWNER",
-        "TARGET",
-        "PROGRESS",
-        "EPICS",
-        "ISSUES",
-        "HEALTH",
-        "TITLE",
-    ]
-    .map(str::to_string)
-    .to_vec()];
-    for r in rows {
-        let p = &r["progress"];
-        table.push(vec![
-            r["project"].as_str().unwrap_or_default().to_string(),
-            r["id"].as_str().unwrap_or_default().to_string(),
-            r["status"].as_str().unwrap_or("undefined").to_string(),
-            r["owner"].as_str().unwrap_or("-").to_string(),
-            r["target_date"].as_str().unwrap_or("-").to_string(),
-            format!(
-                "{}/{} {:.0}%",
-                p["done_weight"].as_u64().unwrap_or(0),
-                p["total_weight"].as_u64().unwrap_or(0),
-                p["ratio"].as_f64().unwrap_or(0.0) * 100.0
-            ),
-            r["epics"].as_array().map_or(0, Vec::len).to_string(),
-            r["issues"].as_array().map_or(0, Vec::len).to_string(),
-            r["health"]["state"]
-                .as_str()
-                .unwrap_or("-")
-                .replace('_', " "),
-            r["title"].as_str().unwrap_or("-").to_string(),
-        ]);
-    }
-    print_table(&table);
 }
 
 fn print_show(view: &board::View, by_id: &std::collections::HashMap<String, &board::View>) {

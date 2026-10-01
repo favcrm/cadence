@@ -11,6 +11,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use super::load_opts;
+use super::DeviceLoginAction;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::operator_auth;
@@ -132,6 +133,70 @@ pub(super) fn sessions(
             time(&r["last_used"]),
             r["user_agent"].as_str().unwrap_or("")
         );
+    }
+    Ok(0)
+}
+
+/// `cadence ui device-login set|clear|show` (CAD-841): the operator's
+/// door to the daemon-owned device-login config — the same gate as
+/// `login`/`sessions` (operator proof + the operator secret read
+/// under strict modes), so an agent is refused however it runs this.
+/// The config lives in the daemon store; a running board picks a
+/// `set`/`clear` up on the next request, no restart.
+pub(super) fn device_login(state_dir: &Path, action: &DeviceLoginAction) -> Result<i32> {
+    let secret = operator_auth::read_secret(state_dir)?;
+    match action {
+        DeviceLoginAction::Set {
+            issuer,
+            org,
+            subject,
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "operator_device_login_set",
+                json!({"secret": secret, "issuer": issuer, "org": org,
+                       "subjects": subject}),
+            )?;
+            println!(
+                "device login configured — issuer {} · workspace {}",
+                out["issuer"].as_str().unwrap_or("-"),
+                out["org"].as_str().unwrap_or("-"),
+            );
+        }
+        DeviceLoginAction::Clear => {
+            client::rpc(
+                state_dir,
+                "operator_device_login_clear",
+                json!({"secret": secret}),
+            )?;
+            println!("device login cleared — the board's sign-in menu stops offering it.");
+        }
+        DeviceLoginAction::Show { json: as_json } => {
+            let out = client::rpc(
+                state_dir,
+                "operator_device_login_show",
+                json!({"secret": secret}),
+            )?;
+            if *as_json {
+                println!("{out}");
+            } else if out["configured"].as_bool() == Some(true) {
+                println!("issuer:   {}", out["issuer"].as_str().unwrap_or("-"));
+                println!("org:      {}", out["org"].as_str().unwrap_or("-"));
+                let subjects = out["subjects"].as_array().cloned().unwrap_or_default();
+                println!(
+                    "subjects: {}",
+                    subjects
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else {
+                println!(
+                    "device login is not configured — `cadence ui device-login set` enables it."
+                );
+            }
+        }
     }
     Ok(0)
 }

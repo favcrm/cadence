@@ -43,10 +43,11 @@ below continue to apply. There is no deletion, retarget, applied receipt,
 authenticated enrollment or local task mutation in these offline verbs.
 Caller pins remain structural metadata; reported task/head remain assertions.
 
-IDs retain v1's ASCII 1–128 bound and audiences its exact canonical HTTPS origin
-rules. Unsupported issuer IDs are refused, not normalized or truncated. Genuine
-identity compatibility and issuer rotation remain CAD-675/AOS-62 integration
-dependencies.
+Hosted command and destination IDs use ASCII letters/digits/underscore/dash,
+1–200 bytes, matching AgenticOS's shared hosted-id contract. Audiences retain
+exact canonical HTTPS origin rules. Unsupported issuer IDs are refused, not
+normalized or truncated. Issuer-bound identity checks and credential rotation
+remain CAD-675/AOS-62 integration dependencies.
 
 The library interface is `ResultCommand::parse_json`, `DestinationPin::new`, and
 `ResultOutbox::open`, `enqueue`, `pending_for`, `get`, and `deliver_with`. The
@@ -118,8 +119,8 @@ application acknowledgement, restore-safe witness or cleanup here.
 The codec consumes the strict `hosted-cadence-result.v1` envelope from AOS-64
 PR130 at `8312b78b83af51cb2ea025914004efd7c830e917`. Version/kind and all fields
 are required; extra fields and duplicate JSON keys are refused. Command and
-destination IDs use the current inbox's ASCII letters/digits/underscore/dash
-bound of 1–128 bytes. Larger issuer IDs are unsupported, never truncated or
+destination IDs use the shared hosted contract's ASCII letters/digits/underscore/dash
+bound of 1–200 bytes. Larger issuer IDs are unsupported, never truncated or
 mapped to invented identities.
 
 Revision matches decoded positive safe-integer Number semantics: `1.0` and

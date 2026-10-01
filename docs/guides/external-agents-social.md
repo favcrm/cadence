@@ -107,22 +107,28 @@ The human operator signs into the board without SSH. Agent access
 stays CLI-shaped. Unchanged: alias-carried actions, per-run teams,
 human-approved sends.
 
-Configure it once, from your own shell:
+Configure it once, from your own shell, on the daemon:
 
 ```sh
-cadence ui start --device-login-issuer https://your-agenticos-api.example \
-  --device-login-org ws_company --device-login-subject <your-subject-id>
+cadence ui device-login set --issuer https://your-agenticos-api.example \
+  --org ws_company --subject <your-subject-id>
 ```
 
-Supply issuer, org and at least one subject together, or none of them. You
-can also use env `CADENCE_DEVICE_LOGIN_ISSUER` / `_ORG` / `_SUBJECTS`
-(comma-separated). `--device-login-subject` repeats, once per operator
-who may sign in remotely. It is the operator's allowlist: any other
-verified workspace member is refused `device_subject_not_allowed`. Find
-your subject id with `cadence auth status` (`principal.subject_id`);
-a refused sign-in also names the subject it saw. Changing the
-configuration while the board runs is refused. Stop the UI, then start
-it again.
+Supply issuer, org and at least one subject together, or none of them.
+`--subject` repeats, once per operator who may sign in remotely. The
+write goes through the operator-secret RPC — run it from your own
+shell, not an agent pane. (`cadence ui start`/`run` still accept the
+`--device-login-*` flags as a thin client over the same `set`, env
+`CADENCE_DEVICE_LOGIN_ISSUER` / `_ORG` / `_SUBJECTS` included; the
+daemon's store is the persistence, not `ui.json`.) The config applies
+live to a running board — `cadence ui device-login show` prints it,
+`clear` removes it — and survives board restarts. It is the operator's
+allowlist: any other verified workspace member is refused
+`device_subject_not_allowed`. Find your subject id with
+`cadence auth status` (`principal.subject_id`); a refused sign-in
+also names the subject it saw. If the configuration is cleared or
+changed while your grant is being verified, the sign-in is refused
+(`device_authority_changed`); start it again.
 
 On the board, open the header's **Sign in** menu and choose **Sign in
 with AgenticOS**. The board shows a user code and an approval link,

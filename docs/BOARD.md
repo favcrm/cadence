@@ -399,6 +399,16 @@ cadence issue unlink CAD-16 blocked_by CAD-12
 cadence issue ref CAD-16 pr https://… --label "PR #16"
 cadence issue comment CAD-16 -m "text" --author me
 cadence issue attach CAD-16 ./shot.png      # copies into artifacts/, 1 MiB cap
+cadence issue edit CAD-16 --set status=review --tag +ui,-wip \
+  --link blocked_by:CAD-12 --ref pr:https://… --attach ./shot.png \
+  --acceptance acc.md --comment-file -      # many parts, ONE commit, all-or-
+                                            # nothing: every part is validated
+                                            # first, a bad one refuses the whole
+                                            # edit naming its flag. `-` reads
+                                            # stdin (one body per call). Prints
+                                            # {id, rev, changed}. Same writers,
+                                            # lock, lint and Actor rules as the
+                                            # single-purpose verbs above
 cadence issue lint                          # schema, links, depth, sizes, symlinks
                                             # → exit !=0 on errors; warnings
                                             #   (e.g. ready/doing/review with an
@@ -491,12 +501,17 @@ tags; an `agent` needs a `focus` from the allowlist above and takes no
 other key. `reviews`, `risk` and each `require` are non-empty, with no
 duplicates and every `require` name defined — and never an advisory
 check. A `when` holds ≥ 1 condition; `lines_over`/`files_over` are ≥ 1
-and `paths` are non-empty repo-relative globs (no leading `/`, `..`
-segment, `\`, control character or `[`/`]`/`{`/`}` — `*`, `**`, `?`
-are the only wildcards; slice 3 owns matching). `heavy` sits strictly
+and `paths` are non-empty entries in the same repo-relative,
+file-level glob grammar the `areas:` reader and an issue's `paths=`
+field use (`*` and `?` match inside one path segment, a `**` segment
+any number of segments, a trailing `/` everything under it — no
+leading `/` or `~`, no empty/`.`/`..` segment, `#`, `\`, `,` or
+control characters; validated by `areas::check_path` and, in slice 3,
+matched by `areas::matches`, so the two grammars can't diverge). `heavy` sits strictly
 under `oversized`. And the safety floor: at least one unconditional
-rule must require a blocking review (`agent`, `operator` or a
-`required` check), so a merge can never need no review at all.
+rule must require an `agent` or `operator` review — a `check` is a bot
+and never satisfies the floor, even `required` (it still blocks where
+a rule names it) — so a merge can never need no review at all.
 
 While the file's section is not the approved one, every reader falls
 back — to the approved policy, else the defaults — and reports the
@@ -1072,8 +1087,12 @@ the Host/Origin allowlists), `--read-only` (every write answers `403`,
 the SPA hides its edit controls; `--no-read-only` clears a persisted
 one), `--device-login-issuer <origin> --device-login-org <ws-id>
 --device-login-subject <id>` (remote operator sign-in through the
-AgenticOS device grant, CAD-777 — issuer + org + at least one
-allowlisted subject, or none; default off).
+AgenticOS device grant, CAD-777/841 — issuer + org + at least one
+allowlisted subject, or none; the flags are a thin client that pushes
+the triple to the daemon's store through the operator-secret RPC, so
+they apply live to a running board and never persist in `ui.json`;
+`ui start --reset` does not touch the daemon store either — only
+`cadence ui device-login clear` turns the flow off; default off).
 
 **Signing in (CAD-313, ADR 0004).** Board writes need the operator's
 session. `cadence ui login`, run from your own shell, prints a link —
@@ -1111,20 +1130,27 @@ operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
 
-**Remote sign-in without SSH (CAD-777).** With `--device-login-issuer`,
-`--device-login-org` and at least one `--device-login-subject`
-resolved, `POST /api/session/device/code`
+**Remote sign-in without SSH (CAD-777, daemon-owned since CAD-841).**
+Device login is configured on the *daemon*, never by the board:
+`cadence ui device-login set --issuer <origin> --org <ws-id>
+--subject <id>` writes `<state>/operator/device-login.json` through an
+operator-proof + operator-secret RPC (`show` prints it, `clear`
+removes it; the same pair `--device-login-*` flags on `ui run`/`ui
+start` is a thin client over `set` — pushed by the foreground process
+before any board spawns, and never persisted to `ui.json`). With a
+config resolved, `POST /api/session/device/code`
 requests an AgenticOS device grant for exactly that workspace and
 answers the user code + verification link plus a pending id; `POST
 /api/session/device/poll` exchanges the approval for a session
 with the same cookie shape as `/api/session`. The issuer device code
 lives only in the board's pending map (bounded, TTL-pruned) and the
 `agc_` credential is verified and dropped — neither ever reaches the
-browser. The daemon verifies the presented grant live against its own
-pinned trust root (`<state>/operator/device-login.json`, written at
-board start, removed when the flow is unconfigured) and derives the
+browser. The daemon verifies the presented grant live against the
+daemon-owned config — read again under the mint lock after the issuer
+answer, so a `set`/`clear` landing mid-verify retires the in-flight
+sign-in (`device_authority_changed`, 403) — and derives the
 subject itself — request fields cannot forge it — then mints only
-when that subject is on the pin's allowlist; any other verified
+when that subject is on the config's allowlist; any other verified
 workspace member is refused `device_subject_not_allowed` (403 on the
 poll route, no cookie). The allowlist names the one or few operators
 who sign in remotely — `cadence auth status` prints your subject id
@@ -1132,7 +1158,10 @@ under `principal.subject_id`, and a refusal names the subject it saw.
 Sessions minted this way live 12 h idle, 24 h at most, one per
 verified subject, operator-mapped to the allowlisted subject only;
 agent peers are refused without side effects.
-When device login is configured, the header's Sign in menu offers
+Because the board asks the daemon per request, a `set`/`clear` takes
+effect on a running board at once — no restart — and a stopped or
+restarted board leaves the config untouched. When device login is
+configured, the header's Sign in menu offers
 "Sign in with AgenticOS" — it shows the user code and approval link
 and polls until the grant settles. Unconfigured boards answer both
 routes 404. The login audience
@@ -1696,9 +1725,20 @@ historical parked deliveries in SQL, rather than decoding completed bodies
 and results every tick. The parked count still examines historical results;
 it is not constant-time. Overview probes pass `active_only: true` to
 `agent_show`, keeping queued/submitting/running messages and unresolved
-unknowns for fence evidence. A normal `agent_show` keeps full current-agent
-history. Both variants retain turn-token redaction; reads do not unfence,
-resume or launch an agent. The `start: skipping fenced agent` log is a
+unknowns for fence evidence; `cadence self` sends the same field, so it
+reads no history. A request with neither `limit` nor `since` keeps full
+current-agent history, which the board drawer and every in-process caller
+rely on (CAD-879). `cadence agent show` is the bounded path: it sends
+`limit` (default 20) and the daemon returns the newest `limit` finished
+messages plus every unfinished one, with `messages_omitted` counting what
+was left out; `--since <message id|unix ts>` adds a lower bound, `--limit N`
+changes the window (`--since` without `--limit` drops the default 20-message
+window and lists everything after that point), and `--all` sends neither
+field. `messages_omitted` appears only on a `limit`/`since` read. A `limit`
+that is present but not a non-negative integer is rejected. Absence of the
+fields means today's behaviour, so an older client is unaffected. Both
+variants retain turn-token redaction; reads do not unfence, resume or launch
+an agent. The `start: skipping fenced agent` log is a
 daemon-start observation, not a periodic scheduler action (CAD-627).
 
 **Deploy drift** — the daemon reports its `build_commit` via the

@@ -49,6 +49,7 @@ pub(crate) enum WorkflowAction {
         project: Option<String>,
     },
     /// Every stored workflow: project, name, inputs, approval state.
+    #[command(visible_alias = "list")]
     Ls {
         /// Project key; all projects when absent.
         #[arg(long)]

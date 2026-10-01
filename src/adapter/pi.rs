@@ -340,6 +340,9 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[path = "pi_agenticos.rs"]
+mod agenticos;
+
 /// Copy the operator's `auth.json` into `dir` (0600, atomic via
 /// `auth.json.tmp` rename) when the dir has no non-empty login of its
 /// own — the same scoped copy `master start --copy-login` makes
@@ -1629,6 +1632,13 @@ impl PiAdapter {
             "worker"
         };
         crate::pi_policy::require_allowed(pi_policy.as_ref(), role, &want)?;
+        // Pi has already loaded its catalog and auth. Reopening performs the
+        // credentialless AgenticOS admission before either can be used.
+        if role == "worker" && provider == "agenticos" {
+            return Err(Error::rejected(
+                "select AgenticOS for the next worker launch and reopen; live model switching is unavailable",
+            ));
+        }
         let model = match self.checked(
             "set_model",
             json!({"provider": provider, "modelId": model_id}),
@@ -2050,7 +2060,9 @@ impl ProviderAdapter for PiAdapter {
                 self.env.var("PI_CODING_AGENT_DIR"),
                 self.env.var("HOME"),
             );
-            if let Some(operator) = operator.as_deref() {
+            if want.starts_with("agenticos/") {
+                agenticos::seed(&config, &pi_config_dir(&self.state_dir), want)?;
+            } else if let Some(operator) = operator.as_deref() {
                 copy_pi_auth(&config, operator)?;
             } else {
                 ensure_private_dir(&config)?;

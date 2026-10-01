@@ -540,7 +540,11 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
 fn store_db_chat(chats_dir: &Path, pid: u32) -> Option<String> {
     // Trailing slashes in a configured chats dir must not double the
     // separator in the fd-link prefix.
-    let prefix = format!("{}/", chats_dir.to_string_lossy().trim_end_matches('/'));
+    // The fd link is kernel-resolved; a chats dir reached through a
+    // symlink (HOME or ~/.cursor behind one) must be resolved the same
+    // way or no fd ever matches (CAD-872).
+    let resolved = std::fs::canonicalize(chats_dir).unwrap_or_else(|_| chats_dir.to_path_buf());
+    let prefix = format!("{}/", resolved.to_string_lossy().trim_end_matches('/'));
     let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     for fd in fds.flatten() {
         let Ok(link) = std::fs::read_link(fd.path()) else {
@@ -883,9 +887,20 @@ impl TuiProfile for CursorProfile {
 
     /// The chat whose live attachment descends from `pane_pid`, or
     /// `None` when the pane owns no chat.
+    ///
+    /// CAD-872: only the open `store.db` fd counts here. The argv names
+    /// the chat from exec, so a TUI that is about to exit on a deleted
+    /// chat shows it for the whole of its (load-dependent) startup; as
+    /// proof of the open that claim reported a dying pane as opened,
+    /// and the dead id was fenced later instead of cleared. Argv stays
+    /// a *claim* in `attachments` — enough to refuse a takeover or
+    /// name a foreign owner, never to prove our own pane holds the chat.
     fn owned_session(&self, pane_pid: u32) -> Option<String> {
-        self.attachments()
-            .into_iter()
+        let procs = std::fs::read_dir("/proc").ok()?;
+        procs
+            .flatten()
+            .filter_map(|proc| proc.file_name().to_string_lossy().parse::<u32>().ok())
+            .filter_map(|pid| store_db_chat(&self.chats_dir, pid).map(|chat| (pid, chat)))
             .find(|(pid, _)| descends_from(*pid, pane_pid))
             .map(|(_, chat)| chat)
     }
@@ -1698,6 +1713,23 @@ mod tests {
         drop(file);
     }
 
+    /// CAD-872: the fd link is resolved by the kernel, so a chats dir
+    /// reached through a symlink must still match.
+    #[test]
+    fn store_db_chat_matches_through_a_symlinked_chats_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-chats");
+        let db = real.join("abc123").join("chat-sym").join("store.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let link = dir.path().join("link-chats");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let _file = std::fs::File::create(&db).unwrap();
+        assert_eq!(
+            store_db_chat(&link, std::process::id()).as_deref(),
+            Some("chat-sym")
+        );
+    }
+
     #[test]
     fn argv_proof_fabricated() {
         // A process whose argv[0] names cursor-agent and carries
@@ -1734,6 +1766,40 @@ mod tests {
         let _ = other.kill();
         let _ = holder.wait();
         let _ = other.wait();
+    }
+
+    /// CAD-872: a pane whose cursor-agent argv names a chat but holds
+    /// no `store.db` fd does not own it (a TUI still starting, or about
+    /// to exit on a deleted chat); the fd is what proves ownership.
+    #[test]
+    fn owned_session_needs_the_fd_not_argv_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile_in(dir.path());
+        let mut holder = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "exec -a cursor-agent python3 -c 'import time; time.sleep(30)' --resume chat-argv-only",
+            ])
+            .spawn()
+            .unwrap();
+        let mut seen = false;
+        for _ in 0..100 {
+            if argv_chat(holder.id()).is_some() {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(seen, "the argv claim must be visible for the test to bite");
+        // Still a claim (takeover refusal, foreign-owner naming) ...
+        assert!(p
+            .attachments()
+            .iter()
+            .any(|(pid, chat)| *pid == holder.id() && chat == "chat-argv-only"));
+        // ... but not proof that the pane holds the chat.
+        assert_eq!(p.owned_session(holder.id()), None);
+        let _ = holder.kill();
+        let _ = holder.wait();
     }
 
     /// A profile rooted in a temp dir: `cli-config.json` lands next

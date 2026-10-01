@@ -10,7 +10,11 @@ if os.environ.get("MOCK_CURSOR_SWAP"):
     sid = "swapped-" + sid
 # A chat named by MOCK_CURSOR_DIE_ON is unresumable — the real TUI
 # exits on a deleted/foreign chat, so the mock does too.
+# MOCK_CURSOR_DIE_DELAY holds the doomed process up (argv visible, no
+# store.db fd yet) for that many seconds before it exits — the real
+# TUI's node startup, made deterministic instead of load-dependent.
 if sid == os.environ.get("MOCK_CURSOR_DIE_ON"):
+    time.sleep(float(os.environ.get("MOCK_CURSOR_DIE_DELAY", "0")))
     sys.exit(1)
 chat_dir = os.path.join(chats, "mockhash", sid)
 os.makedirs(chat_dir, exist_ok=True)

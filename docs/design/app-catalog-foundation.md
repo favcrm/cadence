@@ -25,9 +25,12 @@ its previous catalog identity. Future workspace storage uses
 
 Mutation requires the existing canonical operator proof and existing PM write
 lock. The lock also serializes cooperating app update/approve/remove operations.
-It is create-exclusive; a process crash can leave `.write.lock`. This foundation
-does not unlink a stale lock automatically. An operator must establish that its
-holder is gone before following the existing PM recovery instruction.
+It is a kernel lock on `.git/cadence-write.flock` that the kernel releases when
+its holder dies; `.write.lock` remains only as a fence for older binaries. A
+crash can leave a stale `.write.lock` and, if it died mid-write, interrupted git
+state: the next writer refuses until that state is resolved. A `.write.lock`
+this build did not write is never removed automatically; the rollout owner
+clears it in a quiescent migration.
 
 Build and validate the complete candidate before changing records. Preserve
 nonempty IDs; mint a missing ID once. Save bounded original/staged record bytes

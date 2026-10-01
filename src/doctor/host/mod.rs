@@ -604,10 +604,7 @@ pub fn cli(state_dir: &Path, json_out: bool, reclaim: bool) -> Result<i32> {
         if json_out {
             let mut merged = report.clone();
             merged["reclaim"] = plan;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&merged).unwrap_or_default()
-            );
+            println!("{}", crate::output::json_text(&merged).unwrap_or_default());
         } else {
             print!("{}", render(&report));
             print!("{}", render_reclaim(&plan));
@@ -615,10 +612,7 @@ pub fn cli(state_dir: &Path, json_out: bool, reclaim: bool) -> Result<i32> {
         return Ok(exit_code(&report));
     }
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        println!("{}", crate::output::json_text(&report).unwrap_or_default());
     } else {
         print!("{}", render(&report));
     }

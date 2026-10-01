@@ -187,21 +187,6 @@ fn check_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The operator directory, created `0700` when absent and
-/// [`check_dir`]-verified always — for files that live next to the
-/// secret but are not written through [`write_private`] (the device
-/// pin's advisory lock, CAD-777).
-pub(crate) fn checked_dir(state_dir: &Path) -> Result<PathBuf> {
-    let dir = dir(state_dir);
-    match fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(Error::internal(format!("{}: {e}", dir.display()))),
-    }
-    check_dir(&dir)?;
-    Ok(dir)
-}
-
 /// Create the secret when there is none (`O_CREAT|O_EXCL|O_NOFOLLOW`,
 /// mode `0600`, in a `0700` directory). An existing file is left
 /// exactly as it is — a wrong mode is [`read_secret`]'s refusal, never

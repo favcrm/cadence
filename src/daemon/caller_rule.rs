@@ -631,11 +631,27 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "operator_session_open_device",
-        Rule::Handler("issuer bearer, verified live against the daemon-owned device pin; agent callers refused pre-mint (CAD-777)"),
+        Rule::Handler("issuer bearer, verified live against the daemon-owned device-login config; agent callers refused pre-mint (CAD-777, CAD-841)"),
     ),
     ("operator_session_check", Rule::Bearer),
     ("operator_session_logout", Rule::Bearer),
     ("operator_session_stolen", Rule::Bearer),
+    // CAD-841: the daemon owns the device-login config — boards read
+    // issuer+org through the open read; only the operator-secret verbs
+    // write it or disclose the allowlist.
+    ("device_login_config", Rule::Read),
+    (
+        "operator_device_login_set",
+        Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-841)"),
+    ),
+    (
+        "operator_device_login_clear",
+        Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-841)"),
+    ),
+    (
+        "operator_device_login_show",
+        Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-841)"),
+    ),
     // CAD-526: the platform sign-in exchange — the compact JWS is the
     // credential; a connection that derives an agent is refused before
     // the `jti` is consumed (the handler checks).

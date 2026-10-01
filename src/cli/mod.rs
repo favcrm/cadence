@@ -21,6 +21,7 @@ mod dispatch;
 mod doctor;
 mod events;
 mod export;
+mod help;
 mod idea;
 mod inbox;
 mod intake;
@@ -644,16 +645,20 @@ pub(crate) enum Commands {
     /// reporting continue asynchronously.
     ///
     /// `cadence send <ALIAS> --text <body>`: the recipient is the
-    /// positional alias and the body is `--text`, `-m` or `--file`.
-    /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
-    /// flags.
+    /// positional alias (or `--to <ALIAS>`, exactly one of the two) and
+    /// the body is `--text`, `-m` or `--file`. There are no email-style
+    /// `--subject`, `--body` or `--cc` flags.
     ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["alias", "to"])))]
     Send {
         /// Agent alias or provider-native id.
-        alias: String,
+        alias: Option<String>,
+        /// The same recipient as the positional alias; give exactly one.
+        #[arg(long)]
+        to: Option<String>,
         /// Literal single-line body.
         #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
@@ -1069,6 +1074,10 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ConnectionAction,
     },
+    /// Platform accounts (ADR 0006): the operator enrolls, rotates and
+    /// revokes scoped credentials, grants agents scopes and sets
+    /// per-project defaults; an agent reads only its own grants and
+    /// effects.
     Platform {
         #[command(subcommand)]
         action: PlatformAction,
@@ -2795,7 +2804,7 @@ pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Resul
 pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
+        cadence_agent::output::json_text(value).unwrap_or_default()
     );
 }
 
@@ -3204,11 +3213,20 @@ pub(crate) fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
     } else {
         return None;
     };
+    // CAD-888: top-level `send` accepts `--to` as the recipient.
+    let (banned, recipient) = if verb == "send" {
+        (
+            "--subject/--body/--cc",
+            "the positional alias or --to <alias>",
+        )
+    } else {
+        ("--to/--subject/--body/--cc", "the positional alias")
+    };
     Some(clap::Error::raw(
         ErrorKind::UnknownArgument,
         format!(
             "`cadence {verb}` has no `{flag}` flag — it takes no email-style \
-             --to/--subject/--body/--cc; the recipient is the positional alias\n\n\
+             {banned}; the recipient is {recipient}\n\n\
              Usage: cadence {verb} <ALIAS> --text <body>\n\n\
              \x20 body: --text <body>, -m <body> or --file <path>\n\
              \x20 multi-topic report: open the body with `SUBJECT: <topic>`\n\n\
@@ -3305,8 +3323,26 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     }
 }
 
+/// The `agent_show` request `cadence self` sends (CAD-879): running
+/// turns only, no message history.
+fn self_show_params(alias: &str) -> Value {
+    json!({"alias": alias, "active_only": true})
+}
+
 pub(crate) fn run() -> Result<i32> {
-    let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // CAD-888: `help operator|advanced|all` print the sections the
+    // default root help leaves out; `help <verb>` stays clap's own.
+    if let Some(text) = help::help_section(&argv) {
+        print!("{text}");
+        return Ok(0);
+    }
+    let cli = help::root_command(help::in_pane())
+        .try_get_matches()
+        .and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m))
+        .unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     // Offline custody never resolves daemon, org defaults or issuer credentials.
     if let Commands::Remote { action } = &cli.command {
         if cli.state_dir.is_some() {
@@ -3585,6 +3621,7 @@ pub(crate) fn run() -> Result<i32> {
         ),
         Commands::Send {
             alias,
+            to,
             text,
             file,
             message,
@@ -3595,7 +3632,18 @@ pub(crate) fn run() -> Result<i32> {
             nudge,
             steer,
         } => send::run(
-            state_dir, alias, text, file, message, reply_to, task, ready, force, nudge, steer,
+            state_dir,
+            // The ArgGroup guarantees exactly one of the two.
+            alias.or(to).expect("clap target group"),
+            text,
+            file,
+            message,
+            reply_to,
+            task,
+            ready,
+            force,
+            nudge,
+            steer,
         ),
         Commands::Dispatch {
             issue,
@@ -3687,7 +3735,8 @@ pub(crate) fn run() -> Result<i32> {
             let alias = std::env::var("CADENCE_ALIAS").map_err(|_| {
                 Error::rejected("CADENCE_ALIAS is not set — not inside a cadence-owned pane")
             })?;
-            let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+            // CAD-879: only the running turns are read — no history.
+            let show = client::rpc(&state_dir, "agent_show", self_show_params(&alias))?;
             // A mailbox has no running turn — report the inbound
             // backlog a consumer would drain instead.
             let (provider, kind) = (

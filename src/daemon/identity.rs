@@ -5,19 +5,46 @@ use super::*;
 use crate::peer::PeerTies;
 
 impl Shared {
-    /// Revalidate every active strict enrollment against its owner row
+    /// Revalidate the snapshotted active strict enrollments against their owner rows
     /// before a slot call: a missing row, a closed endpoint or a changed
     /// owner generation revokes (CAD-230). A store that cannot answer
     /// refuses the call instead — it proves no drift, so it neither
     /// revokes nor lets an unrevalidated enrollment admit.
     pub(super) fn revalidate_enrollments(&self) -> Result<()> {
-        let owners = self
+        // CAD-893: the rows below are read without the slot lock, so only
+        // the enrollments snapshotted here are judged by them — one a
+        // master mints meanwhile has no row in `current` and would be
+        // revoked as "owner has no live endpoint".
+        let snapshot = self
             .slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .enrolled_owners();
+            .enrollment_snapshot();
+        let owners = snapshot.owners();
         if owners.is_empty() {
             return Ok(());
+        }
+        // Test seam, same shape as CADENCE_TEST_INTERRUPT_PAUSE_MS: hold
+        // the first revalidation of this daemon open between the
+        // snapshot and the row reads, so a suite can enroll a master
+        // inside the gap. Only an in-process test daemon that set the
+        // name pauses (`ProviderEnv::own` never reads the process
+        // environment), and only once per daemon (the calls that run during the pause must
+        // not pause too).
+        if let Some(ms) = self
+            .provider_env
+            .own("CADENCE_TEST_REVALIDATE_PAUSE_MS")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if self
+                .revalidate_pause_armed
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = self
+                    .store
+                    .event_public("daemon", "revalidate_paused", json!({"ms": ms}));
+                thread::sleep(Duration::from_millis(ms));
+            }
         }
         let mut current: HashMap<String, Option<String>> = HashMap::new();
         for alias in owners {
@@ -28,7 +55,7 @@ impl Shared {
             .slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .revalidate_owners(&current);
+            .revalidate_snapshot(&snapshot, &current);
         self.emit_slot_events(events);
         Ok(())
     }

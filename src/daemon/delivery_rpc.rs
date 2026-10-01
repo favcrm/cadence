@@ -1092,7 +1092,7 @@ impl Shared {
             // same lock here; the Needs-you row and the event carry it,
             // and the retry that settles it comments then.
             let busy = matches!(n.kind, "ticket_done_pending" | "ticket_done_refused")
-                && pm.dir.join(".write.lock").exists();
+                && !matches!(pm.lock_state(), issue::LockState::Free);
             if let Some(text) = n.comment.as_ref().filter(|_| !busy) {
                 let _ = issue::write::add_comment(
                     pm,

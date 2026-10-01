@@ -28,6 +28,7 @@ pub(crate) enum MonitorAction {
     },
     /// List persistent monitor registrations and their separate delivery state.
     #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    #[command(visible_alias = "ls")]
     List {
         /// Sort by id project owner monitoring heartbeat_at created
         /// updated open_alerts; `-KEY` descending.
