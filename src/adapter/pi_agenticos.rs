@@ -15,6 +15,7 @@ pub(super) fn seed(dir: &Path, operator: Option<&Path>, model: &str) -> Result<(
     if model != MODEL {
         return Err(Error::rejected("unsupported AgenticOS worker model"));
     }
+    require_empty_auth(dir)?;
     let source = operator
         .ok_or_else(|| Error::rejected("AgenticOS worker requires the reviewed operator catalog"))?
         .join("models.json");
@@ -62,4 +63,38 @@ pub(super) fn seed(dir: &Path, operator: Option<&Path>, model: &str) -> Result<(
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Pi creates `{}` during startup. Preserve that resume state, but never admit
+/// a credential-bearing or unreadable store left by a previous worker model.
+fn require_empty_auth(dir: &Path) -> Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("auth.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(auth_refusal()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(auth_refusal());
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file).take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(auth_refusal());
+    }
+    let empty = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.is_empty()))
+        == Some(true);
+    if !empty {
+        return Err(auth_refusal());
+    }
+    Ok(())
+}
+
+fn auth_refusal() -> Error {
+    Error::rejected("AgenticOS worker requires an absent or empty auth store; use a fresh worker directory without deleting the existing login")
 }

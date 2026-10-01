@@ -14,6 +14,12 @@ API key is copied through this path. Other worker providers retain their existin
 authentication behavior. A missing, oversized, symlinked or changed source
 catalog, or an unsupported AgenticOS model, refuses before a Pi child launches.
 
+A worker directory with existing credentials is also refused without deleting
+or rewriting its login. Use a fresh worker directory when switching from another
+provider. Pi's normal empty `{}` auth store is allowed for resume; malformed,
+nonempty, oversized or symlinked auth stores are refused. Store values never
+appear in errors or the generated model catalog.
+
 The existing operator model allowlist still has to admit the model. This change
 does not alter that policy or authorize a paid turn. Pi's reported model and
 effort remain verified at startup; confinement remains enabled as configured.
