@@ -38,7 +38,7 @@ def successful(job):
     return job.get("status") == "completed" and job.get("conclusion") == "success"
 
 
-def summarize(run, jobs):
+def summarize(run, jobs, source="api"):
     created = run["created_at"]
     elapsed = interval(created, run["updated_at"])
     if not isinstance(jobs, list) or not all(isinstance(j, dict) for j in jobs):
@@ -63,6 +63,17 @@ def summarize(run, jobs):
         name = job.get("name")
         if not isinstance(name, str):
             raise ValueError("job name must be a string")
+        # Raw job objects must belong to this exact run, SHA and attempt.
+        # Offline receipts can otherwise be paired with another run's jobs.
+        for field, expected in (("run_id", run["id"]), ("head_sha", sha), ("run_attempt", run.get("run_attempt"))):
+            value = job.get(field)
+            if type(value) is not type(expected) or value != expected:
+                blockers.append(f"{name}: job {field} is missing or differs from the run")
+        steps = job.get("steps", [])
+        if not isinstance(steps, list) or not all(isinstance(x, dict) for x in steps):
+            blockers.append(f"{name}: malformed steps")
+            steps = []
+        job = {**job, "steps": steps}
         by_name.setdefault(name, []).append(job)
         row = {"name": name, "status": job.get("status"), "conclusion": job.get("conclusion"),
                "dispatch_to_start_seconds": None, "execution_seconds": None, "steps": []}
@@ -100,7 +111,7 @@ def summarize(run, jobs):
             blockers.append(f"{name}: missing, duplicate or non-successful job")
     for name in shard_names:
         for step_name in (COMPILE_STEP, TEST_STEP):
-            steps = [s for j in by_name[name] for s in j.get("steps", []) if s.get("name") == step_name]
+            steps = [s for j in by_name[name] for s in j["steps"] if s.get("name") == step_name]
             if len(steps) != 1 or not successful(steps[0]):
                 blockers.append(f"{name}: missing or non-successful {step_name}")
 
@@ -111,7 +122,7 @@ def summarize(run, jobs):
             gate_end = max(interval(created, by_name[n][0].get("completed_at")) for n in required)
         except (ValueError, TypeError):
             pass  # Timing errors are already recorded above.
-    return {"schema": 1, "run_id": run["id"], "source_sha": sha, "event": run.get("event"),
+    return {"schema": 1, "source": source, "run_id": run["id"], "source_sha": sha, "event": run.get("event"),
             "attempt": run.get("run_attempt"), "shards": width,
             "workflow_elapsed_seconds": elapsed if run.get("status") == "completed" else None,
             "gate_elapsed_seconds": gate_end, "runner_seconds": runner_seconds,
@@ -121,6 +132,8 @@ def summarize(run, jobs):
 def compare(left, right):
     if not left["comparable"] or not right["comparable"]:
         raise ValueError("comparison requires complete successful first-attempt CI evidence")
+    if left["run_id"] == right["run_id"]:
+        raise ValueError("comparison requires two different runs")
     if left["source_sha"] != right["source_sha"]:
         raise ValueError("comparison requires the same exact source SHA")
     if left["event"] != "workflow_dispatch" or right["event"] != "workflow_dispatch":
@@ -142,7 +155,7 @@ def minutes(seconds):
 
 def markdown(report):
     lines = [f"# CI timing: run {report['run_id']}", "",
-             f"SHA: `{report['source_sha']}`; event: {report['event']}; attempt: {report['attempt']}; shards: {report['shards']}",
+             f"SHA: `{report['source_sha']}`; event: {report['event']}; attempt: {report['attempt']}; shards: {report['shards']}; source: {report['source']}",
              f"Workflow elapsed: {minutes(report['workflow_elapsed_seconds'])} min; gates elapsed: {minutes(report['gate_elapsed_seconds'])} min; summed runner-minutes: {minutes(report['runner_seconds'])}.",
              "", "Job dispatch-to-start includes dependency wait and scheduling; it is not pure runner queue time.",
              "Runner-minutes sum executed job wall time, not CPU time or GitHub billing. Incomplete evidence is partial.",
@@ -195,7 +208,8 @@ def main():
             if args.jobs is None or args.compare_run_id is not None or bool(args.compare_run) != bool(args.compare_jobs):
                 raise ValueError("offline mode requires --jobs and a paired --compare-run/--compare-jobs")
             def offline(run, jobs):
-                return summarize(json.loads(run.read_text()), json.loads(jobs.read_text())["jobs"])
+                return summarize(json.loads(run.read_text()), json.loads(jobs.read_text())["jobs"],
+                                 source="offline-unverified")
             report = offline(args.run, args.jobs)
             other = offline(args.compare_run, args.compare_jobs) if args.compare_run else None
         comparison = compare(report, other) if other else None

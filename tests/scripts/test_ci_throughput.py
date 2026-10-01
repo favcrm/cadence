@@ -32,6 +32,7 @@ def fixture(width=8, run_id=10):
     names = ["fmt", "clippy", "test", "build", "ui", "test-once"]
     names += [f"test-shard ({i})" for i in range(1, width + 1)]
     jobs = [{"name": name, "status": "completed", "conclusion": "success",
+             "run_id": run_id, "head_sha": "a" * 40, "run_attempt": 1,
              "started_at": "2026-09-29T12:02:00Z", "completed_at": "2026-09-29T12:06:00Z",
              # GitHub can reset created_at after started_at on a rerun.
              "created_at": "2026-09-29T12:03:00Z",
@@ -106,6 +107,7 @@ class TimingEvidence(unittest.TestCase):
     def test_skipped_optional_jobs_add_no_runner_time(self):
         run, jobs = fixture()
         jobs.append({"name": "release-artifact", "status": "completed", "conclusion": "skipped",
+                     "run_id": 10, "head_sha": "a" * 40, "run_attempt": 1,
                      "started_at": run["created_at"], "completed_at": run["created_at"], "steps": []})
         report = self.mod.summarize(run, jobs)
         self.assertTrue(report["comparable"])
@@ -157,6 +159,77 @@ class TimingEvidence(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 self.mod.fetch("favcrm/cadence", 10)
 
+    def test_jobs_must_belong_to_the_run(self):
+        for field, value in [("run_id", 999), ("head_sha", "b" * 40), ("run_attempt", 3),
+                             ("run_id", None), ("head_sha", None), ("run_attempt", None)]:
+            run, jobs = fixture()
+            jobs[3][field] = value
+            report = self.mod.summarize(run, jobs)
+            self.assertFalse(report["comparable"], (field, value))
+            self.assertTrue(any(field in b for b in report["comparison_blockers"]), (field, value))
+            run, jobs = fixture()
+            del jobs[3][field]
+            self.assertFalse(self.mod.summarize(run, jobs)["comparable"], field)
+
+    def test_offline_reports_are_marked_unverified_and_api_reports_are_not(self):
+        self.assertEqual(self.mod.summarize(*fixture(), source="offline-unverified")["source"],
+                         "offline-unverified")
+        self.assertEqual(self.mod.summarize(*fixture())["source"], "api")
+
+    def test_same_run_id_cannot_be_compared_with_itself(self):
+        with self.assertRaises(ValueError):
+            self.mod.compare(self.mod.summarize(*fixture(4, 10)), self.mod.summarize(*fixture(8, 10)))
+
+    def test_shard_must_have_both_compile_and_test_steps(self):
+        for step_name in ["Verify selected inventory parity", "Run recorded Rust scope with pinned nextest"]:
+            for mutate in [lambda steps, n: steps.remove(next(x for x in steps if x["name"] == n)),
+                           lambda steps, n: next(x for x in steps if x["name"] == n).update(conclusion="failure"),
+                           lambda steps, n: steps.append(copy.deepcopy(next(x for x in steps if x["name"] == n)))]:
+                run, jobs = fixture()
+                shard = next(j for j in jobs if j["name"] == "test-shard (3)")
+                mutate(shard["steps"], step_name)
+                report = self.mod.summarize(run, jobs)
+                self.assertFalse(report["comparable"], step_name)
+                self.assertTrue(any("test-shard (3)" in b and step_name in b
+                                    for b in report["comparison_blockers"]))
+
+    def test_malformed_steps_are_a_clean_blocker_not_a_traceback(self):
+        for bad in [["text"], [None], None, "x", [{"name": "x"}, 3]]:
+            run, jobs = fixture()
+            jobs[-1]["steps"] = bad
+            report = self.mod.summarize(run, jobs)
+            self.assertFalse(report["comparable"])
+            self.assertTrue(any("malformed steps" in b for b in report["comparison_blockers"]))
+
+    def test_cli_offline_report_says_unverified_and_survives_malformed_steps(self):
+        with tempfile.TemporaryDirectory(prefix="cad840-") as directory:
+            root = Path(directory)
+            run, jobs = fixture()
+            jobs[-1]["steps"] = ["junk"]
+            (root / "run.json").write_text(json.dumps(run))
+            (root / "jobs.json").write_text(json.dumps({"jobs": jobs}))
+            out = subprocess.run(["python3", str(SCRIPT), "--run", str(root / "run.json"),
+                                  "--jobs", str(root / "jobs.json"), "--json"],
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            doc = json.loads(out.stdout)
+            self.assertEqual(doc["source"], "offline-unverified")
+            self.assertFalse(doc["comparable"])
+            self.assertNotIn("Traceback", out.stderr)
+
+    def test_cli_cross_run_offline_pair_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="cad840-") as directory:
+            root = Path(directory)
+            run4, jobs4 = fixture(4, 10)
+            run8, jobs8 = fixture(8, 11)
+            for name, doc in [("r4", run4), ("j4", {"jobs": jobs8}), ("r8", run8), ("j8", {"jobs": jobs8})]:
+                (root / f"{name}.json").write_text(json.dumps(doc))
+            out = subprocess.run(["python3", str(SCRIPT), "--run", str(root / "r4.json"),
+                                  "--jobs", str(root / "j4.json"), "--compare-run", str(root / "r8.json"),
+                                  "--compare-jobs", str(root / "j8.json"), "--json"],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(out.returncode, 0)
+
     def test_cli_offline_fixture_and_failure_exit_codes(self):
         with tempfile.TemporaryDirectory(prefix="cad840-") as directory:
             root = Path(directory)
@@ -175,6 +248,11 @@ class TimingEvidence(unittest.TestCase):
 class WorkflowContract(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text()
+
+    def test_reporter_step_names_exist_in_the_workflow(self):
+        mod = load()
+        for step in (mod.COMPILE_STEP, mod.TEST_STEP):
+            self.assertIn(f"- name: {step}\n", self.text)
 
     def test_manual_only_width_expression_and_choice(self):
         self.assertIn("  workflow_dispatch:\n", self.text)

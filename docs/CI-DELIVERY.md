@@ -130,7 +130,8 @@ Each `test-shard` job selects the scope from the base policy, proves
 Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
 SPA, executes its assigned tests and uploads assignment/cost artifacts.
 The required `test` aggregate verifies complete, disjoint coverage from the
-assignment receipts (eight automatically; four or eight on a manual benchmark). Default-feature refusal proofs and doctests
+assignment receipts (eight automatically; four or eight on a manual
+benchmark). Default-feature refusal proofs and doctests
 remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
 
 ## Why shards compile themselves (CAD-869)
@@ -169,7 +170,9 @@ gh workflow run ci.yml -R favcrm/cadence --ref <frozen-ref> -f test_shards=8
 The matrix, partition denominator and assignment aggregate use the same
 width. Each width must prove its complete inventory union, with no missing,
 duplicate or out-of-range shard. Default-feature refusal proofs, doctests,
-fmt, both clippy shapes, build, UI and cross-build checks remain. Manual
+fmt, both clippy shapes, build and UI checks remain. Cross-build runs only
+on pull_request and merge_group events, and the secrets scan only on
+pull_request, so manual runs at either width skip both equally. Manual
 runs do not publish a release or reuse a main push's queue evidence.
 Benchmark dispatches have their own concurrency groups, so they cannot
 hold up an unrelated run sharing the main ref.
@@ -210,7 +213,10 @@ or an independent replacement for the assignment coverage gate.
 For offline review, provide raw API responses with `--run run.json --jobs
 jobs.json`; compare a second pair using `--compare-run other-run.json
 --compare-jobs other-jobs.json`. The jobs file has the shape
-`{"jobs": [...]}`. Keep the raw responses with the report.
+`{"jobs": [...]}`. Keep the raw responses with the report. Every job must
+carry the run's `run_id`, `head_sha` and `run_attempt`, and a run cannot be
+compared with itself. Offline reports are labelled `source:
+offline-unverified`: the files are only as trustworthy as their provenance.
 
 Choose a default only after repeated same-SHA trials show better gate
 latency **and** acceptable runner-minutes under realistic load. Do not
