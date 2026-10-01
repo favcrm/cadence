@@ -352,7 +352,6 @@ fn refuses_unsafe_record_references() {
         json!("Customer"),        // case
         json!("customer record"), // space
         json!("customers;drop"),  // injection-ish
-        json!("app_records"),     // a host-internal name is not a kind
         json!("../customers"),    // path
         json!("a".repeat(65)),
         json!(""),
@@ -428,7 +427,7 @@ fn enum_values_required_and_only_on_enum() {
     // enum without values refuses.
     let mut raw = load_example("crm.json");
     raw["actions"][0]["input"]["fields"][0] = json!({
-        "id": "tier", "label": "Tier", "type": "enum"
+        "id": "membership", "label": "Membership", "type": "enum"
     });
     parse_err(&raw);
     // values on a non-enum refuses.
@@ -442,7 +441,7 @@ fn enum_values_required_and_only_on_enum() {
     // A valid enum is accepted.
     let mut raw = load_example("crm.json");
     raw["actions"][0]["input"]["fields"][0] = json!({
-        "id": "tier", "label": "Tier", "type": "enum", "values": ["member", "vip"]
+        "id": "membership", "label": "Membership", "type": "enum", "values": ["member", "vip"]
     });
     parse_ok(&raw);
 }
@@ -638,4 +637,18 @@ fn refuses_oversize_raw_json_before_decoding() {
     let input = format!("{}{}", " ".repeat(65536), load_example("crm.json"));
     let error = app_action::parse_str(&input).unwrap_err().to_string();
     assert!(error.contains("exceeds 65536 bytes"), "{error}");
+}
+
+/// A well-formed name is declaration metadata, not host storage selection.
+/// Domain-kind existence and installation-scoped admission are later gates.
+#[test]
+fn accepts_well_formed_forward_record_reference_without_storage_authority() {
+    let mut raw = load_example("crm.json");
+    raw["actions"][0]["record"] = json!("app_records");
+    let validator = jsonschema::validator_for(&load("app-actions.schema.json")).unwrap();
+    assert!(validator.is_valid(&raw));
+    assert_eq!(parse_ok(&raw).actions[0].record, "app_records");
+    raw["actions"][0]["sql"] = json!("SELECT * FROM app_records");
+    assert!(!validator.is_valid(&raw));
+    parse_err(&raw);
 }

@@ -493,10 +493,8 @@ fn parse_action(raw: &Value, path: &str) -> Result<Action> {
     )?
     .to_string();
     let operation = match map.get("operation") {
-        Some(Value::String(op)) if OPERATIONS.contains(&op.as_str()) => match op.as_str() {
-            "record.create" => Operation::RecordCreate,
-            _ => Operation::RecordUpdate,
-        },
+        Some(Value::String(op)) if op == "record.create" => Operation::RecordCreate,
+        Some(Value::String(op)) if op == "record.update" => Operation::RecordUpdate,
         _ => {
             return Err(fail(
                 &format!("{path}.operation"),
