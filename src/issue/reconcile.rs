@@ -492,10 +492,21 @@ const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// (CAD-823) covers a ticket whose file never left backlog/ready
 /// while a note or a live job says in flight — a verdict no longer
 /// fakes `done`, so it must still reach the probe — and a live job
-/// still outranks even a terminal file (CAD-244). (One commit per
-/// issue, `mark_done_on_merge` semantics: `expect` pins the status it
-/// was read at so a mid-sweep reopen is never overwritten.)
-/// `held`/`stalled` rows are reported, not moved.
+/// still outranks even a terminal file (CAD-244). The notes-derived
+/// arm admits only a fresh note: a `status:` write recorded after the
+/// newest tagged note (an operator park/reopen) wins, and a failed
+/// history walk admits nothing through it — the sweep reports that
+/// failure on `history` instead of widening on a guess (CAD-878).
+/// A job-derived candidate needs no history at all; it widens even
+/// when the walk fails. (One commit per issue, `mark_done_on_merge`
+/// semantics: `expect` pins the status it was read at so a mid-sweep
+/// reopen is never overwritten.) `held`/`stalled` rows are reported,
+/// not moved. `limit` charges only evidence-bearing candidates — an
+/// issue with lanes or `pr:` refs; a ref-less candidate classifies
+/// `skipped` for free so idle note-driven tickets ahead of it never
+/// starve it. The CLI starts at the head; daemon ticks retain a
+/// rotating cursor so unresolved candidates cannot starve later ones
+/// (see [`run_daemon`]).
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
 pub fn run(
@@ -545,6 +556,7 @@ pub(crate) fn run_with_clock(
         &gh_view,
         Some(clock.now() + CLI_CLOSE_LOCK_WAIT),
         clock,
+        &LineTimes::load,
     )
 }
 
@@ -565,6 +577,20 @@ pub fn run_daemon(pm: &Pm, actor: &str, limit: usize, cursor: Option<&str>) -> R
     run_inner(
         pm, None, false, actor, None, limit, cursor, &gh_list, &gh_view, None,
     )
+}
+
+/// The `LineTimes::load` seam — tests inject a failure or a fixed
+/// clock so the sweep's fail-closed notes arm is provable without
+/// timing games. The string is the load error the sweep reports.
+type HistoryLoad<'a> = &'a dyn Fn(&Path, Duration) -> std::result::Result<LineTimes, String>;
+
+/// A `LineTimes::load` error is already bounded (git spawn/walk
+/// strings); it still passes through the argv scrubber so a
+/// credential-shaped token in a path can never reach the output, and
+/// flattens to one line — sweep rows and daemon logs are single-line.
+fn safe_history_error(e: &str) -> String {
+    let line = e.lines().next().unwrap_or("");
+    crate::doctor::host::redact_argv(&[line])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -592,6 +618,7 @@ fn run_inner(
         pr_view,
         close_lock_deadline,
         &write::RealWait,
+        &LineTimes::load,
     )
 }
 
@@ -612,6 +639,7 @@ fn run_inner_with(
     pr_view: PrView<'_>,
     close_lock_deadline: Option<Instant>,
     clock: &dyn write::WaitClock,
+    history: HistoryLoad<'_>,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
@@ -639,8 +667,20 @@ fn run_inner_with(
     // `status:` line times from tracker history — the note-driven arm
     // is only as fresh as the newest note vs the last status write
     // (a status move after the note is a deliberate park/reopen and
-    // wins). `None` when the walk fails: then nothing widens.
-    let times = LineTimes::load(&pm.dir, Duration::from_secs(10)).ok();
+    // wins). When the walk fails the notes arm does not widen — a
+    // candidacy that cannot tell a park from a fresh note stays
+    // parked — and the failure is reported on the sweep's `history`
+    // field instead of swallowed, so a stuck walk is diagnosable
+    // rather than silently starving every note-driven ticket. Jobs
+    // still widen on their own; file `doing`/`review` rows are
+    // unaffected.
+    let (times, history_state) = match history(&pm.dir, Duration::from_secs(10)) {
+        Ok(t) => (Some(t), json!({"state": "ok"})),
+        Err(e) => (
+            None,
+            json!({"state": "failed", "error": safe_history_error(&e)}),
+        ),
+    };
     let children: HashSet<&str> = views
         .iter()
         .filter_map(|v| v.issue.front.parent.as_deref())
@@ -767,6 +807,7 @@ fn run_inner_with(
         "project": project,
         "classified": classified,
         "cursor": last_classified,
+        "history": history_state,
         "rows": rows,
         "done": done,
         "held": held,
@@ -1350,6 +1391,138 @@ mod tests {
             .filter(|r| r["outcome"] == "skipped")
             .count();
         assert_eq!(skipped, 30, "{out}");
+    }
+
+    /// CAD-878: a history-walk failure must surface on the sweep and
+    /// hold every note-driven candidate fail-closed — never widen on
+    /// an unknown park decision. The injected failure makes the arm
+    /// unreachable for the sweep's duration; the output says why.
+    #[test]
+    fn history_failure_parks_note_driven_and_reports() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 40, None, "backlog");
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: git log HEAD failed".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        // Note-driven and not provably fresh → excluded entirely, the
+        // file keeps its parked status, and the sweep says why.
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        assert!(out["rows"].as_array().unwrap().is_empty(), "{out}");
+        assert!(out["done"].as_array().unwrap().is_empty(), "{out}");
+        assert_eq!(out["history"]["state"], "failed", "{out}");
+        let err = out["history"]["error"].as_str().unwrap_or("");
+        assert!(err.contains("git log"), "{out}");
+    }
+
+    /// A file `doing`/`review` ticket does not need the notes arm, so
+    /// a failed history walk must not hold it back: only the
+    /// note-derived candidates park.
+    #[test]
+    fn history_failure_still_classifies_file_driven() {
+        let rig = rig();
+        let id = put_issue(&rig, 41, None); // file status doing
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: out of time".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert_eq!(out["history"]["state"], "failed", "{out}");
+    }
+
+    /// Recovery: the same parked ticket regains candidacy once the
+    /// history load succeeds again — the failure parked it, it did
+    /// not disqualify it.
+    #[test]
+    fn history_recovery_restores_note_driven_candidacy() {
+        let rig = rig();
+        let id = put_issue_at(&rig, 42, None, "backlog");
+        verdict_note(&rig, &id, "20260928-120000-x-verdict.md");
+        lane(&rig.repo, true);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: git log HEAD failed".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        assert_eq!(status(&rig, &id), "backlog", "{out}");
+        // Next sweep: the walk answers again, the fresh note admits
+        // the arm and the merged lane closes the ticket.
+        let out = sweep(&rig, false, &no_gh, &no_view);
+        assert_eq!(status(&rig, &id), "done", "{out}");
+        assert_eq!(out["history"]["state"], "ok", "{out}");
+    }
+
+    /// The reported error is single-line and bounded — the daemon log
+    /// and CLI row print it verbatim.
+    #[test]
+    fn history_error_is_one_scrubbed_line() {
+        let rig = rig();
+        put_issue(&rig, 43, None);
+        let boom = |_: &Path, _: Duration| -> std::result::Result<LineTimes, String> {
+            Err("tracker line times: spawn git: first\nsecond\nthird".to_string())
+        };
+        let out = run_inner_with(
+            &rig.pm,
+            None,
+            false,
+            "op",
+            None,
+            0,
+            None,
+            &no_gh,
+            &no_view,
+            None,
+            &write::RealWait,
+            &boom,
+        )
+        .unwrap();
+        let err = out["history"]["error"].as_str().unwrap_or("");
+        assert_eq!(err, "tracker line times: spawn git: first", "{err}");
+        assert!(!err.contains('\n'), "{err}");
     }
 
     #[test]
