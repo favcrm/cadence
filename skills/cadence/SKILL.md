@@ -93,6 +93,12 @@ cadence milestone ls --json
 - `--sort KEY` orders (`-KEY` descending), `--limit N` caps, `--fields a,b`
   keeps only those JSON row keys, `--since/--until` take `24h`/`7d`, an ISO
   date, or an epoch.
+- Output policy: JSON on stdout is one compact line per document when
+  stdout is not a terminal (your case), pretty on a TTY.
+  `CADENCE_JSON=pretty|compact` overrides. `issue ls`, `issue epic
+  ls|show` and `milestone ls|show` print JSON when piped, a table only
+  on a TTY (`CADENCE_JSON=table` forces the table). Field names and
+  order never change.
 - `issue ls --tag` is the one exception: every named tag must be present.
 - `agent list` from your pane still shows only your group — filters narrow
   it, `--all` widens past it.

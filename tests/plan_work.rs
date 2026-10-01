@@ -4491,7 +4491,7 @@ fn project_new_registers_seeds_and_is_operator_only() {
     // Idempotent: the same key and repo again changes nothing.
     let (ok, out, err) = d.operator_cadence(&["project", "new", "reminders", "--repo", &a]);
     assert!(ok, "{out}{err}");
-    assert!(out.contains("\"changed\": false"), "{out}");
+    assert!(out.contains("\"changed\":false"), "{out}");
     assert_eq!(commits(), after);
     assert_eq!(
         std::fs::read_to_string(pm_dir.join("reminders/PROJECT.md")).unwrap(),

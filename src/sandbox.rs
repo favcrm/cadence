@@ -76,7 +76,7 @@ pub fn run_cli(action: &SandboxAction) -> Result<i32> {
         SandboxAction::Reset { name } => reset(&Sandbox::open(name)?)?,
         SandboxAction::Ls => ls()?,
     };
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    println!("{}", crate::output::json_text(&out).unwrap_or_default());
     Ok(0)
 }
 

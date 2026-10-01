@@ -2646,7 +2646,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     }
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", crate::output::json_text(&report)?);
     } else {
         println!("report: {}", md_path.display());
         println!("verdict: {verdict} — {}", reasons.join("; "));

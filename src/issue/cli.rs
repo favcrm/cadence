@@ -70,7 +70,7 @@ pub enum IssueAction {
         #[arg(long)]
         status: Option<String>,
     },
-    /// List issues — a compact table on a TTY, `--json` for agents.
+    /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
     /// present. See PROTOCOL.md "List grammar".
@@ -730,10 +730,7 @@ pub enum ProjectAction {
 }
 
 pub(crate) fn print_json(value: &Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+    println!("{}", crate::output::json_text(value).unwrap_or_default());
 }
 
 fn open_pm() -> Result<Pm> {
@@ -937,6 +934,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             summary,
             json: json_flag,
         } => {
+            // CAD-877: a table only on a TTY; piped output is JSON.
+            let json_flag = &(*json_flag || !crate::output::stdout_table());
             crate::filter::fields_need_json(fields, *json_flag)?;
             if *summary && !fields.is_empty() {
                 return Err(Error::rejected(
@@ -1500,6 +1499,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     json,
                     ..
                 } => {
+                    let json = &(*json || !crate::output::stdout_table());
                     crate::filter::fields_need_json(fields, *json)?;
                     let ctx =
                         work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir));
@@ -1571,6 +1571,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     }
                 }
                 EpicAction::Show { id, json } => {
+                    let json = &(*json || !crate::output::stdout_table());
                     model::check_id(id)?;
                     let epic = by_id.get(id).ok_or_else(|| {
                         Error::rejected(format!(
@@ -2094,6 +2095,7 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
             json,
             ..
         } => {
+            let json = &(*json || !crate::output::stdout_table());
             crate::filter::fields_need_json(fields, *json)?;
             if !stage.is_empty() {
                 let mut valid: Vec<String> = ctx
@@ -2152,6 +2154,7 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
         }
         MilestoneAction::Show { id, json, .. } => {
             let row = work::milestone_show(&ctx, &views, id, one)?;
+            let json = &(*json || !crate::output::stdout_table());
             if *json {
                 print_json(&row);
             } else {

@@ -2795,7 +2795,7 @@ pub(crate) fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Resul
 pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
+        cadence_agent::output::json_text(value).unwrap_or_default()
     );
 }
 
