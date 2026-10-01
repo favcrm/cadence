@@ -42,6 +42,12 @@ pub(crate) enum DaemonAction {
     /// asks for the lease, but a same-build `daemon stop` followed by
     /// `daemon start` (or a crash restart of the same build) stays
     /// lease-free, so that same-build requirement is advisory.
+    ///
+    /// The verdict also reads the new daemon's recovery record: a
+    /// restart that fenced any in-flight turn, whose predecessor's
+    /// drain failed, or whose record is missing or unbound exits
+    /// "not cleanly" — including a restart without --when-idle that
+    /// sweeps stale running rows on stopped agents.
     Restart {
         /// First wait until every pty pane probes idle and no managed
         /// agent has a running message; on timeout nothing is changed.

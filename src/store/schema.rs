@@ -1407,12 +1407,6 @@ impl ShutdownDrainError {
     pub fn is_fenced(&self) -> bool {
         matches!(self, Self::Fenced(_))
     }
-
-    pub fn into_error(self) -> crate::Error {
-        match self {
-            Self::Fenced(e) | Self::Failed(e) => e,
-        }
-    }
 }
 
 impl std::fmt::Display for ShutdownDrainError {

@@ -3551,6 +3551,13 @@ fn cad694_failed_shutdown_fences_the_restart_verdict() {
         // Contention only adds time, so these are lower bounds; a zero
         // backoff would fail here.
         let stamps = stamps.lock().unwrap();
+        // The bound is the first try plus two retries: more attempts
+        // than that means the retry count was raised.
+        assert!(
+            stamps.len() <= 3,
+            "{} drain attempts exceed the first try plus two retries",
+            stamps.len()
+        );
         for (i, pair) in stamps.windows(2).enumerate() {
             let floor = std::time::Duration::from_millis(50 * (i as u64 + 1));
             assert!(

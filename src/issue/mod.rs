@@ -433,6 +433,7 @@ impl Pm {
                 message.as_str(),
             ],
             cancel,
+            self.lease.as_ref(),
         )?;
         Ok(true)
     }
@@ -640,19 +641,54 @@ impl FlushCancel {
 }
 
 /// How long a cancelled commit gets to unwind (git removes its lock
-/// files on SIGTERM) before the group is killed outright.
+/// files on SIGTERM) before the whole group is killed outright.
 const CANCEL_TERM_GRACE: Duration = Duration::from_millis(1000);
 
-/// [`git`] that the owning thread polls against `cancel`. The child runs
-/// in its own process group, so the commit hooks it spawned die with it;
-/// the owner terminates and reaps the group itself — never a kill of a
-/// pid it no longer owns.
-fn git_cancellable(dir: &Path, args: &[&str], cancel: &FlushCancel) -> Result<String> {
+/// A commit may run only while the lease has at least this much room:
+/// the SIGTERM grace plus a margin. Below it the commit is cancelled,
+/// so it is over (or dead) before the lease can lapse into a successor.
+const COMMIT_LEASE_FLOOR: Duration = Duration::from_millis(2000);
+
+/// Whether the leader of `group` has exited, WITHOUT reaping it — the
+/// zombie keeps the pgid ours, so signalling the group stays safe.
+fn leader_exited(group: i32) -> bool {
+    // SAFETY: waitid with WNOWAIT|WNOHANG only inspects a child of ours.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            group as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc != 0 || info.si_pid() != 0
+    }
+}
+
+/// [`git`] that the owning thread polls against `cancel` AND the lease:
+/// a lost lease or one with less than [`COMMIT_LEASE_FLOOR`] of validity
+/// left cancels the commit like an explicit cancel. The child runs in
+/// its own process group; the owner terminates the group, then kills it
+/// outright after the grace (a hook that traps TERM included) with the
+/// leader still unreaped, and never joins the pipe drains on that path —
+/// so the worker unwinds, drops the tracker lock, and no writer is left.
+fn git_cancellable(
+    dir: &Path,
+    args: &[&str],
+    cancel: &FlushCancel,
+    lease: Option<&crate::lease::PmLease>,
+) -> Result<String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    if cancel.cancelled() {
-        return Err(Error::rejected("tracker flush cancelled before its commit"));
+    let must_stop = || {
+        cancel.cancelled()
+            || lease.is_some_and(|l| l.remaining().is_some_and(|r| r < COMMIT_LEASE_FLOOR))
+    };
+    if must_stop() {
+        return Err(Error::rejected(
+            "tracker flush cancelled before its commit (cancelled, or the lease is too close to lapsing)",
+        ));
     }
     let mut cmd = Command::new("git");
     cmd.arg("-C")
@@ -687,20 +723,19 @@ fn git_cancellable(dir: &Path, args: &[&str], cancel: &FlushCancel) -> Result<St
     );
     let group = child.id() as i32;
     let status = loop {
-        if cancel.cancelled() {
-            // SAFETY: signalling the process group this thread created
-            // and has not yet reaped, so the id cannot have been reused.
+        if must_stop() {
+            // SAFETY: the group's leader is our child and stays
+            // unreaped until after the last signal, so the id is ours.
             unsafe { libc::kill(-group, libc::SIGTERM) };
             let deadline = Instant::now() + CANCEL_TERM_GRACE;
-            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            while Instant::now() < deadline && !leader_exited(group) {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if matches!(child.try_wait(), Ok(None)) {
-                // SAFETY: as above — still unreaped.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
-                let _ = child.wait();
-            }
-            let _ = (out.join(), err.join());
+            // SAFETY: as above; hooks that ignored TERM die here.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            let _ = child.wait();
+            // The drain threads end when the group's pipes close; they
+            // are not joined — a straggler must not hold the worker.
             return Err(Error::rejected(
                 "tracker flush cancelled — its commit was terminated",
             ));
@@ -708,7 +743,12 @@ fn git_cancellable(dir: &Path, args: &[&str], cancel: &FlushCancel) -> Result<St
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(Error::internal(format!("waiting on git: {e}"))),
+            Err(e) => {
+                // SAFETY: still our unreaped child's group.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(Error::internal(format!("waiting on git: {e}")));
+            }
         }
     };
     let stdout = out.join().unwrap_or_default();

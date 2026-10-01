@@ -496,7 +496,8 @@ pub(super) fn lease_flush(
         } else {
             eprintln!(
                 "cadence: shutdown flush worker still running after cancel — \
-                 it is outside the tracker commit (checkpoint or a parked seam)"
+                 not inside the tracker commit (the WAL checkpoint, the read-only \
+                 staged probe or a parked seam)"
             );
         }
         return false;

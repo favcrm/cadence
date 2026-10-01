@@ -4573,9 +4573,13 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                         .max(Duration::from_millis(5))
                         .min(ACCEPT_BACKOFF_MAX);
                     if accept_log_at.is_none_or(|at| at.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                        let note = if accept_suppressed > 0 {
+                            format!(" ({accept_suppressed} similar failures not logged)")
+                        } else {
+                            String::new()
+                        };
                         eprintln!(
-                            "cadence: listener accept failed ({e}); retrying in {}ms \
-                             ({accept_suppressed} similar failures not logged)",
+                            "cadence: listener accept failed ({e}); retrying in {}ms{note}",
                             accept_backoff.as_millis()
                         );
                         accept_log_at = Some(std::time::Instant::now());

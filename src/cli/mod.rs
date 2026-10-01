@@ -2163,9 +2163,10 @@ pub(crate) fn daemon_restart(
     let start_unbound = started["state"].as_str() != Some("started");
     if start_unbound {
         eprintln!(
-            "restart: the start answered {} — that daemon is not the one this restart \
-             spawned, so its recovery evidence is not bound to this restart",
-            started["state"].as_str().unwrap_or("with no state")
+            "restart: the start answered {} instead of `started` — that daemon is not \
+             the one this restart spawned, so its recovery evidence is not bound to \
+             this restart",
+            started["state"].as_str().unwrap_or("without a state")
         );
     }
     // Wait until every agent that was live before leaves the
@@ -2255,9 +2256,13 @@ pub(crate) fn daemon_restart(
     // none, and non-pty endpoints were never scanned. The record is
     // bound to the instance this start returned; missing, malformed or
     // mismatched, a failed drain, or any fenced turn fails closed.
-    if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
-        eprintln!("restart: {reason}");
-        bad = true;
+    // An unbound start already reported itself above; its record verdict
+    // would only repeat that, so it is judged only for a spawned start.
+    if !start_unbound {
+        if let Some(reason) = recovery_record_verdict(state_dir, started_instance.as_deref()) {
+            eprintln!("restart: {reason}");
+            bad = true;
+        }
     }
     for alias in &cursor_misses {
         eprintln!("restart: no pre-stop event cursor for {alias} — its verdict is unverified");

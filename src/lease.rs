@@ -145,6 +145,26 @@ impl Fence {
             .clone()
     }
 
+    /// How long the held lease stays valid if it is never renewed
+    /// again: `None` when no expiry applies (unleased), `Some(ZERO)`
+    /// once tripped or lapsed.
+    pub fn remaining(&self) -> Option<Duration> {
+        if self.reason().is_some() {
+            return Some(Duration::ZERO);
+        }
+        if let Some(deadline) = *self
+            .expires_monotonic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Some(deadline.saturating_duration_since(Instant::now()));
+        }
+        let expiry = f64::from_bits(self.expires_unix.load(Ordering::SeqCst));
+        expiry
+            .is_finite()
+            .then(|| Duration::from_secs_f64((expiry - now_unix()).max(0.0)))
+    }
+
     pub fn tripped(&self) -> bool {
         self.reason
             .lock()
@@ -214,6 +234,11 @@ impl PmLease {
                 "tracker write refused — the daemon's hosted lease is lost: {reason}"
             ))),
         }
+    }
+
+    /// See [`Fence::remaining`].
+    pub fn remaining(&self) -> Option<Duration> {
+        self.fence.remaining()
     }
 
     /// The lease epoch outbound writes record (`Lease-Epoch:`).
@@ -472,12 +497,18 @@ pub(crate) fn acquire_with_endpoint(
         // A third of the TTL: one missed or late beat never lapses.
         None => Duration::from_secs_f64((ttl.as_secs_f64() / 3.0).max(0.2)),
     };
+    // CAD-694: the flush must end while the lease is still ours even if
+    // renewals stop — a commit admitted late may not outlive the TTL
+    // (HOST_TTL 6s vs the 10s default would otherwise allow it). Clamp
+    // to the room one missed beat leaves.
     let flush_timeout = Duration::from_secs(
         hosted
             .flush_timeout_secs
             .unwrap_or(DEFAULT_FLUSH_SECS)
             .max(1),
-    );
+    )
+    .min(ttl.saturating_sub(renew_every))
+    .max(Duration::from_secs(1));
     let (provider, spec_name): (Arc<dyn Provider>, String) = match spec {
         Spec::Off => return Ok(None),
         Spec::File(path) => (Arc::new(FileProvider::new(path, ttl)), raw.to_string()),
@@ -983,6 +1014,33 @@ mod http_tests;
 
 #[cfg(test)]
 mod tests {
+    /// CAD-694: the flush bound never outlasts the room one missed
+    /// renewal leaves — the production defaults (TTL 6s, flush 10s)
+    /// would otherwise let a late commit outlive the lease.
+    #[test]
+    fn flush_timeout_is_clamped_under_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosted = Hosted {
+            lease: Some(format!("file:{}", dir.path().join("l.json").display())),
+            lease_ttl_secs: Some(6),
+            lease_renew_secs: Some(2),
+            flush_timeout_secs: Some(10),
+        };
+        let ctl = acquire(dir.path(), &hosted).unwrap().unwrap();
+        assert_eq!(ctl.flush_timeout, Duration::from_secs(4));
+        let relaxed = Hosted {
+            flush_timeout_secs: Some(3),
+            ..hosted
+        };
+        let dir2 = tempfile::tempdir().unwrap();
+        let relaxed = Hosted {
+            lease: Some(format!("file:{}", dir2.path().join("l.json").display())),
+            ..relaxed
+        };
+        let ctl = acquire(dir2.path(), &relaxed).unwrap().unwrap();
+        assert_eq!(ctl.flush_timeout, Duration::from_secs(3));
+    }
+
     use super::*;
 
     fn dir() -> tempfile::TempDir {
