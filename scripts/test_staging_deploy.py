@@ -32,6 +32,9 @@ class FakeRunner:
         self.attempt = attempt
         self.calls = []
         self.tailscale_rc = 0
+        # `ui tailscale status` answers — a mapping the operator removed
+        # shows `absent`; a foreign one `(NOT ours — left alone)`.
+        self.ts_status_out = "tailscale sharing: off\n"
         # What `prepare` stamps when it differs from the gh answer —
         # a rerun resolving a newer attempt mid-tick.
         self.prepare_attempt = None
@@ -95,7 +98,7 @@ class FakeRunner:
         if " agent register " in joined:
             return 0, "{}", ""
         if "ui tailscale status" in joined:
-            return 0, "tailscale sharing: off\n", ""
+            return 0, self.ts_status_out, ""
         if "ui tailscale start" in joined:
             if self.tailscale_rc:
                 return self.tailscale_rc, "", (
@@ -293,6 +296,156 @@ class TickTest(unittest.TestCase):
         self.assertTrue(
             r.argvs(f"{prev_bin} sandbox up staging --port 3020"),
             "rollback must target the older release")
+
+    def test_repair_rollback_records_the_live_fallback(self):
+        # Repairing A (board down) fails and B is rolled back — the
+        # recorded deployed identity must name the PROVEN live fallback,
+        # or the next tick reads a healthy B as a mismatch and needlessly
+        # bounces it (review round 4, P2).
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "previous_release": REL_B, "previous_sha": SHA_B,
+            "failed_release": None}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        make_release(self.base, REL_B, SHA_B, 1, 1)
+        r = FakeRunner(self.base)
+        r.fail_up_for = REL_A
+        live = {"sha": None}  # nothing answers until the board is up
+
+        def up_aware(argv, env=None, cwd=None):
+            argv = [str(a) for a in argv]
+            rc, out, err = FakeRunner.__call__(r, argv, env, cwd)
+            if argv[:1] == [str(self.base / "releases" / REL_B / "cadence")] \
+                    and "sandbox up" in " ".join(argv) and rc == 0:
+                live["sha"] = SHA_B
+            if "sandbox down" in " ".join(argv):
+                live["sha"] = None
+            return rc, out, err
+
+        def http(url, host):
+            if live["sha"]:
+                return http_ok(live["sha"])(url, host)
+            raise OSError("connection refused")
+
+        rc = sd.tick(up_aware, http, base=self.base)
+        self.assertEqual(rc, 1)
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["deployed_release"], REL_B,
+                         "the rollback target is what is verifiably live")
+        self.assertEqual(status["deployed_sha"], SHA_B)
+        self.assertEqual(status["failed_release"], REL_A)
+        # The next tick must not stop/restart the healthy fallback.
+        r2 = FakeRunner(self.base)
+        rc2 = self.deploy(r2, http_ok(SHA_B))
+        self.assertEqual(rc2, 0)
+        self.assertFalse(r2.argvs("sandbox up"),
+                         "next tick restarted the healthy fallback")
+        self.assertFalse(r2.argvs("sandbox down"),
+                         "next tick stopped the healthy fallback")
+
+    def test_noop_revalidates_sharing_and_repairs_a_dropped_mapping(self):
+        # A stale "sharing" record once masked a lost mapping forever:
+        # the no-op tick must ask the board (not its own status.json)
+        # and re-publish when the mapping is gone (review round 4, P2).
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "tailnet": "sharing at " + sd.URL_TAILNET,
+            "tailnet_health": "ok"}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        r = FakeRunner(self.base)
+        r.ts_status_out = (
+            "tailscale sharing: on\n"
+            "url:      " + sd.URL_TAILNET + "\n"
+            "mapping:  https:9460 absent\n"
+        )
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        self.assertTrue(r.argvs("ui tailscale status"),
+                        "no-op tick never asked the board about the mapping")
+        self.assertTrue(r.argvs("ui tailscale start"),
+                        "absent mapping was not repaired")
+        self.assertFalse(r.argvs("sandbox up"), "no redeploy on a no-op tick")
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertTrue(status["tailnet"].startswith("sharing"))
+        self.assertEqual(status["tailnet_health"], "ok")
+
+    def test_noop_repair_never_overwrites_a_foreign_mapping(self):
+        # A foreign mapping on :9460 (something else owns the port) is
+        # detected live, recorded as a refusal, and never touched: the
+        # tick neither republishes over it nor removes it.
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "tailnet": "sharing at " + sd.URL_TAILNET,
+            "tailnet_health": "ok"}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        r = FakeRunner(self.base)
+        r.ts_status_out = (
+            "tailscale sharing: on\n"
+            "url:      " + sd.URL_TAILNET + "\n"
+            "mapping:  https:9460 → http://127.0.0.1:3010  (NOT ours — left alone)\n"
+        )
+        r.tailscale_rc = 1  # the CLI would refuse anyway
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        self.assertTrue(r.argvs("ui tailscale status"),
+                        "no-op tick never asked the board about the mapping")
+        self.assertFalse(r.argvs("ui tailscale stop"),
+                         "foreign mapping must never be removed")
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertNotEqual(status["tailnet"], "sharing at " + sd.URL_TAILNET,
+                            "stale 'sharing' survived a foreign mapping")
+        self.assertFalse(
+            str(status.get("tailnet")).startswith("sharing at"),
+            "foreign mapping must not read as shared")
+
+    def test_noop_revalidates_sharing_and_probes_health(self):
+        # Mapping live per the board → probe reachability again, never
+        # trust the stored "ok".
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A,
+            "tailnet": "sharing at " + sd.URL_TAILNET,
+            "tailnet_health": "ok"}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        r = FakeRunner(self.base)
+        r.ts_status_out = (
+            "tailscale sharing: on\n"
+            "url:      " + sd.URL_TAILNET + "\n"
+            "mapping:  https:9460 → http://127.0.0.1:3020  (live)\n"
+        )
+        probed = []
+
+        def http(url, host):
+            if url.startswith(sd.URL_TAILNET):
+                probed.append(url)
+                return 200, "{}"
+            return http_ok(SHA_A)(url, host)
+
+        rc = self.deploy(r, http)
+        self.assertEqual(rc, 0)
+        self.assertFalse(r.argvs("ui tailscale start"),
+                         "live mapping re-published")
+        self.assertTrue(probed, "tailnet reachability not probed")
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertEqual(status["tailnet_health"], "ok")
+
+    def test_noop_without_stored_tailnet_still_validates(self):
+        # A status file that lost its tailnet field entirely must not
+        # skip validation either — the live mapping decides.
+        (self.base / "status.json").write_text(json.dumps({
+            "deployed_release": REL_A, "deployed_sha": SHA_A}))
+        make_release(self.base, REL_A, SHA_A, 4242, 1)
+        r = FakeRunner(self.base)
+        r.ts_status_out = (
+            "tailscale sharing: on\n"
+            "url:      " + sd.URL_TAILNET + "\n"
+            "mapping:  https:9460 → http://127.0.0.1:3020  (live)\n"
+        )
+        rc = self.deploy(r, http_ok(SHA_A))
+        self.assertEqual(rc, 0)
+        self.assertTrue(r.argvs("ui tailscale status"))
+        status = json.loads((self.base / "status.json").read_text())
+        self.assertTrue(status["tailnet"].startswith("sharing"))
+        self.assertEqual(status["tailnet_health"], "ok")
 
     def test_run_id_override_pins_the_run(self):
         r = FakeRunner(self.base, sha=SHA_B, run_id=999, attempt=3)

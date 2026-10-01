@@ -156,8 +156,13 @@ clean no-op, and the timer's `ExecStartPre` detaches its dedicated clone
 (`%h/.local/share/cadence-staging/src`) onto `origin/main` first — the
 deploy logic is always main's reviewed code, never a lane's.
 
-Flow: green main build → staging live within ~5 min → human review on
-the board → the existing `staging.yml` approval → rollout.
+Flow: green main build → staging live on the next timer tick → human
+review on the board → the existing `staging.yml` approval → rollout.
+The tick polls *latest* green main, not every green build: commits that
+land faster than the five-minute interval coalesce into one deploy of
+the newest run, intermediate builds are never installed, and the
+interval is a poll cadence, not an end-to-end SLA (a slow CI run, a
+held `deploy.lock` or a failed health check defers the deploy).
 
 **Tailnet publish.** The board's live updates are Server-Sent Events
 (`ui/src/lib/sse.ts`, served by `src/ui/threads.rs`), which

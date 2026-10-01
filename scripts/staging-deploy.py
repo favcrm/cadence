@@ -244,17 +244,31 @@ def seed(run, cadence, env, base):
 
 def tailnet(run, cadence, env):
     """Best-effort publish on the tailnet. Returns the status.json
-    `tailnet` field text."""
+    `tailnet` field text.
+
+    The board's own status — not the stored status.json string — says
+    whether the serve mapping is live: a mapping the operator removed
+    (or tailscaled dropped) shows `absent` even while the persisted
+    board options still say sharing. An `absent` mapping is republished
+    through `ui tailscale start`; a foreign one on the port is named
+    and left alone — that command refuses to overwrite it anyway."""
     try:
-        _, out, _ = run([cadence, "ui", "tailscale", "status"], env=env)
+        code, out, _ = run([cadence, "ui", "tailscale", "status"], env=env)
+        if code != 0:
+            return f"refused: tailscale status exited {code}"
         sharing = "sharing: on" in out
-        if not sharing:
+        mapping_live = "(live)" in out
+        foreign = "NOT ours" in out
+        needs_publish = not sharing or (sharing and not mapping_live and not foreign)
+        if needs_publish:
             code, _, err = run(
                 [cadence, "ui", "tailscale", "start", "--port", str(TS_PORT)],
                 env=env,
             )
             if code != 0:
                 return f"refused: {err.strip()[:300]}"
+        if foreign and not mapping_live:
+            return f"refused: foreign mapping on :{TS_PORT} — left alone"
         return f"sharing at {URL_TAILNET}"
     except Exception as e:  # never fatal
         return f"error: {e}"
@@ -378,22 +392,23 @@ def _tick_locked(run, http_get, base, run_id):
 
     deployed = health_ok(http_get)
     if rel_id == status.get("deployed_release") and deployed == sha:
-        # Already live — but a refused tailnet publication (e.g. before
-        # the sandbox opt-in landed) must not wait for the next build:
-        # the mapping and the board allowlists are `ts_start`'s, not
-        # `tailscale serve`'s, so retry it here.
-        if not str(status.get("tailnet") or "").startswith("sharing"):
-            cadence = verified_binary(base / "releases" / rel_id)
-            if cadence:
-                status["tailnet"] = tailnet(
-                    run, cadence, sandbox_env(run, cadence, base)
-                )
-                status["tailnet_health"] = (
-                    probe_tailnet(http_get)
-                    if status["tailnet"].startswith("sharing")
-                    else None
-                )
-                status_path.write_text(json.dumps(status, indent=2) + "\n")
+        # Already live. The tailnet mapping is still revalidated against
+        # the board every tick — a stored "sharing" is only what the
+        # last tick saw, and a removed/foreign mapping while staging was
+        # live never heals itself. `tailnet()` republishes an absent
+        # mapping and probes reachability; the CLI refuses to overwrite
+        # a foreign route, and a refusal is recorded, not fatal.
+        cadence = verified_binary(base / "releases" / rel_id)
+        if cadence:
+            status["tailnet"] = tailnet(
+                run, cadence, sandbox_env(run, cadence, base)
+            )
+            status["tailnet_health"] = (
+                probe_tailnet(http_get)
+                if status["tailnet"].startswith("sharing")
+                else None
+            )
+            status_path.write_text(json.dumps(status, indent=2) + "\n")
         log_line(base, f"tick: no-op — {rel_id[:12]} already live")
         return 0
 
@@ -468,7 +483,15 @@ def _tick_locked(run, http_get, base, run_id):
             "previous_sha": previous_sha,
             "tailnet": status.get("tailnet"),
         })
-        if not rolled_back:
+        if rolled_back:
+            # The fallback's `sandbox up` only returns 0 once its board
+            # answers health, and verified_binary bound that release dir
+            # to previous_sha — the fallback is what is verifiably live.
+            # Record it, or the next tick reads the healthy fallback as
+            # a wrong-build mismatch and bounces it again.
+            status["deployed_release"] = previous_release
+            status["deployed_sha"] = previous_sha
+        else:
             # Nothing verifiably live: the no-op check must not claim
             # the old release is still deployed.
             status["deployed_release"] = None

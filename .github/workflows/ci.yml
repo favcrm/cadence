@@ -248,6 +248,10 @@ jobs:
           python3 tests/scripts/test_delivery_candidate.py
           python3 tests/scripts/test_auto_stage.py
           python3 tests/scripts/test_native_review_observation.py
+      # CAD-833: the live-staging tick is mocked end-to-end — it must
+      # run in CI, not only on the deploying host.
+      - name: Test live-staging deploy tick
+        run: python3 -m unittest discover -s scripts -p 'test_staging_deploy.py'
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
