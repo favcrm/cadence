@@ -32,7 +32,19 @@
 //!
 //! A `.write.lock` whose content is exactly [`MARKER`] is taken for a
 //! dead new-protocol writer's marker once the flock is ours; liveness
-//! comes from the flock alone. A tracker whose `.git` is a gitfile
+//! comes from the flock alone.
+//!
+//! `flock` belongs to the open file description, which a `fork` copies,
+//! and `close` of one descriptor does not release it while a forked
+//! child still holds a copy (until it execs and `O_CLOEXEC` closes it).
+//! So every holder here is an [`Unlock`]: dropping it calls
+//! `flock(LOCK_UN)`, which releases the lock for every descriptor that
+//! shares the description, a forked child's included. Without that, the
+//! lock read as held for tens of milliseconds after its guard dropped
+//! whenever another thread spawned a process in between (CAD-948,
+//! `lock_tests::a_forked_child_does_not_keep_the_lock_after_the_guard_drops`).
+//!
+//! A tracker whose `.git` is a gitfile
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
 
@@ -61,7 +73,7 @@ const PROBE_RETRY_GAP: Duration = Duration::from_millis(2);
 
 /// Held for the whole tracker mutation. Dropping removes the legacy
 /// fence file first (only if it is still the file this writer made),
-/// then closes the descriptor, which releases the kernel lock.
+/// then releases the kernel lock with an explicit `LOCK_UN`.
 #[derive(Debug)]
 pub struct PmLock {
     legacy: PathBuf,
@@ -70,11 +82,25 @@ pub struct PmLock {
     /// False while a reused marker is still under suspicion: a refusal
     /// must leave it in place so the next attempt checks again.
     armed: bool,
-    _flock: File,
+    _flock: Unlock,
+}
+
+/// A held `flock` that is released explicitly on drop. `close` alone
+/// would leave the lock held by any forked copy of the descriptor.
+#[derive(Debug)]
+pub(crate) struct Unlock(pub(crate) File);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        // SAFETY: a valid descriptor owned by the file.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl Drop for PmLock {
     fn drop(&mut self) {
+        // The kernel lock is released after this body, when `_flock`
+        // drops, on the unarmed path as well.
         if !self.armed {
             return;
         }
@@ -412,6 +438,8 @@ impl Pm {
             Ok(false) => return Ok(Attempt::Held),
             Err(e) => return Err(io_unknown(&flock_path, "flock", e)),
         }
+        // From here every exit releases the lock explicitly.
+        let file = Unlock(file);
         // The kernel lock is ours, so any leaked temp marker is stale.
         sweep_tmp(&git_dir);
         let legacy = self.dir.join(MARKER_LOCK_FILE);
@@ -555,7 +583,7 @@ impl Pm {
         // Held across the classification below, released on return.
         let _probe = match open_coordination(&flock_path, false) {
             Ok(Some(f)) => match flock(&f, libc::LOCK_EX) {
-                Ok(true) => Some(f),
+                Ok(true) => Some(Unlock(f)),
                 Ok(false) => return LockState::Held,
                 Err(e) => return LockState::IoUnknown(format!("{}: {e}", flock_path.display())),
             },

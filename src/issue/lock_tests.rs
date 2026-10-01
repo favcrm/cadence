@@ -693,3 +693,76 @@ fn a_legacy_lock_refusal_is_a_gate_and_a_live_writer_is_busy() {
     assert!(legacy.to_string().contains(".write.lock"), "{legacy}");
     assert!(legacy.to_string().contains("rollout owner"), "{legacy}");
 }
+
+/// Closes both ends of the `go` pipe on drop, first writing `go`, so a
+/// failed assertion never leaves a child parked in `pre_exec`.
+struct Release {
+    go_w: i32,
+    fds: [i32; 3],
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        unsafe {
+            let b = 1u8;
+            libc::write(self.go_w, (&b as *const u8).cast(), 1);
+            libc::close(self.go_w);
+            for fd in self.fds {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// CAD-948: a forked child that has not exec'd yet holds a copy of the
+/// lock descriptor. Dropping the guard must still release the lock for
+/// everyone (explicit `LOCK_UN`), not only once the child execs.
+#[test]
+fn a_forked_child_does_not_keep_the_lock_after_the_guard_drops() {
+    let (_tmp, pm) = tracker();
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+    }
+    let (ready_w, go_r) = (ready[1], go[0]);
+    // Declared before anything can panic: it releases the child.
+    let _release = Release {
+        go_w: go[1],
+        fds: [ready[0], ready[1], go[0]],
+    };
+    let held = pm.lock().unwrap();
+    let spawner = std::thread::spawn(move || {
+        let mut cmd = Command::new("true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            // Async-signal-safe only: tell the parent we forked, then
+            // park before exec until told to go.
+            cmd.pre_exec(move || {
+                let mut b = 1u8;
+                libc::write(ready_w, (&b as *const u8).cast(), 1);
+                libc::read(go_r, (&mut b as *mut u8).cast(), 1);
+                Ok(())
+            });
+        }
+        cmd.status().unwrap()
+    });
+    let mut b = 0u8;
+    assert_eq!(
+        unsafe { libc::read(ready[0], (&mut b as *mut u8).cast(), 1) },
+        1
+    );
+    drop(held);
+    // The child is parked in pre_exec with a copy of the descriptor.
+    assert_eq!(
+        pm.lock_state(),
+        LockState::Free,
+        "a forked copy must not keep the lock after the guard dropped"
+    );
+    assert!(pm.try_lock().unwrap().is_some());
+    unsafe { libc::write(go[1], (&b as *const u8).cast(), 1) };
+    assert!(spawner.join().unwrap().success());
+    assert_eq!(pm.lock_state(), LockState::Free);
+}

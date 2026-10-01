@@ -383,7 +383,7 @@ impl GithubApi for GhApi {
 /// blocks the next poll. The file itself may remain; ownership is the lock.
 #[derive(Debug)]
 pub struct RelayLock {
-    _file: fs::File,
+    _file: crate::issue::pmlock::Unlock,
 }
 
 pub fn acquire_lock(state_dir: &Path) -> Result<RelayLock> {
@@ -401,7 +401,9 @@ pub fn acquire_lock(state_dir: &Path) -> Result<RelayLock> {
             "intake relay is already running; wait for the existing sync or inspect its state",
         ));
     }
-    Ok(RelayLock { _file: file })
+    Ok(RelayLock {
+        _file: crate::issue::pmlock::Unlock(file),
+    })
 }
 
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
