@@ -4359,7 +4359,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // store opens or recovery runs — startup of any length rides a
     // renewed lease. The guard stops and joins it if startup fails; the
     // lease is then left to expire.
-    let mut lease_heartbeat = lease
+    let lease_heartbeat = lease
         .as_ref()
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);

@@ -556,6 +556,103 @@ fn cad694_failed_start_withholds_lease_while_flush_unproven() {
     );
 }
 
+/// True while this state dir's heartbeat thread (`lh-` + the last 12
+/// chars of the dir name — see `LeaseHeartbeat::thread_name`) lives.
+fn heartbeat_thread_alive(state_dir: &Path) -> bool {
+    let leaf = state_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tail: String = leaf
+        .chars()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let want = format!("lh-{tail}");
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|task| {
+            std::fs::read_to_string(task.path().join("comm")).is_ok_and(|name| name.trim() == want)
+        })
+}
+
+/// CAD-694 x CAD-947: the CAD-947 heartbeat runs from just after acquire,
+/// so a start that fails after acquiring the lease (relaunch fault) has a
+/// live renewal poster. The exit tail must flush, then stop AND JOIN the
+/// poster, and only then release — never a renewal racing the release
+/// (CAD-702: it would rewrite a removed lease or trip a spurious fence).
+/// The poster sleeps in 100ms steps, so a tail that releases first leaves
+/// it alive for up to 100ms after the release is visible; a 1ms watcher
+/// catches that. Passing no heartbeat to the tail fails this test.
+#[test]
+fn cad694_failed_start_stops_heartbeat_before_release() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.relaunch_fault_for_test = Some(Arc::new(AtomicBool::new(true)));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let state_dir = state.path().to_path_buf();
+    let lease_path = lease_file(dir.path());
+    let watched_state = state.path().to_path_buf();
+    let done = Arc::new(AtomicBool::new(false));
+    // Records, at the first instant the release is visible (expiry
+    // zeroed), whether the poster was still alive. `None` = never seen.
+    let watcher = {
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let mut seen_alive = false;
+            let mut released = false;
+            while !done.load(Ordering::SeqCst) {
+                if let Ok(text) = std::fs::read_to_string(&lease_path) {
+                    if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                        if body["expires_unix"].as_f64() == Some(0.0) {
+                            released = true;
+                            seen_alive |= heartbeat_thread_alive(&watched_state);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            (released, seen_alive)
+        })
+    };
+    let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
+    let err = handle
+        .join()
+        .unwrap()
+        .expect_err("the injected relaunch fault exits serve");
+    assert!(
+        err.to_string().contains("injected relaunch fault"),
+        "serve must fail on the injected relaunch fault: {err}"
+    );
+    // Outlive two renew periods: a surviving poster would rewrite the
+    // lease or trip the fence by now.
+    thread::sleep(Duration::from_millis(2500));
+    done.store(true, Ordering::SeqCst);
+    let (released, seen_alive) = watcher.join().unwrap();
+    assert!(released, "the failed start never released the lease");
+    assert!(
+        !seen_alive,
+        "the heartbeat was still alive when the lease released: a renewal could race the release"
+    );
+    assert!(
+        lease_expiry(dir.path()) == 0.0,
+        "a renewal rewrote the released lease"
+    );
+    assert!(
+        !state.path().join("lease-fence.json").exists(),
+        "a late renewal tripped a spurious fence after release"
+    );
+}
+
 /// Installs a pre-commit hook that parks the flush commit INSIDE git —
 /// reached only after the fence admitted the write. `trap_term` makes it
 /// ignore SIGTERM, like a hook that outlives its commit. Returns the

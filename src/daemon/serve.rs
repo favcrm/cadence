@@ -45,13 +45,36 @@ impl LeaseHeartbeat {
         let handle = {
             let (stop, shared, lease) = (Arc::clone(&stop), Arc::clone(&shared), Arc::clone(lease));
             let state_dir = state_dir.to_path_buf();
-            thread::spawn(move || Self::run(&state_dir, &lease, &stop, &shared))
+            // Named `lh-` + the state dir's last 12 name chars, so a test
+            // can observe its own poster's lifetime against the lease
+            // release (15 chars: the Linux `comm` limit).
+            thread::Builder::new()
+                .name(Self::thread_name(&state_dir))
+                .spawn(move || Self::run(&state_dir, &lease, &stop, &shared))
+                .expect("spawn lease heartbeat")
         };
         Self {
             stop,
             shared,
             handle: Some(handle),
         }
+    }
+
+    /// The poster's OS thread name for `state_dir`.
+    pub(super) fn thread_name(state_dir: &Path) -> String {
+        let leaf = state_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tail: String = leaf
+            .chars()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("lh-{tail}")
     }
 
     /// Hand the heartbeat the daemon it keeps leased.
