@@ -139,6 +139,14 @@ async function main() {
   assert(day!.textContent!.includes("1 post"), "anchored count");
   const card = day!.querySelector(".wa-cal-card");
   assert(card, "240px card present");
+  // Style-boundary contract: the strip element carries BOTH .wa-strip (shared
+  // HorizontalStrip) and .wa-cal-posts so `.wa-strip.wa-cal-posts` applies the
+  // horizontal flex; cards are direct children matching `.wa-cal-posts >
+  // .wa-cal-card`. (Real geometry is the coordinator's browser gate.)
+  const strip = day!.querySelector(".wa-strip");
+  assert(strip && strip.classList.contains("wa-cal-posts"), "strip carries wa-strip+wa-cal-posts");
+  assert(card!.parentElement === strip, "240px card is a direct strip child");
+  assert(strip!.parentElement === day!.querySelector(".wa-strip-wrap"), "strip sits inside the shared wrap");
   // run is `succeeded` → completed, but the posted state lives on the INTENT.
   assert(text().includes("Queued"), "intent state shown, not run completion");
 

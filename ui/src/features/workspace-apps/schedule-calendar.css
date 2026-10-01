@@ -38,11 +38,38 @@
   color: var(--color-ink-200);
 }
 
-/* Horizontal card strip: never wraps; cards are a fixed 240px. */
-.wa-cal-posts {
+/* Horizontal card strip: never wraps; cards are a fixed 240px.
+ * `.wa-cal-posts` is applied to HorizontalStrip's `.wa-strip` element — make
+ * it an explicit horizontal flex row so cards lay out side-by-side and scroll
+ * (the shared `.wa-strip` is display:block by default). `.wa-post-card`'s
+ * `width:100%` in workspace-apps.css loads later and would otherwise win, so
+ * these rules use `.wa-strip.wa-cal-posts` / `.wa-cal-posts > .wa-cal-card`
+ * for higher specificity. Shared .wa-strip scrolling behaviour is unchanged.
+ */
+.wa-strip.wa-cal-posts {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: flex-start;
   min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
+.wa-cal-posts > .wa-cal-card {
+  flex: 0 0 240px;
+  width: 240px;
+  min-width: 240px;
+  max-width: 240px;
+  height: 80px;
+  min-height: 80px;
+  margin: 0;
+  padding: 4px;
+  gap: 2px;
+  overflow: hidden;
+}
+
+/* Keep the .wa-cal-card block form for non-strip contexts (malformed list). */
 .wa-cal-card {
   flex: 0 0 240px;
   width: 240px;
