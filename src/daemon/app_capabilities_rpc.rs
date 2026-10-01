@@ -7,14 +7,79 @@ use crate::issue::app_catalog::workspace;
 use crate::store::app_bindings::BindingProof;
 use crate::store::app_runs;
 
+#[cfg(test)]
+mod tests;
+
 impl Shared {
+    /// Called only under the broker's custody lock, never by the legacy
+    /// credential/grant path. Empty bytes require a live registered builtin
+    /// account and its exact frozen connection/descriptor receipts.
+    fn app_capability_credential(&self, config: &Value) -> Result<Vec<u8>> {
+        let provider = required_str(config, "provider")?;
+        let account = required_str(config, "account")?;
+        let adapter = self
+            .platforms
+            .get(provider)
+            .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+        if !adapter.app_credentialless_account(account) {
+            if config["connection_kind"] == "builtin"
+                && !crate::platform::is_builtin(provider, account)
+            {
+                return Err(Error::rejected(
+                    "bound builtin is not credentialless in this registration",
+                ));
+            }
+            return crate::platform::load_credential(
+                &self.store,
+                &self.platform_custody,
+                provider,
+                account,
+            );
+        }
+        let descriptor = self.connection_descriptor(provider)?;
+        if config["schema"] != 1
+            || config["workspace_id"] != self.store.connection_workspace_id()?
+            || config["connection_kind"] != "builtin"
+            || !descriptor
+                .builtin_accounts
+                .iter()
+                .any(|builtin| builtin == account)
+            || config["descriptor_revision"] != descriptor.revision
+            || adapter.connection_registration().as_deref() != config["sink_registration"].as_str()
+            || !config["sink_registration"].is_string()
+        {
+            return Err(Error::rejected(
+                "credentialless app connection is not a current builtin",
+            ));
+        }
+        let current = self
+            .connection_list_locked()?
+            .into_iter()
+            .find(|row| row["id"] == config["connection_id"])
+            .ok_or_else(|| Error::rejected("credentialless app connection is missing"))?;
+        if current["kind"] != "builtin"
+            || current["provider"] != provider
+            || current["account"] != account
+            || current["revision"] != config["connection_revision"]
+            || current["registration_digest"] != config["registration_digest"]
+            || !current["registration_digest"].is_string()
+            || current["status"]["manifest_status"] != "matched"
+            || current["status"]["reviewed_pin"] != config["reviewed_pin"]
+            || current["status"]["reported_pin"] != config["reported_pin"]
+        {
+            return Err(Error::rejected(
+                "credentialless app connection receipt is stale",
+            ));
+        }
+        Ok(Vec::new())
+    }
+
     pub(super) fn app_capability_quote(
         &self,
         proof: &BindingProof,
     ) -> Result<crate::platform::AppCapabilityQuote> {
         let config = &proof.config;
         let provider = required_str(config, "provider")?;
-        let account = required_str(config, "account")?;
         let tool = required_str(&config["mapping"], "tool")?;
         let effect = required_str(&config["mapping"], "effect")?;
         let adapter = self
@@ -36,12 +101,7 @@ impl Shared {
                 "bound app capability is not a current read/draft action",
             ));
         }
-        let credential = crate::platform::load_credential(
-            &self.store,
-            &self.platform_custody,
-            provider,
-            account,
-        )?;
+        let credential = self.app_capability_credential(config)?;
         let quote = adapter
             .quote_app_capability(&credential, &serde_json::to_value(proof)?)
             .map_err(|_| Error::rejected("bound capability price discovery refused"))?;
@@ -218,7 +278,6 @@ impl Shared {
                     }
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
-                    let account = required_str(config, "account")?;
                     let tool = required_str(&config["mapping"], "tool")?;
                     let effect = required_str(&config["mapping"], "effect")?;
                     let adapter = self
@@ -284,12 +343,7 @@ impl Shared {
                         "quote":run["snapshot"]["quotes"][&slot],
                         "call_id":call_id,
                     });
-                    let credential = crate::platform::load_credential(
-                        &self.store,
-                        &self.platform_custody,
-                        provider,
-                        account,
-                    )?;
+                    let credential = self.app_capability_credential(config)?;
                     let output = adapter
                         .execute_app_capability(&credential, &authority, input, &call_id)
                         .map_err(Error::rejected)?;

@@ -51,7 +51,11 @@ The separate `agenticos_external` pin identifies the exact deployed external
 provider-tools contract for priced Social Content reads and drafts. The app
 cannot supply or change its origin or manifest pin.
 An exact pin is necessary but does not grant a device credential, approve a
-quote, or authorize a paid call.
+quote, or authorize a paid call. Hosted media uses a separate, strictly parsed
+`transport: "hosted-media-lease@1"` assertion at the exact internal origin;
+a pin alone never authorizes that transport. See
+[Hosted image media composition](hosted-image-media.md) for admission, custody,
+registration, unchanged limits and review/release ownership.
 
 Embedding code may supply typed `ServeOptions::provider_deployments` instead of
 the fixed file. This is a programmatic trusted-composition seam, never serialized
