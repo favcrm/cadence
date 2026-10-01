@@ -168,34 +168,17 @@ impl MediaImporter {
         mime: &str,
         bytes: &[u8],
     ) -> std::result::Result<MediaReceipt, Refusal> {
-        // I1 — input bound + signature, all before the wire.
-        if !valid_connection_id(connection_id) {
-            return Err(Refusal::new(
-                "bad_connection",
-                "media import connection id shape is invalid",
-            ));
-        }
-        if !matches!(mime, "image/jpeg" | "image/png") {
-            return Err(Refusal::new(
-                "bad_image_digest",
-                "media import only accepts a reviewed jpeg/png still",
-            ));
-        }
-        if bytes.is_empty() || bytes.len() > IMPORT_MAX_BYTES {
-            return Err(Refusal::new(
-                "bad_image_digest",
-                "media import bytes are empty or exceed the retained-custody bound",
-            ));
-        }
-        // The declared type must match the actual byte signature before any
-        // of it leaves: a label over mismatched or non-image bytes is
-        // refused here rather than uploaded under a lying content-type.
-        if sniff_still_mime(bytes) != Some(mime) {
-            return Err(Refusal::new(
-                "bad_image_digest",
-                "media import bytes do not match the declared still type",
-            ));
-        }
+        // MUTANT(witness): the I1 input gate is removed — nothing is checked
+        // before the wire, so connection shape, MIME allowlist, size bound and
+        // the signature==declared proof are all bypassed. The guards are still
+        // evaluated (and discarded) so the file compiles under -D warnings; a
+        // compile error would not be an assertion red.
+        let _input_gate = (
+            valid_connection_id(connection_id),
+            matches!(mime, "image/jpeg" | "image/png"),
+            !bytes.is_empty() && bytes.len() <= IMPORT_MAX_BYTES,
+            sniff_still_mime(bytes) == Some(mime),
+        );
         // Cadence computes the digest it expects back; the door recomputes
         // it over the same bytes and the receipt must echo it. The key that
         // comes back must embed this digest — anything else is refused.
@@ -259,19 +242,14 @@ fn read_import_envelope(
     let bytes = response
         .body_mut()
         .with_config()
-        .limit(IMPORT_RESPONSE_CAP)
         .read_to_vec()
         .map_err(|_| Fault::Ambiguous)?;
     let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Ambiguous)?;
-    if (200..=299).contains(&status) {
-        // Only a 2xx may carry a success receipt, and it must be
-        // `{ok:true}` with a `data` field present — `ok:false` or a missing
-        // `data` on a success status is drift, not a refusal and not a
-        // receipt.
-        if envelope.get("ok") == Some(&Value::Bool(true)) && envelope.get("data").is_some() {
-            return Ok(envelope["data"].clone());
-        }
-        return Err(Fault::Ambiguous);
+    // MUTANT(witness): the 2xx success gate and the IMPORT_RESPONSE_CAP were
+    // removed — a forged ok:true body mints a receipt on ANY status, `data`
+    // need not be present, and an unbounded body is parsed.
+    if envelope.get("ok") == Some(&Value::Bool(true)) {
+        return Ok(envelope["data"].clone());
     }
     // Below 2xx and not 5xx: only a 4xx door error document is an
     // authoritative refusal. A redirect (3xx) or 1xx can never carry one —
@@ -284,7 +262,18 @@ fn read_import_envelope(
             .and_then(|error| error.get("code"))
             .and_then(Value::as_str)
         {
-            return Err(Fault::Refused(import_refusal(code)));
+            // MUTANT(witness): the fixed-vocabulary map removed — the
+            // untrusted upstream code AND message are echoed verbatim, so a
+            // hostile door can leak a credential/URL/text into the refusal.
+            let message = envelope
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return Err(Fault::Refused(Refusal::new(
+                code.to_string(),
+                format!("door {code}: {message}"),
+            )));
         }
     }
     Err(Fault::Ambiguous)
@@ -343,86 +332,29 @@ fn receipt_of(
     digest: &str,
     data: &Value,
 ) -> std::result::Result<MediaReceipt, Refusal> {
+    // MUTANT(witness): every receipt binding check removed — the mediaKey,
+    // connectionId, digest, mime, sizeBytes and readBack the door returned are
+    // trusted verbatim, so a forged/mismatched/foreign receipt mints a key.
     let get_str = |field: &str| -> std::result::Result<&str, Refusal> {
         data.get(field)
             .and_then(Value::as_str)
             .ok_or_else(|| Refusal::new("bad_effect", format!("media receipt omits {field}")))
     };
     let media_key = get_str("mediaKey")?;
-    if !valid_media_key(media_key) {
-        return Err(Refusal::new(
-            "bad_effect",
-            "media receipt key is not a device media key",
-        ));
-    }
-    if get_str("connectionId")? != connection_id {
-        return Err(Refusal::new(
-            "grant_binding_mismatch",
-            "media receipt echoes a different connection",
-        ));
-    }
-    let echoed_digest = get_str("digest")?;
-    if echoed_digest != digest {
-        return Err(Refusal::new(
-            "key_conflict",
-            "media receipt digest differs from the uploaded bytes",
-        ));
-    }
-    if get_str("mime")? != mime {
-        return Err(Refusal::new(
-            "bad_image_digest",
-            "media receipt mime differs from the uploaded still",
-        ));
-    }
-    let size_bytes = data
-        .get("sizeBytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| Refusal::new("bad_effect", "media receipt omits sizeBytes"))?;
-    if size_bytes != bytes.len() as u64 {
-        return Err(Refusal::new(
-            "key_conflict",
-            "media receipt size differs from the uploaded bytes",
-        ));
-    }
-    // Read-back proof: the door must report it stored exactly these bytes
-    // under exactly this digest. This is the custody guarantee — without it
-    // a forged or truncated store would still mint a plausible key.
-    let read_back = data
-        .get("readBack")
-        .ok_or_else(|| Refusal::new("bad_effect", "media receipt omits readBack"))?;
-    let rb_bytes = read_back
-        .get("bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| Refusal::new("bad_effect", "media readBack omits bytes"))?;
-    let rb_digest = read_back
-        .get("digest")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Refusal::new("bad_effect", "media readBack omits digest"))?;
-    if rb_bytes != bytes.len() as u64 || rb_digest != digest {
-        return Err(Refusal::new(
-            "key_conflict",
-            "media read-back does not match the uploaded bytes",
-        ));
-    }
-    // The returned key must bind this connection and digest. A well-formed
-    // key naming another connection or digest is a forged binding, refused.
-    let parts: Vec<&str> = media_key.split('.').collect();
-    let binds = parts.len() == 4
-        && parts[0] == "dp1"
-        && parts[2] == connection_id
-        && parts[3] == &digest[..32];
-    if !binds {
-        return Err(Refusal::new(
-            "grant_binding_mismatch",
-            "media key does not bind this connection and digest",
-        ));
-    }
+    // MUTANT(witness): the binding validators were removed. They are still
+    // referenced (discarded) so the file compiles under -D warnings — a
+    // compile error would not be an assertion red.
+    let _ = valid_media_key(media_key);
     Ok(MediaReceipt {
         media_key: media_key.to_owned(),
-        connection_id: connection_id.to_owned(),
-        digest: digest.to_owned(),
-        mime: mime.to_owned(),
-        size_bytes: bytes.len(),
+        connection_id: get_str("connectionId").unwrap_or(connection_id).to_owned(),
+        digest: get_str("digest").unwrap_or(digest).to_owned(),
+        mime: get_str("mime").unwrap_or(mime).to_owned(),
+        size_bytes: data
+            .get("sizeBytes")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(bytes.len()),
     })
 }
 
