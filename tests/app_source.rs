@@ -42,6 +42,15 @@ const FIXTURE_URL: &str = "https://fixture.invalid/apps-repo";
 /// The bundle directory the fixture publishes: `bundles/app`.
 const FIXTURE_DIR: &str = "bundles/app";
 
+/// The deadline the private `timeout` wrapper pins into every git
+/// step: `0.75` for the step under test and `0.1` for its TERM→KILL
+/// escalation. The 0.75 bound must be applied ONLY at the matched
+/// step's own call frame — blanket-rewriting every step's deadline
+/// misattributes an earlier healthy phase's stall (under host load a
+/// `clone` takes well over 0.75 s) to the phase actually under test.
+const SHORT_STEP_DEADLINE: &str = "0.75";
+const SHORT_KILL_AFTER: &str = "0.1";
+
 fn fixture_git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .env_clear()
@@ -292,6 +301,112 @@ fn assert_env_scrubbed(log: &str, poison: &[&Path]) {
                 "poisoned path {s} reached the child: {line}"
             );
         }
+    }
+}
+
+/// The git argv fragment that uniquely selects one resolver phase.
+/// `clone` is the only clone argv; `verify` is the
+/// `rev-parse --verify <sha>^{commit}`; `checkout` is the detached
+/// checkout; `head` is the bare `rev-parse HEAD`. `in argv` is
+/// exact-element membership, so `--no-checkout` never matches
+/// `'checkout'`, and the `head` classifier excludes `--verify` so the
+/// verify step — whose argv also carries `rev-parse` — is never
+/// selected as `head`.
+fn phase_predicate(phase: &str) -> &'static str {
+    match phase {
+        "clone" => "'clone' in argv",
+        "verify" => "'rev-parse' in argv and '--verify' in argv",
+        "checkout" => "'checkout' in argv",
+        "head" => "'rev-parse' in argv and 'HEAD' in argv and '--verify' not in argv",
+        _ => unreachable!("{phase}"),
+    }
+}
+
+/// Patch the fixture's `git` wrapper so invocations matching `phase`
+/// stall `seconds` while ignoring SIGTERM — the production TERM must
+/// escalate to a finite KILL. The stall is deterministic: it does not
+/// depend on wall-clock jitter, only on the wrapper observing the
+/// matched argv.
+fn stall_phase(f: &GitFixture, phase: &str, seconds: u64) {
+    let git = f.bin.join("git");
+    let script = std::fs::read_to_string(&git).unwrap();
+    let predicate = phase_predicate(phase);
+    let stall = format!(
+        "argv = sys.argv[1:]\nif {predicate}:\n    import signal, time\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n    time.sleep({seconds})"
+    );
+    let patched = script.replace("argv = sys.argv[1:]", &stall);
+    assert_ne!(patched, script, "git stall injection anchor missing");
+    std::fs::write(&git, patched).unwrap();
+}
+
+/// Patch the fixture's `git` wrapper so invocations matching `phase`
+/// take at least `seconds` of real work (a plain sleep, TERM
+/// untouched) — a HEALTHY step slowed past the private test deadline,
+/// never past the production one. Unlike [`stall_phase`] this does
+/// not ignore SIGTERM; it models a well-behaved step under host load.
+fn slow_phase(f: &GitFixture, phase: &str, seconds: u64) {
+    let git = f.bin.join("git");
+    let script = std::fs::read_to_string(&git).unwrap();
+    let predicate = phase_predicate(phase);
+    let slow =
+        format!("argv = sys.argv[1:]\nif {predicate}:\n    import time\n    time.sleep({seconds})");
+    let patched = script.replace("argv = sys.argv[1:]", &slow);
+    assert_ne!(patched, script, "git slow injection anchor missing");
+    std::fs::write(&git, patched).unwrap();
+}
+
+/// Install the private `timeout` wrapper in `f.bin`, bound to `phase`.
+/// It logs the verbatim argv production sent (`timeout-argv.jsonl`
+/// under the fixture dir), asserts the production `--kill-after=10 120
+/// git` shape, then — at the matched step's own call frame ONLY —
+/// execs the real `timeout` with the shortened `SHORT_STEP_DEADLINE`/
+/// `SHORT_KILL_AFTER` pair. Every other phase's `timeout` call passes
+/// through with its argv untouched: healthy steps keep the full
+/// production 120 s deadline and 10 s kill-after, so an earlier
+/// phase's slowness under host load can never be misreported as this
+/// phase's timeout. Rewriting EVERY call's deadline —
+/// [`install_timeout_wrapper_all_phases`] — is exactly the bug
+/// `a_slow_earlier_phase_is_not_blamed_for_a_later_stall` demonstrates.
+fn install_timeout_wrapper(f: &GitFixture, real_timeout: &str, python: &str, phase: &str) {
+    let timeout_log = f._dir.path().join("timeout-argv.jsonl");
+    let predicate = phase_predicate(phase);
+    let timeout_script = format!(
+        "#!{python}\nimport json, os, sys\nargv = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(argv) + '\\n')\nassert argv[:3] == ['--kill-after=10', '120', 'git'], argv\nif {predicate}:\n    # The selected step's own frame ONLY: shorten the deadline so the\n    # TERM->KILL escalation is exercised without waiting out the\n    # production bound. Other phases keep argv exactly as written.\n    argv = ['--kill-after={kill}', '{deadline}'] + argv[2:]\nos.execv({real}, [{real}] + argv)\n",
+        log = serde_json::to_string(&timeout_log.to_str().unwrap()).unwrap(),
+        real = serde_json::to_string(&real_timeout).unwrap(),
+        kill = SHORT_KILL_AFTER,
+        deadline = SHORT_STEP_DEADLINE,
+        predicate = predicate,
+    );
+    let timeout = f.bin.join("timeout");
+    std::fs::write(&timeout, timeout_script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The pre-fix `timeout` wrapper shape, kept ONLY as the witness's
+/// counterexample: it shortens the deadline on EVERY git step, so a
+/// healthy earlier phase slower than `SHORT_STEP_DEADLINE` eats the
+/// kill meant for the selected phase and the error names the wrong
+/// step. `a_slow_earlier_phase_is_not_blamed_for_a_later_stall` runs it
+/// to prove that misattribution deterministically, then runs the fixed
+/// wrapper to prove the selected phase is the one reported.
+fn install_timeout_wrapper_all_phases(f: &GitFixture, real_timeout: &str, python: &str) {
+    let timeout_log = f._dir.path().join("timeout-argv.jsonl");
+    let timeout_script = format!(
+        "#!{python}\nimport json, os, sys\nargv = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(argv) + '\\n')\nassert argv[:3] == ['--kill-after=10', '120', 'git'], argv\nos.execv({real}, [{real}, '--kill-after={kill}', '{deadline}'] + argv[2:])\n",
+        log = serde_json::to_string(&timeout_log.to_str().unwrap()).unwrap(),
+        real = serde_json::to_string(&real_timeout).unwrap(),
+        kill = SHORT_KILL_AFTER,
+        deadline = SHORT_STEP_DEADLINE,
+    );
+    let timeout = f.bin.join("timeout");
+    std::fs::write(&timeout, timeout_script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 
@@ -944,9 +1059,12 @@ fn resolved_bundle_owns_and_cleans_its_temporary_files() {
 }
 
 /// A private timeout wrapper observes production's fixed deadline argv,
-/// then runs the real timeout with a shorter TEST-ONLY deadline. Each
-/// Git phase stalls and ignores TERM so finite KILL escalation is exercised
-/// without waiting 130 seconds or introducing a runtime bypass parameter.
+/// then shortens ONLY the selected phase's own call frame to the
+/// TEST-ONLY deadline. Every other phase keeps the production
+/// 120s/kill-after-10 argv untouched, so a healthy earlier phase that
+/// is merely slow under host load can never be misreported as the
+/// phase under test. The stalled git ignores TERM so the finite KILL
+/// escalation fires inside the test deadline.
 #[test]
 fn every_git_step_has_a_finite_deadline() {
     if !in_own_process("every_git_step_has_a_finite_deadline", &[]) {
@@ -958,38 +1076,16 @@ fn every_git_step_has_a_finite_deadline() {
     for phase in ["clone", "verify", "checkout", "head"] {
         std::env::set_var("PATH", &orig_path);
         let f = GitFixture::basic();
-        let git = f.bin.join("git");
-        let script = std::fs::read_to_string(&git).unwrap();
-        let predicate = match phase {
-            "clone" => "'clone' in argv",
-            "verify" => "'rev-parse' in argv and '--verify' in argv",
-            "checkout" => "'checkout' in argv",
-            "head" => "'rev-parse' in argv and 'HEAD' in argv",
-            _ => unreachable!(),
-        };
-        let stall = format!(
-            "argv = sys.argv[1:]\nif {predicate}:\n    import signal, time\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n    time.sleep(30)"
-        );
-        std::fs::write(&git, script.replace("argv = sys.argv[1:]", &stall)).unwrap();
-        let timeout_log = f._dir.path().join("timeout-argv.jsonl");
-        let timeout_script = format!(
-            "#!{python}\nimport json, os, sys\nargv = sys.argv[1:]\nwith open({log}, 'a') as fh:\n    fh.write(json.dumps(argv) + '\\n')\nassert argv[:3] == ['--kill-after=10', '120', 'git'], argv\nos.execv({real}, [{real}, '--kill-after=0.1', '0.75'] + argv[2:])\n",
-            log = serde_json::to_string(&timeout_log.to_str().unwrap()).unwrap(),
-            real = serde_json::to_string(&real_timeout).unwrap(),
-        );
-        let timeout = f.bin.join("timeout");
-        std::fs::write(&timeout, timeout_script).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        stall_phase(&f, phase, 30);
+        install_timeout_wrapper(&f, &real_timeout, &python, phase);
         use_bin(&f, &orig_path);
         let selected = SelectedGitSource::new(FIXTURE_URL, &f.sha1, FIXTURE_DIR).unwrap();
         let started = std::time::Instant::now();
         let error = resolve(&selected).unwrap_err().to_string();
         assert!(error.contains(&format!("git {phase} exceeded")), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        let calls = std::fs::read_to_string(timeout_log).unwrap();
+        let timeout_log = f._dir.path().join("timeout-argv.jsonl");
+        let calls = std::fs::read_to_string(&timeout_log).unwrap();
         let expected_steps = match phase {
             "clone" => 1,
             "verify" => 2,
@@ -1001,6 +1097,90 @@ fn every_git_step_has_a_finite_deadline() {
         for call in calls.lines() {
             let args: Vec<String> = serde_json::from_str(call).unwrap();
             assert_eq!(&args[..3], &["--kill-after=10", "120", "git"]);
+        }
+    }
+    std::env::set_var("PATH", orig_path);
+}
+
+/// Adversarial witness for the bounded deadline fixture, in two legs
+/// over identical stalls: a HEALTHY earlier phase (`clone`, TERM-
+/// respecting, only slowed — 2 s, well past the 0.75 s test deadline
+/// yet far inside the production 120 s) precedes a `checkout` that
+/// wedges ignoring TERM.
+///
+/// Leg A runs the pre-fix all-phase wrapper: the shortened deadline
+/// hits the slowed clone first, so the error names `clone` — the
+/// misattribution this correction exists to remove. Leg B runs the
+/// fixed per-phase wrapper: the clone keeps its production 120 s
+/// deadline and survives, checkout alone hits the short bound, and
+/// the error names `checkout` — with the argv log proving every call
+/// production made carried the untouched `--kill-after=10 120` pair.
+#[test]
+fn a_slow_earlier_phase_is_not_blamed_for_a_later_stall() {
+    if !in_own_process("a_slow_earlier_phase_is_not_blamed_for_a_later_stall", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    let real_timeout = which("timeout");
+    let python = which("python3");
+
+    // Leg A — the buggy all-phase wrapper reports the wrong phase.
+    {
+        let f = GitFixture::basic();
+        slow_phase(&f, "clone", 2);
+        stall_phase(&f, "checkout", 30);
+        install_timeout_wrapper_all_phases(&f, &real_timeout, &python);
+        use_bin(&f, &orig_path);
+        let selected = SelectedGitSource::new(FIXTURE_URL, &f.sha1, FIXTURE_DIR).unwrap();
+        let error = resolve(&selected).unwrap_err().to_string();
+        // Deterministic misattribution: the healthy 2 s clone is what
+        // hit the blanket 0.75 s deadline — never the wedged checkout.
+        assert!(
+            error.contains("git clone exceeded"),
+            "the all-phase wrapper should have blamed clone: {error}"
+        );
+        assert!(
+            !error.contains("git checkout exceeded"),
+            "the buggy wrapper must not reach checkout: {error}"
+        );
+        let calls = std::fs::read_to_string(f._dir.path().join("timeout-argv.jsonl")).unwrap();
+        assert_eq!(calls.lines().count(), 1, "clone died first: {calls}");
+        let args: Vec<String> = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(&args[..3], &["--kill-after=10", "120", "git"], "{calls}");
+    }
+    std::env::set_var("PATH", &orig_path);
+
+    // Leg B — the fixed wrapper times out the selected phase only.
+    {
+        let f = GitFixture::basic();
+        slow_phase(&f, "clone", 2);
+        stall_phase(&f, "checkout", 30);
+        install_timeout_wrapper(&f, &real_timeout, &python, "checkout");
+        use_bin(&f, &orig_path);
+        let selected = SelectedGitSource::new(FIXTURE_URL, &f.sha1, FIXTURE_DIR).unwrap();
+        let started = std::time::Instant::now();
+        let error = resolve(&selected).unwrap_err().to_string();
+        // The blame lands on the stalled phase — never the slow one.
+        assert!(
+            error.contains("git checkout exceeded"),
+            "blame misattributed: {error}"
+        );
+        assert!(
+            !error.contains("git clone exceeded"),
+            "the healthy slow clone took the blame: {error}"
+        );
+        // clone's 2 s + checkout's 0.75 s + escalation, inside 10 s.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // clone's production 120 s deadline is what let it survive its
+        // 2 s: every recorded call carried the real argv.
+        let calls = std::fs::read_to_string(f._dir.path().join("timeout-argv.jsonl")).unwrap();
+        // clone, verify and checkout ran; checkout never returns, so
+        // head is never reached.
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        for call in calls.lines() {
+            let args: Vec<String> = serde_json::from_str(call).unwrap();
+            assert_eq!(&args[..3], &["--kill-after=10", "120", "git"], "{call}");
         }
     }
     std::env::set_var("PATH", orig_path);
