@@ -3687,7 +3687,12 @@ pub(crate) fn run() -> Result<i32> {
             let alias = std::env::var("CADENCE_ALIAS").map_err(|_| {
                 Error::rejected("CADENCE_ALIAS is not set — not inside a cadence-owned pane")
             })?;
-            let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+            // CAD-879: only the running turns are read — no history.
+            let show = client::rpc(
+                &state_dir,
+                "agent_show",
+                json!({"alias": alias, "active_only": true}),
+            )?;
             // A mailbox has no running turn — report the inbound
             // backlog a consumer would drain instead.
             let (provider, kind) = (

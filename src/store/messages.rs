@@ -1293,6 +1293,67 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// A bounded view of [`Self::messages`] (CAD-879): every non-terminal
+    /// row — live work is never hidden — plus the newest `limit` terminal
+    /// rows at or after `since`. `since` is a message id (rows after it)
+    /// or a unix timestamp (rows created at or after it); an id wins when
+    /// a message of that alias carries it. Returns the rows in `seq`
+    /// order and how many of this registration's rows were left out.
+    pub fn messages_window(
+        &self,
+        alias: &str,
+        limit: Option<usize>,
+        since: Option<&str>,
+    ) -> Result<(Vec<Message>, usize)> {
+        let conn = self.conn();
+        let agent = self.agent_in(&conn, alias)?;
+        let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
+        if let Some(since) = since {
+            let by_id = conn
+                .query_row(
+                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                    params![alias, since],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            match (by_id, since.parse::<f64>()) {
+                (Some(seq), _) => after_seq = seq,
+                (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "--since '{since}' is neither a message id of '{alias}' nor a timestamp"
+                    )))
+                }
+            }
+        }
+        let live = "state NOT IN ('completed','failed','interrupted','cancelled')";
+        let mut rows = {
+            let mut stmt =
+                conn.prepare(&format!("SELECT * FROM messages WHERE alias=?1 AND {live}"))?;
+            let rows = stmt.query_map([alias], row_message)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM messages WHERE alias=?1 AND NOT ({live})
+             AND created >= ?2 AND created >= ?3 AND seq > ?4
+             ORDER BY seq DESC LIMIT ?5"
+        ))?;
+        let cap = limit.map_or(-1, |n| n.min(i64::MAX as usize) as i64);
+        let recent = stmt.query_map(
+            params![alias, agent.created, after_ts, after_seq, cap],
+            row_message,
+        )?;
+        rows.extend(recent.collect::<rusqlite::Result<Vec<_>>>()?);
+        rows.sort_by_key(|m| m.seq);
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR {live})"),
+            params![alias, agent.created],
+            |r| r.get(0),
+        )?;
+        let omitted = (total as usize).saturating_sub(rows.len());
+        Ok((rows, omitted))
+    }
+
     /// Current work and unresolved outcomes for overview probes. Terminal
     /// history stays available through `messages`; unknowns remain visible
     /// even after a clock step or alias re-registration, as there too.

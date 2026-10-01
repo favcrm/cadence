@@ -2462,8 +2462,29 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                // CAD-879: absent `limit`/`since` keeps the full history
+                // (the board and in-process consumers rely on it); the
+                // CLI sends them to bound what an agent reads.
+                let (limit, since) = (
+                    optional_u64(params, "limit"),
+                    match params.get("since") {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(Value::Number(n)) => Some(n.to_string()),
+                        Some(Value::Null) | None => None,
+                        Some(_) => return Err(Error::rejected("since must be a string or number")),
+                    },
+                );
+                let mut omitted = 0usize;
                 let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
                     self.store.active_messages(&alias)?
+                } else if limit.is_some() || since.is_some() {
+                    let (rows, left_out) = self.store.messages_window(
+                        &alias,
+                        limit.map(|n| n as usize),
+                        since.as_deref(),
+                    )?;
+                    omitted = left_out;
+                    rows
                 } else {
                     self.store.messages(&alias)?
                 };
@@ -2542,6 +2563,9 @@ impl Shared {
                 Ok(json!({
                     "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
+                    // CAD-879: how many older terminal rows a bounded
+                    // read left out (0 for the full history).
+                    "messages_omitted": omitted,
                     "event_cursor": self.store.event_cursor(&alias)?,
                     // Inbound backlog — what `cadence inbox` would drain
                     // for a mailbox, what the actor will still take for
@@ -4823,6 +4847,106 @@ mod tests {
             .unwrap();
         assert_eq!(full["messages"].as_array().unwrap().len(), 3);
         assert_eq!(shared.store.event_cursor("w1").unwrap(), before);
+    }
+
+    /// CAD-879: a bounded `agent_show` returns the last `limit` terminal
+    /// rows plus every unfinished one, whatever the history length; a
+    /// request without the fields still returns everything; `since`
+    /// takes a message id or a timestamp; a bounded read never leaks a
+    /// turn token.
+    #[test]
+    fn cad879_agent_show_window_is_bounded_and_keeps_live_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let mut conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        let created = shared.store.agent("w1").unwrap().created;
+        let tx = conn.transaction().unwrap();
+        // An old unfinished row (oldest of all) and 600 finished ones.
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created,turn_id)
+             VALUES ('old-live','w1','b','user','running',?1,'private-token')",
+            [created + 0.5],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('old-unknown','w1','b','user','unknown',?1)",
+            [created + 0.6],
+        )
+        .unwrap();
+        for i in 0..600 {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,source,state,created)
+                 VALUES (?1,'w1','b','user','completed',?2)",
+                rusqlite::params![format!("h-{i}"), created + 1.0 + i as f64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let show = |params: Value| {
+            shared
+                .dispatch("agent_show", &params, std::process::id())
+                .unwrap()
+        };
+        let ids = |v: &Value| -> Vec<String> {
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // No fields: today's full history, nothing omitted.
+        let full = show(json!({"alias": "w1"}));
+        assert_eq!(full["messages"].as_array().unwrap().len(), 602);
+        assert_eq!(full["messages_omitted"], 0);
+        // Default window: the last 20 plus both unfinished rows.
+        let win = show(json!({"alias": "w1", "limit": 20}));
+        let got = ids(&win);
+        assert_eq!(got.len(), 22, "{got:?}");
+        assert_eq!(&got[..2], ["old-live", "old-unknown"]);
+        assert_eq!(got[2], "h-580");
+        assert_eq!(got[21], "h-599");
+        assert_eq!(win["messages_omitted"], 580);
+        // The window is the same size whatever the history length.
+        assert!(win.to_string().len() < full.to_string().len() / 10);
+        assert!(!win.to_string().contains("private-token"));
+        // limit 0: only unfinished work.
+        assert_eq!(ids(&show(json!({"alias": "w1", "limit": 0}))).len(), 2);
+        // since by message id: rows after it, plus unfinished ones.
+        let by_id = ids(&show(json!({"alias": "w1", "since": "h-595"})));
+        assert_eq!(
+            by_id,
+            [
+                "old-live",
+                "old-unknown",
+                "h-596",
+                "h-597",
+                "h-598",
+                "h-599"
+            ]
+        );
+        // since + limit compose.
+        let both = ids(&show(json!({"alias": "w1", "since": "h-595", "limit": 2})));
+        assert_eq!(both, ["old-live", "old-unknown", "h-598", "h-599"]);
+        // since by timestamp.
+        let ts = (created + 1.0 + 597.0).to_string();
+        let by_ts = ids(&show(json!({"alias": "w1", "since": ts})));
+        assert_eq!(
+            by_ts,
+            ["old-live", "old-unknown", "h-597", "h-598", "h-599"]
+        );
+        // since that is neither an id nor a number is refused.
+        assert!(shared
+            .dispatch(
+                "agent_show",
+                &json!({"alias": "w1", "since": "no-such-id"}),
+                std::process::id()
+            )
+            .is_err());
+        // active_only (what `cadence self` sends) is history-free.
+        let active = show(json!({"alias": "w1", "active_only": true}));
+        assert_eq!(ids(&active), ["old-live", "old-unknown"]);
     }
 
     /// CAD-324: a pending compaction whose pack cannot be sent is
