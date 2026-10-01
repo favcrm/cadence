@@ -640,6 +640,75 @@ fn cad979_import_then_schedule_binds_reviewed_asset() {
     assert_eq!(intent["state"], "queued");
 }
 
+/// I4 crash-inert: an import writes no `social_publish_intents` row — a
+/// crash between import and schedule leaves nothing behind; the durable
+/// row appears only at schedule. Proven by listing intents before/after.
+#[test]
+fn cad979_import_writes_no_intent_row() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "inert");
+    let before = h
+        .daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap()["intents"]
+        .as_array()
+        .unwrap()
+        .len();
+    let imported = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-inert-1"),
+        )
+        .expect("import succeeds");
+    assert_eq!(imported["ok"], json!(true));
+    let after = h
+        .daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap()["intents"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        before, after,
+        "media import must write no social_publish_intents row"
+    );
+}
+
+/// I4 concurrency: the same `request_id` re-scheduled is refused by the
+/// `request` UNIQUE column — the durable idempotency bound lives at freeze.
+#[test]
+fn cad979_import_same_request_id_schedule_refused() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "dup");
+    let ws = workspace(&h);
+    let key = format!("dp1.{ws}.{}.{:.32}", h.connection, image_digest);
+    let req = "cad979-dup-sched";
+    h.daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            schedule_body(&run, &bundle, &install, req, Some(key.clone())),
+        )
+        .expect("first schedule queues");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            schedule_body(&run, &bundle, &install, req, Some(key)),
+        )
+        .expect_err("same request_id re-schedule must be refused");
+    assert!(
+        err.to_string().contains("request") || err.to_string().contains("idempotent"),
+        "{err}"
+    );
+}
+
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
 /// identical 1×1 PNG, so this is deterministic.
 fn h_png() -> Vec<u8> {
