@@ -706,7 +706,7 @@ impl Store {
             let workspace_id = material["binding"]["config"]["workspace_id"]
                 .as_str()
                 .ok_or_else(|| Error::rejected("reviewed binding names no workspace"))?;
-            let bound = image_digest.as_deref().is_some_and(|digest| {
+            let bound = image_digest.is_some_and(|digest| {
                 device::media_key_authorizes(key, workspace_id, connection_id, digest)
             });
             if !bound {

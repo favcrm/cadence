@@ -86,15 +86,63 @@ impl Shared {
         }
     }
 
+    /// Segment-shaped required param: a nonempty, ≤128-byte ASCII id.
+    fn required_segment<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
+        let value = required_str(params, field)?;
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(Error::rejected(format!(
+                "malformed parameter '{field}'"
+            )));
+        }
+        Ok(value)
+    }
+
+    /// Strict optional param: absent/null → None; a valid nonempty
+    /// segment string → Some; any other JSON type or an empty/oversize
+    /// string is a rejection, never a silent None.
+    fn strict_optional_segment<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> {
+        match params.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => {
+                if s.is_empty()
+                    || s.len() > 128
+                    || !s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                {
+                    return Err(Error::rejected(format!(
+                        "malformed parameter '{field}'"
+                    )));
+                }
+                Ok(Some(s.as_str()))
+            }
+            Some(_) => Err(Error::rejected(format!(
+                "malformed parameter '{field}'"
+            ))),
+        }
+    }
+
     /// CAD-979: operator-only retained-media import. Proves the run's
     /// reviewed asset + this request's exact scope, reads the retained bytes
     /// by receipt custody, uploads them to the device media door and returns
     /// the validated `media_key`/`image_digest` for the operator to schedule.
     /// No grant minted, no send, no persisted row — freeze owns durability.
     fn import_social_media(&self, params: &Value) -> Result<Value> {
+        // Required request_id: a nonempty, bounded, segment-shaped string,
+        // validated BEFORE any custody read or provider call. import writes
+        // no durable row, so this is an idempotency/receipt shape bound, not
+        // a claimed durable uniqueness (schedule's `request` UNIQUE is).
+        let _request_id = required_segment(params, "request_id")?;
         let common = |field: &str| required_str(params, field);
         let request_install = common("install_id")?;
-        let request_context = optional_str(params, "context_id");
+        // I2 scope pin: `context_id` is strict — absent/null → None; a valid
+        // nonempty string → Some; a number/object/bool/empty/oversize string
+        // refuses rather than silently mapping to None (optional_str would).
+        let request_context = strict_optional_segment(params, "context_id")?;
         let run_id = common("run_id")?;
         let artifact_id = common("artifact_id")?;
         let bundle_digest = common("bundle_digest")?;
