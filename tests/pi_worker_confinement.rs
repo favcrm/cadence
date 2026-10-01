@@ -853,6 +853,7 @@ fn pm_config_defaults_confinement_and_explicit_params_win() {
 
 #[test]
 fn confined_devin_is_refused_before_registration_or_model_switch() {
+    let _catalog = mock_offline_devin_catalog();
     let pm_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         pm_dir.path().join("pm.yaml"),
@@ -906,6 +907,23 @@ fn confined_devin_is_refused_before_registration_or_model_switch() {
     test_env().remove("CADENCE_PM_DIR");
 }
 
+/// The unconfined controls use fake Pi but still obey the production offline
+/// bootstrap preflight. Metadata only; no operator cache or credentials.
+fn mock_offline_devin_catalog() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pi-devin")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let catalog = json!({"version":1,"fetchedAt":now,"catalog":{"families":[{
+        "family_label":"SWE-2","family_uid":"swe-2","slug":"swe-2","variants":[
+        {"model_uid":"swe-2-high","label":"Synthetic high"}]}]}});
+    std::fs::write(dir.path().join("pi-devin/models.json"), catalog.to_string()).unwrap();
+    test_env().set("XDG_CACHE_HOME", dir.path().to_string_lossy().to_string());
+    dir
+}
+
 /// pi-devin@0.2.1 reads the operator's Devin login for
 /// `devin/swe-2-high` on every turn. Simulate a persisted row from
 /// before CAD-751: direct task dispatch must refuse it before a task
@@ -913,6 +931,7 @@ fn confined_devin_is_refused_before_registration_or_model_switch() {
 /// the same pinned model can receive and complete a turn.
 #[test]
 fn persisted_confined_devin_row_cannot_receive_a_dispatched_turn() {
+    let _catalog = mock_offline_devin_catalog();
     let d = TestDaemon::start();
     let _pi = d.mock_pi("normal");
     d.register_inbox("pm-in");

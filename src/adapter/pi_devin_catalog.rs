@@ -438,6 +438,9 @@ mod tests {
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
         std::fs::remove_file(&source).unwrap();
         std::fs::write(&source, catalog().to_string()).unwrap();
+        // Failed reads create only the empty private directory. Remove this
+        // owned fixture directory before replacing it with a hostile symlink.
+        std::fs::remove_dir(cache.join("pi-devin")).unwrap();
         std::os::unix::fs::symlink(dir.path(), cache.join("pi-devin")).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
     }
