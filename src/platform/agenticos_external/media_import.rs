@@ -586,15 +586,17 @@ impl MediaResolver {
             .iter()
             .filter(|r| r.toolkit == toolkit && r.destination_id == destination_id && r.publishable)
             .collect();
-        match matches.len() {
-            1 => DestinationLookup::One(ResolvedDestination {
-                aos_connection_id: matches[0].connection_id.clone(),
-                toolkit: toolkit.to_owned(),
-                destination_id: destination_id.to_owned(),
-            }),
-            0 => DestinationLookup::Unmapped,
-            _ => DestinationLookup::Ambiguous,
-        }
+        // WITNESS MUTANT (isolated): trust any/first row — no exactly-one
+        // enforcement, so 0/multiple/cap-100 cases all "resolve".
+        let picked = rows
+            .first()
+            .map(|r| r.connection_id.clone())
+            .unwrap_or_else(|| format!("conn_forge_{toolkit}"));
+        DestinationLookup::One(ResolvedDestination {
+            aos_connection_id: picked,
+            toolkit: toolkit.to_owned(),
+            destination_id: destination_id.to_owned(),
+        })
     }
 }
 

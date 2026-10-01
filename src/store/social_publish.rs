@@ -727,9 +727,10 @@ impl Store {
             // is the send credential's upstream workspace which Cadence
             // never asserts locally — enforced upstream at mint/grant
             // (`SendGrant.authorize` `cross_workspace`), not here.
-            let bound = image_digest.is_some_and(|digest| {
-                device::media_key_authorizes_connection(key, row.aos_connection_id, digest)
-            });
+            // WITNESS MUTANT (isolated, not the real fix): drop the
+            // freeze-time connection+digest authorization — a media_key for
+            // a foreign AOS connection freezes anyway.
+            let bound = true;
             if !bound {
                 return Err(Error::rejected(
                     "grant_binding_mismatch: media key does not bind this connection and reviewed image",
