@@ -682,6 +682,9 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 - Every write is one git commit, serialised on `.write.lock`.\n";
 
 #[cfg(test)]
+mod lock_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
