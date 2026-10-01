@@ -11,6 +11,7 @@ use common::*;
 use cadence_agent::client;
 use serde_json::json;
 use serde_json::Value;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
@@ -2347,4 +2348,47 @@ fn build_slot_cli_wait_then_grant() {
     assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
     assert_eq!(held[0]["lane"], SELF_LANE);
     slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+/// CAD-954: a managed worker that never answers fails with evidence,
+/// not a bare timeout — whether it died, what it printed to stderr,
+/// which command files landed and what the daemon recorded for it. A
+/// live worker still answers inside the same call.
+#[test]
+fn a_silent_managed_worker_fails_with_its_own_evidence() {
+    let d = TestDaemon::start();
+    let mut w = ManagedWorker::start(&d, "w1");
+    let ping = json!({"how": "self", "frame": {"method": "health", "params": {}}});
+
+    // A live worker answers (the deadline is not what is under test).
+    let n = w.send(ping.clone());
+    assert_eq!(
+        w.answer_within(n, "live health", Duration::from_secs(30))["ok"],
+        true
+    );
+
+    // The daemon owns the worker's stderr log; a line there must be
+    // quoted back. Then the worker dies before the next command.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&w.provider_log)
+        .unwrap()
+        .write_all(b"CAD954-STDERR-MARKER\n")
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(w.pid as i32, libc::SIGKILL) }, 0);
+    let n = w.send(ping);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w.answer_within(n, "ping", Duration::from_millis(500))
+    }))
+    .expect_err("a dead worker never answers");
+    let msg = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    for evidence in [
+        "managed worker never answered ping",
+        "gone",
+        "CAD954-STDERR-MARKER",
+        "slot_enrolled",
+        "req-1.json",
+    ] {
+        assert!(msg.contains(evidence), "missing {evidence:?} in: {msg}");
+    }
 }
