@@ -727,8 +727,8 @@ fn git_cancellable(
             let grace = lease.map_or(CANCEL_TERM_GRACE, |l| {
                 CANCEL_TERM_GRACE.min(l.commit_floor() / 2)
             });
-            let deadline = Instant::now() + grace;
-            while Instant::now() < deadline && !leader_exited(group) {
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline && !leader_exited(group) {
                 std::thread::sleep(Duration::from_millis(10));
             }
             // SAFETY: as above; hooks that ignored TERM die here.
