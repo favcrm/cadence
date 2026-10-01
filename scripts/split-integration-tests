@@ -150,6 +150,7 @@ PINNED_DATA = {
     "pty_cursor_resume_passes_resume_flag": "agents_pty",
     "pty_cursor_send_pastes_and_completes_via_report": "agents_pty",
     "pty_cursor_unresumable_chat_clears_and_mints_fresh": "agents_pty",
+    "pty_cursor_argv_alone_is_not_ownership_while_a_doomed_tui_starts": "agents_pty",
     "pty_forbidden_prefix_is_prewrite_and_keeps_claim": "agents_pty",
     "pty_locked_session_refuses_takeover": "agents_pty",
     "pty_nudge_needs_a_live_pane_and_dies_with_the_actor": "agents_pty",
