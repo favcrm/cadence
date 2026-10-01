@@ -229,7 +229,7 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list">
+    <section aria-label="Segments list" className="crm-list">
       <div className="crm-toolbar">
         <p className="text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.

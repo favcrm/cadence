@@ -570,6 +570,41 @@
   min-height: 2rem;
 }
 
+/* Bound scope: the same links stay reachable as a compact inline
+   switch — never a second picker, and never a card on every view. */
+.app-shell-switch {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  min-width: 0;
+}
+
+.app-shell-switch > p {
+  margin: 0;
+}
+
+.app-shell-switch-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.9rem;
+}
+
+/* The bound context stays in the switch list (aria-current) so the
+   current scope is announced without becoming a dead control. */
+.app-shell-scope-list .lnk[aria-current] {
+  color: var(--color-ink-100);
+  font-weight: 600;
+}
+
+/* WCAG 2.5.5 target size at pointer-coarse widths: the 2rem desktop
+   row grows to a 44px target on touch/narrow screens. */
+@media (max-width: 1023.98px) {
+  .app-shell-scope-list .lnk {
+    min-height: 2.75rem;
+  }
+}
+
 /* The app-views surface is a bounded flex column so a table view can
    fill the outlet's remaining height. `flex:1; min-height:0` lets the
    .av chain grow inside the flex outlet; children keep natural height

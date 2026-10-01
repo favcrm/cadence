@@ -490,13 +490,40 @@ export default function AppShell({
                   or remembered scope stays unselected rather than
                   silently picking a client. Each context is an explicit
                   `?ctx=` link — a real URL write, deep-linkable, never a
-                  hidden default. The removed header picker stays gone. */}
-              {!isSocial && contextId === "" && activeIds.length > 1 && (
-                <nav className="app-shell-scope card px-4 py-4" aria-label="Choose a context">
-                  <p className="text-label text-ink-300">
-                    Choose a context to open {title}'s records.
+                  hidden default. The removed header picker stays gone.
+                  The same links stay available after a scope is bound
+                  (chosen, linked or remembered): without them the only
+                  way to reach a second context would be hand-editing
+                  the URL — the regression the header picker's removal
+                  introduced. The bound context keeps its link but
+                  carries `aria-current`, so the current scope is still
+                  announced and never a dead control. Single-context
+                  installs keep the entry hidden — no link clutter. */}
+              {!isSocial && activeIds.length > 1 && (
+                <nav
+                  className={
+                    contextId === ""
+                      ? "app-shell-scope card px-4 py-4"
+                      : "app-shell-switch"
+                  }
+                  aria-label={contextId === "" ? "Choose a context" : "Switch context"}
+                >
+                  <p
+                    className={
+                      contextId === "" ? "text-label text-ink-300" : "text-label text-ink-500"
+                    }
+                  >
+                    {contextId === ""
+                      ? `Choose a context to open ${title}'s records.`
+                      : "Context:"}
                   </p>
-                  <ul className="app-shell-scope-list">
+                  <ul
+                    className={
+                      contextId === ""
+                        ? "app-shell-scope-list"
+                        : "app-shell-scope-list app-shell-switch-list"
+                    }
+                  >
                     {contexts
                       .filter((c) => c.state === "active")
                       .map((c) => (
@@ -505,6 +532,7 @@ export default function AppShell({
                             href={scopedEntryHref(href, c.id)}
                             className="lnk text-label"
                             data-scope-link={c.id}
+                            aria-current={c.id === contextId ? "page" : undefined}
                           >
                             {c.config.label}
                           </Link>

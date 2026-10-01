@@ -224,7 +224,7 @@ function CampaignList({
   })();
 
   return (
-    <section aria-label="Campaigns list">
+    <section aria-label="Campaigns list" className="crm-list">
       <div className="crm-toolbar">
         <p className="text-secondary text-ink-300">
           Versioned email content with content-only approval. Audience freezes and test-send

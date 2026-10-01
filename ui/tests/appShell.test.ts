@@ -392,7 +392,50 @@ const acmeEntry = scopeLinks.find((a) => a.getAttribute("data-scope-link") === "
 assert(acmeEntry, "scoped entry exists for ctx-a");
 await click(acmeEntry);
 assert(location.search.includes("ctx=ctx-a"), "scoped entry lands its context in the URL");
-assert(!host.querySelector("[data-scope-link]"), "entry links go away once a scope is bound");
+// The links stay after a scope binds: a compact switch keeps every
+// active context reachable without hand-editing the URL — the
+// regression the removed header picker introduced. The bound context
+// carries aria-current instead of disappearing.
+const switchLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(switchLinks.length, 2, "context links stay reachable once a scope is bound");
+assert(switchLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "switch entries stay real ?ctx= links");
+const betaEntry = switchLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
+assert(betaEntry, "the other context stays linkable once a scope is bound");
+equal(
+  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("aria-current"),
+  "page",
+  "the bound context carries aria-current",
+);
+assert(
+  !host.querySelector('[data-scope-link="ctx-b"]')?.hasAttribute("aria-current"),
+  "unselected contexts carry no aria-current",
+);
+await click(betaEntry);
+assert(location.search.includes("ctx=ctx-b"), "the switch rebinds the new scope in the URL");
+assert(!location.search.includes("appview=") && !location.search.includes("record="), "the switch clears any stale record/view");
+assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the header label follows the switched context");
+
+// A remembered context (sessionStorage) no longer traps the operator:
+// the switch stays rendered and clicking through clears stale state.
+win.sessionStorage.setItem("cadence.workspace-app.context.install-shell", "ctx-a");
+await React.act(async () => { navigate("/app-installations/install-shell"); });
+await flush(); await flush();
+assert(location.search === "" || !location.search.includes("ctx="), "a remembered context needs no ?ctx in the URL");
+assert((host.textContent ?? "").includes("Acme · 0.1.0"), "the remembered context binds without a URL param");
+const rememberedLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
+equal(rememberedLinks.length, 2, "the switch still renders under a remembered context");
+const rememberedBeta = rememberedLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
+assert(rememberedBeta, "ctx-b stays linkable while ctx-a is remembered");
+// Stale outlet state on the remembered scope: a carried record and a
+// New view both die on the switch, matching the scoped-entry contract.
+await React.act(async () => { navigate("/app-installations/install-shell?appview=new&record=rec-stale"); });
+await flush(); await flush();
+assert(host.querySelector("#app-outlet-draft"), "stale New view mounts for the remembered context");
+await click(rememberedBeta);
+assert(location.search.includes("ctx=ctx-b"), "switching under a remembered context binds the new scope");
+assert(!location.search.includes("record=") && !location.search.includes("appview="), "switching clears the stale record and view");
+assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the switched context renders its own label");
+win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
 
 // A context-bound direct link restores scope; browser back keeps it.
 history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-9");
@@ -426,6 +469,8 @@ await React.act(async () => {
 await flush(); await flush(); await flush();
 assert(!location.search.includes("record=") && !location.search.includes("ctx="), "install switch strips stale outlet query");
 assert(text().includes("Second"), "new installation renders");
+// A single-context install keeps the switch hidden — no link clutter.
+assert(!host.querySelector("[data-scope-link]"), "single-context installs render no switch links");
 equal(panes(), 1, "install switch keeps one chat pane");
 equal(eventSources, 1, "install switch opens no second stream");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
