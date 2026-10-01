@@ -305,20 +305,18 @@ impl Shared {
         dg::ci_green(&branch, &runs, &workflows, (head, pr, base), &rollup)
             .map_err(|why| deny(format!("CI is not green on {head}: {why}")))?;
         let notes_dir = pm.config.notes_dir();
-        let notes = crate::audit::note_index(&notes_dir)
-            .ok_or_else(|| deny(format!("notes dir {} unreadable", notes_dir.display())))?;
+        let rows = crate::audit::verdicts_in(&notes_dir, &issue_id, pr, head)?;
         let mut excluded = authors;
         excluded.insert(alias.clone());
-        let chosen = dg::pick_verdicts(&notes, &issue_id, pr, head, &excluded, scope_id)?;
+        let chosen = dg::pick_verdicts(&rows, &excluded, scope_id)?;
         let mut verdicts = Vec::new();
         let mut sha = Vec::new();
         let mut reviewers = Vec::new();
-        for n in chosen {
-            let bytes =
-                std::fs::read(&n.path).map_err(|e| deny(format!("{}: {e}", n.path.display())))?;
-            verdicts.push(n.path.display().to_string());
+        for (path, reviewer) in chosen {
+            let bytes = std::fs::read(&path).map_err(|e| deny(format!("{path}: {e}")))?;
             sha.push(dg::sha256_hex(&bytes));
-            reviewers.push(dg::alias_of(n.from.as_deref().unwrap_or_default()));
+            verdicts.push(path);
+            reviewers.push(reviewer);
         }
         let approver = format!("delegated:{alias}");
         let approval = store::NewApproval {

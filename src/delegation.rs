@@ -7,7 +7,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::audit::Note;
 use crate::error::{Error, Result};
 
 /// The single source of the path lists, compiled in: the daemon applies
@@ -124,18 +123,10 @@ pub fn diff_paths(diff: &str) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
-/// The alias a `From:` line names: its first token, without backticks
-/// or a trailing `(model)`, lowercased — `` `pm-d` (claude opus) `` is
-/// `pm-d`.
+/// The alias a `From:` line names — exactly `cadence audit verdicts`'
+/// reviewer (`audit::reviewer_identity`), so both readers agree.
 pub fn alias_of(from: &str) -> String {
-    let token = from.split_whitespace().next().unwrap_or_default();
-    let token = token.trim_matches('`');
-    token
-        .split('(')
-        .next()
-        .unwrap_or_default()
-        .trim_matches('`')
-        .to_lowercase()
+    crate::audit::reviewer_identity(from)
 }
 
 /// `owner/name` lowercased, or `None` for anything else (a host prefix,
@@ -275,57 +266,59 @@ fn names_ident(text: &str, sym: &str) -> bool {
     })
 }
 
-/// The verdict notes a delegated approval rests on: PASS notes for
-/// this ticket and PR, on exactly `head`, from two distinct reviewers
-/// (by alias, [`alias_of`]) who are neither an author nor the approver.
-/// Every verdict note on this head must class it `auto` or `delegated`,
-/// and with a scope pre-approval the chosen notes must name its id.
-pub(crate) fn pick_verdicts<'a>(
-    notes: &'a [Note],
-    issue: &str,
-    pr: u64,
-    head: &str,
+/// The verdict notes a delegated approval rests on, read by the one
+/// reader `cadence audit verdicts` and `scripts/enqueue-reviewed` use
+/// (`audit::verdicts_in`: notes of this ticket and PR on exactly `head`,
+/// symlinks skipped, each with the outcome its title, section and inline
+/// line agree on). Two PASS notes from distinct reviewers who are neither
+/// an author nor the approver; a conflicted note refuses, and so does
+/// any note on this head whose Risk is not `auto` or `delegated`. With a
+/// scope pre-approval the chosen notes must name its id. Answers
+/// `(path, reviewer)` pairs.
+pub(crate) fn pick_verdicts(
+    rows: &Value,
     excluded: &BTreeSet<String>,
     scope_id: Option<&str>,
-) -> Result<Vec<&'a Note>> {
-    let on_head: Vec<&Note> = notes
-        .iter()
-        .filter(|n| n.kind == "verdict" && n.issue.as_deref() == Some(issue))
-        .filter(|n| n.head_sha.as_deref() == Some(head))
-        .collect();
-    if let Some(n) = on_head
-        .iter()
-        .find(|n| !matches!(n.class.as_deref(), Some("auto" | "delegated")))
-    {
+) -> Result<Vec<(String, String)>> {
+    let text = |r: &Value, k: &str| r[k].as_str().unwrap_or_default().to_string();
+    let mut on_head: Vec<&Value> = rows["verdicts"].as_array().into_iter().flatten().collect();
+    if let Some(r) = on_head.iter().find(|r| r["outcome"] == "conflict") {
+        return Err(Error::rejected(format!(
+            "verdict note {} is a conflict — its title, `## Verdict` section and \
+             inline `Verdict:` line disagree",
+            text(r, "path")
+        )));
+    }
+    if let Some(r) = on_head.iter().find(|r| {
+        !matches!(
+            text(r, "risk").to_lowercase().as_str(),
+            "auto" | "delegated"
+        )
+    }) {
         return Err(Error::rejected(format!(
             "verdict note {} states Risk: {} — a delegated approval needs every \
              reviewer to state auto or delegated (when unsure, human)",
-            n.path.display(),
-            n.class.as_deref().unwrap_or("(none)")
+            text(r, "path"),
+            text(r, "risk")
         )));
     }
-    let mut chosen: Vec<(&Note, String)> = Vec::new();
-    let mut newest_first = on_head;
-    newest_first.sort_by(|a, b| b.path.cmp(&a.path));
-    for n in newest_first {
-        let from = alias_of(n.from.as_deref().unwrap_or_default());
-        let pass = n
-            .verdict
-            .as_deref()
-            .is_some_and(|v| v.eq_ignore_ascii_case("pass"));
+    let mut chosen: Vec<(String, String)> = Vec::new();
+    on_head.sort_by_key(|r| std::cmp::Reverse(text(r, "name")));
+    for r in on_head {
+        let (path, from) = (text(r, "path"), text(r, "reviewer"));
         let names_scope = scope_id
-            .is_none_or(|id| std::fs::read_to_string(&n.path).is_ok_and(|t| names_ident(&t, id)));
-        if pass
+            .is_none_or(|id| std::fs::read_to_string(&path).is_ok_and(|t| names_ident(&t, id)));
+        if r["outcome"] == "pass"
             && !from.is_empty()
-            && n.prs.contains(&pr)
             && !excluded.contains(&from)
             && names_scope
             && !chosen.iter().any(|(_, f)| *f == from)
         {
-            chosen.push((n, from));
+            chosen.push((path, from));
         }
     }
     if chosen.len() < 2 {
+        let (issue, pr, head) = (text(rows, "issue"), &rows["pr"], text(rows, "head"));
         return Err(Error::rejected(format!(
             "a delegated approval needs two PASS verdict notes for {issue} PR #{pr} on head \
              {head} from distinct reviewers who are neither the author nor the approver{}; \
@@ -338,7 +331,8 @@ pub(crate) fn pick_verdicts<'a>(
             chosen.len()
         )));
     }
-    Ok(chosen.into_iter().take(2).map(|(n, _)| n).collect())
+    chosen.truncate(2);
+    Ok(chosen)
 }
 
 #[cfg(test)]
@@ -422,7 +416,7 @@ mod tests {
     fn alias_of_strips_decoration() {
         assert_eq!(alias_of("pm-d (claude opus)"), "pm-d");
         assert_eq!(alias_of("`R1` (claude)"), "r1");
-        assert_eq!(alias_of("r1(model)"), "r1");
+        assert_eq!(alias_of("pm-d, standards"), "pm-d");
         assert_eq!(repo_slug("Acme/App").as_deref(), Some("acme/app"));
         assert_eq!(repo_slug("github.com/acme/app"), None);
     }

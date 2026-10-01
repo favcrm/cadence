@@ -824,7 +824,7 @@ fn gate_is_stress(lower: &str) -> bool {
 /// `None` when the notes directory itself cannot be read — distinct
 /// from an empty one: an unreadable directory is missing evidence, an
 /// empty one is an answered "no verdicts".
-pub(crate) fn note_index(dir: &Path) -> Option<Vec<Note>> {
+fn note_index(dir: &Path) -> Option<Vec<Note>> {
     let mut notes = Vec::new();
     let read = std::fs::read_dir(dir).ok()?;
     for ent in read.flatten() {
@@ -1703,7 +1703,7 @@ fn bind_approval_for(
 /// minus backticks and trailing punctuation. `From:` is free text
 /// (`cc13-pm standards reviewer`); this is the ONE identity used for both
 /// the author exclusion and the distinct-reviewer count.
-fn reviewer_identity(from: &str) -> String {
+pub(crate) fn reviewer_identity(from: &str) -> String {
     from.split_whitespace()
         .next()
         .unwrap_or("")
@@ -1760,7 +1760,8 @@ fn title_kind_and_result(title: &str, issue: &str) -> (&'static str, String) {
 /// parsed by [`parse_note`] so there is one parser. Notes of the issue that
 /// do not bind to this PR and head are listed under `skipped` with a
 /// reason, never dropped silently. Symlinks are skipped, never followed.
-fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
+/// CAD-918: the delegated approval reads its notes through this too.
+pub(crate) fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
     let read = std::fs::read_dir(dir).map_err(|e| {
         Error::rejected(format!("cannot read the notes dir {}: {e}", dir.display()))
     })?;

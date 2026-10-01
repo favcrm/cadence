@@ -339,11 +339,35 @@ fn cad918_delegated_approval_needs_two_independent_passes_on_the_head() {
         ("03-w1", "w1", HEAD),
         ("04-pm", "pm-d", HEAD),
         ("04-pmd", "pm-d (claude opus)", HEAD),
+        ("04-pmc", "pm-d, standards", HEAD),
         ("05-r2", "r2", OLD),
     ] {
         let note = fx.note(name, from, head, "delegated (5)");
         fx.refuse(&mut pm, "", "found 1");
         std::fs::remove_file(note).unwrap();
+    }
+    // A symlinked note is skipped, never followed (as `audit verdicts`).
+    let outside = fx.home.path().join("20261001-000008-r2-verdict.md");
+    let note = fx.note("08-r2", "r2", HEAD, "delegated (5)");
+    std::fs::rename(&note, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &note).unwrap();
+    fx.refuse(&mut pm, "", "found 1");
+    std::fs::remove_file(note).unwrap();
+    // One reader (CAD-959): a note whose title and section disagree, or
+    // whose section and inline line disagree, is a conflict, not a pass.
+    let head_line = format!("pass — PR #7, head {HEAD}");
+    for (name, title, tail) in [
+        ("06-c1", "revise", ""),
+        ("06-c2", "pass", "\nVerdict: revise\n"),
+    ] {
+        let path = fx.notes.join(format!("20261001-0000{name}-verdict.md"));
+        let text = format!(
+            "# Verdict: CAD-1 Standards review — {title}\n> Issue: CAD-1\n> From: r2\n\n\
+             ## Verdict\n{head_line}\n\nRisk: delegated (5)\n{tail}"
+        );
+        std::fs::write(&path, text).unwrap();
+        fx.refuse(&mut pm, "", "is a conflict");
+        std::fs::remove_file(path).unwrap();
     }
     let (rc, out) = fx.approve_pr(&mut pm, 7, OLD, "");
     refused(rc, &out, "an approval binds the exact head");
