@@ -7,6 +7,8 @@
 //!   never silently retried.
 //! - [`Error::Internal`]: local runtime failures (I/O, storage, protocol).
 //! - [`Error::busy`]: transient resource contention, not loss of authority.
+//!   Only a condition that frees by itself may be `busy`; a standing
+//!   refusal that needs an operator is a coded `gate` ([`Error::gate_coded`]).
 
 use std::fmt;
 
@@ -99,11 +101,31 @@ impl Error {
             revision: None,
         })
     }
+    /// A standing refusal with a stable code: no retry helps until an
+    /// operator clears the reason (exit 4, never the retryable `busy`).
+    pub fn gate_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "gate",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {
         Self::Structured(Structured {
             kind: "rejected",
             code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
+    /// A command line the parser rejected (CAD-876). Printed by `main`
+    /// like any other error, so usage errors share the JSON shape.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "usage",
+            code: "usage".to_string(),
             message: message.into(),
             revision: None,
         })
@@ -146,6 +168,35 @@ impl Error {
             Self::Structured(structured) => structured.kind,
         }
     }
+}
+
+/// The one table from an error `kind` to the CLI process exit code
+/// (CAD-876). `main` and nothing else maps kinds to codes, so an agent
+/// can branch on `$?` without parsing stderr. Codes 0 and 1 and the
+/// verb-specific 2 (`doctor --host`, `setup`, `audit`, `message`
+/// pending, `agent-uid provision`) predate the table; it only adds
+/// codes that none of them uses, and `usage` shares the clap-compatible
+/// 2. Only `busy` (75) may be retried blindly, a bounded few times;
+/// `unknown` (1) may be retried only after checking whether the effect
+/// landed. `gate` (4) is final until an operator clears its reason. An
+/// unrecognised kind exits 1, like the old generic failure.
+pub const EXIT_TABLE: &[(&str, i32)] = &[
+    ("usage", 2),
+    ("rejected", 3),
+    ("gate", 4),
+    ("conflict", 5),
+    ("provider", 6),
+    ("internal", 70),
+    ("busy", 75),
+    ("unknown", 1),
+];
+
+/// Exit code for an error `kind`; anything not in [`EXIT_TABLE`] is 1.
+pub fn exit_code_for_kind(kind: &str) -> i32 {
+    EXIT_TABLE
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(1, |(_, code)| *code)
 }
 
 impl fmt::Display for Error {

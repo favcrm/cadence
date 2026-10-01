@@ -2248,8 +2248,8 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
     let status = child.wait().unwrap();
     assert_eq!(
         status.code(),
-        Some(1),
-        "a failing verb keeps its failure code on a closed pipe"
+        Some(3),
+        "a failing verb keeps its kind's failure code (rejected = 3) on a closed pipe"
     );
     // …and with the reader still open, the same failure exits the
     // same way — the hook only fires when the pipe is gone.
@@ -2261,7 +2261,7 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
         .env("CADENCE_PM_DIR", &pm_dir)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(3), "rejected exits 3");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("NOSUCH-9999"),
         "the open-pipe failure still prints its error"

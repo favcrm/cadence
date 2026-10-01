@@ -505,15 +505,23 @@ impl Pm {
         // A live writer is not evidence that authority changed: app
         // validation defers on busy rather than revoking approval.
         if legacy {
-            Error::busy(format!(
-                "PM dir is locked by a legacy write lock ({}) that this build did not \
-                 write; its owner cannot be identified — an older cadence \
-                 writer may be live, or may have crashed holding it. This build \
-                 will not write beside it and will not remove it. Do not delete \
-                 it as routine: the rollout owner clears it during a quiescent \
-                 migration, after every pre-flock cadence process is stopped",
-                self.dir.join(MARKER_LOCK_FILE).display()
-            ))
+            // Not transient: this build never removes or ages out the
+            // file, so a retry loop would spin forever (CAD-876). A
+            // non-retryable gate with its own code sends the caller to
+            // the rollout owner instead.
+            Error::gate_coded(
+                "legacy_write_lock",
+                format!(
+                    "PM dir is locked by a legacy write lock ({}) that this build did not \
+                     write; its owner cannot be identified — an older cadence \
+                     writer may be live, or may have crashed holding it. This build \
+                     will not write beside it and will not remove it, and retrying will \
+                     not help. Do not delete it as routine: the rollout owner must \
+                     clear it during a quiescent migration, after every pre-flock \
+                     cadence process is stopped",
+                    self.dir.join(MARKER_LOCK_FILE).display()
+                ),
+            )
         } else {
             Error::busy(
                 "PM dir is locked by another live writer (kernel lock on \

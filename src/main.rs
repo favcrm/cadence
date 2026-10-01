@@ -57,7 +57,8 @@ fn main() {
             // Record the failure BEFORE the error print — if the
             // eprintln itself hits a closed pipe, the hook must
             // exit with the real code, not success.
-            INTENDED_EXIT.store(1, Ordering::Relaxed);
+            let code = cadence_agent::error::exit_code_for_kind(error.kind());
+            INTENDED_EXIT.store(code, Ordering::Relaxed);
             // `code` is the stable refusal name (e.g.
             // `workflow_unapproved`) — the wire carries it, so the
             // CLI's error print does too.
@@ -66,7 +67,7 @@ fn main() {
                 err["code"] = json!(code);
             }
             eprintln!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
-            1
+            code
         }
     };
     INTENDED_EXIT.store(code, Ordering::Relaxed);

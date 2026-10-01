@@ -101,6 +101,30 @@ on recorded commit paths, so new work without commits can miss a relevant
 lesson. The [development-team proposal](design/DEVELOPMENT-TEAM.md) describes
 future learning behavior separately from these implementation guarantees.
 
+## CLI errors and exit codes
+
+The CLI prints one JSON error on stderr (`{"error", "kind", "code"?}`) and
+exits by `kind`. The table lives in one place, `error::EXIT_TABLE`; the client
+keeps every known wire kind, coded or not, and maps an unknown one to
+`internal` (70). Only a self-clearing condition is `busy`; a legacy tracker
+lock is a coded `gate` (exit 4, escalate). Codes 0, 1 and 2
+predate it and stay verb-specific where noted.
+
+| Exit | Kind | Meaning | Retry? |
+|-----:|------|---------|--------|
+| 0 | | success | |
+| 1 | `unknown` | outcome unknown, or a failure with no kind; the verbs below also use 1 for "found a problem" | only after checking whether the side effect landed |
+| 2 | `usage` | bad command line (clap), or the verb's own no-go (`doctor --host`, `audit`, `message` pending, `agent-uid provision`) | no, fix the command |
+| 3 | `rejected` | invalid or disallowed request | no |
+| 4 | `gate` | a gate refused the action; `code` `legacy_write_lock` means a legacy tracker lock only the rollout owner can clear | no: escalate, do not retry |
+| 5 | `conflict` | stale revision; reload and redo the edit | no, reload first |
+| 6 | `provider` | the provider explicitly rejected the request | no |
+| 70 | `internal` | local failure (I/O, storage, daemon not reachable) | maybe, after fixing the cause |
+| 75 | `busy` | transient contention (another live writer holds the tracker lock) | yes: at most 3 attempts with backoff (2s, 5s, 15s), same idempotency key, then report |
+
+Verbs that wrap another program (`cadence test`, `build-slot`, attach) pass
+that program's own exit code through. `--help` and `--version` exit 0.
+
 ## Validation and change impact
 
 Use the [contribution guide](../CONTRIBUTING.md) and
