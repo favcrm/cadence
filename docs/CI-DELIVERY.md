@@ -66,39 +66,52 @@ Rust jobs (`clippy`, `test-shard`, `test-once`, `build`, `ui`) can share
 compiled artifacts through an sccache backend on the R2 bucket
 `cadence-ci-sccache` (30-day object expiry). GitHub caches are scoped per
 branch, so merge-queue refs could not read each other's rust-cache; R2 is
-not. rust-cache stays for the registry and git dependencies.
+not. rust-cache stays for the registry and git dependencies and is not
+changed here (its save scope is a separate ticket).
 
-The feature is a strict no-op until the operator adds credentials. With no
-secrets (fork PRs, or before setup) `scripts/ci-sccache enable` exits 0
-without touching the job, `RUSTC_WRAPPER` stays unset and the job compiles
-exactly as before. Any failure after credentials resolve (download, checksum
-mismatch, unreachable bucket, bad token) also fails open to the same state.
+The feature is a strict no-op without credentials. With no secrets (fork
+PRs, or before setup) `scripts/ci-sccache enable` exits 0 without touching
+the job, `RUSTC_WRAPPER` stays unset and the job compiles exactly as
+before. Any failure after credentials resolve (download, checksum mismatch,
+unreachable bucket, bad token) also fails open to the same state.
 `release-artifact` (the attested build) never uses the cache.
+
+Who may write (CI-SEC-2): **only the `cache-warm` job, on `push` to
+`refs/heads/main`, holds the read-write key.** A queued PR's build scripts
+and tests run in the merge_group gate jobs, so a read-write key there would
+let that code poison the cache or exfiltrate the key. Therefore:
+
+- `cache-warm` has `if: push && ref == refs/heads/main`, the static
+  `environment: sccache-writer`, `continue-on-error: true`, and nothing
+  `needs` it. It builds the profiles the gates use (the feature-on test
+  profile, the release profile, clippy dependencies) so main fills the
+  cache. It skips the builds when sccache did not enable.
+- Every other job, including all gate jobs on `pull_request` and
+  `merge_group` and on main pushes, gets only the read-only pair and no
+  `environment:`.
+- `tests/scripts/test_ci_sccache.py` (run in `fmt`) fails if an RW secret
+  appears anywhere but `cache-warm`, if its `if` admits any event but push
+  to main, if the writer environment is attached to another job, or if
+  any job waits on it.
 
 How it works:
 
 - sccache 0.18.0 is pinned by version and archive SHA-256
   (`.config/sccache.sha256`, same shape as `.config/cargo-nextest.sha256`).
-- Modes: `push` to `main` and `merge_group` get the read-write pair; every
-  other event (PRs, tags, dispatch) gets only the read-only pair, or nothing.
-  Read-only is enforced twice: a read-only bucket-scoped token, and
-  `SCCACHE_S3_RW_MODE=READ_ONLY` (sccache `docs/S3.md`, v0.18.0; the
-  alternative `SCCACHE_S3_NO_CREDENTIALS` means anonymous public access, not
-  read-only, so it is not used).
-- The RW secrets are referenced only behind
-  `(merge_group || push to refs/heads/main) && secrets.X || ''`, and only in
-  jobs whose `environment:` is the same guard selecting `sccache-writer`
-  (empty string, so no environment, on every other event, including `v*`
-  tags). `tests/scripts/test_ci_sccache.py` evaluates that guard for each
-  event and fails if any other path can see an RW secret.
+  It installs into `$CARGO_HOME/bin`, which the Landlock worker confinement
+  test already grants.
+- Read-only is enforced twice: a read-only bucket-scoped token, and
+  `SCCACHE_S3_RW_MODE=READ_ONLY` (sccache `docs/S3.md`, v0.18.0).
+  `SCCACHE_S3_NO_CREDENTIALS` means anonymous public access, not read-only,
+  so it is not used. In read-only mode sccache's stats still count every
+  miss as a "cache write error"; that is the local refusal to write, not
+  a failed upload.
 - Settings: `SCCACHE_BUCKET=cadence-ci-sccache`, `SCCACHE_REGION=auto`,
   `SCCACHE_ENDPOINT` from the repo variable `SCCACHE_R2_ENDPOINT`,
   `SCCACHE_S3_KEY_PREFIX=v1/rustc-<version>`, `CARGO_INCREMENTAL=0`.
-  Each job prints `sccache --show-stats` (also in the step summary).
-- Residual risk: the credentials reach later steps through the job
-  environment, so test processes see them. RW exists only on `merge_group`
-  and main pushes, where the code is the reviewed PR content; a PR job holds
-  only the read-only token. Both tokens are scoped to this one bucket.
+  Each Rust job prints `sccache --show-stats` (and to the step summary).
+- Residual risk: PR jobs run PR code with the read-only token in their
+  environment; the token is scoped to this one bucket and cannot write.
 
 ### Operator setup (once; nothing here is done by the agent)
 
@@ -113,8 +126,8 @@ How it works:
    `read -rs TOKEN; printf %s "$TOKEN" | sha256sum | cut -d' ' -f1`.
 3. Settings, Environments, New environment `sccache-writer`. Under
    Deployment branches and tags choose "Selected branches and tags" and add
-   two patterns: `main` and `gh-readonly-queue/main/*`. Add no tag rule,
-   and no required reviewers (they would stall every queue run).
+   **one** pattern: `main`. No `gh-readonly-queue/*` rule, no tag rule, and
+   no required reviewers (they would stall every main run).
 4. Add the environment secrets `SCCACHE_R2_RW_ACCESS_KEY_ID` and
    `SCCACHE_R2_RW_SECRET_ACCESS_KEY` to `sccache-writer`.
 5. Add the repository secrets `SCCACHE_R2_RO_ACCESS_KEY_ID` and
@@ -122,19 +135,15 @@ How it works:
    Actions, Secrets). Fork PRs never receive them and fall back cleanly.
 6. Add the repository variable `SCCACHE_R2_ENDPOINT` =
    `https://<account-id>.r2.cloudflarestorage.com`.
-7. Verify: open a PR and read the `sccache` step summary (mode READ_ONLY,
-   hits after the first main run). Then watch the first `merge_group` run.
-   Environment branch rules are evaluated against the queue ref
-   `gh-readonly-queue/main/...`; if the jobs fail with "Branch ... is not
-   allowed to deploy to sccache-writer", correct the pattern in step 3 (the
-   environment is only attached to `merge_group` and main pushes, so PRs are
-   unaffected). To turn the feature off, delete the six values; CI returns to
-   today's behaviour with no workflow change.
+7. Verify: a PR's `sccache` step summary shows mode READ_ONLY. After the
+   first main push, `cache-warm` shows mode READ_WRITE and later PR and
+   queue runs show cache hits. To turn the feature off, delete the six
+   values; CI returns to today's behaviour with no workflow change.
 
-Job-level `environment:` does not change which jobs run on which event,
-only whether a deployment record is created for the writer events. The
-environment is created automatically, unprotected and without secrets, the
-first time a main or queue run references it, which is also a no-op.
+`cache-warm` is the only job that references the environment, and only on
+main pushes, so the environment never affects which jobs run on which event.
+Because the job is skipped (not failed) on every other event, a missing or
+misconfigured environment cannot block a PR or the merge queue.
 
 ## Mutation experiments
 

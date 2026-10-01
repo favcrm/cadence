@@ -200,7 +200,6 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -210,8 +209,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Enable shared sccache (no-op without credentials)
         env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
@@ -236,7 +233,6 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     strategy:
       # A shard failure must never hide the others' signal (or their
@@ -356,8 +352,6 @@ jobs:
       - name: Enable shared sccache (no-op without credentials)
         if: steps.scope.outputs.mode != 'docs'
         env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
@@ -434,7 +428,6 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -442,8 +435,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Enable shared sccache (no-op without credentials)
         env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
@@ -503,7 +494,6 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -511,8 +501,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Enable shared sccache (no-op without credentials)
         env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
@@ -567,7 +555,6 @@ jobs:
     needs: [queue-evidence]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
-    environment: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'sccache-writer' || '' }}
     timeout-minutes: 20
     defaults:
       run:
@@ -591,14 +578,50 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Enable shared sccache (no-op without credentials)
         env:
-          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || '' }}
-          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY || '' }}
           SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-904 / CI-SEC-2: the ONLY job that holds the read-write R2 key. It
+  # runs on push to main alone, under the `sccache-writer` environment
+  # (deployment branch: main only), and compiles merged code. No gate job,
+  # no pull_request and no merge_group job sees the key: a queued PR's build
+  # scripts and tests run in the gates, which only ever read the cache.
+  # Nothing `needs` it and it never fails the run: it only warms sccache
+  # with the profiles the gates build (test, release, clippy deps).
+  cache-warm:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    environment: sccache-writer
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Enable shared sccache (read-write; no-op without credentials)
+        id: sccache
+        env:
+          SCCACHE_CI_RW_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}
+          SCCACHE_CI_RW_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      - name: Warm the test profile (feature-on, as the shards build it)
+        if: steps.sccache.outputs.enabled == 'true'
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --no-run --locked --all-targets --features test-seam
+      - name: Warm the release profile
+        if: steps.sccache.outputs.enabled == 'true'
+        run: cargo build --release --locked
+      - name: Warm clippy dependencies
+        if: steps.sccache.outputs.enabled == 'true'
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: sccache statistics
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats

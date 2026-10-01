@@ -11,10 +11,14 @@
 # checksum or an unreachable bucket: the cache is an optimisation, so every
 # failure leaves RUSTC_WRAPPER unset and the job compiles exactly as before.
 #
+# The binary installs into $CARGO_HOME/bin (see cmd_enable).
+# When enabled it also writes `enabled=true` to $GITHUB_OUTPUT, so the
+# cache-warm job can skip its builds when there is nothing to warm.
 # Inputs (environment, set by the workflow step; secrets never in argv):
 #   SCCACHE_CI_RW_ACCESS_KEY_ID / _SECRET_ACCESS_KEY  read-write pair. The
-#       workflow passes them only on push to main and merge_group (job
-#       environment `sccache-writer`); they are empty everywhere else.
+#       workflow passes them only in the `cache-warm` job (push to main,
+#       environment `sccache-writer`); no gate job, pull_request or
+#       merge_group job ever receives them.
 #   SCCACHE_CI_RO_ACCESS_KEY_ID / _SECRET_ACCESS_KEY  read-only pair
 #   SCCACHE_CI_ENDPOINT  https://<account>.r2.cloudflarestorage.com
 # Read-only mode is enforced twice: a bucket-scoped read-only R2 token and
@@ -65,13 +69,18 @@ cmd_enable() {
 
     want=$(awk -v n="$ARCHIVE" '$1 !~ /^#/ && $2 == n { print $1; exit }' "$MANIFEST" 2>/dev/null)
     [ -n "$want" ] || off "no trusted checksum for $ARCHIVE"
-    dir="${RUNNER_TEMP:-/tmp}/sccache-$VERSION"
-    mkdir -p "$dir" || off "cannot create $dir"
+    # The binary goes into $CARGO_HOME/bin, beside cargo: the Landlock
+    # worker confinement (tests/pi_worker_confinement.rs) already grants
+    # that directory, and a confined `cargo build` inherits RUSTC_WRAPPER
+    # and must be able to execute it. $RUNNER_TEMP is not granted.
+    dir="${CARGO_HOME:-${HOME:-/tmp}/.cargo}/bin"
+    dl="${RUNNER_TEMP:-/tmp}/sccache-$VERSION-download"
+    mkdir -p "$dir" "$dl" || off "cannot create $dir"
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-        --retry 2 --output "$dir/$ARCHIVE" "$URL" || off "download failed"
-    printf '%s  %s\n' "$want" "$dir/$ARCHIVE" | sha256sum -c - >/dev/null \
+        --retry 2 --output "$dl/$ARCHIVE" "$URL" || off "download failed"
+    printf '%s  %s\n' "$want" "$dl/$ARCHIVE" | sha256sum -c - >/dev/null \
         || off "archive checksum mismatch"
-    tar -xzf "$dir/$ARCHIVE" -C "$dir" --strip-components=1 \
+    tar -xzf "$dl/$ARCHIVE" -C "$dir" --strip-components=1 \
         "sccache-v$VERSION-x86_64-unknown-linux-musl/sccache" || off "extraction failed"
     chmod 755 "$dir/sccache"
 
@@ -102,6 +111,7 @@ cmd_enable() {
         echo "AWS_ACCESS_KEY_ID=$key_id"
         echo "AWS_SECRET_ACCESS_KEY=$key_secret"
     } >> "$GITHUB_ENV"
+    [ -z "${GITHUB_OUTPUT:-}" ] || echo "enabled=true" >> "$GITHUB_OUTPUT"
     note "enabled: sccache $VERSION, mode $mode, prefix $prefix"
     [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "sccache enabled: mode $mode, prefix $prefix" >> "$GITHUB_STEP_SUMMARY"
 }

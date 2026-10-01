@@ -27,7 +27,12 @@ ENV_NAME = "sccache-writer"
 
 def job_body(workflow, name):
     body = workflow.split(f"\n  {name}:\n", 1)[1]
-    return re.split(r"\n  [a-z][a-z-]*:\n", body, maxsplit=1)[0]
+    body = re.split(r"\n  [a-z][a-z-]*:\n", body, maxsplit=1)[0]
+    # Comment blocks that introduce the next job belong to that job.
+    lines = body.split("\n")
+    while lines and (not lines[-1].strip() or lines[-1].startswith("  #")):
+        lines.pop()
+    return "\n".join(lines)
 
 
 def job_names(workflow):
@@ -56,53 +61,60 @@ EVENTS = [
     ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1-abc"),
     ("push", "refs/heads/main"),
 ]
-WRITERS = {EVENTS[5], EVENTS[6]}
-
-
-def guarded_expressions(line):
-    """The guard of every `${{ (guard) && X || '' }}` on a line."""
-    return re.findall(r"\$\{\{\s*(\(.+?\))\s*&&\s*(?:secrets\.\w+|'sccache-writer')\s*\|\|\s*''\s*\}\}", line)
+WRITERS = {("push", "refs/heads/main")}
+WARM = "cache-warm"
 
 
 def assert_rw_gated(case, workflow):
+    """CI-SEC-2: only cache-warm, only push to main, holds the RW key."""
     case.assertNotIn("pull_request_target", workflow)
     case.assertNotRegex(workflow, r"secrets:\s*inherit")
-    users = [j for j in job_names(workflow) if RW_SECRET.search(job_body(workflow, j))]
-    case.assertEqual(sorted(users), sorted(RUST_JOBS))
-    # Never at workflow level or outside a job.
+    # Never at workflow level or in any job but cache-warm.
     head = workflow.split("\njobs:\n", 1)[0]
     case.assertNotRegex(head, r"SCCACHE_R2_RW")
-    for job in users:
-        body = job_body(workflow, job)
-        env_lines = re.findall(r"(?m)^    environment: (.+)$", body)
-        case.assertEqual(len(env_lines), 1, f"{job} needs one environment")
-        exprs = guarded_expressions(env_lines[0])
-        case.assertEqual(len(exprs), 1, f"{job} environment must be guarded: {env_lines[0]}")
-        case.assertIn(f"'{ENV_NAME}'", env_lines[0])
-        for event, ref in EVENTS:
-            case.assertEqual(guard_allows(exprs[0], event, ref), (event, ref) in WRITERS,
-                             f"{job} environment for {event} {ref}")
-        for line in body.splitlines():
-            if not RW_SECRET.search(line):
-                continue
-            gs = guarded_expressions(line)
-            case.assertEqual(len(gs), 1, f"unguarded RW secret in {job}: {line.strip()}")
-            for event, ref in EVENTS:
-                case.assertEqual(guard_allows(gs[0], event, ref), (event, ref) in WRITERS,
-                                 f"{job} RW secret visible to {event} {ref}")
-    # The environment name appears only on those guarded job lines.
+    users = [j for j in job_names(workflow) if re.search(r"SCCACHE_R2_RW|SCCACHE_CI_RW", job_body(workflow, j))]
+    case.assertEqual(users, [WARM])
+    case.assertEqual(len(re.findall(r"SCCACHE_R2_RW_", workflow)), 2)
+    warm = job_body(workflow, WARM)
+    ifs = re.findall(r"(?m)^    if: (.+)$", warm)
+    case.assertEqual(len(ifs), 1, "cache-warm needs exactly one job-level if")
+    expr = re.sub(r"^\$\{\{\s*|\s*\}\}$", "", ifs[0])
+    for event, ref in EVENTS:
+        case.assertEqual(guard_allows(expr, event, ref), (event, ref) in WRITERS,
+                         f"cache-warm if for {event} {ref}")
+    case.assertRegex(warm, rf"(?m)^    environment: {ENV_NAME}$")
+    case.assertNotRegex(warm, r"(?m)^    (strategy|needs):")
+    case.assertNotRegex(warm, r"merge_group|pull_request")
+    # The writer environment is attached to no other job, and no job waits
+    # for cache-warm (a skipped or failed warm must never gate anything).
     for job in job_names(workflow):
-        has = ENV_NAME in job_body(workflow, job)
-        case.assertEqual(has, job in users, f"{job}: {ENV_NAME} placement")
+        body = job_body(workflow, job)
+        if job != WARM:
+            case.assertNotIn(ENV_NAME, body, job)
+            case.assertNotRegex(body, rf"needs:.*\b{WARM}\b", job)
+    # Gate jobs never get an environment, and see only the RO pair.
+    for job in RUST_JOBS:
+        body = job_body(workflow, job)
+        case.assertNotRegex(body, r"(?m)^    environment:", job)
+        for line in body.splitlines():
+            if "secrets." in line:
+                case.assertRegex(line, r"secrets\.SCCACHE_R2_RO_(ACCESS_KEY_ID|SECRET_ACCESS_KEY) \}\}$")
 
 
 def assert_no_secret_path_has_no_wrapper(case, workflow):
     # Only the script may set the wrapper, and only after credentials resolve.
     case.assertNotRegex(workflow, r"(?m)^\s*RUSTC_WRAPPER:|RUSTC_WRAPPER=sccache|export RUSTC_WRAPPER")
-    for job in RUST_JOBS:
+    for job in RUST_JOBS + (WARM,):
         body = job_body(workflow, job)
         case.assertEqual(body.count("scripts/ci-sccache enable"), 1, job)
         case.assertEqual(body.count("scripts/ci-sccache stats"), 1, job)
+    # The warm builds run only when the script reports it enabled.
+    warm = job_body(workflow, WARM)
+    case.assertIn("id: sccache", warm)
+    builds = [st for st in re.split(r"(?m)^      - ", warm) if re.search(r"run: cargo ", st)]
+    case.assertEqual(len(builds), 3)
+    for st in builds:
+        case.assertIn("if: steps.sccache.outputs.enabled == 'true'", st)
     # release-artifact is attested: it never uses the shared cache.
     for job in ("release-artifact", "release-gate", "release-publish", "fmt", "test", "queue-evidence"):
         body = job_body(workflow, job)
@@ -114,54 +126,54 @@ class WorkflowContract(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text()
 
-    def test_rw_secrets_only_in_writer_environment_jobs(self):
+    def test_rw_secrets_only_in_the_push_main_warm_job(self):
         assert_rw_gated(self, self.workflow)
 
-    def test_no_pull_request_path_sees_rw_secrets(self):
-        # The same guard is evaluated for every event; also the RO pair is
-        # the only secret a PR job is ever handed.
+    def test_no_pull_request_or_merge_group_path_sees_rw_secrets(self):
         assert_rw_gated(self, self.workflow)
-        for job in RUST_JOBS:
-            for line in job_body(self.workflow, job).splitlines():
-                if "secrets." in line and not RW_SECRET.search(line):
-                    self.assertRegex(line, r"secrets\.SCCACHE_R2_RO_(ACCESS_KEY_ID|SECRET_ACCESS_KEY) \}\}$")
+        for event, ref in EVENTS:
+            if event in ("pull_request", "merge_group"):
+                self.assertNotIn((event, ref), WRITERS)
 
     def test_no_secret_path_does_not_set_wrapper(self):
         assert_no_secret_path_has_no_wrapper(self, self.workflow)
 
-    def test_unguarded_rw_secret_is_rejected(self):
-        guard = "(github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_ACCESS_KEY_ID || ''"
-        self.assertIn(guard, self.workflow)
-        mutated = self.workflow.replace(guard, "secrets.SCCACHE_R2_RW_ACCESS_KEY_ID", 1)
-        with self.assertRaises(AssertionError):
-            assert_rw_gated(self, mutated)
-
-    def test_pull_request_in_guard_is_rejected(self):
-        old = "(github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY"
-        new = "(github.event_name == 'merge_group' || github.event_name == 'pull_request') && secrets.SCCACHE_R2_RW_SECRET_ACCESS_KEY"
-        self.assertIn(old, self.workflow)
-        with self.assertRaises(AssertionError):
-            assert_rw_gated(self, self.workflow.replace(old, new, 1))
-
-    def test_push_without_main_ref_is_rejected(self):
-        old = "(github.event_name == 'push' && github.ref == 'refs/heads/main')"
+    def test_rw_secret_in_a_gate_job_is_rejected(self):
+        # The pre-CI-SEC-2 design: the RW key on merge_group gate jobs.
         for job in RUST_JOBS:
-            body = job_body(self.workflow, job)
-            self.assertIn(old, body)
-        mutated = self.workflow.replace(old, "github.event_name == 'push'")
+            marker = f"  {job}:\n"
+            mutated = self.workflow.replace(
+                marker, marker + "    env:\n      K: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}\n", 1)
+            with self.subTest(job=job), self.assertRaises(AssertionError):
+                assert_rw_gated(self, mutated)
+
+    def test_writer_environment_on_a_gate_job_is_rejected(self):
+        mutated = self.workflow.replace("  clippy:\n", "  clippy:\n    environment: sccache-writer\n", 1)
         with self.assertRaises(AssertionError):
             assert_rw_gated(self, mutated)
 
-    def test_missing_environment_is_rejected(self):
-        env = re.search(r"(?m)^    environment: .*sccache-writer.*\n", job_body(self.workflow, "clippy"))
-        mutated = self.workflow.replace(env[0], "", 1)
-        with self.assertRaises(AssertionError):
-            assert_rw_gated(self, mutated)
+    def test_widening_the_warm_guard_is_rejected(self):
+        old = "if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        self.assertIn(old, job_body(self.workflow, WARM))
+        for new in ("if: ${{ github.event_name == 'push' }}",
+                    "if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}",
+                    "if: ${{ github.event_name != 'pull_request' }}",
+                    "if: ${{ github.ref == 'refs/heads/main' }}"):
+            with self.subTest(new=new), self.assertRaises(AssertionError):
+                assert_rw_gated(self, self.workflow.replace(old, new, 1))
 
-    def test_rw_secret_in_extra_job_is_rejected(self):
-        marker = "  fmt:\n    needs: [queue-evidence]\n"
-        self.assertIn(marker, self.workflow)
-        mutated = self.workflow.replace(marker, marker + "    env:\n      X: ${{ secrets.SCCACHE_R2_RW_ACCESS_KEY_ID }}\n", 1)
+    def test_dropping_the_warm_guard_is_rejected(self):
+        old = "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"
+        with self.assertRaises(AssertionError):
+            assert_rw_gated(self, self.workflow.replace(old, "", 1))
+
+    def test_dropping_the_writer_environment_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            assert_rw_gated(self, self.workflow.replace("    environment: sccache-writer\n", "", 1))
+
+    def test_a_job_waiting_on_the_warm_job_is_rejected(self):
+        mutated = self.workflow.replace("  build:\n    needs: [queue-evidence]", "  build:\n    needs: [queue-evidence, cache-warm]", 1)
+        self.assertNotEqual(mutated, self.workflow)
         with self.assertRaises(AssertionError):
             assert_rw_gated(self, mutated)
 
@@ -173,6 +185,12 @@ class WorkflowContract(unittest.TestCase):
         mutated = self.workflow.replace("  CARGO_TERM_COLOR: always\n", "  CARGO_TERM_COLOR: always\n  RUSTC_WRAPPER: sccache\n", 1)
         with self.assertRaises(AssertionError):
             assert_no_secret_path_has_no_wrapper(self, mutated)
+
+    def test_warm_builds_without_the_enabled_guard_are_rejected(self):
+        old = "        if: steps.sccache.outputs.enabled == 'true'\n        run: cargo build --release --locked"
+        self.assertIn(old, self.workflow)
+        with self.assertRaises(AssertionError):
+            assert_no_secret_path_has_no_wrapper(self, self.workflow.replace(old, "        run: cargo build --release --locked", 1))
 
     def test_attested_release_build_never_uses_the_cache(self):
         mutated = self.workflow.replace("  release-artifact:\n", "  release-artifact:\n    # scripts/ci-sccache enable\n", 1)
@@ -194,7 +212,8 @@ class Harness:
         self.github_env = self.dir / "github_env"
         self.github_path = self.dir / "github_path"
         self.summary = self.dir / "summary"
-        for p in (self.github_env, self.github_path, self.summary):
+        self.output = self.dir / "output"
+        for p in (self.github_env, self.github_path, self.summary, self.output):
             p.write_text("")
         self.runner_temp = self.dir / "tmp"
         self.runner_temp.mkdir()
@@ -233,7 +252,9 @@ class Harness:
             "GITHUB_ENV": str(self.github_env),
             "GITHUB_PATH": str(self.github_path),
             "GITHUB_STEP_SUMMARY": str(self.summary),
+            "GITHUB_OUTPUT": str(self.output),
             "RUNNER_TEMP": str(self.runner_temp),
+            "CARGO_HOME": str(self.dir / "cargo"),
         }
         base.update(env)
         return subprocess.run(["sh", str(self.dir / "repo/scripts/ci-sccache"), command],
@@ -257,6 +278,7 @@ class ScriptBehaviour(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("RUSTC_WRAPPER", h.exported())
         self.assertEqual(h.exported(), "")
+        self.assertEqual(h.output.read_text(), "", "a disabled run never reports enabled")
         self.assertIn("disabled", result.stdout)
 
     def test_no_credentials_is_a_noop(self):
@@ -264,7 +286,8 @@ class ScriptBehaviour(unittest.TestCase):
         good_install(h)
         self.assertDisabled(h, h.run())
         self.assertDisabled(h, h.run(SCCACHE_CI_ENDPOINT=ENDPOINT))
-        self.assertFalse((h.runner_temp / "sccache-0.18.0").exists(), "nothing downloaded without credentials")
+        self.assertFalse((h.dir / "cargo").exists(), "nothing installed without credentials")
+        self.assertEqual(list(h.runner_temp.iterdir()), [], "nothing downloaded without credentials")
 
     def test_credentials_without_endpoint_is_a_noop(self):
         h = Harness(self)
@@ -316,6 +339,7 @@ class ScriptBehaviour(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         out = h.exported()
         self.assertIn("RUSTC_WRAPPER=sccache\n", out)
+        self.assertEqual(h.output.read_text(), "enabled=true\n")
         self.assertIn("SCCACHE_S3_RW_MODE=READ_ONLY\n", out)
         self.assertIn("SCCACHE_BUCKET=cadence-ci-sccache\n", out)
         self.assertIn("SCCACHE_REGION=auto\n", out)
@@ -324,7 +348,9 @@ class ScriptBehaviour(unittest.TestCase):
         self.assertIn("CARGO_INCREMENTAL=0\n", out)
         self.assertIn("::add-mask::rosecret", result.stdout)
         self.assertNotIn("rosecret", result.stderr)
-        self.assertIn("sccache-0.18.0", h.github_path.read_text())
+        # Beside cargo, where the Landlock worker confinement grants exec.
+        self.assertEqual(h.github_path.read_text().strip(), str(h.dir / "cargo/bin"))
+        self.assertTrue(os.access(h.dir / "cargo/bin/sccache", os.X_OK))
 
     def test_read_write_pair_wins_only_when_supplied(self):
         h = Harness(self)
