@@ -52,6 +52,8 @@ function read(path: string): Response {
   if (path === "/api/app-installations/install-a/effects") return json({ effects });
   if (path === "/api/app-run-artifacts/artifact-a") return json({ id: "artifact-a", digest: "text-digest", media_type: "text/plain", size: 13, text: "Reviewed text" });
   if (path === "/api/outbox?effect_id=effect-a") return json({ item: { effect_id: "effect-a", project: null, scope: "app", post: "Reviewed text", provenance: { run_id: "run-a" } } });
+  // CAD-980 installed Schedule: the calendar reads publish intents (empty here).
+  if (path.startsWith("/api/social-publishes")) return json({ intents: [] });
   throw new Error(`Unexpected read ${path}`);
 }
 globalThis.fetch = async (input, init) => {
@@ -169,7 +171,8 @@ async function main() {
   await click(host.querySelector('button[aria-label="Optional brand context"]'));
   await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("No brand context")));
   await click(button("Schedule"));
-  assert(text().includes("Scheduling isn’t available"), "Unsupported scheduling remains explicitly unavailable");
+  await flush();
+  assert(text().includes("Schedule") && text().includes("No posts are planned"), "Installed Schedule renders the real calendar's honest empty state");
   assert(writes.length === 0, "Loading and schedule navigation cause zero side effects");
   await click(button("New post"));
   await fill("#wa-post-title", "Synthetic caption"); await fill("#wa-post-source", "Synthetic\nsource facts");
