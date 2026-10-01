@@ -1624,6 +1624,28 @@ mod test_pause {
         release: Sender<()>,
     }
 
+    /// How a parked call's bounded release wait ended.
+    ///
+    /// The three outcomes are deliberately distinct because they license
+    /// different choreography conclusions:
+    /// - `Released`: the controller explicitly released the parked call —
+    ///   the intended sequence ran.
+    /// - `Timeout`: the controller NEVER released within the bound while
+    ///   still connected — the parked call did not wait for its partner,
+    ///   so the strict ordering the test set up did not happen. Failing
+    ///   loudly (rather than resuming as if success) is what keeps a
+    ///   >BOUND controller stall from silently re-sequencing the race
+    ///   into a passing-by-accident sequential run.
+    /// - `Disconnected`: the controller was dropped — the test's
+    ///   controller thread panicked or finished early — so the parked
+    ///   call resumes for bounded teardown rather than stranding.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum WaitOutcome {
+        Released,
+        Timeout,
+        Disconnected,
+    }
+
     /// No parked call outlives this bound and no controller wait
     /// exceeds it: a test that panics drops its channel end, and a
     /// stuck call fails the test instead of hanging the suite.
@@ -1631,6 +1653,12 @@ mod test_pause {
 
     thread_local! {
         static ARMED: RefCell<Option<Pause>> = const { RefCell::new(None) };
+        /// A private cfg(test) bound override. `None` means the real
+        /// 60s `BOUND`; a lifecycle test sets a tiny per-test value so
+        /// the timeout path is exercised without a 60s-per-run cost.
+        /// Scoped to the arming thread and consumed by `arm`/`wait` —
+        /// never a production knob and never visible to other tests.
+        static WAIT_BOUND: RefCell<Option<Duration>> = const { RefCell::new(None) };
     }
 
     /// Arm the NEXT `put_blob` call made by THIS thread — one shot,
@@ -1649,17 +1677,62 @@ mod test_pause {
         Control { arrived, release }
     }
 
+    /// Set a private cfg(test) release-wait bound for THIS thread's
+    /// next parked call — the lifecycle tests' per-test bound, so a
+    /// `Timeout` outcome is provable without a real 60s wait. `None`
+    /// restores the default `BOUND`. Test-only; consumed by the same
+    /// thread's `arm`/`wait`, cleared on `drop`/`clear`.
+    pub(super) fn set_wait_bound(bound: Option<Duration>) {
+        WAIT_BOUND.with(|b| {
+            *b.borrow_mut() = bound;
+        });
+    }
+
+    /// The bounded release wait, separated so the outcome is
+    /// inspectable: `Timeout` and `Disconnected` are different
+    /// failure geometries and must not be conflated.
+    ///
+    /// - `Released` → the controller released the parked call.
+    /// - `Timeout` → the bound elapsed with the controller still
+    ///   connected: it never released. The parked call did NOT
+    ///   synchronize — treat this as loud failure, never a resume.
+    /// - `Disconnected` → the controller's `Control` was dropped while
+    ///   the call was parked: the test orchestrator is gone, so the
+    ///   call resumes for bounded teardown rather than stranding.
+    fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
+        match release.recv_timeout(bound) {
+            Ok(()) => WaitOutcome::Released,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WaitOutcome::Timeout,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Disconnected,
+        }
+    }
+
     /// The seam inside `put_blob`: blob bytes published, pointer lock
     /// not yet taken, no lock held. Fires once on the armed thread
     /// only; unarmed it is a no-op, so unrelated parallel tests are
     /// untouched.
+    ///
+    /// A `Timeout` outcome FAILS the test: the parked call did not wait
+    /// for its partner, so the strict choreography did not happen and
+    /// continuing would let a later assertion pass on a silently
+    /// degraded schedule. `Disconnected` resumes — the controller
+    /// already dropped, so the call unwinds for bounded teardown.
     pub(super) fn at_publish_seam() {
         let pause = ARMED.with(|armed| armed.borrow_mut().take());
         if let Some(pause) = pause {
+            let bound = WAIT_BOUND.with(|b| b.borrow().unwrap_or(BOUND));
             let _ = pause.reached.send(());
-            // Bounded even if the controller died: the parked call
-            // resumes and finishes instead of stranding the thread.
-            let _ = pause.release.recv_timeout(BOUND);
+            match wait_for_release(&pause.release, bound) {
+                WaitOutcome::Released | WaitOutcome::Disconnected => {}
+                WaitOutcome::Timeout => {
+                    panic!(
+                        "the armed put_blob's controller never released it \
+                         within {bound:?} — the strict publish/pointer-lock \
+                         choreography did not run, so the test must not \
+                         resume it as if it had"
+                    );
+                }
+            }
         }
     }
 
@@ -2245,8 +2318,8 @@ mod tests {
 
         // Publish once so the hash name exists, then REPLACE the
         // object with same-length foreign bytes.
-        let bytes: &[u8] = b"uploaded bytes, 33 bytes long exactly.";
-        let foreign: &[u8] = b"FOREIGN bytes,  33 bytes long exactly!";
+        let bytes: &[u8] = b"uploaded bytes, 38 bytes long exactly.";
+        let foreign: &[u8] = b"FOREIGN bytes,  38 bytes long exactly!";
         assert_eq!(
             bytes.len(),
             foreign.len(),
@@ -2524,5 +2597,107 @@ mod tests {
             before,
             "the capped copy preserved the source tmp"
         );
+    }
+
+    // ---- CAD-911 R4: seam release lifecycle -------------------------
+    //
+    // These tests pin the `test_pause` seam's own release lifecycle,
+    // distinct from the put_blob custody choreography above: a Timeout
+    // (controller still connected but never released within the bound)
+    // is a loud failure, while Disconnected (the controller dropped)
+    // is a bounded teardown. They run the private `wait_for_release`
+    // collaborator directly — no real put_blob, no lock — and use a
+    // per-test bound so the timeout path costs milliseconds, not 60s.
+
+    /// Release the parked call explicitly → Released. Baseline: the
+    /// normal, intended exit the custody tests rely on.
+    #[test]
+    fn release_wait_released_is_ok() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let ctl = std::thread::spawn(move || {
+            // Controller side: after a beat, release the parked call.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = hold.send(());
+        });
+        let out = test_pause::wait_for_release(&release, std::time::Duration::from_secs(60));
+        ctl.join().unwrap();
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Released,
+            "an explicit release resumes the seam"
+        );
+    }
+
+    /// A controller that stays connected but NEVER releases within the
+    /// bound → Timeout. This is the loud failure: without it, a >BOUND
+    /// controller stall re-sequences the strict choreography into a
+    /// silently-passing sequential run. A tiny private bound proves
+    /// the timeout branch without a real 60s wait.
+    #[test]
+    fn release_wait_timeout_fails() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        // The sender stays ALIVE (never dropped, never sends) so only
+        // the bound can end the wait — a connected-but-stalled
+        // controller, which must be Timeout, not Disconnected.
+        let _keep_connected = hold;
+        let out = test_pause::wait_for_release(&release, std::time::Duration::from_millis(20));
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Timeout,
+            "a connected controller that never releases must fail loudly"
+        );
+    }
+
+    /// A controller that is DROPPED while the call is parked →
+    /// Disconnected → the parked call resumes for bounded teardown.
+    /// This is the seam's strand-prevention: a panicking controller
+    /// must not leave the armed thread parked forever.
+    #[test]
+    fn release_wait_disconnected_resumes() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        // Drop the controller side: the parked call sees Disconnected.
+        drop(hold);
+        let out = test_pause::wait_for_release(&release, std::time::Duration::from_secs(60));
+        assert_eq!(
+            out,
+            test_pause::WaitOutcome::Disconnected,
+            "a dropped controller resumes the parked call for teardown"
+        );
+    }
+
+    /// The `at_publish_seam` entry a real `put_blob` hits: arm this
+    /// thread with a tiny bound, never release, and the parked seam
+    /// PANICS on Timeout — the loud failure the choreography requires.
+    /// Using a per-test bound keeps the run at milliseconds.
+    #[test]
+    fn publish_seam_timeout_panics() {
+        test_pause::set_wait_bound(Some(std::time::Duration::from_millis(20)));
+        let _ctl = test_pause::arm();
+        // The seam consumes the armed pause and panics on Timeout.
+        let outcome = std::panic::catch_unwind(test_pause::at_publish_seam);
+        test_pause::set_wait_bound(None);
+        let err = outcome.expect_err("an unreleased armed seam must fail loudly on timeout");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("never released"),
+            "the timeout panic names its cause: {msg}"
+        );
+    }
+
+    /// With a dropped `Control`, the armed seam takes the Disconnected
+    /// teardown path — resumes, does not panic, and consumes the
+    /// one-shot pause so a later unarmed call is untouched.
+    #[test]
+    fn publish_seam_disconnect_resumes_for_teardown() {
+        let ctl = test_pause::arm();
+        drop(ctl); // controller gone before the seam runs
+        // Must NOT panic — a dropped controller means bounded teardown.
+        test_pause::at_publish_seam();
+        // The pause was consumed: a second unarmed call is a no-op.
+        test_pause::at_publish_seam();
     }
 }
