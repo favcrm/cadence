@@ -359,7 +359,7 @@ fn cad979_import_refuses_caller_material_fields() {
             .daemon
             .operator_rpc("social_publish_media_import", body)
             .expect_err("caller material fields must be refused");
-        assert!(err.to_string().contains("unknown"), "{forged}: {err}");
+        assert!(err.to_string().contains("unsupported fields"), "{forged}: {err}");
     }
 }
 
