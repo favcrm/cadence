@@ -98,12 +98,8 @@ impl Fx {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(body.as_bytes())
-            .unwrap();
+        // A capped reader may close the pipe early.
+        let _ = child.stdin.take().unwrap().write_all(body.as_bytes());
         let out = child.wait_with_output().unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -464,4 +460,55 @@ fn single_purpose_verbs_still_make_one_commit_each() {
         assert!(ok, "{args:?}: {out}");
         assert_eq!(commits(pm), n + 1, "{args:?}: one commit");
     }
+}
+
+#[test]
+fn blocked_by_link_warns_and_notifies_holders_like_issue_link() {
+    let f = fx();
+    // seed leaves CAD-2 `doing`, owned by `me`.
+    let (ok, link) = f.cli(&["issue", "link", "CAD-2", "blocked_by", "CAD-3"]);
+    assert!(ok, "{link}");
+    assert!(
+        f.cli(&["issue", "unlink", "CAD-2", "blocked_by", "CAD-3"])
+            .0
+    );
+    let (ok, out) = f.cli(&[
+        "issue",
+        "edit",
+        "CAD-2",
+        "--link",
+        "blocked_by:CAD-3",
+        "--set",
+        "priority=P0",
+    ]);
+    assert!(ok, "{out}");
+    let notice = &out["blocker_notices"][0];
+    assert_eq!(notice["target"], "CAD-3", "{out}");
+    assert_eq!(
+        notice["notified"][0]["to"], link["blocker_notice"]["notified"][0]["to"],
+        "edit notifies the same holders `issue link` does: {out}"
+    );
+    assert_eq!(notice["notified"][0]["to"], "me", "{out}");
+    assert_eq!(out["warnings"], link["warnings"], "{out}");
+    assert!(
+        out["warnings"][0].as_str().unwrap().contains("CAD-3"),
+        "{out}"
+    );
+}
+
+#[test]
+fn bare_comment_stdin_is_capped() {
+    let f = fx();
+    let pm = f.pm.path();
+    let (ok, out) = f.stdin("piped bare\n", &["issue", "comment", "CAD-3"]);
+    assert!(ok, "{out}");
+    let n = commits(pm);
+    let big = "x".repeat((4 << 20) + 10);
+    let (ok, out) = f.stdin(&big, &["issue", "comment", "CAD-3"]);
+    assert!(
+        !ok && out["kind"] == "rejected",
+        "{}",
+        out.to_string().len()
+    );
+    assert_eq!(commits(pm), n);
 }

@@ -1726,12 +1726,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 }
                 (None, Some(f)) => std::fs::read_to_string(f)?,
                 (None, None) => {
+                    if crate::master::caller_is_master() {
+                        return Err(Error::rejected(crate::master::NO_STDIN));
+                    }
                     if atty_stdin() {
                         return Err(Error::rejected("Provide -m or --file"));
                     }
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf
+                    read_stdin_body("issue comment")?
                 }
             };
             let pm = open_pm()?;
@@ -1795,7 +1796,12 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 force: force.clone(),
             };
             let pm = open_pm()?;
-            print_json(&crate::issue::edit::edit(&pm, id, &spec, "")?);
+            let sd = crate::client::state_dir().ok();
+            let out = crate::issue::edit::edit(&pm, id, &spec, "", sd.as_deref())?;
+            print_json(&out);
+            if out["worktree_open"].is_array() {
+                eprintln!("{id}: worktree open: run cadence issue finish {id}");
+            }
             Ok(0)
         }
         IssueAction::Attach { id, file } => {

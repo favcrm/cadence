@@ -96,7 +96,7 @@ fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value>> {
 /// Lint parity at write time: an issue whose status is ready|doing|
 /// review while a blocked_by target is unfinished succeeds but the
 /// response carries this warning.
-fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
+pub(crate) fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
     let issues = board::load_all(&pm.dir, None)?;
     let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
     let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
@@ -1190,7 +1190,9 @@ pub fn set_fields_if_rev(
     let staged = stage(pm, ids, |project, front| {
         let prev = front.clone();
         changed = apply_pairs(project, front, pairs)?;
-        forced = check_set_gates(pm, project, &prev, front, force)?;
+        if let Some(reason) = check_set_gates(pm, project, &prev, front, force)? {
+            forced = Some(reason);
+        }
         Ok(true)
     })?;
     let summary = match &forced {
@@ -2207,6 +2209,79 @@ mod tests {
     fn clean(pm: &Pm) -> bool {
         crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok()
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+    }
+
+    /// A forced done over several ids keeps its reason in the commit
+    /// subject even when a later id was already done (CAD-887 review).
+    #[test]
+    fn forced_done_keeps_its_reason_when_a_later_id_is_already_done() {
+        let (tmp, pm) = tracker();
+        new_issue(
+            &pm,
+            tmp.path(),
+            Some("cadence"),
+            "second",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "t",
+        )
+        .unwrap();
+        set_fields(
+            &pm,
+            &["CAD-2".to_string()],
+            &["status=done".to_string()],
+            "t",
+            Some("first"),
+        )
+        .unwrap();
+        set_fields(
+            &pm,
+            &["CAD-1".to_string(), "CAD-2".to_string()],
+            &["status=done".to_string()],
+            "t",
+            Some("because reasons"),
+        )
+        .unwrap();
+        let subject = crate::issue::git(&pm.dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert!(subject.contains("forced: because reasons"), "{subject}");
+    }
+
+    /// `issue edit` whose commit is refused leaves issue.md as it was
+    /// and removes the attachment and comment files it created.
+    #[test]
+    fn edit_commit_failure_rolls_everything_back() {
+        let (tmp, pm) = tracker();
+        let before = std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap();
+        let attach = tmp.path().join("a.txt");
+        std::fs::write(&attach, "x").unwrap();
+        let hook = failing_hook(&pm);
+        let spec = crate::issue::edit::EditSpec {
+            set: vec!["priority=P0".to_string()],
+            attach: vec![attach],
+            comment: Some("a comment".to_string()),
+            ..Default::default()
+        };
+        assert!(crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).is_err());
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap(),
+            before
+        );
+        let count = |sub: &str| {
+            std::fs::read_dir(pm.dir.join("cadence/CAD-1").join(sub))
+                .map(|rd| rd.count())
+                .unwrap_or(0)
+        };
+        assert_eq!(count("artifacts"), 0);
+        assert_eq!(count("comments"), 0);
+        assert!(clean(&pm));
+        std::fs::remove_file(hook).unwrap();
+        crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
     }
 
     #[test]

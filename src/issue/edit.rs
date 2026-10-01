@@ -7,7 +7,7 @@
 //! shared, not copied — under the same PM lock, with the same actor
 //! and trailer derivation (`write::commit_who`, `write::comment_author`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -64,7 +64,13 @@ fn is_http(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
-pub fn edit(pm: &Pm, id: &str, spec: &EditSpec, actor: &str) -> Result<Value> {
+pub fn edit(
+    pm: &Pm,
+    id: &str,
+    spec: &EditSpec,
+    actor: &str,
+    state_dir: Option<&Path>,
+) -> Result<Value> {
     if spec.author.is_some() && spec.comment.is_none() {
         return Err(Error::rejected(
             "edit --author names a comment's author — pass --comment-file with it",
@@ -330,6 +336,32 @@ pub fn edit(pm: &Pm, id: &str, spec: &EditSpec, actor: &str) -> Result<Value> {
         "changed": changed,
         "committed": true,
     });
+    // `issue link` parity: lint-style warnings, and the CAD-757 notice
+    // to the holders of a held ticket for each new blocked_by edge.
+    out["warnings"] = json!(write::blocked_warnings(pm, id, state_dir)?);
+    let notices: Vec<Value> = links
+        .iter()
+        .filter(|(unlink, kind, _)| !unlink && *kind == "blocked_by")
+        .map(|(_, _, target)| {
+            let mut n = crate::issue::blocked::notify_new_blocker(&front, target, state_dir);
+            n["target"] = json!(target);
+            n
+        })
+        .collect();
+    if !notices.is_empty() {
+        out["blocker_notices"] = json!(notices);
+    }
+    // `issue set` parity: a done ticket whose worktree ref is still
+    // open tells the CLI to print the `issue finish` hint.
+    if front.status == "done"
+        && prev.status != "done"
+        && front
+            .refs
+            .iter()
+            .any(|r| r.kind == "worktree" && r.closed != Some(true))
+    {
+        out["worktree_open"] = json!([id]);
+    }
     if let Some(name) = comment_name {
         out["comment"] = json!(name);
     }
