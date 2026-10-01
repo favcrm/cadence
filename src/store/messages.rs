@@ -1321,7 +1321,7 @@ impl Store {
                 (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
                 _ => {
                     return Err(Error::rejected(format!(
-                        "--since '{since}' is neither a message id of '{alias}' nor a timestamp"
+                        "since '{since}' is neither a message id of '{alias}' nor a timestamp"
                     )))
                 }
             }

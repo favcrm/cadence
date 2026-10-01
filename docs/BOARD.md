@@ -1722,9 +1722,13 @@ rely on (CAD-879). `cadence agent show` is the bounded path: it sends
 `limit` (default 20) and the daemon returns the newest `limit` finished
 messages plus every unfinished one, with `messages_omitted` counting what
 was left out; `--since <message id|unix ts>` adds a lower bound, `--limit N`
-changes the window, and `--all` sends neither field. Absence of the fields
-means today's behaviour, so an older client is unaffected. Both variants retain turn-token redaction; reads do not unfence,
-resume or launch an agent. The `start: skipping fenced agent` log is a
+changes the window (`--since` without `--limit` drops the default 20-message
+window and lists everything after that point), and `--all` sends neither
+field. `messages_omitted` appears only on a `limit`/`since` read. A `limit`
+that is present but not a non-negative integer is rejected. Absence of the
+fields means today's behaviour, so an older client is unaffected. Both
+variants retain turn-token redaction; reads do not unfence, resume or launch
+an agent. The `start: skipping fenced agent` log is a
 daemon-start observation, not a periodic scheduler action (CAD-627).
 
 **Deploy drift** — the daemon reports its `build_commit` via the

@@ -1333,3 +1333,12 @@ fn cad800_single_id_sweep_flags_rejected() {
     // A plain single-ID finish still parses.
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1"]).is_ok());
 }
+
+/// CAD-879: `cadence self` asks the daemon for running turns only.
+#[test]
+fn cad879_self_requests_no_history() {
+    assert_eq!(
+        super::self_show_params("w1"),
+        json!({"alias": "w1", "active_only": true})
+    );
+}

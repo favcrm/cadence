@@ -2465,16 +2465,22 @@ impl Shared {
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.
-                let (limit, since) = (
-                    optional_u64(params, "limit"),
+                let limit =
+                    match params.get("limit") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(v.as_u64().ok_or_else(|| {
+                            Error::rejected("limit must be a non-negative integer")
+                        })?),
+                    };
+                let since = {
                     match params.get("since") {
                         Some(Value::String(s)) => Some(s.clone()),
                         Some(Value::Number(n)) => Some(n.to_string()),
                         Some(Value::Null) | None => None,
                         Some(_) => return Err(Error::rejected("since must be a string or number")),
-                    },
-                );
-                let mut omitted = 0usize;
+                    }
+                };
+                let mut omitted: Option<usize> = None;
                 let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
                     self.store.active_messages(&alias)?
                 } else if limit.is_some() || since.is_some() {
@@ -2483,7 +2489,7 @@ impl Shared {
                         limit.map(|n| n as usize),
                         since.as_deref(),
                     )?;
-                    omitted = left_out;
+                    omitted = Some(left_out);
                     rows
                 } else {
                     self.store.messages(&alias)?
@@ -2560,12 +2566,9 @@ impl Shared {
                         }
                     }
                 }
-                Ok(json!({
+                let mut out = json!({
                     "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
-                    // CAD-879: how many older terminal rows a bounded
-                    // read left out (0 for the full history).
-                    "messages_omitted": omitted,
                     "event_cursor": self.store.event_cursor(&alias)?,
                     // Inbound backlog — what `cadence inbox` would drain
                     // for a mailbox, what the actor will still take for
@@ -2576,7 +2579,13 @@ impl Shared {
                     // agent is fenced and `message reconcile` /
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
-                }))
+                });
+                // CAD-879: how many older rows a `limit`/`since` read
+                // left out; absent when the history was not windowed.
+                if let Some(n) = omitted {
+                    out["messages_omitted"] = json!(n);
+                }
+                Ok(out)
             }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
@@ -4874,6 +4883,20 @@ mod tests {
             [created + 0.6],
         )
         .unwrap();
+        // A previous registration's rows (CAD-304 S4): a finished one is
+        // never listed or counted; an unfinished one is always listed.
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('prev-done','w1','b','user','completed',?1)",
+            [created - 10.0],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES ('prev-live','w1','b','user','queued',?1)",
+            [created - 9.0],
+        )
+        .unwrap();
         for i in 0..600 {
             tx.execute(
                 "INSERT INTO messages(id,alias,body,source,state,created)
@@ -4898,21 +4921,30 @@ mod tests {
         };
         // No fields: today's full history, nothing omitted.
         let full = show(json!({"alias": "w1"}));
-        assert_eq!(full["messages"].as_array().unwrap().len(), 602);
-        assert_eq!(full["messages_omitted"], 0);
+        assert_eq!(full["messages"].as_array().unwrap().len(), 603);
+        assert!(full.get("messages_omitted").is_none());
         // Default window: the last 20 plus both unfinished rows.
         let win = show(json!({"alias": "w1", "limit": 20}));
         let got = ids(&win);
-        assert_eq!(got.len(), 22, "{got:?}");
-        assert_eq!(&got[..2], ["old-live", "old-unknown"]);
-        assert_eq!(got[2], "h-580");
-        assert_eq!(got[21], "h-599");
+        assert_eq!(got.len(), 23, "{got:?}");
+        assert!(got.contains(&"prev-live".to_string()));
+        assert!(!got.contains(&"prev-done".to_string()));
+        assert_eq!(got[3], "h-580");
+        assert_eq!(got[22], "h-599");
+        // 580 finished rows left out; the previous registration's
+        // finished row is not counted.
         assert_eq!(win["messages_omitted"], 580);
         // The window is the same size whatever the history length.
         assert!(win.to_string().len() < full.to_string().len() / 10);
         assert!(!win.to_string().contains("private-token"));
+        // A window wider than the history reaches the previous
+        // registration's finished row and must still stop short of it.
+        let wide = show(json!({"alias": "w1", "limit": 5000}));
+        assert!(!ids(&wide).contains(&"prev-done".to_string()));
+        assert_eq!(ids(&wide).len(), 603);
+        assert_eq!(wide["messages_omitted"], 0);
         // limit 0: only unfinished work.
-        assert_eq!(ids(&show(json!({"alias": "w1", "limit": 0}))).len(), 2);
+        assert_eq!(ids(&show(json!({"alias": "w1", "limit": 0}))).len(), 3);
         // since by message id: rows after it, plus unfinished ones.
         let by_id = ids(&show(json!({"alias": "w1", "since": "h-595"})));
         assert_eq!(
@@ -4920,6 +4952,7 @@ mod tests {
             [
                 "old-live",
                 "old-unknown",
+                "prev-live",
                 "h-596",
                 "h-597",
                 "h-598",
@@ -4928,13 +4961,23 @@ mod tests {
         );
         // since + limit compose.
         let both = ids(&show(json!({"alias": "w1", "since": "h-595", "limit": 2})));
-        assert_eq!(both, ["old-live", "old-unknown", "h-598", "h-599"]);
+        assert_eq!(
+            both,
+            ["old-live", "old-unknown", "prev-live", "h-598", "h-599"]
+        );
         // since by timestamp.
         let ts = (created + 1.0 + 597.0).to_string();
         let by_ts = ids(&show(json!({"alias": "w1", "since": ts})));
         assert_eq!(
             by_ts,
-            ["old-live", "old-unknown", "h-597", "h-598", "h-599"]
+            [
+                "old-live",
+                "old-unknown",
+                "prev-live",
+                "h-597",
+                "h-598",
+                "h-599"
+            ]
         );
         // since that is neither an id nor a number is refused.
         assert!(shared
@@ -4946,7 +4989,19 @@ mod tests {
             .is_err());
         // active_only (what `cadence self` sends) is history-free.
         let active = show(json!({"alias": "w1", "active_only": true}));
-        assert_eq!(ids(&active), ["old-live", "old-unknown"]);
+        assert_eq!(ids(&active), ["old-live", "old-unknown", "prev-live"]);
+        assert!(active.get("messages_omitted").is_none());
+        // A malformed `limit` is refused, never a silent full history.
+        for bad in [json!(-1), json!("20"), json!(5.0), json!(true)] {
+            let err = shared
+                .dispatch(
+                    "agent_show",
+                    &json!({"alias": "w1", "limit": bad}),
+                    std::process::id(),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("limit"), "{bad}: {err}");
+        }
     }
 
     /// CAD-324: a pending compaction whose pack cannot be sent is

@@ -145,6 +145,7 @@ pub(crate) enum AgentAction {
         #[arg(long, conflicts_with = "all")]
         limit: Option<u64>,
         /// Only messages after this message id or unix timestamp.
+        /// Without `--limit` this drops the default 20-message window.
         #[arg(long, conflicts_with = "all")]
         since: Option<String>,
         /// Every message since the agent registered.
