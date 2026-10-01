@@ -1211,10 +1211,16 @@ fn refused_upload_never_deletes_a_shared_blob() {
 ///
 /// Here the winner is staged and its pointer committed while a loser
 /// (same bytes, stale `if_rev`) conflicts — the loser's refusal path
-/// must not have deleted the winner's object. The Barrier interleave
-/// is timing-dependent (a live-RPC check); the deterministic
-/// accepted/rejected custody proof under both literal orderings is
-/// `same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings`.
+/// must not have deleted the winner's object. This is a live-RPC
+/// TIMING check: the Barrier makes the overlap likely, not certain.
+/// The deterministic reproduction — a real `put_blob` parked between
+/// publication and the pointer lock while a second real `put_blob`
+/// dedupes and commits — lives in the unit tests
+/// `wiki::tests::loser_publishes_winner_dedupes_and_commits_then_loser_
+/// conflicts` and `..._winner_dedupes_then_pauses_loser_conflicts_then_
+/// winner_commits` (src/wiki/mod.rs `test_pause` seam, cfg(test)).
+/// `same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings`
+/// is a sequential INVARIANT, not the race reproduction.
 #[test]
 fn concurrent_same_bytes_upload_never_orphans_an_accepted_pointer() {
     let fx = fx();
@@ -1540,11 +1546,16 @@ fn dedupe_refuses_a_nonregular_object_at_the_hash_name() {
     }
 }
 
-/// CAD-911: the deterministic ordering probe — under BOTH publication
-/// orders, whichever call lands the pointer keeps byte-exact bytes and
-/// the rejected call deletes nothing shared. This is the checked-in
-/// form of the old race: not probabilistic scheduling, each ordering
-/// executed literally.
+/// CAD-911: a sequential INVARIANT, not the old-race reproduction —
+/// the pre-fix defect needed the loser's created-flag unlink to land
+/// BETWEEN the winner's dedupe and its pointer commit, an
+/// interleaving no sequential call order can reach (both orders
+/// pass unmodified pre-fix code). What this pins is the standing
+/// contract: under both literal orderings the accepted pointer keeps
+/// byte-exact bytes and the refused call deletes nothing shared.
+/// The checked-in deterministic reproduction of the defect — real
+/// `put_blob` calls interleaved at the publish seam — is the
+/// `wiki::tests::*` pair in src/wiki/mod.rs.
 #[test]
 fn same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings() {
     for ordering in [
@@ -1589,6 +1600,11 @@ fn same_bytes_accepted_and_rejected_keep_bytes_under_both_orderings() {
         };
         let tmp_w = stage_upload(&uploads, "w.bin", bytes);
         let tmp_l = stage_upload(&uploads, "l.bin", bytes);
+        // Literal sequential calls — an invariant under both
+        // orderings. The deterministic race reproduction needs a
+        // parked call (the `test_pause` seam in src/wiki/mod.rs),
+        // which integration tests cannot see: the library they link
+        // is built without cfg(test).
         let (out_w, out_l) = if ordering.starts_with("winner") {
             (winner(&state, &tmp_w), loser(&state, &tmp_l))
         } else {
@@ -1931,6 +1947,13 @@ fn unproven_callers_are_refused() {
         ("wiki_write", json!({"path": "global/x.md", "text": "x"})),
         ("wiki_search", json!({"q": "shared"})),
         ("wiki_history", json!({"path": "global/n.md"})),
+        // The blob upload is refused on the caller binding before a
+        // tmp is ever considered — the nonexistent tmp below would
+        // fail later checks anyway, but the caller refusal is first.
+        (
+            "wiki_put_blob",
+            json!({"path": "global/x.bin", "tmp": "/nonexistent-tmp"}),
+        ),
     ] {
         let err = refused(d.unproven_rpc(method, params));
         assert!(err.contains("refused"), "{method}: {err}");

@@ -1443,6 +1443,13 @@ pub fn put_blob(
     }
     let dest = blobs.join(&actual);
     publish_blob(&stage, &dest)?;
+    // CAD-911 test seam — compiled ONLY into test builds (`cfg(test)`;
+    // shipped daemons and libraries never carry it): a unit test that
+    // armed this thread parks HERE — blob published, pointer lock not
+    // yet taken, no lock held while parked — to interleave a second
+    // real put_blob deterministically. Unarmed it is a no-op.
+    #[cfg(test)]
+    test_pause::at_publish_seam();
 
     // The pointer file — a normal tracker text write under the lock.
     let pointer = vault.join(format!("{norm}.blob"));
@@ -1585,6 +1592,90 @@ fn verify_existing_blob_inner(stage: &Path, dest: &Path) -> Result<()> {
         return Err(refuse("content does not match its hash name".to_string()));
     }
     Ok(())
+}
+
+/// CAD-911 — TEST-ONLY synchronization hooks for the `put_blob`
+/// unit tests; `cfg(test)` keeps every byte of this module out of
+/// shipped binaries and libraries. It is NOT a production hook: no
+/// request field, env var or exported API reaches it — a test arms a
+/// per-thread, one-shot [`Pause`] on the thread that will run
+/// `put_blob`, and only that thread's next call parks, exactly once,
+/// at the publication↔pointer-lock seam. Ordering is established by
+/// channels, never sleeps; every wait is bounded so a panicking
+/// controller cannot strand a thread.
+#[cfg(test)]
+mod test_pause {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::time::Duration;
+
+    /// The half parked inside `put_blob` — installed by [`arm`] on the
+    /// calling thread, consumed by [`at_publish_seam`].
+    pub(super) struct Pause {
+        reached: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    /// The controlling half a test holds: [`Control::arrived`] resolves
+    /// once the armed call has published its blob; [`Control::release`]
+    /// lets it run on to the pointer lock.
+    pub(super) struct Control {
+        arrived: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    /// No parked call outlives this bound and no controller wait
+    /// exceeds it: a test that panics drops its channel end, and a
+    /// stuck call fails the test instead of hanging the suite.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    thread_local! {
+        static ARMED: RefCell<Option<Pause>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the NEXT `put_blob` call made by THIS thread — one shot,
+    /// consumed when it fires; other threads and later calls see
+    /// nothing. Re-arming replaces a stale pause, whose `Control`
+    /// then times out rather than deadlocking.
+    pub(super) fn arm() -> Control {
+        let (reached, arrived) = channel();
+        let (release, hold) = channel();
+        ARMED.with(|armed| {
+            *armed.borrow_mut() = Some(Pause {
+                reached,
+                release: hold,
+            });
+        });
+        Control { arrived, release }
+    }
+
+    /// The seam inside `put_blob`: blob bytes published, pointer lock
+    /// not yet taken, no lock held. Fires once on the armed thread
+    /// only; unarmed it is a no-op, so unrelated parallel tests are
+    /// untouched.
+    pub(super) fn at_publish_seam() {
+        let pause = ARMED.with(|armed| armed.borrow_mut().take());
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            // Bounded even if the controller died: the parked call
+            // resumes and finishes instead of stranding the thread.
+            let _ = pause.release.recv_timeout(BOUND);
+        }
+    }
+
+    impl Control {
+        /// Block until the armed call parks at the seam — bounded, so
+        /// a call that never arrives fails the test, not the suite.
+        pub(super) fn arrived(&self) {
+            self.arrived
+                .recv_timeout(BOUND)
+                .expect("the armed put_blob never reached the publish seam");
+        }
+        /// Release the parked call toward the pointer lock.
+        pub(super) fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
 }
 
 /// Search the derived index. The caller and path checks remain the wiki's
@@ -1894,6 +1985,522 @@ mod tests {
         assert_eq!(
             sniff_mime(&[0xde, 0xad, 0xbe, 0xef]),
             "application/octet-stream"
+        );
+    }
+
+    // ---- CAD-911: deterministic custody evidence --------------------
+    //
+    // These tests exercise the REAL `put_blob` end to end (Pm, vault,
+    // pointer commit included). The publication↔pointer-lock seam is
+    // `test_pause`: a thread arms its own next call, parks there, and
+    // the test orchestrates a second real call — channel ordering,
+    // never sleeps. Coverage the suite carries for this fix:
+    //
+    //   unit/deterministic — this module: both interleavings of a
+    //       same-bytes winner/loser pair through the publish seam;
+    //       a same-length wrong-digest dedupe refusal; the real-I/O
+    //       partial-copy cleanup (a capped child writes a genuine
+    //       partial stage).
+    //   integration/live-RPC — tests/wiki.rs:
+    //       `concurrent_same_bytes_upload_never_orphans_an_accepted_
+    //       pointer` (probabilistic Barrier check) and the sequential
+    //       `same_bytes_accepted_and_rejected_keep_bytes_under_both_
+    //       orderings` (an invariant, NOT the race reproduction — the
+    //       defect needed an interleaving, which is what the seam
+    //       tests below pin down).
+
+    /// A private tracker + upload-state pair under one root. `Pm::at`
+    /// is what a second caller would open — each thread takes its own
+    /// handle; the pointer lock is the file lock, so that is the same
+    /// serialization the daemon gets.
+    fn cad911_pm(root: &Path) -> Pm {
+        Pm::init(&root.join("pm")).unwrap()
+    }
+
+    fn cad911_uploads(state: &Path) -> PathBuf {
+        let up = state.join(UPLOAD_DIR);
+        std::fs::create_dir_all(&up).unwrap();
+        up
+    }
+
+    fn cad911_stage_tmp(uploads: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let tmp = uploads.join(name);
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp
+    }
+
+    /// `.blobs/` entry names — staging-leak evidence.
+    fn cad911_blob_names(blobs: &Path) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(blobs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn cad911_no_stage_left(blobs: &Path) {
+        let stray: Vec<_> = cad911_blob_names(blobs)
+            .into_iter()
+            .filter(|n| n.contains(".upload-"))
+            .collect();
+        assert!(stray.is_empty(), "staging leftovers: {stray:?}");
+    }
+
+    /// One `put_blob` against `pm_dir` for `path`, armed to park at
+    /// the publish seam. The `Control` is sent to `ctl_tx` BEFORE the
+    /// call runs — the call itself parks, so handing the controller
+    /// back afterwards would deadlock.
+    fn cad911_call(
+        pm_dir: &Path,
+        state: &Path,
+        path: &str,
+        tmp: &Path,
+        if_rev: Option<&str>,
+        ctl_tx: &std::sync::mpsc::Sender<test_pause::Control>,
+    ) -> Result<Value> {
+        let pm = Pm::at(pm_dir).unwrap();
+        ctl_tx.send(test_pause::arm()).unwrap();
+        put_blob(&pm, state, &Caller::Operator, path, tmp, None, if_rev)
+    }
+
+    /// CAD-911 — deterministic interleaving (a): the LOSER publishes
+    /// `.blobs/<sha>` first and parks; the WINNER dedupes those exact
+    /// bytes and commits its pointer; the loser resumes and conflicts
+    /// on its stale `if_rev`. Under the legacy `created=true` cleanup
+    /// the loser's exit unlinked the object the winner's pointer now
+    /// references — restoring that cleanup makes this test fail.
+    /// Channel rendezvous order the stages; no sleeps, no timing loop.
+    #[test]
+    fn loser_publishes_winner_dedupes_and_commits_then_loser_conflicts() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let bytes: &[u8] = b"identical bytes for winner and loser (a)";
+        let loser_tmp = cad911_stage_tmp(&uploads, "loser.bin", bytes);
+        let winner_tmp = cad911_stage_tmp(&uploads, "winner.bin", bytes);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
+        let state_t = state.clone();
+        let pm_dir_t = pm_dir.clone();
+        let loser = std::thread::spawn(move || {
+            cad911_call(
+                &pm_dir_t,
+                &state_t,
+                "global/loser.bin",
+                &loser_tmp,
+                Some("fnv1a:deadbeefdeadbeef"),
+                &ctl_tx,
+            )
+        });
+        let loser_ctl = ctl_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the loser thread never armed its call");
+        // The loser has PUBLISHED the shared object and is parked
+        // before its pointer lock — the exact window the defect hit.
+        loser_ctl.arrived();
+
+        let winner_out = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/winner.bin",
+            &winner_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let sha = winner_out["sha256"].as_str().unwrap().to_string();
+        loser_ctl.release();
+        let loser_out = loser.join().unwrap().unwrap();
+
+        assert!(winner_out["rev"].is_string(), "winner commits");
+        assert_eq!(
+            loser_out["conflict"].as_str().unwrap_or(""),
+            "if_rev",
+            "loser conflicts, never an error or success: {loser_out}"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join(&sha)).unwrap_or_else(|e| panic!(
+                "the accepted pointer's blob is missing/corrupt: {e}"
+            )),
+            bytes,
+            "a rejected same-bytes upload must never delete the accepted blob"
+        );
+        assert!(
+            vault
+                .join("global/loser.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no loser pointer"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// CAD-911 — deterministic interleaving (b): the loser publishes
+    /// and parks; the WINNER dedupes the published bytes and parks
+    /// before ITS pointer finalization; the loser resumes and
+    /// conflicts; the winner resumes and commits. The legacy
+    /// `created=true` cleanup deleted the object in the loser's
+    /// conflict exit — between the winner's dedupe and its commit —
+    /// so this fails there too, deterministically.
+    #[test]
+    fn winner_dedupes_then_pauses_loser_conflicts_then_winner_commits() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let bytes: &[u8] = b"identical bytes for winner and loser (b)";
+        let loser_tmp = cad911_stage_tmp(&uploads, "loser.bin", bytes);
+        let winner_tmp = cad911_stage_tmp(&uploads, "winner.bin", bytes);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        let (l_tx, l_rx) = std::sync::mpsc::channel();
+        let (w_tx, w_rx) = std::sync::mpsc::channel();
+        let pm_l = pm_dir.clone();
+        let state_l = state.clone();
+        let loser = std::thread::spawn(move || {
+            cad911_call(
+                &pm_l,
+                &state_l,
+                "global/loser.bin",
+                &loser_tmp,
+                Some("fnv1a:deadbeefdeadbeef"),
+                &l_tx,
+            )
+        });
+        let pm_w = pm_dir.clone();
+        let state_w = state.clone();
+        let winner = std::thread::spawn(move || {
+            cad911_call(
+                &pm_w,
+                &state_w,
+                "global/winner.bin",
+                &winner_tmp,
+                None,
+                &w_tx,
+            )
+        });
+        let (loser_ctl, winner_ctl) = (
+            l_rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the loser thread never armed its call"),
+            w_rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the winner thread never armed its call"),
+        );
+
+        // Stage 1 — the loser published the shared object and parks.
+        loser_ctl.arrived();
+        // Stage 2 — the winner deduped that object (same bytes) and
+        // parks before its pointer write; the object is now visible
+        // to a second caller's commit path.
+        winner_ctl.arrived();
+        // Stage 3 — the loser resumes and conflicts on its stale rev.
+        loser_ctl.release();
+        let loser_out = loser.join().unwrap().unwrap();
+        assert_eq!(loser_out["conflict"], "if_rev", "{loser_out}");
+        // Stage 4 — the winner resumes and commits its pointer.
+        winner_ctl.release();
+        let winner_out = winner.join().unwrap().unwrap();
+
+        assert!(winner_out["rev"].is_string(), "winner commits");
+        let sha = winner_out["sha256"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read(blobs.join(sha)).unwrap_or_else(|e| panic!(
+                "the accepted pointer's blob is missing/corrupt: {e}"
+            )),
+            bytes,
+            "the loser's conflict must not delete bytes the winner deduped"
+        );
+        assert!(
+            vault
+                .join("global/loser.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no loser pointer"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// CAD-911 — the dedupe guard's DIGEST half. A foreign object
+    /// planted at the upload's hash name with the SAME length as the
+    /// upload passes the size check and is refused ONLY by the
+    /// sha256 comparison — the discriminating line. Removing that
+    /// comparison (counterfactual) makes this dedupe commit a pointer
+    /// to foreign bytes and the test fails.
+    #[test]
+    fn same_length_foreign_bytes_at_the_hash_name_refuse() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let state = root.path().join("state");
+        let uploads = cad911_uploads(&state);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        // Publish once so the hash name exists, then REPLACE the
+        // object with same-length foreign bytes.
+        let bytes: &[u8] = b"uploaded bytes, 33 bytes long exactly.";
+        let foreign: &[u8] = b"FOREIGN bytes,  33 bytes long exactly!";
+        assert_eq!(
+            bytes.len(),
+            foreign.len(),
+            "the plant must be same-length — only the digest discriminates"
+        );
+        let tmp_a = cad911_stage_tmp(&uploads, "a.bin", bytes);
+        let out = put_blob(&pm, &state, &Caller::Operator, "global/a.bin", &tmp_a, None, None)
+            .unwrap();
+        let sha = out["sha256"].as_str().unwrap().to_string();
+        let object = blobs.join(&sha);
+        std::fs::write(&object, foreign).unwrap();
+
+        let tmp_b = cad911_stage_tmp(&uploads, "b.bin", bytes);
+        let err = put_blob(&pm, &state, &Caller::Operator, "global/b.bin", &tmp_b, None, None)
+            .expect_err("same-length foreign bytes at the hash name must refuse");
+        assert!(
+            err.to_string().contains("content does not match"),
+            "the digest guard names its refusal: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&object).unwrap(),
+            foreign,
+            "the refused upload leaves the planted object byte-exact"
+        );
+        assert!(
+            vault
+                .join("global/b.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no pointer commits against unverified bytes"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    // ---- CAD-911: a REAL failed partial copy ------------------------
+    //
+    // `cad911_partial_copy_child` re-executes this test binary under a
+    // CHILD-ONLY RLIMIT_FSIZE (applied in pre_exec — post-fork,
+    // pre-exec; the parent suite's own limits are never touched) with
+    // SIGXFSZ ignored so the kernel reports EFBIG to `fs::copy`
+    // instead of killing the child. The tmp lives on /dev/shm
+    // (proven a different filesystem than the fixture root), so the
+    // tmp→stage publish takes the real EXDEV `fs::copy` branch — and
+    // the cap makes that copy fail mid-write: a genuine partial
+    // private stage, then the real cleanup path. No injected fault.
+
+    /// Set only on the spawned child; names the env keys carrying its
+    /// fixture paths.
+    const COPY_CHILD_ENV: &str = "CAD911_PARTIAL_COPY_CHILD";
+    const COPY_CHILD_PM: &str = "CAD911_PARTIAL_COPY_PM";
+    const COPY_CHILD_STATE: &str = "CAD911_PARTIAL_COPY_STATE";
+    const COPY_CHILD_TMP: &str = "CAD911_PARTIAL_COPY_TMP";
+
+    /// Exclusive state dir on tmpfs — `create_dir`, never `create_dir_all`:
+    /// a pre-existing or raced name is a failure, not a shared dir.
+    struct Cad911ShmState {
+        dir: PathBuf,
+    }
+    impl Cad911ShmState {
+        fn new(vault_fs_root: &Path) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let shm = Path::new("/dev/shm");
+            assert_ne!(
+                shm.metadata().unwrap().dev(),
+                vault_fs_root.metadata().unwrap().dev(),
+                "/dev/shm must be a different filesystem than the fixture root \
+                 — the EXDEV copy path is the point of this test"
+            );
+            let dir = shm.join(format!(
+                "cad911-copy-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&dir).unwrap_or_else(|e| {
+                panic!("exclusive shm state dir {} must not exist: {e}", dir.display())
+            });
+            Self { dir }
+        }
+    }
+    impl Drop for Cad911ShmState {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// CAD-911 — a REAL partial-copy failure through the real
+    /// `put_blob` EXDEV branch, in an owned child whose RLIMIT_FSIZE
+    /// caps its file writes mid-copy. Asserts: the failed upload
+    /// removes only its private `.upload-` stage, the source tmp is
+    /// untouched, the already-accepted blob keeps byte-exact custody,
+    /// and no pointer commits. Omitting the copy-failure cleanup
+    /// (counterfactual) leaves the partial stage and fails this test.
+    #[test]
+    fn failed_partial_copy_cleans_only_its_private_stage() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let pm_dir = pm.dir.clone();
+        let shm_state = Cad911ShmState::new(root.path());
+        let uploads = cad911_uploads(&shm_state.dir);
+        let vault = vault_dir(&pm).unwrap();
+        let blobs = blobs_dir(&vault);
+
+        // An accepted blob BEFORE the failure — the custody the failed
+        // copy must never touch. Its commit also settles `.gitignore`
+        // so the capped child writes nothing before the copy itself.
+        let kept_bytes: &[u8] = b"the already-accepted blob, byte-exact";
+        let kept_tmp = cad911_stage_tmp(&uploads, "kept.bin", kept_bytes);
+        let kept = put_blob(&pm, &shm_state.dir, &Caller::Operator, "global/kept.bin", &kept_tmp, None, None)
+            .unwrap();
+        let kept_sha = kept["sha256"].as_str().unwrap().to_string();
+
+        // The failing upload's tmp: created on tmpfs NOW, before any
+        // limit exists — and sized over the child's 512-byte cap so
+        // the copy fails mid-write with a partial stage on disk.
+        let fail_bytes: Vec<u8> = (0..4096u32)
+            .map(|i| (i % 251) as u8 ^ 0x5a)
+            .collect();
+        let fail_tmp = cad911_stage_tmp(&uploads, "failed.bin", &fail_bytes);
+        let fail_sha = sha256_file(&fail_tmp).unwrap();
+
+        // Spawn THIS test binary's ignored child entry with the
+        // child-only file-size cap. The suite lock/nextest markers are
+        // not the child's to honour — it is a plain libtest process.
+        let logs = tempfile::TempDir::new().unwrap();
+        let out_path = logs.path().join("child.log");
+        let out = std::fs::File::create(&out_path).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "wiki::tests::cad911_partial_copy_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .env(COPY_CHILD_ENV, "1")
+        .env(COPY_CHILD_PM, &pm_dir)
+        .env(COPY_CHILD_STATE, &shm_state.dir)
+        .env(COPY_CHILD_TMP, &fail_tmp)
+        .env_remove("CADENCE_SUITE_LOCK")
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NEXTEST") {
+                cmd.env_remove(key);
+            }
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                // Child-only, pre-exec: cap file writes so fs::copy
+                // fails mid-write with EFBIG. SIGXFSZ is ignored so
+                // the syscall reports the error instead of killing
+                // the child before cleanup runs.
+                let mut rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_FSIZE, &mut rl) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                rl.rlim_cur = 512;
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the partial-copy child did not finish: {}",
+                    std::fs::read_to_string(&out_path).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+        assert!(status.success(), "the partial-copy child failed: {text}");
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "the child must actually run its assertion: {text}"
+        );
+
+        // The child saw the copy fail. Now the custody assertions:
+        // tmp untouched, no object at the failed hash name, no
+        // pointer, no stage — and the earlier accepted blob intact.
+        assert_eq!(
+            std::fs::read(&fail_tmp).unwrap(),
+            fail_bytes,
+            "a failed copy preserves the source tmp"
+        );
+        assert!(
+            blobs.join(&fail_sha).symlink_metadata().is_err(),
+            "no object may be left at the failed upload's hash name"
+        );
+        assert!(
+            vault
+                .join("global/failed.bin.blob")
+                .symlink_metadata()
+                .is_err(),
+            "no pointer commits for a failed copy"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join(&kept_sha)).unwrap(),
+            kept_bytes,
+            "the accepted blob is byte-exact after the failed copy"
+        );
+        cad911_no_stage_left(&blobs);
+    }
+
+    /// The owned child the parent test re-executes: RLIMIT_FSIZE is
+    /// already in force (set pre-exec), the fixture was pre-built by
+    /// the parent, and the real `put_blob` EXDEV copy is the only
+    /// file write the cap cuts. Runs `#[ignore]`d — never standalone.
+    #[test]
+    #[ignore = "child entry point of failed_partial_copy_cleans_only_its_private_stage"]
+    fn cad911_partial_copy_child() {
+        if std::env::var_os(COPY_CHILD_ENV).is_none() {
+            return;
+        }
+        let pm_dir = PathBuf::from(std::env::var_os(COPY_CHILD_PM).unwrap());
+        let state = PathBuf::from(std::env::var_os(COPY_CHILD_STATE).unwrap());
+        let tmp = PathBuf::from(std::env::var_os(COPY_CHILD_TMP).unwrap());
+        let before = std::fs::read(&tmp).unwrap();
+        let pm = Pm::at(&pm_dir).unwrap();
+        let err = put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/failed.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .expect_err("a copy capped mid-write must fail");
+        // An I/O failure — never a wiki policy refusal — so the store
+        // could not even consider committing a pointer.
+        assert!(
+            !err.to_string().contains("refused"),
+            "the failure is the real I/O error, not a guard: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            before,
+            "the capped copy preserved the source tmp"
         );
     }
 }
