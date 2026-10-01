@@ -4019,6 +4019,17 @@ fn cad867_view_read_http_actor_gate_and_parity() {
     let (code, _, body) =
         common::op::raw(port, &session.request("GET", &cust_list("query=Ada"), ""));
     assert_eq!(code, 200, "operator customers list query: {body}");
+    // Filtered query must actually FILTER — a 200 that ignores `query`
+    // and returns all rows is a silent-ignore hole.
+    let filtered: Value = serde_json::from_str(&body).unwrap();
+    let frows = filtered["rows"].as_array().unwrap();
+    assert_eq!(frows.len(), 1, "HTTP query must filter to the match");
+    assert_eq!(frows[0]["ref"], json!("cust-1"));
+    // Limit bounds over HTTP: 0 and 101 refuse (RECORD_LIMIT 1..=100).
+    for bound in ["limit=0", "limit=101"] {
+        let (code, _, body) = common::op::raw(port, &session.request("GET", &cust_list(bound), ""));
+        assert_eq!(code, 400, "HTTP customers list admitted {bound}: {body}");
+    }
     // Cursor continuation over HTTP: `limit=1` returns one row plus a
     // `next_cursor`; following it returns a DIFFERENT `ref` (no
     // duplicate of the first page).
