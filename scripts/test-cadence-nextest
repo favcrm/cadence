@@ -220,4 +220,70 @@ if ! wait "$runner_pid"; then
 fi
 [ "$observed" = 1 ] || die "outer flock was not held during child startup"
 
+# CAD-955: a process the suite leaves behind (a detached tmux server) must
+# not keep the suite lock held after nextest exits, on a pass or a failure.
+# Each fixture test leaks a setsid child marked in argv0; once the runner
+# exits the lock must be free. The marked children are this run's own and
+# are the only processes the scan matches and kills.
+mkdir -p "$TMP/leak-workspace/src"
+cat >"$TMP/leak-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-leak-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/leak-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    fn leak() {
+        let mark = std::env::var("CADENCE_LEAK_MARK").unwrap();
+        std::process::Command::new("setsid")
+            .args(["bash", "-c", "exec -a \"$0\" sleep 120", &mark])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    fn leak_then_pass() {
+        leak();
+    }
+
+    #[test]
+    fn leak_then_fail() {
+        leak();
+        panic!("intentional leak fixture failure");
+    }
+}
+EOF
+leak_mark="cadence-leak-fixture-$$-$(date +%s)"
+leak_lock="$TMP/leak.lock"
+count_marked() {
+    n=0
+    for d in /proc/[0-9]*; do
+        if cat "$d/cmdline" 2>/dev/null | tr '\0' ' ' | grep -qF -- "$leak_mark"; then
+            n=$((n + 1))
+            [ "${1:-}" != kill ] || kill "${d#/proc/}" 2>/dev/null || :
+        fi
+    done
+    echo "$n"
+}
+trap 'count_marked kill >/dev/null; rm -rf "$TMP"' EXIT HUP INT TERM
+CADENCE_LEAK_MARK="$leak_mark" CARGO_BUILD_JOBS=4 \
+    CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$leak_lock" \
+    "$RUNNER" --manifest-path "$TMP/leak-workspace/Cargo.toml" --no-fail-fast \
+    >"$TMP/leak.out" 2>"$TMP/leak.err" || :
+leaked=$(count_marked)
+[ "$leaked" -ge 2 ] || {
+    cat "$TMP/leak.out" "$TMP/leak.err" >&2
+    die "leak fixture did not leave its marked children running (leaked=$leaked)"
+}
+flock -n "$leak_lock" -c true ||
+    die "a process left behind by the suite still holds the suite lock"
+
 printf '%s\n' 'nextest contract checks passed'

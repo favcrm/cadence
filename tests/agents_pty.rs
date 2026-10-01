@@ -6205,3 +6205,27 @@ fn agent_remove_force_notifies_reply_to() {
         "{m}"
     );
 }
+
+/// CAD-955: a test that installs no mock tmux must not reach the real
+/// one — a pane launched there is a server nothing kills, and it keeps
+/// the suite lock's descriptor alive after the run.
+#[test]
+fn cad955_a_test_without_a_mock_has_no_real_tmux() {
+    assert_eq!(
+        test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
+        Some(NO_REAL_TMUX)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mock = install_mock_devin(dir.path());
+    assert_ne!(
+        test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
+        Some(NO_REAL_TMUX),
+        "the mock replaces the refusal"
+    );
+    drop(mock);
+    assert_eq!(
+        test_env().var("CADENCE_TMUX_COMMAND").as_deref(),
+        Some(NO_REAL_TMUX),
+        "dropping the mock restores the refusal, not the real tmux"
+    );
+}
