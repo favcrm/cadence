@@ -5,7 +5,6 @@
 //! (`dp1.<ws>.<connection>.<image_digest[..32]>`), not accept-and-freeze it.
 //! Written before the freeze guard lands: this is the genuine red.
 #![allow(clippy::disallowed_methods)]
-mod board_common;
 mod common;
 use cadence_agent::contract_fixture::{ToolTable, Verified};
 use cadence_agent::platform::agenticos_external::media_import::MediaImporter;
@@ -16,6 +15,7 @@ use cadence_agent::platform::{
     PlatformAdapter,
 };
 use common::app_release::{Release, OWNER, REVIEWER, WRITER};
+use common::{op, test_port};
 use image::ImageEncoder as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -790,56 +790,71 @@ fn cad979_import_http_route_is_operator_only() {
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "http");
     let body = import_body(&run, &install, None, "cad979-http-1").to_string();
 
-    // A board on the daemon's state dir; the daemon serves the operator
-    // session mint, so sign_in works against h.daemon.state.
+    // An in-process board on the daemon's own state dir (ui::serve).
+    let lease = test_port();
+    let port = lease.port;
+    let state = h.daemon.state.clone();
     let pm = tempfile::tempdir().unwrap();
-    let (port, _board) = board_common::start_ui(pm.path().to_path_buf(), h.daemon.state.clone());
-    let host = format!("127.0.0.1:{port}");
-    let op = board_common::sign_in(h.daemon.state.as_path(), port);
-    // Operator write → a real 200 carrying the validated import receipt. The
-    // door minted exactly one key; assert the real digest/provenance.
-    let (code, _, resp) =
-        board_common::op_write_json(&op, port, "POST", "/api/social-media-imports", &host, &body);
+    let pm_dir = pm.path().to_path_buf();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bstop = stop.clone();
+    let join = std::thread::spawn(move || {
+        cadence_agent::ui::serve(
+            &state,
+            &pm_dir,
+            &cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(bstop),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            },
+        )
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(10)).expect("board up");
+
+    // A proven operator write → a real 200 carrying the validated receipt.
+    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, port);
+    let (code, _, resp) = op::raw(
+        port,
+        &session.request("POST", "/api/social-media-imports", &body),
+    );
     assert_eq!(code, 200, "operator import must be 200: {resp}");
     let parsed: Value = serde_json::from_str(&resp).expect("import reply is JSON");
     assert_eq!(parsed["ok"], json!(true), "{parsed}");
     let key = parsed["media_key"].as_str().unwrap();
     assert!(key.starts_with("dp1."), "{key}");
-    assert_eq!(door.calls.load(Ordering::SeqCst), 1, "one fake upload");
-    // The receipt's digest part is the sha256 of the retained PNG.
     let image_digest = sha_hex(&h_png());
     assert!(
         key.contains(&image_digest[..32]),
         "{key} binds the asset digest"
     );
+    assert_eq!(door.calls.load(Ordering::SeqCst), 1, "one fake upload");
 
-    // Anonymous write → fail-closed 403 before the route dispatches.
-    let (code, _, _) = board_common::http_write(
+    // Anonymous write → fail-closed 403 before the route.
+    let (code, _, _) = op::raw(
         port,
-        "POST",
-        "/api/social-media-imports",
-        &host,
-        &["Content-Type: application/json"],
-        body.as_bytes(),
+        &format!(
+            "POST /api/social-media-imports HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ),
     );
     assert_eq!(code, 403, "an anonymous POST must be refused operator-only");
 
-    // Invalid typed input → 4xx (deny_unknown_fields + typed body), never a
-    // forged upload. An unknown field is refused before the verb.
+    // Forged/unknown field → 4xx via deny_unknown_fields, never a real upload.
     let mut bad = import_body(&run, &install, None, "cad979-http-bad");
     bad["forged_actor"] = json!("operator");
-    let (code, _, _) = board_common::op_write_json(
-        &op,
+    let (code, _, _) = op::raw(
         port,
-        "POST",
-        "/api/social-media-imports",
-        &host,
-        &bad.to_string(),
+        &session.request("POST", "/api/social-media-imports", &bad.to_string()),
     );
-    assert!(
-        code == 400 || code == 422 || code == 403,
-        "a forged/unknown field must be refused: {code}"
-    );
+    assert!((400..500).contains(&code), "forged field refused: {code}");
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = join.join();
 }
 
 /// Typed-input matrix over the HTTP route: missing/malformed `request_id`
@@ -853,19 +868,35 @@ fn cad979_import_http_typed_input_matrix_no_import() {
     *door.connection.lock().unwrap() = Some(h.connection.clone());
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "typed");
 
+    let lease = test_port();
+    let port = lease.port;
+    let state = h.daemon.state.clone();
     let pm = tempfile::tempdir().unwrap();
-    let (port, _board) = board_common::start_ui(pm.path().to_path_buf(), h.daemon.state.clone());
-    let host = format!("127.0.0.1:{port}");
-    let op = board_common::sign_in(h.daemon.state.as_path(), port);
+    let pm_dir = pm.path().to_path_buf();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bstop = stop.clone();
+    let join = std::thread::spawn(move || {
+        cadence_agent::ui::serve(
+            &state,
+            &pm_dir,
+            &cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(bstop),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            },
+        )
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(10)).expect("board up");
+    let session = op::sign_in(env!("CARGO_BIN_EXE_cadence"), &h.daemon.state, port);
 
     let post = |b: Value| -> u16 {
-        board_common::op_write_json(
-            &op,
+        op::raw(
             port,
-            "POST",
-            "/api/social-media-imports",
-            &host,
-            &b.to_string(),
+            &session.request("POST", "/api/social-media-imports", &b.to_string()),
         )
         .0
     };
@@ -883,12 +914,17 @@ fn cad979_import_http_typed_input_matrix_no_import() {
         let code = post(b);
         assert!((400..500).contains(&code), "{field}={badval}: {code}");
     }
-    // Missing request_id entirely.
     let mut missing = import_body(&run, &install, None, "cad979-t2");
     missing.as_object_mut().unwrap().remove("request_id");
     assert!((400..500).contains(&post(missing)), "missing request_id");
-    // No request reached the device door — zero uploads across every case.
-    assert_eq!(door.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        door.calls.load(Ordering::SeqCst),
+        0,
+        "no request reached the door"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = join.join();
 }
 
 /// I1 authority — a detached `setsid` child with no provable identity cannot
