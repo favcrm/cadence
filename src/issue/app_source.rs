@@ -73,6 +73,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path};
 use std::process::{Command, Output};
 
@@ -391,7 +392,13 @@ fn git_step(tmp: &Path, step: &str, args: impl FnOnce(&mut Command)) -> Result<O
         ))
     })?;
     if !out.status.success() {
-        let code = out.status.code().unwrap_or(-1);
+        // GNU timeout's kill-after may kill its own process group too.
+        // Command then observes SIGKILL, not a normal exit code 137.
+        let code = out
+            .status
+            .code()
+            .or_else(|| out.status.signal().map(|signal| 128 + signal))
+            .unwrap_or(-1);
         let tail = tail_str(stderr_text(&out), 2000);
         if code == TIMEOUT_TERM_CODE || code == TIMEOUT_KILL_CODE {
             return Err(Error::rejected(format!(
