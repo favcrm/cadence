@@ -126,108 +126,34 @@ release evidence. They no longer repeat in every Rust test shard.
 `tests/scripts/test_ci_shared_checks.py` checks that each command remains
 once-only and blocking, including early failures in multi-command steps.
 
-The producer selects the scope once. Each shard verifies the sealed archive
-and inventory, builds its SPA, executes its assigned tests and uploads
-assignment/cost artifacts. The required `test` aggregate still verifies complete, disjoint
-coverage. Default-feature refusal proofs and doctests remain in `test-once`.
-Exact-SHA main queue-evidence reuse is unchanged. This deduplicates eight
-shared commands from eight copies to one on a full gate run; it does not
-claim measured wall-time savings. Build-once distribution is described below.
+Each `test-shard` job selects the scope from the base policy, proves
+Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
+SPA, executes its assigned tests and uploads assignment/cost artifacts.
+The required `test` aggregate verifies complete, disjoint coverage from the
+eight assignment receipts. Default-feature refusal proofs and doctests
+remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
 
-## Compile-once Rust test archives (CAD-858)
+## Why shards compile themselves (CAD-869)
 
-The `test-build` job selects the scope using the PR base policy, proves the
-existing Cargo/nextest inventory parity once, and creates a pinned nextest
-0.9.145 archive. A trusted base runner without `ARCHIVE_PROTOCOL = 1` gets
-an explicitly recorded full-scope archive fallback, not eight independent
-compiles. Actual documentation edits still receive the full scope; existing
-explicit `docs` plans retain verified empty markers and receipts.
+CAD-858 (#603) tried a serial `test-build` producer that archived the
+compiled tests once and handed a 2.5 GB nextest archive to eight consumers.
+Measured, it doubled the critical path: shards could not start until the
+~5 min producer finished (run 36795228728: `test-build` 00:15:23-00:20:14Z,
+shards 00:20:16-00:24:47Z, 10 min total), and each shard still spent 3.5-4.3
+min on archive download, verification, extraction and the tests themselves.
+Before it, shards started at t=0 and compiled against a warm rust-cache for
+a 5-6 min run (merge-group run 36794979053, ~5.5 min). Compile-once saves
+little when the dependency cache already makes each shard's compile cheap,
+and the serial producer plus transfer costs more than it saves.
 
-Eight `test-shard` consumers download the exact immutable artifact ID from
-successful producer job outputs. Source SHA, run, original producer attempt,
-archive/plan/inventory/manifest digests, compiler/tool/config identity, flags,
-container/runtime identity and absolute workspace/target layout must match
-independently collected consumer context. The artifact cannot supply its own expected
-context. Failed-job reruns retain the original successful producer ID and
-attempt; missing/expired artifacts or incompatible contexts fail explicitly.
-Rerun the producer and its dependent consumers when new producer bytes are
-needed, rather than guessing a latest artifact or overwriting its name.
-
-Trusted descriptors — manifests, producer references, expected contexts and
-selected outputs — are bounded at 64 KiB each. The recorded plan is a
-larger payload class: the base policy lists every changed `{status, path}`
-entry, so a big monorepo or documentation diff legitimately exceeds the
-descriptor budget. Plan reads and writes carry a separate explicit
-16 MiB bound on producer, consumer-reuse and CLI verify paths alike; a
-plan past that bound refuses before any nextest call, never silently
-truncates, and no descriptor limit is raised to accommodate it.
-
-Producer and shards use the identical source-pinned official Rust 1.98.1
-Trixie Linux/amd64 image manifest, with signed Debian snapshot repositories
-for Python/zstd/procps/jq bootstrap. `.config/ci-test-runtime.env` records the
-image, snapshot, distro and compiler; refreshed pins require review and fresh
-runtime acceptance. Both jobs independently measure os-release, installed
-package versions and x86_64 ELF bytes for libc/libstdc++/the loader. Missing,
-malformed, changed or unproven runtime identity fails closed. Normal shell
-steps run as non-root uid 1001; only fresh-container bootstrap and producer
-cache and CI-directory ownership restoration use root. The latter validates
-the observed container paths `/github/home`, `/usr/local/cargo` and
-`/__w/_temp` before changing ownership after root Actions. Both containers
-use Docker `--init`; preflight exercises the installed Git
-`merge-tree --merge-base` capability and checks that a known exited orphan
-is reaped. Consumers still have no target cache.
-Hosted `ImageOS`/`ImageVersion` remain bounded immutable observations in the
-sealed producer manifest, not userspace compatibility authority. Run 36682010782
-attempts 1/2 proved the hosted label can mix image versions, even on failed-only
-reruns; dropping a label check without a pinned and independently measured
-runtime is not this contract. Container jobs share the same container workspace
-path with each other, not the historical host path. Containers do not freeze
-the host kernel; Linux/X64 remains required, kernel details are logged and real
-fixture/syscall/permission behavior still needs full runtime CI acceptance.
-
-Consumers require an absent `target/`, never delete or overwrite a restored
-cache, and preflight GNU tar.zst members before one archive-backed list extracts
-into the identical producer workspace. Preflight refuses non-target paths,
-links/devices, duplicates, corrupt decoding, missing metadata and resource
-limits: 20,000 members, 32 GiB cumulative logical file sizes, bounded metadata
-headers, and bounded decompressed input. These are explicit refusal thresholds,
-not sampled coverage; exceeding one requires investigation and reviewed policy
-changes. GNU long names and sparse files are supported. `zstd` is required.
-The archive-backed list must reproduce both testcase identities and run
-eligibility; the restored CLI must report the exact source SHA. Later filtered
-lists and runs use extracted metadata only, with no Cargo build selectors,
-features or `--locked`. Existing LPT weights, filter equality, eight disjoint
-assignment receipts, zero retries and the required `test` aggregate remain.
-Producer failures/skips/missing evidence cannot green the aggregate.
-
-`test-once` stays independent for default-feature refusal proofs and doctests.
-Each consumer still installs/builds the SPA and needs real `tsc`; Rust fixture
-Cargo subprocesses remain real. After archive inventory/source verification,
-the consumer performs one `cargo fetch --locked` to populate the registry
-needed by fixture calls such as `cargo tree --locked --offline`; docs-only
-plans skip it. This fetch does not build the suite. This is not elimination of every Rust build or
-sharing of release/UI-feature binaries. No production deployment or approval
-policy is changed.
-
-The historical two-partition archive was 1,523,895,478 bytes. Eight transfers
-would total about 12.2 GB before wrapper overhead; this is arithmetic, not a
-current measurement. The first current bootstrap run uploaded a 2,493,340,836-byte
-full bundle (~19.95 GB arithmetic for eight downloads); the pinned container's
-compressed image layers total 562,530,953 bytes, before bootstrap/network costs.
-Run 36740682630 subsequently uploaded a 2,517,835,247-byte bundle; its
-eight downloads took 39–332 seconds each. Archive verification and exact
-assignment of all 3,615 tests passed, but seven shards failed actual test
-bodies: Bookworm Git lacked `--merge-base`, an offline Cargo call lacked
-registry data, and permission/provider lifecycle tests failed. The runtime
-correction passed all eight shards and the required aggregate in run
-36746748151; its receipts cover all 3,615 tests exactly. A changed integration
-head still needs its own full CI and independent reviews.
-No measured speedup is implied. Producer scheduling, upload/download, preflight/extraction,
-UI setup and other required builds can outweigh saved compilation. Require
-current-head full/selected archive execution and eight-shard coverage evidence;
-contract tests and the historical run are not a measured speedup or current
-runtime acceptance. Measure critical-path feedback and runner minutes before
-claiming delivery improvement.
+CAD-869 removed the producer, the archive/bundle scripts, the pinned
+container runtime and their contract tests. Shards compile in parallel as
+before; the CAD-854 move of the shared contracts into `fmt` is kept. Test
+sets are unchanged: the same LPT weights, filter equality, eight disjoint
+assignment receipts and zero retries, enforced by `scripts/ci-shard-check.py`
+in the `test` aggregate. Revisit build-once distribution only with a
+producer that is not serial on the critical path and a measured win over a
+cache-hit shard.
 
 ## Remaining delivery work
 
