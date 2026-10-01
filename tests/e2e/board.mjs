@@ -25,6 +25,7 @@ import { chromium } from "playwright-core";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { routeContext } from "./route.mjs";
 
 const base = process.env.E2E_URL;
 const out = process.env.E2E_ARTIFACTS ?? ".";
@@ -450,20 +451,7 @@ async function main() {
   const origin = new URL(base).origin;
   const offsite = [];
   const context = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
-  await context.route("**/*", (route) => {
-    const url = route.request().url();
-    let same = false;
-    try {
-      same = new URL(url).origin === origin;
-    } catch {
-      same = false;
-    }
-    if (same || url.startsWith("data:") || url.startsWith("blob:")) {
-      return route.continue();
-    }
-    offsite.push(url);
-    return route.abort();
-  });
+  await routeContext(context, origin, offsite);
   const page = await context.newPage();
   page.on("pageerror", (e) => errors.push(String(e)));
 

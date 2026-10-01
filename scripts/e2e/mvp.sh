@@ -76,6 +76,14 @@ tar -czf "$DL/$TAG/$ASSET" -C "$STAGE" cadence cadence.sha256 manifest.json
 rm -rf "$STAGE"
 
 (cd "$ROOT/tests/e2e" && pnpm install --frozen-lockfile)
+# CAD-871: a screenshot must not wait on web fonts; prove it before the journey.
+# Staging runs this script from main against older candidates, whose
+# tests/e2e may predate the self-test; it checks the candidate's own driver.
+if [ -f "$ROOT/tests/e2e/fonts-offline.mjs" ]; then
+    (cd "$ROOT/tests/e2e" && node fonts-offline.mjs)
+else
+    echo "fonts-offline.mjs: not in this candidate, skipped" >&2
+fi
 
 cd "$ROOT"
 CADENCE_E2E_DIST=$DL \
