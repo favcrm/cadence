@@ -591,7 +591,7 @@ fn stall_budget_gates_despite_clock() {
     opts.stall_clock_offset = std::sync::Arc::clone(&offset);
     opts.stall_tick = Some(Duration::from_millis(50));
     let d = TestDaemon::start_opts(opts);
-    let _mock = d.mock_stub();
+    let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
@@ -606,7 +606,7 @@ fn stall_budget_gates_despite_clock() {
         .unwrap();
     d.wait_message("w1", "ms9", &["running"], 15);
     // Half the budget: elapsed but gated, nothing fires.
-    offset.store(1800, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 1800, 20);
     thread::sleep(Duration::from_millis(400));
     assert!(
         d.events("w1")
@@ -622,6 +622,40 @@ fn stall_budget_gates_despite_clock() {
     stall_sample(0);
 }
 
+/// CAD-983: the clock advance is ordered after the idle streak settles.
+/// A pane that never shows the stub's reply (no turn ran) is not a
+/// settled streak, so the helper refuses to move the clock at all —
+/// the offset stays `0` and the failure names the missing reply. (Red
+/// without the reply gate: the helper falls through to a later wait and
+/// names a different condition; red without the ordering entirely: the
+/// offset moves.)
+#[test]
+fn stall_clock_advance_waits_for_settled_streak() {
+    let offset = stall_clock_offset();
+    let mut opts = daemon_opts();
+    opts.stall_clock_offset = std::sync::Arc::clone(&offset);
+    opts.stall_tick = Some(Duration::from_millis(50));
+    let d = TestDaemon::start_opts(opts);
+    let mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "stall_secs": 0, "silent_end_secs": 3600}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 7200, 2);
+    }))
+    .expect_err("an unsettled pane must not advance the clock");
+    let why = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(why.contains("stub reply never reached the screen"), "{why}");
+    assert_eq!(offset.load(std::sync::atomic::Ordering::SeqCst), 0);
+    stall_sample(0);
+}
+
 /// Clock-seam payoff: a full silent-end cycle with zero wall sleeps.
 /// The edge fires on advanced time; an hour more across hot ticks
 /// still leaves exactly one — the whole proof runs in seconds wall.
@@ -632,7 +666,7 @@ fn stall_absence_under_clock_zero_wall() {
     opts.stall_clock_offset = std::sync::Arc::clone(&offset);
     opts.stall_tick = Some(Duration::from_millis(50));
     let d = TestDaemon::start_opts(opts);
-    let _mock = d.mock_stub();
+    let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
@@ -644,7 +678,7 @@ fn stall_absence_under_clock_zero_wall() {
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
         .unwrap();
     d.wait_message("w1", "ms9", &["running"], 15);
-    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 7200, 20);
     let e = d.wait_event("w1", "turn_silent_end", 10);
     assert_eq!(e["payload"]["message"], "ms9", "{e}");
     // A day passes on the clock across hot ticks: still exactly one.
@@ -782,7 +816,7 @@ fn pty_silent_end_sends_one_report_reminder() {
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
         .unwrap();
     let token = pty_token(&d, "w1", "ms9");
-    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 7200, 20);
     d.wait_event("w1", "turn_silent_end", 10);
 
     // The daemon's reminder: a `sys-nudge-` row only the daemon can
@@ -913,7 +947,7 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
     opts.stall_clock_offset = std::sync::Arc::clone(&offset);
     opts.stall_tick = Some(Duration::from_millis(50));
     let mut d = TestDaemon::start_opts(opts);
-    let _mock = d.mock_stub();
+    let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
@@ -923,7 +957,7 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
     d.send("w1", json!({"text": "do work", "message": "ms9"}))
         .unwrap();
     pty_token(&d, "w1", "ms9");
-    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 7200, 20);
     d.wait_event("w1", "turn_silent_end", 10);
     let reminders = |d: &TestDaemon| -> Vec<Value> {
         d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
@@ -964,7 +998,7 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
     // frozen clock — elapsed cannot accrue until the clock moves again.
     // Advancing proves the re-fire needs fresh post-restart accrual,
     // not a restart artifact.
-    offset.store(14_400, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 14_400, 20);
     let fires = wait_event_count(&d, "w1", "turn_silent_end", 2, 40);
     assert_eq!(fires.len(), 2, "the edge re-fired after restart: {fires:?}");
     assert_eq!(reminders(&d).len(), 1, "{:?}", reminders(&d));

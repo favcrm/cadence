@@ -5550,7 +5550,7 @@ fn pty_silent_end_views_and_recovery() {
     // The stub pane returns to `» stub ready` after the submission —
     // the message still runs but the probe reads idle. The budget
     // elapses on the clock; the streak lands on hot ticks.
-    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    advance_stall_clock_after_idle_streak(&d, &mock, "w1", &offset, 7200, 20);
     let e = d.wait_event("w1", "turn_silent_end", 10);
     assert_eq!(e["payload"]["message"], "ms9", "{e}");
     assert!(

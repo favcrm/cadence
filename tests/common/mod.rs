@@ -2844,6 +2844,54 @@ pub fn stall_clock_offset() -> std::sync::Arc<std::sync::atomic::AtomicI64> {
     Default::default()
 }
 
+/// Advance the stall clock to `to` seconds only once the running
+/// turn's idle streak is settled (CAD-983). `turn_silent_end` needs
+/// `silent_end_secs` of logic time since the streak's `idle_since`
+/// stamp, and that stamp reads the clock when it is taken: a jump
+/// before it is baked in (`idle_since = now + to`), elapsed stays 0
+/// and the edge never fires. The stamp is also reset by any non-idle
+/// sample, and the pane is non-idle between the turn starting and the
+/// stub echoing the submission (the paste frame) — so an early stamp is
+/// not the streak. Settled means: the stub's reply is on the screen
+/// (every later frame is idle), two captures have STARTED after that
+/// (captures are serial and a capture starts only after the previous
+/// sample landed, so every earlier sample, stale frames included, has
+/// been folded in, and the first final-frame sample too), and the view
+/// shows the streak (`ended_secs`, present exactly while `idle_since`
+/// is set for the running message). No sleeps as synchronisation:
+/// every wait is on an observed condition; `secs` bounds failure only.
+pub fn advance_stall_clock_after_idle_streak(
+    d: &TestDaemon,
+    mock: &MockStub,
+    alias: &str,
+    offset: &std::sync::atomic::AtomicI64,
+    to: i64,
+    secs: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let screen = d.stub_pane_file(mock, alias, "screen");
+    let captures = d.stub_pane_file(mock, alias, "captures");
+    let poll = |what: &str, ready: &dyn Fn() -> bool| {
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias}: idle streak not settled ({what})"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    poll("stub reply never reached the screen", &|| {
+        std::fs::read_to_string(&screen).is_ok_and(|s| s.contains("STUB_REPLY"))
+    });
+    let len = || std::fs::read_to_string(&captures).unwrap_or_default().len();
+    let from = len();
+    poll("no two captures after the reply", &|| len() >= from + 2);
+    poll("view never showed the streak", &|| {
+        d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"]["ended_secs"].is_u64()
+    });
+    offset.store(to, std::sync::atomic::Ordering::SeqCst);
+}
+
 // ---------- CAD-52: stall detection ----------
 
 /// Wait until the mock pane's screen has been captured `want_more` times
