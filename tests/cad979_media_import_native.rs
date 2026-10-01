@@ -797,12 +797,24 @@ fn cad979_import_http_route_is_operator_only() {
     let (port, _board) = board_common::start_ui(pm.path().to_path_buf(), h.daemon.state.clone());
     let host = format!("127.0.0.1:{port}");
     let op = board_common::sign_in(h.daemon.state.as_path(), port);
-    // Operator write → reaches the verb (any 200/4xx from the handler, not a
-    // 403 session refusal).
-    let (code, _, _) =
+    // Operator write → a real 200 carrying the validated import receipt. The
+    // door minted exactly one key; assert the real digest/provenance.
+    let (code, _, resp) =
         board_common::op_write_json(&op, port, "POST", "/api/social-media-imports", &host, &body);
-    assert_ne!(code, 403, "a proven operator write must reach the verb");
-    // Anonymous write → fail-closed 403 before the route.
+    assert_eq!(code, 200, "operator import must be 200: {resp}");
+    let parsed: Value = serde_json::from_str(&resp).expect("import reply is JSON");
+    assert_eq!(parsed["ok"], json!(true), "{parsed}");
+    let key = parsed["media_key"].as_str().unwrap();
+    assert!(key.starts_with("dp1."), "{key}");
+    assert_eq!(door.calls.load(Ordering::SeqCst), 1, "one fake upload");
+    // The receipt's digest part is the sha256 of the retained PNG.
+    let image_digest = sha_hex(&h_png());
+    assert!(
+        key.contains(&image_digest[..32]),
+        "{key} binds the asset digest"
+    );
+
+    // Anonymous write → fail-closed 403 before the route dispatches.
     let (code, _, _) = board_common::http_write(
         port,
         "POST",
@@ -812,6 +824,52 @@ fn cad979_import_http_route_is_operator_only() {
         body.as_bytes(),
     );
     assert_eq!(code, 403, "an anonymous POST must be refused operator-only");
+
+    // Invalid typed input → 4xx (deny_unknown_fields + typed body), never a
+    // forged upload. An unknown field is refused before the verb.
+    let mut bad = import_body(&run, &install, None, "cad979-http-bad");
+    bad["forged_actor"] = json!("operator");
+    let (code, _, _) = board_common::op_write_json(
+        &op,
+        port,
+        "POST",
+        "/api/social-media-imports",
+        &host,
+        &bad.to_string(),
+    );
+    assert!(
+        code == 400 || code == 422 || code == 403,
+        "a forged/unknown field must be refused: {code}"
+    );
+}
+
+/// I1 authority — a detached `setsid` child with no provable identity cannot
+/// reach the operator import verb over the unix socket, exactly like every
+/// other operator-only gate. Same refusal as agent/unproven.
+#[test]
+fn cad979_import_refuses_detached_setsid_peer() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "setsid");
+    let mut lane = common::LaneShell::spawn(h.daemon.state.parent().unwrap());
+    let request = lane.dir.path().join("import-detached.json");
+    std::fs::write(
+        &request,
+        cadence_agent::proto::request(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-setsid"),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let (rc, output) = lane.run(&format!(
+        "setsid python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");print(s.makefile().readline())' {} {}",
+        cadence_agent::client::socket_path(&h.daemon.state).display(),
+        request.display()
+    ));
+    assert_eq!(rc, 0, "{output}");
+    let frame: Value = serde_json::from_str(output.trim()).expect("one JSON reply");
+    assert_eq!(frame["ok"], json!(false), "{frame}");
+    assert!(frame.to_string().contains("operator"), "{frame}");
 }
 
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
