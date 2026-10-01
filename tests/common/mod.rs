@@ -55,6 +55,7 @@ mod status_cli;
 pub use status_cli::{status_json, status_table, status_tracker_env};
 
 mod suite;
+pub mod tmux_guard;
 // Each integration binary uses a different subset of the shared API.
 #[allow(unused_imports)]
 pub use suite::{
@@ -950,8 +951,18 @@ pub fn run_signal_child(test: &str, limit: Duration) {
 
 // ---- mock Codex provider over real stdio (no model calls) ----
 
+/// CAD-955: the tmux a test daemon runs unless the test installed a mock.
+/// `false` fails every launch loudly. Left unset, a pty agent launched by
+/// a test with no mock started a real tmux server (and the real provider
+/// in it) that nothing killed, holding the suite lock fd past the run.
+pub const NO_REAL_TMUX: &str = "false";
+
 thread_local! {
-    static TEST_ENV: ProviderEnv = ProviderEnv::default();
+    static TEST_ENV: ProviderEnv = {
+        let env = ProviderEnv::default();
+        env.set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
+        env
+    };
     static TEST_STALL_SAMPLE: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::default();
 }
@@ -1473,7 +1484,7 @@ pub fn kill_mock_panes(dir: &Path) {
 impl Drop for MockDevin {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
         test_env().remove("CADENCE_DEVIN_COMMAND");
         test_env().remove("CADENCE_DEVIN_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
@@ -1515,7 +1526,7 @@ pub fn install_mock_stub(dir: &Path) -> MockStub {
 impl Drop for MockStub {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
         test_env().remove("CADENCE_STUB_COMMAND");
         test_env().remove("CADENCE_STUB_LOCKS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
@@ -1585,7 +1596,7 @@ impl TestDaemon {
 impl Drop for MockClaudeTui {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
         test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
         test_env().remove("CADENCE_CLAUDE_SESSIONS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));
@@ -1699,7 +1710,7 @@ impl Drop for MockCursorTui {
             }
         }
         kill_mock_panes(&self.dir);
-        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().set("CADENCE_TMUX_COMMAND", NO_REAL_TMUX);
         test_env().remove("CADENCE_CURSOR_COMMAND");
         test_env().remove("CADENCE_CURSOR_CHATS");
         let _ = std::fs::remove_file(self.dir.join("mock-env"));

@@ -1423,6 +1423,9 @@ fn cad447_an_answer_reaches_the_worker_who_asked() {
 #[test]
 fn cad447_master_agent_and_pty_answers() {
     let f = PlanFixture::start();
+    // The pty asker's pane comes up on the mock tmux/claude pair, never
+    // a real tmux server (CAD-955); its panes die with the mock.
+    let _mock = f.d.mock_claude_tui();
     let mut wk = ManagedWorker::start(&f.d, "wk");
     let (mut m, _) = f.start_master();
     // The asker has a PM upstream: an answer must still owe it nothing.

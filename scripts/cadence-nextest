@@ -132,7 +132,11 @@ command -v flock >/dev/null 2>&1 || die "flock is required for the outer suite l
 if [ "$SUBCOMMAND" = archive ]; then
     set -- archive "$@"
 fi
-exec flock "$LOCK" env \
+#
+# CAD-955: `-o` closes the lock fd in the command's own process. Without
+# it every process the suite starts inherits the fd, and a detached child
+# that outlives nextest (a tmux server) keeps the lock held after the run.
+exec flock -o "$LOCK" env \
     CADENCE_SUITE_LOCK= \
     CADENCE_REVIEW_SUITE_LOCK_HELD=1 \
     CADENCE_REVIEW_PR="${CADENCE_REVIEW_PR:-direct}" \

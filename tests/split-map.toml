@@ -460,6 +460,7 @@ tests = [
     "agent_remove_and_gc_caller_rule_per_caller_kind",
     "agent_remove_force_unassigns_open_tasks",
     "agent_remove_force_notifies_reply_to",
+    "cad955_a_test_without_a_mock_has_no_real_tmux",
 ]
 helpers = [
     "source_guard",
