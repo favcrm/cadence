@@ -1,6 +1,6 @@
 //! Operator-owned workspace installation transport. Execution is deliberately absent.
 use super::*;
-use crate::issue::{app, workflow, write};
+use crate::issue::{app, app_view, workflow, write};
 use serde_json::{json, Value};
 
 const INSTALL_PENDING: &str = ".apps/install-pending.yaml";
@@ -256,16 +256,22 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
         }
         match root.kind(&path)? {
             Some(libc::S_IFDIR)
-                if matches!(name.as_str(), "workflows" | "rubrics" | "templates") =>
+                if matches!(
+                    name.as_str(),
+                    "workflows" | "rubrics" | "templates" | "views"
+                ) =>
             {
                 for leaf in root.list(&path, &mut budget)? {
                     if leaf.starts_with('.')
                         || (name == "workflows"
                             && (!leaf.ends_with(".md")
                                 || !model::valid_tag(leaf.trim_end_matches(".md"))))
+                        // views/ holds exactly one file — the filename
+                        // pins the descriptor contract version.
+                        || (name == "views" && leaf != app_view::FILE)
                     {
                         return Err(Error::rejected(
-                            "workflows must be named Markdown files and all bundle entries must be visible flat text files",
+                            "workflows must be named Markdown files, views/ holds exactly app-views-v1.json, and all bundle entries must be visible flat text files",
                         ));
                     }
                     add(format!("{name}/{leaf}"), path.join(leaf))?;
@@ -627,13 +633,11 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
         return Err(Error::rejected("upgrade manifest changes app identity"));
     }
     for (name, text) in &journal.files {
-        let path = Path::new(name);
-        let parts: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (parts.len() == 2
-                && matches!(parts[0], std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(parts[1], std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| !leaf.starts_with('.') && (!name.starts_with("workflows/") || (leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))))));
-        if !valid || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !journal_file_valid(
+            name,
+            text.len() as u64,
+            crate::issue::plan::MAX_PLAN_BYTES as u64,
+        ) {
             return Err(Error::rejected(
                 "unsafe or oversized upgrade journal bundle file",
             ));
@@ -807,13 +811,11 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         ));
     }
     for (name, text) in &journal.files {
-        let path = Path::new(name);
-        let components: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (components.len() == 2
-                && matches!(components[0],std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(components[1],std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| !leaf.starts_with('.') && (!name.starts_with("workflows/") || (leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md")))))));
-        if !valid || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !journal_file_valid(
+            name,
+            text.len() as u64,
+            crate::issue::plan::MAX_PLAN_BYTES as u64,
+        ) {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
     }
@@ -829,12 +831,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
     ];
     for (name, text) in &journal.files {
         let path = Path::new(name);
-        let components: Vec<_> = path.components().collect();
-        let valid = name == "app.md"
-            || (components.len() == 2
-                && matches!(components[0], std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates")
-                && matches!(components[1], std::path::Component::Normal(_)));
-        if !valid || text.len() as u64 > CATALOG_CAP {
+        if !journal_file_valid(name, text.len() as u64, CATALOG_CAP) {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -902,6 +899,30 @@ pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
     Ok(row)
 }
 
+/// One journal bundle path's admitted shape, shared by every journal
+/// replay check (install apply, upgrade apply). A file is `app.md`,
+/// `workflows/<tag>.md`, `rubrics/<leaf>`, `templates/<leaf>` or —
+/// CAD-864 — `views/app-views-v1.json`; the last is the only
+/// non-flat-by-name rule, and the filename itself pins the contract.
+fn journal_file_valid(name: &str, bytes: u64, cap: u64) -> bool {
+    let path = Path::new(name);
+    let parts: Vec<_> = path.components().collect();
+    let shape_ok = name == "app.md"
+        || (parts.len() == 2
+            && matches!(parts[0], std::path::Component::Normal(n) if n=="workflows" || n=="rubrics" || n=="templates" || n=="views")
+            && matches!(parts[1], std::path::Component::Normal(n) if n.to_str().is_some_and(|leaf| {
+                !leaf.starts_with('.')
+                    && if name.starts_with("workflows/") {
+                        leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md"))
+                    } else if name.starts_with("views/") {
+                        leaf == app_view::FILE
+                    } else {
+                        true
+                    }
+            })));
+    shape_ok && bytes <= cap
+}
+
 fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value> {
     catalog.require_current(root)?;
     catalog.installation(root, id)?;
@@ -928,6 +949,43 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
             "installation record changed during inspection",
         ));
     }
+    // CAD-864: the installed descriptor rides the receipt as validated
+    // data — re-parsed from the bundle snapshot every read, so a
+    // hand-edited installed file that no longer meets the contract
+    // surfaces as this read's refusal rather than stale served bytes.
+    // The read re-proves the pairing too: a descriptor file whose
+    // manifest no longer declares `needs.views`, or one naming another
+    // app, is a tampered install — refuse rather than serve it.
+    let (view_descriptor, view_descriptor_digest) = match files.get(app_view::REL_PATH) {
+        Some(text) => {
+            if manifest.view_contract.as_deref() != Some(app_view::CONTRACT) {
+                return Err(Error::rejected(format!(
+                    "installed bundle carries {} that its manifest does not declare",
+                    app_view::REL_PATH
+                )));
+            }
+            let descriptor = app_view::parse_descriptor(text)
+                .map_err(|e| Error::rejected(format!("installed {}: {e}", app_view::REL_PATH)))?;
+            if descriptor.app != manifest.app {
+                return Err(Error::rejected(format!(
+                    "installed {} names app '{}' — this installation is '{}'",
+                    app_view::REL_PATH,
+                    descriptor.app,
+                    manifest.app
+                )));
+            }
+            (descriptor.raw, json!(format!("sha256:{}", hash(text))))
+        }
+        None => {
+            if manifest.view_contract.is_some() {
+                return Err(Error::rejected(format!(
+                    "installed manifest declares `needs.views` but {} is absent",
+                    app_view::REL_PATH
+                )));
+            }
+            (Value::Null, Value::Null)
+        }
+    };
     let workflows = files
         .iter()
         .filter_map(|(path, text)| {
@@ -943,7 +1001,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"source":record.source,"installed_at":record.installed_at,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 pub fn list(pm: &Pm) -> Result<Value> {
