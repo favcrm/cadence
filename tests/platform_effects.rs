@@ -87,6 +87,7 @@ impl Daemon {
             platforms: self.platforms.clone(),
             effect_execute_gate: Some(Arc::new(move |_| !crash.load(Ordering::SeqCst))),
             social_publish_sender: None,
+            social_media_importer: None,
             test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };

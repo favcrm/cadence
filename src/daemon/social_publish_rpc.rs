@@ -101,9 +101,9 @@ impl Shared {
         let slot = common("slot")?;
         // Reuse the exact provenance re-proof freeze uses: approved completed
         // run, frozen slot, current binding — keyed by run+artifact+bundle+slot.
-        let material = self
-            .store
-            .app_publication_material(run_id, artifact_id, bundle_digest, slot)?;
+        let material =
+            self.store
+                .app_publication_material(run_id, artifact_id, bundle_digest, slot)?;
         // I2 scope pin (E3): the request's install/context must equal the
         // run's OWN scope — `app_publication_material` re-proves only the
         // run's binding against the run's own scope, so a request naming a
