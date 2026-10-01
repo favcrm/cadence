@@ -256,6 +256,113 @@ fn cad979_freeze_refuses_media_key_for_foreign_connection() {
     );
 }
 
+fn import_body(run: &Value, install: &str, context: Option<&str>, request: &str) -> Value {
+    let mut b = json!({"request_id": request, "install_id": install,
+        "run_id": run["id"], "artifact_id": run["artifacts"][0]["id"],
+        "bundle_digest": run["snapshot"]["bundle_digest"], "slot": "publication"});
+    if let Some(ctx) = context {
+        b["context_id"] = json!(ctx);
+    }
+    b
+}
+
+/// I1 authority: an agent pane cannot reach the operator import verb.
+#[test]
+fn cad979_import_verb_is_operator_only() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "a1");
+    let err = h
+        .daemon
+        .agent_rpc(
+            "worker-0",
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-a1"),
+        )
+        .expect_err("an agent pane must not reach the media import");
+    assert!(err.to_string().contains("operator"), "{err}");
+}
+
+/// I1 authority: an unproven peer cannot reach the operator import verb.
+#[test]
+fn cad979_import_verb_refuses_unproven_peer() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "a2");
+    let err = h
+        .daemon
+        .unproven_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-a2"),
+        )
+        .expect_err("an unproven peer must not reach the media import");
+    assert!(err.to_string().contains("operator"), "{err}");
+}
+
+/// I2 scope pin (E3): a request naming a different install is refused even
+/// though `app_publication_material` resolves the run's own binding.
+#[test]
+fn cad979_import_refuses_cross_install_scope() {
+    let (h, png) = png_harness();
+    let (run, _bundle, _install, _d) = approved_image_run(&h, &png, "a3");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, "install-FRIENDSHIP", None, "cad979-a3"),
+        )
+        .expect_err("a cross-install media import must be refused");
+    assert!(err.to_string().contains("grant_binding_mismatch"), "{err}");
+}
+
+/// I2 scope pin: a request carrying a context the run does not own is
+/// refused (exact/null-preserving — no wildcard match).
+#[test]
+fn cad979_import_refuses_foreign_context_scope() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "a4");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, Some("ctx_foreign"), "cad979-a4"),
+        )
+        .expect_err("a foreign-context media import must be refused");
+    assert!(err.to_string().contains("grant_binding_mismatch"), "{err}");
+}
+
+/// Honest unconfigured: with no `social_media_importer` wired the verb
+/// fails closed `capability_unavailable` after the provenance + scope pin —
+/// never a silent accept or a half-import.
+#[test]
+fn cad979_import_without_importer_is_capability_unavailable() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "a6");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-a6"),
+        )
+        .expect_err("an unconfigured importer must refuse capability_unavailable");
+    assert!(err.to_string().contains("capability_unavailable"), "{err}");
+}
+
+/// I5 custody: strict_fields refuses caller bytes / path / URL / digest /
+/// receipt / slot-content — only the provenance tuple reaches the handler.
+#[test]
+fn cad979_import_refuses_caller_material_fields() {
+    let (h, png) = png_harness();
+    let (run, _bundle, install, _d) = approved_image_run(&h, &png, "a5");
+    for forged in ["bytes", "path", "url", "digest", "receipt_id", "image"] {
+        let mut body = import_body(&run, &install, None, "cad979-a5");
+        body[forged] = json!("x");
+        let err = h
+            .daemon
+            .operator_rpc("social_publish_media_import", body)
+            .expect_err("caller material fields must be refused");
+        assert!(err.to_string().contains("unknown"), "{forged}: {err}");
+    }
+}
+
 /// Genuine red: a `media_key` whose digest part is not this asset's must be
 /// refused — the key binds a different image than the reviewed one.
 #[test]
