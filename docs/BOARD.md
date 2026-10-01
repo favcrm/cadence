@@ -1715,9 +1715,20 @@ historical parked deliveries in SQL, rather than decoding completed bodies
 and results every tick. The parked count still examines historical results;
 it is not constant-time. Overview probes pass `active_only: true` to
 `agent_show`, keeping queued/submitting/running messages and unresolved
-unknowns for fence evidence. A normal `agent_show` keeps full current-agent
-history. Both variants retain turn-token redaction; reads do not unfence,
-resume or launch an agent. The `start: skipping fenced agent` log is a
+unknowns for fence evidence; `cadence self` sends the same field, so it
+reads no history. A request with neither `limit` nor `since` keeps full
+current-agent history, which the board drawer and every in-process caller
+rely on (CAD-879). `cadence agent show` is the bounded path: it sends
+`limit` (default 20) and the daemon returns the newest `limit` finished
+messages plus every unfinished one, with `messages_omitted` counting what
+was left out; `--since <message id|unix ts>` adds a lower bound, `--limit N`
+changes the window (`--since` without `--limit` drops the default 20-message
+window and lists everything after that point), and `--all` sends neither
+field. `messages_omitted` appears only on a `limit`/`since` read. A `limit`
+that is present but not a non-negative integer is rejected. Absence of the
+fields means today's behaviour, so an older client is unaffected. Both
+variants retain turn-token redaction; reads do not unfence, resume or launch
+an agent. The `start: skipping fenced agent` log is a
 daemon-start observation, not a periodic scheduler action (CAD-627).
 
 **Deploy drift** — the daemon reports its `build_commit` via the

@@ -2,6 +2,52 @@
 
 use super::*;
 
+/// `agent show` lists this many terminal messages by default (CAD-879);
+/// unfinished ones are always listed.
+const DEFAULT_SHOW_MESSAGES: u64 = 20;
+
+/// The `agent_show` request for `agent show` (CAD-879): bounded unless
+/// `--all`. A `--since` alone is its own bound; otherwise the recent
+/// window. The daemon treats absent `limit`/`since` as the full history.
+fn show_params(alias: &str, limit: Option<u64>, since: Option<String>, all: bool) -> Value {
+    let mut params = json!({"alias": alias});
+    if !all {
+        if limit.is_some() || since.is_none() {
+            params["limit"] = json!(limit.unwrap_or(DEFAULT_SHOW_MESSAGES));
+        }
+        if let Some(since) = since {
+            params["since"] = json!(since);
+        }
+    }
+    params
+}
+
+#[cfg(test)]
+mod show_params_tests {
+    use super::*;
+
+    #[test]
+    fn cad879_show_is_bounded_unless_all() {
+        assert_eq!(
+            show_params("w", None, None, false),
+            json!({"alias": "w", "limit": 20})
+        );
+        assert_eq!(
+            show_params("w", Some(5), None, false),
+            json!({"alias": "w", "limit": 5})
+        );
+        assert_eq!(
+            show_params("w", None, Some("m1".into()), false),
+            json!({"alias": "w", "since": "m1"})
+        );
+        assert_eq!(
+            show_params("w", Some(3), Some("m1".into()), false),
+            json!({"alias": "w", "limit": 3, "since": "m1"})
+        );
+        assert_eq!(show_params("w", None, None, true), json!({"alias": "w"}));
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum AgentAction {
     /// Register an agent and start its actor.
@@ -90,8 +136,23 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         json: bool,
     },
-    /// Show one agent, its messages and event cursor.
-    Show { alias: String },
+    /// Show one agent, its recent messages and event cursor. Lists the
+    /// last 20 messages plus every unfinished one unless bounded
+    /// otherwise.
+    Show {
+        alias: String,
+        /// Terminal messages to list (newest N; unfinished ones are
+        /// always listed).
+        #[arg(long, conflicts_with = "all")]
+        limit: Option<u64>,
+        /// Only messages after this message id or unix timestamp.
+        /// Without `--limit` this drops the default 20-message window.
+        #[arg(long, conflicts_with = "all")]
+        since: Option<String>,
+        /// Every message since the agent registered.
+        #[arg(long)]
+        all: bool,
+    },
     /// List pending provider requests (approvals, input).
     Requests { alias: String },
     /// Answer a pending provider request.
@@ -399,8 +460,14 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             )?;
             out
         }
-        AgentAction::Show { alias } => {
-            client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?
+        AgentAction::Show {
+            alias,
+            limit,
+            since,
+            all,
+        } => {
+            let params = show_params(&alias, limit, since, all);
+            client::rpc(&state_dir, "agent_show", params)?
         }
         AgentAction::Requests { alias } => {
             client::rpc(&state_dir, "agent_requests", json!({"alias": alias}))?
