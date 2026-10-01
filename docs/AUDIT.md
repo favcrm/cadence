@@ -289,6 +289,14 @@ land. `cadence audit digest` shows both reviewers and whether each note
 still hashes to what was recorded. The operator-proof residual above
 carries over to `designate`.
 
+A second residual: delegable client code (`src/cli/status.rs`,
+`src/cli/overview.rs`, the issue CLI) runs with operator authority
+whenever the operator later runs that command from their own shell. A
+delegated change could add an operator-only RPC call (`approval_designate`,
+`approval_record`, …) there. The path check classifies paths, not code
+content, so the mitigation is review: reviewers must flag any new
+`client::rpc` verb in a delegable file, and such a PR is not delegated.
+
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
 

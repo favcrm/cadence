@@ -292,7 +292,7 @@ impl Shared {
         let branch = gh(&["api", &format!("repos/{repo}/branches/{base}")])?;
         let runs = gh(&[
             "api",
-            &format!("repos/{repo}/commits/{head}/check-runs?per_page=100"),
+            &format!("repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100"),
         ])?;
         let workflows = gh(&[
             "api",
@@ -302,7 +302,7 @@ impl Shared {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        dg::ci_green(&branch, &runs, &workflows, head, &rollup)
+        dg::ci_green(&branch, &runs, &workflows, (head, pr, base), &rollup)
             .map_err(|why| deny(format!("CI is not green on {head}: {why}")))?;
         let notes_dir = pm.config.notes_dir();
         let notes = crate::audit::note_index(&notes_dir)

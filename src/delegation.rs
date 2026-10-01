@@ -155,16 +155,19 @@ pub const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
 /// CI is green only from GitHub check runs: every check the base branch
 /// requires (`protection.required_status_checks.checks`) must have a
-/// completed, successful run from the required app, inside the check
-/// suite of a `pull_request` run of [`CI_WORKFLOW`] for `head` (from
-/// `workflows`, `actions/runs?head_sha=`). A same-named run any other
-/// workflow posts counts for nothing; so do commit statuses, except
-/// that a `qa-verdict` in any state but SUCCESS refuses.
+/// completed, successful newest run from the required app, inside the
+/// check suite of a `pull_request` run of [`CI_WORKFLOW`] for `head` that
+/// belongs to THIS PR — its `pull_requests[]` names `pr` on `base` (from
+/// `workflows`, `actions/runs?head_sha=`; a fork run lists none and
+/// counts for nothing). `runs` is `check-runs?filter=all`, so a later
+/// run elsewhere cannot hide this suite's. A same-named run any other
+/// workflow or PR posts counts for nothing; so do commit statuses,
+/// except that a `qa-verdict` in any state but SUCCESS refuses.
 pub fn ci_green(
     branch: &Value,
     runs: &Value,
     workflows: &Value,
-    head: &str,
+    (head, pr, base): (&str, u64, &str),
     rollup: &[Value],
 ) -> std::result::Result<(), String> {
     let required = branch["protection"]["required_status_checks"]["checks"]
@@ -186,6 +189,13 @@ pub fn ci_green(
         .flatten()
         .filter(|w| {
             w["path"] == CI_WORKFLOW && w["event"] == "pull_request" && w["head_sha"] == head
+        })
+        .filter(|w| {
+            w["pull_requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|p| p["number"].as_u64() == Some(pr) && p["base"]["ref"] == base)
         })
         .filter_map(|w| w["check_suite_id"].as_u64())
         .collect();
@@ -213,10 +223,9 @@ pub fn ci_green(
                  {CI_WORKFLOW}"
             ));
         }
-        if !mine
-            .iter()
-            .all(|r| r["status"] == "completed" && r["conclusion"] == "success")
-        {
+        // The newest run in this PR's own suites decides (a rerun).
+        let newest = mine.iter().max_by_key(|r| r["id"].as_u64().unwrap_or(0));
+        if !newest.is_some_and(|r| r["status"] == "completed" && r["conclusion"] == "success") {
             return Err(format!(
                 "required check '{name}' is not a completed success"
             ));
@@ -381,6 +390,10 @@ mod tests {
             "tests/delegated_approval.rs",
             "tests/daemon.rs",
             "docs/design/CONTRACT-TEMPLATE.md",
+            "docs/cadence/project-context.yaml",
+            "docs/START-HERE.md",
+            "docs/ARCHITECTURE.md",
+            "docs/BOARD.md",
         ] {
             assert!(op(p), "{p} must need the operator");
         }
@@ -389,7 +402,7 @@ mod tests {
             "src/cli/status.rs",
             "src/issue/write.rs",
             "tests/board_issue.rs",
-            "docs/BOARD.md",
+            "docs/guides/wiki-knowledge.md",
         ] {
             assert_eq!(rp.classify(p), PathClass::Delegable, "{p}");
         }

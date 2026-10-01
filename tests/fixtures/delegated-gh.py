@@ -31,7 +31,7 @@ elif a[:2] == ["pr", "diff"]:
 elif a[:1] == ["api"] and a[1] == "repos/%s/branches/main" % REPO:
     need(len(a) == 2)
     print(json.dumps(st["branch"]))
-elif a[:1] == ["api"] and a[1] == "repos/%s/commits/%s/check-runs?per_page=100" % (REPO, HEAD):
+elif a[:1] == ["api"] and a[1] == "repos/%s/commits/%s/check-runs?filter=all&per_page=100" % (REPO, HEAD):
     need(len(a) == 2)
     print(json.dumps(st["runs"]))
 elif a[:1] == ["api"] and a[1] == ("repos/%s/actions/runs?head_sha=%s&event=pull_request"

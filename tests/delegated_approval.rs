@@ -97,9 +97,10 @@ impl Fx {
                 {"checks": [{"context": "test", "app_id": 15368}]}}},
             "runs": {"total_count": 1, "check_runs": [{"name": "test", "status": "completed",
                 "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"},
-                "check_suite": {"id": 500}}]},
+                "check_suite": {"id": 500}, "id": 1}]},
             "workflows": {"total_count": 1, "workflow_runs": [{"path": ".github/workflows/ci.yml",
-                "event": "pull_request", "head_sha": HEAD, "check_suite_id": 500}]},
+                "event": "pull_request", "head_sha": HEAD, "check_suite_id": 500,
+                "pull_requests": [{"number": 7, "base": {"ref": "main"}}]}]},
         });
         self.write_gh(&state);
     }
@@ -430,6 +431,44 @@ fn cad918_delegated_approval_ci_counts_only_required_actions_checks() {
         "in a pull_request run of .github/workflows/ci.yml",
     );
     fx.pr(&["src/cli/status.rs"]);
+    // A run of another PR on the same head; then this PR's number on an
+    // attacker-made base; then a fork run that names no PR.
+    let other = json!([{"number": 99, "base": {"ref": "main"}}]);
+    fx.set("/workflows/workflow_runs/0/pull_requests", other);
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set(
+        "/workflows/workflow_runs/0/pull_requests/0/base/ref",
+        json!("evil-base"),
+    );
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    fx.pr(&["src/cli/status.rs"]);
+    fx.set("/workflows/workflow_runs/0/pull_requests", json!([]));
+    fx.refuse(
+        &mut pm,
+        "",
+        "in a pull_request run of .github/workflows/ci.yml",
+    );
+    // A real failure, then a later same-name success elsewhere.
+    fx.pr(&["src/cli/status.rs"]);
+    let real = json!({"id": 1, "name": "test", "status": "completed", "conclusion": "failure",
+                      "app": {"id": 15368}, "check_suite": {"id": 500}});
+    let forged = json!({"id": 2, "name": "test", "status": "completed", "conclusion": "success",
+                        "app": {"id": 15368}, "check_suite": {"id": 900}});
+    fx.set(
+        "/runs",
+        json!({"total_count": 2, "check_runs": [real, forged]}),
+    );
+    fx.refuse(&mut pm, "", "'test' is not a completed success");
+    fx.pr(&["src/cli/status.rs"]);
     fx.set("/workflows/total_count", json!(3));
     fx.refuse(&mut pm, "", "did not list every workflow run");
     assert!(fx.delegated().is_empty());
@@ -550,6 +589,10 @@ fn cad918_delegated_approval_path_allowlist_overrides_reviewers() {
     fx.set("/pr", json!("8"));
     fx.set("/view/headRefOid", json!(OLD));
     fx.set("/workflows/workflow_runs/0/head_sha", json!(OLD));
+    fx.set(
+        "/workflows/workflow_runs/0/pull_requests/0/number",
+        json!(8),
+    );
     fx.note_pr("03-r1", "r1", OLD, &risk, 8);
     fx.note_pr("04-r2", "r2", OLD, &risk, 8);
     let (rc, out) = fx.approve_pr(&mut pm, 8, OLD, &with_scope);
