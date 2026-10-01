@@ -696,3 +696,118 @@ fn cad702_http_renewal_continues_through_slow_flush() {
     thread::sleep(Duration::from_millis(2500));
     assert_eq!(stub.posts(), total, "renewal poster outlived the flush");
 }
+
+fn lease_expiry(dir: &Path) -> f64 {
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir)).unwrap()).unwrap();
+    body["expires_unix"].as_f64().unwrap()
+}
+
+fn wait_for_lease_file(dir: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !lease_file(dir).exists() {
+        assert!(Instant::now() < deadline, "lease never acquired");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// CAD-947: a recovery that outlives the lease TTL. The heartbeat must
+/// already be renewing when startup begins, so the daemon's own first
+/// startup write is not refused by its own expired lease, and it keeps
+/// the lease afterwards. RED on main: the heartbeat started only after
+/// startup, so the write at the end of a 4s dwell hit a 2s lease and
+/// the daemon exited with "store write refused — the daemon's hosted
+/// lease is lost: lease expired".
+#[test]
+fn cad947_startup_longer_than_ttl_keeps_the_lease() {
+    let dir = TempDir::new().unwrap();
+    let mut opts = leased_opts(dir.path(), 2);
+    opts.startup_delay_for_test = Some(Duration::from_secs(4));
+    let d = TestDaemon::start_opts(opts);
+    let h = d.rpc("health", json!({})).unwrap();
+    assert_eq!(h["lease"]["epoch"], 1, "{h}");
+    assert!(h["lease"]["fenced"].is_null(), "{h}");
+    // Still held and still writable well past another TTL.
+    thread::sleep(Duration::from_secs(3));
+    d.register("w1");
+    let h = d.rpc("health", json!({})).unwrap();
+    assert!(h["lease"]["fenced"].is_null(), "{h}");
+    assert!(lease_expiry(dir.path()) > now_unix(), "lease lapsed: {h}");
+}
+
+/// CAD-947: startup that fails after the lease was taken and the
+/// heartbeat started must stop the heartbeat. The lease is then left to
+/// expire (the existing rule for an unclean exit), so a successor takes
+/// over after one TTL and no renewal poster outlives the failed start.
+#[test]
+fn cad947_failed_startup_stops_the_heartbeat_and_lets_the_lease_expire() {
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let mut opts = leased_opts(dir.path(), 3);
+    // A shared socket without a configured agent UID is refused by
+    // startup after the lease, the store and the heartbeat exist.
+    opts.shared_socket = Some((state.path().join("shared.sock"), 0));
+    let err = daemon::serve_with(state.path(), opts).unwrap_err();
+    assert!(err.to_string().contains("shared socket"), "{err}");
+    let at_exit = lease_expiry(dir.path());
+    // Two renew periods: a surviving heartbeat would have extended it.
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        lease_expiry(dir.path()),
+        at_exit,
+        "the heartbeat outlived the failed startup"
+    );
+    // Left to expire, not leaked: a successor holds it after the TTL.
+    while lease_expiry(dir.path()) > now_unix() {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let successor = TempDir::new().unwrap();
+    let d = TestDaemon::start_on_opts(successor.path().to_path_buf(), leased_opts(dir.path(), 3));
+    let h = d.rpc("health", json!({})).unwrap();
+    assert_eq!(h["lease"]["epoch"], 2, "{h}");
+}
+
+/// CAD-947: a renewal failure during startup trips the fence like any
+/// other: the foreign holder takes the lease while recovery dwells, the
+/// early heartbeat sees it, and the daemon's startup write is refused
+/// rather than landing under a lease it no longer holds.
+#[test]
+fn cad947_renewal_failure_during_startup_trips_the_fence() {
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.startup_delay_for_test = Some(Duration::from_secs(4));
+    opts.stop = Some(stop.clone());
+    let owned = state.path().to_path_buf();
+    let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
+    wait_for_lease_file(dir.path());
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    let stolen = json!({"holder": "intruder",
+                        "epoch": body["epoch"].as_u64().unwrap() + 5,
+                        "expires_unix": now_unix() + 600.0});
+    std::fs::write(lease_file(dir.path()), stolen.to_string()).unwrap();
+    // The dwell is 4s; give startup a generous margin to finish.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let finished = handle.is_finished();
+    stop.store(true, Ordering::SeqCst);
+    let result = handle.join().unwrap();
+    assert!(finished, "daemon came up under a lease it had lost");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("lease"), "{err}");
+    let fact: Value = serde_json::from_str(
+        &std::fs::read_to_string(state.path().join("lease-fence.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fact["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("renewal failed"),
+        "{fact}"
+    );
+}

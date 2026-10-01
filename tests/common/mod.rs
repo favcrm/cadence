@@ -1083,6 +1083,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // pins them — production never sets either.
         lease_http_endpoint_override: None,
         flush_delay_for_test: None,
+        startup_delay_for_test: None,
         agent_uid: None,
         shared_socket: None,
         // CAD-482: when the test build carries the seam, fixture
