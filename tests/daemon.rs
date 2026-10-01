@@ -4929,6 +4929,461 @@ fn turn_tokens_are_shown_only_to_the_owning_connection() {
     assert_eq!(d.message_state("wa", "m-a"), "completed");
 }
 
+/// CAD-880 fixture: a `devin/pty` lane holding one `running` turn under
+/// `token`, planted the way the CAD-375 test plants its pane rows — the
+/// provider/generation by SQL, the turn row carrying the pty `submitted`
+/// marker so it holds the lane's one turn.
+fn plant_pty_turn(d: &TestDaemon, alias: &str, id: &str, token: &str) {
+    if d.rpc("agent_show", json!({"alias": alias})).is_err() {
+        d.register(alias);
+    }
+    cad162_sql(
+        d,
+        "UPDATE agents SET provider='devin', endpoint_kind='pty', \
+         generation='planted', pid=NULL, pid_start=NULL WHERE alias=?1",
+        &[alias],
+    );
+    let now = format!(
+        "{}",
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    );
+    cad162_sql(
+        d,
+        "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,result,created,started)
+         VALUES(?1,?2,'task',NULL,'user','running',?3,
+                '{\"status\":\"submitted\",\"ack\":null}',CAST(?4 AS REAL),CAST(?4 AS REAL))",
+        &[id, alias, token, &now],
+    );
+}
+
+/// CAD-880: `message result` / `message ack` with no `<msg-id>` and no
+/// `--token` report the calling agent's single running turn — resolved
+/// daemon-side from the connection caller, never from a request field.
+#[test]
+fn message_result_default_reports_the_callers_single_running_turn() {
+    let d = TestDaemon::start();
+    plant_pty_turn(&d, "wa", "m-def1", "pty-planted-def1token");
+    // A default ack keeps the turn running; a default result completes it.
+    d.agent_rpc(
+        "wa",
+        "message_report",
+        json!({"kind": "ack", "text": "holding"}),
+    )
+    .expect("default ack refused");
+    assert_eq!(d.message_state("wa", "m-def1"), "running");
+    d.agent_rpc(
+        "wa",
+        "message_report",
+        json!({"kind": "result", "text": "done"}),
+    )
+    .expect("default result refused");
+    assert_eq!(d.message_state("wa", "m-def1"), "completed");
+}
+
+/// CAD-880: zero or several held turns refuse with `kind: rejected`,
+/// listing the candidates — the default never guesses.
+#[test]
+fn message_result_default_refuses_zero_or_several_turns() {
+    let d = TestDaemon::start();
+    plant_pty_turn(&d, "wa", "m-sev1", "pty-planted-sev1token");
+    plant_pty_turn(&d, "wa", "m-sev2", "pty-planted-sev2token");
+    let err = d
+        .agent_rpc(
+            "wa",
+            "message_report",
+            json!({"kind": "result", "text": "x"}),
+        )
+        .expect_err("several held turns were reported");
+    let err = err.to_string();
+    assert!(err.contains("m-sev1") && err.contains("m-sev2"), "{err}");
+    assert_eq!(d.message_state("wa", "m-sev1"), "running");
+    assert_eq!(d.message_state("wa", "m-sev2"), "running");
+    // Both reported explicitly: the lane is left with no running turn.
+    for (id, token) in [
+        ("m-sev1", "pty-planted-sev1token"),
+        ("m-sev2", "pty-planted-sev2token"),
+    ] {
+        d.report(id, token, "result", "x").expect("explicit report");
+    }
+    let err = d
+        .agent_rpc(
+            "wa",
+            "message_report",
+            json!({"kind": "result", "text": "x"}),
+        )
+        .expect_err("zero held turns were reported");
+    assert!(err.to_string().contains("no running turn"), "{err}");
+}
+
+/// CAD-880: a peer's default resolves only the peer's own turns — it can
+/// never report another agent's turn, with or without ids of its own.
+#[test]
+fn message_result_default_scoped_to_the_calling_agent() {
+    let d = TestDaemon::start();
+    plant_pty_turn(&d, "wa", "m-peer1", "pty-planted-peer1token");
+    plant_pty_turn(&d, "wb", "m-peer9", "pty-planted-peer9token");
+    // wb's turn is already done: wb's default finds no running turn of
+    // its own, and wa's turn is untouched.
+    d.report("m-peer9", "pty-planted-peer9token", "result", "x")
+        .expect("explicit report");
+    let err = d
+        .agent_rpc(
+            "wb",
+            "message_report",
+            json!({"kind": "result", "text": "x"}),
+        )
+        .expect_err("peer reported without a turn of its own");
+    assert!(err.to_string().contains("no running turn"), "{err}");
+    assert_eq!(d.message_state("wa", "m-peer1"), "running");
+    // With a turn of its own, the peer's default reports exactly that one.
+    plant_pty_turn(&d, "wb", "m-peer2", "pty-planted-peer2token");
+    d.agent_rpc(
+        "wb",
+        "message_report",
+        json!({"kind": "result", "text": "done"}),
+    )
+    .expect("peer default refused");
+    assert_eq!(d.message_state("wb", "m-peer2"), "completed");
+    assert_eq!(d.message_state("wa", "m-peer1"), "running");
+}
+
+/// CAD-880: the operator runs no turn and an unproven (detached) caller
+/// derives no agent — both are refused before any write.
+#[test]
+fn message_result_default_refuses_operator_and_unproven_callers() {
+    let d = TestDaemon::start();
+    plant_pty_turn(&d, "wa", "m-op1", "pty-planted-op1token");
+    let params = json!({"kind": "result", "text": "x"});
+    let err = d
+        .operator_rpc("message_report", params.clone())
+        .expect_err("operator reported a turn");
+    assert!(err.to_string().contains("operator"), "{err}");
+    let err = d
+        .unproven_rpc("message_report", params)
+        .expect_err("unproven caller reported a turn");
+    assert!(
+        err.to_string().contains("no agent identity")
+            || err.to_string().contains("Unproven")
+            || err.to_string().contains("unproven"),
+        "{err}"
+    );
+    assert_eq!(d.message_state("wa", "m-op1"), "running");
+}
+
+/// CAD-880 (N1): `alias` and every `IDENTITY_FIELDS` member on a report
+/// is refused outright — one request per field, so each class is
+/// exercised, never read and never ignored.
+#[test]
+fn message_result_refuses_forged_identity_fields() {
+    let d = TestDaemon::start();
+    plant_pty_turn(&d, "wa", "m-for1", "pty-planted-for1token");
+    for field in [
+        "alias", "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid",
+        "owner",
+    ] {
+        for params in [
+            json!({"message": "m-for1", "token": "pty-planted-for1token",
+                   "kind": "result", "text": "x", field: "wa"}),
+            json!({"kind": "result", "text": "x", field: "wa"}),
+        ] {
+            let err = d
+                .agent_rpc("wa", "message_report", params)
+                .expect_err("forged identity field accepted");
+            assert!(
+                err.to_string().contains("not accepted"),
+                "field {field}: {err}"
+            );
+        }
+    }
+    assert_eq!(d.message_state("wa", "m-for1"), "running");
+}
+
+/// CAD-880 (F1): a unique message-id prefix of at least 8 chars reports
+/// for an agent caller; anything shorter (that is not the exact id) or
+/// ambiguous is refused. Prefix enumeration is caller-scoped, so these
+/// run as the alias that holds the turns.
+#[test]
+fn message_result_prefix_accepts_unique_prefix_and_refuses_ambiguous_or_short() {
+    let d = TestDaemon::start();
+    let m1 = "abcdef0011111111111111111111111";
+    let m2 = "abcdef0022222222222222222222222";
+    plant_pty_turn(&d, "wa", m1, "pty-planted-pfx1token");
+    plant_pty_turn(&d, "wa", m2, "pty-planted-pfx2token");
+    let report = |message: &str, token: &str| {
+        d.agent_rpc(
+            "wa",
+            "message_report",
+            json!({"message": message, "token": token, "kind": "ack", "text": "x"}),
+        )
+    };
+    // Too short and not exact: refused before any token is judged.
+    let err = report("abc", "nope").expect_err("short prefix accepted");
+    assert!(err.to_string().contains("at least 8"), "{err}");
+    // Shared 8-char prefix: refused, naming both matches.
+    let err = report("abcdef00", "nope").expect_err("ambiguous prefix accepted");
+    let err = err.to_string();
+    assert!(err.contains(m1) && err.contains(m2), "{err}");
+    // Unique prefix with the right token: accepted, turn kept running.
+    report("abcdef001", "pty-planted-pfx1token").expect("unique prefix refused");
+    assert_eq!(d.message_state("wa", m1), "running");
+    // The exact id still reports as before.
+    d.report(m2, "pty-planted-pfx2token", "result", "done")
+        .expect("exact id refused");
+    assert_eq!(d.message_state("wa", m2), "completed");
+}
+
+/// CAD-880 (F1): prefix enumeration is caller-scoped. An agent's
+/// ambiguous prefix names only its own alias's ids; a prefix matching
+/// only another alias's rows is "no such message" even with the right
+/// token — while the exact id stays bearer-possession authorized. The
+/// operator's explicit path stays global; unproven callers need the
+/// exact id.
+#[test]
+fn message_result_prefix_scoped_to_callers_own_messages() {
+    let d = TestDaemon::start();
+    let wa1 = "c0ffee00a10000000000000000000001";
+    let wa2 = "c0ffee00a20000000000000000000002";
+    let wb1 = "c0ffee00b10000000000000000000003";
+    plant_pty_turn(&d, "wa", wa1, "pty-planted-sc1token");
+    plant_pty_turn(&d, "wa", wa2, "pty-planted-sc2token");
+    plant_pty_turn(&d, "wb", wb1, "pty-planted-sc3token");
+    let ack = |who: &str, message: &str, token: &str| {
+        d.agent_rpc(
+            who,
+            "message_report",
+            json!({"message": message, "token": token, "kind": "ack", "text": "x"}),
+        )
+    };
+    // Shared prefix: ambiguous for wa, naming only wa's own rows.
+    let err = ack("wa", "c0ffee00", "nope").expect_err("cross-alias prefix resolved");
+    let err = err.to_string();
+    assert!(err.contains(wa1) && err.contains(wa2), "{err}");
+    assert!(!err.contains(wb1), "other agent's id disclosed: {err}");
+    // A prefix matching only wb's row is nothing to wa — even with
+    // wb's own token. The exact id still reports (bearer possession).
+    let err =
+        ack("wa", "c0ffee00b1", "pty-planted-sc3token").expect_err("cross-alias prefix enumerated");
+    assert!(err.to_string().contains("No such message"), "{err}");
+    ack("wa", wb1, "pty-planted-sc3token").expect("exact bearer id refused");
+    // wb's own prefix is unique in wb's scope and resolves.
+    ack("wb", "c0ffee00b1", "pty-planted-sc3token").expect("own-scope prefix refused");
+    // The operator's explicit path stays global: ambiguous across aliases.
+    let err = d
+        .operator_rpc(
+            "message_report",
+            json!({"message": "c0ffee00", "token": "nope", "kind": "ack", "text": "x"}),
+        )
+        .expect_err("operator prefix scoped");
+    let err = err.to_string();
+    assert!(
+        err.contains(wa1) && err.contains(wa2) && err.contains(wb1),
+        "{err}"
+    );
+    d.operator_rpc(
+        "message_report",
+        json!({"message": "c0ffee00b1", "token": "pty-planted-sc3token",
+               "kind": "ack", "text": "x"}),
+    )
+    .expect("operator prefix refused");
+    // Unproven callers need the exact id: prefix refused, exact works.
+    let err = d
+        .unproven_rpc(
+            "message_report",
+            json!({"message": "c0ffee00b1", "token": "pty-planted-sc3token",
+                   "kind": "ack", "text": "x"}),
+        )
+        .expect_err("unproven prefix enumerated");
+    assert!(err.to_string().contains("No such message"), "{err}");
+    d.unproven_rpc(
+        "message_report",
+        json!({"message": wb1, "token": "pty-planted-sc3token",
+               "kind": "ack", "text": "x"}),
+    )
+    .expect("unproven bearer id refused");
+    assert_eq!(d.message_state("wa", wa1), "running");
+    assert_eq!(d.message_state("wa", wa2), "running");
+    assert_eq!(d.message_state("wb", wb1), "running");
+}
+
+/// CAD-880 (F3): two default reports racing on one turn — exactly one
+/// wins. Both resolve the same turn; the finish transaction lets one
+/// through and the loser sees `completed` (same text: `duplicate: true`)
+/// or linearizes after the win (no running turn left). Nothing is ever
+/// reported twice or to another turn.
+#[test]
+fn message_result_racing_defaults_exactly_one_wins() {
+    let d = TestDaemon::start();
+    for round in 0..3 {
+        let id = format!("race{round}000000000000000000000000000");
+        assert_eq!(id.len(), 32);
+        plant_pty_turn(&d, "wa", &id, &format!("pty-planted-race{round}token"));
+        let barrier = std::sync::Barrier::new(2);
+        let barrier_ref = &barrier;
+        std::thread::scope(|s| {
+            let hands: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier_ref.wait();
+                        d.agent_rpc(
+                            "wa",
+                            "message_report",
+                            json!({"kind": "result", "text": "same outcome"}),
+                        )
+                        .map(|v| v.to_string())
+                        .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            let mut wins = 0;
+            for h in hands {
+                match h.join().unwrap() {
+                    Ok(out) if out.contains("\"reported\"") => wins += 1,
+                    // The loser: duplicate after a finished twin, or
+                    // linearized past the win with no turn left to resolve.
+                    Ok(out) => assert!(
+                        out.contains("\"duplicate\":true"),
+                        "round {round}: loser neither duplicate nor refused: {out}"
+                    ),
+                    Err(e) => assert!(
+                        e.contains("has no running turn"),
+                        "round {round}: unexpected loser error: {e}"
+                    ),
+                }
+            }
+            assert_eq!(wins, 1, "round {round}: not exactly one winner");
+        });
+        assert_eq!(d.message_state("wa", &id), "completed");
+    }
+}
+
+/// CAD-880: end to end through the real CLI under a real pane —
+/// `message result --text` with no ids, the `done` alias, `--file` and
+/// `--file -` resolve the caller's turn; the CLI sends no token itself.
+/// A refusal exits 3 with the JSON `rejected` kind (CAD-876).
+#[test]
+fn message_result_default_via_cli_reports_without_ids() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "wa", owner.pid());
+    cad162_sql(
+        &d,
+        "UPDATE agents SET provider='devin' WHERE alias='wa'",
+        &[],
+    );
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let state = d.state.display().to_string();
+    let plant = |id: &str, token: &str| {
+        let now = format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+        );
+        cad162_sql(
+            &d,
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,result,created,started)
+             VALUES(?1,'wa','task',NULL,'user','running',?2,
+                    '{\"status\":\"submitted\",\"ack\":null}',CAST(?3 AS REAL),CAST(?3 AS REAL))",
+            &[id, token, &now],
+        );
+    };
+    // No ids anywhere: the daemon resolves the caller's single turn.
+    plant("m-cli1", "pty-planted-cli1token");
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message result --text ok"
+    ));
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(d.message_state("wa", "m-cli1"), "completed");
+    // The `done` alias reports the same way.
+    plant("m-cli2", "pty-planted-cli2token");
+    let (rc, out) = owner.run(&format!("{bin} --state-dir {state} done --text ok"));
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(d.message_state("wa", "m-cli2"), "completed");
+    // `--file` reads the body from a path.
+    plant("m-cli3", "pty-planted-cli3token");
+    let file = home.path().join("result.txt");
+    std::fs::write(&file, "file result\n").unwrap();
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message result --file {}",
+        file.display()
+    ));
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(d.message_state("wa", "m-cli3"), "completed");
+    // `--file -` reads a capped stdin.
+    plant("m-cli4", "pty-planted-cli4token");
+    let (rc, out) = owner.run(&format!(
+        "printf 'piped result' | {bin} --state-dir {state} message result --file -"
+    ));
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(d.message_state("wa", "m-cli4"), "completed");
+    // Nothing running: a refusal, exit 3, JSON `rejected`.
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message result --text ok"
+    ));
+    assert_eq!(rc, 3, "{out}");
+    assert!(out.contains("\"kind\": \"rejected\""), "{out}");
+    // Over the 4 MiB cap: refused whole, never truncated (I5).
+    plant("m-cli5", "pty-planted-cli5token");
+    let big = home.path().join("big.txt");
+    std::fs::write(&big, "x".repeat(5 << 20)).unwrap();
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message result --file {}",
+        big.display()
+    ));
+    assert_eq!(rc, 3, "{out}");
+    assert!(out.contains("over 4 MiB"), "{out}");
+    assert_eq!(d.message_state("wa", "m-cli5"), "running");
+    let (rc, out) = owner.run(&format!(
+        "head -c 5000000 /dev/zero | tr '\\0' 'x' | {bin} --state-dir {state} message result --file -"
+    ));
+    assert_eq!(rc, 3, "{out}");
+    assert!(out.contains("over 4 MiB"), "{out}");
+    assert_eq!(d.message_state("wa", "m-cli5"), "running");
+}
+
+/// CAD-880 (F2): `--file -` with a terminal stdin is refused (I5) — the
+/// `script` pty makes stdin a terminal, so the CLI must refuse before
+/// reading instead of blocking on (or swallowing) terminal input.
+#[test]
+fn message_result_tty_stdin_refused() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "wa", owner.pid());
+    cad162_sql(
+        &d,
+        "UPDATE agents SET provider='devin' WHERE alias='wa'",
+        &[],
+    );
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let state = d.state.display().to_string();
+    let now = format!(
+        "{}",
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    );
+    cad162_sql(
+        &d,
+        "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,result,created,started)
+         VALUES('m-tty1','wa','task',NULL,'user','running','pty-planted-ttytoken',
+                '{\"status\":\"submitted\",\"ack\":null}',CAST(?1 AS REAL),CAST(?1 AS REAL))",
+        &[&now],
+    );
+    let (rc, out) = owner.run(&format!(
+        "script -qec '{bin} --state-dir {state} message result --file -' /dev/null </dev/null"
+    ));
+    assert_eq!(rc, 3, "{out}");
+    assert!(out.contains("\"kind\": \"rejected\""), "{out}");
+    assert_eq!(d.message_state("wa", "m-tty1"), "running");
+}
+
 /// CAD-110: `--instructions-file` content reaches every provider through
 /// the briefing's role-instructions section, and a later briefing
 /// rewrite (`agent bootstrap`) carries it forward.

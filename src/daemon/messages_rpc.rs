@@ -856,6 +856,140 @@ impl Shared {
         Ok(message)
     }
 
+    /// CAD-880: the (message id, submission token) a report acts on (I1,
+    /// I4). Both fields present: the explicit path, with git-style prefix
+    /// resolution on the id. Both absent: the caller's single held turn,
+    /// resolved from the connection caller. Exactly one of the two is a
+    /// refusal — a token without its message names nothing, and a message
+    /// without its token proves nothing.
+    fn report_target(&self, params: &Value, peer_pid: u32) -> Result<(String, String)> {
+        let id = optional_str(params, "message");
+        let token = optional_str(params, "token");
+        match (id, token) {
+            (Some(id), Some(token)) => Ok((
+                self.resolve_message_id_for(peer_pid, id)?,
+                token.to_string(),
+            )),
+            (None, None) => self.caller_turn(peer_pid),
+            (Some(_), None) => Err(Error::rejected(
+                "message report needs both the message id and its --token, or neither \
+                 (neither reports your own single running turn)",
+            )),
+            (None, Some(_)) => Err(Error::rejected(
+                "message report needs both the message id and its --token, or neither \
+                 (a token without its message names nothing)",
+            )),
+        }
+    }
+
+    /// CAD-880 (F1): explicit-id resolution. An exact id resolves globally
+    /// — bearer possession, unchanged for every caller. A prefix
+    /// enumerates only the caller's own alias for agent callers (an
+    /// ambiguity refusal names only their own ids), globally for the
+    /// operator, and not at all for unproven callers (exact id only —
+    /// possession still works, prefix fishing does not). Resolution never
+    /// bypasses the token/generation/state gates below (I4).
+    fn resolve_message_id_for(&self, peer_pid: u32, id: &str) -> Result<String> {
+        if self.store.message(id)?.is_some() {
+            return Ok(id.to_string());
+        }
+        if id.len() < 8 {
+            return Err(Error::rejected(format!(
+                "No such message '{id}' — pass the full id or a unique prefix of \
+                 at least 8 chars"
+            )));
+        }
+        let matches = match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Agent(alias) => self.store.message_id_prefix_for(id, &alias)?,
+            caller_rule::Who::Operator => self.store.message_id_prefix(id)?,
+            caller_rule::Who::Unproven(_) => {
+                return Err(Error::rejected(format!("No such message '{id}'")));
+            }
+        };
+        Self::pick_prefix_match(id, matches)
+    }
+
+    /// CAD-880: one candidate from a prefix pool — unique wins, none or
+    /// several are refused, the latter listing the matches.
+    fn pick_prefix_match(id: &str, mut matches: Vec<String>) -> Result<String> {
+        matches.retain(|m| m != id);
+        if matches.is_empty() {
+            return Err(Error::rejected(format!("No such message '{id}'")));
+        }
+        if matches.len() > 1 {
+            matches.sort();
+            let shown = matches
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let count = if matches.len() > 10 {
+                "more than 10".to_string()
+            } else {
+                matches.len().to_string()
+            };
+            return Err(Error::rejected(format!(
+                "Ambiguous message prefix '{id}' ({count} matches): {shown}"
+            )));
+        }
+        Ok(matches.into_iter().next().unwrap())
+    }
+
+    /// CAD-880: the caller's single held turn (I1, I2) — the daemon-side
+    /// counterpart of `cadence self`. The caller comes ONLY from
+    /// `connection_caller`: a peer resolves only its own turns, the
+    /// operator (which runs no turn) and an unproven or detached caller
+    /// are refused before any write.
+    fn caller_turn(&self, peer_pid: u32) -> Result<(String, String)> {
+        let alias = match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Agent(alias) => alias,
+            caller_rule::Who::Operator => {
+                return Err(Error::rejected(
+                    "message report with no id reports the caller's own running turn — \
+                     this connection is provably the operator, which runs no turn; \
+                     pass an explicit message id and token",
+                ));
+            }
+            caller_rule::Who::Unproven(why) => {
+                return Err(Error::rejected(format!(
+                    "message report with no id reports the caller's own running turn — \
+                     this connection derives no agent identity and is not provably \
+                     the operator: {why}"
+                )));
+            }
+        };
+        let held = self.store.held_turns(&alias)?;
+        match held.len() {
+            0 => Err(Error::rejected(format!(
+                "agent '{alias}' has no running turn — pass an explicit message id \
+                 and token"
+            ))),
+            1 => {
+                let m = held.into_iter().next().unwrap();
+                let token = m.turn_id.clone().ok_or_else(|| {
+                    Error::rejected(format!(
+                        "message {} holds a turn with no submission token — report it \
+                         explicitly",
+                        m.id
+                    ))
+                })?;
+                Ok((m.id, token))
+            }
+            _ => {
+                let ids = held
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(Error::rejected(format!(
+                    "agent '{alias}' holds {} running turns — report one explicitly: {ids}",
+                    held.len()
+                )))
+            }
+        }
+    }
+
     /// Explicit ack/result report for a running message. The `token` is
     /// the `turn_id` minted at submission; it embeds the endpoint
     /// generation under the endpoint's own scheme (CAD-162:
@@ -873,13 +1007,22 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        let id = required_str(params, "message")?;
-        let token = required_str(params, "token")?;
+        // CAD-880 (I3): caller identity is connection-bound — an `alias`
+        // field would name whose turn a default resolves, so it is
+        // refused outright rather than ignored.
+        if params.get("alias").is_some() {
+            return Err(Error::rejected(
+                "message report: caller identity is connection-bound; request field \
+                 'alias' is not accepted",
+            ));
+        }
+        reject_identity_fields(params, "message report")?;
         let kind = required_str(params, "kind")?;
         let text = optional_str(params, "text");
+        let (id, token) = self.report_target(params, peer_pid)?;
         let message = self
             .store
-            .message(id)?
+            .message(&id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
         if message.source == "app_run_dispatch" {
             let caller = self.agent_caller(peer_pid, "app material report")?;
@@ -890,7 +1033,7 @@ impl Shared {
             }
         }
         let agent = self.store.agent(&message.alias)?;
-        if message.turn_id.as_deref() != Some(token) {
+        if message.turn_id.as_deref() != Some(token.as_str()) {
             return Err(Error::rejected(
                 "Token does not match the message's submission token",
             ));
@@ -899,7 +1042,7 @@ impl Shared {
             &agent.provider,
             &agent.endpoint_kind,
             agent.generation.as_deref(),
-            token,
+            &token,
         ) {
             return Err(Error::rejected(
                 "Submission token belongs to a stale endpoint generation",

@@ -477,6 +477,19 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             print_json(&json!({"alias": alias, "running": running}));
             Ok(0)
         }
+        Commands::Done {
+            message,
+            token,
+            text,
+            file,
+            sha,
+            report,
+        } => {
+            let (result, pending) =
+                message::run_result(&state_dir, message, token, text, file, sha, report)?;
+            print_json(&result);
+            Ok(if pending { 2 } else { 0 })
+        }
         Commands::Inbox {
             alias,
             action,

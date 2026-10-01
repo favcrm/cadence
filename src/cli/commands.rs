@@ -809,6 +809,38 @@ pub(crate) enum Commands {
     /// inbound count instead.
     #[command(name = "self")]
     SelfInfo,
+    /// Report your running turn's result.
+    ///
+    /// `message result` with no ids: the daemon resolves your single
+    /// running turn from the connection itself. With an explicit id (a
+    /// unique 8+ char prefix works) plus `--token`, it reports exactly
+    /// that message. The body is `--text` or `--file` (`-` reads stdin,
+    /// capped at 4 MiB).
+    Done {
+        /// Message id; omit it and `--token` together to report your
+        /// single running turn.
+        message: Option<String>,
+        /// Submission token (the `turn_id` `cadence self` prints).
+        #[arg(long)]
+        token: Option<String>,
+        /// Result text reported for the message.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the result text from a file (`-` reads stdin).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The commit this report produced — binds the message to an
+        /// exact revision for `job verdict`.
+        #[arg(long)]
+        sha: Option<String>,
+        /// A task report file (`cadence.report/2`, see `cadence report
+        /// file`) whose frontmatter names kind and task. It is filed on
+        /// the ticket first — a malformed report refuses the result —
+        /// and the result text gains a `Report: <ID>/reports/<file>`
+        /// line. A retry with the same file reuses the stored report.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Read an inbox agent's durable queue: one JSON object per
     /// message, oldest first. The default drains — each message is
     /// marked completed `via=inbox_read` as it is printed. The safe

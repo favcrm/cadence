@@ -44,16 +44,25 @@ task the message carries — `null` for unattached deliveries.
 
 ## Reporting on a task
 
-Every dispatched message expects a correlated report. When done:
+Every dispatched message expects a correlated report. When done, report
+with no ids — the daemon resolves your single running turn from your
+connection itself:
 
 ```bash
-cadence message result <msg-id> --token <turn_id> --text "summary of outcome"
+cadence message result --text "summary of outcome"
+# or the `done` alias, which reports the same way:
+cadence done --text "summary of outcome"
 # a job kickoff additionally wants the commit you produced:
-cadence message result <msg-id> --token <turn_id> --text "summary" --sha "$(git rev-parse HEAD)"
+cadence message result --text "summary" --sha "$(git rev-parse HEAD)"
+# a long result reads from a file (`-` reads stdin):
+cadence message result --file <path>
 ```
 
-Get `<msg-id>` and `<turn_id>` from `cadence self`. Report every running
-message — an unreported message stays `running` forever and blocks review.
+Holding several running turns is refused — name the one to report, with
+`<msg-id>` and `<turn_id>` from `cadence self` (a unique id prefix of 8+
+chars also works): `cadence message result <msg-id> --token <turn_id>
+--text "summary"`. Report every running message — an unreported message
+stays `running` forever and blocks review.
 Never report a SHA you have not committed — a `job verdict` binds QA to
 exactly that commit. Managed endpoints (codex/claude) never run
 `message result`: their kickoff instead asks the final answer to end with
