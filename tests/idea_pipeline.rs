@@ -24,8 +24,18 @@ fn ping(f: &PlanFixture) {
 }
 
 fn wait_tag(f: &PlanFixture, id: &str, tag: &str) {
+    wait_tag_with(f, id, tag, || {});
+}
+
+/// Poll until `id` carries `tag`, pinging the router each round and
+/// running `each_round` before the check. The daemon works only after a
+/// ping, one router pass at a time, so every effect the test reads must
+/// be waited for. Reading it right after some other effect is visible
+/// races the pass that has not reached it yet (CAD-906).
+fn wait_tag_with(f: &PlanFixture, id: &str, tag: &str, each_round: impl Fn()) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        each_round();
         ping(f);
         if f.front(id).tags.iter().any(|t| t == tag) {
             return;
@@ -38,6 +48,51 @@ fn wait_tag(f: &PlanFixture, id: &str, tag: &str) {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Poll until a comment on `id` contains `needle`. The cap and dedupe
+/// comments are written by the router pass that reaches the idea, which
+/// can be a later pass than the one that finished a sibling idea.
+fn wait_comment(f: &PlanFixture, id: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        ping(f);
+        if comment_text(f, id).contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} never got a comment with {needle:?}; comments {:?}",
+            comment_text(f, id)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Backdate the plan so the next pass sees 14 days with no decision.
+/// The write is applied only to a record the daemon has persisted as
+/// `plan_ready`: the tag is set before the pass saves its records, so
+/// a copy read earlier still says `planning` and writing it back would
+/// make the next pass stamp a fresh `plan_ready_at`. The file is
+/// replaced by rename, never truncated, so a pass never reads half of
+/// it. The caller repeats this each round, because a pass that loaded
+/// the state before this write saves its own copy over it.
+fn backdate_plan(f: &PlanFixture, id: &str) {
+    let state = f.d.state.join("idea-pipeline.json");
+    let Ok(text) = std::fs::read_to_string(&state) else {
+        return;
+    };
+    let Ok(mut pipeline) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let rec = &pipeline["records"][id];
+    if rec["state"] != "plan_ready" || rec["stale"] == true || rec["plan_ready_at"] == 0 {
+        return;
+    }
+    pipeline["records"][id]["plan_ready_at"] = json!(0);
+    let tmp = state.with_extension("json.test");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+    std::fs::rename(&tmp, &state).unwrap();
 }
 
 fn message_ids(f: &PlanFixture, alias: &str) -> Vec<String> {
@@ -183,7 +238,7 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
     assert!(!message_ids(&f, "rsch-1")
         .iter()
         .any(|id| id.contains(&dup.to_ascii_lowercase())));
-    assert!(comment_text(&f, &capped).contains("daily cap"));
+    wait_comment(&f, &capped, "daily cap");
     assert_eq!(f.front(&capped).status, "backlog");
     assert!(!f.front(&capped).tags.iter().any(|t| t == "plan-ready"));
     assert!(!message_ids(&f, "rsch-1")
@@ -199,12 +254,7 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
         "children exist before the decision"
     );
 
-    let state = f.d.state.join("idea-pipeline.json");
-    let mut pipeline: Value =
-        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
-    pipeline["records"][&happy]["plan_ready_at"] = json!(0);
-    std::fs::write(&state, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
-    wait_tag(&f, &happy, "idea-stale");
+    wait_tag_with(&f, &happy, "idea-stale", || backdate_plan(&f, &happy));
     assert!(f.front(&happy).tags.iter().any(|t| t == "plan-ready"));
     assert!(comment_text(&f, &happy).contains("14 days"));
 
