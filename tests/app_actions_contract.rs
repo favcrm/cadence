@@ -24,11 +24,10 @@
 //! descriptor is decided by operator approval, admission and execution
 //! gates this slice deliberately does not build.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use cadence_agent::issue::app_action;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn contract_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts/app-actions/v1")
@@ -66,21 +65,24 @@ fn parse_err(raw: &Value) -> String {
 #[test]
 fn published_examples_validate_and_parse() {
     let schema = load("app-actions.schema.json");
-    let validator =
-        jsonschema::validator_for(&schema).unwrap_or_else(|e| panic!("schema does not compile: {e}"));
+    let validator = jsonschema::validator_for(&schema)
+        .unwrap_or_else(|e| panic!("schema does not compile: {e}"));
     for name in ["crm.json", "ledger.json"] {
         let raw = load_example(name);
-        let errors: Vec<String> = validator
-            .iter_errors(&raw)
-            .map(|e| e.to_string())
-            .collect();
-        assert!(errors.is_empty(), "examples/{name} fails the schema: {errors:?}");
+        let errors: Vec<String> = validator.iter_errors(&raw).map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "examples/{name} fails the schema: {errors:?}"
+        );
         // Schema-valid is not sufficient — the consumer's closed parse
         // must also accept (unique ids, cross-references, forbidden
         // keys live beyond JSON Schema's reach).
         let descriptor = parse_ok(&raw);
         assert_eq!(descriptor.app, raw["app"].as_str().unwrap());
-        assert!(!descriptor.actions.is_empty(), "examples/{name} declares no actions");
+        assert!(
+            !descriptor.actions.is_empty(),
+            "examples/{name} declares no actions"
+        );
     }
 }
 
@@ -153,13 +155,13 @@ fn refuses_wrong_or_missing_contract_tag() {
 #[test]
 fn refuses_unsafe_app_names() {
     for app in [
-        json!("CRM"),           // case
-        json!("crm app"),       // space
-        json!("crm/app"),       // path separator
-        json!("-crm"),          // leading dash
+        json!("CRM"),     // case
+        json!("crm app"), // space
+        json!("crm/app"), // path separator
+        json!("-crm"),    // leading dash
         json!("_crm"),
         json!("9crm"),
-        json!("a".repeat(65)),  // over 64
+        json!("a".repeat(65)), // over 64
         json!(""),
     ] {
         let mut raw = load_example("crm.json");
@@ -176,16 +178,44 @@ fn refuses_unsafe_app_names() {
 #[test]
 fn refuses_unknown_top_level_keys() {
     for key in [
-        "views", "routes", "install", "install_id", "context",
-        "context_id", "workspace", "project", "actor", "by", "role",
-        "grant", "scope", "scopes", "capability", "capabilities",
-        "effect", "effects", "verified", "digest", "revision",
-        "secret", "token", "url", "endpoint", "sql", "path", "script",
+        "views",
+        "routes",
+        "install",
+        "install_id",
+        "context",
+        "context_id",
+        "workspace",
+        "project",
+        "actor",
+        "by",
+        "role",
+        "grant",
+        "scope",
+        "scopes",
+        "capability",
+        "capabilities",
+        "effect",
+        "effects",
+        "verified",
+        "digest",
+        "revision",
+        "secret",
+        "token",
+        "url",
+        "endpoint",
+        "sql",
+        "path",
+        "script",
     ] {
         let mut raw = load_example("crm.json");
-        raw.as_object_mut().unwrap().insert(key.to_string(), json!("x"));
+        raw.as_object_mut()
+            .unwrap()
+            .insert(key.to_string(), json!("x"));
         let e = parse_err(&raw);
-        assert!(e.contains(key) || e.contains("forbidden") || e.contains("unknown"), "{key}: {e}");
+        assert!(
+            e.contains(key) || e.contains("forbidden") || e.contains("unknown"),
+            "{key}: {e}"
+        );
     }
 }
 
@@ -194,12 +224,9 @@ fn refuses_unknown_top_level_keys() {
 /// refusal, not just at the top level.
 #[test]
 fn refuses_forged_authority_at_any_depth() {
-    let bases: Vec<Value> = vec![
-        load_example("crm.json"),
-        load_example("ledger.json"),
-    ];
+    let bases: Vec<Value> = vec![load_example("crm.json"), load_example("ledger.json")];
     for base in bases {
-        for key in app_action::FORBIDDEN_DESCRIPTOR_KEYS {
+        for &key in app_action::FORBIDDEN_DESCRIPTOR_KEYS {
             // On an action object.
             let mut raw = base.clone();
             raw["actions"][0]
@@ -214,12 +241,10 @@ fn refuses_forged_authority_at_any_depth() {
                 .unwrap()
                 .insert(key.to_string(), json!("x"));
             parse_err(&raw);
-            // Deep inside a value: a forged object field nested in an
-            // object the field legitimately carries. `note` is not a
-            // declared key, so we probe the recursive scan through an
-            // object smuggled where any object is refused anyway — the
-            // scan must run before shape checks, so the forbidden key
-            // still names itself first.
+            // Deep inside a value: a forbidden key nested under a
+            // non-declared object on a field. The recursive scan runs
+            // before the shape checks, so the forbidden key names
+            // itself rather than the enclosing unknown key.
             let mut raw = base.clone();
             raw["actions"][0]["input"]["fields"][0] = json!({
                 "id": "x", "label": "X", "type": "text",
@@ -240,8 +265,16 @@ fn refuses_forged_authority_at_any_depth() {
 #[test]
 fn refuses_each_named_authority_key_on_an_action() {
     for key in [
-        "install_id", "context_id", "actor", "by", "digest",
-        "revision", "approval_pin", "revision_pin", "guard", "caller",
+        "install_id",
+        "context_id",
+        "actor",
+        "by",
+        "digest",
+        "revision",
+        "approval_pin",
+        "revision_pin",
+        "guard",
+        "caller",
     ] {
         let mut raw = load_example("crm.json");
         raw["actions"][0]
@@ -292,9 +325,9 @@ fn refuses_unsupported_operations() {
         json!("publish"),
         json!("POST /api/customers"),
         json!("sql:insert into customers"),
-        json!("record.create "),      // trailing space
+        json!("record.create "), // trailing space
         json!(" record.create"),
-        json!("Record.Create"),       // case
+        json!("Record.Create"), // case
         json!(""),
         json!(1),
     ] {
@@ -316,14 +349,14 @@ fn refuses_unsupported_operations() {
 #[test]
 fn refuses_unsafe_record_references() {
     for record in [
-        json!("Customer"),           // case
-        json!("customer record"),    // space
-        json!("customers;drop"),     // injection-ish
-        json!("app_records"),        // a host-internal name is not a kind
-        json!("../customers"),       // path
+        json!("Customer"),        // case
+        json!("customer record"), // space
+        json!("customers;drop"),  // injection-ish
+        json!("app_records"),     // a host-internal name is not a kind
+        json!("../customers"),    // path
         json!("a".repeat(65)),
         json!(""),
-        json!({"kind": "customer"}), // an object, not a ref
+        json!({ "kind": "customer" }), // an object, not a ref
         json!(["customer"]),
         json!(1),
     ] {
@@ -368,11 +401,18 @@ fn refuses_duplicate_input_field_ids() {
 #[test]
 fn refuses_unknown_field_types() {
     for t in [
-        json!("object"), json!("array"), json!("json"), json!("ref"),
-        json!("file"), json!("blob"), json!("schema"), json!("any"),
-        json!("string"),   // 'string' is not the contract word — 'text' is
+        json!("object"),
+        json!("array"),
+        json!("json"),
+        json!("ref"),
+        json!("file"),
+        json!("blob"),
+        json!("schema"),
+        json!("any"),
+        json!("string"), // 'string' is not the contract word — 'text' is
         json!("boolean"),
-        json!(""), json!(1),
+        json!(""),
+        json!(1),
     ] {
         let mut raw = load_example("crm.json");
         raw["actions"][0]["input"]["fields"][0]["type"] = t;
@@ -413,9 +453,20 @@ fn enum_values_required_and_only_on_enum() {
 #[test]
 fn refuses_unknown_field_keys() {
     for key in [
-        "default", "pattern", "regex", "expression", "formula",
-        "schema", "properties", "items", "ref", "endpoint", "script",
-        "send", "required_roles", "visible_if",
+        "default",
+        "pattern",
+        "regex",
+        "expression",
+        "formula",
+        "schema",
+        "properties",
+        "items",
+        "ref",
+        "endpoint",
+        "script",
+        "send",
+        "required_roles",
+        "visible_if",
     ] {
         let mut raw = load_example("crm.json");
         raw["actions"][0]["input"]["fields"][0]
@@ -455,8 +506,7 @@ fn refuses_oversize_content() {
 
     // A label over its cap.
     let mut raw = load_example("crm.json");
-    raw["actions"][0]["input"]["fields"][0]["label"] =
-        json!("x".repeat(4096));
+    raw["actions"][0]["input"]["fields"][0]["label"] = json!("x".repeat(4096));
     parse_err(&raw);
 
     // A title over its cap.
@@ -464,7 +514,8 @@ fn refuses_oversize_content() {
     raw["title"] = json!("t".repeat(4096));
     parse_err(&raw);
 
-    // A deeply nested payload inside a legitimate field.
+    // A deeply nested payload inside a non-declared object on a field —
+    // the recursive scan's depth bound trips before the shape checks.
     let mut deep = json!("x");
     for _ in 0..64 {
         deep = json!({ "k": deep });
@@ -477,7 +528,8 @@ fn refuses_oversize_content() {
 }
 
 /// The serialized-size ceiling counts bytes — a descriptor padded past
-/// the cap refuses even when every individual field is in bounds.
+/// the cap refuses even when every individual field is in bounds. A
+/// too-long `summary` trips the byte ceiling (and its own length cap).
 #[test]
 fn refuses_serialized_size_over_cap() {
     let mut raw = load_example("crm.json");
@@ -546,4 +598,44 @@ fn action_ids_are_scoped_to_the_descriptor() {
     // legal, because ids scope to the descriptor, not the repo.
     other["actions"][0]["id"] = json!("customer.create");
     parse_ok(&other);
+}
+
+/// Optional means absent, not null: published schema and parser agree.
+#[test]
+fn refuses_null_optional_properties_on_both_contract_surfaces() {
+    let validator = jsonschema::validator_for(&load("app-actions.schema.json")).unwrap();
+    let mut cases = Vec::new();
+    let mut summary = load_example("crm.json");
+    summary["summary"] = Value::Null;
+    cases.push(summary);
+    for key in ["type", "required", "values", "maxLength", "maxItems"] {
+        let mut raw = load_example("crm.json");
+        raw["actions"][0]["input"]["fields"][0][key] = Value::Null;
+        cases.push(raw);
+    }
+    for raw in cases {
+        assert!(
+            !validator.is_valid(&raw),
+            "schema accepted explicit null: {raw}"
+        );
+        parse_err(&raw);
+    }
+}
+
+/// Four full identifier segments include three dots (259 characters).
+#[test]
+fn accepts_maximum_dotted_action_id_on_both_contract_surfaces() {
+    let mut raw = load_example("crm.json");
+    raw["actions"][0]["id"] = json!(vec!["a".repeat(64); 4].join("."));
+    let validator = jsonschema::validator_for(&load("app-actions.schema.json")).unwrap();
+    assert!(validator.is_valid(&raw));
+    parse_ok(&raw);
+}
+
+/// Bound raw bytes before JSON decoding, including redundant whitespace.
+#[test]
+fn refuses_oversize_raw_json_before_decoding() {
+    let input = format!("{}{}", " ".repeat(65536), load_example("crm.json"));
+    let error = app_action::parse_str(&input).unwrap_err().to_string();
+    assert!(error.contains("exceeds 65536 bytes"), "{error}");
 }

@@ -1,0 +1,48 @@
+{
+  "contract": "app-actions/v1",
+  "app": "crm",
+  "title": "CRM — customer record actions",
+  "summary": "Data-only action declarations a CRM package could ship: create and update for the customer record kind. The descriptor declares metadata only — the host owns the actor, the context, the guard floor and whether any action ever executes.",
+  "actions": [
+    {
+      "id": "customer.create",
+      "title": "New customer",
+      "operation": "record.create",
+      "record": "customer",
+      "input": {
+        "fields": [
+          { "id": "name", "label": "Full name", "required": true },
+          { "id": "email", "label": "Email", "required": true },
+          {
+            "id": "tier",
+            "label": "Tier",
+            "type": "enum",
+            "values": ["member", "vip", "vip_plus"]
+          },
+          { "id": "notes", "label": "Notes", "maxLength": 512 },
+          { "id": "tags", "label": "Tags", "type": "tags", "maxItems": 8 }
+        ]
+      }
+    },
+    {
+      "id": "customer.update",
+      "title": "Edit customer",
+      "operation": "record.update",
+      "record": "customer",
+      "input": {
+        "fields": [
+          { "id": "name", "label": "Full name" },
+          { "id": "email", "label": "Email" },
+          {
+            "id": "tier",
+            "label": "Tier",
+            "type": "enum",
+            "values": ["member", "vip", "vip_plus"]
+          },
+          { "id": "last_visit", "label": "Last visit", "type": "date" },
+          { "id": "notes", "label": "Notes", "maxLength": 512 }
+        ]
+      }
+    }
+  ]
+}

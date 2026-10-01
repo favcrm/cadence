@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:app-actions:v1:descriptor",
+  "title": "App actions descriptor (app-actions/v1)",
+  "description": "A versioned, data-only declaration of the record mutations a workspace app package may describe: named actions, each a closed record.create or record.update operation on a declared record kind, carrying closed typed input-field definitions. The descriptor is data, never code and never authority — it cannot carry executable surfaces (script/code/html/css/eval/import/module), URLs or navigation (url/href/src/link/endpoint/method), scope or actor identity (install_id/context_id/workspace/project/actor/by/role), credentials or storage internals (secret/credential/token/password/sql/query/path/file), authority claims (effect/verified/digest/revision) or guard-weakening toggles (revision_pin/approval_pin/actor_request/guard/caller/public/unauthenticated/skip_approval). The host alone derives the actor, derives the context and enforces the operation's guard floor; a declaration can narrow, never widen. Identifier grammar is [a-z][a-z0-9_-]{0,63}. Consumers must also enforce the bounds documented here (max actions/fields/enum values, string lengths, unique action and field ids, and the closed operation vocabulary) — JSON Schema alone cannot express duplicate ids or the consumer's recursive forbidden-key scan.",
+  "type": "object",
+  "required": ["contract", "app", "title", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "app-actions/v1",
+      "description": "The contract tag. A descriptor naming any other version is refused."
+    },
+    "app": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "The workspace-app kind this descriptor was reviewed with (e.g. crm, ledger). Provenance only — never an installation id, route, or authority claim."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Human title for the descriptor — plain text."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280,
+      "description": "Inert free-text summary."
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/action" },
+      "description": "Declared actions; ids unique within the descriptor (consumer-checked)."
+    }
+  },
+  "$defs": {
+    "safeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "__proto__", "prototype", "constructor",
+            "script", "scripts", "code", "html", "innerHTML", "css", "style",
+            "javascript", "eval", "import", "module",
+            "url", "uri", "href", "src", "link", "endpoint", "method", "route",
+            "install_id", "installId", "context_id", "contextId",
+            "workspace", "workspace_id", "project", "project_id", "project_link",
+            "actor", "by", "role", "grant", "scope", "scopes",
+            "capability", "capabilities", "caller",
+            "secret", "secrets", "credential", "credentials", "token", "password",
+            "sql", "query", "path", "file",
+            "effect", "effects", "verified", "digest", "revision",
+            "revision_pin", "approval_pin", "actor_request", "guard",
+            "public", "unauthenticated", "skip_approval",
+            "default", "pattern", "regex", "expression", "formula",
+            "schema", "properties", "items", "send"
+          ]
+        }
+      }
+    },
+    "field": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "The input field's declared identifier — unique within its action (consumer-checked)."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Visible label — plain text."
+        },
+        "type": {
+          "enum": ["text", "number", "date", "datetime", "enum", "tags"],
+          "default": "text",
+          "description": "Closed input vocabulary, mirroring the shared host controls. An absent type is text."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the host's form must collect a value. Data only — the host owns whether an operation is permitted at all."
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "description": "Closed allowlist a type \"enum\" field may equal — required on enum, forbidden on every other type (consumer-checked)."
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "description": "Optional declared cap on a text/tags item's length — a request, not authority; the host enforces its own bound regardless."
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Optional declared cap on a tags list's length — a request, not authority."
+        }
+      }
+    },
+    "input": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["fields"],
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/field" },
+          "description": "The closed typed inputs the action's host form may collect; ids unique within the action (consumer-checked)."
+        }
+      }
+    },
+    "action": {
+      "allOf": [{ "$ref": "#/$defs/safeObject" }],
+      "type": "object",
+      "required": ["id", "title", "operation", "record", "input"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}(\\.[a-z][a-z0-9_-]{0,63}){0,3}$",
+          "description": "The action's declared identifier — a dotted name like \"customer.create\", unique within the descriptor (consumer-checked). Data only; never a route."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Human title for the action — plain text."
+        },
+        "operation": {
+          "enum": ["record.create", "record.update"],
+          "description": "The closed v1 operation vocabulary: a named semantic reference to a host operation, never a method, URL, SQL or arbitrary verb. record.delete, custom verbs and every outward effect are refused in v1."
+        },
+        "record": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "A reference to a record kind the package declares elsewhere (a future domain/ contract). This descriptor only records the name — validation against a declared domain is a later admission requirement, not expressible here."
+        },
+        "input": { "$ref": "#/$defs/input" }
+      }
+    }
+  }
+}
