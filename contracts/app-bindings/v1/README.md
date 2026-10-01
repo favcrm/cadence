@@ -58,18 +58,27 @@ unchanged: the companion is optional in one direction only.
   view is a disabled preview and can never carry a binding.
 - `source` — the closed set of host read sources:
   - `customers` — the record store's `CustomerProfile` (kind
-    `customer`): `record_id` (the host's row handle), `display_name`,
-    `email`, `phone`, `tags`, `source`, `consent.email`,
-    `consent.sms`. Consent values are `granted`/`denied`/`unknown`.
+    `customer`): `record_id` (the row's `id` — the adapter renames it
+    to this handle; the raw API emits `id`), `display_name`, `email`,
+    `phone`, `tags`, `source`, `consent.email`, `consent.sms`.
+    Consent values are `granted`/`denied`/`unknown`; `consent.sms`,
+    `email`, `phone` and `source` may be absent on a record and the
+    adapter omits the cell entirely (missing renders "—", never a raw
+    `null`).
   - `caption-runs` — the run row's metadata-only surface
-    (`app_run_show`): `id`, `state`, `context_id`,
-    `snapshot_digest`, `created`, `updated` (integer epoch seconds),
+    (`app_run_show`): `id`, `state`, `context_id`, `snapshot_digest`,
     `snapshot.workflow.title`, `snapshot.inputs.subject`,
     `snapshot.context.id`. Run `state` is one of
     `awaiting_approval`/`approved`/`running`/`succeeded`/`failed`/
-    `cancelled`. Artifact ids, digests, media types, sizes and —
+    `cancelled`. `context_id`/`snapshot.context.id` are absent on a
+    contextless run and `snapshot.inputs.subject` is absent on
+    workflows that declare no `subject` input (e.g.
+    `source-instagram` declares `profile_handle`) — the adapter omits
+    those cells. Artifact ids, digests, media types, sizes and —
     above all — **artifact content** (the caption text itself) are
-    deliberately not in this projection.
+    deliberately not in this projection. Run `created`/`updated`
+    columns exist in storage but are **not** part of the `app_run_show`
+    API projection, so no binding key may name them.
 - `ops` — the closed read operations the binding admits: `list` (a
   `table` view's read) and `show` (a `detail` view's). A binding may
   declare one or both; an op unusable by the view's kind refuses.
@@ -77,10 +86,14 @@ unchanged: the companion is optional in one direction only.
   source's fixed projection and the `format` the host renders it
   with. `field` must equal a field `id` declared on that view;
   `format` must equal the descriptor field's `format` *and* be one
-  the produced value can honestly fill — `tags` only for list-shaped
-  sources, `enum` only for the source's own declared domain (and the
-  descriptor `values` must equal that domain exactly), integer
-  timestamps only as `number` or `datetime`.
+  the produced value can honestly fill, and the produced shape must
+  match the descriptor field's `kind` (`scalar`/`list`). The honest
+  pairings are closed: scalar string/digest producers fill only
+  `text`; `tags` fills only `format:"tags", kind:"list"`; consent
+  and run-state fill only `enum` and the descriptor `values` must
+  equal the produced domain exactly. A scalar producer can never
+  claim `number`, `date`, `datetime`, `enum` or a `list` kind — the
+  host's cell consumer would refuse the value at render.
 
 `app` must equal both the manifest's `app` and the descriptor's `app`
 — all three documents are reviewed as one bundle and the binding can

@@ -2,12 +2,13 @@
 //! one kind of work — `app.md` (frontmatter `app`, `title`, `version`,
 //! `needs.connections: [<slot>…]`; the body is the guide agents read),
 //! `workflows/*.md` (the same plan templates CAD-487 ships), optional
-//! flat `rubrics/` and `templates/` dirs, — CAD-864 — an optional
+//! flat `rubrics/` and `templates/` dirs, an optional
 //! `views/app-views-v1.json` data-only view descriptor declared by
-//! `needs.views.contract`, and — CAD-867 — an optional
+//! `needs.views.contract` (CAD-864), and an optional
 //! `bindings/app-bindings-v1.json` companion declared by
 //! `needs.bindings.contract` that maps descriptor views onto closed
-//! host read sources (the companion requires the descriptor it maps).
+//! host read sources — the companion requires the descriptor it maps
+//! (CAD-867).
 //! `records`, `actions`, `ui`, `settings` stay gated for later stages.
 //!
 //! `cadence app install <path|git-url> --project <key>` copies a
@@ -592,7 +593,7 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
         return Err(Error::rejected(format!(
             "app source entry '{name}' — v0 knows app.md, workflows/, rubrics/, \
-             templates/, views/; everything else refuses"
+             templates/, views/, bindings/; everything else refuses"
         )));
     }
     if !manifest {
@@ -894,10 +895,11 @@ fn validate_contents(
     match (manifest.binding_contract.as_deref(), binding_file) {
         (Some(app_binding::CONTRACT), Some(text)) => {
             if manifest.view_contract.is_none() {
-                errors.push(format!(
+                errors.push(
                     "app.md declares `needs.bindings` but not `needs.views` — a \
                      bindings companion requires the descriptor it maps"
-                ));
+                        .to_string(),
+                );
             }
             match app_binding::parse_binding(text) {
                 Ok(binding) => {

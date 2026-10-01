@@ -72,11 +72,11 @@
           "type": "string",
           "pattern": "^[a-z0-9_-]+(\\.[a-z0-9_-]+)*$",
           "maxLength": 64,
-          "description": "Dotted path into the source's fixed projection (e.g. display_name, consent.email, snapshot.workflow.title). Must be a member of the source's reviewed key table (consumer-checked)."
+          "description": "Dotted path into the source's fixed projection (e.g. display_name, consent.email, snapshot.workflow.title, record_id — the record row's `id`). Must be a member of the source's reviewed key table (consumer-checked)."
         },
         "format": {
           "enum": ["text", "number", "date", "datetime", "enum", "tags"],
-          "description": "Must equal the descriptor field's `format` and be a format the produced shape can fill (consumer-checked): list-shaped sources only via `tags`, consent/run-state enums only via `enum`, integer timestamps only via `number` or `datetime`."
+          "description": "Must equal the descriptor field's `format` and be a format the produced shape can honestly fill (consumer-checked): scalar string/digest producers only `text`, the list-shaped `tags` only `format:\"tags\"` with `kind:\"list\"`, consent/run-state only `enum` with the descriptor `values` equal to the produced domain. The produced scalar/list shape must also match the descriptor field's `kind`."
         }
       }
     },

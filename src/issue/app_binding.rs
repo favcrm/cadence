@@ -24,7 +24,13 @@
 //! `cursor`) that would turn a data mapping into an invocation. The
 //! host always selects the installation and context; `list`/`show` are
 //! the only operations v1 knows, and `form` views — disabled previews
-//! — can never acquire a binding.
+//! — can never acquire a binding. Optional producer fields that are
+//! absent on a record (`email`/`phone`/`source`/`consent.sms`) or null
+//! on a contextless run (`context_id`, `snapshot.context.id`), or
+//! absent on a workflow that never declares the input
+//! (`snapshot.inputs.subject`), are **omitted** cells — the live
+//! adapter emits no key rather than a raw `null`, and the descriptor's
+//! renderer shows the empty mark.
 //!
 //! Validation is two-layer: [`parse_binding`] checks the file's own
 //! grammar and bounds; [`validate_against`] additionally requires the
@@ -85,21 +91,21 @@ const FIELD_KEYS: &[&str] = &["field", "key", "format"];
 const BINDING_FILE_KEYS: &[&str] = &["contract", "app", "title", "bindings"];
 
 /// How one projected value actually arrives — the producer's real
-/// shape, never the package's claim. `Text` covers optional text
-/// columns (an absent/NULL cell renders as the host's empty mark);
-/// `Tags` is a list of tag strings; `Consent` is the
-/// `CustomerConsent` state (`granted`/`denied`/`unknown`, SMS may be
-/// absent → renders empty); `IntTimestamp` is a Unix epoch integer
-/// (run `created`/`updated`) — it projects through `number` (raw
-/// epoch) or `datetime` (host renders the timestamp), never `date`;
-/// `Digest` is a sha256 hex string the renderer shows as text;
-/// `Enum` supplies a fixed domain listed in the entry.
+/// shape, never the package's claim. `Text` is a scalar string
+/// (optional on the producer — an absent/NULL cell is omitted by the
+/// adapter and renders as the host's empty mark); `Tags` is a list of
+/// tag strings (the only list-shaped producer); `Consent` is the
+/// `CustomerConsent` state string (`granted`/`denied`/`unknown`, SMS
+/// may be absent → omitted); `Digest` is a sha256 hex string rendered
+/// as text; `Enum` supplies a fixed domain listed in the entry. A
+/// scalar producer can only fill a `scalar` kind and a scalar format
+/// it honestly produces — never `number`/`date`/`datetime` it cannot
+/// guarantee, and never a `list` kind.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Produced {
     Text,
     Tags,
     Consent,
-    IntTimestamp,
     Digest,
     Enum(&'static [&'static str]),
 }
@@ -119,13 +125,19 @@ enum Produced {
 /// surface: `snapshot.workflow.title`, `snapshot.inputs.subject`,
 /// `snapshot.context.id`. `state` is the run-state enum
 /// (`awaiting_approval`/`approved`/`running`/`succeeded`/`failed`/
-/// `cancelled`). `created`/`updated` are integer run timelines. The
-/// artifact surface is deliberately absent — artifact ids, digests,
-/// types, sizes and content are never projected v1.
+/// `cancelled`). `context_id`/`snapshot.context.id` are null on a
+/// contextless run and `snapshot.inputs.subject` is absent on
+/// workflows that never declare it (e.g. `source-instagram`'s
+/// `profile_handle`) — the adapter omits those cells. The artifact
+/// surface is deliberately absent — artifact ids, digests, types,
+/// sizes and content are never projected v1.
 const SOURCE_KEYS: &[(&str, &[(&str, Produced)])] = &[
     (
         "customers",
         &[
+            // `record_id` is the host adapter's rename of the record
+            // row's `id` field — the API response calls it `id`; the
+            // binding's key names the projected handle.
             ("record_id", Produced::Text),
             ("display_name", Produced::Text),
             ("email", Produced::Text),
@@ -153,8 +165,6 @@ const SOURCE_KEYS: &[(&str, &[(&str, Produced)])] = &[
             ),
             ("context_id", Produced::Text),
             ("snapshot_digest", Produced::Digest),
-            ("created", Produced::IntTimestamp),
-            ("updated", Produced::IntTimestamp),
             ("snapshot.workflow.title", Produced::Text),
             ("snapshot.inputs.subject", Produced::Text),
             ("snapshot.context.id", Produced::Text),
@@ -698,23 +708,19 @@ pub fn validate_against(
             }
             // The declared format must also be one the produced shape
             // can honestly fill — the package never invents a producer
-            // type. `tags` needs the source's list-of-tags; scalar
-            // text/number/date/datetime/enum need scalar producers;
-            // `enum` needs the source's own declared domain.
-            let shape_ok = match produced(&binding.source, &field.key) {
-                Some(Produced::Text) | Some(Produced::Digest) => {
-                    matches!(
-                        field.format.as_str(),
-                        "text" | "number" | "date" | "datetime"
-                    )
-                }
-                Some(Produced::Tags) => field.format == "tags",
-                Some(Produced::Consent) => field.format == "enum",
-                Some(Produced::IntTimestamp) => {
-                    matches!(field.format.as_str(), "number" | "datetime")
-                }
-                Some(Produced::Enum(_)) => field.format == "enum",
-                None => false,
+            // type, and a scalar producer can never claim `number`,
+            // `date` or `datetime` it does not produce, or a `list`
+            // kind. `tags` needs the source's list-of-tags; `enum`
+            // needs the source's own declared domain.
+            let shape_ok = match (produced(&binding.source, &field.key), field.format.as_str()) {
+                // Scalar string producers fill only `text` — never a
+                // number, calendar or digest renderer they cannot
+                // honestly produce.
+                (Some(Produced::Text) | Some(Produced::Digest), "text") => true,
+                (Some(Produced::Tags), "tags") => true,
+                (Some(Produced::Consent), "enum") => true,
+                (Some(Produced::Enum(_)), "enum") => true,
+                _ => false,
             };
             if !shape_ok {
                 return Err(fail(
@@ -722,6 +728,25 @@ pub fn validate_against(
                     format!(
                         "field '{}' maps '{}:{}' — its produced shape cannot fill descriptor format '{}'",
                         field.field, binding.source, field.key, field.format
+                    ),
+                ));
+            }
+            // The produced shape must also match the descriptor's
+            // scalar/list kind: `tags` is the only list-shaped
+            // producer, everything else is scalar. A scalar mapped to
+            // a descriptor `kind:"list"` would hand the cell
+            // consumer a string where it demands an array.
+            let kind_ok = match produced(&binding.source, &field.key) {
+                Some(Produced::Tags) => descriptor_field.kind == "list",
+                Some(_) => descriptor_field.kind == "scalar",
+                None => false,
+            };
+            if !kind_ok {
+                return Err(fail(
+                    &fpath,
+                    format!(
+                        "field '{}' maps '{}:{}' — its produced shape is not descriptor kind '{}'",
+                        field.field, binding.source, field.key, descriptor_field.kind
                     ),
                 ));
             }
@@ -814,14 +839,14 @@ mod tests {
         {"view":"runs","source":"caption-runs","ops":["list"],"fields":[
             {"field":"id","key":"id","format":"text"},
             {"field":"state","key":"state","format":"enum"},
-            {"field":"created","key":"created","format":"datetime"}
+            {"field":"subject","key":"snapshot.inputs.subject","format":"text"}
         ]}
     ]}"#;
     const DESCRIPTOR_RUNS: &str = r#"{"contract":"app-views/v1","app":"social-content","title":"Runs","views":[
         {"id":"runs","title":"Caption runs","kind":"table","fields":[
             {"id":"id","label":"Run","format":"text"},
             {"id":"state","label":"State","format":"enum","values":["awaiting_approval","approved","running","succeeded","failed","cancelled"]},
-            {"id":"created","label":"Created","format":"datetime"}
+            {"id":"subject","label":"Subject","format":"text"}
         ],"columns":[{"field":"id"},{"field":"state"}]}
     ]}"#;
 
@@ -834,6 +859,7 @@ mod tests {
             capabilities: Default::default(),
             summary: None,
             view_contract: Some(app_view::CONTRACT.to_string()),
+            binding_contract: Some(CONTRACT.to_string()),
             guide: String::new(),
         }
     }
@@ -851,6 +877,7 @@ mod tests {
             capabilities: Default::default(),
             summary: None,
             view_contract: Some(app_view::CONTRACT.to_string()),
+            binding_contract: Some(CONTRACT.to_string()),
             guide: String::new(),
         }
     }
@@ -865,7 +892,7 @@ mod tests {
         assert_eq!(binding.bindings[1].ops, vec!["show".to_string()]);
         let runs = parse_and_validate(BINDING_RUNS, &run_manifest(), DESCRIPTOR_RUNS).unwrap();
         assert_eq!(runs.bindings[0].source, "caption-runs");
-        assert_eq!(runs.bindings[0].fields[2].key, "created");
+        assert_eq!(runs.bindings[0].fields[2].key, "snapshot.inputs.subject");
     }
 
     /// Producer-shape honesty: a format that the real produced value
@@ -893,32 +920,37 @@ mod tests {
         let binding = parse_binding(&bad.to_string()).unwrap();
         let err = validate_against(&binding, &manifest, Some(&descriptor)).unwrap_err();
         assert!(err.to_string().contains("produced shape"), "{err}");
-        // A timestamp key on format `date` refuses — produced epoch ints
-        // are number-or-datetime, never a bare calendar date.
-        let mut bad = serde_json::from_str::<Value>(BINDING_RUNS).unwrap();
-        bad["bindings"][0]["fields"][2] =
-            serde_json::json!({"field":"created","key":"created","format":"number"});
-        let run_desc = app_view::parse_descriptor(
-            &DESCRIPTOR_RUNS.replace("\"format\":\"datetime\"", "\"format\":\"number\""),
-        )
-        .unwrap();
-        let binding = parse_binding(&bad.to_string()).unwrap();
-        assert!(
-            validate_against(&binding, &run_manifest(), Some(&run_desc)).is_ok(),
-            "number timestamp must be allowed"
-        );
-        let mut bad = serde_json::from_str::<Value>(BINDING_RUNS).unwrap();
-        bad["bindings"][0]["fields"][2] =
-            serde_json::json!({"field":"created","key":"created","format":"date"});
-        let run_desc = app_view::parse_descriptor(
-            &DESCRIPTOR_RUNS.replace("\"format\":\"datetime\"", "\"format\":\"date\""),
-        )
-        .unwrap();
-        let binding = parse_binding(&bad.to_string()).unwrap();
-        assert!(
-            validate_against(&binding, &run_manifest(), Some(&run_desc)).is_err(),
-            "date format on an epoch int must refuse"
-        );
+        // A scalar text key can never claim a `number`/`date`/`datetime`
+        // format — the produced string cannot honestly fill them.
+        for (key, fmt) in [
+            ("display_name", "number"),
+            ("display_name", "date"),
+            ("display_name", "datetime"),
+        ] {
+            let mut bad = base.clone();
+            bad["bindings"][0]["fields"][0] =
+                serde_json::json!({"field":"name","key":key,"format":fmt});
+            // Descriptor field `name` stays text — a mismatched declared
+            // format already refuses; test against a descriptor whose
+            // `name` field actually declares that format so only the
+            // produced-shape rule fires.
+            let desc = app_view::parse_descriptor(&DESCRIPTOR.replace(
+                "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\"}",
+                &format!("{{\"id\":\"name\",\"label\":\"Name\",\"format\":\"{fmt}\"}}"),
+            ));
+            // `number`/`date`/`datetime` fields are legal v1 grammar —
+            // the refusal must come from produced shape, not parse.
+            let desc = match desc {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let binding = parse_binding(&bad.to_string()).unwrap();
+            let err = validate_against(&binding, &manifest, Some(&desc)).unwrap_err();
+            assert!(
+                err.to_string().contains("produced shape"),
+                "{key}→{fmt} refused for the wrong reason: {err}"
+            );
+        }
         // An enum binding whose declared domain does not equal the
         // produced domain refuses (widened or narrowed).
         let mut bad = serde_json::from_str::<Value>(BINDING_RUNS).unwrap();
@@ -935,6 +967,31 @@ mod tests {
             validate_against(&binding, &run_manifest(), Some(&run_desc)).is_err(),
             "widened enum domain must refuse"
         );
+    }
+
+    /// The produced scalar/list shape must match the descriptor field's
+    /// declared `kind` — a scalar `display_name` can never fill a
+    /// `kind:"list"` cell (the consumer calls `stringList` on it).
+    #[test]
+    fn produced_shape_refuses_a_scalar_on_a_list_field() {
+        let manifest = manifest();
+        // Descriptor that declares `name` as a text list (v1 allows
+        // text kind:"list"); bind it to a scalar source key.
+        let desc = app_view::parse_descriptor(&DESCRIPTOR.replace(
+            "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\"}",
+            "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\",\"kind\":\"list\"}",
+        ))
+        .unwrap();
+        let mut bad = serde_json::from_str::<Value>(BINDING).unwrap();
+        bad["bindings"][0]["fields"][0] =
+            serde_json::json!({"field":"name","key":"display_name","format":"text"});
+        let binding = parse_binding(&bad.to_string()).unwrap();
+        let err = validate_against(&binding, &manifest, Some(&desc)).unwrap_err();
+        assert!(err.to_string().contains("kind"), "{err}");
+        // The same kind mismatch in reverse — `tags` (a real list) on a
+        // scalar field — is already covered by the format check, but the
+        // kind check stands alone: a `tags` key on a descriptor field
+        // wrongly declared scalar is refused by the format rule too.
     }
 
     #[test]
@@ -1145,5 +1202,37 @@ mod tests {
             "x".repeat(17 * 1024)
         );
         assert!(parse_binding(&big).is_err());
+    }
+
+    /// The shipped contract examples must validate end-to-end against
+    /// their matching `app-views/v1` examples — the two published
+    /// documents agree on view ids, field ids, formats and apps, so a
+    /// drift between the schema and the examples fails the suite.
+    #[test]
+    fn shipped_examples_validate_against_their_descriptors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for app in ["crm", "social-content"] {
+            let descriptor = std::fs::read_to_string(
+                root.join(format!("contracts/app-views/v1/examples/{app}.json")),
+            )
+            .unwrap();
+            let binding = std::fs::read_to_string(
+                root.join(format!("contracts/app-bindings/v1/examples/{app}.json")),
+            )
+            .unwrap();
+            let manifest = Manifest {
+                app: app.to_string(),
+                title: app.to_string(),
+                version: "1".to_string(),
+                connections: vec![],
+                capabilities: Default::default(),
+                summary: None,
+                view_contract: Some(app_view::CONTRACT.to_string()),
+                binding_contract: Some(CONTRACT.to_string()),
+                guide: String::new(),
+            };
+            parse_and_validate(&binding, &manifest, &descriptor)
+                .unwrap_or_else(|e| panic!("{app} example must validate: {e}"));
+        }
     }
 }
