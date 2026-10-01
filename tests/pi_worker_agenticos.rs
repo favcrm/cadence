@@ -10,6 +10,27 @@ use std::path::Path;
 
 const CATALOG: &str = include_str!("fixtures/agenticos-pi-models.json");
 
+#[test]
+fn agenticos_worker_uses_the_hosted_master_catalog_without_operator_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("state/master/pi");
+    std::fs::create_dir_all(&master).unwrap();
+    std::fs::write(master.join("models.json"), CATALOG).unwrap();
+    let ad = open_worker(root.path()).expect("hosted master catalog must seed workers");
+    ad.close();
+}
+
+#[test]
+fn agenticos_worker_live_model_switch_requires_reopening() {
+    let root = tempfile::tempdir().unwrap();
+    operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
+    let ad = open_worker(root.path()).unwrap();
+    std::fs::remove_file(root.path().join("operator/models.json")).unwrap();
+    let result = ad.session_command("model", Some("agenticos/z-ai/glm-5.3-flash"));
+    ad.close();
+    assert!(result.is_err(), "live switch bypassed catalog admission");
+}
+
 fn open_worker(root: &Path) -> cadence_agent::Result<PiAdapter> {
     let state = root.join("state");
     let pm = root.join("pm");
