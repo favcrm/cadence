@@ -7,6 +7,9 @@ set -eu
 # The checks set the suite lock env themselves; an inherited one (a lane
 # shell, pre-push) must not change what they prove.
 unset CADENCE_SUITE_LOCK CADENCE_REVIEW_SUITE_LOCK_HELD
+# CI forces colour on; the help-text checks below match plain text.
+NO_COLOR=1 CARGO_TERM_COLOR=never
+export NO_COLOR CARGO_TERM_COLOR
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUNNER="$ROOT/scripts/cadence-nextest"
