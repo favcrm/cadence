@@ -220,7 +220,7 @@ function SegmentList({
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
         Segments
       </h3>
-      <div className="crm-toolbar">
+      <div className="crm-toolbar mb-4">
         <p className="text-secondary text-ink-300">
           Saved rules over customer tags, source, consent and email domain.
         </p>

@@ -242,7 +242,7 @@ function CustomerList({
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
         Customers
       </h3>
-      <div className="crm-toolbar">
+      <div className="crm-toolbar mb-1">
         <div className="crm-search">
           <label className="sr-only" htmlFor="crm-customer-search">
             Search customers

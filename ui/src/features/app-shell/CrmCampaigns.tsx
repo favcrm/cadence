@@ -215,7 +215,7 @@ function CampaignList({
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
         Campaigns
       </h3>
-      <div className="crm-toolbar">
+      <div className="crm-toolbar mb-4">
         <p className="text-secondary text-ink-300">
           Versioned email content with content-only approval. Audience freezes and test-send
           receipts live on each campaign's detail page — the host stores no campaign-level
