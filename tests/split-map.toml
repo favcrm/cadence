@@ -821,6 +821,7 @@ tests = [
     "cad324_compaction_pack_survives_a_daemon_restart",
     "cad378_start_warns_on_overlap_owner_and_capacity",
     "cad378_bad_areas_config_is_reported_not_fatal",
+    "cad874_project_md_diagnostics_are_scrubbed",
     "cad378_area_ack_row_needs_the_owner",
     "cad378_area_ack_row_re_raises_on_new_commits",
     "cad378_lane_pm_binds_the_dispatch_record_not_frontmatter",
