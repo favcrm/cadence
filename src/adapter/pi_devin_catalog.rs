@@ -82,7 +82,14 @@ impl<'de> serde::Deserialize<'de> for UniqueValue {
     }
 }
 
-const LIMIT: u64 = 1_048_576;
+// Input byte cap, enforced before parsing, and structure caps. Basis: the
+// live catalog is about 270 KiB with about 54 families and a largest family
+// of 460 variants, so 2 MiB is about 7x headroom (the snapshot is worker-writable and re-read
+// at each launch, so it stays tight), 1024 families about 19x and 4096
+// variants per family about 9x.
+const LIMIT: u64 = 2 * 1_048_576;
+const MAX_FAMILIES: usize = 1024;
+const MAX_VARIANTS: usize = 4096;
 const MAX_AGE: u64 = 21_600_000;
 fn refusal() -> Error {
     Error::rejected("Offline Devin catalog unavailable or invalid; refresh the operator catalog and use a valid private worker cache")
@@ -160,8 +167,15 @@ fn text(value: &Value) -> bool {
             && text.chars().all(|c| c.is_ascii_graphic() || c == ' ')
     })
 }
-fn optional_text(value: &Value, key: &str) -> bool {
-    value.get(key).is_none_or(|v| v.is_null() || text(v))
+// Display-only strings (labels, cost text, aliases) are free Unicode such as
+// the live catalog's U+00B7 separator; control characters stay refused.
+fn display(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|t| !t.is_empty() && t.len() <= 512 && t.chars().all(|c| !c.is_control()))
+}
+fn optional_display(value: &Value, key: &str) -> bool {
+    value.get(key).is_none_or(|v| v.is_null() || display(v))
 }
 fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     let mut value = serde_json::from_slice::<UniqueValue>(bytes)
@@ -180,7 +194,7 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     let families = value["catalog"]["families"]
         .as_array()
         .ok_or_else(refusal)?;
-    if families.is_empty() || families.len() > 256 {
+    if families.is_empty() || families.len() > MAX_FAMILIES {
         return Err(refusal());
     }
     let mut selected = false;
@@ -189,19 +203,18 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
         if !keys(
             family,
             &["family_label", "family_uid", "slug", "aliases", "variants"],
-        ) || !["family_label", "family_uid", "slug"]
-            .iter()
-            .all(|key| text(&family[*key]))
+        ) || !display(&family["family_label"])
+            || !["family_uid", "slug"].iter().all(|key| text(&family[*key]))
             || !family.get("aliases").is_none_or(|aliases| {
                 aliases
                     .as_array()
-                    .is_some_and(|a| a.len() <= 32 && a.iter().all(text))
+                    .is_some_and(|a| a.len() <= 32 && a.iter().all(display))
             })
         {
             return Err(refusal());
         }
         let variants = family["variants"].as_array().ok_or_else(refusal)?;
-        if variants.is_empty() || variants.len() > 128 {
+        if variants.is_empty() || variants.len() > MAX_VARIANTS {
             return Err(refusal());
         }
         for variant in variants {
@@ -219,9 +232,9 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
                     "is_beta",
                 ],
             ) || !text(&variant["model_uid"])
-                || !text(&variant["label"])
-                || !optional_text(variant, "cost_summary")
-                || !optional_text(variant, "cost_tier")
+                || !display(&variant["label"])
+                || !optional_display(variant, "cost_summary")
+                || !optional_display(variant, "cost_tier")
                 || !variant.get("description").is_none_or(|v| {
                     v.is_null()
                         || v.as_str()
@@ -383,6 +396,136 @@ mod tests {
         std::fs::create_dir(&cache).unwrap();
         (dir, source, cache)
     }
+
+    fn family(uid: &str, count: usize) -> Value {
+        let variants: Vec<Value> = (0..count)
+            .map(|i| json!({"model_uid": format!("{uid}-v{i}"), "label": format!("{uid} v{i}")}))
+            .collect();
+        json!({"family_label":uid,"family_uid":uid,"slug":uid,"variants":variants})
+    }
+    fn seed_doc(doc: &Value) -> Result<()> {
+        let (_dir, source, cache) = fixture();
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/swe-2-high", NOW)
+    }
+    fn with_families(mut extra: Vec<Value>) -> Value {
+        let mut doc = catalog();
+        doc["catalog"]["families"]
+            .as_array_mut()
+            .unwrap()
+            .append(&mut extra);
+        doc
+    }
+    #[test]
+    fn accepts_live_sized_family_and_refuses_just_over_each_bound() {
+        // CAD-993: the live catalog's Fusion family has 460 variants.
+        seed_doc(&with_families(vec![family("fusion", 460)])).unwrap();
+        seed_doc(&with_families(vec![family("big", MAX_VARIANTS)])).unwrap();
+        assert!(seed_doc(&with_families(vec![family("big", MAX_VARIANTS + 1)])).is_err());
+        let many = |n: usize| (0..n - 1).map(|i| family(&format!("f{i}"), 1)).collect();
+        seed_doc(&with_families(many(MAX_FAMILIES))).unwrap();
+        assert!(seed_doc(&with_families(many(MAX_FAMILIES + 1))).is_err());
+    }
+    #[test]
+    fn accepts_trimmed_sample_with_real_live_string_shapes() {
+        // Real live shapes: a middle-dot in cost_summary, the real cost tiers,
+        // and nullable description / max_output_tokens / cost_summary.
+        let mut fusion = family("fusion", 460);
+        for (i, v) in fusion["variants"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            v["cost_summary"] =
+                json!("$0.5 / 1M Input \u{b7} $0.1 / 1M Cached input \u{b7} $2 / 1M Output");
+            v["cost_tier"] = json!(["High cost", "Med cost", "Low cost", "Free"][i % 4]);
+            v["description"] = if i % 2 == 0 {
+                Value::Null
+            } else {
+                json!("Synthetic description.")
+            };
+            v["max_context_tokens"] = json!(262000);
+            v["max_output_tokens"] = if i % 2 == 0 {
+                Value::Null
+            } else {
+                json!(64000)
+            };
+            v["is_new"] = json!(i % 3 == 0);
+            v["is_beta"] = json!(false);
+        }
+        fusion["aliases"] = json!(["fusion-alias"]);
+        let mut sparse = family("sparse", 2);
+        sparse["variants"][0]["cost_summary"] = Value::Null;
+        sparse["variants"][1]["cost_tier"] = Value::Null;
+        let doc = with_families(vec![fusion, sparse]);
+        let (_dir, source, cache) = fixture();
+        std::fs::write(&source, doc.to_string()).unwrap();
+        seed(&cache, &source, "devin/fusion-v459", NOW).unwrap();
+        assert!(cache.join("pi-devin/models.json").exists());
+    }
+    #[test]
+    fn display_fields_allow_unicode_but_never_control_and_ids_stay_ascii() {
+        let with = |f: fn(&mut Value)| {
+            let mut doc = catalog();
+            f(&mut doc);
+            seed_doc(&doc)
+        };
+        let v = |d: &mut Value| d["catalog"]["families"][0]["variants"][0].clone();
+        let _ = v;
+        assert!(with(|d| d["catalog"]["families"][0]["family_label"] = json!("S\u{b7}WE")).is_ok());
+        assert!(with(|d| d["catalog"]["families"][0]["aliases"] = json!(["a\u{b7}b"])).is_ok());
+        assert!(
+            with(|d| d["catalog"]["families"][0]["variants"][0]["label"] = json!("H\u{e9}"))
+                .is_ok()
+        );
+        assert!(
+            with(|d| d["catalog"]["families"][0]["variants"][0]["cost_tier"] = json!("a\nb"))
+                .is_err()
+        );
+        assert!(
+            with(|d| d["catalog"]["families"][0]["variants"][0]["label"] = json!("a\u{7}b"))
+                .is_err()
+        );
+        assert!(with(|d| d["catalog"]["families"][0]["slug"] = json!("sl\u{b7}ug")).is_err());
+        assert!(with(|d| d["catalog"]["families"][0]["family_uid"] = json!("f\u{b7}")).is_err());
+        assert!(with(
+            |d| d["catalog"]["families"][0]["variants"][0]["model_uid"] = json!("m\u{b7}")
+        )
+        .is_err());
+    }
+    // Operator check: CADENCE_REAL_CATALOG=<copy of the live models.json>
+    // CADENCE_REAL_MODEL=devin/<uid> cargo test --lib real_catalog -- --ignored
+    #[test]
+    #[ignore]
+    fn real_catalog_copy_is_accepted() {
+        let src = std::env::var("CADENCE_REAL_CATALOG").unwrap();
+        let model = std::env::var("CADENCE_REAL_MODEL").unwrap();
+        let bytes = std::fs::read(&src).unwrap();
+        let fetched = serde_json::from_slice::<Value>(&bytes).unwrap()["fetchedAt"]
+            .as_u64()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let source = dir.path().join("copy.json");
+        std::fs::write(&source, &bytes).unwrap();
+        seed(&cache, &source, &model, fetched).unwrap();
+    }
+    #[test]
+    fn padded_valid_catalog_is_accepted_at_the_byte_cap_and_refused_past_it() {
+        for (extra, ok) in [(0usize, true), (1, false)] {
+            let (_dir, source, cache) = fixture();
+            let mut padded = catalog().to_string().into_bytes();
+            padded.resize(LIMIT as usize + extra, b' ');
+            std::fs::write(&source, &padded).unwrap();
+            assert_eq!(
+                seed(&cache, &source, "devin/swe-2-high", NOW).is_ok(),
+                ok,
+                "extra {extra}"
+            );
+        }
+    }
     #[test]
     fn seeds_only_catalog_and_preserves_private_existing_snapshot() {
         let (_dir, source, cache) = fixture();
@@ -429,7 +572,11 @@ mod tests {
         let (dir, source, cache) = fixture();
         std::fs::remove_file(&source).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
-        std::fs::write(&source, vec![b' '; 1_048_577]).unwrap();
+        // A VALID catalog padded with trailing whitespace past the cap: only
+        // the byte cap can refuse it, not JSON parsing.
+        let mut padded = catalog().to_string().into_bytes();
+        padded.resize(LIMIT as usize + 1, b' ');
+        std::fs::write(&source, &padded).unwrap();
         assert!(seed(&cache, &source, "devin/swe-2-high", NOW).is_err());
         std::fs::remove_file(&source).unwrap();
         let real = dir.path().join("real.json");
