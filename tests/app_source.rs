@@ -884,6 +884,28 @@ fn aggregate_bundle_bytes_refuse() {
 }
 
 #[test]
+fn an_existing_blob_sha_refuses_as_a_commit() {
+    if !in_own_process("an_existing_blob_sha_refuses_as_a_commit", &[]) {
+        return;
+    }
+    let orig_path = std::env::var_os("PATH").unwrap();
+    let f = GitFixture::basic();
+    // This blob is reachable from HEAD and is included in a full
+    // clone. Its refusal therefore exercises object type verification,
+    // rather than the missing-object path.
+    let blob = fixture_git_sha(
+        &f.repo,
+        &["rev-parse", &format!("{}:bundles/app/app.md", f.sha2)],
+    );
+    assert_ne!(blob, f.sha1);
+    assert_ne!(blob, f.sha2);
+    use_bin(&f, &orig_path);
+    let source = SelectedGitSource::new(FIXTURE_URL, &blob, FIXTURE_DIR).unwrap();
+    assert!(resolve(&source).is_err());
+    assert!(f.argv_log().contains("clone"));
+}
+
+#[test]
 fn non_utf8_member_name_refuses() {
     if !in_own_process("non_utf8_member_name_refuses", &[]) {
         return;
