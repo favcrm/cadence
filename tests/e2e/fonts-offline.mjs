@@ -8,7 +8,7 @@
 // carries board.mjs's routing policy (route.mjs). The screenshot gets
 // a 10 s budget; before the fix it waited out the whole budget on the
 // hung font. Exits 1 when the capture times out, when a font request
-// reached the network, or when a font counts as an off-host reach.
+// reached the network, or when the off-host font is not recorded as an off-host reach.
 
 import { chromium } from "playwright-core";
 import http from "node:http";
@@ -48,7 +48,8 @@ try {
   await page.goto(origin, { waitUntil: "domcontentloaded" });
   await page.screenshot({ timeout: 10_000, fullPage: true });
   if (hung.length) failure = `the hung font reached the server: ${hung}`;
-  else if (offsite.length) failure = `a font counted as an off-host reach: ${offsite}`;
+  else if (offsite.length !== 1 || !offsite[0].startsWith("http://fonts.invalid/"))
+    failure = `the off-host font must be recorded exactly once: ${offsite}`;
 } catch (e) {
   failure = String(e?.message ?? e);
 } finally {
