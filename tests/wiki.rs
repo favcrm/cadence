@@ -1486,9 +1486,14 @@ fn dedupe_refuses_a_nonregular_object_at_the_hash_name() {
     assert_eq!(std::fs::read(blobs.join(&sha)).unwrap(), bytes);
 
     for (i, plant) in ["dir", "symlink"].into_iter().enumerate() {
-        // Publish bytes_b once, then replace its object with a
-        // non-regular entry under the same hash name.
-        let bytes_b: &[u8] = b"nonregular-object bytes";
+        // Publish distinct bytes once, then replace the object with a
+        // non-regular entry under the same hash name. The bytes differ
+        // per iteration so the first publish never re-collides with a
+        // previous iteration's planted entry.
+        let bytes_b: &[u8] = match plant {
+            "dir" => b"nonregular-object bytes, dir case",
+            _ => b"nonregular-object bytes, symlink case",
+        };
         let tmp_b = stage_upload(&uploads, &format!("b{i}.bin"), bytes_b);
         let first = cadence_agent::wiki::put_blob(
             &pm,
