@@ -1616,32 +1616,14 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         IssueAction::Link { id, kind, target } => {
             let pm = open_pm()?;
-            let sd = crate::client::state_dir().ok();
-            print_json(&write::link(
-                &pm,
-                id,
-                kind,
-                target,
-                false,
-                None,
-                "",
-                sd.as_deref(),
-            )?);
+            let sd = Some(state_dir);
+            print_json(&write::link(&pm, id, kind, target, false, None, "", sd)?);
             Ok(0)
         }
         IssueAction::Unlink { id, kind, target } => {
             let pm = open_pm()?;
-            let sd = crate::client::state_dir().ok();
-            print_json(&write::link(
-                &pm,
-                id,
-                kind,
-                target,
-                true,
-                None,
-                "",
-                sd.as_deref(),
-            )?);
+            let sd = Some(state_dir);
+            print_json(&write::link(&pm, id, kind, target, true, None, "", sd)?);
             Ok(0)
         }
         IssueAction::Ref {
@@ -1751,8 +1733,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 force: force.clone(),
             };
             let pm = open_pm()?;
-            let sd = crate::client::state_dir().ok();
-            let out = crate::issue::edit::edit(&pm, id, &spec, "", sd.as_deref())?;
+            let sd = Some(state_dir);
+            let out = crate::issue::edit::edit(&pm, id, &spec, "", sd)?;
             print_json(&out);
             if out["worktree_open"].is_array() {
                 eprintln!("{id}: worktree open: run cadence issue finish {id}");

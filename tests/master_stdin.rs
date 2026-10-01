@@ -177,6 +177,25 @@ fn master_stdin_and_file_reads_are_refused_on_comment_and_edit() {
     )
     .unwrap();
     assert!(init.status.success());
+    // CAD-908: a REAL ticket, so "nothing stored" is a claim about a
+    // ticket that exists — a refusal that ran too late would have
+    // written a comment or a front edit onto D-1.
+    for args in [
+        &["issue", "project", "add", "demo", "--prefix", "D"][..],
+        &["issue", "new", "target", "--project", "demo"][..],
+    ] {
+        let (ok, text) = run(&pm, &state, false, args);
+        assert!(ok, "seed {args:?}: {text}");
+    }
+    assert!(pm.join("demo/D-1/issue.md").is_file(), "ticket D-1 seeded");
+    let rev = |args: &[&str]| {
+        let out = cadence_agent::reaper::output(Command::new("git").arg("-C").arg(&pm).args(args))
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let head = rev(&["rev-parse", "HEAD"]);
+    let issue_before = std::fs::read(pm.join("demo/D-1/issue.md")).unwrap();
     let env = [("CADENCE_GRANT_TOKEN", "x")];
     let cases: &[&[&str]] = &[
         &["issue", "comment", "D-1", "--file", "-"],
@@ -199,4 +218,20 @@ fn master_stdin_and_file_reads_are_refused_on_comment_and_edit() {
         contains_secret(&pm).is_none(),
         "stdin stored in the tracker"
     );
+    assert_eq!(
+        rev(&["rev-parse", "HEAD"]),
+        head,
+        "a refused call committed"
+    );
+    assert_eq!(
+        std::fs::read(pm.join("demo/D-1/issue.md")).unwrap(),
+        issue_before
+    );
+    let files = |sub: &str| {
+        std::fs::read_dir(pm.join("demo/D-1").join(sub))
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0)
+    };
+    assert_eq!(files("comments"), 0, "a comment landed");
+    assert_eq!(files("artifacts"), 0, "an attachment landed");
 }
