@@ -56,8 +56,8 @@ itself. A change to *this* rule is class `human` (trigger 7) and can
 never approve itself.
 
 ### Review count by diff (CAD-957)
-A PR whose every changed path is in the one-review set
-(`docs/roles/one-review-paths.toml`) needs one independent review covering
+A PR whose every change qualifies under the one-review allowlist
+(`docs/roles/one-review-paths.toml`, match rules in its header) needs one independent review covering
 standards and spec. Everything else keeps two. This changes only the count:
 a `human` trigger still needs the operator, and the file is itself trigger 7.
 

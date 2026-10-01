@@ -24,12 +24,19 @@ this workflow exactly.
   never on main.
 
 ### Design contract first (CAD-957)
-A ticket that touches a daemon-enforced rule (gate, lease, lock, fence,
-operator-only action, exactly-once) starts with a filled
-`docs/design/CONTRACT-TEMPLATE.md`, in the ticket or the PR. One
-Spec/security reviewer (not the author) passes the contract BEFORE code.
-The PR links it. The code reviewers check the code against it, and each
-adversarial test it names must exist and fail without its guard.
+A ticket needs a design contract when it touches a daemon-enforced rule
+(gate, lease, lock, fence, operator-only action, exactly-once) or a
+`docs/roles/risk-classes.md` trigger 1-3 or 7. The PM or ticket author
+declares it, a reviewer may add it, and when unsure it counts.
+- The assignee writes it from `docs/design/CONTRACT-TEMPLATE.md`, in the
+  ticket or the PR, before code.
+- One Spec/security reviewer (not the author) passes it BEFORE code, in a
+  verdict note titled `# Verdict: <ID> Design contract review — pass|revise`,
+  pinned to the contract's commit or blob SHA. A changed contract voids it.
+- The code PR links the contract and cites that note. Its reviewers check
+  the code against the contract, and each adversarial test it names must
+  exist and fail without its guard. The contract reviewer MAY also do the
+  code's Spec/security review.
 
 ### Review: what a merge needs (interim, CAD-815)
 Until the delivery loop enforces a per-project policy (CAD-814), every
@@ -51,11 +58,11 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
-- **Risk-sized count (CAD-957):** a PR whose every changed path matches
-  `one_review_include` and no `one_review_exclude` in
-  `docs/roles/one-review-paths.toml` (tests, non-gate docs, ui tests;
-  not `docs/roles/**`, `docs/TEAM.md`, `docs/CHARTER.md`, this file) needs
-  ONE independent review covering both standards and spec. Any other PR
+- **Risk-sized count (CAD-957):** a PR whose every change qualifies under
+  `docs/roles/one-review-paths.toml` (an allowlist of plain guides and ui
+  tests, with the match rules in its header) needs ONE independent review
+  covering standards and spec, filed as
+  `# Verdict: <ID> Review (standards+spec) — pass|revise`. Any other PR
   keeps two. `human` triggers are unchanged. That file is the only list;
   scripts read it.
 - **Browser QA** at desktop and narrow widths when the PR changes
