@@ -481,9 +481,7 @@ struct FakeImportDoor {
 impl FakeImportDoor {
     fn start() -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let addr = server.server_addr().to_ip().unwrap().to_string()
-            + ":"
-            + &server.server_addr().to_port().to_string();
+        let addr = server.server_addr().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let workspace = Arc::new(Mutex::new(None::<String>));
