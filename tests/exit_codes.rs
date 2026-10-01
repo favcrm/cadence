@@ -59,7 +59,7 @@ fn error_frame(kind: &str, code: Option<&str>) -> Value {
 
 #[test]
 fn every_kind_exits_with_its_table_code_and_prints_json() {
-    let cases: [(&str, Option<&str>, i32, &str); 8] = [
+    let cases: [(&str, Option<&str>, i32, &str); 11] = [
         ("rejected", None, 3, "rejected"),
         ("gate", None, 4, "gate"),
         ("conflict", Some("revision_conflict"), 5, "conflict"),
@@ -70,6 +70,10 @@ fn every_kind_exits_with_its_table_code_and_prints_json() {
         // A kind this build does not know is a failure, never a success
         // and never a code that claims a meaning.
         ("from_the_future", None, 70, "internal"),
+        // The kind is chosen by one match whether or not a code is present.
+        ("gate", Some("legacy_write_lock"), 4, "gate"),
+        ("from_the_future", Some("x"), 70, "internal"),
+        ("busy", None, 75, "busy"),
     ];
     for (kind, code, want_exit, want_kind) in cases {
         let out = against_fake_daemon(error_frame(kind, code));
@@ -77,6 +81,33 @@ fn every_kind_exits_with_its_table_code_and_prints_json() {
         assert_eq!(out.status.code(), Some(want_exit), "{kind}: {json}");
         assert_eq!(json["kind"], want_kind, "{kind}: {json}");
         assert_eq!(json["error"], format!("a {kind} failure"), "{kind}");
+    }
+}
+
+#[test]
+fn a_legacy_write_lock_refusal_exits_4_not_75() {
+    // The wire shape `PmLock::busy_error(legacy)` produces: a coded gate.
+    let out = against_fake_daemon(error_frame("gate", Some("legacy_write_lock")));
+    let json = stderr_json(&out);
+    assert_eq!(out.status.code(), Some(4), "{json}");
+    assert_eq!(json["code"], "legacy_write_lock");
+}
+
+#[test]
+fn a_bare_parent_command_prints_plain_help_on_stderr_with_exit_2() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [vec![], vec!["issue"], vec!["agent"]] {
+        let mut cmd = cadence(home.path());
+        cmd.args(&args);
+        let out = cadence_agent::reaper::output(&mut cmd).unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(err.contains("Usage:"), "{args:?}: {err}");
+        assert!(
+            serde_json::from_str::<Value>(&err).is_err(),
+            "{args:?}: help must be plain text, not JSON"
+        );
+        assert!(out.stdout.is_empty(), "{args:?}");
     }
 }
 

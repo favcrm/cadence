@@ -621,3 +621,27 @@ fn a_fifo_or_symlink_at_the_fence_path_is_legacy_unknown_and_never_blocks() {
         assert!(legacy.symlink_metadata().is_ok(), "{kind} was removed");
     }
 }
+
+/// CAD-876: exit 75 means "retry", so only a lock that frees by itself
+/// may be `busy`. A legacy `.write.lock` is never removed or aged out by
+/// this build: it must be a non-retryable, coded gate.
+#[test]
+fn a_legacy_lock_refusal_is_a_gate_and_a_live_writer_is_busy() {
+    let (_tmp, pm) = tracker();
+    let held = pm.lock().unwrap();
+    let busy = pm.acquire_for(Duration::from_millis(100)).err().unwrap();
+    assert_eq!(busy.kind(), "busy", "{busy}");
+    assert_eq!(busy.code(), Some("resource_busy"));
+    drop(held);
+    std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    let legacy = pm.acquire_for(Duration::from_millis(100)).err().unwrap();
+    assert_eq!(legacy.kind(), "gate", "{legacy}");
+    assert_eq!(legacy.code(), Some("legacy_write_lock"));
+    assert_eq!(
+        crate::error::exit_code_for_kind(legacy.kind()),
+        4,
+        "legacy lock must not look retryable"
+    );
+    assert!(legacy.to_string().contains(".write.lock"), "{legacy}");
+    assert!(legacy.to_string().contains("rollout owner"), "{legacy}");
+}

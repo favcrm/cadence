@@ -3347,7 +3347,12 @@ pub(crate) fn run() -> Result<i32> {
         Err(e) => {
             let e = email_flag_error(&e).unwrap_or(e);
             // `--help` and `--version` print to stdout and exit 0 as before.
-            if !e.use_stderr() {
+            // A bare parent command (`cadence issue`) prints its help as
+            // plain text on stderr, exit 2, as before CAD-876: help stays
+            // readable and JSON is for real usage errors.
+            if !e.use_stderr()
+                || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            {
                 e.exit();
             }
             // CAD-876: a usage error is a JSON error like every other one

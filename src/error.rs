@@ -7,6 +7,8 @@
 //!   never silently retried.
 //! - [`Error::Internal`]: local runtime failures (I/O, storage, protocol).
 //! - [`Error::busy`]: transient resource contention, not loss of authority.
+//!   Only a condition that frees by itself may be `busy`; a standing
+//!   refusal that needs an operator is a coded `gate` ([`Error::gate_coded`]).
 
 use std::fmt;
 
@@ -99,6 +101,16 @@ impl Error {
             revision: None,
         })
     }
+    /// A standing refusal with a stable code: no retry helps until an
+    /// operator clears the reason (exit 4, never the retryable `busy`).
+    pub fn gate_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "gate",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {
         Self::Structured(Structured {
@@ -164,8 +176,10 @@ impl Error {
 /// verb-specific 2 (`doctor --host`, `setup`, `audit`, `message`
 /// pending, `agent-uid provision`) predate the table; it only adds
 /// codes that none of them uses, and `usage` shares the clap-compatible
-/// 2. `busy` and `unknown` are the retryable kinds; `unknown` stays 1
-/// so an unrecognised kind still looks like the old generic failure.
+/// 2. Only `busy` (75) may be retried blindly, a bounded few times;
+/// `unknown` (1) may be retried only after checking whether the effect
+/// landed. `gate` (4) is final until an operator clears its reason. An
+/// unrecognised kind exits 1, like the old generic failure.
 pub const EXIT_TABLE: &[(&str, i32)] = &[
     ("usage", 2),
     ("rejected", 3),

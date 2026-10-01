@@ -49,16 +49,28 @@ pub fn unwrap(frame: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let revision = frame.pointer("/error/revision").and_then(Value::as_i64);
-    if kind == "conflict" || code.is_some() {
+    // CAD-876: ONE match picks the kind, whether or not a code came with
+    // it. Known kinds survive the wire; anything else is `internal` (70).
+    let kind: &'static str = match kind {
+        "rejected" => "rejected",
+        "conflict" => "conflict",
+        "busy" => "busy",
+        "gate" => "gate",
+        "provider" => "provider",
+        "unknown" => "unknown",
+        _ => "internal",
+    };
+    // `conflict` and `busy` only exist as structured errors; any other
+    // kind is structured only when the frame carries a code.
+    if code.is_some() || matches!(kind, "conflict" | "busy") {
+        let default_code = match kind {
+            "busy" => "resource_busy",
+            "conflict" => "revision_conflict",
+            other => other,
+        };
         return Err(Error::Structured(crate::error::Structured {
-            // CAD-876: `busy` keeps its kind across the wire so the
-            // CLI exits 75 (retryable), not 3 (final).
-            kind: match kind {
-                "conflict" => "conflict",
-                "busy" => "busy",
-                _ => "rejected",
-            },
-            code: code.unwrap_or_else(|| "rejected".to_string()),
+            kind,
+            code: code.unwrap_or_else(|| default_code.to_string()),
             message,
             revision,
         }));
