@@ -20,7 +20,7 @@ TOOLCHAIN = ROOT / "rust-toolchain.toml"
 SCRIPT = ROOT / "scripts/ci-rust-toolchain"
 EXACT = re.compile(r"\d+\.\d+\.\d+")
 INSTALL = re.compile(r"^\s*(?:- )?(?:run: )?(?:\./|control/|\$GITHUB_WORKSPACE/)?scripts/ci-rust-toolchain(?: .*)?$")
-CARGO_USE = re.compile(r"\bcargo (?:build|test|clippy|fmt|check|nextest)\b|scripts/cadence-nextest")
+CARGO_USE = re.compile(r"\bcargo [a-z]|scripts/cadence-nextest|\bmvp\.sh\b|delivery-candidate\.py mutation|test-feedback\.py run")
 JOB = re.compile(r"(?m)^  ([A-Za-z0-9_-]+):\n")
 
 
@@ -49,6 +49,21 @@ def jobs(text):
     return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
 
 
+def checkout_paths(lines):
+    """`path:` of each actions/checkout step in a job (None when it has none)."""
+    out = []
+    for i, l in enumerate(lines):
+        if "actions/checkout" not in l:
+            continue
+        m = None
+        for nxt in lines[i + 1:]:
+            if re.match(r"\s*- ", nxt):
+                break
+            m = m or re.match(r"\s+path: (\S+)", nxt)
+        out.append(m.group(1) if m else None)
+    return out
+
+
 def check_workflow(name, text):
     """Problems in one workflow's Rust installs."""
     problems = []
@@ -68,9 +83,19 @@ def check_workflow(name, text):
         installs = [i for i, l in enumerate(lines) if INSTALL.match(l)]
         if uses_cargo and not installs:
             problems.append(f"{name}:{job}: runs cargo without installing the pinned toolchain")
+        paths = checkout_paths(lines)
         for i in installs:
             if not any("actions/checkout" in l for l in lines[:i]):
                 problems.append(f"{name}:{job}: toolchain install precedes checkout")
+            m = re.match(r"\s*(?:- )?run: (\S*?)scripts/ci-rust-toolchain(.*)$", lines[i])
+            prefix, args = (m.group(1), m.group(2)) if m else ("", "")
+            if prefix in ("", "./", "$GITHUB_WORKSPACE/"):
+                if None not in paths:
+                    problems.append(f"{name}:{job}: bare {prefix}scripts/ path but every checkout sets path: {sorted(paths)}")
+            elif prefix.rstrip("/") not in paths:
+                problems.append(f"{name}:{job}: install runs {prefix}scripts/ but no checkout sets path: {prefix.rstrip('/')}")
+            if any(paths) and "--export" not in args.split():
+                problems.append(f"{name}:{job}: cargo runs in a non-root checkout, so the install needs --export")
     return problems
 
 
@@ -147,9 +172,43 @@ class Mutations(unittest.TestCase):
         self.assertTrue(any("RUSTUP_TOOLCHAIN" in p for p in got), got)
 
     def test_toolchain_action_is_caught(self):
-        got = self.mutate("mutation.yml", "scripts/ci-rust-toolchain --profile minimal",
+        got = self.mutate("mutation.yml", "run: control/scripts/ci-rust-toolchain --export --profile minimal",
                           "uses: dtolnay/rust-toolchain@stable")
         self.assertTrue(got)
+
+    def test_bare_script_path_when_every_checkout_has_a_path_is_caught(self):
+        for name in ("mutation.yml", "test-feedback.yml"):
+            got = self.mutate(name, "run: control/scripts/ci-rust-toolchain", "run: scripts/ci-rust-toolchain")
+            self.assertTrue(any("every checkout sets path" in p for p in got), (name, got))
+        got = self.mutate("mutation.yml", "run: control/scripts/ci-rust-toolchain", "run: ./scripts/ci-rust-toolchain")
+        self.assertTrue(got)
+
+    def test_control_prefix_without_a_control_checkout_is_caught(self):
+        got = self.mutate("ci.yml", "      - run: scripts/ci-rust-toolchain --profile minimal --component rustfmt",
+                          "      - run: control/scripts/ci-rust-toolchain --profile minimal --component rustfmt")
+        self.assertTrue(any("no checkout sets path: control" in p for p in got), got)
+
+    def test_missing_export_with_a_non_root_checkout_is_caught(self):
+        for name in ("mutation.yml", "test-feedback.yml", "staging.yml"):
+            got = self.mutate(name, "control/scripts/ci-rust-toolchain --export", "control/scripts/ci-rust-toolchain")
+            self.assertTrue(any("needs --export" in p for p in got), (name, got))
+
+    def test_deleting_the_install_from_cargo_jobs_is_caught(self):
+        cases = {
+            "staging.yml": "      - run: control/scripts/ci-rust-toolchain --export --profile minimal\n",
+            "mutation.yml": "      - run: control/scripts/ci-rust-toolchain --export --profile minimal\n",
+            "test-feedback.yml": "      - run: control/scripts/ci-rust-toolchain --export --profile minimal\n",
+            "ci.yml": "      - run: scripts/ci-rust-toolchain --profile minimal\n      - name: Tag names this version and is on main\n",
+        }
+        for name, old in cases.items():
+            keep = old.split("\n", 1)[1] if old.count("\n") > 1 else ""
+            got = self.mutate(name, old, keep)
+            self.assertTrue(any("without installing" in p for p in got), (name, got))
+
+    def test_widened_cargo_detector_sees_every_entry_point(self):
+        for line in ("cargo metadata --no-deps", "scripts/e2e/mvp.sh --no-build",
+                     "python3 x/delivery-candidate.py mutation --t", "python3 x/test-feedback.py run --r"):
+            self.assertTrue(CARGO_USE.search(line), line)
 
     def test_dropping_the_install_step_is_caught(self):
         got = self.mutate("stress.yml", "      - run: scripts/ci-rust-toolchain --profile minimal\n", "")
@@ -201,11 +260,19 @@ class InstallScript(unittest.TestCase):
         self.assertEqual(ghenv.strip(), f"RUSTUP_TOOLCHAIN={channel}")
 
     def test_floating_channel_in_the_file_is_refused_without_installing(self):
-        for bad in ("stable", "1.99", ""):
+        for bad in ("stable", "1.99", "", "1.99.0-beta.1", "1x.2.3", "1.99.0\\n9", "01.2.3x"):
             toml = f'[toolchain]\nchannel = "{bad}"\n'
             r, argv, _ = self.run_script(toml, "--profile", "minimal")
             self.assertNotEqual(r.returncode, 0, bad)
             self.assertIsNone(argv, f"rustup ran for {bad!r}")
+
+    def test_two_channel_lines_are_refused_without_installing(self):
+        for toml in ('[toolchain]\nchannel = "1.99.0"\nchannel = "1.98.1"\n',
+                     '[toolchain]\nchannel = "1.99.0"\n[other]\nchannel = "1.99.0"\n',
+                     '[toolchain]\n'):
+            r, argv, _ = self.run_script(toml, "--profile", "minimal")
+            self.assertNotEqual(r.returncode, 0, toml)
+            self.assertIsNone(argv, toml)
 
 
 if __name__ == "__main__":

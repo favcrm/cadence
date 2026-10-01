@@ -73,7 +73,7 @@ def touched(changed, *prefixes):
 def rust_changed(changed):
     if changed is None:
         return True
-    return any(p.endswith(".rs") or p in ("Cargo.toml", "Cargo.lock", "build.rs")
+    return any(p.endswith(".rs") or p in ("Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml")
                or p.endswith("/Cargo.toml") for p in changed)
 
 

@@ -112,6 +112,14 @@ class PrePush(unittest.TestCase):
         self.assertIn("tests/split-map.toml [binaries.foo]", r.stdout)
         self.assertEqual(self.calls(), ["cargo fmt --all -- --check [jobs=4]"])
 
+    def test_toolchain_pin_change_runs_clippy(self):
+        # CAD-927: bumping rust-toolchain.toml changes lints, so clippy must run.
+        self.edit("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n')
+        r = self.pp()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotRegex(r.stdout, r"\[SKIP\] clippy")
+        self.assertTrue(any("clippy" in c for c in self.calls()), self.calls())
+
     def test_verdict_is_the_exit_code_not_the_text(self):
         # The stub prints "clean" and exits 1: still a failure.
         self.edit("src/lib.rs", "pub fn x() {}\n")
