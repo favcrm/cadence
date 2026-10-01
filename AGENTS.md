@@ -63,13 +63,18 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     qa-verdict-status, or risk-class gates.
   - **Risk-sized count (CAD-957):** an exception to the two-reviewer
     default. A PR whose every change qualifies under
-    `docs/roles/one-review-paths.toml` (an allowlist of plain prose guides,
-    with the match rules in its header) needs ONE independent review
+    `docs/roles/one-review-paths.toml` (an allowlist of plain prose guides
+    and, per CAD-965, top-level test files `tests/*.rs` and
+    `tests/common/**`, with the match rules in its header) needs ONE
+    independent review
     covering standards and spec, filed as
     `# Verdict: <ID> Review (standards+spec) — pass|revise`. Unlike
     solo-operator scaling, it needs no operator approval for the count.
-    Any other PR keeps two. `human` triggers are unchanged. That file is
-    the only list; scripts read it.
+    For a test-only PR the single reviewer must state in the verdict
+    that no adversarial gate test was weakened or deleted, naming the
+    tests checked. Any other PR (including any with `src/**`) keeps two.
+    `human` triggers are unchanged. That file is the only list; scripts
+    read it.
 - **Browser QA** at desktop and narrow widths when the PR changes
   `ui/**`.
 - **Operator approval** when any `human` trigger in

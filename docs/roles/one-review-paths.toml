@@ -18,11 +18,17 @@
 # - An empty diff, an unreadable or malformed TOML file disqualifies.
 # A disqualified PR keeps two reviews. `human` triggers apply on top.
 #
-# Tests (tests/*.rs, src/**/tests.rs, tests/scripts/**, fixtures, split maps)
-# are NOT listed: they can hold adversarial gate tests or decide what CI runs.
+# CAD-965 (operator decision 2026-10-01): top-level test files (`tests/*.rs`,
+# which `*` keeps to one segment) and `tests/common/**` need one review.
+# Not listed, so they keep two: `src/**` (including src/**/tests.rs) and the
+# excluded tests/scripts/**, fixtures and split maps, which decide what CI runs.
+# The single reviewer must state in the verdict that no adversarial gate test
+# was weakened or deleted, naming the tests checked (AGENTS.md).
 one_review_include = [
   "docs/guides/**",
   "docs/ui/**",
+  "tests/*.rs",
+  "tests/common/**",
 ]
 # Redundant with the allowlist on purpose: these stay two-review even if an
 # include glob is ever widened.
