@@ -1,0 +1,38 @@
+#!/bin/sh
+# CAD-927: install the Rust toolchain pinned in rust-toolchain.toml.
+#
+#   ci-rust-toolchain [--export] [rustup toolchain install args...]
+#
+# The channel is read from rust-toolchain.toml next to this script's
+# repository root, so the version lives in exactly one file. Remaining
+# arguments (--profile, --component) go to `rustup toolchain install`.
+# --export also appends RUSTUP_TOOLCHAIN=<channel> to $GITHUB_ENV, for jobs
+# that build a checkout other than the workspace (which may predate the file).
+# The file must hold exactly one `channel = "x.y.z"` line; anything else
+# (stable, 1.99, 1.99.0-beta.1, two channel lines) is refused before rustup runs.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+file="$root/rust-toolchain.toml"
+export_env=0
+if [ "${1:-}" = "--export" ]; then
+    export_env=1
+    shift
+fi
+
+lines=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$file")
+count=$(printf '%s\n' "$lines" | grep -c . || true)
+if [ "$count" != 1 ]; then
+    echo "ci-rust-toolchain: $file must have exactly one channel line, found $count" >&2
+    exit 1
+fi
+channel=$lines
+if ! printf '%s\n' "$channel" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+    echo "ci-rust-toolchain: $file must pin an exact x.y.z channel, got '$channel'" >&2
+    exit 1
+fi
+
+rustup toolchain install "$channel" "$@"
+if [ "$export_env" = 1 ]; then
+    echo "RUSTUP_TOOLCHAIN=$channel" >> "${GITHUB_ENV:?--export needs GITHUB_ENV}"
+fi

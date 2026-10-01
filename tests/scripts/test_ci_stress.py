@@ -209,7 +209,7 @@ class StressWorkflow(unittest.TestCase):
     def test_mutation_cache_saves(self):
         self.assertRejects(self.text.replace("save-if: false", "save-if: true", 1), "save-if")
         self.assertRejects(self.text.replace("          save-if: false\n", "", 1), "save-if")
-        mutated = self.text.replace("      - run: rustup toolchain install stable --profile minimal\n", "      - uses: actions/cache@0000000000000000000000000000000000000000\n        with:\n          path: target\n          key: k\n      - run: rustup toolchain install stable --profile minimal\n", 1)
+        mutated = self.text.replace("      - run: scripts/ci-rust-toolchain --profile minimal\n", "      - uses: actions/cache@0000000000000000000000000000000000000000\n        with:\n          path: target\n          key: k\n      - run: scripts/ci-rust-toolchain --profile minimal\n", 1)
         self.assertRejects(mutated, "actions/cache")
 
     def test_mutation_setup_node_cache(self):

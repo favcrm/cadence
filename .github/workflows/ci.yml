@@ -144,7 +144,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: scripts/ci-rust-toolchain --profile minimal --component rustfmt
       - run: cargo fmt --all -- --check
       - name: Validate manual benchmark width
         env:
@@ -219,6 +219,9 @@ jobs:
       # workflow (0 jobs), which the regex-based contracts cannot see.
       - name: Test workflows parse strictly (no duplicate keys)
         run: python3 tests/scripts/test_workflows_strict.py
+      # CAD-927: every Rust install follows the pin in rust-toolchain.toml.
+      - name: Test the Rust toolchain pin
+        run: python3 tests/scripts/test_ci_toolchain_pin.py
       # CAD-958: the manual stress workflow stays dispatch-only, read-only and cache-restore-only.
       - name: Test stress workflow contract
         run: python3 tests/scripts/test_ci_stress.py
@@ -230,7 +233,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: scripts/ci-rust-toolchain --profile minimal --component clippy
       # Rust build cache (pinned): dependency artifacts keyed on
       # toolchain + lockfile; final binaries always rebuild from sources.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -297,7 +300,7 @@ jobs:
             python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
           fi
           cat "$plan" >> "$GITHUB_STEP_SUMMARY"
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
         if: steps.scope.outputs.mode != 'docs'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.scope.outputs.mode != 'docs'
@@ -455,7 +458,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-test
@@ -538,7 +541,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-release
@@ -619,6 +622,9 @@ jobs:
       - name: Verify app development isolation and HMR
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: pnpm build
+      # This job had no install step and built on the runner's preinstalled
+      # (floating) Rust; the default working directory here is ui/.
+      - run: $GITHUB_WORKSPACE/scripts/ci-rust-toolchain --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gate-release
@@ -661,7 +667,7 @@ jobs:
         profile: [test, release, clippy]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: scripts/ci-rust-toolchain --profile minimal --component clippy
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -742,7 +748,7 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
@@ -897,6 +903,7 @@ jobs:
             exit 1
           }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-rust-toolchain --profile minimal
       - name: Tag names this version and is on main
         env:
           TAG: ${{ github.ref_name }}
@@ -951,7 +958,7 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: pnpm install --frozen-lockfile
         working-directory: ui
@@ -1147,7 +1154,7 @@ jobs:
       - run: pnpm build
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       - run: cargo build --locked
       - run: target/debug/cadence --version
 
