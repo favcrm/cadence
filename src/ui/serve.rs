@@ -298,12 +298,12 @@ mod embedded {
     use std::collections::HashMap;
     use std::sync::LazyLock;
 
-    pub const INDEX: &str = include_str!("../ui/dist/index.html");
-    pub const JS: &str = include_str!("../ui/dist/assets/index.js");
-    pub const CSS: &str = include_str!("../ui/dist/assets/index.css");
-    pub const FAVICON: &[u8] = include_bytes!("../ui/dist/favicon.svg");
-    pub const ICON: &[u8] = include_bytes!("../ui/dist/icon.svg");
-    pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../ui/dist/apple-touch-icon.png");
+    pub const INDEX: &str = include_str!("../../ui/dist/index.html");
+    pub const JS: &str = include_str!("../../ui/dist/assets/index.js");
+    pub const CSS: &str = include_str!("../../ui/dist/assets/index.css");
+    pub const FAVICON: &[u8] = include_bytes!("../../ui/dist/favicon.svg");
+    pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
+    pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
 
     /// The latin woff2 files the CSS references (woff fallbacks are not
     /// embedded — every supported browser takes woff2 first).
@@ -311,27 +311,27 @@ mod embedded {
         HashMap::from([
             (
                 "ibm-plex-sans-latin-400-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-400-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-400-normal.woff2") as &[u8],
             ),
             (
                 "ibm-plex-sans-latin-500-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-500-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-500-normal.woff2") as &[u8],
             ),
             (
                 "ibm-plex-sans-latin-600-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-600-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-600-normal.woff2") as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-400-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-400-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-400-normal.woff2") as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-500-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-500-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-500-normal.woff2") as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-600-normal.woff2",
-                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-600-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-600-normal.woff2") as &[u8],
             ),
         ])
     });
