@@ -5,7 +5,6 @@
 //! (`dp1.<ws>.<connection>.<image_digest[..32]>`), not accept-and-freeze it.
 //! Written before the freeze guard lands: this is the genuine red.
 #![allow(clippy::disallowed_methods)]
-#[allow(dead_code)]
 mod board_common;
 mod common;
 use cadence_agent::contract_fixture::{ToolTable, Verified};
@@ -843,6 +842,55 @@ fn cad979_import_http_route_is_operator_only() {
     );
 }
 
+/// Typed-input matrix over the HTTP route: missing/malformed `request_id`
+/// and `context_id` must refuse (4xx) with ZERO upstream door calls — the
+/// typed body + strict_fields reject before the resolver/importer runs.
+#[test]
+fn cad979_import_http_typed_input_matrix_no_import() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "typed");
+
+    let pm = tempfile::tempdir().unwrap();
+    let (port, _board) = board_common::start_ui(pm.path().to_path_buf(), h.daemon.state.clone());
+    let host = format!("127.0.0.1:{port}");
+    let op = board_common::sign_in(h.daemon.state.as_path(), port);
+
+    let post = |b: Value| -> u16 {
+        board_common::op_write_json(
+            &op,
+            port,
+            "POST",
+            "/api/social-media-imports",
+            &host,
+            &b.to_string(),
+        )
+        .0
+    };
+
+    for (field, badval) in [
+        ("request_id", json!(7)),
+        ("request_id", json!("")),
+        ("request_id", json!("bad id!")),
+        ("context_id", json!(9)),
+        ("context_id", json!({"x": 1})),
+        ("context_id", json!("bad id!")),
+    ] {
+        let mut b = import_body(&run, &install, None, "cad979-t1");
+        b[field] = badval;
+        let code = post(b);
+        assert!((400..500).contains(&code), "{field}={badval}: {code}");
+    }
+    // Missing request_id entirely.
+    let mut missing = import_body(&run, &install, None, "cad979-t2");
+    missing.as_object_mut().unwrap().remove("request_id");
+    assert!((400..500).contains(&post(missing)), "missing request_id");
+    // No request reached the device door — zero uploads across every case.
+    assert_eq!(door.calls.load(Ordering::SeqCst), 0);
+}
+
 /// I1 authority — a detached `setsid` child with no provable identity cannot
 /// reach the operator import verb over the unix socket, exactly like every
 /// other operator-only gate. Same refusal as agent/unproven.
@@ -870,6 +918,44 @@ fn cad979_import_refuses_detached_setsid_peer() {
     let frame: Value = serde_json::from_str(output.trim()).expect("one JSON reply");
     assert_eq!(frame["ok"], json!(false), "{frame}");
     assert!(frame.to_string().contains("operator"), "{frame}");
+}
+
+/// Concurrent scope isolation: one thread runs the import for the run's OWN
+/// scope (succeeds), a concurrent thread names a foreign install (refused) —
+/// neither custody nor scope leaks across the two calls.
+#[test]
+fn cad979_import_concurrent_scope_isolation() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "ciso");
+    let state = h.daemon.state.clone();
+    let good = import_body(&run, &install, None, "cad979-ciso-ok");
+    let bad = import_body(&run, "install_FOREIGN", None, "cad979-ciso-bad");
+    let s1 = state.clone();
+    let s2 = state.clone();
+    let t1 = thread::spawn(move || {
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&s1, "social_publish_media_import", good)
+        })
+    });
+    let t2 = thread::spawn(move || {
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&s2, "social_publish_media_import", bad)
+        })
+    });
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
+    assert!(
+        r1.expect("own-scope import succeeds")["ok"] == json!(true),
+        "own scope must import"
+    );
+    let e = r2.expect_err("foreign install must refuse").to_string();
+    assert!(e.contains("grant_binding_mismatch"), "{e}");
+    // Exactly one upload (the good scope); the refused call never reached the
+    // door — scope-pin refused before custody read or import.
+    assert_eq!(door.calls.load(Ordering::SeqCst), 1);
 }
 
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
