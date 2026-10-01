@@ -921,7 +921,10 @@ mod tests {
         let err = validate_against(&binding, &manifest, Some(&descriptor)).unwrap_err();
         assert!(err.to_string().contains("produced shape"), "{err}");
         // A scalar text key can never claim a `number`/`date`/`datetime`
-        // format — the produced string cannot honestly fill them.
+        // format — the produced string cannot honestly fill them. Each
+        // case mutates the descriptor *structurally* (the `name` field
+        // re-declared under the target format) so only the produced-shape
+        // rule can refuse — never a format/parse mismatch.
         for (key, fmt) in [
             ("display_name", "number"),
             ("display_name", "date"),
@@ -930,20 +933,14 @@ mod tests {
             let mut bad = base.clone();
             bad["bindings"][0]["fields"][0] =
                 serde_json::json!({"field":"name","key":key,"format":fmt});
-            // Descriptor field `name` stays text — a mismatched declared
-            // format already refuses; test against a descriptor whose
-            // `name` field actually declares that format so only the
-            // produced-shape rule fires.
-            let desc = app_view::parse_descriptor(&DESCRIPTOR.replace(
-                "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\"}",
-                &format!("{{\"id\":\"name\",\"label\":\"Name\",\"format\":\"{fmt}\"}}"),
-            ));
-            // `number`/`date`/`datetime` fields are legal v1 grammar —
-            // the refusal must come from produced shape, not parse.
-            let desc = match desc {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+            let mut desc_value: Value = serde_json::from_str(DESCRIPTOR).unwrap();
+            desc_value["views"][0]["fields"][0]["format"] = Value::String(fmt.to_string());
+            let desc = app_view::parse_descriptor(&desc_value.to_string())
+                .unwrap_or_else(|e| panic!("{key}→{fmt}: descriptor fixture must parse: {e}"));
+            // The mutated field really does declare the target format —
+            // the test pins that, so a silent fixture drift can't turn
+            // the produced-shape check into a format-equality check.
+            assert_eq!(desc.views[0].fields[0].format, fmt);
             let binding = parse_binding(&bad.to_string()).unwrap();
             let err = validate_against(&binding, &manifest, Some(&desc)).unwrap_err();
             assert!(
@@ -956,12 +953,18 @@ mod tests {
         let mut bad = serde_json::from_str::<Value>(BINDING_RUNS).unwrap();
         bad["bindings"][0]["fields"][1] =
             serde_json::json!({"field":"state","key":"state","format":"enum"});
-        let widened = app_view::parse_descriptor(&DESCRIPTOR_RUNS.replace(
-            "\"values\":[\"awaiting_approval\",\"approved\",\"running\",\"succeeded\",\"failed\",\"cancelled\"]",
-            "\"values\":[\"awaiting_approval\",\"approved\",\"running\",\"succeeded\",\"failed\",\"cancelled\",\"bogus\"]",
-        ));
+        let mut widened: Value = serde_json::from_str(DESCRIPTOR_RUNS).unwrap();
+        widened["views"][0]["fields"][1]["values"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String("bogus".into()));
         // widened descriptor parses but mismatches the produced domain
-        let run_desc = widened.unwrap();
+        let run_desc = app_view::parse_descriptor(&widened.to_string())
+            .expect("widened enum descriptor must parse");
+        assert_eq!(
+            run_desc.views[0].fields[1].values.as_ref().unwrap().len(),
+            7
+        );
         let binding = parse_binding(&bad.to_string()).unwrap();
         assert!(
             validate_against(&binding, &run_manifest(), Some(&run_desc)).is_err(),
@@ -976,12 +979,13 @@ mod tests {
     fn produced_shape_refuses_a_scalar_on_a_list_field() {
         let manifest = manifest();
         // Descriptor that declares `name` as a text list (v1 allows
-        // text kind:"list"); bind it to a scalar source key.
-        let desc = app_view::parse_descriptor(&DESCRIPTOR.replace(
-            "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\"}",
-            "{\"id\":\"name\",\"label\":\"Name\",\"format\":\"text\",\"kind\":\"list\"}",
-        ))
-        .unwrap();
+        // text kind:"list"); bind it to a scalar source key. Mutated
+        // structurally, and the fixture's kind is pinned before use.
+        let mut desc_value: Value = serde_json::from_str(DESCRIPTOR).unwrap();
+        desc_value["views"][0]["fields"][0]["kind"] = Value::String("list".into());
+        let desc = app_view::parse_descriptor(&desc_value.to_string())
+            .expect("list-typed text field must parse");
+        assert_eq!(desc.views[0].fields[0].kind, "list");
         let mut bad = serde_json::from_str::<Value>(BINDING).unwrap();
         bad["bindings"][0]["fields"][0] =
             serde_json::json!({"field":"name","key":"display_name","format":"text"});
