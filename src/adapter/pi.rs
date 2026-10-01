@@ -2051,6 +2051,32 @@ impl ProviderAdapter for PiAdapter {
             "XDG_CACHE_HOME".to_string(),
             cache_dir.to_string_lossy().to_string(),
         ));
+        if !master && want.starts_with("devin/") {
+            let source_root = self
+                .env
+                .var("XDG_CACHE_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    self.env
+                        .var("HOME")
+                        .filter(|v| !v.is_empty())
+                        .map(|v| PathBuf::from(v).join(".cache"))
+                })
+                .ok_or_else(|| Error::rejected("Offline Devin catalog source is unavailable"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?
+                .as_millis();
+            let now = u64::try_from(now)
+                .map_err(|_| Error::rejected("Offline Devin catalog clock is unavailable"))?;
+            devin_catalog::seed(
+                &cache_dir,
+                &source_root.join("pi-devin/models.json"),
+                want,
+                now,
+            )?;
+        }
         if !master {
             // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
             // state dir — auth arrives as the scoped file copy, never
