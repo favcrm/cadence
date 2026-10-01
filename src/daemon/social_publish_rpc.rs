@@ -236,6 +236,16 @@ impl Shared {
         let toolkit = common("toolkit")?;
         let destination_id = common("destination_id")?;
         let media_key = optional_str(params, "media_key");
+        // Backend refusal order is pinned by tests (run resolution precedes
+        // approval/binding): surface `unknown app run` before any
+        // `capability_unavailable` from a missing resolver. Re-prove the
+        // reviewed material first — the same pure store call freeze makes.
+        self.store.app_publication_material(
+            common("run_id")?,
+            common("artifact_id")?,
+            common("bundle_digest")?,
+            common("slot")?,
+        )?;
         // v9: the wire identity on `frozen` is the remote AOS `connectionId`,
         // resolved under the read credential — never the local `conn-<uuid4>`
         // custody id and never a caller-supplied id. A supplied `media_key`

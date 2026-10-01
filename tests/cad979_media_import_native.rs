@@ -1101,10 +1101,19 @@ fn h_png() -> Vec<u8> {
 /// answering the `toDeviceDestination` reply shape for the connections this
 /// fixture registers. Scoped to a `workspace` it stamps on each row's
 /// `workspaceId`; bounded like the import door.
+/// One fake destinations row — the `toDeviceDestination` reply shape a
+/// real AOS `GET /connectors/destinations` returns.
+struct DestinationRow {
+    connection_id: String,
+    toolkit: String,
+    destination_id: String,
+    publishable: bool,
+}
+
 struct FakeDestinationsDoor {
     addr: String,
     /// `(connectionId, toolkit, destinationId, publishable)` rows served.
-    rows: Arc<Mutex<Vec<(String, String, String, bool)>>>,
+    rows: Arc<Mutex<Vec<DestinationRow>>>,
     /// 5xx mode: return a server error (ambiguous) instead of the list.
     dead: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -1150,12 +1159,12 @@ impl FakeDestinationsDoor {
                     .lock()
                     .unwrap()
                     .iter()
-                    .map(|(cid, toolkit, dest, publishable)| {
+                    .map(|r| {
                         json!({
-                            "connectionId": cid, "toolkit": toolkit,
-                            "displayName": cid, "destinationId": dest,
+                            "connectionId": r.connection_id, "toolkit": r.toolkit,
+                            "displayName": r.connection_id, "destinationId": r.destination_id,
                             "status": "active", "available": true,
-                            "publishable": publishable,
+                            "publishable": r.publishable,
                             "workspaceId": w,
                         })
                     })
@@ -1174,12 +1183,12 @@ impl FakeDestinationsDoor {
         }
     }
     fn add(&self, connection_id: &str, toolkit: &str, destination_id: &str, publishable: bool) {
-        self.rows.lock().unwrap().push((
-            connection_id.to_owned(),
-            toolkit.to_owned(),
-            destination_id.to_owned(),
+        self.rows.lock().unwrap().push(DestinationRow {
+            connection_id: connection_id.to_owned(),
+            toolkit: toolkit.to_owned(),
+            destination_id: destination_id.to_owned(),
             publishable,
-        ));
+        });
     }
 }
 

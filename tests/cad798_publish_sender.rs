@@ -36,6 +36,12 @@ const DEST: &str = "275491372109884";
 const GRANT: &str = "dpq_cad798_grant_01";
 const CAPTION: &str = "Harbour at dusk. Synthetic CAD-798 caption.";
 const BEARER: &str = "cad798-synthetic-credential";
+/// CAD-979 v9: the read (`provider.read`) credential for the destinations
+/// GET — a separate bearer, never the send one.
+const READ_BEARER: &str = "cad798-read-credential";
+/// The remote AOS `connectionId` the resolver maps to (wire identity);
+/// `CONN` stays the local custody/install id.
+const AOS_CONN: &str = "connA_harbour_fb";
 
 fn sha_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -412,6 +418,33 @@ impl FakeDoor {
         value: &Value,
     ) -> (DoorReply, Option<Duration>) {
         let mut guard = state.lock().unwrap();
+        // CAD-979 v9: the destinations read runs under the separate
+        // `provider.read` credential — admit that bearer on this GET path
+        // only and map `(toolkit, destination_id)` → the remote AOS
+        // `connectionId`. Everything else requires the send credential.
+        if method == "GET" && url == "/v1/runtime/connectors/destinations" {
+            if auth != format!("Bearer {READ_BEARER}") {
+                return (
+                    fail(
+                        401,
+                        "unauthorized",
+                        "A valid device credential is required.",
+                    ),
+                    None,
+                );
+            }
+            return (
+                ok(&json!([
+                    {"connectionId": AOS_CONN, "toolkit": "facebook",
+                     "displayName": "fb", "destinationId": DEST,
+                     "status": "active", "available": true, "publishable": true},
+                    {"connectionId": AOS_CONN, "toolkit": "instagram",
+                     "displayName": "ig", "destinationId": DEST,
+                     "status": "active", "available": true, "publishable": true},
+                ])),
+                None,
+            );
+        }
         guard.http_calls += 1;
         if !value.is_null() {
             guard.bodies.push(value.clone());
@@ -1241,6 +1274,17 @@ fn daemon_release(door: &FakeDoor) -> (Release, Arc<HttpPublishSender>) {
             )
             .expect("loopback sender"),
         ));
+        // CAD-979 v9: the schedule path resolves the remote AOS
+        // `connectionId` via a real `MediaResolver` against the fake door's
+        // destinations route (read credential, separate from the send one).
+        let base3 = base.clone();
+        opts.social_media_resolver = Some(Arc::new(
+            cadence_agent::platform::agenticos_external::media_import::MediaResolver::new(
+                &base3,
+                DeviceCredential::new(READ_BEARER.into()),
+            )
+            .expect("fake destinations resolver"),
+        ));
     });
     (h, sender)
 }
@@ -1278,8 +1322,11 @@ fn freeze_params(
 
 fn recheck_for(intent: &Value) -> Value {
     let frozen = &intent["frozen"];
+    // v9: the claim recheck carries the remote AOS wire identity — the field
+    // the frozen approval binds (and the door's grant authorizes against).
     json!({"grant_id": frozen["grant_id"],
         "connection_id": frozen["connection_id"],
+        "aos_connection_id": frozen["aos_connection_id"],
         "destination_id": frozen["destination_id"],
         "caption_digest": frozen["caption_digest"],
         "image_digest": frozen["image_digest"]})
@@ -1319,15 +1366,11 @@ fn cad798_daemon_posts_from_approved_run_with_store_backed_material() {
     assert_eq!(intent["frozen"]["caption_digest"], json!(caption_digest));
     // Enroll the owner-minted grant AFTER freeze: connection and content
     // come from the frozen approval, never from caller strings.
-    door.enroll_connection(intent["frozen"]["connection_id"].as_str().unwrap());
-    door.enroll_grant(
-        grant,
-        intent["frozen"]["connection_id"].as_str().unwrap(),
-        DEST,
-        &caption_digest,
-        None,
-        3,
-    );
+    // v9: the door authorizes the wire `connectionId` — the remote AOS id
+    // persisted as `aos_connection_id` — not the local custody connection.
+    let aos_conn = intent["frozen"]["aos_connection_id"].as_str().unwrap();
+    door.enroll_connection(aos_conn);
+    door.enroll_grant(grant, aos_conn, DEST, &caption_digest, None, 3);
     // Dispatch through the production sender: the door posts once.
     let claimed = h
         .daemon
