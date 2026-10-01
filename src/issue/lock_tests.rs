@@ -190,7 +190,7 @@ impl Drop for ReapOnDrop {
 fn a_child_exec_does_not_inherit_the_lock() {
     let (_tmp, pm) = tracker();
     let held = pm.lock().unwrap();
-    let mut guard = ReapOnDrop(
+    let guard = ReapOnDrop(
         Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -201,37 +201,47 @@ fn a_child_exec_does_not_inherit_the_lock() {
     );
     let pid = guard.0.id();
     // `spawn` returns once the child's exec has swapped its address space,
-    // but the kernel closes the O_CLOEXEC descriptors a moment later, so an
-    // immediate scan can see the not-yet-closed copy. Wait (bounded) until
-    // `/proc/<pid>/exe` is no longer this test binary: the exec is complete.
-    // This waits only for the exec; a descriptor that survives it still fails
-    // the scan below.
-    let me = std::fs::read_link("/proc/self/exe").unwrap();
+    // but O_CLOEXEC descriptors are closed partway through exec, later than
+    // that point (on Linux 6.x `/proc/<pid>/exe` already shows the new image
+    // before `do_close_on_exec` runs in `begin_new_exec`). An immediate scan
+    // can therefore see a copy that is about to close. Rescan, bounded to 1s,
+    // until no descriptor points at a tracker lock file. A real leak keeps
+    // the descriptor for the child's whole lifetime and still fails at the
+    // deadline.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match std::fs::read_link(format!("/proc/{pid}/exe")) {
-            Ok(exe) if exe != me => break,
-            _ => {}
+        let mut leaked = Vec::new();
+        let mut last_err = None;
+        let mut listed = false;
+        match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            Ok(entries) => {
+                listed = true;
+                for e in entries {
+                    match e.and_then(|e| std::fs::read_link(e.path())) {
+                        Ok(target) => {
+                            let t = target.to_string_lossy().into_owned();
+                            if t.contains("write.lock") || t.contains("write.flock") {
+                                leaked.push(t);
+                            }
+                        }
+                        Err(err) => last_err = Some(err.to_string()),
+                    }
+                }
+            }
+            Err(err) => last_err = Some(err.to_string()),
+        }
+        if listed && leaked.is_empty() {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "child {pid} did not finish exec within 1s"
+            "child inherited {leaked:?} or its fds were unreadable (listed: {listed}, last read error: {last_err:?})"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    // No descriptor of the child may point at a tracker lock file.
-    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
-        let target = std::fs::read_link(e.unwrap().path()).unwrap_or_default();
-        let t = target.to_string_lossy().into_owned();
-        assert!(
-            !t.contains("write.lock") && !t.contains("write.flock"),
-            "child inherited {t}"
-        );
-    }
     drop(held);
     let got = pm.try_lock().unwrap();
-    guard.0.kill().unwrap();
-    guard.0.wait().unwrap();
+    drop(guard);
     assert!(got.is_some(), "an inherited fd kept the lock past release");
 }
 
