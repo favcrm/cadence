@@ -3031,6 +3031,18 @@ fn cad867_view_read_customers_projects_real_values() {
         );
     }
 
+    // Filtered query contents: `query` is a real bounded substring
+    // search (app_record_list_paged) — a list naming only the matching
+    // record's text returns exactly that row, never a silent-ignore
+    // all-rows dump.
+    let mut p = view_read_params(&id, "customers", "list", &digests);
+    p["context_id"] = json!(context_id);
+    p["query"] = json!("Ada");
+    let filtered = w.daemon.operator_rpc("app_view_read", p).unwrap();
+    let frows = filtered["rows"].as_array().unwrap();
+    assert_eq!(frows.len(), 1, "query must filter to the matching row");
+    assert_eq!(frows[0]["ref"], json!("cust-1"));
+
     // show: the detail binding projects `ref`+`name` under the same
     // one-row `rows` envelope and echoes all three pins.
     let mut p = view_read_params(&id, "customer-detail", "show", &digests);
@@ -3079,6 +3091,10 @@ fn cad867_view_read_customers_paginates_and_shows_refuse_paging() {
     assert_eq!(page1["truncated"], json!(true));
     let cursor = page1["next_cursor"].clone();
     assert!(cursor.is_string());
+    assert!(
+        !cursor.as_str().unwrap().is_empty(),
+        "next_cursor must be a non-empty string"
+    );
     let first_id = page1["rows"][0]["ref"].clone();
 
     // Page 2: the cursor advances without duplicating page 1.
@@ -3113,6 +3129,16 @@ fn cad867_view_read_customers_paginates_and_shows_refuse_paging() {
     p["context_id"] = json!(context_id);
     p["record_id"] = json!("cust-1");
     assert!(w.daemon.operator_rpc("app_view_read", p).is_err());
+    // Limit bounds: RECORD_LIMIT is 1..=100 — 0 and 101 both refuse.
+    for bound in [0, 101] {
+        let mut p = view_read_params(&id, "customers", "list", &digests);
+        p["context_id"] = json!(context_id);
+        p["limit"] = json!(bound);
+        assert!(
+            w.daemon.operator_rpc("app_view_read", p).is_err(),
+            "customers list admitted limit={bound}"
+        );
+    }
 }
 
 /// Every digest the request asserts is re-proven: wrong, stale (a real
