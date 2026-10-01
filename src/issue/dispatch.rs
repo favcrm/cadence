@@ -934,7 +934,7 @@ pub fn run(
         None,
         actor,
     )
-    .map_err(&add_ref_failed)?;
+    .map_err(add_ref_failed)?;
     let send_failed = |e: Error| -> Error {
         // The ref recorded pre-send is an orphan — no live message
         // will ever carry `mid`. Close it so it stays history without
@@ -980,7 +980,7 @@ pub fn run(
             json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
                    "issue": front.id, "worktree": started["worktree"]}),
         )
-        .map_err(&send_failed)?;
+        .map_err(send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("message_state", sent["state"].clone()),
@@ -992,7 +992,7 @@ pub fn run(
             "task_dispatch",
             json!({"task": task, "by": reply_to, "message": mid}),
         )
-        .map_err(&send_failed)?;
+        .map_err(send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("task_state", sent["task"]["state"].clone()),
