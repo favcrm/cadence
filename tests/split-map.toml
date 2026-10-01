@@ -1026,6 +1026,8 @@ helpers = [
 
 [binaries.delivery]
 tests = [
+    "cad907_installing_the_next_mock_never_rewrites_a_script_a_launching_mock_has_open",
+    "cad907_a_changed_script_is_replaced_whole_never_torn",
     "cad120_review_evidence_rejects_untrusted_stale_and_forged_requests",
     "delivery_list_cad437_filters",
     "master_end_to_end_chat_plan_approve_dispatch_report",
