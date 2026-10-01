@@ -18,7 +18,6 @@ use common::app_release::{Release, OWNER, REVIEWER, WRITER};
 use image::ImageEncoder as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
