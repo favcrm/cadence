@@ -834,47 +834,64 @@ mod tests {
     /// and the client never re-POSTs to "confirm".
     #[test]
     fn cad979_import_forged_receipt_fails_closed_single_post() {
-        // Each closure coerces to a `fn(&mut Value)` pointer — a plain array
-        // of distinct closure types cannot unify (E0308), so the element
-        // type is named explicitly.
-        let cases: [(&str, fn(&mut Value)); 10] = [
-            ("wrong connection", |d: &mut Value| {
-                d["connectionId"] = json!("con_other");
-            }),
-            ("wrong digest echo", |d: &mut Value| {
-                d["digest"] = json!("0".repeat(64));
-            }),
-            ("wrong mime", |d: &mut Value| {
-                d["mime"] = json!("image/gif");
-            }),
-            ("wrong size", |d: &mut Value| {
-                d["sizeBytes"] = json!(1);
-            }),
-            ("key names other connection", |d: &mut Value| {
-                d["mediaKey"] = json!("dp1.ws_target.con_other.9f86d081884c7d659a2feaa0c55ad01");
-            }),
-            ("key names other digest", |d: &mut Value| {
-                d["mediaKey"] = json!("dp1.ws_target.con_ig.00000000000000000000000000000000");
-            }),
-            ("key not a device key", |d: &mut Value| {
-                d["mediaKey"] = json!("r2://bucket/object with spaces");
-            }),
-            ("readBack bytes drift", |d: &mut Value| {
-                d["readBack"]["bytes"] = json!(1);
-            }),
-            ("readBack digest drift", |d: &mut Value| {
-                d["readBack"]["digest"] = json!("0".repeat(64));
-            }),
-            ("missing readBack", |d: &mut Value| {
-                d.as_object_mut().unwrap().remove("readBack");
-            }),
+        // Each forgery mutates the honest receipt; a plain enum + one
+        // mutator keeps the cases readable and avoids an array of distinct
+        // closure types.
+        #[derive(Clone, Copy)]
+        enum Forge {
+            WrongConnection,
+            WrongDigest,
+            WrongMime,
+            WrongSize,
+            KeyOtherConnection,
+            KeyOtherDigest,
+            KeyNotDevice,
+            ReadBackBytes,
+            ReadBackDigest,
+            MissingReadBack,
+        }
+        fn forge(receipt: &mut Value, which: Forge) {
+            match which {
+                Forge::WrongConnection => receipt["connectionId"] = json!("con_other"),
+                Forge::WrongDigest => receipt["digest"] = json!("0".repeat(64)),
+                Forge::WrongMime => receipt["mime"] = json!("image/gif"),
+                Forge::WrongSize => receipt["sizeBytes"] = json!(1),
+                Forge::KeyOtherConnection => {
+                    receipt["mediaKey"] =
+                        json!("dp1.ws_target.con_other.9f86d081884c7d659a2feaa0c55ad01")
+                }
+                Forge::KeyOtherDigest => {
+                    receipt["mediaKey"] =
+                        json!("dp1.ws_target.con_ig.00000000000000000000000000000000")
+                }
+                Forge::KeyNotDevice => {
+                    receipt["mediaKey"] = json!("r2://bucket/object with spaces")
+                }
+                Forge::ReadBackBytes => receipt["readBack"]["bytes"] = json!(1),
+                Forge::ReadBackDigest => receipt["readBack"]["digest"] = json!("0".repeat(64)),
+                Forge::MissingReadBack => {
+                    receipt.as_object_mut().unwrap().remove("readBack");
+                }
+            }
+        }
+        let cases = [
+            ("wrong connection", Forge::WrongConnection),
+            ("wrong digest echo", Forge::WrongDigest),
+            ("wrong mime", Forge::WrongMime),
+            ("wrong size", Forge::WrongSize),
+            ("key names other connection", Forge::KeyOtherConnection),
+            ("key names other digest", Forge::KeyOtherDigest),
+            ("key not a device key", Forge::KeyNotDevice),
+            ("readBack bytes drift", Forge::ReadBackBytes),
+            ("readBack digest drift", Forge::ReadBackDigest),
+            ("missing readBack", Forge::MissingReadBack),
         ];
-        for (label, mutate) in cases {
+        for (label, which) in cases {
             let door = FakeDoor::start();
             door.state().connections.push("con_ig".into());
             let bytes = png_bytes();
             let mut bad = receipt("ws_target", "con_ig", "image/png", &bytes);
-            mutate(&mut bad);
+            forge(&mut bad, which);
             door.state().receipt_override = Some(bad);
             let err = door
                 .importer()
