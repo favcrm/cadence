@@ -426,7 +426,7 @@ export default function ScheduleCalendar({
                   {day.intents.length} {day.intents.length === 1 ? "post" : "posts"}
                 </span>
               </header>
-              <HorizontalStrip label={`Posts planned for ${day.date}`} className="wa-cal-posts">
+              <HorizontalStrip label={`Posts planned for ${day.date}`} className="wa-cal-posts" scrollStep={248}>
                 {day.intents.map(intentCard)}
               </HorizontalStrip>
             </section>
@@ -459,7 +459,7 @@ export default function ScheduleCalendar({
                 <strong>Unplanned</strong>
                 <span className="wa-status">{projection.unplanned.length}</span>
               </header>
-              <HorizontalStrip label="Runs with no planned date" className="wa-cal-posts">
+              <HorizontalStrip label="Runs with no planned date" className="wa-cal-posts" scrollStep={248}>
                 {projection.unplanned.map(runCard)}
               </HorizontalStrip>
             </section>

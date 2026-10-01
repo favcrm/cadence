@@ -5,10 +5,14 @@ export function HorizontalStrip({
   label,
   children,
   className = "",
+  scrollStep,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  /** Optional explicit scroll step in px (e.g. one card + gap). Default keeps
+   *  the existing `Math.max(240, clientWidth * 0.8)` viewport behaviour. */
+  scrollStep?: number;
 }) {
   const strip = useRef<HTMLDivElement>(null);
   const [edges, setEdges] = useState({ before: false, after: false });
@@ -34,7 +38,7 @@ export function HorizontalStrip({
     const element = strip.current;
     if (!element) return;
     element.scrollBy({
-      left: direction * Math.max(240, element.clientWidth * 0.8),
+      left: direction * (scrollStep ?? Math.max(240, element.clientWidth * 0.8)),
       behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
         ? "auto"
         : "smooth",
