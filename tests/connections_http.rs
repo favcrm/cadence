@@ -23,12 +23,15 @@ struct Board {
 }
 impl Board {
     fn new() -> Self {
-        Self::new_with_after_probe(|_| None)
+        Self::new_with_busy_first_port(None)
     }
 
-    fn new_with_after_probe(
-        after_probe: impl FnOnce(u16) -> Option<std::net::TcpListener>,
-    ) -> Self {
+    /// `busy` is a listener the caller already holds; its port is the first
+    /// one the board is offered, so the first bind is refused with AddrInUse
+    /// by construction. The listener stays held until the board is up, so no
+    /// retry can be handed the same port. Nothing is released and re-bound
+    /// by port number, which is the race a probe-then-bind hook would have.
+    fn new_with_busy_first_port(busy: Option<std::net::TcpListener>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         let mut opts = daemon_opts();
@@ -48,14 +51,14 @@ impl Board {
         );
         let daemon = TestDaemon::start_opts(opts);
         let stop = Arc::new(AtomicBool::new(false));
-        let mut after_probe = Some(after_probe);
+        let mut first = busy.as_ref().map(|l| l.local_addr().unwrap().port());
         for _ in 0..20 {
             // The OS assigns an ephemeral port; the bind can still race between
             // this probe and `ui::serve`, so trust only its startup channel.
-            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let held = after_probe.take().and_then(|hook| hook(port));
+            let port = first.take().unwrap_or_else(|| {
+                let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                probe.local_addr().unwrap().port()
+            });
             let (startup, ready) = std::sync::mpsc::channel();
             let opts = cadence_agent::ui::ServeOpts {
                 host: "127.0.0.1".into(),
@@ -74,7 +77,7 @@ impl Board {
                 .expect("board startup timed out")
             {
                 Ok(()) => {
-                    drop(held);
+                    drop(busy);
                     return Self {
                         root,
                         daemon,
@@ -85,7 +88,6 @@ impl Board {
                 }
                 Err(std::io::ErrorKind::AddrInUse) => {
                     thread.join().unwrap().unwrap_err();
-                    drop(held);
                 }
                 Err(kind) => panic!("board failed to start on {port}: {kind}"),
             }
@@ -216,16 +218,10 @@ impl Drop for Board {
 
 #[test]
 fn cad772_busy_handoff_retries_and_keeps_its_own_operator_seam() {
-    let mut occupied = None;
-    let b = Board::new_with_after_probe(|port| {
-        occupied = Some(port);
-        Some(std::net::TcpListener::bind(("127.0.0.1", port)).unwrap())
-    });
-    assert_ne!(
-        b.port,
-        occupied.unwrap(),
-        "fixture reused a port stolen after its probe"
-    );
+    let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let occupied = busy.local_addr().unwrap().port();
+    let b = Board::new_with_busy_first_port(Some(busy));
+    assert_ne!(b.port, occupied, "fixture reused a port that was busy");
     assert!(b.value("GET", "/api/connections", json!({}))["connections"].is_array());
 }
 
