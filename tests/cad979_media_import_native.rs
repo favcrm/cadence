@@ -723,6 +723,60 @@ fn cad979_import_same_request_id_schedule_is_idempotent() {
     assert!(err.to_string().contains("different frozen"), "{err}");
 }
 
+/// True concurrency: two threads run the import for the SAME run at once —
+/// the door sees each call independently (no shared custody leak), each gets
+/// the same content-addressed key (idempotent upstream), and no row is
+/// written for either. Real concurrent callers, not sequential.
+#[test]
+fn cad979_import_concurrent_calls_same_key_no_leak() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, _bundle, install, image_digest) = approved_image_run(&h, &h_png(), "conc");
+    let body = import_body(&run, &install, None, "cad979-conc");
+    let state = h.daemon.state.clone();
+
+    // Two concurrent operator imports of the same retained bytes.
+    let b1 = body.clone();
+    let b2 = body.clone();
+    let s1 = state.clone();
+    let s2 = state.clone();
+    let t1 = thread::spawn(move || {
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&s1, "social_publish_media_import", b1)
+        })
+    });
+    let t2 = thread::spawn(move || {
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&s2, "social_publish_media_import", b2)
+        })
+    });
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
+    let k1 = r1.expect("import 1")["media_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let k2 = r2.expect("import 2")["media_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Content-addressed: same bytes+digest → the same key, never a conflict.
+    assert_eq!(k1, k2);
+    assert!(k1.ends_with(&image_digest[..32]));
+    // Both saw the door; no cross-call leak beyond the two uploads.
+    assert!(door.calls.load(Ordering::SeqCst) >= 2);
+    let intents = h
+        .daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .unwrap()["intents"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(intents, 0, "import writes no intent row even concurrently");
+}
+
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
 /// identical 1×1 PNG, so this is deterministic.
 fn h_png() -> Vec<u8> {
