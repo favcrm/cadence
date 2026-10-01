@@ -1,0 +1,174 @@
+#!/bin/sh
+# CAD-904: optional shared sccache on Cloudflare R2 for CI Rust jobs.
+#
+#   ci-sccache enable   decide a mode from the credentials the workflow
+#                       passed, install the pinned sccache and export the
+#                       cache environment to later steps
+#   ci-sccache verify-ro  prove the read-only token cannot write (HTTP 403)
+#   ci-sccache stats    print `sccache --show-stats` (no-op when disabled)
+#
+# Contract: this is a strict no-op unless credentials resolve. `enable`
+# never exits non-zero for a missing credential, a failed download, a bad
+# checksum or an unreachable bucket: the cache is an optimisation, so every
+# failure leaves RUSTC_WRAPPER unset and the job compiles exactly as before.
+#
+# The binary installs into $CARGO_HOME/bin (see cmd_enable).
+# When enabled it also writes `enabled=true` to $GITHUB_OUTPUT, so the
+# cache-warm job can skip its builds when there is nothing to warm.
+# Inputs (environment, set by the workflow step; secrets never in argv):
+#   SCCACHE_CI_RW_ACCESS_KEY_ID / _SECRET_ACCESS_KEY  read-write pair. The
+#       workflow passes them only in the `cache-warm` job (push to main,
+#       environment `sccache-writer`); no gate job, pull_request or
+#       merge_group job ever receives them.
+#   SCCACHE_CI_RO_ACCESS_KEY_ID / _SECRET_ACCESS_KEY  read-only pair
+#   SCCACHE_CI_ENDPOINT  https://<account>.r2.cloudflarestorage.com
+# Read-only mode is enforced twice: a bucket-scoped read-only R2 token and
+# SCCACHE_S3_RW_MODE=READ_ONLY (sccache docs/S3.md, v0.18.0).
+set -u
+
+VERSION=0.18.0
+ARCHIVE="sccache-v$VERSION-x86_64-unknown-linux-musl.tar.gz"
+URL="https://github.com/mozilla/sccache/releases/download/v$VERSION/$ARCHIVE"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+MANIFEST="$ROOT/.config/sccache.sha256"
+BUCKET=cadence-ci-sccache
+
+note() { printf '%s\n' "sccache: $*"; }
+off() {
+    note "disabled: $*"
+    [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "sccache disabled: $*" >> "$GITHUB_STEP_SUMMARY"
+    exit 0
+}
+
+cmd_enable() {
+    rw_id=${SCCACHE_CI_RW_ACCESS_KEY_ID:-}
+    rw_secret=${SCCACHE_CI_RW_SECRET_ACCESS_KEY:-}
+    ro_id=${SCCACHE_CI_RO_ACCESS_KEY_ID:-}
+    ro_secret=${SCCACHE_CI_RO_SECRET_ACCESS_KEY:-}
+    endpoint=${SCCACHE_CI_ENDPOINT:-}
+    [ -n "$endpoint" ] || off "no R2 endpoint configured"
+    case "$endpoint" in
+        https://*) ;;
+        *) off "endpoint is not https" ;;
+    esac
+    if [ -n "$rw_id" ] && [ -n "$rw_secret" ]; then
+        mode=READ_WRITE
+        key_id=$rw_id
+        key_secret=$rw_secret
+    elif [ -n "$ro_id" ] && [ -n "$ro_secret" ]; then
+        mode=READ_ONLY
+        key_id=$ro_id
+        key_secret=$ro_secret
+    else
+        off "no credentials"
+    fi
+    [ -n "${GITHUB_ENV:-}" ] && [ -n "${GITHUB_PATH:-}" ] || off "not running in GitHub Actions"
+    command -v curl >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 \
+        && command -v tar >/dev/null 2>&1 && command -v awk >/dev/null 2>&1 \
+        || off "curl, sha256sum, tar and awk are required"
+    [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || off "no pinned build for $(uname -s)-$(uname -m)"
+
+    want=$(awk -v n="$ARCHIVE" '$1 !~ /^#/ && $2 == n { print $1; exit }' "$MANIFEST" 2>/dev/null)
+    [ -n "$want" ] || off "no trusted checksum for $ARCHIVE"
+    # The binary goes into $CARGO_HOME/bin, beside cargo: the Landlock
+    # worker confinement (tests/pi_worker_confinement.rs) already grants
+    # that directory, and a confined `cargo build` inherits RUSTC_WRAPPER
+    # and must be able to execute it. $RUNNER_TEMP is not granted.
+    dir="${CARGO_HOME:-${HOME:-/tmp}/.cargo}/bin"
+    dl="${RUNNER_TEMP:-/tmp}/sccache-$VERSION-download"
+    mkdir -p "$dir" "$dl" || off "cannot create $dir"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --retry 2 --max-time 120 --output "$dl/$ARCHIVE" "$URL" || off "download failed"
+    printf '%s  %s\n' "$want" "$dl/$ARCHIVE" | sha256sum -c - >/dev/null \
+        || off "archive checksum mismatch"
+    tar -xzf "$dl/$ARCHIVE" -C "$dir" --strip-components=1 \
+        "sccache-v$VERSION-x86_64-unknown-linux-musl/sccache" || off "extraction failed"
+    chmod 755 "$dir/sccache"
+
+    prefix="v1/rustc-$(rustc --version 2>/dev/null | awk '{print $2}')"
+    case "$prefix" in
+        v1/rustc-) prefix="v1/rustc-unknown" ;;
+    esac
+    # Probe: start the server with the final environment. A bad token or an
+    # unreachable bucket fails here, before any later step depends on it.
+    SCCACHE_BUCKET=$BUCKET SCCACHE_REGION=auto SCCACHE_ENDPOINT=$endpoint \
+        SCCACHE_S3_KEY_PREFIX=$prefix SCCACHE_S3_USE_SSL=true SCCACHE_S3_RW_MODE=$mode \
+        AWS_ACCESS_KEY_ID=$key_id AWS_SECRET_ACCESS_KEY=$key_secret \
+        "$dir/sccache" --start-server >/dev/null 2>&1 \
+        || { "$dir/sccache" --stop-server >/dev/null 2>&1; off "cache backend not reachable with the supplied credentials"; }
+
+    echo "::add-mask::$key_id"
+    echo "::add-mask::$key_secret"
+    echo "$dir" >> "$GITHUB_PATH"
+    {
+        echo "RUSTC_WRAPPER=sccache"
+        echo "CARGO_INCREMENTAL=0"
+        echo "SCCACHE_BUCKET=$BUCKET"
+        echo "SCCACHE_REGION=auto"
+        echo "SCCACHE_ENDPOINT=$endpoint"
+        echo "SCCACHE_S3_KEY_PREFIX=$prefix"
+        echo "SCCACHE_S3_USE_SSL=true"
+        echo "SCCACHE_S3_RW_MODE=$mode"
+        echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP:-/tmp}/sccache-error.log"
+        echo "AWS_ACCESS_KEY_ID=$key_id"
+        echo "AWS_SECRET_ACCESS_KEY=$key_secret"
+    } >> "$GITHUB_ENV"
+    [ -z "${GITHUB_OUTPUT:-}" ] || echo "enabled=true" >> "$GITHUB_OUTPUT"
+    note "enabled: sccache $VERSION, mode $mode, prefix $prefix"
+    [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "sccache enabled: mode $mode, prefix $prefix" >> "$GITHUB_STEP_SUMMARY"
+}
+
+cmd_stats() {
+    if [ "${RUSTC_WRAPPER:-}" != sccache ] || ! command -v sccache >/dev/null 2>&1; then
+        note "stats: not enabled for this job"
+        exit 0
+    fi
+    out=$(sccache --show-stats 2>&1) || true
+    printf '%s\n' "$out"
+    if [ -s "${SCCACHE_ERROR_LOG:-}" ]; then
+        echo "sccache error log (last 20 lines):"
+        tail -n 20 "$SCCACHE_ERROR_LOG"
+    fi
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        { echo '```'; printf '%s\n' "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+    fi
+}
+
+# CAD-904: prove the read-only key cannot write. One SigV4 PutObject of a
+# throwaway key with the read-only credentials; R2 must answer 403. The key
+# is passed to curl on stdin (`-K -`), never in argv. Fails the job only on a
+# 2xx (the token can write) -- network trouble or an unexpected status is a
+# warning, so an R2 outage cannot redden CI.
+cmd_verify_ro() {
+    if [ "${RUSTC_WRAPPER:-}" != sccache ] || [ "${SCCACHE_S3_RW_MODE:-}" != READ_ONLY ]; then
+        note "verify-ro: not in read-only mode; nothing to prove"
+        exit 0
+    fi
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -n "${SCCACHE_ENDPOINT:-}" ] \
+        || { note "verify-ro: no credentials in the environment"; exit 0; }
+    url="$SCCACHE_ENDPOINT/$SCCACHE_BUCKET/ro-write-probe/${GITHUB_RUN_ID:-0}-$$"
+    code=$(printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+        | curl -K - --silent --show-error --max-time 30 --proto '=https' \
+            --aws-sigv4 "aws:amz:auto:s3" --request PUT --data 'cad904' \
+            --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null) || code=000
+    case "$code" in
+        403)
+            note "verify-ro: PutObject with the read-only token was refused (HTTP 403), as required"
+            [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "sccache read-only token: PutObject refused (HTTP 403)" >> "$GITHUB_STEP_SUMMARY"
+            ;;
+        2??)
+            echo "::error::the read-only R2 token WROTE an object (HTTP $code); revoke it and fix its policy"
+            exit 1
+            ;;
+        *)
+            echo "::warning::verify-ro inconclusive: PutObject answered HTTP $code (expected 403)"
+            ;;
+    esac
+}
+
+case "${1:-}" in
+    verify-ro) cmd_verify_ro ;;
+    enable) cmd_enable ;;
+    stats) cmd_stats ;;
+    *) echo "usage: ci-sccache enable|stats|verify-ro" >&2; exit 2 ;;
+esac

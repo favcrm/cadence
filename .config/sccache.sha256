@@ -1,0 +1,3 @@
+# Trusted sccache 0.18.0 release archive (CAD-904).
+# Source: https://github.com/mozilla/sccache/releases/tag/v0.18.0
+45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89  sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz
