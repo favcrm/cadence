@@ -340,6 +340,9 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[path = "pi_devin_catalog.rs"]
+mod devin_catalog;
+
 #[path = "pi_agenticos.rs"]
 mod agenticos;
 
