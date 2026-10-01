@@ -60,6 +60,18 @@ pub struct NewApproval<'a> {
     pub pr: u64,
 }
 
+/// CAD-918: the latest per `(alias, project)` is the designation in force.
+pub const DESIGNATION_EVENT: &str = "approval_designation";
+
+/// A delegated approval the daemon verified (CAD-918).
+pub struct NewDelegated<'a> {
+    pub approval: NewApproval<'a>,
+    /// `delegated:<alias>`, from the connection.
+    pub approver: &'a str,
+    pub verdicts: &'a [String],
+    pub scope_approval: Option<&'a str>,
+}
+
 /// `<action>-pr<N>-<head[..12]>` — the base id an approval records
 /// under when the operator names none. A fresh approval after a revoke
 /// becomes `<base>-2`, `<base>-3`, … (see `Store::record_approval`).
@@ -631,6 +643,194 @@ impl Store {
         Err(Error::rejected(format!(
             "Approval id '{base}': no free default id — pass --id"
         )))
+    }
+
+    /// Every approval-stream event, oldest first: `(kind, payload, at)`.
+    fn approval_stream(conn: &Connection) -> Result<Vec<(String, Value, f64)>> {
+        let mut stmt =
+            conn.prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq")?;
+        let rows = stmt.query_map(params![APPROVAL_STREAM], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+        })?;
+        let rows = rows.collect::<rusqlite::Result<Vec<(String, String, f64)>>>()?;
+        let parse =
+            |(k, raw, at): (String, String, f64)| Some((k, serde_json::from_str(&raw).ok()?, at));
+        Ok(rows.into_iter().filter_map(parse).collect())
+    }
+
+    /// Append an approval record whose id is `base`, or the first free
+    /// `<base>-<n>`: ids are never reused.
+    fn append_approval(
+        conn: &Connection,
+        stream: &[(String, Value, f64)],
+        base: &str,
+        mut payload: Value,
+    ) -> Result<String> {
+        let taken = |id: &str| {
+            stream
+                .iter()
+                .any(|(k, p, _)| k == APPROVAL_RECORDED_EVENT && p["approval_id"] == id)
+        };
+        let id = std::iter::once(base.to_string())
+            .chain((2..=1000u32).map(|n| format!("{base}-{n}")))
+            .find(|id| !taken(id))
+            .ok_or_else(|| Error::rejected(format!("Approval id '{base}': no free id")))?;
+        identifier(&id, "Approval id")?;
+        payload["approval_id"] = json!(id);
+        Self::event(conn, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
+        Ok(id)
+    }
+
+    fn revoked_ids(stream: &[(String, Value, f64)]) -> std::collections::HashSet<String> {
+        stream
+            .iter()
+            .filter(|(k, _, _)| k == APPROVAL_REVOKED_EVENT)
+            .filter_map(|(_, p, _)| p["approval_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The id of an unrevoked record of `action` whose `fields` all match.
+    fn standing(
+        stream: &[(String, Value, f64)],
+        action: &str,
+        fields: &[(&str, &Value)],
+    ) -> Option<String> {
+        let revoked = Self::revoked_ids(stream);
+        stream.iter().find_map(|(k, p, _)| {
+            let id = p["approval_id"].as_str()?;
+            (k == APPROVAL_RECORDED_EVENT
+                && p["action"] == action
+                && fields.iter().all(|(f, v)| &p[*f] == *v)
+                && !revoked.contains(id))
+            .then(|| id.to_string())
+        })
+    }
+
+    /// CAD-918: record a verified delegated approval — exactly once per
+    /// `(repo, pr, head)`. While one stands unrevoked, every later call
+    /// (a retry, a concurrent duplicate, a different source) answers
+    /// that record with `new == false`. The check and the write share
+    /// one transaction under the store's write lock.
+    pub fn record_delegated(&self, d: &NewDelegated) -> Result<(bool, String)> {
+        let a = &d.approval;
+        approval_source(a.source)?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let stream = Self::approval_stream(&tx)?;
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        let head = json!(a.head_sha);
+        let standing = Self::standing(&stream, a.action, &[("scope", &scope), ("head_sha", &head)]);
+        if let Some(id) = standing {
+            return Ok((false, id));
+        }
+        let payload = json!({
+            "source": a.source, "action": a.action, "head_sha": a.head_sha,
+            "scope": scope, "approver": d.approver, "verdicts": d.verdicts,
+            "scope_approval": d.scope_approval, "recorded_via": d.approver,
+        });
+        let base = default_approval_id(a.action, a.pr, a.head_sha);
+        let id = Self::append_approval(&tx, &stream, &base, payload)?;
+        tx.commit()?;
+        Ok((true, id))
+    }
+
+    /// CAD-918: the operator pre-approved the scope of `issue` at ticket
+    /// time, bound to `digest` (its body). A live identical record dedupes.
+    pub fn record_scope_approval(
+        &self,
+        issue: &str,
+        digest: &str,
+        source: &str,
+        recorded_via: &str,
+    ) -> Result<(bool, String)> {
+        approval_source(source)?;
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let stream = Self::approval_stream(&tx)?;
+        let scope = json!({"issue": issue, "digest": digest});
+        let standing = Self::standing(
+            &stream,
+            crate::delegation::SCOPE_ACTION,
+            &[("scope", &scope)],
+        );
+        if let Some(id) = standing {
+            return Ok((false, id));
+        }
+        let payload = json!({"source": source, "action": crate::delegation::SCOPE_ACTION,
+                             "scope": scope, "recorded_via": recorded_via});
+        let base = format!("scope-{}-{}", issue.to_ascii_lowercase(), &digest[..12]);
+        let id = Self::append_approval(&tx, &stream, &base, payload)?;
+        tx.commit()?;
+        Ok((true, id))
+    }
+
+    /// A live (unrevoked) scope pre-approval by id: `(issue, digest)`.
+    pub fn scope_approval(&self, id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        let stream = Self::approval_stream(&conn)?;
+        if Self::revoked_ids(&stream).contains(id) {
+            return Ok(None);
+        }
+        Ok(stream.iter().find_map(|(k, p, _)| {
+            (k == APPROVAL_RECORDED_EVENT
+                && p["approval_id"] == id
+                && p["action"] == crate::delegation::SCOPE_ACTION
+                && p["recorded_via"] == "operator-connection")
+                .then(|| {
+                    let text = |f: &str| p["scope"][f].as_str().unwrap_or_default().to_string();
+                    (text("issue"), text("digest"))
+                })
+        }))
+    }
+
+    /// CAD-918: designate (`active`) or undesignate `alias` for
+    /// `project`. Answers whether the state changed.
+    pub fn record_designation(
+        &self,
+        alias: &str,
+        project: &str,
+        active: bool,
+        source: &str,
+        recorded_via: &str,
+    ) -> Result<bool> {
+        identifier(alias, "Designated alias")?;
+        approval_source(source)?;
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let now_active = Self::designations_in(&tx)?
+            .iter()
+            .any(|d| d["alias"] == alias && d["project"] == project && d["active"] == true);
+        if now_active == active {
+            return Ok(false);
+        }
+        let payload = json!({"alias": alias, "project": project, "active": active,
+                             "source": source, "recorded_via": recorded_via});
+        Self::event(&tx, APPROVAL_STREAM, DESIGNATION_EVENT, payload)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The designation in force per `(alias, project)`, with its time.
+    pub fn designations(&self) -> Result<Vec<Value>> {
+        Self::designations_in(&self.conn())
+    }
+
+    fn designations_in(conn: &Connection) -> Result<Vec<Value>> {
+        let mut latest: std::collections::BTreeMap<(String, String), Value> = Default::default();
+        for (k, p, at) in Self::approval_stream(conn)? {
+            if k != DESIGNATION_EVENT || p["recorded_via"] != "operator-connection" {
+                continue;
+            }
+            let (Some(alias), Some(project)) = (p["alias"].as_str(), p["project"].as_str()) else {
+                continue;
+            };
+            let mut row = p.clone();
+            row["at"] = json!(at);
+            latest.insert((alias.to_string(), project.to_string()), row);
+        }
+        Ok(latest.into_values().collect())
     }
 
     /// Persist an explicit operator revocation of approval `id`. It must

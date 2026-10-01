@@ -1,0 +1,36 @@
+# The mechanical path lists of docs/roles/risk-classes.md (CAD-918) —
+# the single source. `cadence audit approve --delegated` compiles it in
+# (src/delegation.rs), so the daemon applies the lists of the build it
+# runs, never the PR's own. Editing it is trigger 7. `paths` are globs
+# (`*` within a component, `**` across directories); `symbols` match a
+# diff line that changes, or a hunk that sits inside, code naming them.
+
+# Trigger 1: trust boundary and identity. Pre-approvable at ticket time.
+[trigger1]
+paths = ["src/peer.rs", "src/daemon/identity.rs", "src/daemon/caller_rule.rs",
+  "src/ui/operator.rs", "src/operator_auth.rs", "src/tailnet_proof.rs",
+  "src/test_seam.rs", "src/master_perm.rs"]
+symbols = ["request_identity", "write_caller", "tailnet_proof", "operator_proof",
+  "operator_connection", "connection_caller", "slot_identity", "verify_ownership",
+  "resolve_session", "open_adopted"]
+
+# Trigger 2, schema and store version. Pre-approvable at ticket time.
+[schema]
+paths = ["src/store/schema.rs", "src/rollout.rs"]
+
+# Trigger 4: supply chain and CI. Never delegable, never pre-approvable.
+[trigger4]
+paths = ["Cargo.toml", "Cargo.lock", "ui/package.json", "ui/pnpm-lock.yaml",
+  ".github/**", "scripts/**"]
+
+# Trigger 7: the rules and the gates. Never delegable, never pre-approvable.
+[trigger7]
+paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
+  "AGENTS.md", "cadence-review.toml", "src/review.rs", "src/audit.rs",
+  "src/delegation.rs", "src/daemon/approvals_rpc.rs", "scripts/**"]
+
+# Exactly the "Script allowlist (auto-eligible)" of risk-classes.md:
+# exempt from the `scripts/**` globs above.
+[scripts_allowlist]
+paths = ["scripts/measurements/README.md", "scripts/measurements/board-live.mjs",
+  "scripts/test-dup-report", "scripts/test-dup-report.txt", "scripts/auto-stage.py"]

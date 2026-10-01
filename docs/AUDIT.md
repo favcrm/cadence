@@ -263,6 +263,22 @@ to this machine in agent-written markdown are never clickable, and
 there is no failed-login rate limit (a shared budget let an agent lock
 the operator out). These audit verbs do not take the secret yet (ADR 0004 §12, Q7).
 
+**Delegated approvals (CAD-918).** `cadence audit designate` and
+`cadence audit approve --issue <ID> --action scope` are operator-connection
+verbs with the proof above, and the master can never request either. A
+designated agent records `cadence audit approve --delegated` from its own
+pane: the approver is `delegated:<alias>` from `connection_caller`, never
+a flag or field, so the operator, a detached child (`setsid -f`, with or
+without `CADENCE_ALIAS`) and unproven callers are refused. The daemon
+reads every fact itself — the designation (only for an agent row
+registered no later than it), the PR through its boot-fixed `gh`, the
+ticket, and the verdict notes through `parse_note` — and records
+`action: delegated-merge`, `recorded_via: delegated:<alias>` exactly once
+per `(repo, PR, head)`. That action is not `merge`, so no reader counts it
+as an operator approval. Residuals: verdict notes are files the agents'
+uid can write (daemon-attested receipts are CAD-814 slice 2), and the
+residual above carries over to `designate`.
+
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
 

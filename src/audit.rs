@@ -60,7 +60,7 @@ const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct AuditOptions {
     /// `--since 24h|7d|YYYY-MM-DD|<epoch>` — drop merges older than this.
     pub since: Option<String>,
-    /// `--class auto|notify|human` — keep rows classified to that class.
+    /// `--class auto|notify|delegated|human` — keep rows of that class.
     pub class: Option<String>,
     /// `--project P` — keep rows whose tracker issue lives under project P.
     pub project: Option<String>,
@@ -153,6 +153,9 @@ struct Row {
     structural: Vec<String>,
     /// Operator approval evidence bound to the landed head (CAD-217).
     approval: ApprovalView,
+    /// CAD-918: a designated agent's delegated approval, bound the same
+    /// way and reported apart — it never stands in for `approval`.
+    delegated: ApprovalView,
     /// `(field, reason)` pairs for every `unknown` rendered.
     unknowns: Vec<(String, String)>,
 }
@@ -169,9 +172,9 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     let class_filter = match opts.class.as_deref() {
         Some(c) => {
             let c = c.to_lowercase();
-            if !["auto", "notify", "human"].contains(&c.as_str()) {
+            if !["auto", "notify", "delegated", "human"].contains(&c.as_str()) {
                 return Err(Error::rejected(format!(
-                    "--class must be auto, notify or human (got '{c}')"
+                    "--class must be auto, notify, delegated or human (got '{c}')"
                 )));
             }
             Some(c)
@@ -711,27 +714,28 @@ fn gh_status(slug: &str, sha: &str) -> std::result::Result<Value, String> {
 // ---------- notes ----------------------------------------------------
 
 /// One note's extracted evidence. Only the fields the audit renders.
+/// CAD-918: delegated approvals read notes through this same parser.
 #[derive(Debug, Default)]
-struct Note {
-    path: PathBuf,
+pub(crate) struct Note {
+    pub(crate) path: PathBuf,
     /// `verdict` | `ops-merge` | `other` — from the filename.
-    kind: String,
+    pub(crate) kind: String,
     /// `From:` identity.
-    from: Option<String>,
+    pub(crate) from: Option<String>,
     /// Full 40-hex tokens seen in the note.
     shas: Vec<String>,
     /// `#NN` PR references seen in the note.
-    prs: Vec<u64>,
+    pub(crate) prs: Vec<u64>,
     /// The `Issue:` header — binds a verdict to one tracker issue.
-    issue: Option<String>,
+    pub(crate) issue: Option<String>,
     /// The sha a `head …` line names — the verdict's reviewed head.
-    head_sha: Option<String>,
-    verdict: Option<String>,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) verdict: Option<String>,
     /// CAD-959: the `## Verdict` section's word and the inline `Verdict:`
     /// line's word, kept apart so a caller can see them disagree.
-    verdict_section: Option<String>,
-    verdict_inline: Option<String>,
-    class: Option<String>,
+    pub(crate) verdict_section: Option<String>,
+    pub(crate) verdict_inline: Option<String>,
+    pub(crate) class: Option<String>,
     trigger: Option<String>,
     auditor_check: Option<String>,
     gates: Vec<String>,
@@ -820,7 +824,7 @@ fn gate_is_stress(lower: &str) -> bool {
 /// `None` when the notes directory itself cannot be read — distinct
 /// from an empty one: an unreadable directory is missing evidence, an
 /// empty one is an answered "no verdicts".
-fn note_index(dir: &Path) -> Option<Vec<Note>> {
+pub(crate) fn note_index(dir: &Path) -> Option<Vec<Note>> {
     let mut notes = Vec::new();
     let read = std::fs::read_dir(dir).ok()?;
     for ent in read.flatten() {
@@ -949,7 +953,7 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
                 None => (rest.to_string(), String::new()),
             };
             let class = class.trim_end_matches('*').to_lowercase();
-            if ["auto", "notify", "human"].contains(&class.as_str()) {
+            if ["auto", "notify", "delegated", "human"].contains(&class.as_str()) {
                 note.class = Some(class);
                 if !trigger.is_empty() {
                     note.trigger = Some(trigger);
@@ -1310,6 +1314,9 @@ struct ApprovalRec {
     repo: String,
     pr: u64,
     recorded_via: Option<String>,
+    /// CAD-918: `delegated:<alias>` and its two verdict notes.
+    approver: Option<String>,
+    verdicts: Vec<String>,
     at: f64,
 }
 
@@ -1440,6 +1447,8 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
                 repo,
                 pr,
                 recorded_via: text("recorded_via"),
+                approver: text("approver"),
+                verdicts: serde_json::from_value(p["verdicts"].clone()).unwrap_or_default(),
                 at,
             });
         } else if kind == APPROVAL_REVOKED_EVENT {
@@ -1472,6 +1481,49 @@ fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
     }
 }
 
+// ---------- delegated digest (CAD-918) -------------------------------
+
+/// A delegated approval: its action, recorded by the delegated verb
+/// (`recorded_via: delegated:<alias>`) — never the operator's generic one.
+fn is_delegated(a: &ApprovalRec) -> bool {
+    a.action == crate::delegation::DELEGATED_ACTION
+        && a.recorded_via
+            .as_deref()
+            .is_some_and(|v| v.starts_with("delegated:"))
+}
+
+/// `cadence audit digest [--since 24h]`: every delegated approval in
+/// the window, each with the commands that undo it — revoke the record,
+/// and revert the merge if it landed. Read-only over the daemon store.
+pub fn digest(state_dir: &Path, since: Option<&str>) -> Result<Value> {
+    let since = parse_since(since.unwrap_or("24h"))?;
+    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    if let Some(gap) = &ev.approvals_gap {
+        return Err(Error::rejected(format!(
+            "approval records unreadable: {gap}"
+        )));
+    }
+    let rows: Vec<Value> = ev
+        .approvals
+        .iter()
+        .filter(|a| is_delegated(a) && a.at >= since)
+        .map(|a| {
+            let mut j = approval_rec_json(a);
+            j["revoked"] = json!(ev.revocations.contains_key(&a.id));
+            j["revoke"] = json!(format!(
+                "cadence audit revoke {} --source \"<who, where>\" --reason \"<why>\"",
+                a.id
+            ));
+            j["revert"] = json!(format!(
+                "git revert $(gh pr view {} -R {} --json mergeCommit -q .mergeCommit.oid)",
+                a.pr, a.repo
+            ));
+            j
+        })
+        .collect();
+    Ok(json!({"since": iso(since), "delegated": rows}))
+}
+
 // ---------- operator approval (CAD-217) -----------------------------
 
 /// Bind the row to the operator approval in force at merge time for
@@ -1480,6 +1532,12 @@ fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
 /// context and are otherwise `not-required` (or `unknown` without a
 /// risk class).
 fn enrich_approval(ev: &StoreEvidence, slug: Option<&str>, row: &mut Row) {
+    let delegated = bind_approval_for(ev, slug, row, crate::delegation::DELEGATED_ACTION);
+    row.delegated = if delegated.record.is_some() || row.class.as_deref() == Some("delegated") {
+        delegated
+    } else {
+        ApprovalView::default()
+    };
     let view = bind_approval(ev, slug, row);
     row.approval = match row.class.as_deref() {
         Some("human") => {
@@ -1511,6 +1569,19 @@ fn enrich_approval(ev: &StoreEvidence, slug: Option<&str>, row: &mut Row) {
 }
 
 fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalView {
+    bind_approval_for(ev, slug, row, "merge")
+}
+
+/// [`bind_approval`] for one approval action: `merge` (the operator's)
+/// or `delegated-merge` (a designated agent's, CAD-918). A delegated
+/// record carries `recorded_via: delegated:<alias>`; any other is not
+/// one, whatever its action says.
+fn bind_approval_for(
+    ev: &StoreEvidence,
+    slug: Option<&str>,
+    row: &Row,
+    action: &str,
+) -> ApprovalView {
     let unknown = |reason: String| ApprovalView {
         state: "unknown".into(),
         reason: Some(reason),
@@ -1526,8 +1597,11 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
     // checked whenever the audit knows its own: gh's slug, or the
     // checkout's origin in fixture runs).
     let in_scope = |a: &&ApprovalRec| {
-        a.action == "merge"
-            && row.pr == Some(a.pr)
+        (if action == "merge" {
+            a.action == action
+        } else {
+            is_delegated(a)
+        }) && row.pr == Some(a.pr)
             && slug.is_none_or(|s| s.eq_ignore_ascii_case(&a.repo))
     };
     let (bound, other_heads): (Vec<&ApprovalRec>, Vec<&ApprovalRec>) = ev
@@ -1553,7 +1627,12 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         // In force at merge time. A later revocation is shown, but the
         // question is what held when the merge happened.
         let reason = revoked(a).map(|r| format!("revoked after the merge ({})", iso(r.at)));
-        return view("operator-claimed", a, reason);
+        let state = if action == "merge" {
+            "operator-claimed"
+        } else {
+            "delegated"
+        };
+        return view(state, a, reason);
     }
     if let Some(a) = bound.iter().find(before) {
         let reason = format!("approval {} was revoked before the merge", a.id);
@@ -2043,6 +2122,15 @@ fn flag_row(row: &mut Row) {
             _ => {}
         }
     }
+    // CAD-918: a delegated-class merge needs a delegated approval in
+    // force, or the operator's.
+    if row.class.as_deref() == Some("delegated") && row.approval.state != "operator-claimed" {
+        match row.delegated.state.as_str() {
+            "missing" => row.flags.push("approval-missing".into()),
+            "revoked" => row.flags.push("approval-revoked".into()),
+            _ => {}
+        }
+    }
 }
 
 /// The fleet-level fact behind a structural match (CAD-207).
@@ -2128,6 +2216,7 @@ fn approval_rec_json(a: &ApprovalRec) -> Value {
         "head_sha": a.head_sha,
         "scope": {"repo": a.repo, "pr": a.pr},
         "recorded_via": a.recorded_via, "recorded_at": a.at,
+        "approver": a.approver, "verdicts": a.verdicts,
     })
 }
 
@@ -2168,10 +2257,18 @@ fn claimed_count(rows: &[Row]) -> usize {
 /// as proof.
 fn approvals_clause(rows: &[Row]) -> String {
     let claimed = claimed_count(rows);
-    if claimed == 0 && !rows.iter().any(|r| r.class.as_deref() == Some("human")) {
+    if claimed == 0
+        && !rows
+            .iter()
+            .any(|r| matches!(r.class.as_deref(), Some("human" | "delegated")))
+    {
         return String::new();
     }
-    format!(", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED})")
+    let delegated = rows.iter().filter(|r| r.delegated.state == "delegated");
+    let delegated = delegated.count();
+    format!(
+        ", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED}), {delegated} delegated"
+    )
 }
 
 /// The text row's approval line — for human-class rows, and for any
@@ -2255,6 +2352,12 @@ fn row_json(row: &Row) -> Value {
         "flags": row.flags,
         "structural": row.structural,
         "approval": approval_json(row),
+        // CAD-918: apart from the operator's; null when not in play.
+        "delegated_approval": (!row.delegated.state.is_empty()).then(|| json!({
+            "state": row.delegated.state, "reason": row.delegated.reason,
+            "record": row.delegated.record.as_ref().map(approval_rec_json),
+            "revoked": row.delegated.revocation.is_some(),
+        })),
         "evidence_unavailable": if row.evidence_gaps.is_empty() {
             Value::Null
         } else {
@@ -2433,6 +2536,22 @@ fn render_text(
         );
         if let Some(line) = approval_line(row) {
             let _ = writeln!(out, "    {line}");
+        }
+        if !row.delegated.state.is_empty() {
+            let v = &row.delegated;
+            let rec = v.record.as_ref().map_or(String::new(), |a| {
+                let by = a.approver.as_deref().unwrap_or("?");
+                format!(
+                    " · id {} · by {by} · verdicts {}",
+                    a.id,
+                    a.verdicts.join(", ")
+                )
+            });
+            let why = v
+                .reason
+                .as_ref()
+                .map_or(String::new(), |r| format!(" — {r}"));
+            let _ = writeln!(out, "    delegated approval {}{rec}{why}", v.state);
         }
         for (field, reason) in &row.unknowns {
             let _ = writeln!(out, "    unknown[{field}] {reason}");
@@ -2873,8 +2992,40 @@ mod tests {
             repo: "x/y".into(),
             pr: 1,
             recorded_via: Some("operator-connection".into()),
+            approver: None,
+            verdicts: vec![],
             at,
         }
+    }
+
+    /// CAD-918: a delegated record is reported apart from the operator's
+    /// and never clears a human-class merge; an operator-recorded
+    /// `delegated-merge` is no delegated approval at all.
+    #[test]
+    fn delegated_approval_is_reported_apart_and_never_clears_human() {
+        let mut d = rec("d", HEAD, MERGED - 60.0);
+        d.action = crate::delegation::DELEGATED_ACTION.into();
+        d.recorded_via = Some("delegated:pm-d".into());
+        let r = human(&ev(vec![d.clone()], &[]), None);
+        assert_eq!(r.approval.state, "missing");
+        assert_eq!(r.delegated.state, "delegated");
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
+        assert_eq!(row_json(&r)["delegated_approval"]["state"], "delegated");
+        let delegated_row = |e: &StoreEvidence| {
+            let mut r = flagged_row();
+            r.landed_head = Some(HEAD.into());
+            r.merged_at = Some(MERGED);
+            r.class = Some("delegated".into());
+            r.qa_verdict_status = Some("SUCCESS".into());
+            enrich_approval(e, None, &mut r);
+            flag_row(&mut r);
+            r
+        };
+        assert!(delegated_row(&ev(vec![d.clone()], &[])).flags.is_empty());
+        d.recorded_via = Some("operator-connection".into());
+        let r = delegated_row(&ev(vec![d], &[]));
+        assert_eq!(r.delegated.state, "missing");
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
     }
 
     fn revoke(at: f64) -> Revocation {

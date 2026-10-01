@@ -390,7 +390,10 @@ fn audit_approve_and_revoke_parse() {
     else {
         panic!("audit approve must parse to AuditAction::Approve");
     };
-    assert_eq!((pr, action.as_str(), id, repo), (84, "merge", None, None));
+    assert_eq!(
+        (pr, action.as_str(), id, repo),
+        (Some(84), "merge", None, None)
+    );
     assert!(Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err());
     assert!(matches!(
         Cli::try_parse_from(["cadence", "audit", "--json"])

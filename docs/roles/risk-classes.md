@@ -31,11 +31,27 @@ Each path must satisfy ALL four criteria:
 
 A PR is auto-eligible under this allowlist only when every `scripts/**` path it touches is allowlisted, the changes preserve all four criteria, and no other human trigger applies (for example, `.github/**` stays human under trigger 4). New paths and new gate or delivery wiring are not implicitly allowlisted: a PR that gives an allowlisted script a gate, release or promotion caller must remove its allowlist entry in the same PR. Changing this allowlist is itself trigger 7 (`human`). The two-independent-review requirement is unchanged.
 
+## Class `delegated` — a designated agent approves (CAD-918, operator decision 2026-10-01)
+
+Class `human` splits in two. These stay `human`, and the operator approves them at merge: trigger 1 (trust boundary and identity), trigger 3 (fixes for an actual leak or vulnerability, redaction logic), trigger 4 (supply chain and CI), trigger 6 (outward or fleet actions, production rollouts), trigger 7 (the rules and gates, including this section), and from trigger 2 schema migrations and store-version changes.
+
+These become `delegated`: the rest of trigger 2 (data and deletion paths, the tracker write path, memory writes); trigger 5 (size and review rounds); and a `human` ticket whose scope the operator pre-approved at ticket time (`cadence audit approve --issue <ID> --action scope`), when both reviewers state that the PR stays within that scope, name the pre-approval id, and add no new trigger. Triggers 4 and 7 are never pre-approvable.
+
+A designated agent approves a `delegated` PR with `cadence audit approve --pr <n> --head <full sha> --delegated [--scope <id>] --source "<notes>"`, run from its own pane. The daemon refuses it unless every safeguard holds:
+1. Two PASS verdict notes for the ticket and PR, each pinned to the exact head, from two distinct reviewers. Neither reviewer is an author (the ticket's owner, the loop's worker, the PR's GitHub login) or the approver. No verdict note on that head may state anything but `auto` or `delegated`.
+2. CI is green at that head, and the PR is open.
+3. Any gate change carries an adversarial test that fails without its guard. Reviewers check this, and their PASS states it.
+4. A mechanical path check. The lists live in one place, [`docs/roles/risk-paths.toml`](risk-paths.toml), which the binary compiles in. A diff touching a trigger 4 or 7 path is refused, whatever the reviewers wrote. A trigger 1 path or symbol, or a schema path, is refused unless a live scope pre-approval is cited. The pre-approval must be bound to the ticket's current text.
+5. The approval is recorded as `delegated:<alias>`. The alias comes from the caller's connection (the CAD-411 derivation), never from a flag, so the operator, a detached child and an unprovable caller are all refused. Only an agent the operator designated for the ticket's project may record it: `cadence audit designate <alias> --project <key>`, operator only, listed by `cadence audit designations`.
+6. `cadence audit digest [--since 24h]` lists delegated approvals, each with a revoke command and a revert command. `cadence audit revoke` withdraws a delegated approval like any other.
+
+`cadence audit` reports delegated approvals apart from operator approvals. A delegated approval never satisfies a `human` merge.
+
 ## Class `auto` — ops-1 merges on its own
 Everything else, provided ALL hold: qa-1 verdict `pass` on the exact head SHA; CI green on that head; the combined-tree gate (train) green including one full integration suite under the suite lock; net-deletion check clean; the author is frozen; no secret-looking string in the PR body or diff.
 
 ## Who decides
-qa-1 states `Risk: auto` or `Risk: human (<trigger numbers>)` in every verdict with one line of reasons. ops-1 re-checks mechanically (paths touched, `Cargo.toml`/workflow diffs, line count, round count). If either says `human`, it is `human`. When unsure, `human`.
+qa-1 states `Risk: auto`, `Risk: delegated (<triggers>)` or `Risk: human (<trigger numbers>)` in every verdict with one line of reasons. ops-1 re-checks mechanically (paths touched, `Cargo.toml`/workflow diffs, line count, round count). If either says `human`, it is `human`. When unsure, `human`.
 
 ### Reviewer count on a solo-operator lane
 The default is two distinct independent reviewers (Standards and
