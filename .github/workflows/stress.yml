@@ -1,0 +1,220 @@
+name: stress
+
+# CAD-958: run a nextest filterset N times on ephemeral GitHub runners so
+# flake loops leave the shared host. Manual dispatch only: this workflow must
+# never run on pull_request, merge_group or push (tests/scripts/test_ci_stress.py).
+#
+#   gh workflow run stress.yml -f ref=<branch-or-sha> -f filter='test(=name)' \
+#     -f count=30 -f copies=4 -f load=true
+#
+# Every copy builds once, then runs the filter `count` times with retries 0
+# (scripts/cadence-nextest pins the cadence profile and zero retries).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or full SHA to check out
+        type: string
+        required: true
+      filter:
+        description: cargo-nextest filterset expression, for example 'test(=name)'
+        type: string
+        required: true
+      features:
+        description: Cargo features for the build
+        type: string
+        default: test-seam
+        required: false
+      count:
+        description: Iterations per copy (1-200)
+        type: string
+        default: "30"
+        required: true
+      copies:
+        description: Parallel runner copies (1-8)
+        type: string
+        default: "1"
+        required: true
+      load:
+        description: Run a bounded CPU burner alongside the tests
+        type: boolean
+        default: false
+        required: false
+      stop_on_fail:
+        description: Stop a copy at its first failing iteration
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      copies: ${{ steps.validate.outputs.copies }}
+    steps:
+      # Inputs reach the shell only through env, never through ${{ }} in the
+      # script body, so a crafted filter or ref cannot inject commands.
+      - name: Validate inputs
+        id: validate
+        env:
+          COUNT: ${{ inputs.count }}
+          COPIES: ${{ inputs.copies }}
+          FEATURES: ${{ inputs.features }}
+          FILTER: ${{ inputs.filter }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          case "$COUNT" in ''|*[!0-9]*) echo "count must be an integer 1-200" >&2; exit 1 ;; esac
+          case "$COPIES" in ''|*[!0-9]*) echo "copies must be an integer 1-8" >&2; exit 1 ;; esac
+          if [ "${#COUNT}" -gt 3 ] || [ "$COUNT" -lt 1 ] || [ "$COUNT" -gt 200 ]; then
+            echo "count must be 1-200, got $COUNT" >&2; exit 1
+          fi
+          if [ "${#COPIES}" -gt 1 ] || [ "$COPIES" -lt 1 ] || [ "$COPIES" -gt 8 ]; then
+            echo "copies must be 1-8, got $COPIES" >&2; exit 1
+          fi
+          if ! printf '%s' "$FEATURES" | grep -Eq '^[A-Za-z0-9_,/:.-]*$'; then
+            echo "features may hold only letters, digits and _ , / : . -" >&2; exit 1
+          fi
+          if [ -z "$FILTER" ] || [ -z "$REF" ]; then
+            echo "ref and filter are required" >&2; exit 1
+          fi
+          matrix=$(seq 1 "$COPIES" | paste -sd, -)
+          echo "copies=[$matrix]" >> "$GITHUB_OUTPUT"
+
+  stress:
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      # One copy's failure must never hide the others' counts.
+      fail-fast: false
+      matrix:
+        copy: ${{ fromJSON(needs.plan.outputs.copies) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      # Restore only: a stress run must never write the shared cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate-test
+          save-if: false
+      # Read-only credentials only (SCCACHE_S3_RW_MODE=READ_ONLY is set by
+      # scripts/ci-sccache); no environment, no write key.
+      - name: Enable shared sccache (no-op without credentials)
+        env:
+          SCCACHE_CI_RO_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_RO_ACCESS_KEY_ID }}
+          SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
+          SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      # Board-surface tests serve the real SPA build through ui/dist.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm build
+        working-directory: ui
+      - name: Install pinned cargo-nextest
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      # Build once. Listing compiles the test binaries and proves the filter
+      # selects at least one test, so a typo fails here rather than as `count`
+      # identical failures.
+      - name: Build test binaries once and check the filter
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+          FEATURES: ${{ inputs.features }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          set -eu
+          scripts/cadence-nextest list --locked --features "$FEATURES" -E "$FILTER" --message-format oneline > "$RUNNER_TEMP/selected.txt"
+          if [ ! -s "$RUNNER_TEMP/selected.txt" ]; then
+            echo "filter selects no tests" >&2; exit 1
+          fi
+          wc -l < "$RUNNER_TEMP/selected.txt" | xargs printf 'selected tests: %s\n'
+      - name: Start bounded CPU burner
+        if: ${{ inputs.load }}
+        run: |
+          set -eu
+          : > "$RUNNER_TEMP/burner.pids"
+          for _ in $(seq 1 "$(nproc)"); do
+            setsid timeout 18000 sh -c 'while :; do :; done' > /dev/null 2>&1 &
+            echo $! >> "$RUNNER_TEMP/burner.pids"
+          done
+      - name: Run the filter in a loop
+        id: loop
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+          COUNT: ${{ inputs.count }}
+          COPY: ${{ matrix.copy }}
+          FEATURES: ${{ inputs.features }}
+          FILTER: ${{ inputs.filter }}
+          LOAD: ${{ inputs.load }}
+          STOP_ON_FAIL: ${{ inputs.stop_on_fail }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/stress-fail"
+          mkdir -p "$out"
+          pass=0
+          fail=0
+          ran=0
+          i=1
+          while [ "$i" -le "$COUNT" ]; do
+            log="$RUNNER_TEMP/iter-$i.log"
+            if scripts/cadence-nextest --locked --features "$FEATURES" -E "$FILTER" > "$log" 2>&1; then
+              pass=$((pass + 1))
+            else
+              fail=$((fail + 1))
+              cp "$log" "$out/copy-$COPY-iter-$i.log"
+              [ ! -f target/nextest/cadence/junit.xml ] || cp target/nextest/cadence/junit.xml "$out/copy-$COPY-iter-$i.junit.xml"
+            fi
+            rm -f "$log"
+            ran=$i
+            if [ "$fail" -gt 0 ] && [ "$STOP_ON_FAIL" = true ]; then
+              break
+            fi
+            i=$((i + 1))
+          done
+          {
+            echo "### stress copy $COPY"
+            echo
+            echo "| copy | iterations run | requested | passed | failed | load | filter |"
+            echo "| --- | --- | --- | --- | --- | --- | --- |"
+            printf '| %s | %s | %s | %s | %s | %s | `%s` |\n' "$COPY" "$ran" "$COUNT" "$pass" "$fail" "$LOAD" "$FILTER"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "failed=$fail" >> "$GITHUB_OUTPUT"
+          [ "$fail" -eq 0 ]
+      - name: Stop the CPU burner
+        if: ${{ always() && inputs.load }}
+        run: |
+          if [ -f "$RUNNER_TEMP/burner.pids" ]; then
+            while read -r pid; do
+              kill -- "-$pid" 2> /dev/null || kill "$pid" 2> /dev/null || true
+            done < "$RUNNER_TEMP/burner.pids"
+          fi
+      - name: Keep the failing iterations' output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-failures-${{ github.run_id }}-${{ github.run_attempt }}-copy-${{ matrix.copy }}
+          path: ${{ runner.temp }}/stress-fail
+          if-no-files-found: ignore
+          retention-days: 14

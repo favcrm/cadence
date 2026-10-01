@@ -216,6 +216,9 @@ jobs:
       # workflow (0 jobs), which the regex-based contracts cannot see.
       - name: Test workflows parse strictly (no duplicate keys)
         run: python3 tests/scripts/test_workflows_strict.py
+      # CAD-958: the manual stress workflow stays dispatch-only, read-only and cache-restore-only.
+      - name: Test stress workflow contract
+        run: python3 tests/scripts/test_ci_stress.py
 
   clippy:
     needs: [queue-evidence]
