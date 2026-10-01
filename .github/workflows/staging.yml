@@ -70,14 +70,13 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
-      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: scripts/ci-rust-toolchain --export --profile minimal
       - run: pnpm install --frozen-lockfile
         working-directory: ui
       - run: pnpm build
         working-directory: ui
       - run: cargo build --release --locked --features ui
         env:
-          RUSTUP_TOOLCHAIN: 1.98.1
           CARGO_BUILD_JOBS: 4
       - name: Real-binary migration and backup recovery rehearsal
         env:
@@ -91,7 +90,6 @@ jobs:
             --candidate "$GITHUB_WORKSPACE/target/release/cadence" --sha "$SOURCE_SHA" --out "$RUNNER_TEMP/rehearsal"
       - name: Full MVP journey using the PR's embedded-UI release binary
         env:
-          RUSTUP_TOOLCHAIN: 1.98.1
           CARGO_BUILD_JOBS: 4
           E2E_OUT: ${{ runner.temp }}/staging-e2e
           CADENCE_E2E_PORT: 3186
@@ -207,11 +205,10 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: candidate-source/tests/e2e/pnpm-lock.yaml
-      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: control/scripts/ci-rust-toolchain --export --profile minimal
       - name: MVP journey against the exact downloadable binary
         id: mvp
         env:
-          RUSTUP_TOOLCHAIN: 1.98.1
           CARGO_BUILD_JOBS: 4
           E2E_OUT: ${{ runner.temp }}/staging-e2e
           CADENCE_E2E_ROOT: ${{ github.workspace }}/candidate-source

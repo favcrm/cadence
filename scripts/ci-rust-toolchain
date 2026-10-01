@@ -1,0 +1,30 @@
+#!/bin/sh
+# CAD-927: install the Rust toolchain pinned in rust-toolchain.toml.
+#
+#   ci-rust-toolchain [--export] [rustup toolchain install args...]
+#
+# The channel is read from rust-toolchain.toml next to this script's
+# repository root, so the version lives in exactly one file. Remaining
+# arguments (--profile, --component) go to `rustup toolchain install`.
+# --export also appends RUSTUP_TOOLCHAIN=<channel> to $GITHUB_ENV, for jobs
+# that build a checkout other than the workspace (which may predate the file).
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+file="$root/rust-toolchain.toml"
+export_env=0
+if [ "${1:-}" = "--export" ]; then
+    export_env=1
+    shift
+fi
+
+channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' "$file")
+case "$channel" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "ci-rust-toolchain: $file must pin an exact x.y.z channel, got '$channel'" >&2; exit 1 ;;
+esac
+
+rustup toolchain install "$channel" "$@"
+if [ "$export_env" = 1 ]; then
+    echo "RUSTUP_TOOLCHAIN=$channel" >> "${GITHUB_ENV:?--export needs GITHUB_ENV}"
+fi

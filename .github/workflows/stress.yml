@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
       # Restore only: a stress run must never write the shared cache.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

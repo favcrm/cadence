@@ -60,7 +60,7 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write('CADENCE_SUITE_LOCK=' + os.environ['RUNNER_TEMP'] + '/cadence-suite.lock\n')
           PY
-      - run: rustup toolchain install stable --profile minimal
+      - run: scripts/ci-rust-toolchain --profile minimal
         if: steps.scope.outputs.mode != 'docs'
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         if: steps.scope.outputs.mode != 'docs'

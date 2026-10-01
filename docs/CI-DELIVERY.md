@@ -372,3 +372,31 @@ review bridge must report both PR-head and merge-group checks before
 activating it in branch protection. CAD-120 tracks reviewer identity
 integration. Real-provider acceptance remains CAD-434; the fake-provider
 MVP journey cannot prove provider compatibility or real fleet continuity.
+
+## Rust toolchain pin (CAD-927)
+
+`rust-toolchain.toml` pins an exact Rust release (`channel = "x.y.z"`, never
+`stable`). It is the only place the version is written. Every workflow
+installs Rust through `scripts/ci-rust-toolchain`, which reads the channel
+from that file and runs `rustup toolchain install <channel>` with the
+profile and components the job passes. `--export` also sets
+`RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
+`candidate-source`). Local `cargo` follows the file too, so a local
+`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` fails
+if a workflow installs a literal or floating channel.
+
+A new stable release can no longer turn the queue red: lints and
+`-D warnings` change only when the pin changes. Because the cache keys
+(`Swatinem/rust-cache` `shared-key: gate-*`, and sccache) hash the rustc
+version, the first main run after a bump re-warms them; the key prefixes
+do not change.
+
+To bump the pin, in one PR:
+
+1. Edit `channel` in `rust-toolchain.toml` and nothing else for the
+   version. `rustup toolchain install` the new version locally.
+2. Run `cargo clippy --all-targets --locked -- -D warnings` (and again
+   with `--features test-seam`) plus `cargo fmt --all -- --check`, and fix
+   every new lint or format change in the same PR.
+3. Run `scripts/pre-push`. The PR touches `rust-toolchain.toml`, so expect
+   it to be reviewed like any other CI change.

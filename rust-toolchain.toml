@@ -1,0 +1,7 @@
+# CAD-927: the one place the Rust version is pinned. CI installs exactly this
+# channel (scripts/ci-rust-toolchain reads it); local cargo and rustup follow
+# it too. To bump it, see "Rust toolchain pin" in docs/CI-DELIVERY.md.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
