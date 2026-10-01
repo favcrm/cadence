@@ -76,6 +76,8 @@ tar -czf "$DL/$TAG/$ASSET" -C "$STAGE" cadence cadence.sha256 manifest.json
 rm -rf "$STAGE"
 
 (cd "$ROOT/tests/e2e" && pnpm install --frozen-lockfile)
+# CAD-871: a screenshot must not wait on web fonts; prove it before the journey.
+(cd "$ROOT/tests/e2e" && node fonts-offline.mjs)
 
 cd "$ROOT"
 CADENCE_E2E_DIST=$DL \
