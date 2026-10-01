@@ -1699,7 +1699,7 @@ mod test_pause {
     /// - `Disconnected` → the controller's `Control` was dropped while
     ///   the call was parked: the test orchestrator is gone, so the
     ///   call resumes for bounded teardown rather than stranding.
-    fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
+    pub(super) fn wait_for_release(release: &Receiver<()>, bound: Duration) -> WaitOutcome {
         match release.recv_timeout(bound) {
             Ok(()) => WaitOutcome::Released,
             // COUNTERFACTUAL MUTANT (temporary — not for merge): the
@@ -2618,13 +2618,15 @@ mod tests {
     /// normal, intended exit the custody tests rely on.
     #[test]
     fn release_wait_released_is_ok() {
-        let (release, hold) = std::sync::mpsc::channel::<()>();
+        // channel() -> (Sender, Receiver): the controller holds the
+        // Sender; the parked call waits on the Receiver.
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         let ctl = std::thread::spawn(move || {
             // Controller side: after a beat, release the parked call.
             std::thread::sleep(std::time::Duration::from_millis(10));
-            let _ = hold.send(());
+            let _ = release_tx.send(());
         });
-        let out = test_pause::wait_for_release(&release, std::time::Duration::from_secs(60));
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_secs(60));
         ctl.join().unwrap();
         assert_eq!(
             out,
@@ -2640,12 +2642,12 @@ mod tests {
     /// the timeout branch without a real 60s wait.
     #[test]
     fn release_wait_timeout_fails() {
-        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         // The sender stays ALIVE (never dropped, never sends) so only
         // the bound can end the wait — a connected-but-stalled
         // controller, which must be Timeout, not Disconnected.
-        let _keep_connected = hold;
-        let out = test_pause::wait_for_release(&release, std::time::Duration::from_millis(20));
+        let _keep_connected = release_tx;
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_millis(20));
         assert_eq!(
             out,
             test_pause::WaitOutcome::Timeout,
@@ -2659,10 +2661,10 @@ mod tests {
     /// must not leave the armed thread parked forever.
     #[test]
     fn release_wait_disconnected_resumes() {
-        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         // Drop the controller side: the parked call sees Disconnected.
-        drop(hold);
-        let out = test_pause::wait_for_release(&release, std::time::Duration::from_secs(60));
+        drop(release_tx);
+        let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_secs(60));
         assert_eq!(
             out,
             test_pause::WaitOutcome::Disconnected,
@@ -2699,8 +2701,9 @@ mod tests {
     #[test]
     fn publish_seam_disconnect_resumes_for_teardown() {
         let ctl = test_pause::arm();
-        drop(ctl); // controller gone before the seam runs
-        // Must NOT panic — a dropped controller means bounded teardown.
+        // Controller gone before the seam runs: the parked call must
+        // take the Disconnected teardown path — resume, never panic.
+        drop(ctl);
         test_pause::at_publish_seam();
         // The pause was consumed: a second unarmed call is a no-op.
         test_pause::at_publish_seam();
