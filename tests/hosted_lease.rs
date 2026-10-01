@@ -720,6 +720,31 @@ fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
     assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
 }
 
+/// CAD-694: a short but valid lease (TTL 2s, renew 1s) must still get
+/// its stop flush. The commit floor derives from the lease's own margin;
+/// a fixed floor above the validity one missed beat leaves would refuse
+/// every commit (CAD-538 regression).
+#[test]
+fn cad694_short_ttl_lease_still_flushes_on_stop() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 2, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = leased_opts(dir.path(), 2);
+    opts.stop = Some(stop.clone());
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    stop.store(true, Ordering::SeqCst);
+    drop(d);
+    let log = git(&pm_dir, &["log", "-1", "--format=%B"]);
+    assert!(log.contains("cadence flush on stop"), "{log}");
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "");
+}
+
 /// CAD-694 (r4 B5): the exit decision itself. A real, non-retryable
 /// drain fault followed by the lease lapsing (renewal wedged past the
 /// TTL) before the verdict is still a fault: serve must exit `Err`. A
@@ -736,11 +761,19 @@ fn cad694_real_drain_fault_exits_err_even_when_the_lease_lapses_after() {
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let entered_tx = Mutex::new(entered_tx);
     let go_rx = Mutex::new(go_rx);
-    let mut opts = leased_opts(dir.path(), 2);
+    // A roomy lease (TTL 6s, renew 2s): it cannot lapse on its own
+    // before shutdown reaches the drain, even on a loaded host.
+    let mut opts = daemon_opts();
+    opts.lease = Some(Hosted {
+        lease: Some(format!("file:{}", lease_file(dir.path()).display())),
+        lease_ttl_secs: Some(6),
+        lease_renew_secs: Some(2),
+        flush_timeout_secs: Some(15),
+    });
     opts.stop = Some(Arc::new(AtomicBool::new(true)));
     opts.shutdown_entries_hook = Some(Arc::new(move |_conn| {
         let _ = entered_tx.lock().unwrap().send(());
-        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
         Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             Some("injected disk full".to_string()),
@@ -750,18 +783,33 @@ fn cad694_real_drain_fault_exits_err_even_when_the_lease_lapses_after() {
         Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
     let state_dir = state.path().to_path_buf();
     let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
-    entered_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the drain never ran");
-    // The drain's write already passed the fence. Now renewal wedges
-    // and the 2s lease lapses before the fault is returned.
+    match entered_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("serve ended before the drain ran: {:?}", handle.join())
+        }
+        Err(e) => panic!("the drain never ran: {e}"),
+    }
+    // The drain's write already passed the fence. Wedge renewal, then
+    // wait — explicitly — until the lease on disk has lapsed.
     let wedged = File::options()
         .read(true)
         .write(true)
         .open(dir.path().join("lease.json.lock"))
         .unwrap();
     assert_eq!(unsafe { libc::flock(wedged.as_raw_fd(), libc::LOCK_EX) }, 0);
-    thread::sleep(Duration::from_millis(3500));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        if body["expires_unix"].as_f64().unwrap_or(f64::MAX) < now_unix() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the wedged lease never lapsed");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(200));
     go_tx.send(()).unwrap();
     let exit = handle.join().unwrap();
     drop(wedged);

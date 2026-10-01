@@ -644,11 +644,6 @@ impl FlushCancel {
 /// files on SIGTERM) before the whole group is killed outright.
 const CANCEL_TERM_GRACE: Duration = Duration::from_millis(1000);
 
-/// A commit may run only while the lease has at least this much room:
-/// the SIGTERM grace plus a margin. Below it the commit is cancelled,
-/// so it is over (or dead) before the lease can lapse into a successor.
-const COMMIT_LEASE_FLOOR: Duration = Duration::from_millis(2000);
-
 /// Whether the leader of `group` has exited, WITHOUT reaping it — the
 /// zombie keeps the pgid ours, so signalling the group stays safe.
 fn leader_exited(group: i32) -> bool {
@@ -666,7 +661,7 @@ fn leader_exited(group: i32) -> bool {
 }
 
 /// [`git`] that the owning thread polls against `cancel` AND the lease:
-/// a lost lease or one with less than [`COMMIT_LEASE_FLOOR`] of validity
+/// a lost lease or one with less than the lease's [`commit_floor`](crate::lease::PmLease::commit_floor) of validity
 /// left cancels the commit like an explicit cancel. The child runs in
 /// its own process group; the owner terminates the group, then kills it
 /// outright after the grace (a hook that traps TERM included) with the
@@ -683,7 +678,7 @@ fn git_cancellable(
     use std::process::Stdio;
     let must_stop = || {
         cancel.cancelled()
-            || lease.is_some_and(|l| l.remaining().is_some_and(|r| r < COMMIT_LEASE_FLOOR))
+            || lease.is_some_and(|l| l.remaining().is_some_and(|r| r < l.commit_floor()))
     };
     if must_stop() {
         return Err(Error::rejected(
@@ -727,7 +722,12 @@ fn git_cancellable(
             // SAFETY: the group's leader is our child and stays
             // unreaped until after the last signal, so the id is ours.
             unsafe { libc::kill(-group, libc::SIGTERM) };
-            let deadline = Instant::now() + CANCEL_TERM_GRACE;
+            // The TERM grace plus the kill must fit in the lease's own
+            // floor: half of it, at most the default grace.
+            let grace = lease.map_or(CANCEL_TERM_GRACE, |l| {
+                CANCEL_TERM_GRACE.min(l.commit_floor() / 2)
+            });
+            let deadline = Instant::now() + grace;
             while Instant::now() < deadline && !leader_exited(group) {
                 std::thread::sleep(Duration::from_millis(10));
             }
