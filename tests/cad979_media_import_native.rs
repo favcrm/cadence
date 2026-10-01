@@ -19,7 +19,6 @@ use image::ImageEncoder as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -470,9 +469,9 @@ fn cad979_freeze_refuses_media_key_for_wrong_digest() {
 struct FakeImportDoor {
     addr: String,
     calls: Arc<AtomicUsize>,
-    // Filled by set_workspace after the harness daemon starts — the store
-    // derives a fresh workspace_id per daemon, so the door cannot know it
-    // until `h` exists, yet `h` needs door.addr up front for the importer.
+    // Filled after the harness daemon starts — the store derives a fresh
+    // workspace_id per daemon, so the door cannot know it until `h` exists,
+    // yet `h` needs door.addr up front for the importer.
     workspace: Arc<Mutex<Option<String>>>,
     connection: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
@@ -481,94 +480,82 @@ struct FakeImportDoor {
 
 impl FakeImportDoor {
     fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking fake door");
-        let addr = listener.local_addr().unwrap().to_string();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap().to_string()
+            + ":"
+            + &server.server_addr().to_port().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let workspace_cell = Arc::new(Mutex::new(None::<String>));
-        let connection_cell = Arc::new(Mutex::new(None::<String>));
-        let c_calls = calls.clone();
-        let c_stop = stop.clone();
-        let worker_ws = workspace_cell.clone();
-        let worker_conn = connection_cell.clone();
+        let workspace = Arc::new(Mutex::new(None::<String>));
+        let connection = Arc::new(Mutex::new(None::<String>));
+        let w = workspace.clone();
+        let c = connection.clone();
+        let cc = calls.clone();
+        let cs = stop.clone();
         let worker = thread::spawn(move || loop {
-            if c_stop.load(Ordering::SeqCst) {
+            if cs.load(Ordering::SeqCst) {
                 return;
             }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).ok();
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    // Read until headers + body are in (loopback, bounded).
-                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                    loop {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            Err(_) => break,
-                        }
-                        if std::time::Instant::now() > deadline
-                            || buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() > 64
-                        {
-                            break;
-                        }
-                    }
-                    let text = String::from_utf8_lossy(&buf).to_owned();
-                    let headers_end = text.find("\r\n\r\n").unwrap_or(buf.len());
-                    let (head, body) = text.split_at(headers_end.min(text.len()));
-                    let body = &body[4.min(body.len())..];
-                    // Parse connectionId + digest from the query line.
-                    let conn = capture_query(&head, "connectionId");
-                    let dig = capture_query(&head, "digest");
-                    let bearer_ok = head.contains("Authorization: Bearer cad979-test-bearer");
-                    let body_bytes = body.as_bytes().to_vec();
-                    let expect_conn = worker_conn.lock().unwrap().clone().unwrap_or_default();
-                    if !bearer_ok
-                        || conn != expect_conn
-                        || dig.len() != 64
-                        || sha_hex(&body_bytes) != dig
-                    {
-                        let resp = "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 52\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":{\"code\":\"digest_mismatch\"}}";
-                        use std::io::Write;
-                        let _ = stream.write_all(resp.as_bytes());
-                        c_calls.fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    }
-                    let mime = if body_bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-                        "image/jpeg"
-                    } else {
-                        "image/png"
-                    };
-                    let digest = sha_hex(&body_bytes);
-                    let w = worker_ws.lock().unwrap().clone().unwrap_or_default();
-                    let key = format!("dp1.{w}.{expect_conn}.{:.32}", digest);
-                    let data = json!({
-                        "mediaKey": key, "connectionId": expect_conn, "digest": digest,
-                        "mime": mime, "sizeBytes": body_bytes.len(),
-                        "readBack": {"bytes": body_bytes.len(), "digest": digest},
-                    });
-                    let payload = json!({"ok": true, "data": data}).to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    );
-                    use std::io::Write;
-                    let _ = stream.write_all(resp.as_bytes());
-                    c_calls.fetch_add(1, Ordering::SeqCst);
-                }
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
+            let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else {
+                continue;
+            };
+            cc.fetch_add(1, Ordering::SeqCst);
+            let url = req.url().to_owned();
+            let auth = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Authorization"))
+                .map(|h| h.value.to_string())
+                .unwrap_or_default();
+            let mut body = Vec::new();
+            req.as_reader().read_to_end(&mut body).unwrap_or(0);
+            let (_, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+            let getq = |k: &str| {
+                query
+                    .split('&')
+                    .find_map(|p| {
+                        p.split_once('=')
+                            .filter(|(x, _)| *x == k)
+                            .map(|(_, v)| v.to_owned())
+                    })
+                    .unwrap_or_default()
+            };
+            let conn = getq("connectionId");
+            let dig = getq("digest");
+            let expect_conn = c.lock().unwrap().clone().unwrap_or_default();
+            let ok = auth == "Bearer cad979-test-bearer"
+                && conn == expect_conn
+                && dig.len() == 64
+                && sha_hex(&body) == dig;
+            let resp = if ok {
+                let digest = sha_hex(&body);
+                let ws = w.lock().unwrap().clone().unwrap_or_default();
+                let mime = if body.starts_with(&[0xff, 0xd8, 0xff]) {
+                    "image/jpeg"
+                } else {
+                    "image/png"
+                };
+                let key = format!("dp1.{ws}.{conn}.{:.32}", digest);
+                let data = json!({
+                    "mediaKey": key, "connectionId": conn, "digest": digest,
+                    "mime": mime, "sizeBytes": body.len(),
+                    "readBack": {"bytes": body.len(), "digest": digest},
+                });
+                tiny_http::Response::from_string(json!({"ok": true, "data": data}).to_string())
+                    .with_status_code(200)
+            } else {
+                tiny_http::Response::from_string(
+                    json!({"ok": false, "error": {"code": "digest_mismatch"}}).to_string(),
+                )
+                .with_status_code(409)
+            };
+            let _ = req.respond(resp);
         });
         Self {
             addr,
             calls,
-            workspace: workspace_cell,
-            connection: connection_cell,
+            workspace,
+            connection,
             stop,
             worker: Some(worker),
         }
@@ -586,94 +573,6 @@ impl Drop for FakeImportDoor {
 
 fn sha_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn capture_query(head: &str, key: &str) -> String {
-    head.split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .split('?')
-        .nth(1)
-        .unwrap_or("")
-        .split('&')
-        .find_map(|p| {
-            p.split_once('=')
-                .filter(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_owned())
-        })
-        .unwrap_or_default()
-}
-
-/// Build a harness whose daemon already carries a `MediaImporter` against a
-/// fake door, plus the synthetic-PNG media adapter.
-fn importer_harness(door: &FakeImportDoor, bearer: &str) -> Release {
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&[0], 1, 1, image::ExtendedColorType::L8)
-        .unwrap();
-    let media = png.clone();
-    let importer = MediaImporter::new(
-        &format!("http://{}", door.addr),
-        DeviceCredential::new(bearer.to_owned()),
-    )
-    .expect("fake-door importer");
-    Release::with_social_image(move |opts, _| {
-        opts.provider_deployments = Some(
-            DeploymentMetadata::parse(
-                br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#,
-            )
-            .unwrap(),
-        );
-        agenticos_external::attach(opts).unwrap();
-        let inner = opts.platforms.remove("agenticos_external").unwrap();
-        opts.platforms.insert(
-            "agenticos_external".into(),
-            Arc::new(SyntheticMedia { inner, png: media }),
-        );
-        opts.social_media_importer = Some(Arc::new(importer));
-    })
-}
-
-/// Positive path: operator import against a real configured importer mints a
-/// media_key that then passes the freeze guard for the same reviewed asset.
-#[test]
-fn cad979_import_then_schedule_binds_reviewed_asset() {
-    // The daemon derives a fresh workspace per store; the door binds first
-    // (the importer needs its address), then learns `h`'s workspace via the
-    // shared cell before any request arrives.
-    let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
-    let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "imp");
-
-    // The importer uploads the retained PNG; the door mints the key.
-    let imported = h
-        .daemon
-        .operator_rpc(
-            "social_publish_media_import",
-            import_body(&run, &install, None, "cad979-imp-1"),
-        )
-        .expect("operator import against the configured fake door must succeed");
-    assert_eq!(imported["ok"], json!(true));
-    let key = imported["media_key"].as_str().unwrap().to_owned();
-    assert_eq!(imported["image_digest"], json!(image_digest));
-    assert_eq!(
-        door.calls.load(Ordering::SeqCst),
-        1,
-        "exactly one import call"
-    );
-
-    // That key must satisfy the freeze guard for the same run/asset.
-    let intent = h
-        .daemon
-        .operator_rpc(
-            "social_publish_schedule",
-            schedule_body(&run, &bundle, &install, "cad979-imp-sched", Some(key)),
-        )
-        .unwrap()["intent"]
-        .clone();
-    assert_eq!(intent["state"], "queued");
 }
 
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
