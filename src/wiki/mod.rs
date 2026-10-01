@@ -2201,6 +2201,14 @@ mod tests {
                 &l_tx,
             )
         });
+        let loser_ctl = l_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the loser thread never armed its call");
+        // Stage 1 — the loser published the shared object and parks.
+        // The winner is spawned only AFTER that rendezvous, so the
+        // loser is provably the publisher and the winner provably the
+        // deduper — the interleaving, not a race for who creates it.
+        loser_ctl.arrived();
         let pm_w = pm_dir.clone();
         let state_w = state.clone();
         let winner = std::thread::spawn(move || {
@@ -2213,15 +2221,9 @@ mod tests {
                 &w_tx,
             )
         });
-        let (loser_ctl, winner_ctl) = (
-            l_rx.recv_timeout(std::time::Duration::from_secs(60))
-                .expect("the loser thread never armed its call"),
-            w_rx.recv_timeout(std::time::Duration::from_secs(60))
-                .expect("the winner thread never armed its call"),
-        );
-
-        // Stage 1 — the loser published the shared object and parks.
-        loser_ctl.arrived();
+        let winner_ctl = w_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the winner thread never armed its call");
         // Stage 2 — the winner deduped that object (same bytes) and
         // parks before its pointer write; the object is now visible
         // to a second caller's commit path.
