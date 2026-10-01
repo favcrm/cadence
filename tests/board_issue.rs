@@ -2808,3 +2808,60 @@ fn pm_commit_stages_only_the_named_paths() {
     assert_eq!(foreign.len(), 65, "{foreign:?}");
     assert_eq!(foreign.last().unwrap(), "(+9 more)");
 }
+
+/// CAD-971: the board PATCH is never weaker than `issue set` — done
+/// without evidence is refused with the CLI's error (400, no commit),
+/// a planted hidden temp is no evidence, and a real verdict is.
+#[test]
+fn board_patch_done_needs_the_same_evidence_as_the_cli() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    // CAD-3 is the seed's plain backlog sibling (CAD-1 is a rollup).
+    let id = "CAD-3";
+    let (ok, cli_err) = cli(
+        pm.path(),
+        state.path(),
+        &["issue", "set", id, "status=done"],
+    );
+    assert!(!ok);
+    let cli_msg = cli_err["error"].as_str().unwrap().to_string();
+    assert!(cli_msg.contains("needs evidence"), "{cli_msg}");
+
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let patch = |body: &str| {
+        op_write_json(
+            &op,
+            port,
+            "PATCH",
+            &format!("/api/issues/{id}"),
+            &host,
+            body,
+        )
+    };
+    let before = commits(pm.path());
+    let (code, _, body) = patch(r#"{"status":"done"}"#);
+    assert_eq!(code, 400, "{body}");
+    let msg = serde_json::from_str::<Value>(&body).unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(msg, cli_msg, "board and CLI refuse with the same error");
+    assert_eq!(commits(pm.path()), before, "a refusal still committed");
+
+    // A planted hidden temp and a directory are not evidence.
+    let artifacts = pm.path().join("cadence").join(id).join("artifacts");
+    std::fs::create_dir_all(artifacts.join("review")).unwrap();
+    std::fs::write(artifacts.join(".verdict-x.tmp"), "planted").unwrap();
+    let (code, _, body) = patch(r#"{"status":"done"}"#);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(commits(pm.path()), before);
+
+    // Real evidence passes.
+    std::fs::write(artifacts.join("review-r1.md"), "pass\n").unwrap();
+    let (code, _, body) = patch(r#"{"status":"done"}"#);
+    assert_eq!(code, 200, "{body}");
+}

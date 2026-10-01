@@ -214,29 +214,47 @@ pub(crate) fn attach_foreign(out: &mut Value, foreign: &[String]) {
 /// `AlreadyExists` instead of overwriting, like `create_new`. A failed
 /// write leaves no file at `path`; the temp file is removed either way.
 pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    write_new_seq(path, bytes, || SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// How many temp names [`write_new_seq`] tries before giving up.
+const TEMP_ATTEMPTS: usize = 64;
+
+/// [`write_new`] with the temp sequence injected. A temp name that
+/// already exists (pid reuse after a crash, a planted file) is skipped
+/// — never removed, it is not ours — and the next sequence number is
+/// tried, so a leftover temp can never surface as a false
+/// `AlreadyExists` for `path` (CAD-971).
+fn write_new_seq(path: &Path, bytes: &[u8], mut seq: impl FnMut() -> u64) -> std::io::Result<()> {
+    use std::io::Write;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let staged = (|| {
-        let mut file = std::fs::OpenOptions::new()
+    for _ in 0..TEMP_ATTEMPTS {
+        let tmp = path.with_file_name(format!(".{name}.tmp-{}-{}", std::process::id(), seq()));
+        let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    let claimed = staged.and_then(|()| std::fs::hard_link(&tmp, path));
-    let _ = std::fs::remove_file(&tmp);
-    claimed
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // From here the temp is ours: it is removed on every outcome.
+        let staged = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        let claimed = staged.and_then(|()| std::fs::hard_link(&tmp, path));
+        let _ = std::fs::remove_file(&tmp);
+        return claimed;
+    }
+    Err(std::io::Error::other(format!(
+        "no free temp name beside {}",
+        path.display()
+    )))
 }
 
 /// Create a file exclusively; on a name collision try `-2`, `-3`…
@@ -1167,8 +1185,15 @@ fn check_done_evidence(
     let verdictish = staged_artifacts.iter().any(|n| is_verdictish(n))
         || std::fs::read_dir(dir.join("artifacts"))
             .map(|rd| {
-                rd.flatten()
-                    .any(|e| is_verdictish(&e.file_name().to_string_lossy()))
+                rd.flatten().any(|e| {
+                    // CAD-971: only a real artifact counts — a valid
+                    // (allowlisted, non-hidden) name on a regular file,
+                    // never a leftover temp, a symlink or a directory.
+                    let name = e.file_name().to_string_lossy().to_string();
+                    model::valid_artifact_name(&name)
+                        && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        && is_verdictish(&name)
+                })
             })
             .unwrap_or(false);
     if verdictish {
@@ -1621,13 +1646,10 @@ pub fn patch_issue(
         }
     }
     let (mut front, mut body) = load_front(&dir)?;
+    let before = front.clone();
     let mut changed = Vec::new();
     if let Some(v) = &patch.status {
         model::check_status(v)?;
-        crate::issue::plan::check_status_write(&pm.dir, &front, v)?;
-        if v == "ready" {
-            crate::issue::blocked::check_ready(&pm.dir, &front)?;
-        }
         front.status = v.clone();
         changed.push(format!("status={v}"));
     }
@@ -1667,6 +1689,9 @@ pub fn patch_issue(
             "nothing to patch — send at least one field",
         ));
     }
+    // CAD-971: the board is never weaker than `issue set` — the same
+    // gates (plan approval, done-evidence, ready/blocked), no `--force`.
+    check_set_gates(pm, &project, &before, &front, None, &[])?;
     let file = dir.join("issue.md");
     let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
@@ -2264,6 +2289,57 @@ mod tests {
         assert_eq!(names, ["note-1.md", "note.md"], "a temp file survived");
     }
 
+    /// CAD-971: leftover temps (a planted file, a dangling symlink) do
+    /// not read as a target conflict — the next sequence number wins,
+    /// the planted entries stay untouched, and a real target collision
+    /// still reports AlreadyExists.
+    #[test]
+    fn write_new_skips_a_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let planted = dir.path().join(format!(".x.md.tmp-{pid}-7"));
+        std::fs::write(&planted, b"leftover").unwrap();
+        let dangling = dir.path().join(format!(".x.md.tmp-{pid}-8"));
+        std::os::unix::fs::symlink("/nonexistent/target", &dangling).unwrap();
+        let target = dir.path().join("x.md");
+        let mut n = 7;
+        write_new_seq(&target, b"real", || {
+            n += 1;
+            n - 1
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"real");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"leftover");
+        assert!(dangling.symlink_metadata().is_ok());
+        assert!(!std::path::Path::new("/nonexistent/target").exists());
+        // A real collision is still AlreadyExists, and still bounded.
+        let err = write_new_seq(&target, b"again", || {
+            n += 1;
+            n - 1
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    /// Every temp name taken: the write gives up (bounded) with an
+    /// error that is not AlreadyExists, and leaves nothing at the target.
+    #[test]
+    fn write_new_gives_up_when_every_temp_name_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        std::fs::write(dir.path().join(format!(".y.md.tmp-{pid}-0")), b"p").unwrap();
+        let target = dir.path().join("y.md");
+        let mut calls = 0;
+        let err = write_new_seq(&target, b"x", || {
+            calls += 1;
+            0
+        })
+        .unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, TEMP_ATTEMPTS);
+        assert!(!target.exists());
+    }
+
     /// A write that cannot complete leaves no file under the final
     /// name: the target directory is missing, so staging fails first.
     #[test]
@@ -2602,6 +2678,77 @@ mod tests {
         assert!(clean(&pm));
     }
 
+    fn patch_status(pm: &Pm, status: &str) -> Result<Value> {
+        patch_issue(
+            pm,
+            "CAD-1",
+            &IssuePatch {
+                status: Some(status.to_string()),
+                priority: None,
+                owner: None,
+                component: None,
+                title: None,
+                body: None,
+                tags: None,
+            },
+            None,
+            "t",
+            None,
+        )
+    }
+
+    /// CAD-971: the board's PATCH rides the same done-evidence gate as
+    /// `issue set` — same error kind and message, nothing written.
+    #[test]
+    fn patch_done_without_evidence_is_refused_like_set() {
+        let (_tmp, pm) = tracker();
+        let via_set = set_done(&pm, None).unwrap_err();
+        let via_patch = patch_status(&pm, "done").unwrap_err();
+        assert!(matches!(via_patch, Error::Rejected(_)), "{via_patch:?}");
+        assert_eq!(via_patch.to_string(), via_set.to_string());
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let (front, _) = load_front(&dir).unwrap();
+        assert_eq!(front.status, "backlog");
+        assert!(clean(&pm));
+    }
+
+    #[test]
+    fn patch_done_with_evidence_passes_and_dropped_is_exempt() {
+        let (_tmp, pm) = tracker();
+        patch_status(&pm, "dropped").unwrap();
+        let (_tmp, pm) = tracker();
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        std::fs::create_dir_all(dir.join("artifacts")).unwrap();
+        std::fs::write(dir.join("artifacts/review-r1.md"), "v\n").unwrap();
+        patch_status(&pm, "done").unwrap();
+    }
+
+    /// A patch that does not change the status never asks the question.
+    #[test]
+    fn patch_done_to_done_and_other_fields_are_not_gated() {
+        let (_tmp, pm) = tracker();
+        set_done(&pm, Some("seed")).unwrap();
+        patch_status(&pm, "done").unwrap();
+        // A priority-only patch on a done issue never asks either.
+        patch_issue(
+            &pm,
+            "CAD-1",
+            &IssuePatch {
+                status: None,
+                priority: Some("P1".to_string()),
+                owner: None,
+                component: None,
+                title: None,
+                body: None,
+                tags: None,
+            },
+            None,
+            "t",
+            None,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn done_with_pr_ref_passes() {
         let (_tmp, pm) = tracker();
@@ -2667,6 +2814,83 @@ mod tests {
         std::fs::create_dir_all(&artifacts).unwrap();
         std::fs::write(artifacts.join("review-r1-t.md"), "verdict\n").unwrap();
         set_done(&pm, None).unwrap();
+    }
+
+    /// CAD-971: only a real artifact is evidence — a hidden temp, a
+    /// directory named like a verdict and a symlink do not count.
+    #[test]
+    fn done_scan_ignores_dot_names_directories_and_symlinks() {
+        let (_tmp, pm) = tracker();
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let artifacts = dir.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join(".verdict-x.tmp"), "planted").unwrap();
+        std::fs::write(artifacts.join(".review-r1.md"), "planted").unwrap();
+        std::fs::create_dir(artifacts.join("review")).unwrap();
+        std::fs::create_dir(artifacts.join("x-verdict.md")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", artifacts.join("review-link.md")).unwrap();
+        let e = set_done(&pm, None).unwrap_err();
+        assert!(e.to_string().contains("needs evidence"), "{e}");
+        let e = patch_status(&pm, "done").unwrap_err();
+        assert!(e.to_string().contains("needs evidence"), "{e}");
+        // A real regular verdict beside the junk is accepted.
+        std::fs::write(artifacts.join("verdict-r1.md"), "v").unwrap();
+        patch_status(&pm, "done").unwrap();
+    }
+
+    /// CAD-971: a failure AFTER the commit (the board no longer loads)
+    /// never reports the landed PATCH as failed — one commit, `Ok`,
+    /// the failure recorded in `post_commit_warnings`.
+    #[test]
+    fn patch_post_commit_failure_is_a_warning_not_an_error() {
+        let (_tmp, pm) = tracker();
+        let hook = pm.dir.join(".git/hooks/post-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nmkdir -p BAD && printf 'key: [unclosed\\n' > BAD/project.yaml\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let n = crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        let out = patch_status(&pm, "ready").unwrap();
+        assert_eq!(out["committed"], true, "{out}");
+        assert_eq!(out["warnings"], json!([]), "{out}");
+        let warns = out["post_commit_warnings"].as_array().unwrap();
+        assert!(
+            warns[0]
+                .as_str()
+                .unwrap()
+                .contains("blocked-by warnings unavailable"),
+            "{out}"
+        );
+        let after = crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(
+            after.trim().parse::<u32>().unwrap(),
+            n.trim().parse::<u32>().unwrap() + 1
+        );
+    }
+
+    /// CAD-971: a failed tracker commit rolls the board PATCH back —
+    /// the file is restored and the error surfaces.
+    #[test]
+    fn patch_commit_failure_restores_the_file() {
+        let (_tmp, pm) = tracker();
+        let (_p, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let before = std::fs::read(dir.join("issue.md")).unwrap();
+        let hook = pm.dir.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let e = patch_status(&pm, "ready");
+        assert!(e.is_err(), "{e:?}");
+        assert_eq!(std::fs::read(dir.join("issue.md")).unwrap(), before);
     }
 
     #[test]
