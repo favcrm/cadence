@@ -335,6 +335,16 @@ tests = [
     "cad561_update_is_refused_inside_a_pane",
     "cad561_update_refuses_a_dropped_alias_claiming_the_operator",
     "cad628_detached_agent_cannot_request_rollback_with_a_forged_operator",
+    "message_result_default_reports_the_callers_single_running_turn",
+    "message_result_default_refuses_zero_or_several_turns",
+    "message_result_default_scoped_to_the_calling_agent",
+    "message_result_default_refuses_operator_and_unproven_callers",
+    "message_result_refuses_forged_identity_fields",
+    "message_result_prefix_accepts_unique_prefix_and_refuses_ambiguous_or_short",
+    "message_result_default_via_cli_reports_without_ids",
+    "message_result_prefix_scoped_to_callers_own_messages",
+    "message_result_racing_defaults_exactly_one_wins",
+    "message_result_tty_stdin_refused",
 ]
 helpers = [
     "wait_lines",

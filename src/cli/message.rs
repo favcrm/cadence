@@ -96,28 +96,40 @@ pub(crate) enum MessageAction {
     },
     /// Record an explicit acknowledgement for a submitted PTY message.
     /// The token is the `turn_id` `cadence self` prints — shown only
-    /// to the agent's own pane or endpoint (CAD-375).
+    /// to the agent's own pane or endpoint (CAD-375). With no message id
+    /// and no `--token`, the daemon acks the caller's single running
+    /// turn (CAD-880).
     Ack {
-        /// Message id.
-        message: String,
+        /// Message id (a unique prefix of 8+ chars works); omit it and
+        /// `--token` together to ack your single running turn.
+        message: Option<String>,
         /// Submission token (pty-<generation>-<uuid>).
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         /// Optional acknowledgement note.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "file")]
         text: Option<String>,
+        /// Read the note from a file (`-` reads stdin, capped at 4 MiB).
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Report the result of a submitted PTY message; completes it and
-    /// routes to `reply_to` when set.
+    /// routes to `reply_to` when set. With no message id and no `--token`,
+    /// the daemon reports the caller's single running turn (CAD-880).
     Result {
-        /// Message id.
-        message: String,
+        /// Message id (a unique prefix of 8+ chars works); omit it and
+        /// `--token` together to report your single running turn.
+        message: Option<String>,
         /// Submission token (pty-<generation>-<uuid>).
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         /// Result text reported for the message.
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the result text from a file (`-` reads stdin, capped at
+        /// 4 MiB).
         #[arg(long)]
-        text: String,
+        file: Option<PathBuf>,
         /// The commit this report produced — binds the message to an
         /// exact revision for `job verdict`.
         #[arg(long)]
@@ -199,38 +211,32 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             message,
             token,
             text,
-        } => (
-            client::rpc(
-                &state_dir,
-                "message_report",
-                json!({"message": message, "token": token,
-                       "kind": "ack", "text": text}),
-            )?,
-            false,
-        ),
+            file,
+        } => {
+            if message.is_some() != token.is_some() {
+                return Err(Error::rejected(
+                    "message ack needs both the message id and its --token, or neither \
+                     (neither acks your own single running turn)",
+                ));
+            }
+            let text = read_result_body(text, file, false)?;
+            let mut params = json!({"kind": "ack", "text": text});
+            if let Some(m) = message {
+                params["message"] = json!(m);
+            }
+            if let Some(t) = token {
+                params["token"] = json!(t);
+            }
+            (client::rpc(&state_dir, "message_report", params)?, false)
+        }
         MessageAction::Result {
             message,
             token,
             text,
+            file,
             sha,
             report,
-        } => {
-            let text = match report {
-                Some(path) => {
-                    report_result_text(&state_dir, &message, &token, text, sha.as_deref(), path)?
-                }
-                None => text,
-            };
-            (
-                client::rpc(
-                    &state_dir,
-                    "message_report",
-                    json!({"message": message, "token": token,
-                           "kind": "result", "text": text, "sha": sha}),
-                )?,
-                false,
-            )
-        }
+        } => run_result(&state_dir, message, token, text, file, sha, report)?,
         MessageAction::Reconcile {
             message,
             status,
@@ -306,4 +312,51 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
     };
     print_json(&result);
     Ok(if pending { 2 } else { 0 })
+}
+
+/// Shared `message result` / `done` report path (CAD-880): exactly one
+/// of `--text`/`--file` carries the body; the id and token travel only
+/// when both are given, otherwise the daemon resolves the caller's
+/// single running turn from the connection itself.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_result(
+    state_dir: &Path,
+    message: Option<String>,
+    token: Option<String>,
+    text: Option<String>,
+    file: Option<PathBuf>,
+    sha: Option<String>,
+    report: Option<PathBuf>,
+) -> Result<(Value, bool)> {
+    if message.is_some() != token.is_some() {
+        return Err(Error::rejected(
+            "message result needs both the message id and its --token, or neither \
+             (neither reports your own single running turn)",
+        ));
+    }
+    let text = read_result_body(text, file, true)?.unwrap();
+    let text = match report {
+        Some(path) => match report_result_text(
+            state_dir,
+            message.as_deref(),
+            token.as_deref(),
+            text,
+            sha.as_deref(),
+            path,
+        )? {
+            ReportReady::Send(text) => text,
+            // An already-reported turn resolves no default — the stored
+            // outcome is the retry's answer; nothing more is sent.
+            ReportReady::Done(out) => return Ok((out, false)),
+        },
+        None => text,
+    };
+    let mut params = json!({"kind": "result", "text": text, "sha": sha});
+    if let Some(m) = message {
+        params["message"] = json!(m);
+    }
+    if let Some(t) = token {
+        params["token"] = json!(t);
+    }
+    Ok((client::rpc(state_dir, "message_report", params)?, false))
 }

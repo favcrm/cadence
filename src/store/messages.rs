@@ -1402,6 +1402,47 @@ impl Store {
         self.message_in(&conn, id)
     }
 
+    /// CAD-880: message ids starting with `prefix`, ordered — the pool a
+    /// unique id prefix resolves against. The prefix is matched literally
+    /// (`%`, `_` and `\` are escaped, never wildcards); at most 11 rows
+    /// are read — enough to tell unique from ambiguous.
+    pub fn message_id_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut pattern = String::with_capacity(prefix.len() + 1);
+        for c in prefix.chars() {
+            if matches!(c, '\\' | '%' | '_') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT 11")?;
+        let rows = stmt.query_map([pattern], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    /// CAD-880 (F1): `message_id_prefix` scoped to one alias — an agent
+    /// caller's prefix enumeration never names another agent's ids. The
+    /// operator's explicit path uses the global pool above.
+    pub fn message_id_prefix_for(&self, prefix: &str, alias: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut pattern = String::with_capacity(prefix.len() + 1);
+        for c in prefix.chars() {
+            if matches!(c, '\\' | '%' | '_') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 \
+             ORDER BY id LIMIT 11",
+        )?;
+        let rows = stmt.query_map((pattern, alias), |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
     /// The agent's in-flight turn, if any — the actor loop is serial and
     /// holds one report-owing turn at a time (CAD-250); a routed
     /// notification is `running` only for its paste. The newest row wins

@@ -275,6 +275,39 @@ pub(crate) fn read_body_capped(
     Ok(body)
 }
 
+/// Body for `message result` / `message ack` / `done` `--text` / `--file`
+/// (CAD-880, I5): a result needs exactly one; an ack takes either or
+/// neither. `--file -` reads stdin capped at 4 MiB — the same bound as
+/// `issue comment --file -` — and a terminal stdin is refused. A file
+/// past the cap is refused rather than truncated.
+pub(crate) fn read_result_body(
+    text: Option<String>,
+    file: Option<PathBuf>,
+    required: bool,
+) -> Result<Option<String>> {
+    const MAX: u64 = 4 << 20;
+    match (text, file) {
+        (Some(_), Some(_)) => Err(Error::rejected("Provide --text or --file, not both")),
+        (Some(t), None) => Ok(Some(t)),
+        (None, Some(f)) => {
+            let body = read_body_capped(None, Some(f), MAX)?;
+            if body.len() as u64 > MAX {
+                return Err(Error::rejected("message body is over 4 MiB"));
+            }
+            Ok(Some(body))
+        }
+        (None, None) if required => Err(Error::rejected("Provide --text or --file")),
+        (None, None) => Ok(None),
+    }
+}
+
+/// What `report_result_text` decided: the text to report, or an already
+/// stored outcome that answers the retry with nothing more to send
+/// (CAD-880: an already-reported turn resolves no default).
+pub(crate) enum ReportReady {
+    Send(String),
+    Done(Value),
+}
 /// Body for an allowlisted master command that takes `--file`
 /// (`plan propose`, `report file`, `report`, `master escalate`).
 ///
@@ -306,46 +339,62 @@ pub(crate) fn read_master_command_file(
 /// the stored result text is re-sent so the daemon sees a duplicate.
 pub(crate) fn report_result_text(
     state_dir: &Path,
-    message: &str,
-    token: &str,
+    message: Option<&str>,
+    token: Option<&str>,
     text: String,
     sha: Option<&str>,
     path: PathBuf,
-) -> Result<String> {
+) -> Result<ReportReady> {
     use cadence_agent::issue::task_report;
     let body = read_body_capped(None, Some(path), task_report::BODY_MAX as u64)?;
     let pm = cadence_agent::issue::Pm::open_default()?;
     let prepared = task_report::prepare(&pm, &body, None, None)?;
-    let check = client::rpc(
-        state_dir,
-        "message_report",
-        json!({"message": message, "token": token, "kind": "result",
-               "text": text, "sha": sha, "check": true}),
-    )?;
+    let mut check_params = json!({"kind": "result",
+           "text": text, "sha": sha, "check": true});
+    if let Some(m) = message {
+        check_params["message"] = json!(m);
+    }
+    if let Some(t) = token {
+        check_params["token"] = json!(t);
+    }
+    let check = client::rpc(state_dir, "message_report", check_params)?;
     match check["issue"].as_str() {
         Some(bound) if bound == prepared.task() => {}
         Some(bound) => {
+            let what = message.unwrap_or("your running turn");
             return Err(Error::rejected(format!(
-                "Report task {} is not {bound}, the issue message {message} is bound to",
+                "Report task {} is not {bound}, the issue message {what} is bound to",
                 prepared.task()
-            )))
+            )));
         }
         None => {
+            let what = message
+                .map(|m| format!("Message {m}"))
+                .unwrap_or_else(|| "Your running turn".to_string());
             return Err(Error::rejected(format!(
-                "Message {message} is not bound to an issue task — file the report \
+                "{what} is not bound to an issue task — file the report \
                  with `cadence report file --task <ID>` instead"
-            )))
+            )));
         }
     }
     let with_report = |at: &str| format!("{}\n\nReport: {at}", text.trim_end());
     if check["state"] == "completed" {
+        // CAD-880: an already-reported turn resolves no default — the
+        // stored outcome answers the retry with nothing more to send.
+        // The explicit path keeps its resend (the daemon judges the
+        // duplicate), so only the id-less call short-circuits here.
+        if message.is_none() {
+            return Ok(ReportReady::Done(
+                json!({"state": "completed", "duplicate": true}),
+            ));
+        }
         let stored = check["result_text"].as_str().unwrap_or_default();
         let prefix = with_report("");
-        return Ok(if stored.starts_with(&prefix) {
+        return Ok(ReportReady::Send(if stored.starts_with(&prefix) {
             stored.to_string()
         } else {
             text
-        });
+        }));
     }
     let filed = task_report::store(&pm, &prepared, "")?;
     let _ = client::rpc_timeout(
@@ -354,7 +403,9 @@ pub(crate) fn report_result_text(
         json!({}),
         std::time::Duration::from_secs(2),
     );
-    Ok(with_report(filed["path"].as_str().unwrap_or_default()))
+    Ok(ReportReady::Send(with_report(
+        filed["path"].as_str().unwrap_or_default(),
+    )))
 }
 
 pub(crate) fn atty_stdin() -> bool {

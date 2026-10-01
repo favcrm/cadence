@@ -206,7 +206,15 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              addressed to its own alias (CAD-565)",
         ),
     ),
-    ("message_report", Rule::Bearer),
+    (
+        "message_report",
+        Rule::Handler(
+            "rpc_message_report: an explicit id+token reports by bearer possession, \
+             with id prefixes enumerating the caller's own alias (operator: \
+             global; unproven: exact id only); the id-less default resolves \
+             the connection caller's own single held turn (CAD-880)"
+        ),
+    ),
     (
         "message_reconcile",
         Rule::Handler("operator_connection (CAD-374)"),

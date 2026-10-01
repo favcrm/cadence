@@ -1,5 +1,6 @@
 All commands (one line per path):
   self           Inside a cadence-owned pane: print this agent's alias, its running message id and the...
+  done           Report your running turn's result
   inbox          Read an inbox agent's durable queue: one JSON object per message, oldest first
     inbox ack
   issue          The issue board: folders under the PM dir (`~/pm` or `CADENCE_PM_DIR`); this CLI is...
