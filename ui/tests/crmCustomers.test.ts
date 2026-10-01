@@ -294,7 +294,7 @@ await React.act(async () => {
 await settle(() => assert(text().includes("Search Alpha One"), "list paints real server rows"));
 assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
 assert(!host.querySelector(".crm-crumb"), "the CRM outlet does not duplicate the shell breadcrumb");
-assert(host.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Customers", "the submenu identifies the current customers page");
+assert(!host.querySelector('nav[aria-label="CRM sections"]'), "the outlet leaves navigation to the host sidebar");
 assert(text().includes("r1") && text().includes("granted"), "revision and consent cues render");
 assert(!text().includes("No records yet"), "populated list shows no empty state");
 
@@ -309,23 +309,20 @@ await settle(() => assert(text().includes("Search Alpha One"), "clearing restore
 
 // CAD-784 sections render real server-driven screens: empty states off
 // empty server rows, and the list never contains an inline builder.
-// Moves ride the host-owned submenu links (real anchors), not pane buttons.
-const sectionLink = (label: string) =>
-  Array.from(host.querySelectorAll('nav[aria-label="CRM sections"] a')).find(
-    (el) => (el.textContent ?? "").trim() === label,
-  );
-assert(sectionLink("Segments")?.tagName === "A", "submenu offers real links");
-assert(
-  (sectionLink("Segments") as HTMLAnchorElement).getAttribute("href")?.includes("ctx=ctx-a"),
-  "submenu links keep the selected context",
-);
-await click(sectionLink("Segments"));
+// Route transitions exercise the outlet; sidebar/mobile links are tested in crmAppMenu.
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+const { crmSectionHref } = require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet");
+async function openPage(section: "customers" | "segments" | "campaigns") {
+  await React.act(async () => { navigate(crmSectionHref(location.pathname + location.search, section)); });
+  await flush();
+}
+await openPage("segments");
 await settle(() => assert(text().includes("No segments yet in this context"), "segments empty state is server-driven"));
 assert(location.search.includes("crm=segments"), "submenu move routes");
-await click(sectionLink("Campaigns"));
+await openPage("campaigns");
 await settle(() => assert(text().includes("No campaigns yet in this context"), "campaigns empty state is server-driven"));
 assert(!host.querySelector('section[aria-label="Campaigns list"] input'), "campaigns list holds no inline builder");
-await click(sectionLink("Customers"));
+await openPage("customers");
 await settle(() => assert(text().includes("Search Alpha One"), "customers link restores the list"));
 assert(!location.search.includes("crm="), "customers is the default route");
 

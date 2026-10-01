@@ -790,8 +790,8 @@ const appsLinks = (hostEl: HTMLElement) =>
     "customers keeps a real section heading",
   );
   assert(
-    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Customers",
-    "the submenu still marks the current customers section",
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "customers navigation stays in the host sidebar without duplicate outlet tabs",
   );
   // New view is an independent page: its own heading, still one link.
   await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&appview=new"); });
@@ -819,8 +819,8 @@ const appsLinks = (hostEl: HTMLElement) =>
     "segments keeps a real section heading",
   );
   assert(
-    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Segments",
-    "the submenu still marks the current segments section",
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "segments navigation stays in the host sidebar without duplicate outlet tabs",
   );
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
@@ -838,8 +838,8 @@ const appsLinks = (hostEl: HTMLElement) =>
     "campaigns keeps a real section heading",
   );
   assert(
-    hostEl.querySelector('nav[aria-label="CRM sections"] a[aria-current="page"]')?.textContent?.trim() === "Campaigns",
-    "the submenu still marks the current campaigns section",
+    !hostEl.querySelector('nav[aria-label="CRM sections"]'),
+    "campaigns navigation stays in the host sidebar without duplicate outlet tabs",
   );
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();

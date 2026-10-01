@@ -149,6 +149,8 @@ await React.act(async () => {
 await settle(() => assert(sidebarMenu(), "desktop sidebar nests the CRM submenu"));
 await settle(() => assert(text().includes("Seed Alpha"), "outlet still paints server rows"));
 assert(sidebarLinks().length === 3, "sidebar submenu lists three sections");
+assert(!host.querySelector(".app-outlet .section-nav"), "CRM pages have no duplicate outlet tabs");
+assert(!host.querySelector(".crm-crumb"), "CRM pages have no redundant breadcrumb row");
 assert(
   (sidebarLinks()[1] as HTMLAnchorElement).getAttribute("href") === "/app-installations/install-crm?ctx=ctx-a&crm=segments",
   "sidebar segment link keeps the selected context",

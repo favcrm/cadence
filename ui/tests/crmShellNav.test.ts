@@ -143,26 +143,13 @@ assert(
   "bare default route stays bare",
 );
 
-// Host submenu: Apps → CRM → sections lives in the shared outlet
-// as real links (openable, copyable, keyboard-focusable) with the
-// current section marked — not buttons inside the CRM pane.
-const submenu = () => host.querySelector('nav[aria-label="CRM sections"]');
-assert(submenu(), "host-owned CRM submenu renders in the shell");
-const submenuLinks = Array.from(submenu()!.querySelectorAll("a"));
-assert(
-  submenuLinks.length === 3 && submenuLinks.every((el) => el.tagName === "A"),
-  "submenu offers three real links",
-);
-assert(
-  submenuLinks[1].getAttribute("href") === "/app-installations/install-crm?ctx=ctx-a&crm=segments",
-  "segment link keeps the selected context",
-);
-assert(
-  submenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Customers",
-  "submenu marks the current section",
-);
-submenuLinks[1].focus();
-assert(document.activeElement === submenuLinks[1], "submenu links take keyboard focus");
+// The outlet contains page content; the board owns sidebar/mobile links.
+assert(!host.querySelector('nav[aria-label="CRM sections"]'), "no duplicate page navigation inside the outlet");
+const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
+async function openPage(section: "customers" | "segments" | "campaigns") {
+  await React.act(async () => { navigate(crmSectionHref(location.pathname + location.search, section)); });
+  await flush();
+}
 // One chat node across section moves; a drawer never follows.
 const openSeed = Array.from(host.querySelectorAll("button.lnk")).find(
   (el) => el.textContent === "Open" && el.closest("tr")?.textContent?.includes("Seed Alpha"),
@@ -171,15 +158,11 @@ await click(openSeed);
 await settle(() => assert(host.querySelector('[data-drawer="customer"]'), "drawer opens before the move"));
 const chatBefore = host.querySelector("[data-chat-pane]");
 assert(chatBefore, "chat pane mounts with the shell");
-await click(submenuLinks[1]);
-await settle(() => assert(location.search.includes("crm=segments"), "submenu link routes"));
+await openPage("segments");
+await settle(() => assert(location.search.includes("crm=segments"), "independent segment URL routes"));
 assert(!host.querySelector("[data-drawer]"), "no drawer follows a section move");
 assert(host.querySelector("[data-chat-pane]") === chatBefore, "section move keeps the single chat node mounted");
-assert(
-  submenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Segments",
-  "submenu follows the route",
-);
-await click(Array.from(submenu()!.querySelectorAll("a")).find((el) => (el.textContent ?? "").trim() === "Customers")!);
+await openPage("customers");
 await settle(() => assert(text().includes("Seed Alpha"), "customers link restores the list"));
 const wrap = host.querySelector(".crm-table-wrap");
 assert(wrap?.getAttribute("tabindex") === "0", "table wrap is keyboard-focusable for internal scroll");
