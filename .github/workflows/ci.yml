@@ -1,6 +1,15 @@
 name: ci
 
 on:
+  # CAD-840: observational full-suite benchmark; automatic events stay 8-way.
+  workflow_dispatch:
+    inputs:
+      test_shards:
+        description: Full-suite shard width for a same-SHA throughput benchmark
+        type: choice
+        options: ["4", "8"]
+        default: "8"
+        required: true
   pull_request:
   # GitHub merge queue (CAD-290): each queued PR is tested on top of main
   # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
@@ -32,7 +41,7 @@ on:
 # GitHub rejects `queue: max` together with `cancel-in-progress: true`, so
 # both are chosen by event and never meet in one run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && format('main-{0}', github.sha)) || github.ref }}
+  group: ci-${{ (github.event_name == 'workflow_dispatch' && format('benchmark-{0}', github.run_id)) || github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && format('main-{0}', github.sha)) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
@@ -42,6 +51,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Never let a manual input change PR, merge-group, push or tag coverage.
+  CADENCE_CI_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '4' || '8' }}
 
 jobs:
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
@@ -127,6 +138,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component rustfmt
       - run: cargo fmt --all -- --check
+      - name: Validate manual benchmark width
+        env:
+          BENCHMARK_SHARDS: ${{ inputs.test_shards }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "$BENCHMARK_SHARDS" in
+              4|8) ;;
+              *) echo 'manual benchmark width must be 4 or 8' >&2; exit 1 ;;
+            esac
+          fi
+      - name: Test CI throughput and manual-width contracts
+        run: python3 tests/scripts/test_ci_throughput.py
       # Metadata-only target/feature validation catches review-recipe drift
       # without compiling another Rust configuration (CAD-635).
       - run: python3 scripts/check-review-recipe
@@ -204,7 +227,7 @@ jobs:
       # cost evidence): every shard runs to its own verdict.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.test_shards == '4' && '[1,2,3,4]' || '[1,2,3,4,5,6,7,8]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -337,7 +360,7 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/8" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests --partition "${{ matrix.shard }}/$CADENCE_CI_SHARDS" --weights "$GITHUB_WORKSPACE/tests/shard-weights.json" --assignment-out "$RUNNER_TEMP/shard-assignment-${{ github.run_id }}-shard-${{ matrix.shard }}.json"
       - name: Keep the shard's test assignment
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -426,7 +449,7 @@ jobs:
           [ "${{ needs.test-shard.result }}" = success ]
           [ "${{ needs.test-once.result }}" = success ]
       # Cost-weighted shards carry no nextest partition hash, so coverage
-      # is proven from the assignment artifacts themselves: eight files,
+      # is proven from the assignment artifacts themselves: one file per shard,
       # identical inventory, disjoint tests, union complete (CAD-809).
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -434,7 +457,7 @@ jobs:
           path: ${{ runner.temp }}/shard-assignments
           merge-multiple: false
       - name: Verify shard assignments cover the inventory
-        run: python3 scripts/ci-shard-check.py --dir "${{ runner.temp }}/shard-assignments" --total 8
+        run: python3 scripts/ci-shard-check.py --dir "${{ runner.temp }}/shard-assignments" --total "$CADENCE_CI_SHARDS"
 
   build:
     needs: [queue-evidence]

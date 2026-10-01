@@ -51,6 +51,25 @@ class ShardCheck(unittest.TestCase):
     def test_happy_path(self):
         self.assertEqual(self.check(self.docs2()).returncode, 0)
 
+    def test_four_and_eight_widths_have_identical_complete_inventory(self):
+        inventory = [f"b t{i}" for i in range(32)]
+        for width in (4, 8):
+            docs = [assignment(i + 1, width, inventory, inventory[i::width])
+                    for i in range(width)]
+            self.assertEqual(self.check(docs, total=width).returncode, 0)
+            self.assertNotEqual(self.check(docs[:-1], total=width).returncode, 0)
+            docs[0]["total"] = 8 if width == 4 else 4
+            self.assertNotEqual(self.check(docs, total=width).returncode, 0)
+
+    def test_extra_empty_shard_is_refused(self):
+        docs = self.docs2() + [assignment(3, 2, ["b t1", "b t2"], [])]
+        self.assertNotEqual(self.check(docs, total=2).returncode, 0)
+
+    def test_boolean_shard_is_refused(self):
+        docs = self.docs2()
+        docs[0]["shard"] = True
+        self.assertNotEqual(self.check(docs, total=2).returncode, 0)
+
     def test_missing_shard(self):
         r = self.check(self.docs2()[:1], total=2)
         self.assertNotEqual(r.returncode, 0)
