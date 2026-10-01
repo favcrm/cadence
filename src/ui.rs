@@ -637,8 +637,16 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
             "board public-only mode requires a public board identity",
         ));
     }
+    // A persisted tailscale block goes live here for `ui start` and
+    // for the detached `ui run` alike — under a sandbox profile it
+    // needs the same opt-in as the explicit flag.
+    if eff.tailscale.is_some() {
+        crate::sandbox::refuse_global_unless_allowed(
+            "`ui start` with persisted tailscale sharing",
+        )?;
+    }
     if let Some(https_port) = flags.tailscale {
-        crate::sandbox::refuse_global("`ui start --tailscale`")?;
+        crate::sandbox::refuse_global_unless_allowed("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         if !is_loopback_host(&host) {
             return Err(Error::rejected(format!(
@@ -647,6 +655,10 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
             )));
         }
         let ui_port = eff.port.unwrap_or(3010);
+        // Before any mapping write: a sandbox must never publish a
+        // target onto the production port — `serve_opts` would refuse
+        // it later, after the mapping already existed.
+        crate::sandbox::refuse_production_port(ui_port)?;
         let target = format!("http://127.0.0.1:{ui_port}");
         let me = ts_self()?;
         ensure_mapping(https_port, &target)?;
@@ -5001,6 +5013,11 @@ fn kill_detached(state_dir: &Path) -> Option<i32> {
 }
 
 fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
+    if tailscale_off && load_opts(state_dir).tailscale.is_some() {
+        // Refuse before the board is killed: a denied stop leaves the
+        // board up and the mapping's record intact.
+        crate::sandbox::refuse_global_unless_allowed("`ui stop --tailscale-off`")?;
+    }
     let pid = kill_detached(state_dir);
     if pid.is_none() {
         let _ = std::fs::remove_file(pid_file(state_dir));
@@ -5186,8 +5203,9 @@ fn serve_map() -> Result<HashMap<u16, String>> {
 /// left alone (returns false), a different one on that port is a hard
 /// refusal — cadence never overwrites somebody else's serve config.
 fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
-    // The tailnet is host-wide: a sandbox board never goes on it.
-    crate::sandbox::refuse_global("`tailscale serve`")?;
+    // The tailnet is host-wide: a sandbox board goes on it only with
+    // the operator's explicit opt-in.
+    crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
     match serve_map()?.get(&port) {
         Some(existing) if existing == target => Ok(false),
         Some(other) => Err(Error::rejected(format!(
@@ -5210,6 +5228,8 @@ fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
 /// Remove the mapping only while it still targets what cadence
 /// recorded — a foreign or absent mapping returns false.
 fn remove_mapping(port: u16, expected: &str) -> Result<bool> {
+    // Same host-global write as `serve --bg`: sandbox needs the opt-in.
+    crate::sandbox::refuse_global_unless_allowed("`tailscale serve off`")?;
     match serve_map()?.get(&port) {
         Some(existing) if existing == expected => {
             let out = ts(&["serve", &format!("--https={port}"), "off"])?;
@@ -5249,10 +5269,13 @@ pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool)
 }
 
 fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
-    crate::sandbox::refuse_global("`ui tailscale start`")?;
+    crate::sandbox::refuse_global_unless_allowed("`ui tailscale start`")?;
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);
+    // Same ordering rule as `ui start --tailscale`: refuse a sandbox's
+    // production-port target before the mapping exists, not after.
+    crate::sandbox::refuse_production_port(ui_port)?;
     let target = format!("http://127.0.0.1:{ui_port}");
     let created = ensure_mapping(https_port, &target)?;
     opts.tailscale = Some(TailscaleOpts {
@@ -5296,6 +5319,12 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
 /// tailnet options, restart the board local-only when it runs.
 fn ts_stop(state_dir: &Path) -> Result<i32> {
     let mut opts = load_opts(state_dir);
+    if opts.tailscale.is_some() {
+        // Before touching anything: under a sandbox this needs the
+        // opt-in, or the serve write would be refused while the record
+        // of the live mapping was still dropped.
+        crate::sandbox::refuse_global_unless_allowed("`ui tailscale stop`")?;
+    }
     let Some(ts) = opts.tailscale.take() else {
         println!(
             "{}",
@@ -5303,13 +5332,14 @@ fn ts_stop(state_dir: &Path) -> Result<i32> {
         );
         return Ok(0);
     };
-    let removed = match remove_mapping(ts.https_port, &ts.target) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("warning: {e}");
-            false
-        }
-    };
+    // A failed removal keeps the record — clearing it here would
+    // orphan the live mapping (a later sandbox reset would then
+    // delete its only trace).
+    let removed = remove_mapping(ts.https_port, &ts.target).map_err(|e| {
+        Error::rejected(format!(
+            "{e} — the tailnet record is kept; fix the failure and retry"
+        ))
+    })?;
     opts.tailscale = None;
     save_opts(state_dir, &opts)?;
     let was_running = read_pid(state_dir).is_some();
