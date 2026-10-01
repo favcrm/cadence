@@ -126,3 +126,46 @@ fn agenticos_worker_refuses_changed_endpoint_key_or_model_before_launch() {
         assert!(!root.path().join("state/agents/pi-record-w.json").exists());
     }
 }
+
+#[test]
+fn agenticos_worker_refuses_missing_symlinked_and_oversized_catalogs() {
+    for case in ["missing", "symlink", "oversized"] {
+        let root = tempfile::tempdir().unwrap();
+        operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
+        let path = root.path().join("operator/models.json");
+        match case {
+            "missing" => std::fs::remove_file(&path).unwrap(),
+            "symlink" => {
+                let real = root.path().join("catalog.json");
+                std::fs::rename(&path, &real).unwrap();
+                std::os::unix::fs::symlink(real, &path).unwrap();
+            }
+            _ => std::fs::write(&path, vec![b' '; 65_537]).unwrap(),
+        }
+        let result = open_worker(root.path());
+        if let Ok(ad) = &result {
+            ad.close();
+        }
+        assert!(result.is_err(), "{case} catalog was admitted");
+        assert!(!root.path().join("state/agents/pi-record-w.json").exists());
+        assert!(!root.path().join("state/agents/w/pi/auth.json").exists());
+    }
+}
+
+#[test]
+fn agenticos_worker_refresh_replaces_a_target_symlink_without_writing_its_referent() {
+    let root = tempfile::tempdir().unwrap();
+    operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
+    let ad = open_worker(root.path()).unwrap();
+    ad.close();
+    let path = root.path().join("state/agents/w/pi/models.json");
+    std::fs::remove_file(&path).unwrap();
+    let foreign = root.path().join("foreign.json");
+    std::fs::write(&foreign, b"preserve-me").unwrap();
+    std::os::unix::fs::symlink(&foreign, &path).unwrap();
+    let ad = open_worker(root.path()).unwrap();
+    ad.close();
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"preserve-me");
+    assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), CATALOG);
+}
