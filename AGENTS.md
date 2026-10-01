@@ -134,7 +134,13 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
 ### Merging: use the merge queue, never `--admin`
 - A PR merges only after every review that the section above requires
   has passed, pinned to the same head SHA.
-- To enqueue:
+- To enqueue, run `scripts/enqueue-reviewed <n> --head <full-reviewed-sha>`
+  (add `--dry-run` to check without enqueueing). It refuses unless the PR
+  is open at that head with auto-merge off, every required check is
+  present and green, the required verdict notes are pinned to the head, a
+  ticket comment lists them and, for a `human` diff, an operator approval
+  is recorded for the head. It never records an approval. The step it
+  wraps is
   `gh pr merge <n> -R favcrm/cadence --auto --squash --match-head-commit <reviewed-sha>`.
   The queue re-tests the PR on the newest main plus every entry ahead of
   it, so you don't need to rebase first. If the head moved after the

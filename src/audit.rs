@@ -1380,13 +1380,20 @@ fn store_evidence(path: &Path) -> StoreEvidence {
 fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
     use crate::store::{APPROVAL_RECORDED_EVENT, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM};
     let rows: rusqlite::Result<Vec<(String, String, f64)>> = conn
-        .prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq LIMIT 100000")
+        .prepare(
+            "SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq DESC LIMIT 100000",
+        )
         .and_then(|mut st| {
             st.query_map([APPROVAL_STREAM], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect()
         });
+    // Newest-first so the row cap can only drop the oldest history, never
+    // a recent revocation; replayed oldest-first below.
     let rows = match rows {
-        Ok(rows) => rows,
+        Ok(mut rows) => {
+            rows.reverse();
+            rows
+        }
         Err(e) => {
             ev.approvals_gap = Some(format!("approval stream unreadable: {e}"));
             return;
@@ -1561,6 +1568,152 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         other_heads,
         ..Default::default()
     }
+}
+
+/// CAD-959: the first whitespace token of a note's `From:`, lower-cased,
+/// minus backticks and trailing punctuation. `From:` is free text
+/// (`cc13-pm standards reviewer`); this is the ONE identity used for both
+/// the author exclusion and the distinct-reviewer count.
+fn reviewer_identity(from: &str) -> String {
+    from.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('`')
+        .trim_end_matches([',', ';', ':', '.', '(', ')'])
+        .to_lowercase()
+}
+
+/// The `YYYYMMDD-HHMMSS` (or `YYYYMMDDTHHMMSSZ`) stamp a note file name
+/// starts with, as 14 digits. `None` when the name carries no stamp.
+fn name_stamp(name: &str) -> Option<String> {
+    let b = name.as_bytes();
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r.clone())
+            .filter(|s| s.iter().all(u8::is_ascii_digit))
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+    };
+    let date = digits(0..8)?;
+    let sep = *b.get(8)?;
+    if sep != b'-' && sep != b'T' {
+        return None;
+    }
+    let time = digits(9..15)?;
+    Some(format!("{date}{time}"))
+}
+
+/// `(kind, result)` from a verdict note's title `# Verdict: <ID> <KIND> — <result>`.
+/// Kind is matched exactly: `standards`, `spec-security`, `browser-qa`,
+/// `combined` (`Review (standards+spec)`), else `other`.
+fn title_kind_and_result(title: &str, issue: &str) -> (&'static str, String) {
+    let body = title.trim_start_matches('#').trim();
+    let body = body.strip_prefix("Verdict:").unwrap_or(body).trim();
+    let body = body.strip_prefix(issue).unwrap_or(body).trim();
+    let (kind, result) = match body.rsplit_once(" — ").or_else(|| body.rsplit_once(" - ")) {
+        Some((k, r)) => (k.trim(), r.trim()),
+        None => (body, ""),
+    };
+    let kind = match kind.to_lowercase().as_str() {
+        "standards" | "standards review" => "standards",
+        "spec/security" | "spec/security review" => "spec-security",
+        "browser qa" | "browser qa review" => "browser-qa",
+        "review (standards+spec)" => "combined",
+        _ => "other",
+    };
+    let result = result
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    (kind, result)
+}
+
+/// CAD-959: head-pinned verdict notes for `issue` / PR `pr` / full `head`,
+/// parsed by [`parse_note`] so there is one parser. Notes of the issue that
+/// do not bind to this PR and head are listed under `skipped` with a
+/// reason, never dropped silently. Symlinks are skipped, never followed.
+fn verdicts_in(dir: &Path, issue: &str, pr: u64, head: &str) -> Result<Value> {
+    let read = std::fs::read_dir(dir).map_err(|e| {
+        Error::rejected(format!("cannot read the notes dir {}: {e}", dir.display()))
+    })?;
+    let mut names: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
+        .filter(|(n, _)| n.ends_with(".md"))
+        .collect();
+    names.sort();
+    let (mut verdicts, mut skipped) = (Vec::new(), Vec::new());
+    for (name, path) in names {
+        let skip = |why: String| json!({"name": name, "reason": why});
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if name.contains("-verdict") {
+                skipped.push(skip(
+                    "a symlink; notes are never followed through links".into(),
+                ));
+            }
+            continue;
+        }
+        if !meta.is_file() || !name.contains("-verdict") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let note = parse_note(&path, &name, &text);
+        if note.issue.as_deref() != Some(issue) {
+            continue;
+        }
+        let Some(stamp) = name_stamp(&name) else {
+            skipped.push(skip("the file name has no YYYYMMDD-HHMMSS stamp".into()));
+            continue;
+        };
+        if !note.prs.contains(&pr) {
+            skipped.push(skip(format!("does not name PR #{pr}")));
+            continue;
+        }
+        match note.head_sha.as_deref() {
+            None => {
+                skipped.push(skip("no `head <sha>` line".into()));
+                continue;
+            }
+            Some(h) if !h.eq_ignore_ascii_case(head) => {
+                skipped.push(skip(format!("names head {h}, not the full head {head}")));
+                continue;
+            }
+            Some(_) => {}
+        }
+        let title = text.lines().next().unwrap_or("");
+        let (kind, title_result) = title_kind_and_result(title, issue);
+        let section = note.verdict.clone().unwrap_or_default().to_lowercase();
+        let outcome = if title_result == section {
+            title_result.clone()
+        } else {
+            "disagree".to_string()
+        };
+        let risk_raw = text
+            .lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix("Risk:"))
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+        verdicts.push(json!({
+            "name": name, "path": path.display().to_string(), "stamp": stamp,
+            "reviewer": reviewer_identity(note.from.as_deref().unwrap_or("")),
+            "from": note.from, "kind": kind, "outcome": outcome,
+            "title_outcome": title_result, "section_outcome": section,
+            "risk": risk_raw, "head": head,
+        }));
+    }
+    Ok(json!({"issue": issue, "pr": pr, "head": head,
+              "verdicts": verdicts, "skipped": skipped}))
+}
+
+/// `cadence audit verdicts`: read-only; one JSON document.
+pub fn verdicts_check(notes_dir: Option<&Path>, issue: &str, pr: u64, head: &str) -> Result<Value> {
+    verdicts_in(notes_dir.unwrap_or(Path::new(NOTES_DIR)), issue, pr, head)
 }
 
 /// CAD-959: is an operator approval in force for `head` of PR `pr` right
@@ -2801,6 +2954,171 @@ mod tests {
         assert_eq!(human(&e, Some("other/repo")).approval.state, "missing");
         // The fixture/no-slug path still binds on head + PR.
         assert_eq!(human(&e, None).approval.state, "operator-claimed");
+    }
+
+    fn vnote(dir: &Path, name: &str, title: &str, from: &str, head: &str, risk: &str) {
+        let res = title.rsplit(" — ").next().unwrap_or("pass");
+        let res = res.split_whitespace().next().unwrap_or("pass");
+        let text = format!(
+            "{title}\n> Issue: CAD-9\n> From: {from}\n\n## Verdict\n{res} — PR #5, head {head}\n\n{risk}\n"
+        );
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn verdicts_bind_head_and_pr_and_report_what_they_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let (h, old) = (HEAD, OLD_HEAD);
+        vnote(
+            d,
+            "20261001-070000-a-verdict.md",
+            "# Verdict: CAD-9 Standards review — pass",
+            "cc13-pm standards reviewer (Claude)",
+            h,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070100-b-verdict.md",
+            "# Verdict: CAD-9 Spec/security review — pass",
+            "`rev-b`",
+            h,
+            "Risk: human(3)",
+        );
+        vnote(
+            d,
+            "20261001-070200-c-verdict.md",
+            "# Verdict: CAD-9 Browser QA — revise",
+            "rev-c",
+            h,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070300-d-verdict.md",
+            "# Verdict: CAD-9 Review (standards+spec) — pass",
+            "rev-d",
+            old,
+            "Risk: auto",
+        );
+        vnote(
+            d,
+            "20261001-070400-e-verdict.md",
+            "# Verdict: CAD-9 Inspection of respect — pass",
+            "rev-e",
+            h,
+            "",
+        );
+        vnote(
+            d,
+            "nostamp-verdict.md",
+            "# Verdict: CAD-9 Standards review — pass",
+            "rev-f",
+            h,
+            "",
+        );
+        std::fs::write(d.join("20261001-070500-g-verdict.md"),
+            format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: g\n\n## Verdict\npass — head {h}\n")).unwrap();
+        std::fs::write(
+            d.join("20261001-070600-h-verdict.md"),
+            format!("# Verdict: CAD-1 Standards review — pass\n> Issue: CAD-1\n> From: rev-h\n\n## Verdict\npass — PR #5, head {h}\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            d.join("20261001-070000-a-verdict.md"),
+            d.join("20261001-070700-l-verdict.md"),
+        )
+        .unwrap();
+        let v = verdicts_in(d, "CAD-9", 5, h).unwrap();
+        let rows: Vec<(String, String, String, String)> = v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["reviewer"].as_str().unwrap().into(),
+                    r["kind"].as_str().unwrap().into(),
+                    r["outcome"].as_str().unwrap().into(),
+                    r["risk"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        // Prose after the alias never becomes part of the identity.
+        assert_eq!(
+            rows[0],
+            (
+                "cc13-pm".into(),
+                "standards".into(),
+                "pass".into(),
+                "auto".into()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "rev-b".into(),
+                "spec-security".into(),
+                "pass".into(),
+                "human(3)".into()
+            )
+        );
+        assert_eq!(rows[2].1, "browser-qa");
+        assert_eq!(rows[2].2, "revise");
+        // The exact-title rule: a substring never makes a kind.
+        assert_eq!(rows[3].1, "other");
+        assert_eq!(rows[3].3, "");
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let why: Vec<String> = v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {}",
+                    r["name"].as_str().unwrap(),
+                    r["reason"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let has = |n: &str, r: &str| why.iter().any(|w| w.contains(n) && w.contains(r));
+        assert!(has("070300", "not the full head"), "{why:?}");
+        assert!(has("nostamp", "no YYYYMMDD-HHMMSS"), "{why:?}");
+        assert!(has("070500", "does not name PR #5"), "{why:?}");
+        assert!(has("070700", "symlink"), "{why:?}");
+        // Another issue's note is neither a verdict nor a skip.
+        assert!(!why.iter().any(|w| w.contains("070600")), "{why:?}");
+    }
+
+    #[test]
+    fn verdict_title_and_section_disagreement_is_not_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("# Verdict: CAD-9 Standards review — pass\n> Issue: CAD-9\n> From: r\n\n## Verdict\nrevise — PR #5, head {HEAD}\n");
+        std::fs::write(dir.path().join("20261001-070000-x-verdict.md"), text).unwrap();
+        let v = verdicts_in(dir.path(), "CAD-9", 5, HEAD).unwrap();
+        assert_eq!(v["verdicts"][0]["outcome"], "disagree");
+    }
+
+    #[test]
+    fn name_stamps_come_from_the_file_name_only() {
+        assert_eq!(
+            name_stamp("20261001-070151-x.md").as_deref(),
+            Some("20261001070151")
+        );
+        assert_eq!(
+            name_stamp("20261001T065132Z-x.md").as_deref(),
+            Some("20261001065132")
+        );
+        assert_eq!(name_stamp("x-20261001-070151.md"), None);
+        assert_eq!(name_stamp("2026100-070151-x.md"), None);
+    }
+
+    #[test]
+    fn approval_filter_ignores_other_actions() {
+        let mut deploy = rec("a", HEAD, 1.0);
+        deploy.action = "deploy".into();
+        let e = ev(vec![deploy], &[]);
+        assert_eq!(approval_in_force(&e, "x/y", 1, HEAD)["state"], "missing");
     }
 
     #[test]

@@ -47,6 +47,25 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Read-only (CAD-959): the verdict notes of ISSUE that name PR `--pr`
+    /// and the full `--head`, parsed by the audit's own note parser, plus
+    /// a `skipped` list with the reason for every note of the issue that
+    /// does not bind. Reviewer identity is the FIRST whitespace token of
+    /// `From:`, lower-cased (the rest is prose). One JSON document.
+    Verdicts {
+        /// Tracker issue id the notes belong to (`Issue:` header).
+        #[arg(long)]
+        issue: String,
+        /// PR number the notes must name.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the notes must pin.
+        #[arg(long)]
+        head: String,
+        /// Notes directory (default /var/www/agent-notes).
+        #[arg(long)]
+        notes_dir: Option<PathBuf>,
+    },
     /// Withdraw an approval id. Cancelling a message never does this.
     Revoke {
         /// The approval id `audit approve` recorded.
@@ -74,7 +93,23 @@ pub(super) fn run(
     merge_report: Option<PathBuf>,
 ) -> Result<i32> {
     match action {
+        Some(AuditAction::Verdicts {
+            issue,
+            pr,
+            head,
+            notes_dir,
+        }) => {
+            let head = full_head(&head)?;
+            print_json(&cadence_agent::audit::verdicts_check(
+                notes_dir.as_deref(),
+                issue.trim(),
+                pr,
+                &head,
+            )?);
+            Ok(0)
+        }
         Some(AuditAction::Approval { pr, head, repo }) => {
+            let head = full_head(&head)?;
             let repo = match repo {
                 Some(r) => r,
                 None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
@@ -85,12 +120,7 @@ pub(super) fn run(
                     },
                 )?,
             };
-            let (v, code) = cadence_agent::audit::approval_check(
-                &state_dir,
-                &repo,
-                pr,
-                &head.trim().to_ascii_lowercase(),
-            );
+            let (v, code) = cadence_agent::audit::approval_check(&state_dir, &repo, pr, &head);
             print_json(&v);
             Ok(code)
         }
@@ -107,5 +137,16 @@ pub(super) fn run(
             cwd: std::env::current_dir()?,
             state_dir,
         }),
+    }
+}
+
+/// A pinned head is the full 40-hex SHA, lower-cased; anything shorter
+/// would let a read bind to another revision.
+fn full_head(head: &str) -> Result<String> {
+    let h = head.trim().to_ascii_lowercase();
+    if h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(h)
+    } else {
+        Err(Error::rejected("--head must be the full 40-hex SHA"))
     }
 }

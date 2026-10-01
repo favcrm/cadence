@@ -357,6 +357,8 @@ session end
 session ack
 audit
 audit approve
+audit approval
+audit verdicts
 audit revoke
 overview
 upgrade
