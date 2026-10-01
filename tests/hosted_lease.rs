@@ -491,6 +491,500 @@ fn cad538_wedged_lease_lock_bounds_shutdown() {
     assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
 }
 
+/// CAD-694 (review B3): a start that fails AFTER acquiring the lease —
+/// here an injected relaunch fault on the exact flagged path — must not
+/// release the lease while the shutdown flush is still unproven: a
+/// successor taking over would share the live writer. Park the flush at
+/// the gate, let the tail's injected budget lapse, and the lease must
+/// stay held; the parked worker then completes into our own still-valid
+/// TTL window, never a successor's epoch.
+#[test]
+fn cad694_failed_start_withholds_lease_while_flush_unproven() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let gate = Arc::new(Barrier::new(2));
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.relaunch_fault_for_test = Some(Arc::new(AtomicBool::new(true)));
+    opts.flush_gate_for_test = Some({
+        let gate = gate.clone();
+        Arc::new(move || {
+            gate.wait();
+        })
+    });
+    opts.flush_budget_for_test = Some(Duration::from_millis(50));
+    // The worker's completion receipt: the test owns the late
+    // completion instead of racing it, and keeps its fixture dirs alive
+    // until the worker is done touching them.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let done_tx = Mutex::new(done_tx);
+    opts.flush_done_for_test = Some(Arc::new(move || {
+        let _ = done_tx.lock().unwrap().send(());
+    }));
+    // Same-shape fixture daemon as the cad702 test: a hosted lease
+    // triggers the deployment lookup, which must stay hermetic.
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let state_dir = state.path().to_path_buf();
+    let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
+    let exit = handle.join().unwrap();
+    let err = exit.expect_err("the injected relaunch fault exits serve");
+    assert!(
+        err.to_string().contains("injected relaunch fault"),
+        "serve must fail on the injected relaunch fault, not another error: {err}"
+    );
+    // The flush never completed inside the (tiny) budget — the tail
+    // withheld release, so the file lease is still ours until TTL.
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    assert!(
+        body["expires_unix"].as_f64().unwrap_or(0.0) > now_unix(),
+        "released under a live flush: {body}"
+    );
+    // Let the parked worker finish — release stays withheld; the lease
+    // transfers by TTL, the fence-bounded window a late write is
+    // confined to.
+    gate.wait();
+    done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the parked flush worker never completed");
+    let body: Value =
+        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
+    assert!(
+        body["expires_unix"].as_f64().unwrap_or(0.0) > now_unix(),
+        "a late flush completion must not release retroactively: {body}"
+    );
+}
+
+/// True while this state dir's heartbeat thread (`lh-` + the last 12
+/// chars of the dir name — see `LeaseHeartbeat::thread_name`) lives.
+fn heartbeat_thread_alive(state_dir: &Path) -> bool {
+    let leaf = state_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let tail: String = leaf
+        .chars()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let want = format!("lh-{tail}");
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|task| {
+            std::fs::read_to_string(task.path().join("comm")).is_ok_and(|name| name.trim() == want)
+        })
+}
+
+/// CAD-694 x CAD-947: the CAD-947 heartbeat runs from just after acquire,
+/// so a start that fails after acquiring the lease (relaunch fault) has a
+/// live renewal poster. The exit tail must flush, then stop AND JOIN the
+/// poster, and only then release — never a renewal racing the release
+/// (CAD-702: it would rewrite a removed lease or trip a spurious fence).
+/// The poster sleeps in 100ms steps, so a tail that releases first leaves
+/// it alive for up to 100ms after the release is visible; a 1ms watcher
+/// catches that. Passing no heartbeat to the tail fails this test.
+#[test]
+fn cad694_failed_start_stops_heartbeat_before_release() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.relaunch_fault_for_test = Some(Arc::new(AtomicBool::new(true)));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let state_dir = state.path().to_path_buf();
+    let lease_path = lease_file(dir.path());
+    let watched_state = state.path().to_path_buf();
+    let done = Arc::new(AtomicBool::new(false));
+    // Records, at the first instant the release is visible (expiry
+    // zeroed), whether the poster was still alive. `None` = never seen.
+    let watcher = {
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let mut seen_alive = false;
+            let mut released = false;
+            while !done.load(Ordering::SeqCst) {
+                if let Ok(text) = std::fs::read_to_string(&lease_path) {
+                    if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                        if body["expires_unix"].as_f64() == Some(0.0) {
+                            released = true;
+                            seen_alive |= heartbeat_thread_alive(&watched_state);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            (released, seen_alive)
+        })
+    };
+    let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
+    let err = handle
+        .join()
+        .unwrap()
+        .expect_err("the injected relaunch fault exits serve");
+    assert!(
+        err.to_string().contains("injected relaunch fault"),
+        "serve must fail on the injected relaunch fault: {err}"
+    );
+    // Outlive two renew periods: a surviving poster would rewrite the
+    // lease or trip the fence by now.
+    thread::sleep(Duration::from_millis(2500));
+    done.store(true, Ordering::SeqCst);
+    let (released, seen_alive) = watcher.join().unwrap();
+    assert!(released, "the failed start never released the lease");
+    assert!(
+        !seen_alive,
+        "the heartbeat was still alive when the lease released: a renewal could race the release"
+    );
+    assert!(
+        lease_expiry(dir.path()) == 0.0,
+        "a renewal rewrote the released lease"
+    );
+    assert!(
+        !state.path().join("lease-fence.json").exists(),
+        "a late renewal tripped a spurious fence after release"
+    );
+}
+
+/// Installs a pre-commit hook that parks the flush commit INSIDE git —
+/// reached only after the fence admitted the write. `trap_term` makes it
+/// ignore SIGTERM, like a hook that outlives its commit. Returns the
+/// directory holding its `entered`, `pid` and `release` marks.
+fn park_commit_hook(pm_dir: &Path, trap_term: bool) -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let marks = TempDir::new().unwrap();
+    let hook = pm_dir.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n{trap}echo $$ > {m}/pid\n: > {m}/entered\n\
+             n=0\nwhile [ ! -f {m}/release ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done\n",
+            m = marks.path().display(),
+            trap = if trap_term { "trap '' TERM\n" } else { "" },
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    marks
+}
+
+fn wait_entered(marks: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marks.join("entered").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the flush never reached its commit — the test parked nothing"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pid_alive(marks: &Path) -> bool {
+    let pid: i32 = std::fs::read_to_string(marks.join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only probes for existence.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// CAD-694 (r4 B3): withholding the lease release is not enough — a
+/// `git commit` admitted before the budget lapsed must not outlive it,
+/// or it lands after the lease transfers by TTL, into a successor's
+/// epoch. The writer is parked INSIDE the commit; the budget lapses;
+/// serve must return with that commit terminated and reaped, and
+/// releasing the hook afterwards must land nothing.
+#[test]
+fn cad694_budget_lapse_terminates_a_parked_flush_commit() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 30, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let marks = park_commit_hook(&pm_dir, false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.stop = Some(stop.clone());
+    opts.flush_budget_for_test = Some(Duration::from_millis(2000));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    stop.store(true, Ordering::SeqCst);
+    drop(d); // serve returns after the flush tail: budget lapse, cancel
+    wait_entered(marks.path());
+    assert!(
+        !pid_alive(marks.path()),
+        "the parked commit's hook outlived the budget lapse"
+    );
+    std::fs::write(marks.path().join("release"), "").unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let log = git(&pm_dir, &["log", "--format=%B", "-3"]);
+    assert!(!log.contains("cadence flush on stop"), "{log}");
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
+}
+
+/// CAD-694 (r4 B3, review 2): a hook that traps SIGTERM survives git
+/// and holds the pipes. The cancel must still kill the whole group and
+/// let the worker drop the tracker lock — a stale `.write.lock` after
+/// the daemon exits blocks every later tracker writer (CAD-852).
+#[test]
+fn cad694_cancel_kills_a_term_trapping_hook_and_frees_the_tracker_lock() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 30, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let marks = park_commit_hook(&pm_dir, true);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = leased_opts(dir.path(), 30);
+    opts.stop = Some(stop.clone());
+    opts.flush_budget_for_test = Some(Duration::from_millis(2000));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    stop.store(true, Ordering::SeqCst);
+    drop(d);
+    wait_entered(marks.path());
+    assert!(
+        !pid_alive(marks.path()),
+        "a TERM-trapping hook outlived the cancel"
+    );
+    assert!(
+        !pm_dir.join(".write.lock").exists(),
+        "the cancelled flush left the tracker lock behind"
+    );
+}
+
+/// CAD-694 (r4 B3, review 2): the contract's proof. The commit is
+/// admitted under a live lease and parks inside git; renewal then fails
+/// closed, the TTL lapses and a REAL successor acquires epoch 2. Neither
+/// the flush budget (held far open here) nor an explicit cancel fires —
+/// the commit's own owner must notice the lease slipping and end it, or
+/// the old daemon's `Lease-Epoch: 1` commit lands in the successor's
+/// epoch once the hook is released.
+#[test]
+fn cad694_flush_commit_cannot_land_after_a_successor_acquires() {
+    use cadence_agent::lease::{FileProvider, Provider};
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    // TTL 10 / renew 1: validity stays near 10s, far above the 2s commit
+    // floor even when renewals lag on a loaded host.
+    let pm_dir = hosted_pm(dir.path(), 10, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let marks = park_commit_hook(&pm_dir, false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = leased_opts(dir.path(), 10);
+    opts.stop = Some(stop.clone());
+    opts.flush_budget_for_test = Some(Duration::from_secs(120));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    // Request the stop only while the lease has ample validity, so the
+    // commit is admitted before any floor could matter.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        if body["expires_unix"].as_f64().unwrap_or(0.0) - now_unix() > 3.5 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lease never showed headroom");
+        thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::SeqCst);
+    wait_entered(marks.path());
+    // Wedge renewal: the heartbeat fails closed and the lease lapses.
+    let wedged = File::options()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("lease.json.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(wedged.as_raw_fd(), libc::LOCK_EX) }, 0);
+    thread::sleep(Duration::from_secs(11));
+    drop(wedged);
+    let successor = FileProvider::new(lease_file(dir.path()), Duration::from_secs(10))
+        .acquire("successor", 0)
+        .expect("the lapsed lease is takeable");
+    assert!(successor.epoch.unwrap_or(0) >= 2, "{successor:?}");
+    // The parked commit is released only now — after the takeover.
+    std::fs::write(marks.path().join("release"), "").unwrap();
+    drop(d);
+    thread::sleep(Duration::from_millis(300));
+    let log = git(&pm_dir, &["log", "--format=%B", "-3"]);
+    assert!(
+        !log.contains("cadence flush on stop"),
+        "a flush commit landed after the successor took the lease: {log}"
+    );
+    assert!(!pid_alive(marks.path()), "the commit's hook is still alive");
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
+}
+
+/// CAD-694: a lease with a short MARGIN (TTL 6s, renew 5s: one missed
+/// beat leaves 1s) must still get its stop flush. The commit floor
+/// derives from that margin (500ms); a fixed 2s floor would refuse every
+/// commit made in the last 2s before a renewal (CAD-538 regression).
+/// The TTL leaves startup room (the heartbeat starts after recovery);
+/// the stop is requested only once the lease is inside that last 2s
+/// window, so the short-margin floor path is what decides the commit.
+#[test]
+fn cad694_short_margin_lease_still_flushes_on_stop() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 6, 5);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut opts = daemon_opts();
+    opts.lease = Some(Hosted {
+        lease: Some(format!("file:{}", lease_file(dir.path()).display())),
+        lease_ttl_secs: Some(6),
+        lease_renew_secs: Some(5),
+        flush_timeout_secs: Some(15),
+    });
+    opts.stop = Some(stop.clone());
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let d = TestDaemon::start_opts(opts);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    // Wait for the window where validity is under the fixed 2s floor but
+    // still well above the derived 500ms one.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        let left = body["expires_unix"].as_f64().unwrap_or(0.0) - now_unix();
+        if (1.2..1.8).contains(&left) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never saw the short window");
+        thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::SeqCst);
+    drop(d);
+    let log = git(&pm_dir, &["log", "-1", "--format=%B"]);
+    assert!(log.contains("cadence flush on stop"), "{log}");
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "");
+}
+
+/// CAD-694: the crash path. A daemon SIGKILLed mid-flush leaves its
+/// `git commit` child (own process group, out of reach of group
+/// signals) running; it would land `cadence flush on stop` with the OLD
+/// lease epoch long after the write was declared interrupted. The child
+/// must die with its parent: SIGKILL the daemon while the commit is
+/// parked in a hook, release the hook, and nothing may land.
+#[test]
+fn cad694_sigkilled_daemon_does_not_leave_an_orphan_commit() {
+    let dir = TempDir::new().unwrap();
+    let pm_dir = hosted_pm(dir.path(), 30, 1);
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let marks = park_commit_hook(&pm_dir, false);
+    let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    d.register("w1");
+    d.wait_agent("w1", "idle", 15);
+    std::fs::write(pm_dir.join("pending.md"), "pending\n").unwrap();
+    git(&pm_dir, &["add", "pending.md"]);
+    let pid = d.process.as_ref().unwrap().id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    wait_entered(marks.path());
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = d.process.as_mut().unwrap().wait();
+    // The hook is released only after the daemon is dead.
+    std::fs::write(marks.path().join("release"), "").unwrap();
+    thread::sleep(Duration::from_secs(2));
+    let log = git(&pm_dir, &["log", "--format=%B", "-3"]);
+    assert!(
+        !log.contains("cadence flush on stop"),
+        "an orphaned flush commit landed after its daemon was killed: {log}"
+    );
+    assert_eq!(git(&pm_dir, &["status", "--porcelain"]), "A  pending.md");
+}
+
+/// CAD-694 (r4 B5): the exit decision itself. A real, non-retryable
+/// drain fault followed by the lease lapsing (renewal wedged past the
+/// TTL) before the verdict is still a fault: serve must exit `Err`. A
+/// carve-out that re-reads the fence after the fact would call it the
+/// fence's own consequence and exit clean. (The CAD-538 control — a
+/// drain the already-tripped fence refuses at the write exits clean —
+/// is `cad538_wedged_lease_lock_bounds_shutdown`.)
+#[test]
+fn cad694_real_drain_fault_exits_err_even_when_the_lease_lapses_after() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let go_rx = Mutex::new(go_rx);
+    // A roomy lease (TTL 6s, renew 2s): it cannot lapse on its own
+    // before shutdown reaches the drain, even on a loaded host.
+    let mut opts = daemon_opts();
+    opts.lease = Some(Hosted {
+        lease: Some(format!("file:{}", lease_file(dir.path()).display())),
+        lease_ttl_secs: Some(6),
+        lease_renew_secs: Some(2),
+        flush_timeout_secs: Some(15),
+    });
+    opts.stop = Some(Arc::new(AtomicBool::new(true)));
+    opts.shutdown_entries_hook = Some(Arc::new(move |_conn| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("injected disk full".to_string()),
+        ))
+    }));
+    opts.provider_deployments =
+        Some(DeploymentMetadata::parse(br#"{"schema":1,"providers":[]}"#).unwrap());
+    let state_dir = state.path().to_path_buf();
+    let handle = thread::spawn(move || daemon::serve_with(&state_dir, opts));
+    match entered_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("serve ended before the drain ran: {:?}", handle.join())
+        }
+        Err(e) => panic!("the drain never ran: {e}"),
+    }
+    // The drain's write already passed the fence. Wedge renewal, then
+    // wait — explicitly — until the lease on disk has lapsed.
+    let wedged = File::options()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("lease.json.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(wedged.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap())
+                .unwrap();
+        if body["expires_unix"].as_f64().unwrap_or(f64::MAX) < now_unix() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the wedged lease never lapsed");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(200));
+    go_tx.send(()).unwrap();
+    let exit = handle.join().unwrap();
+    drop(wedged);
+    let err = exit.expect_err("a real drain fault must not exit clean");
+    assert!(err.to_string().contains("shutdown entries failed"), "{err}");
+}
+
 /// `hosted.lease` off leaves startup untouched: no lease file, no
 /// `lease` in health. `daemon_opts` pins `Hosted::default()` —
 /// explicitly off, so a real `hosted:` table on this host cannot leak

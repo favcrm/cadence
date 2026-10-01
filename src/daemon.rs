@@ -546,7 +546,17 @@ impl Shared {
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
-        let store = Store::open_adopting(&db_path, marker)?;
+        let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
+        store.shutdown_entries_hook = opts.shutdown_entries_hook.clone();
+        if let Some(ms) = opts.shutdown_backoff_ms_for_test {
+            store.shutdown_backoff_ms = ms;
+        }
+        // CAD-694: persist this start's recovery outcome before any
+        // later failure path can lose it — the restart verdict reads
+        // the record when no per-alias event cursor could have been
+        // taken (the predecessor was already dead) and for endpoints
+        // the cursors never covered.
+        write_recovery_record(state_dir, &daemon_id, &recovered);
         // CAD-538: the store's write path now shares the lease fence —
         // one trip refuses every later write.
         if let Some(lease) = &lease {
@@ -2256,6 +2266,10 @@ impl Shared {
                 json!({
                 "state": "ready",
                 "pid": std::process::id(),
+                // CAD-694: this run's instance id — `daemon restart`
+                // binds the recovery record to the daemon it actually
+                // started, not whatever a later boot left on disk.
+                "instance": self.instance,
                 // The board compares this boot-pinned UID to the private
                 // record before attributing any session-bearing peer.
                 "agent_uid": self.agent_uid,
@@ -3210,7 +3224,12 @@ impl Shared {
     /// `running` without proof. Managed endpoints keep the
     /// interrupt-and-grace path: their provider process dies with the
     /// daemon either way.
-    fn shutdown(&self) {
+    ///
+    /// `Err` is the drain's own failure: no refusal events were
+    /// committed — the marker records the failure instead, so the next
+    /// start's `recover` fences every in-flight row the sweep finds and
+    /// a restart cannot read the stop as clean.
+    fn shutdown(&self) -> Result<()> {
         // Facts come from `begin_closing`, taken before the wake that
         // lets an idle actor detach. Re-reading the agent rows here is
         // the former snapshot and is empty once that detach has run.
@@ -3248,10 +3267,33 @@ impl Shared {
         }
         // LAST: every actor has detached and written its final state,
         // so the message rows are settled — and a marker written here
-        // can only ever describe a clean stop.
-        if let Ok(entries) = self.store.shutdown_entries(&facts) {
-            write_shutdown_marker(&self.state_dir, &self.instance, entries);
-        }
+        // can only ever describe a clean stop. A failed sweep commits
+        // no refusals, so the file becomes the evidence channel: the
+        // next start's recover() fences every unproven row it finds and
+        // the restart verdict stays loud.
+        let entries = match self.store.shutdown_entries(&facts) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "cadence: shutdown entries failed — in-flight turns fence without evidence: {e}"
+                );
+                write_failed_shutdown_marker(&self.state_dir, &self.instance, &e.to_string());
+                // A drain the lease fence itself refused is the fence's
+                // consequence, not a new fault: writes have been
+                // refused since the trip and the fence reason already
+                // reports why. The marker still carries the evidence;
+                // the stop exits cleanly (CAD-538). The cause is the
+                // typed refusal on THIS error — never the fence's
+                // later state, which a real fault followed by a trip
+                // or TTL expiry would also satisfy.
+                if e.is_fenced() {
+                    return Ok(());
+                }
+                return Err(Error::internal(format!("shutdown entries failed: {e}")));
+            }
+        };
+        write_shutdown_marker(&self.state_dir, &self.instance, entries);
+        Ok(())
     }
 }
 
@@ -4020,6 +4062,12 @@ fn group_root_reason(agent: &Agent, roots: &HashSet<String>) -> Option<&'static 
 #[cfg(feature = "test-seam")]
 pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Test seam (CAD-694): a one-shot barrier inside the shutdown flush
+/// worker — the closure runs before the checkpoint and may park the
+/// worker so a test can hold a flush open while the exit tail waits on
+/// its budget. Production leaves it unset.
+pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
@@ -4102,6 +4150,16 @@ pub struct ServeOptions {
     /// Only code in this process holding the flag can set it, so the
     /// gate is untouched. Production leaves it unset.
     pub stop: Option<Arc<AtomicBool>>,
+    /// Test seam: a one-shot serve-loop failure. Setting the flag makes
+    /// the accept loop take its fatal-error exit — the path that must
+    /// still run the shutdown below. Production leaves it unset.
+    pub serve_loop_fault: Option<Arc<AtomicBool>>,
+    /// Test seam (CAD-694): invoked inside every `shutdown_entries`
+    /// transaction with that attempt's live tx — a test can mutate rows
+    /// or return a synthetic sqlite error, proving rollback and the
+    /// retry bound without wedging the store a restart then opens.
+    /// Never set from RPC, PM, or the environment.
+    pub shutdown_entries_hook: Option<crate::store::ShutdownEntriesHook>,
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
@@ -4159,6 +4217,28 @@ pub struct ServeOptions {
     /// write — a recovery that outlives the lease TTL. In-process
     /// fixtures only; production leaves it unset.
     pub startup_delay_for_test: Option<Duration>,
+    /// Test seam (CAD-694): runs inside the shutdown flush worker
+    /// before the checkpoint — park it to hold the flush open while the
+    /// exit tail's budget lapses. Production leaves it unset.
+    pub flush_gate_for_test: Option<FlushGate>,
+    /// Test seam (CAD-694): runs as the flush worker's last act — its
+    /// completion receipt, so a test that parks the worker can wait for
+    /// its late completion instead of racing it. Production leaves it
+    /// unset.
+    pub flush_done_for_test: Option<FlushGate>,
+    /// Test seam (CAD-694): replaces the flush bound the exit tail
+    /// waits on — a test proves the withheld-release path without
+    /// paying a real lease `flush_timeout`. Production leaves it unset.
+    pub flush_budget_for_test: Option<Duration>,
+    /// Test seam (CAD-694): when set, `serve` treats `relaunch_agents`
+    /// as failed — the failed-start exit must still drain actors and
+    /// release the lease tail. Production leaves it unset.
+    pub relaunch_fault_for_test: Option<Arc<AtomicBool>>,
+    /// Test seam (CAD-694): replaces the `shutdown_entries` retry
+    /// backoff multiplier (production 50ms) — tests prove the retry
+    /// bound without paying wall-clock sleeps. Production leaves it
+    /// unset.
+    pub shutdown_backoff_ms_for_test: Option<u64>,
     /// CAD-482: arm the test-only caller seam. Honored only in
     /// `test-seam` builds; a daemon asked for it on any other build
     /// refuses to start rather than fall back to ambient identity.
@@ -4182,7 +4262,21 @@ pub struct ServeOptions {
     pub crm_send_row_gate: Option<Arc<crate::test_seam::SendRowGate>>,
 }
 
+/// Cap on the serve loop's transient-accept backoff — per listener
+/// pass, doubling from 5ms on each consecutive failure. With the
+/// shared socket a pass can sleep twice plus the accept poll, so the
+/// loop is silent for ~450ms at worst before it checks `closing`.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(200);
+/// Minimum gap between repeated transient-accept log lines.
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Run the daemon in the foreground until `shutdown` or a signal.
+/// Earlier setup exits (lease acquire, socket bind, signal hooks) return
+/// before anything is launched; once the sockets and signal hooks are
+/// bound — including a partial actor relaunch — every exit drains
+/// through `shutdown`, so a fatal listener or drain failure
+/// returns `Err` only after the shutdown below has run: adoption
+/// evidence (or a recorded failure) is never skipped.
 pub fn serve(state_dir: &Path) -> Result<()> {
     // CAD-482: a spawned fixture daemon (`daemon run`/`daemon start`
     // under the test suite) arms the seam from its environment —
@@ -4265,7 +4359,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // store opens or recovery runs — startup of any length rides a
     // renewed lease. The guard stops and joins it if startup fails; the
     // lease is then left to expire.
-    let mut lease_heartbeat = lease
+    let lease_heartbeat = lease
         .as_ref()
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
@@ -4309,8 +4403,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    relaunch_agents(&shared)?;
-    // Signal-driven shutdown: set the same flag as the rpc.
+    // Signal-driven shutdown: set the same flag as the rpc. Installed
+    // before actors launch so a signal during relaunch — or a relaunch
+    // failure — still reaches `shutdown` below rather than exiting
+    // unrecorded.
     {
         let shared = Arc::clone(&shared);
         let mut signals = signal_hook::iterator::Signals::new([
@@ -4323,6 +4419,35 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                 shared.begin_closing();
             }
         });
+    }
+    let relaunch = if opts
+        .relaunch_fault_for_test
+        .as_ref()
+        .is_some_and(|f| f.load(Ordering::SeqCst))
+    {
+        Err(Error::internal("injected relaunch fault (test seam)"))
+    } else {
+        relaunch_agents(&shared)
+    };
+    if let Err(e) = relaunch {
+        // A partial relaunch can still own actor threads — drain them
+        // so this exit records the same evidence every later exit does.
+        shared.begin_closing();
+        if let Err(se) = shared.shutdown() {
+            eprintln!("cadence: shutdown after relaunch failure: {se}");
+        }
+        // The CAD-947 heartbeat is running here: the tail flushes, stops
+        // and joins it, then releases the acquired lease and bound
+        // sockets, or the hosted slot stays owned until the TTL expires.
+        release_lease_tail(
+            &shared,
+            &hosted,
+            &opts,
+            lease_heartbeat,
+            &socket_path,
+            shared_socket,
+        );
+        return Err(e);
     }
     // Stall watch: a running turn that goes silent is reported to
     // whoever waits on it — never interrupted, never replayed.
@@ -4397,10 +4522,31 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // poster (started right after acquire, CAD-947) runs until after the
     // shutdown flush — stopped and joined only once the flush has
     // completed, then the lease releases.
-    while !shared.closing.load(Ordering::SeqCst) {
+    //
+    // A loop error is a stop, never a skip: `serve_error` is returned
+    // only after the shutdown below has run — the refusals and the
+    // marker it writes are the next start's adoption evidence.
+    let mut serve_error: Option<Error> = None;
+    let mut accept_backoff = Duration::ZERO;
+    // Persistent pressure (EMFILE) retries every ACCEPT_BACKOFF_MAX:
+    // log the first failure, then at most one line per
+    // ACCEPT_LOG_INTERVAL carrying the count it summarises.
+    let mut accept_log_at: Option<std::time::Instant> = None;
+    let mut accept_suppressed = 0u64;
+    while !shared.closing.load(Ordering::SeqCst) && serve_error.is_none() {
         if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
             shared.begin_closing();
             continue;
+        }
+        // Test seam: the loop's fatal-error exit without a real
+        // listener fault. Production leaves it unset.
+        if opts
+            .serve_loop_fault
+            .as_ref()
+            .is_some_and(|fault| fault.swap(false, Ordering::SeqCst))
+        {
+            serve_error = Some(Error::internal("injected serve loop fault"));
+            break;
         }
         let listeners: Vec<&UnixListener> = std::iter::once(&listener)
             .chain(shared_socket.as_ref().map(|socket| &socket.listener))
@@ -4419,13 +4565,51 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
                     ) => {}
-                Err(e) => return Err(e.into()),
+                // Transient pressure (fd table, kernel memory, an
+                // interrupted syscall) clears on its own: retry under a
+                // bounded backoff instead of ending the daemon mid-turn.
+                Err(e) if serve::accept_wait::transient_accept_error(&e) => {
+                    accept_backoff = (accept_backoff * 2)
+                        .max(Duration::from_millis(5))
+                        .min(ACCEPT_BACKOFF_MAX);
+                    if accept_log_at.is_none_or(|at| at.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                        let note = if accept_suppressed > 0 {
+                            format!(" ({accept_suppressed} similar failures not logged)")
+                        } else {
+                            String::new()
+                        };
+                        eprintln!(
+                            "cadence: listener accept failed ({e}); retrying in {}ms{note}",
+                            accept_backoff.as_millis()
+                        );
+                        accept_log_at = Some(std::time::Instant::now());
+                        accept_suppressed = 0;
+                    } else {
+                        accept_suppressed += 1;
+                    }
+                    std::thread::sleep(accept_backoff);
+                }
+                Err(e) => {
+                    serve_error = Some(e.into());
+                    break;
+                }
             }
         }
-        if !accepted {
-            serve::accept_wait::wait_for_connections(&listeners)?;
+        if accepted {
+            accept_backoff = Duration::ZERO;
+            accept_log_at = None;
+            accept_suppressed = 0;
+        } else if serve_error.is_none() {
+            if let Err(e) = serve::accept_wait::wait_for_connections(&listeners) {
+                serve_error = Some(e.into());
+            }
         }
     }
+    // A loop that ended on error never observed `closing`: set it now
+    // so the watches and actors drain through the normal stop below.
+    // `begin_closing` is idempotent — a clean exit keeps the facts
+    // snapshot taken when its stop was requested.
+    shared.begin_closing();
     // Former facts snapshot lived in `shutdown`. A test holds this
     // barrier until it has observed idle actors detach, which is the
     // interleaving that used to erase adoption facts.
@@ -4446,7 +4630,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // the query-time fallback still covers a daemon that restarts stale.
     shared.wiki_index.close();
     let _ = wiki_index_worker.join();
-    shared.shutdown();
+    if let Err(e) = shared.shutdown() {
+        // The loop's error still wins — it is why the daemon is leaving.
+        serve_error.get_or_insert(e);
+    }
     // CAD-538: flush before exit — WAL fold + the tracker's staged
     // index — then release the lease LAST: a successor may start the
     // moment it is gone, and this process must have no writes left.
@@ -4454,22 +4641,70 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // now is it stopped and joined, so there is never a window with
     // zero posters (heartbeat dead, flush still running) or two (a
     // late renew racing the release and rewriting a removed lease).
-    lease_flush(
+    release_lease_tail(
         &shared,
-        flush_budget(&hosted, shared.lease.as_deref()),
-        opts.flush_delay_for_test.unwrap_or_default(),
+        &hosted,
+        &opts,
+        lease_heartbeat,
+        &socket_path,
+        shared_socket,
     );
-    if let Some(heartbeat) = &mut lease_heartbeat {
+    match serve_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The shared serve-exit tail once `Shared` exists (CAD-702): flush
+/// the lease's stores, stop the heartbeat poster, release the lease
+/// LAST — a successor may start the moment it is gone, so this process
+/// must have no writes left — then unbind the sockets. `heartbeat` is
+/// the CAD-947 guard, running from just after acquire on every exit
+/// path (the relaunch failure included); it is stopped and joined
+/// after the flush and before the release, so no renewal can race the
+/// release and rewrite a removed lease.
+///
+/// CAD-694 (review): the lease is released only on PROVEN flush
+/// completion — the flush worker owns the WAL fold and the tracker's
+/// synchronous git commit, so its `send` is the joined-completion proof
+/// for every store write this tail could otherwise orphan. When the
+/// budget lapses the worker may still be writing; releasing then would
+/// let a successor boot into a live writer, so the hold is left to TTL
+/// expiry instead — the fence then bounds any late write to our own
+/// still-valid window rather than a successor's epoch.
+fn release_lease_tail(
+    shared: &Arc<Shared>,
+    hosted: &crate::lease::Hosted,
+    opts: &ServeOptions,
+    mut heartbeat: Option<serve::LeaseHeartbeat>,
+    socket_path: &Path,
+    shared_socket: Option<serve::SharedSocket>,
+) {
+    let flushed = lease_flush(
+        shared,
+        opts.flush_budget_for_test
+            .unwrap_or_else(|| flush_budget(hosted, shared.lease.as_deref())),
+        opts.flush_delay_for_test.unwrap_or_default(),
+        opts.flush_gate_for_test.clone(),
+        opts.flush_done_for_test.clone(),
+    );
+    if let Some(heartbeat) = &mut heartbeat {
         heartbeat.stop();
     }
     if let Some(lease) = &shared.lease {
-        if let Err(e) = lease.release() {
-            eprintln!("cadence: lease release failed (expiry covers it): {e}");
+        if flushed {
+            if let Err(e) = lease.release() {
+                eprintln!("cadence: lease release failed (expiry covers it): {e}");
+            }
+        } else {
+            eprintln!(
+                "cadence: lease release withheld — the shutdown flush never completed; \
+                 the lease expires by TTL instead of handing a live writer to a successor"
+            );
         }
     }
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(socket_path);
     drop(shared_socket);
-    Ok(())
 }
 
 /// Fallback detail when an unknown fence has no provider account.
@@ -8486,9 +8721,10 @@ pub use serve::HotStart;
 #[allow(unused_imports)]
 use serve::{
     acquire_singleton, flush_budget, handle_conn, hosted_config, hot_restart_begin, lease_flush,
-    process_start_identity, relaunch_agents, resolve_slot_config, write_shutdown_marker,
-    CheckupDispatch, SHUTDOWN_FILE,
+    process_start_identity, relaunch_agents, resolve_slot_config, write_failed_shutdown_marker,
+    write_recovery_record, write_shutdown_marker, CheckupDispatch, SHUTDOWN_FILE,
 };
+pub use serve::{INSTANCE_FILE, LAST_RECOVERY_FILE};
 #[allow(unused_imports)]
 use timers::{
     apply_auto_stop_view, auto_stop_view, AgentGcState, AgentGcTimer, AutoStopState, AutoStopTimer,

@@ -3198,6 +3198,495 @@ fn cad694_assert_restart_refusal(new_refusal: bool) {
     }
 }
 
+/// CAD-694 follow-up (serve-loop exit): a fatal listener error ended
+/// `serve` before `shutdown()` ran — in-flight turns then fenced on
+/// the next start with no `turn_adopt_refused` and no shutdown marker,
+/// which is exactly the silent signature the restart verdict missed.
+/// An injected loop failure must still drain: the refusal event is
+/// committed, the marker exists, and the serve reports the error.
+#[test]
+fn serve_loop_error_still_records_shutdown_evidence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let fault = Arc::new(AtomicBool::new(false));
+    let opts = daemon::ServeOptions {
+        serve_loop_fault: Some(Arc::clone(&fault)),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    d.register_inbox("unprovable");
+    d.send("unprovable", json!({"text": "mid-turn", "message": "m1"}))
+        .unwrap();
+    // The cad694 shape: a `running` turn on a pty agent with no
+    // endpoint facts is unprovable — `shutdown_entries` must refuse it
+    // WITH its event whenever the daemon leaves, not only on a clean
+    // stop.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='unprovable';
+         UPDATE messages SET state='running',turn_id='fault-turn' WHERE id='m1';",
+    )
+    .unwrap();
+    drop(conn);
+    fault.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_err(),
+        "an injected serve-loop error must surface: {exit:?}"
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='unprovable'
+                AND kind='turn_adopt_refused'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "the loop error must not skip shutdown_entries");
+    assert!(
+        d.state.join("shutdown.json").exists(),
+        "the loop error must not skip the shutdown marker"
+    );
+}
+
+/// CAD-694 follow-up (drain failure): a store error inside
+/// `shutdown_entries` used to be swallowed at the `if let Ok` — no
+/// refusal events, no marker, no log line, and `serve` returned Ok so
+/// a following restart still reported clean. The failure must now be
+/// the daemon's observable exit error, naming the step that failed —
+/// and the marker must record the failure so the next start fences
+/// what the drain could not prove.
+#[test]
+fn shutdown_entries_failure_is_an_observable_exit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    // Wedge the exact read `shutdown_entries` makes: a renamed table
+    // fails its prepare deterministically, like a store fault during
+    // the drain.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch("ALTER TABLE messages RENAME TO messages_moved")
+        .unwrap();
+    drop(conn);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    let err = exit.expect_err("a failed shutdown_entries must not exit clean");
+    assert!(
+        err.to_string().contains("shutdown entries"),
+        "the exit error must name the failed step: {err}"
+    );
+    let marker = std::fs::read_to_string(d.state.join("shutdown.json"))
+        .expect("a failed drain still records its marker");
+    assert!(
+        marker.contains("\"failed\""),
+        "the marker must record the failure, not a clean stop: {marker}"
+    );
+    assert!(
+        !marker.contains("\"entries\""),
+        "no entries were proven, so none may be recorded: {marker}"
+    );
+}
+
+/// A sqlite error for the `shutdown_entries` seam — a real
+/// `SqliteFailure` so `shutdown_retryable` classifies by its code,
+/// never a bespoke test-only kind.
+fn injected_sqlite_err(code: i32) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(code),
+        Some("injected shutdown fault".to_string()),
+    )
+}
+
+/// A BUSY drain attempt rolls back instead of committing partway: the
+/// hook mutates the row inside the doomed transaction, so the retry
+/// must re-read the committed `running` state — never the failed
+/// attempt's view — and commit exactly one refusal.
+#[test]
+fn shutdown_entries_retries_a_busy_once_then_records_one_refusal() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&attempted);
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        shutdown_entries_hook: Some(Arc::new(move |conn: &rusqlite::Connection| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Mutate inside the doomed transaction, then fail it:
+                // rollback discards this write, and the retry re-reads
+                // the committed row.
+                conn.execute_batch("UPDATE messages SET state='failed' WHERE id='mid'")
+                    .unwrap();
+                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_BUSY))
+            } else {
+                Ok(())
+            }
+        })),
+        // CAD-809: the retry bound itself is proven once at production
+        // backoff by cad694_failed_shutdown_fences_the_restart_verdict;
+        // every other scenario injects a zero backoff.
+        shutdown_backoff_ms_for_test: Some(0),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    d.register_inbox("unprovable");
+    d.send("unprovable", json!({"text": "mid-turn", "message": "mid"}))
+        .unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='unprovable';
+         UPDATE messages SET state='running',turn_id='busy-turn' WHERE id='mid';",
+    )
+    .unwrap();
+    drop(conn);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_ok(),
+        "one BUSY must be retried, not fatal: {exit:?}"
+    );
+    assert_eq!(attempted.load(Ordering::SeqCst), 2, "first try + one retry");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='unprovable'
+                AND kind='turn_adopt_refused'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "retry commits its refusal exactly once");
+    let state: String = conn
+        .query_row("SELECT state FROM messages WHERE id='mid'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        state, "running",
+        "the failed attempt's write must roll back, not leak"
+    );
+    let marker = std::fs::read_to_string(d.state.join("shutdown.json"))
+        .expect("a retried-then-clean drain records a clean marker");
+    assert!(!marker.contains("\"failed\""), "{marker}");
+}
+
+/// A non-retryable error fails on the first attempt — the retry loop
+/// never fires for a store fault it cannot outwait.
+#[test]
+fn shutdown_entries_stops_at_first_nonretryable_fault() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&attempted);
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        shutdown_entries_hook: Some(Arc::new(move |_conn| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(injected_sqlite_err(rusqlite::ffi::SQLITE_FULL))
+        })),
+        shutdown_backoff_ms_for_test: Some(0),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_err(),
+        "a non-retryable fault must surface: {exit:?}"
+    );
+    assert_eq!(
+        attempted.load(Ordering::SeqCst),
+        1,
+        "only lock contention retries — a full disk must not"
+    );
+    let marker = std::fs::read_to_string(d.state.join("shutdown.json"))
+        .expect("a failed drain still records its marker");
+    assert!(marker.contains("\"failed\""), "{marker}");
+}
+
+/// SQLITE_LOCKED sits on the retryable list like BUSY — the exhaustion
+/// scenarios land it only in the final attempt slot, where the bound
+/// check never consults the classifier, so a LOCKED-then-success queue
+/// is the proof it retries (S2).
+#[test]
+fn shutdown_entries_retries_sqlite_locked_then_records_one_refusal() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempted = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&attempted);
+    let opts = daemon::ServeOptions {
+        stop: Some(Arc::clone(&stop)),
+        shutdown_entries_hook: Some(Arc::new(move |_conn| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(injected_sqlite_err(rusqlite::ffi::SQLITE_LOCKED))
+            } else {
+                Ok(())
+            }
+        })),
+        shutdown_backoff_ms_for_test: Some(0),
+        ..daemon_opts()
+    };
+    let mut d = TestDaemon::start_opts(opts);
+    d.register_inbox("unprovable");
+    d.send("unprovable", json!({"text": "mid-turn", "message": "mid"}))
+        .unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='unprovable';
+         UPDATE messages SET state='running',turn_id='busy-turn' WHERE id='mid';",
+    )
+    .unwrap();
+    drop(conn);
+    stop.store(true, Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(
+        exit.is_ok(),
+        "one LOCKED must be retried, not fatal: {exit:?}"
+    );
+    assert_eq!(attempted.load(Ordering::SeqCst), 2, "first try + one retry");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='unprovable'
+                AND kind='turn_adopt_refused'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "retry commits its refusal exactly once");
+}
+
+/// CAD-694 follow-up (review B1): the restart verdict is the real
+/// contract. A failed `shutdown_entries` used to leave no marker and
+/// no events, so a successor on a now-usable store swept the turn and
+/// the restart reported clean. The failed marker must fence every
+/// unproven row — asserted through the actual `daemon restart` exit
+/// and stderr, not the in-process serve result.
+#[test]
+fn cad694_failed_shutdown_fences_the_restart_verdict() {
+    {
+        // Three BUSY-family faults drain the whole retry bound
+        // (first try + two retries) — the drain then fails over a
+        // store the successor finds usable again. Exactly the
+        // failure-then-recovers shape the verdict used to miss.
+        let faults =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                rusqlite::ffi::SQLITE_BUSY,
+                rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+                rusqlite::ffi::SQLITE_LOCKED,
+            ])));
+        let pending = std::sync::Arc::clone(&faults);
+        // When each attempt reached the hook — the observable backoff.
+        let stamps = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let stamped = std::sync::Arc::clone(&stamps);
+        let d = TestDaemon::start_opts(daemon::ServeOptions {
+            shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+                stamped.lock().unwrap().push(std::time::Instant::now());
+                match pending.lock().unwrap().pop_front() {
+                    Some(code) => Err(injected_sqlite_err(code)),
+                    None => Ok(()),
+                }
+            })),
+            // CAD-809: THE one bound-prover for the `shutdown_entries`
+            // backoff — this test pays the production 50+100ms sleeps so
+            // the real attempt schedule, not an injected one, is what
+            // exhausts below. Every other shutdown-entries scenario runs
+            // on `shutdown_backoff_ms_for_test: Some(0)`.
+            ..daemon_opts()
+        });
+        let _reaper = DaemonReaper::new(&d.state);
+        d.register_inbox("stopped-pty");
+        d.send(
+            "stopped-pty",
+            json!({"text": "unproven turn", "message": "mid"}),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute_batch(
+            "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+                pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='stopped-pty';
+             UPDATE messages SET state='running',turn_id='lost-turn' WHERE id='mid';",
+        )
+        .unwrap();
+        drop(conn);
+        let home = TempDir::new().unwrap();
+        hold_rollout_lease(home.path(), &d.state);
+        let out = operator_cadence_at(
+            home.path(),
+            &d.state,
+            &["daemon", "restart", "--as", "operator:test"],
+        );
+        // Stop our detached replacement before any outcome assertion.
+        let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+        assert!(stop.status.success(), "owned replacement did not stop");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stdout} {stderr}");
+        assert!(
+            stderr.contains("restart completed but not cleanly"),
+            "{stderr}"
+        );
+        // Ambient lock contention (a loaded host) can burn an attempt
+        // before the hook runs, so the bound cannot be pinned to "all
+        // three faults consumed". What must hold: the retry bound ran
+        // into the injected faults, and the drain failed loudly (the
+        // non-clean verdict above plus the failed marker's fence below).
+        assert!(
+            faults.lock().unwrap().len() < 3,
+            "no injected fault was reached: the drain never ran its retry bound"
+        );
+        // The backoff schedule is the production one (50ms x attempt):
+        // consecutive attempts are separated by at least that sleep.
+        // Contention only adds time, so these are lower bounds; a zero
+        // backoff would fail here.
+        let stamps = stamps.lock().unwrap();
+        // The bound is the first try plus two retries: more attempts
+        // than that means the retry count was raised.
+        assert!(
+            stamps.len() <= 3,
+            "{} drain attempts exceed the first try plus two retries",
+            stamps.len()
+        );
+        for (i, pair) in stamps.windows(2).enumerate() {
+            let floor = std::time::Duration::from_millis(50 * (i as u64 + 1));
+            assert!(
+                pair[1].duration_since(pair[0]) >= floor,
+                "attempt {} followed attempt {} sooner than the {floor:?} backoff",
+                i + 2,
+                i + 1
+            );
+        }
+        drop(stamps);
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        let refusals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE alias='stopped-pty'
+                    AND kind='turn_adopt_refused'
+                    AND json_extract(payload,'$.message')='mid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(refusals, 1, "the failed drain's swept turn must fence");
+        let state: String = conn
+            .query_row("SELECT state FROM messages WHERE id='mid'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "unknown", "the unproven turn fences on restart");
+        drop(conn);
+    }
+}
+
+/// CAD-694 (review B1): the verdict used to rest on the per-alias
+/// event cursors alone — but a predecessor already dead when
+/// `daemon restart` runs supplies no `agent_list` and therefore no
+/// cursor, so a failed drain's fencing went unseen. The successor's
+/// recovery record is the cursor-independent evidence: this restart,
+/// run entirely after the predecessor's death, must still fail
+/// non-cleanly.
+#[test]
+fn cad694_offline_restart_still_fences_a_failed_drain() {
+    // Three BUSY-family faults exhaust the retry bound — the drain
+    // fails, the failed marker lands, and the daemon exits before any
+    // restart command ever runs.
+    let faults = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+        rusqlite::ffi::SQLITE_BUSY,
+        rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+        rusqlite::ffi::SQLITE_LOCKED,
+    ])));
+    let pending = std::sync::Arc::clone(&faults);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let mut d = TestDaemon::start_opts(daemon::ServeOptions {
+        stop: Some(stop_flag),
+        shutdown_entries_hook: Some(std::sync::Arc::new(move |_conn| {
+            match pending.lock().unwrap().pop_front() {
+                Some(code) => Err(injected_sqlite_err(code)),
+                None => Ok(()),
+            }
+        })),
+        // The bound is proven once at production backoff by the online
+        // scenario; this offline restart pays none (CAD-809).
+        shutdown_backoff_ms_for_test: Some(0),
+        ..daemon_opts()
+    });
+    let _reaper = DaemonReaper::new(&d.state);
+    d.register_inbox("stopped-pty");
+    d.send(
+        "stopped-pty",
+        json!({"text": "unproven turn", "message": "mid"}),
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "UPDATE agents SET provider='devin',endpoint_kind='pty',state='stopped',enabled=0,
+            pid=NULL,pid_start=NULL,endpoint=NULL,generation=NULL WHERE alias='stopped-pty';
+         UPDATE messages SET state='running',turn_id='lost-turn' WHERE id='mid';",
+    )
+    .unwrap();
+    drop(conn);
+    // The predecessor dies of its own drain before the restart — the
+    // cursor path never even gets an `agent_list`.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let exit = d.handle.take().unwrap().join().unwrap();
+    assert!(exit.is_err(), "the failed drain exits the daemon: {exit:?}");
+    assert!(
+        faults.lock().unwrap().is_empty(),
+        "the whole retry bound ran before the daemon died"
+    );
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
+    // Stop our detached replacement before any outcome assertion.
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success(), "owned replacement did not stop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout} {stderr}");
+    assert!(
+        stderr.contains("drain failed"),
+        "the recovery record must carry the failed drain to the verdict: {stderr}"
+    );
+    assert!(
+        stderr.contains("restart completed but not cleanly"),
+        "{stderr}"
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let refusals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE alias='stopped-pty'
+                AND kind='turn_adopt_refused'
+                AND json_extract(payload,'$.message')='mid'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(refusals, 1, "the failed drain's swept turn must fence");
+    let state: String = conn
+        .query_row("SELECT state FROM messages WHERE id='mid'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "unknown", "the unproven turn fences on restart");
+    drop(conn);
+}
+
 #[test]
 fn events_default_page_is_newest_with_continue_cursor() {
     let d = TestDaemon::start();

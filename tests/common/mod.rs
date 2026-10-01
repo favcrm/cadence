@@ -1074,6 +1074,10 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         checkup_dispatch: None,
         idle_poll: None,
         stop: None,
+        // No injected serve-loop failure unless a test sets one.
+        serve_loop_fault: None,
+        // No injected shutdown-entries fault unless a test sets one.
+        shutdown_entries_hook: None,
         // CAD-313: links and sessions expire by the wall clock unless a
         // test injects one.
         operator_clock: None,
@@ -1095,6 +1099,13 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         lease_http_endpoint_override: None,
         flush_delay_for_test: None,
         startup_delay_for_test: None,
+        // No flush gate/budget override, relaunch fault, or shutdown
+        // backoff unless a test pins them — production never sets any.
+        flush_gate_for_test: None,
+        flush_done_for_test: None,
+        flush_budget_for_test: None,
+        relaunch_fault_for_test: None,
+        shutdown_backoff_ms_for_test: None,
         agent_uid: None,
         shared_socket: None,
         // CAD-482: when the test build carries the seam, fixture

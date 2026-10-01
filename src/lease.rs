@@ -104,6 +104,10 @@ pub trait Provider: Send + Sync {
 
 // ---------- the fence ----------
 
+/// Default validity floor for a tracker commit (CAD-694): the SIGTERM
+/// grace plus a margin. Short leases derive a smaller one.
+pub const DEFAULT_COMMIT_FLOOR: Duration = Duration::from_millis(2000);
+
 /// The trip-once latch the store's write path and every leased `Pm`
 /// share. The first trip wins — later losses add nothing to the story.
 /// Expiry is the second tripwire: a daemon whose heartbeat stopped but
@@ -117,6 +121,9 @@ pub struct Fence {
     /// unfenced or pre-lease store never refuses.
     expires_unix: AtomicU64,
     expires_monotonic: Mutex<Option<Instant>>,
+    /// Validity below which a tracker commit is refused or cancelled
+    /// (CAD-694), in ms; derived from the lease's own margin.
+    commit_floor_ms: AtomicU64,
 }
 
 impl Default for Fence {
@@ -125,6 +132,7 @@ impl Default for Fence {
             reason: Mutex::new(None),
             expires_unix: AtomicU64::new(f64::INFINITY.to_bits()),
             expires_monotonic: Mutex::new(None),
+            commit_floor_ms: AtomicU64::new(DEFAULT_COMMIT_FLOOR.as_millis() as u64),
         }
     }
 }
@@ -143,6 +151,21 @@ impl Fence {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// How long the held lease stays valid if it is never renewed
+    /// again: `None` when no expiry applies (unleased), `Some(ZERO)`
+    /// once tripped or lapsed.
+    pub fn remaining(&self) -> Option<Duration> {
+        if self.reason().is_some() {
+            return Some(Duration::ZERO);
+        }
+        self.lapse().map(|(left, _)| left)
+    }
+
+    /// Validity below which a tracker commit must not run.
+    pub fn commit_floor(&self) -> Duration {
+        Duration::from_millis(self.commit_floor_ms.load(Ordering::SeqCst))
     }
 
     pub fn tripped(&self) -> bool {
@@ -177,22 +200,31 @@ impl Fence {
         if let Some(reason) = self.reason() {
             return Some(reason);
         }
+        self.lapse()
+            .and_then(|(left, why)| left.is_zero().then_some(why))
+    }
+
+    /// The held lease's expiry as `(time left, why it reads as expired)`
+    /// — the single source `check` and `remaining` share. `None` when no
+    /// expiry applies (unleased).
+    fn lapse(&self) -> Option<(Duration, String)> {
         if let Some(deadline) = *self
             .expires_monotonic
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
-            return (Instant::now() >= deadline)
-                .then(|| "host lease renewal deadline expired".to_string());
+            return Some((
+                deadline.saturating_duration_since(Instant::now()),
+                "host lease renewal deadline expired".to_string(),
+            ));
         }
         let expiry = f64::from_bits(self.expires_unix.load(Ordering::SeqCst));
-        if now_unix() >= expiry {
-            Some(format!(
-                "lease expired at {expiry:.0} — a successor may hold it"
-            ))
-        } else {
-            None
-        }
+        expiry.is_finite().then(|| {
+            (
+                Duration::from_secs_f64((expiry - now_unix()).max(0.0)),
+                format!("lease expired at {expiry:.0} — a successor may hold it"),
+            )
+        })
     }
 }
 
@@ -214,6 +246,16 @@ impl PmLease {
                 "tracker write refused — the daemon's hosted lease is lost: {reason}"
             ))),
         }
+    }
+
+    /// See [`Fence::commit_floor`].
+    pub fn commit_floor(&self) -> Duration {
+        self.fence.commit_floor()
+    }
+
+    /// See [`Fence::remaining`].
+    pub fn remaining(&self) -> Option<Duration> {
+        self.fence.remaining()
     }
 
     /// The lease epoch outbound writes record (`Lease-Epoch:`).
@@ -472,12 +514,19 @@ pub(crate) fn acquire_with_endpoint(
         // A third of the TTL: one missed or late beat never lapses.
         None => Duration::from_secs_f64((ttl.as_secs_f64() / 3.0).max(0.2)),
     };
+    // CAD-694: the flush must end while the lease is still ours even if
+    // renewals stop — a commit admitted late may not outlive the TTL
+    // (HOST_TTL 6s vs the 10s default would otherwise allow it). Clamp
+    // to the room one missed beat leaves.
+    let margin = ttl.saturating_sub(renew_every);
     let flush_timeout = Duration::from_secs(
         hosted
             .flush_timeout_secs
             .unwrap_or(DEFAULT_FLUSH_SECS)
             .max(1),
-    );
+    )
+    .min(margin)
+    .max(Duration::from_secs(1).min(margin));
     let (provider, spec_name): (Arc<dyn Provider>, String) = match spec {
         Spec::Off => return Ok(None),
         Spec::File(path) => (Arc::new(FileProvider::new(path, ttl)), raw.to_string()),
@@ -489,7 +538,15 @@ pub(crate) fn acquire_with_endpoint(
             )
         }
     };
-    start_lease(state_dir, provider, spec_name, renew_every, flush_timeout).map(Some)
+    let ctl = start_lease(state_dir, provider, spec_name, renew_every, flush_timeout)?;
+    // A commit needs the SIGTERM grace and its kill to fit inside the
+    // validity one missed beat leaves: half the margin, at most the
+    // default — so even ttl 2 / renew 1 still flushes.
+    ctl.fence.commit_floor_ms.store(
+        DEFAULT_COMMIT_FLOOR.min(margin / 2).as_millis() as u64,
+        Ordering::SeqCst,
+    );
+    Ok(Some(ctl))
 }
 
 fn start_lease(
@@ -983,12 +1040,6 @@ mod http_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn dir() -> tempfile::TempDir {
-        tempfile::TempDir::new().unwrap()
-    }
-
     #[test]
     fn file_lease_is_single_writer() {
         let dir = dir();
@@ -1187,5 +1238,59 @@ mod tests {
         assert!(acquire(&state, &bad).is_err());
         // Off is off: no provider, no files.
         assert!(acquire(&state, &Hosted::default()).unwrap().is_none());
+    }
+
+    /// CAD-694: the flush bound never outlasts the room one missed
+    /// renewal leaves — the production defaults (TTL 6s, flush 10s)
+    /// would otherwise let a late commit outlive the lease.
+    #[test]
+    fn flush_timeout_is_clamped_under_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosted = Hosted {
+            lease: Some(format!("file:{}", dir.path().join("l.json").display())),
+            lease_ttl_secs: Some(6),
+            lease_renew_secs: Some(2),
+            flush_timeout_secs: Some(10),
+        };
+        let ctl = acquire(dir.path(), &hosted).unwrap().unwrap();
+        assert_eq!(ctl.flush_timeout, Duration::from_secs(4));
+        assert_eq!(ctl.fence().commit_floor(), DEFAULT_COMMIT_FLOOR);
+        let relaxed = Hosted {
+            flush_timeout_secs: Some(3),
+            ..hosted
+        };
+        let dir2 = tempfile::tempdir().unwrap();
+        let relaxed = Hosted {
+            lease: Some(format!("file:{}", dir2.path().join("l.json").display())),
+            ..relaxed
+        };
+        let ctl = acquire(dir2.path(), &relaxed).unwrap().unwrap();
+        assert_eq!(ctl.flush_timeout, Duration::from_secs(3));
+    }
+
+    use super::*;
+
+    fn dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    /// CAD-694: a short but valid lease (TTL 2s, renew 1s) keeps a commit
+    /// floor under the validity one missed beat leaves, so the stop
+    /// flush can still commit — a fixed 2s floor would never be met.
+    #[test]
+    fn short_leases_derive_a_commit_floor_they_can_meet() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosted = Hosted {
+            lease: Some(format!("file:{}", dir.path().join("l.json").display())),
+            lease_ttl_secs: Some(2),
+            lease_renew_secs: Some(1),
+            flush_timeout_secs: Some(10),
+        };
+        let ctl = acquire(dir.path(), &hosted).unwrap().unwrap();
+        let floor = ctl.fence().commit_floor();
+        assert_eq!(floor, Duration::from_millis(500));
+        // Validity right before the next beat is still above the floor.
+        assert!(floor < Duration::from_secs(2) - ctl.renew_every);
+        assert_eq!(ctl.flush_timeout, Duration::from_secs(1));
     }
 }

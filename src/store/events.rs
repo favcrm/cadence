@@ -242,6 +242,21 @@ impl Store {
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
+        Self::event_scoped_raw(conn, alias, kind, &payload, job_id, task_id)?;
+        Ok(())
+    }
+
+    /// [`Self::event_scoped`] with the sqlite error unwrapped — callers
+    /// inside a transaction can classify a BUSY-family failure instead
+    /// of losing the code to the crate error's flattening.
+    pub(super) fn event_scoped_raw(
+        conn: &Connection,
+        alias: &str,
+        kind: &str,
+        payload: &Value,
+        job_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
              VALUES(?,?,?,?,?,?)",

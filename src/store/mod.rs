@@ -80,7 +80,7 @@ pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 pub(crate) use schema::open_read_only;
-pub use schema::{AdoptEntry, ConsumedMarker, Take};
+pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 #[cfg(test)]
 mod tests;
 
@@ -113,7 +113,22 @@ pub struct Store {
     /// Provider text the turn result may carry, held per running message
     /// until it finishes ([`Store::thread_hold_running`], CAD-320).
     thread_held: Mutex<std::collections::HashMap<String, Vec<threads::HeldText>>>,
+    /// Test seam (CAD-694): invoked inside every `shutdown_entries`
+    /// transaction with that attempt's live tx — a test can mutate rows
+    /// or return a synthetic sqlite error to prove rollback and retry.
+    /// Production leaves it unset.
+    pub(crate) shutdown_entries_hook: Option<ShutdownEntriesHook>,
+    /// Test seam (CAD-694): the `shutdown_entries` retry backoff
+    /// multiplier in milliseconds — production 50; tests set 0 so the
+    /// retry bound is proven without wall-clock sleeps.
+    pub(crate) shutdown_backoff_ms: u64,
 }
+
+/// The `shutdown_entries` test seam (CAD-694): called with each
+/// attempt's live transaction; the hook may write through it or return
+/// a synthetic sqlite error, so rollback, retry bound and
+/// retryable-classification are provable without wedging the store.
+pub type ShutdownEntriesHook = Arc<dyn Fn(&Connection) -> rusqlite::Result<()> + Send + Sync>;
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).

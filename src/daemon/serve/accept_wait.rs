@@ -74,6 +74,21 @@ fn poll_outcome(result: io::Result<i32>, events: i16) -> io::Result<bool> {
     }
 }
 
+/// accept(2) failures that clear on their own: fd-table and kernel
+/// memory pressure, and an interrupted syscall. The serve loop retries
+/// these under a bounded backoff — an exit here abandons in-flight
+/// turns to the next start's recovery sweep. Anything else is a dead
+/// listener and stays fatal.
+pub(in crate::daemon) fn transient_accept_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return true;
+    }
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +186,31 @@ mod tests {
                 .raw_os_error(),
             Some(libc::ENOMEM)
         );
+    }
+
+    #[test]
+    fn transient_accept_errors_are_retried_and_permanent_ones_are_not() {
+        for raw in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                transient_accept_error(&io::Error::from_raw_os_error(raw)),
+                "errno {raw} must be retried"
+            );
+        }
+        assert!(transient_accept_error(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
+        for raw in [libc::EBADF, libc::EINVAL, libc::EPERM, libc::EFAULT] {
+            assert!(
+                !transient_accept_error(&io::Error::from_raw_os_error(raw)),
+                "errno {raw} must stay fatal"
+            );
+        }
+        // WouldBlock/ConnectionAborted take the caller's benign arm —
+        // they are not retried here.
+        assert!(!transient_accept_error(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "idle"
+        )));
     }
 
     #[test]

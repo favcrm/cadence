@@ -391,6 +391,15 @@ impl Pm {
     /// the tracker lock was busy. A leased daemon that has lost its
     /// lease is refused here like every other write.
     pub fn flush_pending(&self, actor: &str) -> Result<bool> {
+        self.flush_pending_cancellable(actor, &FlushCancel::default())
+    }
+
+    /// [`Self::flush_pending`] whose `git commit` is owned by `cancel`:
+    /// once cancelled, a commit not yet started is refused and one in
+    /// flight is terminated and reaped before this returns — no flush
+    /// writer outlives the cancel (CAD-694). Only the commit writes; the
+    /// read-only `git diff` probe needs no ownership.
+    pub fn flush_pending_cancellable(&self, actor: &str, cancel: &FlushCancel) -> Result<bool> {
         self.fence_check()?;
         let Some(_lock) = self.try_lock()? else {
             return Ok(false);
@@ -411,7 +420,7 @@ impl Pm {
         if let Some(epoch) = self.lease.as_ref().and_then(|lease| lease.epoch()) {
             message.push_str(&format!("Lease-Epoch: {epoch}\n"));
         }
-        git(
+        git_cancellable(
             &self.dir,
             &[
                 "-c",
@@ -423,6 +432,8 @@ impl Pm {
                 "-m",
                 message.as_str(),
             ],
+            cancel,
+            self.lease.as_ref(),
         )?;
         Ok(true)
     }
@@ -609,6 +620,182 @@ fn foreign_listed(foreign: &[String], extra: usize) -> String {
         listed.push(format!("(+{hidden} more)"));
     }
     listed.join(", ")
+}
+
+/// Ownership handle for a shutdown flush's writer (CAD-694). The flush
+/// runs on a worker the shutdown tail stops waiting for when its budget
+/// lapses; cancelling makes that worker's `git commit` die with it, so
+/// the lease can transfer by TTL without a late commit racing the
+/// successor's epoch.
+#[derive(Default)]
+pub struct FlushCancel(std::sync::atomic::AtomicBool);
+
+impl FlushCancel {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// How long a cancelled commit gets to unwind (git removes its lock
+/// files on SIGTERM) before the whole group is killed outright.
+const CANCEL_TERM_GRACE: Duration = Duration::from_millis(1000);
+
+/// Whether the leader of `group` has exited, WITHOUT reaping it — the
+/// zombie keeps the pgid ours, so signalling the group stays safe.
+fn leader_exited(group: i32) -> bool {
+    // SAFETY: waitid with WNOWAIT|WNOHANG only inspects a child of ours.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            group as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc != 0 || info.si_pid() != 0
+    }
+}
+
+/// The commit's own process group is out of reach of group signals sent
+/// to the daemon, so a SIGKILLed daemon would leave it running to land a
+/// late `cadence flush on stop` carrying an old lease epoch. Ask the
+/// kernel to kill it with its parent (Linux), and exit at once if the
+/// parent already died before the request took effect.
+///
+/// Residual: `PR_SET_PDEATHSIG` fires when the spawning THREAD exits,
+/// which here is the flush worker — alive for the whole commit. On other
+/// platforms (macOS) there is no equivalent and a crash can orphan the
+/// commit; the successor's lease epoch still orders it, but the commit
+/// itself is not prevented.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run
+    // between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
+
+/// [`git`] that the owning thread polls against `cancel` AND the lease:
+/// a lost lease or one with less than the lease's [`commit_floor`](crate::lease::PmLease::commit_floor) of validity
+/// left cancels the commit like an explicit cancel. The child runs in
+/// its own process group; the owner terminates the group, then kills it
+/// outright after the grace (a hook that traps TERM included) with the
+/// leader still unreaped, and never joins the pipe drains on that path —
+/// so the worker unwinds, drops the tracker lock, and no writer is left.
+fn git_cancellable(
+    dir: &Path,
+    args: &[&str],
+    cancel: &FlushCancel,
+    lease: Option<&crate::lease::PmLease>,
+) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let must_stop = || {
+        cancel.cancelled()
+            || lease.is_some_and(|l| l.remaining().is_some_and(|r| r < l.commit_floor()))
+    };
+    if must_stop() {
+        return Err(Error::rejected(
+            "tracker flush cancelled before its commit (cancelled, or the lease is too close to lapsing)",
+        ));
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    die_with_parent(&mut cmd);
+    let mut child = crate::reaper::spawn(&mut cmd)
+        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let group = child.id() as i32;
+    let status = loop {
+        if must_stop() {
+            // SAFETY: the group's leader is our child and stays
+            // unreaped until after the last signal, so the id is ours.
+            unsafe { libc::kill(-group, libc::SIGTERM) };
+            // The TERM grace plus the kill must fit in the lease's own
+            // floor: half of it, at most the default grace.
+            let grace = lease.map_or(CANCEL_TERM_GRACE, |l| {
+                CANCEL_TERM_GRACE.min(l.commit_floor() / 2)
+            });
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline && !leader_exited(group) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // SAFETY: as above; hooks that ignored TERM die here.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            let _ = child.wait();
+            // The drain threads end when the group's pipes close; they
+            // are not joined — a straggler must not hold the worker.
+            return Err(Error::rejected(
+                "tracker flush cancelled — its commit was terminated",
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                // SAFETY: still our unreaped child's group.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(Error::internal(format!("waiting on git: {e}")));
+            }
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if !status.success() {
+        return Err(Error::rejected(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Run a git subcommand in `dir`; rejected error carries stderr.

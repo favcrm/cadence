@@ -232,15 +232,17 @@
             pane_pid: 4242,
             native_session: format!("session-{alias}"),
         };
-        let s = Store::open_adopting(
+        let (s, _) = Store::open_adopting(
             &path,
             Some(ConsumedMarker {
+                instance: "old".to_string(),
                 entries: vec![
                     entry("mc", &pty_token),
                     entry("dp", &claude_token),
                     entry("ok", &pty_token),
                 ],
                 stale: None,
+                failed: None,
             }),
         )
         .unwrap();
@@ -281,6 +283,100 @@
             cad162_refusals(&s, "dp"),
             ["turn token predates endpoint generation"]
         );
+    }
+
+    /// CAD-694: the drain takes its write lock up front. A writer that
+    /// commits while the drain is in flight must make it WAIT
+    /// (`busy_timeout`), not fail a deferred lock upgrade as
+    /// BUSY_SNAPSHOT — a failure `busy_timeout` cannot wait out, which
+    /// burns a retry and, on a loaded host, the whole bound. The
+    /// backoff is set far above the writer's hold: any retry shows as
+    /// elapsed time.
+    #[test]
+    fn shutdown_entries_waits_for_a_racing_writer_without_retrying() {
+        let (dir, mut s) = store();
+        let cwd = dir.path().join("w");
+        let pty_token = format!("pty-{CAD162_GEN}-{}", "a".repeat(32));
+        let stale_token = format!("claude-{CAD162_GEN}-{}", "b".repeat(32));
+        cad162_turn(&s, &cwd, "dp", ("devin", "pty"), &stale_token);
+        cad162_turn(&s, &cwd, "ok", ("devin", "pty"), &pty_token);
+        let facts = s.pty_endpoint_facts().unwrap();
+        s.shutdown_backoff_ms = 5_000;
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let path = dir.path().join("t.sqlite3");
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            conn.execute_batch(
+                "INSERT INTO events(alias,kind,payload,at) VALUES('ok','probe','{}',0);
+                 COMMIT",
+            )
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let entries = s.shutdown_entries(&facts).unwrap();
+        let took = started.elapsed();
+        writer.join().unwrap();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "the drain retried instead of waiting for the lock: {took:?}"
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            cad162_refusals(&s, "dp"),
+            ["turn token predates endpoint generation"]
+        );
+    }
+
+    /// CAD-694 (r4): a drain failure's cause is typed where it is
+    /// produced. A real fault (disk full) followed by the lease fence
+    /// tripping — or the TTL lapsing — before the caller reads the
+    /// verdict is STILL a fault: only a write the fence itself refused
+    /// is the fence's consequence. Re-reading the fence afterwards
+    /// would call this one clean.
+    #[test]
+    fn shutdown_drain_failure_keeps_its_own_cause_when_the_fence_trips_later() {
+        let (dir, mut s) = store();
+        let cwd = dir.path().join("w");
+        cad162_turn(
+            &s,
+            &cwd,
+            "dp",
+            ("devin", "pty"),
+            &format!("pty-{CAD162_GEN}-{}", "a".repeat(32)),
+        );
+        let facts = s.pty_endpoint_facts().unwrap();
+        let fence = Arc::new(crate::lease::Fence::default());
+        s.install_write_fence(Arc::clone(&fence));
+        let trip = Arc::clone(&fence);
+        // A real, non-retryable drain fault; the fence trips in the
+        // window between the failing write and the caller's verdict.
+        s.shutdown_entries_hook = Some(Arc::new(move |_conn| {
+            trip.trip("renewal failed after the drain began");
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                Some("injected disk full".to_string()),
+            ))
+        }));
+        let err = s.shutdown_entries(&facts).unwrap_err();
+        assert!(
+            s.fence_reason().is_some(),
+            "the fence is tripped by the time the verdict is read"
+        );
+        assert!(
+            !err.is_fenced(),
+            "a drain fault must not be reclassified by the later fence: {err}"
+        );
+
+        // Control (CAD-538): a drain the tripped fence refuses at the
+        // write is the fence's own consequence.
+        s.shutdown_entries_hook = None;
+        let err = s.shutdown_entries(&facts).unwrap_err();
+        assert!(err.is_fenced(), "{err}");
     }
 
     /// CAD-256: a panic while one caller holds the connection guard
