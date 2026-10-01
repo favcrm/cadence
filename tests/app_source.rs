@@ -44,6 +44,16 @@ const FIXTURE_DIR: &str = "bundles/app";
 
 fn fixture_git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -58,6 +68,16 @@ fn fixture_git(dir: &Path, args: &[&str]) {
 
 fn fixture_git_sha(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -746,7 +766,7 @@ fn non_regular_members_refuse() {
         concat!(
             "status = subprocess.call([REAL] + sub, env=env)\n",
             "if status == 0 and 'checkout' in argv:\n",
-            "    clone = argv[argv.index('-C') + 1]\n",
+            "    clone = argv[argv.index('-C') + 1] if '-C' in argv else os.getcwd()\n",
             "    fifo = os.path.join(clone, 'bundles/app/rubrics/pipe')\n",
             "    os.makedirs(os.path.dirname(fifo), exist_ok=True)\n",
             "    os.mkfifo(fifo)\n",
