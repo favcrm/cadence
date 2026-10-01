@@ -1456,7 +1456,7 @@ pub fn cli(json_out: bool, operator: &str) -> Result<i32> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            crate::output::json_text(&json!({
                 "level": report.level().as_str(),
                 "provisioned": report.provisioned,
                 "checks": checks,

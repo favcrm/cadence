@@ -4848,7 +4848,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
         if !quiet {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
+                crate::output::json_text(&json!({
                     "state": "already_running", "pid": pid, "health_http": code,
                     "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
                 }))
@@ -4957,7 +4957,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                 if !quiet {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&json!({
+                        crate::output::json_text(&json!({
                             "state": "started", "pid": child.id(),
                             "url": format!("http://{host}:{port}"),
                             "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
@@ -5029,7 +5029,7 @@ fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
+        crate::output::json_text(&json!({
             "state": "stopped",
             "pid": pid,
             "note": if pid.is_none() { Some("no live pid") } else { None },
@@ -5056,7 +5056,7 @@ fn status(state_dir: &Path) -> Result<i32> {
     });
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
+        crate::output::json_text(&json!({
             "state": if pid.is_some() { "running" } else { "stopped" },
             "pid": pid,
             "health": health.map(|(code, body)| json!({
@@ -5278,7 +5278,7 @@ fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: boo
     if !quiet {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            crate::output::json_text(&json!({
                 "state": "sharing",
                 "tailnet_url": ts.url(),
                 "mapping": format!("https:{} → {}", ts.https_port, ts.target),
@@ -5299,7 +5299,7 @@ fn ts_stop(state_dir: &Path) -> Result<i32> {
     let Some(ts) = opts.tailscale.take() else {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"state": "not_sharing"})).unwrap_or_default()
+            crate::output::json_text(&json!({"state": "not_sharing"})).unwrap_or_default()
         );
         return Ok(0);
     };
@@ -5320,7 +5320,7 @@ fn ts_stop(state_dir: &Path) -> Result<i32> {
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
+        crate::output::json_text(&json!({
             "state": "stopped_sharing",
             "mapping_removed": removed,
             "board": if was_running { "restarted" } else { "not_running" },

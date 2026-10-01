@@ -3327,7 +3327,7 @@ fn events_follow_starts_at_tail() {
         .unwrap();
     d.wait_message("w1", "mf", &["completed"], 10);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !captured.lock().unwrap().contains("\"message\": \"mf\"") {
+    while !captured.lock().unwrap().contains("\"message\":\"mf\"") {
         assert!(
             Instant::now() < deadline,
             "post-follow event never streamed"
@@ -3338,8 +3338,8 @@ fn events_follow_starts_at_tail() {
     let _ = child.wait();
     let _ = reader.join();
     let text = captured.lock().unwrap().clone();
-    // Pages are pretty-printed JSON back to back — a `{` at column 0
-    // starts each page.
+    // Pages are JSON documents back to back (pretty or compact) — the
+    // brace-depth scan below splits them either way.
     let mut pages: Vec<Value> = Vec::new();
     let mut depth = 0i32;
     let mut start = None;

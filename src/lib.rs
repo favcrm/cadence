@@ -40,6 +40,7 @@ pub mod memory;
 pub mod model_defaults;
 pub mod needs_dismiss;
 pub mod operator_auth;
+pub mod output;
 pub mod overview;
 pub mod peer;
 pub mod pi_policy;

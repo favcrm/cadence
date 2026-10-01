@@ -1096,7 +1096,7 @@ pub fn run_ack(opts: &AckOptions) -> Result<i32> {
                 .collect();
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
+                crate::output::json_text(&json!({
                     "kind": "session-acks", "path": path, "acks": rows,
                 }))
                 .unwrap_or_default()
@@ -1163,7 +1163,7 @@ pub fn run_ack(opts: &AckOptions) -> Result<i32> {
     if opts.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            crate::output::json_text(&json!({
                 "kind": "session-ack", "path": path, "ack": ack,
                 "secret_warnings": crate::secret::warnings_json(&secret_warnings),
             }))
@@ -1851,7 +1851,7 @@ fn finish_start(rows: Vec<Row>, focus: &Focus, json_out: bool, host_source: Stri
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            crate::output::json_text(&json!({
                 "kind": "session-start",
                 "go": worst != Sev::Fail,
                 "scope": focus.json(),
@@ -2241,7 +2241,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     if opts.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            crate::output::json_text(&json!({
                 "kind": "session-end",
                 "dry_run": opts.dry_run,
                 "host_source": host_source(opts.host_report.as_deref()),
