@@ -5,6 +5,8 @@
 //! (`dp1.<ws>.<connection>.<image_digest[..32]>`), not accept-and-freeze it.
 //! Written before the freeze guard lands: this is the genuine red.
 #![allow(clippy::disallowed_methods)]
+#[allow(dead_code)]
+mod board_common;
 mod common;
 use cadence_agent::contract_fixture::{ToolTable, Verified};
 use cadence_agent::platform::agenticos_external::media_import::MediaImporter;
@@ -775,6 +777,41 @@ fn cad979_import_concurrent_calls_same_key_no_leak() {
         .unwrap()
         .len();
     assert_eq!(intents, 0, "import writes no intent row even concurrently");
+}
+
+/// I1 HTTP parity: `POST /api/social-media-imports` is `OperatorOnly` — a
+/// signed-in operator reaches the verb; an unauthenticated/anonymous POST is
+/// refused before the route even dispatches (fail-closed), same as the RPC.
+#[test]
+fn cad979_import_http_route_is_operator_only() {
+    let door = FakeImportDoor::start();
+    let h = importer_harness(&door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some(workspace(&h));
+    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "http");
+    let body = import_body(&run, &install, None, "cad979-http-1").to_string();
+
+    // A board on the daemon's state dir; the daemon serves the operator
+    // session mint, so sign_in works against h.daemon.state.
+    let pm = tempfile::tempdir().unwrap();
+    let (port, _board) = board_common::start_ui(pm.path().to_path_buf(), h.daemon.state.clone());
+    let host = format!("127.0.0.1:{port}");
+    let op = board_common::sign_in(h.daemon.state.as_path(), port);
+    // Operator write → reaches the verb (any 200/4xx from the handler, not a
+    // 403 session refusal).
+    let (code, _, _) =
+        board_common::op_write_json(&op, port, "POST", "/api/social-media-imports", &host, &body);
+    assert_ne!(code, 403, "a proven operator write must reach the verb");
+    // Anonymous write → fail-closed 403 before the route.
+    let (code, _, _) = board_common::http_write(
+        port,
+        "POST",
+        "/api/social-media-imports",
+        &host,
+        &["Content-Type: application/json"],
+        body.as_bytes(),
+    );
+    assert_eq!(code, 403, "an anonymous POST must be refused operator-only");
 }
 
 /// `h` PNG bytes shared between harness builds — the harness regenerates an
