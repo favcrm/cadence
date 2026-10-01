@@ -231,8 +231,9 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
                     .iter()
                     .all(|key| {
                         variant.get(*key).is_none_or(|v| {
-                            v.as_u64()
-                                .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
+                            v.is_null()
+                                || v.as_u64()
+                                    .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
                         })
                     })
                 || !["is_new", "is_beta"]
@@ -264,7 +265,13 @@ fn validate(bytes: &[u8], model: &str, now: u64) -> Result<Vec<u8>> {
     {
         for variant in family["variants"].as_array_mut().ok_or_else(refusal)? {
             let object = variant.as_object_mut().ok_or_else(refusal)?;
-            for key in ["cost_tier", "cost_summary", "description"] {
+            for key in [
+                "cost_tier",
+                "cost_summary",
+                "description",
+                "max_context_tokens",
+                "max_output_tokens",
+            ] {
                 if object.get(key).is_some_and(Value::is_null) {
                     object.remove(key);
                 }
@@ -441,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn representative_wire_metadata_accepts_description_and_normalizes_null_cost() {
+    fn representative_wire_metadata_accepts_all_optional_types_and_normalizes_nulls() {
         let (_dir, source, cache) = fixture();
         let mut doc = catalog();
         let variant = &mut doc["catalog"]["families"][0]["variants"][0];
@@ -449,10 +456,19 @@ mod tests {
             json!("Synthetic model description matching the CLI metadata contract.");
         variant["cost_tier"] = Value::Null;
         variant["cost_summary"] = json!("Synthetic display cost");
-        variant["max_context_tokens"] = json!(262000);
-        variant["max_output_tokens"] = json!(128000);
+        variant["max_context_tokens"] = Value::Null;
+        variant["max_output_tokens"] = Value::Null;
         variant["is_new"] = json!(false);
         variant["is_beta"] = json!(false);
+        // Another variant covers non-null forms of every optional wire field.
+        let other = &mut doc["catalog"]["families"][0]["variants"][1];
+        other["description"] = Value::Null;
+        other["cost_tier"] = json!("Synthetic tier");
+        other["cost_summary"] = Value::Null;
+        other["max_context_tokens"] = json!(262000);
+        other["max_output_tokens"] = json!(128000);
+        other["is_new"] = json!(true);
+        other["is_beta"] = json!(true);
         std::fs::write(&source, doc.to_string()).unwrap();
         seed(&cache, &source, "devin/swe-2-high", NOW).unwrap();
         let saved: Value =
@@ -462,6 +478,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("cost_tier");
+        for variant in doc["catalog"]["families"][0]["variants"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let object = variant.as_object_mut().unwrap();
+            object.retain(|_, value| !value.is_null());
+        }
         assert_eq!(saved, doc);
         assert_eq!(saved["fetchedAt"], NOW);
     }
