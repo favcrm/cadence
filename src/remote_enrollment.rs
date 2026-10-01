@@ -53,9 +53,12 @@ fn now() -> Result<u64> {
         .map_err(|_| reject("Invalid system clock"))?
         .as_secs())
 }
+// Shared AgenticOS hosted id contract: ASCII letters/digits/'_'/'-', 1..=200
+// (packages/contracts/src/hosted-ids.ts). The old 128 cap rejected issued ids.
+const MAX_ID: usize = 200;
 fn id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= MAX_ID
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
@@ -3176,5 +3179,111 @@ mod tests {
             !dir.join(RECORD).exists(),
             "renew recreated removed credential"
         );
+    }
+
+    #[test]
+    fn hosted_identity_fields_accept_the_200_character_issuer_contract() {
+        // The AgenticOS shared contract allows 1..=200 ASCII letters/digits/'_'
+        // /'-'; the previous 128 cap rejected issuer identities it must honor.
+        fn long_id(len: usize, tag: &str) -> String {
+            format!("{tag}-{}", "x".repeat(len - tag.len() - 1))
+        }
+        for len in [128usize, 129, 200] {
+            let mut enrolled = record(u64::MAX);
+            // Distinct values preserve the agent != subject/bridge invariants.
+            enrolled.organization_id = long_id(len, "org");
+            enrolled.subject_id = long_id(len, "sub");
+            enrolled.bridge_id = long_id(len, "brg");
+            enrolled.agent_id = long_id(len, "agt");
+            enrolled.client_agent_id = long_id(len, "cln");
+            enrolled.credential_id = long_id(len, "crd");
+            enrolled.valid(now().unwrap()).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("e");
+            trust(&dir, &enrolled.issuer);
+            save(&dir, &enrolled).unwrap();
+            let reopened = current(&dir).unwrap();
+            assert_eq!(reopened.organization_id(), enrolled.organization_id);
+            assert_eq!(reopened.subject_id(), enrolled.subject_id);
+            let pinned = DestinationPin::new(
+                &enrolled.organization_id,
+                &enrolled.audience,
+                &enrolled.subject_id,
+                &enrolled.agent_id,
+            )
+            .unwrap();
+            let mut calls = 0;
+            let bearer_matched = with_current(&dir, &pinned, |token| {
+                calls += 1;
+                Ok(token == CHILD)
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(bearer_matched, "issuer-bound callback saw a wrong bearer");
+        }
+    }
+
+    #[test]
+    fn stored_enrollment_refuses_oversized_or_punctuated_identity_fields() {
+        for field in [
+            "organization_id",
+            "subject_id",
+            "bridge_id",
+            "agent_id",
+            "client_agent_id",
+            "credential_id",
+        ] {
+            for bad in [
+                "i".repeat(201),
+                String::new(),
+                "has space".to_owned(),
+                "has.dot".to_owned(),
+                "has/slash".to_owned(),
+                "non-ascii-é".to_owned(),
+            ] {
+                let mut forged = record(u64::MAX);
+                let slot = match field {
+                    "organization_id" => &mut forged.organization_id,
+                    "subject_id" => &mut forged.subject_id,
+                    "bridge_id" => &mut forged.bridge_id,
+                    "agent_id" => &mut forged.agent_id,
+                    "client_agent_id" => &mut forged.client_agent_id,
+                    "credential_id" => &mut forged.credential_id,
+                    _ => unreachable!(),
+                };
+                *slot = bad.clone();
+                // The signed record is intact and private; validation alone refuses.
+                assert!(
+                    forged.valid(now().unwrap()).is_err(),
+                    "{field} accepted {bad:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_identity_fails_before_any_issuer_request_or_child_save() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, &issuer);
+        for bad in ["o".repeat(201), "has.dot".to_owned()] {
+            for (org, client) in [(bad.as_str(), "worker"), ("ws_real", bad.as_str())] {
+                assert!(enroll(&issuer, org, "http://127.0.0.1:1", client, SERVICE, &dir).is_err());
+                assert!(enroll_browser(
+                    &issuer,
+                    org,
+                    "http://127.0.0.1:1",
+                    client,
+                    &dir,
+                    |_, _| { panic!("oversized identity reached a device request") }
+                )
+                .is_err());
+            }
+        }
+        assert!(listener.accept().is_err(), "issuer was contacted");
+        assert!(!dir.join(RECORD).exists());
     }
 }
