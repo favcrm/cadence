@@ -50,6 +50,47 @@ impl Workspace {
         self.daemon
             .operator_rpc("app_workspace_install", json!({"source": self.source()}))
     }
+    /// CAD-864: write an `app-views/v1` descriptor into the source bundle
+    /// and declare it in the manifest (`needs.views.contract`). The
+    /// descriptor is the CRM worked example with `app` renamed to match
+    /// the bundle — a real descriptor exercising the seam, not a
+    /// minimized stub.
+    fn write_descriptor(&self, descriptor: &str, declare: bool) {
+        let views = self.source().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(views.join("app-views-v1.json"), descriptor).unwrap();
+        if declare {
+            let manifest = self.source().join("app.md");
+            let text = std::fs::read_to_string(&manifest).unwrap();
+            assert!(
+                !text.contains("views:"),
+                "source manifest already declares views"
+            );
+            std::fs::write(
+                &manifest,
+                text.replace(
+                    "  connections: [publish]",
+                    "  connections: [publish]\n  views:\n    contract: app-views/v1",
+                ),
+            )
+            .unwrap();
+        }
+    }
+    /// The descriptor bytes a descriptor-bearing source carries: the
+    /// contracts crate's CRM example with `app` rebound to `blog-post`.
+    fn descriptor_text() -> String {
+        let text = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/app-views/v1/examples/crm.json"),
+        )
+        .unwrap();
+        text.replace("\"app\": \"crm\"", "\"app\": \"blog-post\"")
+    }
+    fn show(&self, id: &str) -> Value {
+        self.daemon
+            .operator_rpc("app_workspace_show", json!({"install_id": id}))
+            .unwrap()
+    }
     fn upgrade_check(&self, installed: &Value) -> Value {
         self.daemon
             .operator_rpc(
@@ -1762,4 +1803,432 @@ fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_expli
             );
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* CAD-864: the installable app-views/v1 descriptor seam.              */
+/*                                                                     */
+/* Adversarial-first: these tests name the guard before the new        */
+/* validation exists. A descriptor-bearing bundle installs only when   */
+/* `views/app-views-v1.json` parses under the contract's exact rules   */
+/* AND `needs.views.contract` declares it; malformed, undeclared,      */
+/* over-bound, forbidden-key, traversal-named or swapped descriptors   */
+/* refuse before any journal/pending write or catalog mutation. The    */
+/* descriptor rides the verified `describe` receipt — daemon           */
+/* `app_workspace_show` and the HTTP GET peer — never a                */
+/* descriptor-supplied scope.                                          */
+/* ------------------------------------------------------------------ */
+
+/// A descriptor-bearing bundle installs and the verified receipt serves
+/// the validated descriptor plus its content digest; a legacy bundle
+/// without one keeps `view_descriptor: null`.
+#[test]
+fn cad864_descriptor_installs_and_rides_the_verified_receipt() {
+    let w = Workspace::new();
+    // Legacy bundle: no views/ dir, no declaration — unchanged contract.
+    let plain = w.install().unwrap();
+    assert_eq!(plain["view_descriptor"], Value::Null);
+    assert_eq!(plain["view_descriptor_digest"], Value::Null);
+    let id = plain["install_id"].as_str().unwrap().to_string();
+    assert_eq!(w.show(&id)["view_descriptor"], Value::Null);
+
+    // Fresh workspace so the descriptor-bearing bundle is not "already
+    // installed".
+    let w2 = Workspace::new();
+    w2.write_descriptor(&Workspace::descriptor_text(), true);
+    let installed = w2.install().unwrap();
+    let id2 = installed["install_id"].as_str().unwrap().to_string();
+    let shown = w2.show(&id2);
+    let descriptor = &shown["view_descriptor"];
+    assert_eq!(descriptor["contract"], "app-views/v1");
+    assert_eq!(descriptor["app"], "blog-post");
+    assert_eq!(
+        descriptor["views"].as_array().unwrap().len(),
+        3,
+        "descriptor serves its declared views through the receipt"
+    );
+    // The receipt's descriptor digest matches the bytes in the
+    // installation's bundle digest (content-covered, so a descriptor
+    // byte change is a structural change).
+    assert!(shown["view_descriptor_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(
+        shown["digest"], installed["digest"],
+        "receipt digest is the installed bundle digest"
+    );
+    // Descriptor bytes are part of the installed file inventory.
+    assert!(shown["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("views/app-views-v1.json")));
+}
+
+/// Every malformed/undeclared/forbidden descriptor refuses install
+/// before publication — no `.apps/` tree is created and git HEAD does
+/// not move.
+#[test]
+fn cad864_malformed_and_forbidden_descriptors_refuse_before_install() {
+    let good = Workspace::descriptor_text();
+    let nested_forbidden = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"detail","fields":[{"id":"f","label":"l","url":"https://evil.test"}]}]}"#
+        .to_string();
+    // Column naming an undeclared field.
+    let bad_column = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"table","fields":[{"id":"f","label":"l"}],"columns":[{"field":"ghost"}]}]}"#
+        .to_string();
+    // createView naming no declared form view.
+    let bad_create_view = r#"{"contract":"app-views/v1","app":"blog-post","title":"T","views":[{"id":"v","title":"t","kind":"detail","fields":[{"id":"f","label":"l","createView":"nope"}]}]}"#
+        .to_string();
+    // Each case: (descriptor bytes, declare flag) that must refuse.
+    let cases: Vec<(String, bool)> = vec![
+        // Undeclared file — present on disk, never declared in app.md.
+        (good.clone(), false),
+        // Declaration without the file is covered in the next test; here
+        // the file exists but is malformed.
+        ("not json".to_string(), true),
+        (good.replace("\"app-views/v1\"", "\"app-views/v2\""), true),
+        // Forbidden keys at the root and nested inside a field.
+        (
+            good.replace("\"summary\":", "\"install_id\": \"forged\", \"summary\":"),
+            true,
+        ),
+        (nested_forbidden, true),
+        (bad_column, true),
+        (bad_create_view, true),
+        // `app` provenance must match the manifest.
+        (
+            good.replace("\"app\": \"blog-post\"", "\"app\": \"other-app\""),
+            true,
+        ),
+    ];
+
+    for (i, (descriptor, declare)) in cases.into_iter().enumerate() {
+        let w = Workspace::new();
+        w.write_descriptor(&descriptor, declare);
+        let head = w.head();
+        let err = w
+            .install()
+            .expect_err(&format!("case {i} must refuse install"));
+        let _ = err; // refusal itself is the assertion — no partial state
+        assert_eq!(w.head(), head, "case {i} moved HEAD on refusal");
+        assert!(
+            !w.pm.dir.join(".apps").exists(),
+            "case {i} published catalog state on refusal"
+        );
+    }
+}
+
+/// `needs.views` declared without `views/app-views-v1.json` refuses;
+/// a `views/` file under any other name refuses; a symlinked descriptor
+/// refuses.
+#[test]
+fn cad864_declaration_file_pairing_and_layout_are_exact() {
+    // Declaration without the file.
+    let w = Workspace::new();
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "  connections: [publish]",
+            "  connections: [publish]\n  views:\n    contract: app-views/v1",
+        ),
+    )
+    .unwrap();
+    let head = w.head();
+    assert!(
+        w.install().is_err(),
+        "declared views with no descriptor file installed"
+    );
+    assert_eq!(w.head(), head);
+    assert!(!w.pm.dir.join(".apps").exists());
+
+    // Wrong filename under views/.
+    for leaf in ["other.json", "app-views-v2.json", "APP-VIEWS-V1.JSON"] {
+        let w = Workspace::new();
+        let views = w.source().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(views.join(leaf), Workspace::descriptor_text()).unwrap();
+        // Declaration present but the file name is wrong — the contract
+        // pins exactly `views/app-views-v1.json`.
+        let manifest = w.source().join("app.md");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  views:\n    contract: app-views/v1",
+            ),
+        )
+        .unwrap();
+        let head = w.head();
+        assert!(
+            w.install().is_err(),
+            "views/{leaf} installed under the v1 declaration"
+        );
+        assert_eq!(w.head(), head);
+        assert!(!w.pm.dir.join(".apps").exists());
+    }
+
+    // A nested dir under views/ refuses (flat dirs only).
+    let w = Workspace::new();
+    std::fs::create_dir_all(w.source().join("views/nested")).unwrap();
+    std::fs::write(
+        w.source().join("views/app-views-v1.json"),
+        Workspace::descriptor_text(),
+    )
+    .unwrap();
+    let manifest = w.source().join("app.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "  connections: [publish]",
+            "  connections: [publish]\n  views:\n    contract: app-views/v1",
+        ),
+    )
+    .unwrap();
+    assert!(w.install().is_err(), "nested views/ dir installed");
+
+    // A symlinked descriptor refuses.
+    #[cfg(unix)]
+    {
+        let w = Workspace::new();
+        let views = w.source().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let outside = w._root.path().join("outside.json");
+        std::fs::write(&outside, Workspace::descriptor_text()).unwrap();
+        std::os::unix::fs::symlink(&outside, views.join("app-views-v1.json")).unwrap();
+        let manifest = w.source().join("app.md");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "  connections: [publish]",
+                "  connections: [publish]\n  views:\n    contract: app-views/v1",
+            ),
+        )
+        .unwrap();
+        assert!(w.install().is_err(), "symlinked descriptor installed");
+        assert!(!w.pm.dir.join(".apps").exists());
+    }
+}
+
+/// A descriptor byte change is a structural change: it moves the bundle
+/// digest, an upgrade must pin it, and the upgraded receipt serves the
+/// new descriptor. The old revision keeps its own descriptor bytes.
+#[test]
+fn cad864_descriptor_bytes_are_identity_and_upgrade_pinned() {
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let old_digest = installed["digest"].as_str().unwrap().to_string();
+    let generation = installed["catalog_generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Change one label inside the descriptor (still valid) and one
+    // version byte in the manifest.
+    let descriptor = w.source().join("views/app-views-v1.json");
+    let text = std::fs::read_to_string(&descriptor).unwrap();
+    std::fs::write(&descriptor, text.replace("\"Customers\"", "\"Clients\"")).unwrap();
+    let manifest = w.source().join("app.md");
+    let mtext = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, mtext.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
+
+    let proposed = w.upgrade_check(&installed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
+    assert_ne!(
+        new_digest, old_digest,
+        "descriptor edit did not move the digest"
+    );
+    assert!(proposed["structural_diff"]["changed"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("views/app-views-v1.json")));
+
+    let upgraded = w
+        .daemon
+        .operator_rpc(
+            "app_workspace_upgrade",
+            json!({"install_id": id, "source": w.source(),
+                "expected_digest": old_digest, "expected_generation": generation,
+                "expected_new_digest": new_digest, "request_id": "desc-upgrade"}),
+        )
+        .unwrap();
+    assert_eq!(upgraded["digest"], json!(new_digest));
+    assert_eq!(upgraded["approved"], json!(false));
+    let shown = w.show(&id);
+    assert_eq!(
+        shown["view_descriptor"]["views"][0]["title"],
+        json!("Clients")
+    );
+    // The descriptor's own digest moved with the bytes.
+    assert_ne!(
+        shown["view_descriptor_digest"],
+        json!(installed["view_descriptor_digest"])
+    );
+
+    // A stale upgrade (pre-change digest) refuses without mutation.
+    let stale = w.daemon.operator_rpc(
+        "app_workspace_upgrade",
+        json!({"install_id": id, "source": w.source(),
+            "expected_digest": old_digest, "expected_generation": generation,
+            "expected_new_digest": new_digest, "request_id": "desc-stale"}),
+    );
+    assert!(
+        stale.is_err(),
+        "stale descriptor-bearing digest upgraded again"
+    );
+    assert_eq!(w.show(&id)["digest"], json!(new_digest));
+}
+
+/// A descriptor-bearing install refuses midway when the descriptor is
+/// invalid, and the retained-journal recovery path also re-validates —
+/// a forged journal carrying a bad descriptor cannot apply.
+#[test]
+fn cad864_recovery_revalidates_a_forged_descriptor_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let hook = w.pm.dir.join(".git/hooks/pre-commit");
+    let original_hook = std::fs::read(&hook).ok();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failed = w.install().unwrap_err();
+    assert!(failed.to_string().contains("git"));
+    let id = std::fs::read_to_string(w.pm.dir.join(".apps/install-pending.yaml")).unwrap();
+    let journal_path =
+        w.pm.dir
+            .join(".apps/install-journals")
+            .join(format!("{}.yaml", id.trim()));
+    let journal_bytes = std::fs::read(&journal_path).unwrap();
+    // Forge the journal's descriptor entry to invalid bytes — the
+    // journal still parses as YAML but the bundle it carries is bad.
+    let mut forged: serde_yaml::Value = serde_yaml::from_slice(&journal_bytes).unwrap();
+    forged["files"].as_mapping_mut().unwrap().insert(
+        serde_yaml::Value::String("views/app-views-v1.json".into()),
+        serde_yaml::Value::String("{\"contract\":\"app-views/v2\"}".into()),
+    );
+    std::fs::write(&journal_path, serde_yaml::to_string(&forged).unwrap()).unwrap();
+    match original_hook {
+        Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
+        None => std::fs::remove_file(&hook).unwrap(),
+    }
+    assert!(
+        w.daemon
+            .operator_rpc("app_workspace_recover", json!({"install_id": id.trim()}))
+            .is_err(),
+        "a journal carrying an invalid descriptor applied"
+    );
+    // Restore and recover cleanly.
+    std::fs::write(&journal_path, &journal_bytes).unwrap();
+    let recovered = w
+        .daemon
+        .operator_rpc("app_workspace_recover", json!({"install_id": id.trim()}))
+        .unwrap();
+    assert_eq!(recovered["committed"], true);
+    assert_eq!(
+        recovered["view_descriptor"]["contract"],
+        json!("app-views/v1")
+    );
+}
+
+/// The receipt is served only over the operator gate — an agent caller
+/// (daemon RPC) and an HTTP peer carrying a stolen session both refuse;
+/// the descriptor never names its own scope.
+#[test]
+fn cad864_descriptor_read_stays_operator_only_and_installation_bound() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    w.write_descriptor(&Workspace::descriptor_text(), true);
+    let installed = w.install().unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+
+    // Daemon RPC: an agent caller cannot read the receipt.
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "desc-reader", "claude", None, lane.pid());
+    for forged in [
+        json!({"install_id": id}),
+        json!({"install_id": id, "actor": "operator"}),
+        json!({"install_id": "../other"}),
+    ] {
+        let frame = lane.rpc(&w.daemon.state, "app_workspace_show", forged);
+        assert_eq!(frame["ok"], false, "agent read descriptor receipt: {frame}");
+    }
+
+    // HTTP peer: the descriptor rides GET /api/app-installations/<id>
+    // under the same operator read gate — a stolen session from an
+    // enrolled agent's pane is refused.
+    let lease = test_port();
+    let port = lease.port;
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Operator GET serves the descriptor.
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let path = format!("/api/app-installations/{id}");
+    let (code, _, body) = common::op::raw(port, &session.request("GET", &path, ""));
+    assert_eq!(code, 200, "operator descriptor read: {body}");
+    let row: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(row["view_descriptor"]["app"], json!("blog-post"));
+
+    // Agent-peered HTTP read refuses (stolen session replayed through
+    // the agent's pane — the existing operator-read gate's proof).
+    for prefix in ["", "setsid "] {
+        let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+        let wire = stolen.request_as("GET", &path, "", "");
+        let request_file = lane.dir.path().join(format!("desc-http-{}.txt", lane.seq));
+        std::fs::write(&request_file, wire).unwrap();
+        let (rc, response) = lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}", request_file.display()));
+        assert_eq!(rc, 0);
+        assert_eq!(
+            response.split_whitespace().nth(1),
+            Some("403"),
+            "agent-peered HTTP descriptor read reached {path}: {response}"
+        );
+    }
+    // A cross-install/guessed read — an id that is not a live
+    // installation — refuses on both peers.
+    let fake = "0123456789abcdef0123456789abcdef";
+    assert!(w
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id": fake}))
+        .is_err());
+    let session = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
+    let (code, _, _) = common::op::raw(
+        port,
+        &session.request("GET", &format!("/api/app-installations/{fake}"), ""),
+    );
+    assert!(code >= 400, "unknown installation read served: {code}");
 }
