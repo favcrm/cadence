@@ -3497,6 +3497,35 @@ pub fn install_script(path: &Path, body: &str) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
+/// `(tid, comm, state, wchan)` of every thread under a `/proc/<pid>/task`
+/// dir. Unreadable fields come back empty or `?`: a thread can exit
+/// between the listing and the read.
+fn task_states(dir: &str) -> Vec<(String, String, String, String)> {
+    let mut rows = Vec::new();
+    for task in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = task.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let stat = read("stat");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".into());
+        rows.push((
+            task.file_name().to_string_lossy().to_string(),
+            read("comm"),
+            state,
+            read("wchan"),
+        ));
+    }
+    rows.sort();
+    rows
+}
+
 /// File name the enrollment mock is installed under.
 const MOCK_SCRIPT_NAME: &str = "claude-enroll.py";
 
@@ -3664,7 +3693,11 @@ impl ManagedWorker {
             assert!(
                 Instant::now() < deadline,
                 "managed worker never answered {what} (command {n}; {})",
-                self.silence_report()
+                {
+                    // The report quotes process command lines and stderr.
+                    let report = self.silence_report();
+                    cadence_agent::secret::redact_text(&report).unwrap_or(report)
+                }
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -3675,7 +3708,8 @@ impl ManagedWorker {
     /// (CAD-954): the worker's own state, every process of the mock
     /// still alive with what it is blocked on, the command files that
     /// landed, the tail of the stderr the daemon captured, and the load.
-    /// Reads only, so it can never hang the failure it explains.
+    /// Reads only, and every wait is bounded except the `/proc` and file
+    /// reads themselves (one can block behind a process in disk wait).
     pub fn silence_report(&self) -> String {
         // A killed worker the daemon has not yet waited on is a zombie:
         // its /proc entry stays, but it serves nothing.
@@ -3714,9 +3748,12 @@ impl ManagedWorker {
             .collect();
         files.sort();
         out.push_str(&format!("\ncommand dir: {files:?}"));
-        // The mock's processes: the worker itself, its children, and
-        // the detached grandchildren the daemon (the subreaper) adopted
-        // — they all run the mock script.
+        // This worker's mock processes: the worker itself, its children,
+        // and the detached grandchildren the daemon (the subreaper)
+        // adopted. Every one carries this worker's own command dir (as an
+        // argument, or in the response path it lands), which no sibling
+        // worker, parallel test or other lane's mock shares.
+        let cmd_dir = self.cmd_dir.path().to_string_lossy().to_string();
         for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
@@ -3725,7 +3762,7 @@ impl ManagedWorker {
                 continue;
             };
             let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
-            if pid != self.pid && !cmdline.contains(MOCK_SCRIPT_NAME) {
+            if pid != self.pid && !cmdline.contains(&cmd_dir) {
                 continue;
             }
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
@@ -3738,26 +3775,24 @@ impl ManagedWorker {
                 "\n  proc {pid} ppid {ppid} state {state} wchan {wchan} cmd {}",
                 cmdline.chars().take(160).collect::<String>()
             ));
+            // Every thread, not just the main one: the mock's main thread
+            // always reads stdin, the thread that serves requests is another.
+            for (tid, comm, state, wchan) in task_states(&format!("/proc/{pid}/task")) {
+                out.push_str(&format!(
+                    "\n    thread {tid} {comm} state {state} wchan {wchan}"
+                ));
+            }
         }
         // An in-process daemon's threads are this process's threads: a
         // handler parked on a lock (futex), on a disk commit (D,
         // jbd2/fsync) or spinning shows here, by state and wait channel.
         let mut waits: std::collections::BTreeMap<String, usize> = Default::default();
-        for task in std::fs::read_dir("/proc/self/task")
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let dir = task.path();
-            let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
-            let state = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
-                .unwrap_or_else(|| "?".into());
-            let wchan = std::fs::read_to_string(dir.join("wchan")).unwrap_or_default();
-            *waits.entry(format!("{state}/{wchan}")).or_default() += 1;
+        for (_, comm, state, wchan) in task_states("/proc/self/task") {
+            *waits.entry(format!("{comm} {state}/{wchan}")).or_default() += 1;
         }
-        out.push_str(&format!("\ntest process threads (state/wchan): {waits:?}"));
+        out.push_str(&format!(
+            "\ntest process threads (name state/wchan): {waits:?}"
+        ));
         // The daemon's own record of this worker, asked on a thread so
         // a wedged daemon cannot hang the report.
         let (state, alias) = (self.state.clone(), self.alias.clone());
@@ -3784,12 +3819,20 @@ impl ManagedWorker {
             Ok(Err(e)) => out.push_str(&format!("\ndaemon events unreadable: {e}")),
             Err(_) => out.push_str("\ndaemon did not answer agent_events within 5s"),
         }
-        let log = std::fs::read(&self.provider_log).unwrap_or_default();
-        let tail = &log[log.len().saturating_sub(4096)..];
+        // Only the last 4 KiB: the log of a long run can be large.
+        let (len, tail) = std::fs::File::open(&self.provider_log)
+            .and_then(|mut f| {
+                use std::io::{Read, Seek, SeekFrom};
+                let len = f.metadata()?.len();
+                f.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+                let mut tail = Vec::new();
+                f.take(4096).read_to_end(&mut tail)?;
+                Ok((len, tail))
+            })
+            .unwrap_or_default();
         out.push_str(&format!(
-            "\nprovider stderr ({} bytes, tail):\n{}",
-            log.len(),
-            String::from_utf8_lossy(tail)
+            "\nprovider stderr ({len} bytes, tail):\n{}",
+            String::from_utf8_lossy(&tail)
         ));
         out
     }
