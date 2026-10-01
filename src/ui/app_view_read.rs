@@ -70,12 +70,6 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     }
 }
 
-impl Route<'_> {
-    pub(super) fn is_read(self) -> bool {
-        true
-    }
-}
-
 /// A digest claim is `sha256:<64 lowercase hex>`; anything else is a
 /// schema refusal, never a silent skip.
 fn digest_ok(value: &str) -> bool {

@@ -69,9 +69,9 @@ fn digest_shape(value: &str) -> bool {
 /// The typed, validated scope a request resolves to after the schema
 /// gate. `source`-independent fields are proven first; the per-source
 /// readers then enforce which selectors that source actually admits.
+/// `install`/`view` are consumed at the call site (proven against the
+/// snapshot), so they are not stored here.
 struct ViewRead<'a> {
-    install: &'a str,
-    view: &'a str,
     op: &'a str,
     context: Option<&'a str>,
     record: Option<&'a str>,
@@ -166,8 +166,6 @@ impl Shared {
             return Err(Error::rejected("a list read does not name one record"));
         }
         let read = ViewRead {
-            install,
-            view,
             op,
             context,
             record,
@@ -249,7 +247,6 @@ impl Shared {
             out["digest"] = json!(digest);
             out["view_descriptor_digest"] = json!(descriptor_digest);
             out["view_binding_digest"] = json!(binding_digest);
-            let _ = declared;
             Ok(out)
         })
     }
@@ -570,37 +567,60 @@ fn project_run(run: &Value, vb: &app_binding::ViewBinding) -> Result<Value> {
     if crate::store::app_runs::material_digest(snapshot) != snapshot_digest {
         return Err(Error::rejected("run snapshot integrity digest mismatch"));
     }
-    // `workflow`/`inputs` must be objects where present — the produced
-    // shape requires them for `snapshot.workflow.title` /
-    // `snapshot.inputs.subject` to be meaningful.
-    if let Some(wf) = snapshot.get("workflow") {
-        if !wf.is_object() {
-            return Err(Error::rejected("run snapshot workflow is not an object"));
+    // `workflow`/`inputs`/`context` are optional objects, but when
+    // PRESENT they must be real objects — a wrong-typed value is a
+    // corrupt producer shape, never a silent omission. Nested optional
+    // leaves (`title`,`subject`,`context.id`,`context_id`) are `None`
+    // only when absent-or-null; a present wrong-typed value refuses.
+    let obj_at = |v: &Value, key: &str| -> Result<Option<Map<String, Value>>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(m)) => Ok(Some(m.clone())),
+            Some(_) => Err(Error::rejected(format!(
+                "run snapshot '{key}' is not a produced object"
+            ))),
         }
-    }
-    if let Some(inputs) = snapshot.get("inputs") {
-        if !inputs.is_object() {
-            return Err(Error::rejected("run snapshot inputs is not an object"));
+    };
+    // Optional string at a key: absent/null -> None; present non-string
+    // -> refusal (never a silent-omit of a wrong-typed value).
+    let opt_str = |v: &Value, key: &str| -> Result<Option<Value>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(json!(s))),
+            Some(_) => Err(Error::rejected(format!(
+                "an optional producer leaf '{key}' emitted a non-string value"
+            ))),
         }
-    }
+    };
+    let workflow = obj_at(snapshot, "workflow")?;
+    let inputs = obj_at(snapshot, "inputs")?;
+    let context = obj_at(snapshot, "context")?;
+
     let mut cells: CellMap = BTreeMap::new();
     cells.insert("id", Some(json!(id)));
     cells.insert("state", Some(json!(state)));
     cells.insert("snapshot_digest", Some(json!(snapshot_digest)));
-    // Optional cells: `context_id` is null on a contextless run;
-    // `snapshot.context.id`/`snapshot.inputs.subject` omit when absent.
-    cells.insert("context_id", run["context_id"].as_str().map(|c| json!(c)));
+    cells.insert("context_id", opt_str(run, "context_id")?);
     cells.insert(
         "snapshot.context.id",
-        snapshot["context"]["id"].as_str().map(|c| json!(c)),
+        match &context {
+            Some(c) => opt_str(&Value::Object(c.clone()), "id")?,
+            None => None,
+        },
     );
     cells.insert(
         "snapshot.workflow.title",
-        snapshot["workflow"]["title"].as_str().map(|t| json!(t)),
+        match &workflow {
+            Some(w) => opt_str(&Value::Object(w.clone()), "title")?,
+            None => None,
+        },
     );
     cells.insert(
         "snapshot.inputs.subject",
-        snapshot["inputs"]["subject"].as_str().map(|s| json!(s)),
+        match &inputs {
+            Some(i) => opt_str(&Value::Object(i.clone()), "subject")?,
+            None => None,
+        },
     );
     emit_row(vb, &cells)
 }

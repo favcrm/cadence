@@ -155,12 +155,58 @@ The serialized-size ceiling counts file bytes.
   the descriptor on every read, so a torn or stale pair is never
   served.
 
+## The live read (CAD-867)
+
+`app_view_read` is the operator-only RPC that serves a bound view's
+**live** rows; the HTTP peer
+`GET /api/app-installations/<install>/views/<view>/rows[/<record>]`
+mirrors it under the operator read gate. The caller never names a
+host `source`, query, actor or installation authority — it carries
+the installation, the descriptor `view` id, the read `op`, and the
+three pins it was authorized under. `source` and the allowed `op`
+come from the *installed binding*, never the request.
+
+**Request** — the only admitted fields:
+
+| field | shape | when |
+|---|---|---|
+| `install_id` | identifier | always |
+| `view_id` | descriptor view id | always |
+| `op` | `"list"` \| `"show"` | always |
+| `digest`, `view_descriptor_digest`, `view_binding_digest` | `sha256:<64hex>` | always — must equal the ONE verified snapshot's, else refused |
+| `context_id` | identifier | required by `customers`; optional/live-proved on `caption-runs` |
+| `record_id` | identifier | required on `show`; never on `list` |
+| `query`, `limit` (1..=100), `cursor` | bounded | `customers` `list` only; refused on `show` and on `caption-runs` |
+
+**Response** — a uniform envelope. `rows[]` is an array for **both**
+`list` and `show` (show carries one row); each row is keyed by
+descriptor `field` id. The reply echoes `view_id`, `op` and all three
+pins it was authorized under; the `customers` `list` additionally
+carries `truncated` and `next_cursor`.
+
+**Read span & pins** — `with_runtime_snapshot` holds the PM lock for
+the entire read: the digest triple is compared AND the typed producer
+read runs inside the same callback, so a racing upgrade is ordered
+before or after the whole read — never torn inside it. Rows are
+projected from **typed, closed** producer maps (a `CustomerProfile`
+deserialization for customers; a validated snapshot object whose
+`material_digest` matches for runs), never a generic raw-JSON walk. A
+**corrupt producer row fails the whole read** — a present-but-
+wrong-typed optional field (`subject`, `workflow.title`,
+`context.id`, `context_id`) is a bounded `rejected`, not a silent
+omission; a genuinely absent/nullable optional omits the cell.
+
+**Refusals** — a missing/wrong/stale/dup digest, an unknown or
+unbound `view_id`, an op the binding does not admit, an out-of-bounds
+selector, a corrupt or wrong-scoped row, and any write-shaped or
+unknown field all fail closed: the RPC returns `rejected`; the HTTP
+peer maps schema/binding refusals to `400`, an operator-gate refusal
+to `403`, everything else to `503`.
+
 ## Remaining CAD-867/CAD-811 work (not this increment)
 
-- The live adapter itself: reading `view_binding` off the receipt and
-  routing the shared renderer to the host's `app_record_list`/
-  `app_run_list_filtered` reads. This contract/loader slice prepares
-  that; no live consumer is wired yet.
+- The live renderer/adapter that consumes `rows[]` against the
+  declared view shape.
 - Typed forms and action verbs: `form` views stay disabled previews —
   no executable binding, no submit target.
 - Actor/scope/revision-bound writes and the per-package domain
