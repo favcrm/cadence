@@ -267,6 +267,47 @@ fn owner_generation_drift_revokes_new_work() {
     assert_eq!(events[0].2["reason"], "owner has no live endpoint");
 }
 
+/// CAD-893: revalidation reads owner rows without the slot lock, so an
+/// enrollment minted after the owner snapshot is absent from the rows it
+/// read. That enrollment is not drift: revoking it as "no live endpoint"
+/// made a freshly started master lose its identity mid-call
+/// (`cad323_master_interrupts_only_a_turn_it_dispatched`). Only what the
+/// snapshot named is revalidated; the old enrollment still drifts out.
+#[test]
+fn revalidation_never_revokes_an_enrollment_minted_after_the_snapshot() {
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    let old = enroll(&mut s, "wk", "g1", 200);
+    let snapshot = s.enrollment_snapshot();
+    // Between the snapshot and the revalidation a master enrolls, and the
+    // owner of the first enrollment re-registers under a new generation.
+    let fresh = enroll(&mut s, "master", "m1", 500);
+    let rows: HashMap<String, Option<String>> = snapshot
+        .owners()
+        .into_iter()
+        .map(|o| (o, Some("g2".to_string())))
+        .collect();
+    let events = s.revalidate_snapshot(&snapshot, &rows);
+    let state = |id: &str| {
+        s.enrollments
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap()
+            .auth
+            .clone()
+    };
+    assert_eq!(
+        state(&old),
+        AuthState::Revoked("owner generation changed".into()),
+        "drift in the snapshot still revokes: {events:?}"
+    );
+    assert_eq!(
+        state(&fresh),
+        AuthState::Active,
+        "an enrollment the snapshot never named is not revalidated: {events:?}"
+    );
+}
+
 /// Resume: the same owner generation AND root identity renew the same
 /// enrollment; a changed generation or a recycled root pid mints a new
 /// one and supersedes the old.

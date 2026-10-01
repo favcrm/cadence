@@ -2485,6 +2485,49 @@ fn cad323_master_interrupts_only_a_turn_it_dispatched() {
     f.d.wait_agent("w1", "idle", 10);
 }
 
+/// CAD-893: a master that enrolls while another call is revalidating
+/// the enrollments keeps its identity. Revalidation reads owner rows
+/// after releasing the slot lock; the master's enrollment, minted in that
+/// gap, used to be revoked as "owner has no live endpoint" — and its next
+/// call was refused `master_only` / "no PM"
+/// (`cad323_master_interrupts_only_a_turn_it_dispatched`). The daemon's
+/// pause seam widens the gap; the other enrollments still revalidate.
+#[test]
+fn cad893_master_enrolled_during_a_revalidation_is_not_revoked() {
+    let f = PlanFixture::start_routed();
+    let _mock = f.d.mock_claude("await-interrupt", None);
+    f.d.register_claude("w1", Value::Null);
+    f.d.wait_agent("w1", "idle", 15);
+    f.d.wait_event("w1", "slot_enrolled", 15);
+    test_env().set("CADENCE_TEST_REVALIDATE_PAUSE_MS", "4000");
+    let (mut m, _) = std::thread::scope(|s| {
+        let call = s.spawn(|| f.d.operator_rpc("slot_status", json!({})));
+        let paused = f.d.wait_event("daemon", "revalidate_paused", 20);
+        assert_eq!(paused["payload"]["ms"], 4000, "{paused}");
+        // Enrolls inside the gap: the paused call has already snapshotted.
+        let master = f.start_master();
+        let _ = call.join().unwrap();
+        master
+    });
+    test_env().remove("CADENCE_TEST_REVALIDATE_PAUSE_MS");
+    let revoked: Vec<Value> =
+        f.d.events("master")
+            .into_iter()
+            .filter(|e| e["kind"] == "slot_enrollment_revoked")
+            .collect();
+    assert!(
+        revoked.is_empty(),
+        "the master lost its enrollment: {revoked:?}"
+    );
+    // And the master still acts as the master.
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{out}");
+}
+
 /// Run `interrupt` on `alias` with the daemon's pause seam: the call
 /// reads m1 as the running turn, then waits while `land_next` finishes
 /// m1 and starts m2, and only then reaches the adapter. Answers the
