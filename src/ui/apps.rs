@@ -38,6 +38,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::de::{MapAccess, Visitor};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::Request;
 
@@ -47,6 +49,244 @@ use crate::issue::{app, board, model, plan, Pm};
 
 /// The approve body is `{}` — anything else is refused by shape.
 const BODY_CAP: u64 = 4 * 1024;
+
+/// CAD-996: the upload route's own wire cap — much larger than the
+/// `{source}`-install `BODY_CAP` because the bundle arrives inline as a JSON
+/// file-map. Scoped to `/api/app-installations/upload`; the install route's
+/// 4 KiB cap is unchanged.
+const UPLOAD_WIRE_CAP: u64 = 8 * 1024 * 1024;
+/// Decoded ceiling for the whole bundle (matches `app::MAX_APP_BYTES`).
+const UPLOAD_TOTAL_BYTES: u64 = crate::issue::app::MAX_APP_BYTES;
+/// One file's ceiling (matches `plan::MAX_PLAN_BYTES`).
+const UPLOAD_FILE_BYTES: u64 = crate::issue::plan::MAX_PLAN_BYTES as u64;
+/// At most this many files — the same bound `snapshot` enforces on disk.
+const UPLOAD_MAX_FILES: usize = 128;
+
+/// The upload body: exactly `{"files": {path: utf8}}`. A custom
+/// `Deserialize` is REQUIRED — `serde_json::Value` silently keeps the last
+/// duplicate key, so `{"files":…,"files":…}` would collapse to one map and
+/// defeat the strict-shape gate. This visitor rejects any repeated or unknown
+/// top-level key at parse time.
+#[derive(Debug)]
+struct UploadBody {
+    files: Vec<(String, String)>,
+}
+
+impl<'de> Deserialize<'de> for UploadBody {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UploadVisitor;
+        impl<'de> Visitor<'de> for UploadVisitor {
+            type Value = UploadBody;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object with exactly one `files` map")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<UploadBody, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut files: Option<Vec<(String, String)>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "files" {
+                        return Err(serde::de::Error::unknown_field(&key, &["files"]));
+                    }
+                    if files.is_some() {
+                        return Err(serde::de::Error::duplicate_field("files"));
+                    }
+                    // Deserialize the VALUE as the inner {path: text} map —
+                    // `next_value` consumes only this field's value; a nested
+                    // visitor reads its entries with duplicate-path rejection.
+                    files = Some(map.next_value::<FilesMap>()?.0);
+                }
+                let files = files.ok_or_else(|| serde::de::Error::missing_field("files"))?;
+                if files.is_empty() {
+                    return Err(serde::de::Error::custom("files map is empty"));
+                }
+                Ok(UploadBody { files })
+            }
+        }
+        deserializer.deserialize_map(UploadVisitor)
+    }
+}
+
+/// The inner `{path: text}` map as a value — its own `Deserialize` so the
+/// outer visitor can `next_value::<FilesMap>()`. Duplicate inner path keys are
+/// rejected here (a `Value`/derived map would silently keep the last one and
+/// still stage a bundle), and per-file/count bounds apply during the read.
+struct FilesMap(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for FilesMap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilesVisitor;
+        impl<'de> Visitor<'de> for FilesVisitor {
+            type Value = FilesMap;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of bundle path to UTF-8 text")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<FilesMap, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut files: Vec<(String, String)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!("duplicate path '{key}'")));
+                    }
+                    if value.len() as u64 > UPLOAD_FILE_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "file '{key}' is over the {UPLOAD_FILE_BYTES}-byte per-file cap"
+                        )));
+                    }
+                    files.push((key, value));
+                    if files.len() > UPLOAD_MAX_FILES {
+                        return Err(serde::de::Error::custom(format!(
+                            "bundle exceeds the {UPLOAD_MAX_FILES}-file cap"
+                        )));
+                    }
+                }
+                Ok(FilesMap(files))
+            }
+        }
+        deserializer.deserialize_map(FilesVisitor)
+    }
+}
+
+/// A leaf file name is a visible flat name — non-empty, ASCII, no `.`-lead
+/// (dotfile), no `..`, no embedded `\`/`\0`. `seg` is already a single raw
+/// segment (the caller split on literal `/`). `workflows/` leaves additionally
+/// need a `valid_tag` `.md` stem — the same rule the installer's `snapshot`
+/// enforces, so an upload cannot stage a workflow the validator would reject.
+fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
+    if seg.is_empty()
+        || !seg.is_ascii()
+        || seg.starts_with('.')
+        || seg == ".."
+        || seg.contains('\\')
+        || seg.contains('\0')
+    {
+        return false;
+    }
+    if need_md_tag {
+        seg.ends_with(".md") && crate::issue::model::valid_tag(seg.trim_end_matches(".md"))
+    } else {
+        true
+    }
+}
+
+/// One uploaded path is admitted only by an EXACT lexical grammar — we split
+/// on literal `/` and never normalize. `Path::components` folds `a//b`,
+/// `a/./b` and `a/../b` together, which would let two distinct raw JSON keys
+/// alias the same staged file and defeat duplicate detection; this grammar
+/// refuses them instead. Admitted shapes (the only flat entries the bundle
+/// allows):
+///   `app.md`                          (exactly)
+///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
+///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
+/// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
+/// any other top-level name are refused. `snapshot`/`validate_texts` re-check
+/// daemon-side; this schema refuses bad keys before a single byte is staged.
+fn upload_path_ok(path: &str) -> bool {
+    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    // Any empty segment means a doubled, leading or trailing slash.
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return false;
+    }
+    match segs.as_slice() {
+        ["app.md"] => true,
+        ["workflows", leaf] => leaf_ok(leaf, true),
+        ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
+        _ => false,
+    }
+}
+
+/// Stage the validated file-map to a server-derived temp dir OUTSIDE the PM
+/// tracker (`workspace.rs` refuses a source inside `pm.dir` — the tracker is
+/// never its own source), then hand its absolute path to the unchanged
+/// `app_workspace_install` path-source installer. The temp dir is removed on
+/// every return path; it is provenance (`Source::Path`) only — a one-shot,
+/// not a reusable update URL.
+pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, UPLOAD_WIRE_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: UploadBody = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return err_response(
+                400,
+                &format!("upload body must be {{\"files\":{{path:text}}}} — {e}"),
+            )
+        }
+    };
+    // Validate every path key against the flat allowlist + check the decoded
+    // aggregate before touching the filesystem.
+    let mut total: u64 = 0;
+    for (path, text) in &body.files {
+        if !upload_path_ok(path) {
+            return err_response(
+                400,
+                &format!("bundle path '{path}' is not an allowed flat entry"),
+            );
+        }
+        total += text.len() as u64;
+        if total > UPLOAD_TOTAL_BYTES {
+            return err_response(400, "bundle exceeds its aggregate byte cap");
+        }
+    }
+    // Stage into a server-derived external temp dir. `tempfile::tempdir` is
+    // mode-0700 and under the process temp root — never under `pm.dir`.
+    let staging = match tempfile::tempdir() {
+        Ok(t) => t,
+        Err(e) => return err_response(500, &format!("staging dir failed: {e}")),
+    };
+    for (path, text) in &body.files {
+        let dest = staging.path().join(path);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return err_response(500, &format!("staging mkdir failed: {e}"));
+            }
+        }
+        // Refuse to follow a pre-existing or symlinked staging target: the
+        // strict raw-key grammar already makes every `path` unique, so an
+        // existing `dest` (or a planted link) is a defect/attack, never an
+        // overwrite. `create_new(true)` is O_EXCL and `O_NOFOLLOW` refuses a
+        // symlinked leaf at open — no TOCTOU between check and write.
+        if dest.symlink_metadata().is_ok() {
+            return err_response(400, &format!("staging path '{path}' collides"));
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW);
+        }
+        let wrote = open
+            .open(&dest)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        if let Err(e) = wrote {
+            return err_response(500, &format!("staging write failed: {e}"));
+        }
+    }
+    let source = staging.path().to_string_lossy().to_string();
+    // The daemon re-validates and journals the staged dir as a Source::Path;
+    // `installed_by`/`approved` come from the proven operator connection, never
+    // the body. `staging` (a TempDir) is removed on drop, success or failure.
+    match client::rpc(state, "app_workspace_install", json!({"source": source})) {
+        Ok(value) => json_response(value),
+        Err(error) => home::rpc_err(&error, "app_workspace_install"),
+    }
+}
 
 /// `true` when the approve body is exactly an empty JSON object. An
 /// approve request carries nothing — like the daemon, attribution is

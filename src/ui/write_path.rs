@@ -1130,6 +1130,19 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
+    // CAD-996: operator-only bounded manual bundle upload — a `{files}` map
+    // staged to a server-derived external temp dir (NOT under pm.dir, which
+    // the installer refuses as a source), then installed via the unchanged
+    // source-path installer. OperatorOnly in WRITE_ROUTES.
+    if path == "/api/app-installations/upload" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = apps::workspace_upload(&mut request, state_dir);
+        send(request, response);
+        return;
+    }
     // An app approval (CAD-557) — relayed to the daemon's
     // `app_approve`, operator-only on the board (see `apps`).
     if let Some((key, name)) = apps::approve_route(path) {
