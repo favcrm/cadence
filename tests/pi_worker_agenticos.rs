@@ -169,3 +169,22 @@ fn agenticos_worker_refresh_replaces_a_target_symlink_without_writing_its_refere
     assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), CATALOG);
 }
+
+#[test]
+fn agenticos_worker_refuses_existing_auth_without_deleting_it_or_launching() {
+    let root = tempfile::tempdir().unwrap();
+    operator(root.path(), &serde_json::from_str(CATALOG).unwrap());
+    let config = root.path().join("state/agents/w/pi");
+    std::fs::create_dir_all(&config).unwrap();
+    let auth = config.join("auth.json");
+    let original = b"synthetic-existing-worker-login";
+    std::fs::write(&auth, original).unwrap();
+    let result = open_worker(root.path());
+    if let Ok(ad) = &result {
+        ad.close();
+    }
+    assert!(result.is_err(), "a credential-bearing worker was admitted");
+    assert_eq!(std::fs::read(&auth).unwrap(), original);
+    assert!(!config.join("models.json").exists());
+    assert!(!root.path().join("state/agents/pi-record-w.json").exists());
+}
