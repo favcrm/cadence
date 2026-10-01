@@ -969,6 +969,23 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
     Ok(answer)
 }
 
+/// CAD-918: the daemon's `gh`, resolved to an absolute path once at
+/// boot, so a directory later put early on PATH cannot shadow it. With
+/// no executable `gh` on PATH, a path that cannot exist: every call
+/// fails closed.
+pub fn resolve_gh(path: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    path.iter()
+        .flat_map(std::env::split_paths)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(GH))
+        .find(|f| {
+            f.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent/gh-not-on-path-at-boot"))
+}
+
 pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
     let out = crate::proc::run_bounded(Command::new(gh_bin).args(args), GH_TIMEOUT)
         .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?;
@@ -985,6 +1002,19 @@ pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_gh_is_absolute_or_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(["relative", dir.path().to_str().unwrap()]).unwrap();
+        assert_eq!(resolve_gh(Some(path)), gh);
+        let none = resolve_gh(Some("relative".into()));
+        assert!(none.is_absolute() && !none.exists());
+    }
 
     #[test]
     fn legacy_pending_done_write_retains_its_failed_attempt() {

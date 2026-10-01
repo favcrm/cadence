@@ -245,6 +245,9 @@ All commands (one line per path):
     audit approve
     audit approval
     audit verdicts
+    audit designate
+    audit designations
+    audit digest
     audit revoke
   review         Review a PR end-to-end: detached checkout under `.cadence/wt/review-<pr>` (the merge...
     review flakes

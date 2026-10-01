@@ -68,7 +68,11 @@ pub struct NewDelegated<'a> {
     pub approval: NewApproval<'a>,
     /// `delegated:<alias>`, from the connection.
     pub approver: &'a str,
+    /// The two verdict notes: paths, their sha256 at approval time, and
+    /// the reviewer aliases they name.
     pub verdicts: &'a [String],
+    pub verdict_sha256: &'a [String],
+    pub reviewers: &'a [String],
     pub scope_approval: Option<&'a str>,
 }
 
@@ -725,9 +729,39 @@ impl Store {
         if let Some(id) = standing {
             return Ok((false, id));
         }
+        // A revoke sticks: once a delegated approval of this head was
+        // withdrawn, only the operator approves it.
+        let revoked = Self::revoked_ids(&stream);
+        let mine =
+            |p: &Value| p["action"] == a.action && p["scope"] == scope && p["head_sha"] == head;
+        let recorded = |(k, _, _): &&(String, Value, f64)| k == APPROVAL_RECORDED_EVENT;
+        if stream.iter().filter(recorded).any(|(_, p, _)| {
+            mine(p)
+                && p["approval_id"]
+                    .as_str()
+                    .is_some_and(|id| revoked.contains(id))
+        }) {
+            return Err(Error::rejected(
+                "a delegated approval of this head was revoked — only the operator can \
+                 approve it now",
+            ));
+        }
+        // A scope pre-approval is single-use.
+        if let Some(scope_id) = d.scope_approval {
+            if stream
+                .iter()
+                .filter(recorded)
+                .any(|(_, p, _)| p["action"] == a.action && p["scope_approval"] == scope_id)
+            {
+                return Err(Error::rejected(format!(
+                    "scope pre-approval '{scope_id}' was already consumed by a delegated approval"
+                )));
+            }
+        }
         let payload = json!({
             "source": a.source, "action": a.action, "head_sha": a.head_sha,
             "scope": scope, "approver": d.approver, "verdicts": d.verdicts,
+            "verdict_sha256": d.verdict_sha256, "reviewers": d.reviewers,
             "scope_approval": d.scope_approval, "recorded_via": d.approver,
         });
         let base = default_approval_id(a.action, a.pr, a.head_sha);
@@ -794,14 +828,21 @@ impl Store {
         active: bool,
         source: &str,
         recorded_via: &str,
+        registered: Option<f64>,
     ) -> Result<bool> {
         identifier(alias, "Designated alias")?;
         approval_source(source)?;
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let now_active = Self::designations_in(&tx)?
-            .iter()
-            .any(|d| d["alias"] == alias && d["project"] == project && d["active"] == true);
+        // An active designation that predates the agent's current
+        // registration counts for nothing, so designating again writes.
+        let in_force = Self::designations_in(&tx)?
+            .into_iter()
+            .find(|d| d["alias"] == alias && d["project"] == project);
+        let now_active = in_force.is_some_and(|d| {
+            d["active"] == true
+                && registered.is_none_or(|c| d["at"].as_f64().is_some_and(|at| c <= at))
+        });
         if now_active == active {
             return Ok(false);
         }

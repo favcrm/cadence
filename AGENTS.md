@@ -91,7 +91,8 @@ PR needs each of the following as a PASS on the exact head you enqueue:
   the project runs, from its own pane,
   `cadence audit approve --pr <n> --head <full-sha> --delegated --source "<notes>"`.
   The daemon records it as `delegated:<alias>` only when every safeguard
-  holds. Triggers 4 and 7 are never delegated. Until the running daemon
+  holds, including an allowlist of the paths a PR may touch
+  (`docs/roles/risk-paths.toml`). Triggers 1, 4 and 7 are never delegated. Until the running daemon
   is built with CAD-918, delegated-class PRs still need the operator.
 
 Record the evidence so that every merge can be audited:

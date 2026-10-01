@@ -270,14 +270,23 @@ designated agent records `cadence audit approve --delegated` from its own
 pane: the approver is `delegated:<alias>` from `connection_caller`, never
 a flag or field, so the operator, a detached child (`setsid -f`, with or
 without `CADENCE_ALIAS`) and unproven callers are refused. The daemon
-reads every fact itself — the designation (only for an agent row
-registered no later than it), the PR through its boot-fixed `gh`, the
-ticket, and the verdict notes through `parse_note` — and records
-`action: delegated-merge`, `recorded_via: delegated:<alias>` exactly once
-per `(repo, PR, head)`. That action is not `merge`, so no reader counts it
-as an operator approval. Residuals: verdict notes are files the agents'
-uid can write (daemon-attested receipts are CAD-814 slice 2), and the
-residual above carries over to `designate`.
+checks the repo against the designated project first, then reads every
+fact through its own `gh` (an absolute path fixed at boot): the PR, its
+diff (an allowlist covers every path, both sides of a rename), and the
+base branch's required check runs. It records `action: delegated-merge`,
+`recorded_via: delegated:<alias>`, the two notes' sha256 and reviewer
+aliases, exactly once per `(repo, PR, head)`; after a revoke, that head
+is the operator's alone. No reader counts it as an operator approval.
+
+Residual, stated plainly: the verdict notes are files the agents' uid
+can write. The author or the approver can write both notes, under any
+reviewer names, and the daemon cannot tell. The two-reviewer check
+catches honest mistakes; it is not a security boundary. So delegated
+approvals are evidence only: nothing may drive runtime enforcement
+(CAD-814) from them until daemon-attested receipts (CAD-814 slice 2)
+land. `cadence audit digest` shows both reviewers and whether each note
+still hashes to what was recorded. The operator-proof residual above
+carries over to `designate`.
 
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:

@@ -1314,9 +1314,12 @@ struct ApprovalRec {
     repo: String,
     pr: u64,
     recorded_via: Option<String>,
-    /// CAD-918: `delegated:<alias>` and its two verdict notes.
+    /// CAD-918: `delegated:<alias>`, its two verdict notes, their
+    /// sha256 at approval time, and the reviewer aliases they name.
     approver: Option<String>,
     verdicts: Vec<String>,
+    verdict_sha256: Vec<String>,
+    reviewers: Vec<String>,
     at: f64,
 }
 
@@ -1449,6 +1452,9 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
                 recorded_via: text("recorded_via"),
                 approver: text("approver"),
                 verdicts: serde_json::from_value(p["verdicts"].clone()).unwrap_or_default(),
+                verdict_sha256: serde_json::from_value(p["verdict_sha256"].clone())
+                    .unwrap_or_default(),
+                reviewers: serde_json::from_value(p["reviewers"].clone()).unwrap_or_default(),
                 at,
             });
         } else if kind == APPROVAL_REVOKED_EVENT {
@@ -1514,10 +1520,39 @@ pub fn digest(state_dir: &Path, since: Option<&str>) -> Result<Value> {
                 "cadence audit revoke {} --source \"<who, where>\" --reason \"<why>\"",
                 a.id
             ));
-            j["revert"] = json!(format!(
-                "git revert $(gh pr view {} -R {} --json mergeCommit -q .mergeCommit.oid)",
-                a.pr, a.repo
-            ));
+            // Each note must still hash to what the approval recorded.
+            let now: Vec<Option<String>> = a
+                .verdicts
+                .iter()
+                .map(|p| {
+                    std::fs::read(p)
+                        .ok()
+                        .map(|b| crate::delegation::sha256_hex(&b))
+                })
+                .collect();
+            let intact = now.len() == a.verdict_sha256.len()
+                && now
+                    .iter()
+                    .zip(&a.verdict_sha256)
+                    .all(|(n, r)| n.as_ref() == Some(r));
+            j["verdicts_intact"] = json!(intact);
+            // A revert only for a PR that merged, from its merge commit.
+            let args = [
+                "pr",
+                "view",
+                &a.pr.to_string(),
+                "-R",
+                &a.repo,
+                "--json",
+                "state,mergeCommit",
+            ]
+            .map(String::from);
+            let merged = gh_text(&args)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .filter(|v| v["state"] == "MERGED")
+                .and_then(|v| v["mergeCommit"]["oid"].as_str().map(str::to_string));
+            j["revert"] = json!(merged.map(|oid| format!("git revert {oid}")));
             j
         })
         .collect();
@@ -2217,6 +2252,7 @@ fn approval_rec_json(a: &ApprovalRec) -> Value {
         "scope": {"repo": a.repo, "pr": a.pr},
         "recorded_via": a.recorded_via, "recorded_at": a.at,
         "approver": a.approver, "verdicts": a.verdicts,
+        "verdict_sha256": a.verdict_sha256, "reviewers": a.reviewers,
     })
 }
 
@@ -2542,9 +2578,9 @@ fn render_text(
             let rec = v.record.as_ref().map_or(String::new(), |a| {
                 let by = a.approver.as_deref().unwrap_or("?");
                 format!(
-                    " · id {} · by {by} · verdicts {}",
+                    " · id {} · by {by} · reviewers {}",
                     a.id,
-                    a.verdicts.join(", ")
+                    a.reviewers.join(", ")
                 )
             });
             let why = v
@@ -2994,6 +3030,8 @@ mod tests {
             recorded_via: Some("operator-connection".into()),
             approver: None,
             verdicts: vec![],
+            verdict_sha256: vec![],
+            reviewers: vec![],
             at,
         }
     }

@@ -645,7 +645,7 @@ impl Shared {
             delivery_gh: opts
                 .delivery_gh
                 .clone()
-                .unwrap_or_else(|| PathBuf::from(crate::delivery::GH)),
+                .unwrap_or_else(|| crate::delivery::resolve_gh(std::env::var_os("PATH"))),
             idea_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
             continuity_due: Mutex::new(HashMap::new()),

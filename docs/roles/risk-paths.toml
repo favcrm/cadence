@@ -1,36 +1,51 @@
-# The mechanical path lists of docs/roles/risk-classes.md (CAD-918) —
-# the single source. `cadence audit approve --delegated` compiles it in
-# (src/delegation.rs), so the daemon applies the lists of the build it
-# runs, never the PR's own. Editing it is trigger 7. `paths` are globs
-# (`*` within a component, `**` across directories); `symbols` match a
-# diff line that changes, or a hunk that sits inside, code naming them.
+# The mechanical path lists of docs/roles/risk-classes.md (CAD-918), the
+# single source; a test pins them to the doc both ways. The binary
+# compiles this file in, so the daemon applies its own build's lists,
+# never the PR's. Editing it is trigger 7. Globs: `*` stays within one
+# path component, `**` crosses directories.
+#
+# A delegated approval needs EVERY changed path (both sides of a rename)
+# to match `delegable` and no trigger list. A schema path passes only
+# under a live scope pre-approval. Anything else needs the operator.
 
-# Trigger 1: trust boundary and identity. Pre-approvable at ticket time.
+[delegable]
+paths = ["src/issue/board.rs", "src/issue/blocked.rs", "src/issue/claim.rs",
+  "src/issue/cli.rs", "src/issue/cli/**", "src/issue/context.rs", "src/issue/groom.rs",
+  "src/issue/history.rs", "src/issue/line_times.rs", "src/issue/lint.rs",
+  "src/issue/model.rs", "src/issue/notes.rs", "src/issue/parse.rs", "src/issue/plan.rs",
+  "src/issue/report.rs", "src/issue/retro.rs", "src/issue/sprint.rs",
+  "src/issue/summary.rs", "src/issue/sync.rs", "src/issue/time.rs", "src/issue/write.rs",
+  "src/cli/**", "tests/**", "docs/**", "ui/**"]
+
+# Trigger 1: trust boundary and identity. Never delegable.
 [trigger1]
-paths = ["src/peer.rs", "src/daemon/identity.rs", "src/daemon/caller_rule.rs",
-  "src/ui/operator.rs", "src/operator_auth.rs", "src/tailnet_proof.rs",
+paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
+  "src/daemon/caller_rule.rs", "src/daemon/slots_rpc.rs", "src/adapter/pty/**",
+  "src/ui.rs", "src/ui/operator.rs", "src/operator_auth.rs", "src/tailnet_proof.rs",
   "src/test_seam.rs", "src/master_perm.rs"]
-symbols = ["request_identity", "write_caller", "tailnet_proof", "operator_proof",
-  "operator_connection", "connection_caller", "slot_identity", "verify_ownership",
-  "resolve_session", "open_adopted"]
 
 # Trigger 2, schema and store version. Pre-approvable at ticket time.
 [schema]
-paths = ["src/store/schema.rs", "src/rollout.rs"]
+paths = ["src/store/schema.rs", "src/rollout.rs", "src/remote_result_outbox.rs"]
 
-# Trigger 4: supply chain and CI. Never delegable, never pre-approvable.
+# Trigger 4: supply chain and CI. Never delegable.
 [trigger4]
-paths = ["Cargo.toml", "Cargo.lock", "ui/package.json", "ui/pnpm-lock.yaml",
-  ".github/**", "scripts/**"]
+paths = ["Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", ".cargo/**",
+  ".config/**", "**/package.json", "**/pnpm-lock.yaml", ".github/**", "scripts/**"]
 
-# Trigger 7: the rules and the gates. Never delegable, never pre-approvable.
+# Trigger 7: the rules and the gates. Never delegable.
 [trigger7]
 paths = ["docs/roles/**", "docs/TEAM.md", "docs/CHARTER.md", "docs/AUDIT.md",
-  "AGENTS.md", "cadence-review.toml", "src/review.rs", "src/audit.rs",
-  "src/delegation.rs", "src/daemon/approvals_rpc.rs", "scripts/**"]
+  "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
+  "src/audit.rs", "src/audit/**", "src/delegation.rs", "src/delegation/**",
+  "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
+  "src/delivery.rs", "src/issue/delivery_policy.rs", "src/cli/audit.rs", "src/cli/mod.rs",
+  "scripts/**", "tests/scripts/**", "tests/common/**", "tests/split-map*.toml",
+  "tests/split_map_inventory.rs", "tests/ci_test_plan.rs", "tests/test_seam.rs",
+  "tests/audit_review.rs", "tests/delegated_approval.rs", "tests/fixtures/delegated-gh.py"]
 
 # Exactly the "Script allowlist (auto-eligible)" of risk-classes.md:
-# exempt from the `scripts/**` globs above.
+# auto-eligible, never delegable.
 [scripts_allowlist]
 paths = ["scripts/measurements/README.md", "scripts/measurements/board-live.mjs",
   "scripts/test-dup-report", "scripts/test-dup-report.txt", "scripts/auto-stage.py"]
