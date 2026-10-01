@@ -1563,6 +1563,49 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
     }
 }
 
+/// CAD-959: is an operator approval in force for `head` of PR `pr` right
+/// now? The pre-merge read `scripts/enqueue-reviewed` needs: unlike an
+/// audit row there is no merge time, so "in force" means a `merge`
+/// record naming exactly this repo, PR and full head that no revocation
+/// has withdrawn. An approval for another head never counts. States:
+/// `in-force` (a claim, like every approval until CAD-280), `revoked`,
+/// `missing`, `unknown` (the store could not answer).
+fn approval_in_force(ev: &StoreEvidence, repo: &str, pr: u64, head: &str) -> Value {
+    if let Some(gap) = &ev.approvals_gap {
+        return json!({"state": "unknown", "reason": gap});
+    }
+    let bound: Vec<&ApprovalRec> = ev
+        .approvals
+        .iter()
+        .filter(|a| {
+            a.action == "merge"
+                && a.pr == pr
+                && a.repo.eq_ignore_ascii_case(repo)
+                && a.head_sha.eq_ignore_ascii_case(head)
+        })
+        .collect();
+    if let Some(a) = bound.iter().find(|a| !ev.revocations.contains_key(&a.id)) {
+        return json!({"state": "in-force", "approval_id": a.id, "source": a.source,
+                      "recorded_via": a.recorded_via, "verified": false,
+                      "note": APPROVAL_UNVERIFIED});
+    }
+    if let Some(a) = bound.first() {
+        return json!({"state": "revoked", "approval_id": a.id,
+                      "reason": format!("approval {} was revoked", a.id)});
+    }
+    json!({"state": "missing",
+           "reason": format!("no merge approval names head {} of {repo}#{pr}", short(head))})
+}
+
+/// `cadence audit approval`: read-only, no daemon. Exit 0 only when an
+/// approval is in force for exactly this head.
+pub fn approval_check(state_dir: &Path, repo: &str, pr: u64, head: &str) -> (Value, i32) {
+    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let v = approval_in_force(&ev, repo, pr, head);
+    let code = i32::from(v["state"] != "in-force");
+    (v, code)
+}
+
 fn short(sha: &str) -> &str {
     &sha[..9.min(sha.len())]
 }
@@ -2758,6 +2801,38 @@ mod tests {
         assert_eq!(human(&e, Some("other/repo")).approval.state, "missing");
         // The fixture/no-slug path still binds on head + PR.
         assert_eq!(human(&e, None).approval.state, "operator-claimed");
+    }
+
+    #[test]
+    fn pre_merge_approval_binds_only_the_exact_head_and_scope() {
+        let in_force = |e: &StoreEvidence, repo: &str, pr: u64, head: &str| {
+            approval_in_force(e, repo, pr, head)["state"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let e = ev(vec![rec("a", HEAD, 1.0)], &[]);
+        let slug = e.approvals[0].repo.clone();
+        assert_eq!(in_force(&e, &slug, 1, HEAD), "in-force");
+        // An approval for an older head never covers a newer one.
+        assert_eq!(in_force(&e, &slug, 1, OLD_HEAD), "missing");
+        // Another PR or repo is out of scope.
+        assert_eq!(in_force(&e, &slug, 2, HEAD), "missing");
+        assert_eq!(in_force(&e, "other/repo", 1, HEAD), "missing");
+        // A revoked approval is not in force, unless another one is.
+        let revoked = ev(vec![rec("a", HEAD, 1.0)], &[("a", revoke(2.0))]);
+        assert_eq!(in_force(&revoked, &slug, 1, HEAD), "revoked");
+        let both = ev(
+            vec![rec("a", HEAD, 1.0), rec("b", HEAD, 3.0)],
+            &[("a", revoke(2.0))],
+        );
+        assert_eq!(in_force(&both, &slug, 1, HEAD), "in-force");
+        // A store that cannot answer is unknown, never in force.
+        let gap = StoreEvidence {
+            approvals_gap: Some("no store".into()),
+            ..Default::default()
+        };
+        assert_eq!(in_force(&gap, &slug, 1, HEAD), "unknown");
     }
 
     #[test]

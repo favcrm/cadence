@@ -2572,6 +2572,12 @@ pub(crate) fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Resul
             }
             client::rpc(state_dir, "approval_record", params)?
         }
+        // Handled in `cli::audit::run`: a read, not an RPC.
+        AuditAction::Approval { .. } => {
+            return Err(Error::rejected(
+                "audit approval is read-only; it records nothing",
+            ))
+        }
         AuditAction::Revoke { id, source, reason } => client::rpc(
             state_dir,
             "approval_revoke",

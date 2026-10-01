@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""CAD-959: enqueue a PR only when the AGENTS.md review and merge rules hold.
+
+    scripts/enqueue-reviewed <pr> --head <full-40-hex-sha> [--repo owner/name]
+                             [--notes-dir DIR] [--author ALIAS ...]
+                             [--dry-run] [--poll-secs N] [--poll-interval N]
+
+Refuses (exit 1, one reason per line on stderr, every failing rule listed)
+unless ALL of these hold for the pinned head:
+
+  * the PR is OPEN, its head equals --head, mergeStateStatus is not DIRTY and
+    auto-merge is off;
+  * every required status check of the base branch (branch protection AND
+    rulesets) is PRESENT and SUCCESS at that head. Missing or pending fails,
+    and so does a base branch for which no required check can be read: an
+    invalid workflow yields zero checks, and "nothing failed" is not a pass;
+  * the verdict notes in the notes dir give the required count of PASS
+    verdicts pinned to this exact head from distinct reviewers, none of them
+    the PR author: two (Standards plus Spec/security), or one when every
+    changed path is on the one-review list (docs/roles/one-review-paths.toml,
+    CAD-957, read from the base branch so a PR cannot widen its own list);
+  * a ticket comment for this head lists those verdict notes;
+  * for a human-class diff, `cadence audit approval` reports an approval in
+    force for exactly this head. This script never records an approval.
+
+Then it runs `gh pr merge --auto --squash --match-head-commit <sha>`, polls
+isInMergeQueue for up to --poll-secs (default 30), and when the PR is not
+queued runs --disable-auto and exits 1. --dry-run runs every check and
+enqueues nothing. Exit: 0 enqueued (or dry-run clean) / 1 refused / 2 usage.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import tomllib
+
+ME = "enqueue-reviewed"
+DEFAULT_NOTES_DIR = "/var/www/agent-notes"
+ONE_REVIEW_FILE = "docs/roles/one-review-paths.toml"  # CAD-957
+
+# Human-class path triggers: docs/roles/risk-classes.md (4, 7) and the
+# AGENTS.md list. A verdict note's `Risk: human` also makes a diff human.
+HUMAN_PREFIXES = (".github/", "scripts/", "docs/roles/")
+HUMAN_EXACT = {
+    "Cargo.toml", "Cargo.lock", "ui/package.json", "cadence-review.toml",
+    "src/review.rs", "docs/TEAM.md", "docs/CHARTER.md", "AGENTS.md",
+}
+
+REGULAR_MODES = ("100644", "100755")
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def run(argv):
+    """(returncode, stdout, stderr); a missing binary is rc 127."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+def gh_json(argv):
+    rc, out, err = run(["gh", *argv])
+    if rc != 0:
+        raise RuntimeError(f"gh {' '.join(argv[:2])} failed: {err.strip() or out.strip()}")
+    try:
+        return json.loads(out)
+    except ValueError as e:
+        raise RuntimeError(f"gh {' '.join(argv[:2])} returned bad JSON: {e}")
+
+
+# ---- one-review path list (CAD-957) ----------------------------------------
+
+def glob_re(glob):
+    """Repo-root relative glob: `*` within a segment, `**` across segments."""
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif glob.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif glob[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif glob[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(glob[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def one_review_qualifies(changes, toml_text):
+    """CAD-957: one review only when EVERY change is a plain add or modify of a
+    regular file whose path matches an include glob and no exclude glob
+    (exclude wins). `changes` is [(status, old_mode, new_mode, path)] from
+    `git diff --raw --no-renames`. A delete, rename, type change, mode change,
+    symlink (120000), submodule (160000), odd path, empty diff, or a missing or
+    unreadable list means two reviews."""
+    if not changes or toml_text is None:
+        return False
+    try:
+        doc = tomllib.loads(toml_text)
+        inc = doc.get("one_review_include", [])
+        exc = doc.get("one_review_exclude", [])
+        if not (isinstance(inc, list) and isinstance(exc, list)
+                and all(isinstance(g, str) for g in inc + exc)):
+            return False
+        inc = [glob_re(g) for g in inc]
+        exc = [glob_re(g) for g in exc]
+    except (tomllib.TOMLDecodeError, re.error):
+        return False
+    for status, old_mode, new_mode, path in changes:
+        if status not in ("A", "M") or new_mode not in REGULAR_MODES:
+            return False
+        if status == "M" and old_mode != new_mode:
+            return False
+        if status == "A" and old_mode != "000000":
+            return False
+        if (not path or path.startswith(("./", "/")) or "\\" in path
+                or any(seg in ("", ".", "..") for seg in path.split("/"))):
+            return False
+        if not any(g.match(path) for g in inc) or any(g.match(path) for g in exc):
+            return False
+    return True
+
+
+def parse_raw_diff(raw):
+    """[(status, old_mode, new_mode, path)] from `git diff --raw -z`."""
+    toks = raw.split("\0")
+    out = []
+    i = 0
+    while i + 1 < len(toks):
+        meta = toks[i]
+        if not meta.startswith(":"):
+            break
+        f = meta[1:].split()
+        out.append((f[4][:1], f[0], f[1], toks[i + 1]))
+        i += 2
+    return out
+
+
+def pr_changes(pr, head, base, base_oid):
+    """Changed files of the PR, from git in the current checkout: fetch the
+    base branch and the PR head when either commit is absent, then diff the
+    merge base to the pinned head with no rename detection (a rename is a
+    delete plus an add, so both ends are seen). Raises on any failure."""
+    def have(sha):
+        return run(["git", "cat-file", "-e", f"{sha}^{{commit}}"])[0] == 0
+    if not (have(head) and have(base_oid)):
+        rc, _, err = run(["git", "fetch", "--quiet", "--no-tags", "origin", base, f"refs/pull/{pr}/head"])
+        if rc != 0:
+            raise RuntimeError(f"git fetch of {base} and refs/pull/{pr}/head failed: {err.strip()}")
+    for sha in (head, base_oid):
+        if not have(sha):
+            raise RuntimeError(f"commit {sha} is not in this checkout (run from a checkout of the repo)")
+    rc, mb, err = run(["git", "merge-base", base_oid, head])
+    if rc != 0 or not FULL_SHA.match(mb.strip()):
+        raise RuntimeError(f"no merge base of {base_oid} and {head}: {err.strip()}")
+    rc, out, err = run(["git", "diff", "--raw", "-z", "--no-renames", "--no-abbrev",
+                        mb.strip(), head])
+    if rc != 0:
+        raise RuntimeError(f"git diff failed: {err.strip()}")
+    return parse_raw_diff(out)
+
+
+def is_human_path(path):
+    return (path in HUMAN_EXACT or path.startswith(HUMAN_PREFIXES)
+            or path.endswith("/Cargo.toml"))
+
+
+# ---- verdict notes ---------------------------------------------------------
+
+def parse_note(path):
+    """Fields of a verdict note, or None when it is not one."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        mtime = os.path.getmtime(path)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not lines or not lines[0].startswith("# Verdict"):
+        return None
+    title = lines[0]
+    hdr = {}
+    for line in lines[1:]:
+        m = re.match(r">\s*([A-Za-z-]+):\s*(.*)$", line)
+        if not m:
+            break
+        hdr[m.group(1).lower()] = m.group(2).strip()
+    verdict = ""
+    for i, line in enumerate(lines):
+        if line.strip() == "## Verdict":
+            rest = [l for l in lines[i + 1:] if l.strip()]
+            verdict = rest[0].strip() if rest else ""
+            break
+    risk = next((m.group(1).lower() for l in lines
+                 if (m := re.match(r"Risk:\s*(\S+)", l))), "")
+    tl = title.lower()
+    return {
+        "path": path, "name": os.path.basename(path), "mtime": mtime,
+        "issue": hdr.get("issue", ""), "from": hdr.get("from", ""),
+        "title_result": re.split(r"\s[—-]\s", title)[-1].strip().lower()
+        if re.search(r"\s[—-]\s", title) else "",
+        "section_result": (verdict.split() or [""])[0].lower(),
+        "head": (m.group(1).lower() if (m := re.search(r"head\s+([0-9a-fA-F]{40})\b", verdict)) else ""),
+        "pr": (int(m.group(1)) if (m := re.search(r"PR\s*#(\d+)", verdict)) else None),
+        "standards": "standards" in tl and "spec" not in tl and "security" not in tl,
+        "spec": ("spec" in tl or "security" in tl) and "standards" not in tl,
+        "risk": risk,
+    }
+
+
+def head_notes(notes_dir, issue, pr, head):
+    """Latest verdict note per reviewer that names this issue, PR and head."""
+    try:
+        names = sorted(n for n in os.listdir(notes_dir) if n.endswith("-verdict.md"))
+    except OSError as e:
+        raise RuntimeError(f"cannot read the notes dir {notes_dir}: {e}")
+    latest = {}
+    for n in names:
+        note = parse_note(os.path.join(notes_dir, n))
+        if (not note or note["issue"] != issue or note["head"] != head
+                or note["pr"] != pr):
+            continue
+        key = note["from"].lower()
+        if key not in latest or note["mtime"] >= latest[key]["mtime"]:
+            latest[key] = note
+    return list(latest.values())
+
+
+# ---- the rules -------------------------------------------------------------
+
+def required_contexts(repo, base):
+    """(set of required check names, [reasons]). Fail closed."""
+    names, reasons = set(), []
+    rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{base}"])
+    if rc != 0:
+        reasons.append(f"cannot read the rulesets of {base}: {err.strip() or out.strip()}")
+    else:
+        try:
+            for rule in json.loads(out):
+                if rule.get("type") == "required_status_checks":
+                    for c in rule.get("parameters", {}).get("required_status_checks", []):
+                        names.add(c["context"])
+        except (ValueError, TypeError, KeyError) as e:
+            reasons.append(f"cannot parse the rulesets of {base}: {e}")
+    rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{base}/protection"])
+    if rc != 0:
+        if "not protected" not in (out + err).lower():
+            reasons.append(f"cannot read branch protection of {base}: {err.strip() or out.strip()}")
+    else:
+        try:
+            rsc = json.loads(out).get("required_status_checks") or {}
+            names.update(rsc.get("contexts", []))
+            names.update(c["context"] for c in rsc.get("checks", []))
+        except (ValueError, TypeError, KeyError) as e:
+            reasons.append(f"cannot parse branch protection of {base}: {e}")
+    if not reasons and not names:
+        reasons.append(f"no required checks found for {base}; refusing to read an empty list as 'nothing required'")
+    return names, reasons
+
+
+def check_states(rollup):
+    """{check name: [state, ...]} from statusCheckRollup, state upper-case."""
+    states = {}
+    for e in rollup or []:
+        if "context" in e:  # StatusContext
+            name, state = e["context"], (e.get("state") or "").upper()
+        else:  # CheckRun
+            name = e.get("name")
+            status = (e.get("status") or "").upper()
+            state = (e.get("conclusion") or "").upper() if status == "COMPLETED" else (status or "PENDING")
+        if name:
+            states.setdefault(name, []).append(state or "PENDING")
+    return states
+
+
+def check_required(names, rollup, head):
+    reasons = []
+    states = check_states(rollup)
+    for name in sorted(names):
+        got = states.get(name)
+        if not got:
+            reasons.append(f"required check '{name}' is missing at head {head[:12]}")
+        elif any(s != "SUCCESS" for s in got):
+            bad = sorted({s for s in got if s != "SUCCESS"})
+            kind = "pending" if all(s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "EXPECTED", "REQUESTED") for s in bad) else "not successful"
+            reasons.append(f"required check '{name}' is {kind} ({', '.join(bad)}) at head {head[:12]}")
+    return reasons
+
+
+def check_reviews(notes, need_two, authors, issue):
+    """(reasons, counted notes)."""
+    reasons, counted = [], []
+    for n in notes:
+        who = n["from"]
+        if n["title_result"] != "pass" or n["section_result"] != "pass":
+            reasons.append(
+                f"verdict by {who} on this head is not a pass "
+                f"(title '{n['title_result']}', section '{n['section_result']}'): {n['name']}")
+        elif who.lower() in authors:
+            reasons.append(f"verdict by {who} is not independent: they are the PR author ({n['name']})")
+        elif not who:
+            reasons.append(f"verdict note has no 'From:' reviewer: {n['name']}")
+        else:
+            counted.append(n)
+    if need_two:
+        if not any(n["standards"] for n in counted):
+            reasons.append(f"no pass Standards verdict for {issue} pinned to this head")
+        if not any(n["spec"] for n in counted):
+            reasons.append(f"no pass Spec/security verdict for {issue} pinned to this head")
+        if len({n["from"].lower() for n in counted}) < 2:
+            reasons.append("two distinct reviewers are required; fewer than two passed on this head")
+    elif not counted:
+        reasons.append(f"no pass verdict for {issue} pinned to this head (one review is required)")
+    return reasons, counted
+
+
+def check_comment(comments, head, counted):
+    names = sorted({n["name"] for n in counted})
+    for c in comments or []:
+        body = c.get("body") or ""
+        if head in body and all(n in body for n in names):
+            return []
+    return [f"no ticket comment names head {head} and lists the verdict notes"
+            + (f" ({', '.join(names)})" if names else "")]
+
+
+def check_approval(repo, pr, head):
+    rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
+    try:
+        state = json.loads(out)
+    except ValueError:
+        return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
+    if rc == 0 and state.get("state") == "in-force":
+        return []
+    why = state.get("reason") or state.get("state") or "unknown"
+    return [f"human-class diff has no operator approval recorded for exactly head {head} ({why}); the operator records it with `cadence audit approve`"]
+
+
+def evaluate(args, repo):
+    """(reasons, report lines). Collects every failing rule."""
+    reasons, report = [], []
+    pr, head = args.pr, args.head
+    fields = "number,state,title,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
+    view = gh_json(["pr", "view", str(pr), "-R", repo, "--json", fields])
+
+    if view.get("state") != "OPEN":
+        reasons.append(f"PR #{pr} is {view.get('state')}, not OPEN")
+    if (view.get("headRefOid") or "").lower() != head:
+        reasons.append(f"PR #{pr} head is {view.get('headRefOid')}, not the pinned {head}")
+    if view.get("mergeStateStatus") == "DIRTY":
+        reasons.append(f"PR #{pr} has merge conflicts (mergeStateStatus DIRTY)")
+    if view.get("autoMergeRequest"):
+        reasons.append(f"auto-merge is already enabled on PR #{pr}; disable it, then review the exact head")
+    base = view.get("baseRefName") or "main"
+
+    # Required checks.
+    names, rs = required_contexts(repo, base)
+    reasons += rs
+    if names:
+        reasons += check_required(names, view.get("statusCheckRollup"), head)
+        report.append(f"required checks: {', '.join(sorted(names))}")
+
+    # Changed paths (modes included), straight from git.
+    try:
+        changes = pr_changes(pr, head, base, view.get("baseRefOid") or "")
+    except RuntimeError as e:
+        reasons.append(f"cannot list the changed files of PR #{pr}: {e}")
+        changes = []
+    paths = sorted({c[3] for c in changes})
+    if not changes and not any("cannot list the changed files" in r for r in reasons):
+        reasons.append(f"PR #{pr} has an empty diff against {base}")
+
+    # Ticket and verdicts.
+    m = re.match(r"\s*([A-Z][A-Z0-9]*-\d+)\b", view.get("title") or "")
+    if not m:
+        reasons.append(f"PR title carries no issue id (want 'CAD-123: ...'): {view.get('title')!r}")
+        return reasons, report
+    issue = m.group(1)
+    rc, out, err = run(["cadence", "issue", "show", issue, "--json"])
+    try:
+        ticket = json.loads(out)
+    except ValueError:
+        reasons.append(f"cannot read ticket {issue} via `cadence issue show` (rc {rc}): {(err or out).strip()[:200]}")
+        return reasons, report
+
+    rc, toml_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                            f"repos/{repo}/contents/{ONE_REVIEW_FILE}?ref={base}"])
+    one = rc == 0 and one_review_qualifies(changes, toml_text)
+    report.append("reviews required: " + ("one (diff is on the one-review list)" if one else "two (Standards and Spec/security)"))
+
+    authors = {a.lower() for a in args.author}
+    login = (view.get("author") or {}).get("login")
+    if login:
+        authors.add(login.lower())
+    if ticket.get("owner"):
+        authors.add(str(ticket["owner"]).lower())
+    if (ticket.get("claim") or {}).get("by"):
+        authors.add(str(ticket["claim"]["by"]).lower())
+
+    try:
+        notes = head_notes(args.notes_dir, issue, pr, head)
+    except RuntimeError as e:
+        reasons.append(str(e))
+        notes = []
+    rs, counted = check_reviews(notes, not one, authors, issue)
+    reasons += rs
+    report.append("counted verdicts: " + (", ".join(f"{n['from']} ({n['name']})" for n in counted) or "none"))
+    reasons += check_comment(ticket.get("comments"), head, counted)
+
+    human = [p for p in paths if is_human_path(p)]
+    risk_human = [n for n in notes if n["risk"] == "human"]
+    if human or risk_human:
+        report.append("class: human (" + (", ".join(human[:5]) if human else f"verdict note Risk: human by {risk_human[0]['from']}") + ")")
+        reasons += check_approval(repo, pr, head)
+    else:
+        report.append("class: not human by path or verdict note")
+    return reasons, report
+
+
+def queued(repo, pr):
+    owner, name = repo.split("/", 1)
+    q = ("query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n)"
+         "{pullRequest(number:$p){isInMergeQueue state}}}")
+    rc, out, _ = run(["gh", "api", "graphql", "-f", f"query={q}", "-f", f"o={owner}",
+                      "-f", f"n={name}", "-F", f"p={pr}"])
+    if rc != 0:
+        return False
+    try:
+        p = json.loads(out)["data"]["repository"]["pullRequest"]
+    except (ValueError, KeyError, TypeError):
+        return False
+    return p.get("isInMergeQueue") is True or p.get("state") == "MERGED"
+
+
+def enqueue(args, repo):
+    rc, out, err = run(["gh", "pr", "merge", str(args.pr), "-R", repo, "--auto", "--squash",
+                        "--match-head-commit", args.head])
+    if rc != 0:
+        print(f"{ME}: gh pr merge failed: {(err or out).strip()}", file=sys.stderr)
+    else:
+        deadline = time.monotonic() + args.poll_secs
+        while True:
+            if queued(repo, args.pr):
+                print(f"{ME}: PR #{args.pr} is in the merge queue at {args.head}")
+                return 0
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(args.poll_interval)
+        print(f"{ME}: PR #{args.pr} did not enter the merge queue within {args.poll_secs}s", file=sys.stderr)
+    rc, out, err = run(["gh", "pr", "merge", str(args.pr), "-R", repo, "--disable-auto"])
+    if rc != 0:
+        print(f"{ME}: DANGER: --disable-auto failed; auto-merge may still be on: {(err or out).strip()}", file=sys.stderr)
+    else:
+        print(f"{ME}: auto-merge disabled again", file=sys.stderr)
+    return 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog=ME, description="Enqueue a PR only when review, checks and approval hold.")
+    ap.add_argument("pr", type=int)
+    ap.add_argument("--head", required=True, help="the full 40-hex head SHA the review covered")
+    ap.add_argument("--repo")
+    ap.add_argument("--notes-dir", default=os.environ.get("CADENCE_NOTES_DIR", DEFAULT_NOTES_DIR))
+    ap.add_argument("--author", action="append", default=[], help="an extra alias that authored the PR")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--poll-secs", type=float, default=30)
+    ap.add_argument("--poll-interval", type=float, default=2)
+    args = ap.parse_args(argv)
+    args.head = args.head.lower()
+    if args.pr < 1 or not FULL_SHA.match(args.head):
+        print(f"{ME}: --head must be the full 40-hex SHA and <pr> a positive number", file=sys.stderr)
+        return 2
+    repo = args.repo
+    try:
+        if not repo:
+            repo = gh_json(["repo", "view", "--json", "nameWithOwner"])["nameWithOwner"]
+        if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
+            print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
+            return 2
+        reasons, report = evaluate(args, repo)
+    except (RuntimeError, KeyError) as e:
+        reasons, report = [f"cannot read the PR: {e}"], []
+    for line in report:
+        print(f"{ME}: {line}")
+    if reasons:
+        for r in reasons:
+            print(f"{ME}: refused: {r}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"{ME}: dry run: every rule holds for PR #{args.pr} at {args.head}; nothing enqueued")
+        return 0
+    return enqueue(args, repo)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

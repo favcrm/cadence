@@ -33,6 +33,20 @@ pub(crate) enum AuditAction {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Read-only (CAD-959): is a merge approval in force for exactly this
+    /// full `--head` of PR `--pr`? Prints one JSON object; exits 0 only
+    /// for state `in-force`. Reads the store directly and never records.
+    Approval {
+        /// PR number.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA — an approval for another head never counts.
+        #[arg(long)]
+        head: String,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Withdraw an approval id. Cancelling a message never does this.
     Revoke {
         /// The approval id `audit approve` recorded.
@@ -60,6 +74,26 @@ pub(super) fn run(
     merge_report: Option<PathBuf>,
 ) -> Result<i32> {
     match action {
+        Some(AuditAction::Approval { pr, head, repo }) => {
+            let repo = match repo {
+                Some(r) => r,
+                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
+                    || {
+                        Error::rejected(
+                            "no github.com origin remote in the cwd — pass --repo owner/name",
+                        )
+                    },
+                )?,
+            };
+            let (v, code) = cadence_agent::audit::approval_check(
+                &state_dir,
+                &repo,
+                pr,
+                &head.trim().to_ascii_lowercase(),
+            );
+            print_json(&v);
+            Ok(code)
+        }
         Some(action) => run_audit_evidence(&state_dir, action),
         None => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
             since,

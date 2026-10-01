@@ -194,6 +194,9 @@ jobs:
           python3 tests/scripts/test_delivery_candidate.py
           python3 tests/scripts/test_auto_stage.py
           python3 tests/scripts/test_native_review_observation.py
+      # CAD-959: enqueue-reviewed refuses unless review, checks and approval hold.
+      - name: Test enqueue-reviewed refusal reasons
+        run: python3 tests/scripts/test_enqueue_reviewed.py
       # CAD-562: keep the generated tree and its manifest consistent,
       # including each declared item and every #[test] fn.
       - name: Verify doctor/host split-map consistency
