@@ -7,7 +7,7 @@
 #![allow(clippy::disallowed_methods)]
 mod common;
 use cadence_agent::contract_fixture::{ToolTable, Verified};
-use cadence_agent::platform::agenticos_external::media_import::MediaImporter;
+use cadence_agent::platform::agenticos_external::media_import::{MediaImporter, MediaResolver};
 use cadence_agent::platform::agenticos_external::publish_sender::DeviceCredential;
 use cadence_agent::platform::deployments::DeploymentMetadata;
 use cadence_agent::platform::{
@@ -173,17 +173,6 @@ fn approved_image_run(h: &Release, png: &[u8], tag: &str) -> (Value, String, Str
     (run, bundle_digest, install_id, image_digest)
 }
 
-/// The workspace the daemon derived for this store (per-store random).
-fn workspace(h: &Release) -> String {
-    let db = rusqlite::Connection::open(h.daemon.state.join("cadence.sqlite3")).unwrap();
-    db.query_row(
-        "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )
-    .unwrap()
-}
-
 fn schedule_body(
     run: &Value,
     bundle: &str,
@@ -209,10 +198,14 @@ fn schedule_body(
 /// image digest freezes cleanly.
 #[test]
 fn cad979_freeze_accepts_media_key_binding_reviewed_asset() {
-    let (h, png) = png_harness();
+    // v9: schedule resolves local→AOS `connectionId` via the read credential;
+    // the key's `parts[2]` is the resolved AOS id, `parts[1]` the send
+    // credential's workspace (not asserted locally).
+    let (_h_png_only, png) = png_harness();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = resolver_only_harness(&dest_door, AOS_CONN, png.clone());
     let (run, bundle, install, image_digest) = approved_image_run(&h, &png, "ok");
-    let ws = workspace(&h);
-    let key = format!("dp1.{ws}.{}.{:.32}", h.connection, image_digest);
+    let key = format!("dp1.ws-send.{AOS_CONN}.{:.32}", image_digest);
     let intent = h
         .daemon
         .operator_rpc(
@@ -237,11 +230,13 @@ fn cad979_freeze_accepts_media_key_binding_reviewed_asset() {
 /// Without the `media_key_authorizes` check this wrongly freezes.
 #[test]
 fn cad979_freeze_refuses_media_key_for_foreign_connection() {
-    let (h, png) = png_harness();
+    let (_h_png_only, png) = png_harness();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = resolver_only_harness(&dest_door, AOS_CONN, png.clone());
     let (run, bundle, install, image_digest) = approved_image_run(&h, &png, "xconn");
-    let ws = workspace(&h);
-    // Well-formed, but its connection part is not the run's binding connection.
-    let foreign = format!("dp1.{ws}.con_other_install.{:.32}", image_digest);
+    // Well-formed, but its connection part is a different AOS id than the
+    // resolved one — refused at freeze.
+    let foreign = format!("dp1.ws-send.conB_other.{:.32}", image_digest);
     let err = h
         .daemon
         .operator_rpc(
@@ -263,7 +258,10 @@ fn cad979_freeze_refuses_media_key_for_foreign_connection() {
 }
 
 fn import_body(run: &Value, install: &str, context: Option<&str>, request: &str) -> Value {
+    // v9: the import resolves `(toolkit, destination_id)` → remote AOS
+    // `connectionId` via the destinations read credential before upload.
     let mut b = json!({"request_id": request, "install_id": install,
+        "toolkit": "instagram", "destination_id": "17841400008460056",
         "run_id": run["id"], "artifact_id": run["artifacts"][0]["id"],
         "bundle_digest": run["snapshot"]["bundle_digest"], "slot": "publication"});
     if let Some(ctx) = context {
@@ -436,11 +434,12 @@ fn cad979_import_refuses_caller_material_fields() {
 /// refused — the key binds a different image than the reviewed one.
 #[test]
 fn cad979_freeze_refuses_media_key_for_wrong_digest() {
-    let (h, png) = png_harness();
+    let (_h_png_only, png) = png_harness();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = resolver_only_harness(&dest_door, AOS_CONN, png.clone());
     let (run, bundle, install, _image_digest) = approved_image_run(&h, &png, "xdigest");
-    let ws = workspace(&h);
     let wrong_digest = "0".repeat(64);
-    let foreign = format!("dp1.{ws}.{}.{:.32}", h.connection, wrong_digest);
+    let foreign = format!("dp1.ws-send.{AOS_CONN}.{:.32}", wrong_digest);
     let err = h
         .daemon
         .operator_rpc(
@@ -521,10 +520,19 @@ impl FakeImportDoor {
             let conn = getq("connectionId");
             let dig = getq("digest");
             let expect_conn = c.lock().unwrap().clone().unwrap_or_default();
-            let ok = auth == "Bearer cad979-test-bearer"
-                && conn == expect_conn
-                && dig.len() == 64
-                && sha_hex(&body) == dig;
+            // v9 B1: a `connectionId` outside the send credential's workspace
+            // is `not_found` (AOS `connectionInWorkspace` `WHERE id AND
+            // workspaceId`) — the door does not mint a key for it.
+            if conn != expect_conn {
+                let nf = tiny_http::Response::from_string(
+                    json!({"ok": false, "error": {"code": "not_found"}}).to_string(),
+                )
+                .with_status_code(404);
+                let _ = req.respond(nf);
+                continue;
+            }
+            let ok =
+                auth == "Bearer cad979-test-bearer" && dig.len() == 64 && sha_hex(&body) == dig;
             let resp = if ok {
                 let digest = sha_hex(&body);
                 let ws = w.lock().unwrap().clone().unwrap_or_default();
@@ -573,15 +581,33 @@ fn sha_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Build a harness whose daemon already carries a `MediaImporter` against a
-/// fake door, plus the synthetic-PNG media adapter.
-fn importer_harness(door: &FakeImportDoor, bearer: &str) -> Release {
+/// The AOS wire `connectionId` the fake destinations resolver maps the local
+/// custody `conn-<uuid4>` to (v9). Distinct from the local `h.connection` —
+/// a remote AOS id, never the local custody id.
+const AOS_CONN: &str = "connA_1784";
+
+/// Build a harness whose daemon carries BOTH a `MediaImporter` (send
+/// credential → `door`) and a `MediaResolver` (read credential →
+/// `dest_door`) that maps `(instagram, 17841400008460056)` → [`AOS_CONN`].
+/// v9: the import uploads under the resolved AOS id, so `door.connection`
+/// is set to `AOS_CONN` (not the local `conn-<uuid4>`).
+fn importer_harness(
+    door: &FakeImportDoor,
+    dest_door: &FakeDestinationsDoor,
+    bearer: &str,
+) -> Release {
+    dest_door.add(AOS_CONN, "instagram", "17841400008460056", true);
     let media = h_png();
     let importer = MediaImporter::new(
         &format!("http://{}", door.addr),
         DeviceCredential::new(bearer.to_owned()),
     )
     .expect("fake-door importer");
+    let resolver = MediaResolver::new(
+        &format!("http://{}", dest_door.addr),
+        DeviceCredential::new("cad979-read-cred".to_owned()),
+    )
+    .expect("fake destinations resolver");
     Release::with_social_image(move |opts, _| {
         opts.provider_deployments = Some(
             DeploymentMetadata::parse(
@@ -596,6 +622,39 @@ fn importer_harness(door: &FakeImportDoor, bearer: &str) -> Release {
             Arc::new(SyntheticMedia { inner, png: media }),
         );
         opts.social_media_importer = Some(Arc::new(importer));
+        opts.social_media_resolver = Some(Arc::new(resolver));
+    })
+}
+
+/// Resolver harness for the freeze path only (no import door needed): the
+/// resolver maps `(instagram, 17841400008460056)` → `aos_conn` so schedule
+/// can bind `aos_connection_id`. `png_harness` alone has no resolver and
+/// schedule would refuse `capability_unavailable` under v9.
+fn resolver_only_harness(
+    dest_door: &FakeDestinationsDoor,
+    aos_conn: &str,
+    media: Vec<u8>,
+) -> Release {
+    dest_door.add(aos_conn, "instagram", "17841400008460056", true);
+    let resolver = MediaResolver::new(
+        &format!("http://{}", dest_door.addr),
+        DeviceCredential::new("cad979-read-cred".to_owned()),
+    )
+    .expect("fake destinations resolver");
+    Release::with_social_image(move |opts, _| {
+        opts.provider_deployments = Some(
+            DeploymentMetadata::parse(
+                br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#,
+            )
+            .unwrap(),
+        );
+        agenticos_external::attach(opts).unwrap();
+        let inner = opts.platforms.remove("agenticos_external").unwrap();
+        opts.platforms.insert(
+            "agenticos_external".into(),
+            Arc::new(SyntheticMedia { inner, png: media }),
+        );
+        opts.social_media_resolver = Some(Arc::new(resolver));
     })
 }
 
@@ -607,9 +666,12 @@ fn cad979_import_then_schedule_binds_reviewed_asset() {
     // (the importer needs its address), then learns `h`'s workspace and the
     // `publication`-slot connection via shared cells before any request.
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "imp");
 
     // The importer uploads the retained PNG; the door mints the key.
@@ -647,9 +709,12 @@ fn cad979_import_then_schedule_binds_reviewed_asset() {
 #[test]
 fn cad979_import_writes_no_intent_row() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "inert");
     let before = h
         .daemon
@@ -687,12 +752,15 @@ fn cad979_import_writes_no_intent_row() {
 #[test]
 fn cad979_import_same_request_id_schedule_is_idempotent() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, bundle, install, image_digest) = approved_image_run(&h, &h_png(), "dup");
-    let ws = workspace(&h);
-    let key = format!("dp1.{ws}.{}.{:.32}", h.connection, image_digest);
+    // The key binds the resolved AOS connectionId, not the local custody id.
+    let key = format!("dp1.ws-send.{AOS_CONN}.{:.32}", image_digest);
     let req = "cad979-dup-sched";
     let first = h
         .daemon
@@ -731,9 +799,12 @@ fn cad979_import_same_request_id_schedule_is_idempotent() {
 #[test]
 fn cad979_import_concurrent_calls_same_key_no_leak() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, _bundle, install, image_digest) = approved_image_run(&h, &h_png(), "conc");
     let body = import_body(&run, &install, None, "cad979-conc");
     let state = h.daemon.state.clone();
@@ -784,9 +855,12 @@ fn cad979_import_concurrent_calls_same_key_no_leak() {
 #[test]
 fn cad979_import_http_route_is_operator_only() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "http");
     let body = import_body(&run, &install, None, "cad979-http-1").to_string();
 
@@ -863,9 +937,12 @@ fn cad979_import_http_route_is_operator_only() {
 #[test]
 fn cad979_import_http_typed_input_matrix_no_import() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "typed");
 
     let lease = test_port();
@@ -962,9 +1039,12 @@ fn cad979_import_refuses_detached_setsid_peer() {
 #[test]
 fn cad979_import_concurrent_scope_isolation() {
     let door = FakeImportDoor::start();
-    let h = importer_harness(&door, "cad979-test-bearer");
-    *door.workspace.lock().unwrap() = Some(workspace(&h));
-    *door.connection.lock().unwrap() = Some(h.connection.clone());
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    let h = importer_harness(&door, &dest_door, "cad979-test-bearer");
+    *door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    // The door binds the RESOLVED AOS connectionId (the import sends it), not
+    // the local custody .
+    *door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
     let (run, _bundle, install, _d) = approved_image_run(&h, &h_png(), "ciso");
     let state = h.daemon.state.clone();
     let good = import_body(&run, &install, None, "cad979-ciso-ok");
@@ -1002,4 +1082,389 @@ fn h_png() -> Vec<u8> {
         .write_image(&[0], 1, 1, image::ExtendedColorType::L8)
         .unwrap();
     png
+}
+
+// ===========================================================================
+// v9 identity mapping (resolved local→AOS connectionId) — tests first.
+//
+// The destinations reply carries `{connectionId, toolkit, displayName,
+// destinationId, status, available, publishable}` under the read credential;
+// the import door mints `mediaKey` bound to the SEND credential's workspace.
+// A `connectionId` belonging to a different workspace than the send
+// credential's is refused `not_found` → `capability_unavailable`.
+// ===========================================================================
+
+/// A fake upstream destinations door: `GET /v1/runtime/connectors/destinations`
+/// answering the `toDeviceDestination` reply shape for the connections this
+/// fixture registers. Scoped to a `workspace` it stamps on each row's
+/// `workspaceId`; bounded like the import door.
+struct FakeDestinationsDoor {
+    addr: String,
+    /// `(connectionId, toolkit, destinationId, publishable)` rows served.
+    rows: Arc<Mutex<Vec<(String, String, String, bool)>>>,
+    /// 5xx mode: return a server error (ambiguous) instead of the list.
+    dead: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeDestinationsDoor {
+    fn start(workspace: &str) -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let dead = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = workspace.to_owned();
+        let rr = rows.clone();
+        let cs = stop.clone();
+        let dd = dead.clone();
+        let worker = thread::spawn(move || loop {
+            if cs.load(Ordering::SeqCst) {
+                return;
+            }
+            let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(50)) else {
+                continue;
+            };
+            let auth = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Authorization"))
+                .map(|h| h.value.to_string())
+                .unwrap_or_default();
+            let resp = if auth != "Bearer cad979-read-cred" {
+                tiny_http::Response::from_string(
+                    json!({"ok":false,"error":{"code":"unauthorized"}}).to_string(),
+                )
+                .with_status_code(401)
+            } else if dd.load(Ordering::SeqCst) {
+                tiny_http::Response::from_string(
+                    json!({"ok":false,"error":{"code":"upstream"}}).to_string(),
+                )
+                .with_status_code(500)
+            } else {
+                let data: Vec<Value> = rr
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(cid, toolkit, dest, publishable)| {
+                        json!({
+                            "connectionId": cid, "toolkit": toolkit,
+                            "displayName": cid, "destinationId": dest,
+                            "status": "active", "available": true,
+                            "publishable": publishable,
+                            "workspaceId": w,
+                        })
+                    })
+                    .collect();
+                tiny_http::Response::from_string(json!({"ok": true, "data": data}).to_string())
+                    .with_status_code(200)
+            };
+            let _ = req.respond(resp);
+        });
+        Self {
+            addr,
+            rows,
+            dead,
+            stop,
+            worker: Some(worker),
+        }
+    }
+    fn add(&self, connection_id: &str, toolkit: &str, destination_id: &str, publishable: bool) {
+        self.rows.lock().unwrap().push((
+            connection_id.to_owned(),
+            toolkit.to_owned(),
+            destination_id.to_owned(),
+            publishable,
+        ));
+    }
+}
+
+impl Drop for FakeDestinationsDoor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// Harness carrying BOTH a `MediaImporter` (send credential → import door)
+/// and a `MediaResolver` (read credential → destinations door).
+fn mapped_harness(import_door: &FakeImportDoor, dest_door: &FakeDestinationsDoor) -> Release {
+    let media = h_png();
+    let importer = MediaImporter::new(
+        &format!("http://{}", import_door.addr),
+        DeviceCredential::new("cad979-test-bearer".to_owned()),
+    )
+    .expect("fake import door");
+    let resolver = MediaResolver::new(
+        &format!("http://{}", dest_door.addr),
+        DeviceCredential::new("cad979-read-cred".to_owned()),
+    )
+    .expect("fake destinations door");
+    Release::with_social_image(move |opts, _| {
+        opts.provider_deployments = Some(
+            DeploymentMetadata::parse(
+                br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#,
+            )
+            .unwrap(),
+        );
+        agenticos_external::attach(opts).unwrap();
+        let inner = opts.platforms.remove("agenticos_external").unwrap();
+        opts.platforms.insert(
+            "agenticos_external".into(),
+            Arc::new(SyntheticMedia { inner, png: media }),
+        );
+        opts.social_media_importer = Some(Arc::new(importer));
+        opts.social_media_resolver = Some(Arc::new(resolver));
+    })
+}
+
+/// v9 happy-path mapping: the local `conn-<uuid4>` is resolved to the AOS
+/// `connectionId` from the destinations list; the import door mints a key
+/// under that AOS id (not the local one); the frozen `aos_connection_id`
+/// is the wire identity the send path will use.
+#[test]
+fn cad979_map_local_conn_to_aos_connection() {
+    let import_door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    // The send credential's workspace is what the door binds; the dest read
+    // only maps ids. Use the import door's workspace as AOS workspace.
+    let aos_conn = "connA_1784"; // remote AOS id, distinct from local conn-<uuid4>
+    dest_door.add(aos_conn, "instagram", "17841400008460056", true);
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, bundle, install, _digest) = approved_image_run(&h, &h_png(), "map");
+    // import resolves via destinations then uploads under aos_conn.
+    let resp = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-map-import"),
+        )
+        .unwrap();
+    assert_eq!(resp["ok"], true);
+    let key = resp["media_key"].as_str().unwrap().to_owned();
+    // The minted key names the resolved AOS connectionId, not local conn-<uuid4>.
+    assert_eq!(
+        import_door.connection.lock().unwrap().as_deref(),
+        Some(aos_conn),
+        "import must send the resolved AOS connectionId, not the local id"
+    );
+    // freeze binds the key; frozen carries the AOS wire identity.
+    let intent = h
+        .daemon
+        .operator_rpc(
+            "social_publish_schedule",
+            schedule_body(&run, &bundle, &install, "cad979-map-sch", Some(key.clone())),
+        )
+        .unwrap()["intent"]
+        .clone();
+    assert_eq!(intent["state"], "queued");
+    assert_eq!(intent["frozen"]["media_key"], key);
+    assert_eq!(intent["frozen"]["aos_connection_id"], aos_conn);
+}
+
+/// The resolver must refuse 0 matches.
+#[test]
+fn cad979_resolver_zero_match_refuses() {
+    let import_door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    // no rows → (toolkit,destinationId) matches nothing.
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "zero");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-zero"),
+        )
+        .expect_err("no matching destination must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("grant_binding_mismatch") || msg.contains("destination"),
+        "expected a no-match refusal, got: {msg}"
+    );
+    assert_eq!(
+        import_door.calls.load(Ordering::SeqCst),
+        0,
+        "no upload on no-match"
+    );
+}
+
+/// >1 match is ambiguous → refuse; a full 100-row window is unknown → refuse.
+#[test]
+fn cad979_resolver_multiple_match_refuses() {
+    let import_door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    dest_door.add("connA_1", "instagram", "17841400008460056", true);
+    dest_door.add("connA_2", "instagram", "17841400008460056", true);
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "dup");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-dup"),
+        )
+        .expect_err("two matching destinations must refuse");
+    assert_eq!(import_door.calls.load(Ordering::SeqCst), 0);
+    let _ = err;
+}
+
+/// A full 100-row window can't rule out an unseen later match → refuse.
+#[test]
+fn cad979_resolver_cap100_full_window_refuses() {
+    let import_door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    for i in 0..100 {
+        let dest = if i == 0 {
+            "17841400008460056".to_owned()
+        } else {
+            format!("dest{i}")
+        };
+        dest_door.add(&format!("conn{i}"), "instagram", &dest, true);
+    }
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "cap");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-cap"),
+        )
+        .expect_err("a full-window reply must refuse (completeness unknown)");
+    assert_eq!(import_door.calls.load(Ordering::SeqCst), 0);
+    let _ = err;
+}
+
+/// E1 — the load-bearing cross-workspace proof. Read credential (workspace B)
+/// yields `connB`; the `publish.send` import under a workspace-A credential
+/// must refuse `not_found` → `capability_unavailable`: no key, no freeze, no
+/// intent row, no provider send. The local `conn-<uuid4>` custody id and the
+/// remote `connB`/`connA` AOS ids are distinct namespaces.
+#[test]
+fn cad979_mapping_reader_workspace_differs_sender_refuses() {
+    // destinations door scoped to workspace B → connectionId connB (remote B).
+    let dest_door = FakeDestinationsDoor::start("wsB-remote");
+    dest_door.add("connB", "instagram", "17841400008460056", true);
+    // import door scoped to a DIFFERENT workspace A: a `connectionId` not in
+    // workspace A is `not_found` (mirrors AOS `connectionInWorkspace` —
+    // `WHERE id AND workspaceId`). The fake door only accepts the AOS id it
+    // was built with; `connB` isn't it.
+    let import_door = FakeImportDoor::start(); // its accepted AOS conn is a ws-A id
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "xws");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-xws"),
+        )
+        .expect_err("a connectionId outside the send credential's workspace must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("capability_unavailable")
+            || msg.contains("not_found")
+            || msg.contains("grant_binding_mismatch"),
+        "cross-workspace resolved id must refuse, got: {msg}"
+    );
+    // Fail-closed: no key minted at the send door (the door refused
+    // `not_found`), so no frozen key could exist; the import wrote no intent
+    // row for this install either (`social_publish_list` only takes
+    // install/context — a fresh harness yields an empty set).
+    let intents = h
+        .daemon
+        .operator_rpc("social_publish_list", json!({"install_id": install}))
+        .map(|v| v["intents"].clone())
+        .unwrap_or_else(|_| json!([]));
+    assert!(
+        intents.as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "a refused cross-workspace import writes no intent: {intents}"
+    );
+}
+
+/// Resolver unreachable → `capability_unavailable` at import (fail closed).
+#[test]
+fn cad979_resolver_unreachable_refuses_import() {
+    let import_door = FakeImportDoor::start();
+    let dest_door = FakeDestinationsDoor::start("ws-send");
+    dest_door.dead.store(true, Ordering::SeqCst); // 5xx → ambiguous/unavailable
+    dest_door.add("connA_1", "instagram", "17841400008460056", true);
+    *import_door.workspace.lock().unwrap() = Some("ws-send".to_owned());
+    *import_door.connection.lock().unwrap() = Some(AOS_CONN.to_owned());
+    let h = mapped_harness(&import_door, &dest_door);
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "down");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-down"),
+        )
+        .expect_err("an unreachable resolver must refuse, never mint a key");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("capability_unavailable")
+            || msg.contains("ambiguous")
+            || msg.contains("unavailable"),
+        "resolver failure must refuse ambiguous/unavailable, got: {msg}"
+    );
+    assert_eq!(
+        import_door.calls.load(Ordering::SeqCst),
+        0,
+        "no upload when the resolver failed"
+    );
+}
+
+/// A request naming no resolver at all (importer configured, resolver absent)
+/// refuses `capability_unavailable` — never silently uses the local id.
+#[test]
+fn cad979_import_without_resolver_is_capability_unavailable() {
+    let door = FakeImportDoor::start();
+    let media = h_png();
+    let importer = MediaImporter::new(
+        &format!("http://{}", door.addr),
+        DeviceCredential::new("cad979-test-bearer".to_owned()),
+    )
+    .unwrap();
+    let h = Release::with_social_image(move |opts, _| {
+        opts.provider_deployments = Some(
+            DeploymentMetadata::parse(
+                br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@2","transport":"hosted-media-lease@1"}]}"#,
+            )
+            .unwrap(),
+        );
+        agenticos_external::attach(opts).unwrap();
+        let inner = opts.platforms.remove("agenticos_external").unwrap();
+        opts.platforms.insert(
+            "agenticos_external".into(),
+            Arc::new(SyntheticMedia { inner, png: media }),
+        );
+        opts.social_media_importer = Some(Arc::new(importer));
+        // deliberately NO social_media_resolver.
+    });
+    let (run, _b, install, _d) = approved_image_run(&h, &h_png(), "norslv");
+    let err = h
+        .daemon
+        .operator_rpc(
+            "social_publish_media_import",
+            import_body(&run, &install, None, "cad979-norslv"),
+        )
+        .expect_err("import without a destinations resolver must refuse");
+    assert!(
+        err.to_string().contains("capability_unavailable"),
+        "{}",
+        err
+    );
+    assert_eq!(door.calls.load(Ordering::SeqCst), 0);
 }

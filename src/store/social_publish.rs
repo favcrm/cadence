@@ -60,6 +60,12 @@ pub struct NewSocialPublish<'a> {
     pub bundle_digest: Option<&'a str>,
     pub slot: Option<&'a str>,
     pub connection_id: &'a str,
+    /// CAD-979 v9: the remote AOS `connectionId` — the upstream wire
+    /// identity persisted into `frozen["aos_connection_id"]` and used by
+    /// `SendBinding.connection_id`/`check_material`. The local
+    /// `connection_id` stays the custody/install identity. Daemon-resolved;
+    /// `src/store` only persists it (no network).
+    pub aos_connection_id: Option<&'a str>,
     pub destination_id: &'a str,
     pub toolkit: &'a str,
     pub caption_digest: &'a str,
@@ -92,6 +98,13 @@ fn validate_new(row: &NewSocialPublish<'_>) -> Result<()> {
     }
     if !device::valid_connection_id(row.connection_id) {
         return Err(bad("connection"));
+    }
+    // v9: the AOS wire id, when present, must be a valid connection id too
+    // — it is sent as `connectionId`/`grant.connectionId` on the wire.
+    if let Some(aos) = row.aos_connection_id {
+        if !device::valid_connection_id(aos) {
+            return Err(bad("aos connection"));
+        }
     }
     if row.destination_id.is_empty() || row.destination_id.len() > 120 {
         return Err(bad("destination"));
@@ -141,6 +154,7 @@ fn frozen_of(row: &NewSocialPublish<'_>) -> Value {
         "run_id":row.run_id,"effect_id":row.effect_id,"artifact_id":row.artifact_id,
         "bundle_digest":row.bundle_digest,"slot":row.slot,
         "connection_id":row.connection_id,
+        "aos_connection_id":row.aos_connection_id,
         "destination_id":row.destination_id,"toolkit":row.toolkit,
         "caption_digest":row.caption_digest,"image_digest":row.image_digest,
         "media_key":row.media_key,"grant_id":row.grant_id,"approval_id":row.approval_id,
@@ -652,6 +666,10 @@ pub struct FreezeFromArtifact<'a> {
     pub effect_id: &'a str,
     pub destination_id: &'a str,
     pub toolkit: &'a str,
+    /// CAD-979 v9: the daemon-resolved remote AOS `connectionId` (wire
+    /// identity). The `media_key` must bind THIS id — its `parts[2]` — not
+    /// the local custody `connection_id`.
+    pub aos_connection_id: &'a str,
     pub media_key: Option<&'a str>,
     pub grant_id: &'a str,
     pub approval_id: &'a str,
@@ -703,11 +721,14 @@ impl Store {
         // the same frozen binding config.
         if let Some(key) = row.media_key {
             use crate::platform::agenticos_external::publish as device;
-            let workspace_id = material["binding"]["config"]["workspace_id"]
-                .as_str()
-                .ok_or_else(|| Error::rejected("reviewed binding names no workspace"))?;
+            // v9: the key's `parts[2]` is the remote AOS `connectionId` —
+            // validate connection+digest against the resolved wire id, not
+            // the local custody `connection_id`. The workspace (`parts[1]`)
+            // is the send credential's upstream workspace which Cadence
+            // never asserts locally — enforced upstream at mint/grant
+            // (`SendGrant.authorize` `cross_workspace`), not here.
             let bound = image_digest.is_some_and(|digest| {
-                device::media_key_authorizes(key, workspace_id, connection_id, digest)
+                device::media_key_authorizes_connection(key, row.aos_connection_id, digest)
             });
             if !bound {
                 return Err(Error::rejected(
@@ -725,6 +746,7 @@ impl Store {
             bundle_digest: Some(row.bundle_digest),
             slot: Some(row.slot),
             connection_id,
+            aos_connection_id: Some(row.aos_connection_id),
             destination_id: row.destination_id,
             toolkit: row.toolkit,
             caption_digest,

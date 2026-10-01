@@ -1266,6 +1266,7 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         effect_execute_gate: None,
         social_publish_sender: None,
         social_media_importer: None,
+        social_media_resolver: None,
         app_release_claim_gate: None,
         // CAD-546: no `local` outbox — a test that registers the
         // adapter pins its own root via `platform::local::register_at`.

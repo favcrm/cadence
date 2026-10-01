@@ -33,6 +33,10 @@ impl Shared {
                     "artifact_id",
                     "bundle_digest",
                     "slot",
+                    // v9: `(toolkit, destination_id)` drive the local→AOS
+                    // `connectionId` resolution before upload.
+                    "destination_id",
+                    "toolkit",
                 ],
                 "social_publish_schedule" => &[
                     "request_id",
@@ -167,28 +171,51 @@ impl Shared {
         let media_type = asset["media_type"]
             .as_str()
             .ok_or_else(|| Error::rejected("run has no reviewed retained asset"))?;
-        let connection_id = material["binding"]["config"]["connection_id"]
+        // The local custody `conn-<uuid4>` (install/custody identity) and the
+        // send intent's `(toolkit, destination_id)` select the remote AOS
+        // `connectionId` — the upstream wire identity the key must bind.
+        let _local_connection_id = material["binding"]["config"]["connection_id"]
             .as_str()
-            .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?
-            .to_owned();
+            .ok_or_else(|| Error::rejected("reviewed binding names no connection"))?;
+        let toolkit = common("toolkit")?;
+        let destination_id = common("destination_id")?;
+        // v9: resolve local→AOS `connectionId` under the read credential. The
+        // resolver never asserts workspace — the send credential's workspace is
+        // enforced upstream when the door mints the key and when the grant is
+        // authorized. 0 matches → `grant_binding_mismatch`; >1/full-window →
+        // `capability_unavailable`; unreachable → `capability_unavailable`. A
+        // caller/operator-supplied `connectionId` is never trusted.
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(toolkit, destination_id)
+            .into_result()
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
         // Read the retained bytes by receipt custody — never a caller
         // path/URL — and re-verify the digest matches the reviewed asset.
         let db_path = self.state_dir.join("cadence.sqlite3");
         let (_receipt, bytes) =
             crate::store::app_capabilities::read_asset_material(&db_path, receipt_id)?;
         // The importer re-verifies jpeg/png signature + the 2 MiB bound and
-        // recomputes the digest; the door's receipt must echo all of it.
+        // recomputes the digest; the door's receipt must echo all of it. The
+        // resolved remote AOS `connectionId` is sent — never the local
+        // `conn-<uuid4>` — so the minted `dp1.<ws>.<aos_conn>.<digest>` is the
+        // upstream wire binding (the send credential's workspace scopes it).
         let importer = self.social_media_importer.clone().ok_or_else(|| {
             Error::rejected("capability_unavailable: no media importer configured")
         })?;
         let receipt = importer
-            .import(&connection_id, media_type, &bytes)
+            .import(&resolved.aos_connection_id, media_type, &bytes)
             .map_err(|refusal| Error::rejected(refusal.to_string()))?;
         Ok(json!({
             "ok": true,
             "media_key": receipt.media_key,
             "image_digest": receipt.digest,
+            // The wire identity — the remote AOS `connectionId`, not the local
+            // `conn-<uuid4>` custody id.
             "connection_id": receipt.connection_id,
+            "aos_connection_id": resolved.aos_connection_id,
             "mime": receipt.mime,
             "size_bytes": receipt.size_bytes,
         }))
@@ -206,6 +233,23 @@ impl Shared {
             .and_then(Value::as_i64)
             .ok_or_else(|| Error::rejected("Missing or non-integer 'due_epoch'"))?;
         let common = |field: &str| required_str(params, field);
+        let toolkit = common("toolkit")?;
+        let destination_id = common("destination_id")?;
+        let media_key = optional_str(params, "media_key");
+        // v9: the wire identity on `frozen` is the remote AOS `connectionId`,
+        // resolved under the read credential — never the local `conn-<uuid4>`
+        // custody id and never a caller-supplied id. A supplied `media_key`
+        // requires resolution (the key's `parts[2]` is the AOS id); a
+        // text-only schedule without a key still resolves so the AOS wire id
+        // is bound at freeze for the send path. Resolver absent/failed →
+        // `capability_unavailable` (fail closed).
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(toolkit, destination_id)
+            .into_result()
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
         self.store
             .social_publish_freeze_from_artifact(&FreezeFromArtifact {
                 request_id: common("request_id")?,
@@ -216,9 +260,10 @@ impl Shared {
                 bundle_digest: common("bundle_digest")?,
                 slot: common("slot")?,
                 effect_id: common("effect_id")?,
-                destination_id: common("destination_id")?,
-                toolkit: common("toolkit")?,
-                media_key: optional_str(params, "media_key"),
+                destination_id,
+                toolkit,
+                aos_connection_id: &resolved.aos_connection_id,
+                media_key,
                 grant_id: common("grant_id")?,
                 approval_id: common("approval_id")?,
                 due_epoch: due,
@@ -246,9 +291,11 @@ impl Shared {
             return Ok(json!({"claimed": false}));
         };
         let frozen = &due["intent"]["frozen"];
+        // v9: `aos_connection_id` is the wire identity compared at recheck —
+        // the local `connection_id` stays custody, never sent on the wire.
         let matches = [
             "grant_id",
-            "connection_id",
+            "aos_connection_id",
             "destination_id",
             "caption_digest",
         ]
@@ -358,9 +405,12 @@ fn sender_binding(
     request: &Value,
 ) -> Option<crate::platform::agenticos_external::publish::SendBinding> {
     use crate::platform::agenticos_external::publish::{SendBinding, Toolkit};
+    // v9: `aos_connection_id` is the wire identity sent as `connectionId`/
+    // `grant.connectionId` and compared by `check_material` (`parts[2]`).
+    // A pre-v9 `frozen` without it is held, never sent under a local id.
     let binding = SendBinding {
         key: request.as_str()?.to_owned(),
-        connection_id: frozen["connection_id"].as_str()?.to_owned(),
+        connection_id: frozen["aos_connection_id"].as_str()?.to_owned(),
         destination_id: frozen["destination_id"].as_str()?.to_owned(),
         toolkit: Toolkit::parse(frozen["toolkit"].as_str()?)?,
         caption_digest: frozen["caption_digest"].as_str()?.to_owned(),

@@ -121,6 +121,10 @@ struct MediaImport {
     artifact_id: String,
     bundle_digest: String,
     slot: String,
+    /// CAD-979 v9: the send-intent `(toolkit, destination_id)` drive the
+    /// local→AOS `connectionId` resolution before upload. Required.
+    toolkit: String,
+    destination_id: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

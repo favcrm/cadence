@@ -426,6 +426,210 @@ fn receipt_of(
     })
 }
 
+// ===========================================================================
+// v9: destinations resolver — maps a local custody `conn-<uuid4>` to the
+// AOS `connectionId` that is the upstream wire identity. Design contract
+// sha256 `9e0b28eff67383c9a3ace0adcce9d3225047dee8ffa1fb4dc722e19b8c363f6a`
+// (`native-contract-v9.md`, Design PASS `design-review/v9-verdict.md`).
+//
+// Two credentials (B1, upstream-enforced): the READER holds
+// `provider.read`/`provider.draft` and is used ONLY for
+// `GET /v1/runtime/connectors/destinations` — it supplies the local→AOS
+// `connectionId` map and never asserts workspace. The SENDER
+// (`publish.send`) is the workspace authority: its import door binds the
+// minted key to the send bearer's workspace, so a `connectionId` outside
+// that workspace is `not_found` and never mints a key.
+// ===========================================================================
+
+const DESTINATIONS_PATH: &str = "/v1/runtime/connectors/destinations";
+
+/// One upstream destination row (`toDeviceDestination`, AOS
+/// `device-publish.ts`): `{connectionId, toolkit, displayName,
+/// destinationId, status, available, publishable}` — no workspace/account
+/// field, so it can never be used as workspace evidence.
+#[derive(Debug, Clone)]
+pub struct DestinationRow {
+    /// The remote AOS `connectionId` — the wire identity to map to.
+    pub connection_id: String,
+    pub toolkit: String,
+    pub destination_id: String,
+    /// `publishable` — a row not publishable cannot be a send target.
+    pub publishable: bool,
+}
+
+/// The typed proof a daemon-layer resolver hands to the store: the
+/// resolved remote AOS wire identity for `(toolkit, destination_id)`.
+/// `src/store` stays pure — it never performs this lookup; it only
+/// persists `aos_connection_id` into `frozen`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDestination {
+    /// Remote AOS `connectionId` — the upstream wire identity.
+    pub aos_connection_id: String,
+    pub toolkit: String,
+    pub destination_id: String,
+}
+
+/// Destinations-read refusal (fixed safe vocabulary, no echoed upstream
+/// text — the reply is untrusted). `Unmapped` = 0 matches;
+/// `Ambiguous` = >1 match or a full-window (completeness unknown);
+/// `Unavailable` = transport/parse/upstream failure.
+pub enum DestinationLookup {
+    /// Resolved to exactly one AOS `connectionId`.
+    One(ResolvedDestination),
+    /// No row matched `(toolkit, destination_id)`.
+    Unmapped,
+    /// More than one match, or a full-window reply (cap reached).
+    Ambiguous,
+    /// The destinations read failed (transport, 5xx, malformed).
+    Unavailable,
+}
+
+impl DestinationLookup {
+    /// Collapse to a refusal for callers that treat non-resolution as a
+    /// hard stop. `Unmapped` is a binding mismatch; `Ambiguous`/`Unavailable`
+    /// are `capability_unavailable` — all fail closed, none mint a key.
+    pub fn into_result(self) -> std::result::Result<ResolvedDestination, Refusal> {
+        match self {
+            DestinationLookup::One(r) => Ok(r),
+            DestinationLookup::Unmapped => Err(Refusal::new(
+                "grant_binding_mismatch",
+                "no publishable destination binds this toolkit and destination",
+            )),
+            DestinationLookup::Ambiguous => Err(Refusal::new(
+                "capability_unavailable",
+                "the destinations read did not isolate one publishable binding",
+            )),
+            DestinationLookup::Unavailable => Err(Refusal::new(
+                "capability_unavailable",
+                "the destinations resolver is unavailable",
+            )),
+        }
+    }
+}
+
+/// Read-credential destinations client (`provider.read`/`provider.draft`
+/// scope). Supplies only the local→AOS `connectionId` map; the send
+/// credential's workspace is enforced upstream at import and send, never
+/// asserted here. Bounded like the importer (status allowlist, no
+/// redirects, 64 KiB cap, timeout).
+pub struct MediaResolver {
+    base: String,
+    credential: DeviceCredential,
+    http: ureq::Agent,
+}
+
+impl MediaResolver {
+    pub fn new(base: &str, credential: DeviceCredential) -> Result<Self> {
+        let base = super::valid_base(base)?;
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(IMPORT_TIMEOUT))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
+        Ok(Self {
+            base,
+            credential,
+            http: ureq::Agent::new_with_config(config),
+        })
+    }
+
+    /// Resolve `(toolkit, destination_id)` to its remote AOS `connectionId`
+    /// under the read credential's scoped workspace. The reply row set is
+    /// already filtered by `listWorkspaceConnectionBindings(…, 100)` — a
+    /// full 100-row window means completeness is unknown, so it refuses
+    /// `Ambiguous` even if a match is visible (an unseen later match can't
+    /// be ruled out). A caller-supplied id is never trusted; the read is
+    /// the only source of the map.
+    pub fn resolve(&self, toolkit: &str, destination_id: &str) -> DestinationLookup {
+        let url = format!("{}{}", self.base, DESTINATIONS_PATH);
+        let data = match self
+            .http
+            .get(&url)
+            .header("authorization", &self.credential.authorization())
+            .call()
+        {
+            Ok(resp) => match read_destinations_envelope(resp) {
+                Ok(d) => d,
+                Err(Fault::Ambiguous) => return DestinationLookup::Unavailable,
+                Err(Fault::Refused(_)) => return DestinationLookup::Unavailable,
+            },
+            Err(_) => return DestinationLookup::Unavailable,
+        };
+        // Parse the row set; malformed rows are dropped, not trusted.
+        let rows: Vec<DestinationRow> = data
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        let connection_id = v.get("connectionId")?.as_str()?.to_owned();
+                        let toolkit = v.get("toolkit")?.as_str()?.to_owned();
+                        let destination_id = v.get("destinationId")?.as_str()?.to_owned();
+                        let publishable = v
+                            .get("publishable")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        Some(DestinationRow {
+                            connection_id,
+                            toolkit,
+                            destination_id,
+                            publishable,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A full 100-row window can't rule out an unseen later match.
+        if rows.len() >= 100 {
+            return DestinationLookup::Ambiguous;
+        }
+        let matches: Vec<&DestinationRow> = rows
+            .iter()
+            .filter(|r| r.toolkit == toolkit && r.destination_id == destination_id && r.publishable)
+            .collect();
+        match matches.len() {
+            1 => DestinationLookup::One(ResolvedDestination {
+                aos_connection_id: matches[0].connection_id.clone(),
+                toolkit: toolkit.to_owned(),
+                destination_id: destination_id.to_owned(),
+            }),
+            0 => DestinationLookup::Unmapped,
+            _ => DestinationLookup::Ambiguous,
+        }
+    }
+}
+
+/// Read the destinations envelope. Only a 2xx `{ok:true,data:[…]}` is a
+/// read; a 4xx door error is a refused read, 5xx/redirect/drift ambiguous.
+/// The upstream `message` is never consulted.
+fn read_destinations_envelope(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> std::result::Result<Value, Fault> {
+    let status = response.status().as_u16();
+    if (500..=599).contains(&status) {
+        return Err(Fault::Ambiguous);
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(IMPORT_RESPONSE_CAP)
+        .read_to_vec()
+        .map_err(|_| Fault::Ambiguous)?;
+    let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Ambiguous)?;
+    if (200..=299).contains(&status) {
+        if envelope.get("ok") == Some(&Value::Bool(true)) && envelope.get("data").is_some() {
+            return Ok(envelope["data"].clone());
+        }
+        return Err(Fault::Ambiguous);
+    }
+    if (400..=499).contains(&status) {
+        return Err(Fault::Refused(Refusal::new(
+            "refused",
+            "the destinations read was refused",
+        )));
+    }
+    Err(Fault::Ambiguous)
+}
+
 #[cfg(test)]
 mod tests {
     //! Loopback device-door proofs for the approved CAD-979 contract. The

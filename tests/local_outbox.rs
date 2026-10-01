@@ -1209,6 +1209,7 @@ fn decided_at_restart_never_refires() {
             effect_execute_gate: Some(Arc::new(move |_| !crash.load(Ordering::SeqCst))),
             social_publish_sender: None,
             social_media_importer: None,
+            social_media_resolver: None,
             ..Default::default()
         };
         local::register_at(&state, &mut opts, outbox.clone(), BOARD.to_string());
