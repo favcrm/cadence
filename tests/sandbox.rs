@@ -125,14 +125,82 @@ fn refused(out: &Output, needle: &str) {
     );
 }
 
+fn diag(port: u16, stage: &str, args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "sandbox http_diag port={port} stage={stage} {args}"
+    );
+}
+
 fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").ok()?;
+    let mut s = TcpStream::connect(("127.0.0.1", port))
+        .inspect_err(|e| {
+            diag(
+                port,
+                "connect",
+                format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+            )
+        })
+        .ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .inspect_err(|e| {
+            diag(
+                port,
+                "set_read_timeout",
+                format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+            )
+        })
+        .ok()?;
+    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+        .inspect_err(|e| {
+            diag(
+                port,
+                "write_request",
+                format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+            )
+        })
+        .ok()?;
     let mut buf = String::new();
-    s.read_to_string(&mut buf).ok()?;
-    let status = buf.split_whitespace().nth(1)?.parse().ok()?;
-    let body = buf.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
+    s.read_to_string(&mut buf)
+        .inspect_err(|e| {
+            diag(
+                port,
+                "read_response",
+                format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+            )
+        })
+        .ok()?;
+    let status = buf
+        .split_whitespace()
+        .nth(1)
+        .or_else(|| {
+            diag(
+                port,
+                "missing_status",
+                format_args!("response_bytes={}", buf.len()),
+            );
+            None
+        })?
+        .parse()
+        .inspect_err(|_| {
+            diag(
+                port,
+                "parse_status",
+                format_args!("response_bytes={}", buf.len()),
+            )
+        })
+        .ok()?;
+    let body = buf
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .or_else(|| {
+            diag(
+                port,
+                "missing_header_separator",
+                format_args!("response_bytes={}", buf.len()),
+            );
+            None
+        })?;
     Some((status, body))
 }
 
@@ -786,17 +854,55 @@ fn fenced_bindable_port(claim: &str) -> (u16, std::fs::File, TcpListener) {
 /// `ui start` is being attempted.
 fn serve_health_200(listener: TcpListener) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let port = listener.local_addr().ok().map(|a| a.port()).unwrap_or(0);
         for stream in listener.incoming() {
-            let Ok(mut s) = stream else { break };
+            let Ok(mut s) = stream.inspect_err(|e| {
+                diag(
+                    port,
+                    "accept",
+                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                )
+            }) else {
+                break;
+            };
             let mut buf = [0u8; 2048];
-            if s.read(&mut buf).is_err() {
+            if s.read(&mut buf)
+                .inspect_err(|e| {
+                    diag(
+                        port,
+                        "read_request",
+                        format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                    )
+                })
+                .is_err()
+            {
                 continue;
             }
             // Closing with unread request bytes RSTs the peer; answer
             // then shutdown the write side so `read_to_string` sees EOF.
-            let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}" as &[u8]);
-            let _ = s.shutdown(std::net::Shutdown::Write);
-            let _ = s.read(&mut buf);
+            let _ = s
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}" as &[u8])
+                .inspect_err(|e| {
+                    diag(
+                        port,
+                        "write_response",
+                        format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                    )
+                });
+            let _ = s.shutdown(std::net::Shutdown::Write).inspect_err(|e| {
+                diag(
+                    port,
+                    "shutdown_write",
+                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                )
+            });
+            let _ = s.read(&mut buf).inspect_err(|e| {
+                diag(
+                    port,
+                    "drain_request",
+                    format_args!("io_kind={:?} raw_os_error={:?}", e.kind(), e.raw_os_error()),
+                )
+            });
         }
     })
 }
