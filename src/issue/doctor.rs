@@ -183,14 +183,30 @@ pub fn run(pm: &Pm) -> Result<Value> {
         .unwrap_or(true);
     let foreign = foreign_dirty(&pm.dir);
     let foreign_ok = foreign["ok"] == true;
-    let (lock_kind, lock_ok) = match pm.lock_state() {
-        crate::issue::LockState::Held => ("held", true),
-        crate::issue::LockState::Free => ("free", true),
-        crate::issue::LockState::LegacyUnknown => ("legacy_unknown", false),
-        crate::issue::LockState::IoUnknown(_) => ("io_unknown", false),
+    let lock = pm.lock_state();
+    let write_lock = match &lock {
+        crate::issue::LockState::Held => json!({"ok": true, "state": "held"}),
+        crate::issue::LockState::Free => json!({"ok": true, "state": "free"}),
+        crate::issue::LockState::Interrupted { paths, foreign } => json!({
+            "ok": false, "state": "interrupted", "paths": paths, "foreign": foreign,
+            "next": "a crashed writer left these paths; every write is refused until \
+                     they are resolved. Check `git status` and `cadence issue lint`, \
+                     then commit or discard exactly those paths — never foreign ones",
+        }),
+        crate::issue::LockState::LegacyUnknown => json!({
+            "ok": false, "state": "legacy_unknown",
+            "next": "an older binary's .write.lock; its owner cannot be identified. \
+                     Do not delete it as routine: the rollout owner clears it in a \
+                     quiescent migration after every pre-flock cadence process stops",
+        }),
+        crate::issue::LockState::IoUnknown(_) => json!({"ok": false, "state": "io_unknown"}),
     };
-    let write_lock =
-        json!({"ok": lock_ok, "state": lock_kind, "detail": pm.lock_state().to_string()});
+    let lock_ok = write_lock["ok"] == true;
+    let write_lock = {
+        let mut w = write_lock;
+        w["detail"] = json!(lock.to_string());
+        w
+    };
     let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok && lock_ok;
     Ok(json!({
         "ok": ok,

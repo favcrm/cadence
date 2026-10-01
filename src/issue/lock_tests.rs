@@ -49,6 +49,11 @@ fn lock_helper() {
     };
     let pm = Pm::at(Path::new(&std::env::var("CAD852_PM").unwrap())).unwrap();
     let _lock = pm.lock().unwrap();
+    if role == "hold_untracked" {
+        let dir = pm.dir.join("crashed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("issue.md"), "half a write\n").unwrap();
+    }
     if role == "hold_dirty" {
         let dir = pm.dir.join("crashed");
         std::fs::create_dir_all(&dir).unwrap();
@@ -235,7 +240,11 @@ fn a_symlinked_coordination_file_fails_closed() {
     std::fs::write(&target, "x").unwrap();
     std::fs::remove_file(&flock).unwrap();
     std::os::unix::fs::symlink(&target, &flock).unwrap();
-    assert!(pm.try_lock().is_err(), "a symlink must be refused");
+    let e = pm.try_lock().expect_err("a symlink must be refused");
+    assert!(
+        e.to_string().contains("cadence-write.flock"),
+        "path named: {e}"
+    );
     assert_eq!(std::fs::read(&target).unwrap(), b"x");
 }
 
@@ -354,4 +363,261 @@ fn doctor_reports_the_write_lock_state() {
     let r = crate::issue::doctor::run(&pm).unwrap();
     assert_eq!(r["write_lock"]["state"], "legacy_unknown", "{r}");
     assert_eq!(r["ok"], false, "{r}");
+}
+
+// ---- revision 2 (PR #629 reviews) -------------------------------------
+
+fn mkfifo(path: &Path) {
+    let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+/// Production always has long-lived foreign untracked files. A crash
+/// must not turn them into "interrupted" state.
+#[test]
+fn a_crash_with_a_preexisting_foreign_file_is_admitted_once_its_own_state_is_resolved() {
+    let (_tmp, pm) = tracker();
+    std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
+    std::fs::write(pm.dir.join("foreign/blob.txt"), "someone else's\n").unwrap();
+    let head = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let e = match poll_try_lock(&pm, Duration::from_secs(3)) {
+        Err(e) => e.to_string(),
+        Ok(Some(_)) => panic!("a crashed writer's staged index was admitted"),
+        Ok(None) => panic!("lock never freed after SIGKILL"),
+    };
+    assert!(e.contains("crashed/issue.md"), "{e}");
+    assert!(
+        !e.contains("untracked foreign/blob.txt"),
+        "a pre-existing file is not the crashed writer's: {e}"
+    );
+    // The writer's own leftovers resolved; the foreign file stays.
+    git(&pm.dir, &["reset", "-q", "--", "crashed/issue.md"]).unwrap();
+    std::fs::remove_dir_all(pm.dir.join("crashed")).unwrap();
+    assert!(
+        pm.try_lock().unwrap().is_some(),
+        "foreign file must not block"
+    );
+    assert!(pm.dir.join("foreign/blob.txt").exists());
+    assert_eq!(git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(), head);
+    assert!(!git(&pm.dir, &["ls-files"])
+        .unwrap()
+        .contains("foreign/blob.txt"));
+}
+
+/// The crashed writer's own untracked leftovers stay refused.
+#[test]
+fn a_crashed_writers_own_untracked_leftovers_are_still_refused() {
+    let (_tmp, pm) = tracker();
+    std::fs::write(pm.dir.join("foreign.txt"), "x").unwrap();
+    let (child, _) = spawn_writer(&pm, "hold_untracked", false);
+    sigkill(child);
+    let e = match poll_try_lock(&pm, Duration::from_secs(3)) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("own leftovers admitted"),
+    };
+    assert!(e.contains("crashed/issue.md"), "{e}");
+    assert!(!e.contains("untracked foreign.txt"), "{e}");
+}
+
+/// Doctor and the write path share one classifier: while every write
+/// is refused, doctor is not ok and names the paths.
+#[test]
+fn doctor_reports_an_interrupted_write_with_the_paths() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let _ = poll_try_lock(&pm, Duration::from_secs(3));
+    let r = crate::issue::doctor::run(&pm).unwrap();
+    assert_eq!(r["write_lock"]["state"], "interrupted", "{r}");
+    assert_eq!(r["write_lock"]["ok"], false, "{r}");
+    assert!(
+        r["write_lock"]["paths"]
+            .to_string()
+            .contains("crashed/issue.md"),
+        "{r}"
+    );
+    assert_eq!(r["ok"], false, "{r}");
+}
+
+#[test]
+fn doctor_stays_ok_after_a_crash_that_left_only_foreign_files() {
+    let (_tmp, pm) = tracker();
+    std::fs::write(pm.dir.join("foreign.txt"), "x").unwrap();
+    let (child, _) = spawn_writer(&pm, "hold", false);
+    sigkill(child);
+    let r = crate::issue::doctor::run(&pm).unwrap();
+    assert_eq!(r["write_lock"]["state"], "free", "{r}");
+    assert_eq!(r["write_lock"]["ok"], true, "{r}");
+}
+
+#[test]
+fn doctor_gives_legacy_unknown_a_next_step_that_is_not_deletion() {
+    let (_tmp, pm) = tracker();
+    std::fs::write(pm.dir.join(".write.lock"), "").unwrap();
+    let r = crate::issue::doctor::run(&pm).unwrap();
+    let next = r["write_lock"]["next"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(next.contains("quiescent"), "{r}");
+    assert!(next.contains("rollout owner"), "{r}");
+}
+
+#[test]
+fn a_pm_dir_without_git_is_a_clear_not_a_repository_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pm.yaml"),
+        "schema: 1\nnotes_dir: /var/www/agent-notes\n",
+    )
+    .unwrap();
+    let pm = Pm::at(dir.path()).unwrap();
+    for e in [
+        pm.try_lock().err().unwrap().to_string(),
+        pm.lock_for(Duration::from_millis(100))
+            .err()
+            .unwrap()
+            .to_string(),
+    ] {
+        assert!(e.contains("not a git repository"), "{e}");
+    }
+}
+
+/// `Pm::init` accepts a gitfile tracker (`--separate-git-dir`, a
+/// worktree); it must keep writing.
+#[test]
+fn a_gitfile_tracker_is_supported() {
+    let (tmp, pm) = tracker();
+    let store = tmp.path().join("gitstore");
+    std::fs::rename(pm.dir.join(".git"), &store).unwrap();
+    std::fs::write(
+        pm.dir.join(".git"),
+        format!("gitdir: {}\n", store.display()),
+    )
+    .unwrap();
+    assert_eq!(mk(&pm, tmp.path(), "via gitfile"), "CAD-1");
+    assert!(store.join("cadence-write.flock").is_file());
+    assert_eq!(pm.lock_state(), LockState::Free);
+}
+
+/// A delayed guard must not unlink a file a successor created.
+#[test]
+fn a_late_guard_does_not_unlink_a_successors_fence_file() {
+    let (_tmp, pm) = tracker();
+    let held = pm.lock().unwrap();
+    let legacy = pm.dir.join(".write.lock");
+    // Keep the old inode alive so the successor's file cannot reuse its
+    // number (a freed inode is recycled at once on tmpfs and ext4).
+    std::fs::hard_link(&legacy, pm.dir.parent().unwrap().join("old-inode")).unwrap();
+    std::fs::remove_file(&legacy).unwrap();
+    std::fs::write(&legacy, "successor's lock\n").unwrap();
+    drop(held);
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        b"successor's lock\n",
+        "the successor's file must survive the old guard"
+    );
+}
+
+#[test]
+fn a_fifo_or_directory_at_the_coordination_path_fails_closed() {
+    for kind in ["fifo", "dir"] {
+        let (_tmp, pm) = tracker();
+        drop(pm.lock().unwrap());
+        let flock = pm.dir.join(".git/cadence-write.flock");
+        std::fs::remove_file(&flock).unwrap();
+        if kind == "fifo" {
+            mkfifo(&flock);
+        } else {
+            std::fs::create_dir(&flock).unwrap();
+        }
+        let start = Instant::now();
+        let e = pm
+            .try_lock()
+            .err()
+            .unwrap_or_else(|| panic!("{kind} admitted"));
+        assert!(e.to_string().contains("cadence-write.flock"), "{kind}: {e}");
+        assert!(matches!(pm.lock_state(), LockState::IoUnknown(_)), "{kind}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{kind} hung");
+        assert!(pm.dir.join(".write.lock").symlink_metadata().is_err());
+    }
+}
+
+/// A probe racing a non-waiting `try_lock` must not make it see
+/// "busy" when nobody holds the lock.
+#[test]
+fn a_state_probe_does_not_make_try_lock_spuriously_busy() {
+    let (_tmp, pm) = tracker();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let spurious = std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = pm.lock_state();
+                std::thread::sleep(Duration::from_micros(300));
+            }
+        });
+        let mut n = 0;
+        for _ in 0..1500 {
+            match pm.try_lock().unwrap() {
+                Some(l) => drop(l),
+                None => n += 1,
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        n
+    });
+    assert_eq!(spurious, 0, "try_lock saw a lock nobody held");
+}
+
+/// The temp marker is created exclusively without following links,
+/// and stale ones from a crashed writer are swept under the lock.
+#[test]
+fn the_temp_marker_never_follows_a_symlink_and_stale_ones_are_swept() {
+    let (tmp, pm) = tracker();
+    let target = tmp.path().join("victim");
+    std::fs::write(&target, "precious").unwrap();
+    let git_dir = pm.dir.join(".git");
+    std::os::unix::fs::symlink(
+        &target,
+        git_dir.join(format!("cadence-write.tmp-{}", std::process::id())),
+    )
+    .unwrap();
+    std::fs::write(git_dir.join("cadence-write.tmp-999999"), "leaked").unwrap();
+    let got = pm.try_lock().unwrap();
+    assert!(got.is_some());
+    assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+    drop(got);
+    let left: Vec<_> = std::fs::read_dir(&git_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("cadence-write.tmp-")
+        })
+        .collect();
+    assert!(left.is_empty(), "stale tmp markers survived: {left:?}");
+}
+
+/// `.write.lock` as a FIFO or a symlink is a legacy lock of unknown
+/// owner; classifying it neither blocks nor follows.
+#[test]
+fn a_fifo_or_symlink_at_the_fence_path_is_legacy_unknown_and_never_blocks() {
+    for kind in ["fifo", "symlink"] {
+        let (tmp, pm) = tracker();
+        let legacy = pm.dir.join(".write.lock");
+        if kind == "fifo" {
+            mkfifo(&legacy);
+        } else {
+            std::fs::write(tmp.path().join("t"), crate::issue::pmlock::MARKER).unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("t"), &legacy).unwrap();
+        }
+        let start = Instant::now();
+        assert_eq!(pm.lock_state(), LockState::LegacyUnknown, "{kind}");
+        assert!(pm.try_lock().unwrap().is_none(), "{kind}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{kind} hung");
+        assert!(legacy.symlink_metadata().is_ok(), "{kind} was removed");
+    }
 }

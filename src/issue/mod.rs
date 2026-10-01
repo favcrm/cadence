@@ -645,7 +645,8 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 - Acceptance criteria are authored with cadence issue acceptance <ID>\n\
   --from <file> as an ordered - [ ]/- [x] checklist; dispatch enforcement\n\
   remains a later CAD-159 change.\n\
-- Every write is one git commit, serialised on `.write.lock`.\n";
+- Every write is one git commit, serialised by a kernel lock on\n\
+  `.git/cadence-write.flock` (`.write.lock` fences older binaries).\n";
 
 #[cfg(test)]
 mod lock_tests;
