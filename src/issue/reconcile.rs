@@ -556,6 +556,18 @@ fn safe_history_error(e: &str) -> String {
     crate::doctor::host::redact_argv(&[line])
 }
 
+/// The scrubbed history-load error when the sweep's walk failed, for
+/// every output consumer (CLI rows, the sync post-pass, the daemon
+/// tick) — `Some` only on `"state": "failed"`, so a caller prints it
+/// or skips it in one check instead of re-reading two JSON fields.
+pub fn history_failure(out: &Value) -> Option<&str> {
+    if out["history"]["state"].as_str() == Some("failed") {
+        Some(out["history"]["error"].as_str().unwrap_or("unknown"))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     pm: &Pm,

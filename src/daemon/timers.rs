@@ -639,8 +639,7 @@ impl Shared {
                 // stuck walk would starve them unseen. Log it so the
                 // condition is diagnosable (CAD-878); the next tick
                 // retries the walk.
-                if out["history"]["state"].as_str() == Some("failed") {
-                    let e = out["history"]["error"].as_str().unwrap_or("unknown");
+                if let Some(e) = crate::issue::reconcile::history_failure(&out) {
                     eprintln!(
                         "issue reconcile: status-line history failed ({e}); \
                          note-driven candidates parked this tick"

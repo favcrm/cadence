@@ -1727,8 +1727,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 // A failed history walk parks every note-derived
                 // candidate without producing a row — say so up
                 // front or the sweep reads as a quiet no-op (CAD-878).
-                if out["history"]["state"].as_str() == Some("failed") {
-                    let e = out["history"]["error"].as_str().unwrap_or("unknown");
+                if let Some(e) = reconcile::history_failure(&out) {
                     println!(
                         "history: tracker status-line walk failed ({e}); \
                          note-driven candidates stay parked this sweep"
@@ -1782,8 +1781,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             if !*dry_run {
                 match reconcile::run(&pm, None, false, "", state_dir, 0) {
                     Ok(rec) => {
-                        if rec["history"]["state"].as_str() == Some("failed") {
-                            let e = rec["history"]["error"].as_str().unwrap_or("unknown");
+                        if let Some(e) = reconcile::history_failure(&rec) {
                             eprintln!(
                                 "reconcile: status-line history failed ({e}); \
                                  note-driven candidates stayed parked"
