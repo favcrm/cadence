@@ -136,6 +136,10 @@ Bot reviews (Devin Review, CodeRabbit and similar) are advisory:
 - Never skip, ignore or weaken a test or check to get green.
 
 ### Local builds and tests
+- Before every push run `scripts/pre-push` (fmt, split-map sync, clippy,
+  ui typecheck and script contracts for what you changed; add `--tests` for
+  the changed integration binaries). After adding a `#[test]` to an
+  integration binary run `scripts/split-map-sync` to register it.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).
   Don't override `RUSTC_WRAPPER`. If a build fails in a strange way, rerun
   it once with `RUSTC_WRAPPER=` to rule sccache out.

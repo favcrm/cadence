@@ -226,6 +226,35 @@ and a full merge-group run when estimating a landing. Do not describe
 replay timings as measurements of a production-code PR: those changes
 currently receive the full fallback.
 
+## Local pre-push recipe (CAD-905, CAD-922)
+
+`scripts/pre-push` is the one command to run before pushing. It stops at
+the first failing step, judges every step by its exit code alone and prints
+one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
+
+1. `cargo fmt --all -- --check` (always);
+2. `scripts/split-map-sync --check` (always, well under a second);
+3. `cargo clippy --all-targets --locked -- -D warnings`, then the same with
+   `--features test-seam`, when Rust or Cargo files changed;
+4. `pnpm --dir ui run typecheck` when `ui/` changed;
+5. the `tests/scripts/*.py` contracts that CI's `fmt` job runs, when
+   `scripts/`, `.github/` or `tests/scripts/` changed;
+6. with `--tests`, `scripts/cadence-nextest --test <binary> --test-threads 2`
+   for each changed top-level `tests/*.rs`.
+
+"Changed" is the union of commits since `origin/main`, working-tree edits
+and untracked files; use `--base REF` to override and `--list` to print the
+plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
+never runs the full suite; the merge queue does that.
+
+`tests/split-map.toml` and `tests/split-map-board.toml` list each
+integration binary's tests. They are derived from the `#[test]` fns in
+`tests/<binary>.rs`: after adding, moving or deleting a test run
+`scripts/split-map-sync` to write the entries, or `--check` to see which file
+and section is out of step. CI runs the check and
+`tests/scripts/test_split_map_sync.py` / `test_pre_push.py` in the `fmt`
+job; the Rust guard `split_map_inventory` remains the exactly-once contract.
+
 ## Shared CI contracts
 
 The required `fmt` job runs the shared scope/runner, shard-coverage,
