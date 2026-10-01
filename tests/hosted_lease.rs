@@ -37,6 +37,49 @@ fn lease_file(dir: &Path) -> PathBuf {
     dir.join("lease.json")
 }
 
+/// Overwrite the lease file the way a real contender's critical
+/// section does: under `flock(LOCK_EX)` on `lease.json.lock`, then
+/// tmp + fsync + rename. A bare `fs::write` races the heartbeat — a
+/// renewal already inside its lock can overwrite the steal, so the
+/// fence the test waits for never trips and the teardown parks
+/// (CAD-991). The provider's renew also takes this lock, so the steal
+/// can only land between critical sections — never interleaved with
+/// one.
+fn steal_lease(dir: &Path) {
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("lease.json.lock"))
+        .unwrap();
+    // LOCK_NB retried under a deadline — a wedged holder must fail
+    // this test, not hang it (the provider's own renew bounds its
+    // wait the same way).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lease.json.lock stayed held past the steal deadline"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let path = lease_file(dir);
+    let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let stolen = json!({"holder": "intruder",
+                        "epoch": body["epoch"].as_u64().unwrap() + 5,
+                        "expires_unix": now_unix() + 600.0});
+    let tmp = dir.join(format!(".lease-steal.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, stolen.to_string()).unwrap();
+    File::open(&tmp).unwrap().sync_all().unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+}
+
 /// A `file:` lease under `dir` — `renew` 1s keeps the heartbeat fast so
 /// a stolen lease is detected inside the test's poll budget.
 fn lease_spec(dir: &Path, ttl_secs: u64) -> Hosted {
@@ -147,13 +190,10 @@ fn cad538_lease_loss_fences_every_write() {
     assert!(log.contains("Lease-Epoch: 1"), "{log}");
 
     // A foreign holder steals the file — the heartbeat's next renewal
-    // sees holder and epoch differ and trips the fence.
-    let body: Value =
-        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
-    let stolen = json!({"holder": "intruder",
-                        "epoch": body["epoch"].as_u64().unwrap() + 5,
-                        "expires_unix": now_unix() + 600.0});
-    std::fs::write(lease_file(dir.path()), stolen.to_string()).unwrap();
+    // sees holder and epoch differ and trips the fence. The steal
+    // takes the lease's own flock so it cannot race a renewal already
+    // inside its critical section (CAD-991).
+    steal_lease(dir.path());
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -381,16 +421,20 @@ fn cad538_stolen_lease_refuses_the_shutdown_flush() {
 
     // A foreign holder steals the file while the daemon runs — the
     // live heartbeat's next renewal sees holder and epoch differ and
-    // trips the fence. This poll must happen BEFORE the stop below:
-    // once `closing` is set serve stops accepting connections, so any
-    // RPC issued while the tail is parked at the gate would hang on
-    // the 700s client timeout and deadlock the rendezvous.
-    let body: Value =
-        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
-    let stolen = json!({"holder": "intruder",
-                        "epoch": body["epoch"].as_u64().unwrap() + 5,
-                        "expires_unix": now_unix() + 600.0});
-    std::fs::write(lease_file(dir.path()), stolen.to_string()).unwrap();
+    // trips the fence. The steal takes the lease's own flock so it
+    // cannot race a renewal already inside its critical section
+    // (CAD-991). The guard is armed before the steal: it drops before
+    // `d` (locals drop in reverse declaration order), so on a panic
+    // in the steal or the poll it signals `stop` itself — the
+    // daemon's drop has not run yet — and releases the snapshot
+    // barrier from a detached thread, so teardown can never wait on a
+    // partnerless gate (CAD-991: an 18-minute hang seen in CI). The
+    // poll must happen BEFORE the explicit stop below: once `closing`
+    // is set serve stops accepting connections, so an RPC issued
+    // while the tail is parked at the gate would hang on the 700s
+    // client timeout and deadlock the rendezvous.
+    let mut guard = GateGuard::armed(&gate, &stop);
+    steal_lease(dir.path());
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let h = d.rpc("health", json!({})).unwrap();
@@ -405,7 +449,6 @@ fn cad538_stolen_lease_refuses_the_shutdown_flush() {
     // and the tracker flush must refuse: a successor may already hold
     // the lease.
     stop.store(true, Ordering::SeqCst);
-    let mut guard = GateGuard::armed(&gate);
     gate.wait();
     guard.disarm();
 
@@ -1023,19 +1066,25 @@ fn cad538_hosted_config_off_by_default() {
     assert!(err.to_string().contains("bogouscheme"), "{err}");
 }
 
-/// Releases the shutdown gate if the test unwinds after asking serve
-/// to stop but before reaching the gate itself — otherwise serve parks
-/// at the gate forever and the shutdown join hangs. Armed only after
-/// `stop` is set (serve then always reaches the gate); disarmed once
-/// the test rendezvoused normally.
+/// Releases the shutdown gate if the test unwinds before reaching the
+/// gate itself — otherwise serve parks at the gate forever and the
+/// shutdown join hangs (CAD-991). `GateGuard` must be declared AFTER
+/// the `TestDaemon` it protects, so on an unwind it drops first
+/// (locals drop in reverse declaration order): it signals `stop`
+/// itself — the daemon's own drop has not run yet — then releases
+/// the barrier from a detached thread, so the guard itself can never
+/// park the test even if serve is wedged before the gate. Disarmed
+/// once the test rendezvoused normally.
 struct GateGuard {
     gate: Option<Arc<Barrier>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl GateGuard {
-    fn armed(gate: &Arc<Barrier>) -> Self {
+    fn armed(gate: &Arc<Barrier>, stop: &Arc<AtomicBool>) -> Self {
         Self {
             gate: Some(Arc::clone(gate)),
+            stop: Arc::clone(stop),
         }
     }
 
@@ -1047,7 +1096,15 @@ impl GateGuard {
 impl Drop for GateGuard {
     fn drop(&mut self) {
         if let Some(gate) = self.gate.take() {
-            gate.wait();
+            // The daemon's own stop flag is still unset — serve would
+            // never reach the barrier. Ask for the stop here; the
+            // releaser thread then rendezvouses whenever the tail
+            // arrives, while the daemon's own drop (the bounded
+            // `stop_and_join`) is what reports a wedge.
+            self.stop.store(true, Ordering::SeqCst);
+            thread::spawn(move || {
+                gate.wait();
+            });
         }
     }
 }
@@ -1276,12 +1333,10 @@ fn cad947_renewal_failure_during_startup_trips_the_fence() {
     let owned = state.path().to_path_buf();
     let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
     wait_for_lease_file(dir.path());
-    let body: Value =
-        serde_json::from_str(&std::fs::read_to_string(lease_file(dir.path())).unwrap()).unwrap();
-    let stolen = json!({"holder": "intruder",
-                        "epoch": body["epoch"].as_u64().unwrap() + 5,
-                        "expires_unix": now_unix() + 600.0});
-    std::fs::write(lease_file(dir.path()), stolen.to_string()).unwrap();
+    // The steal takes the lease's own flock — a renewal already inside
+    // its critical section would otherwise overwrite it and the
+    // startup write would land under a lease the daemon lost (CAD-991).
+    steal_lease(dir.path());
     // The dwell is 4s; give startup a generous margin to finish.
     let deadline = Instant::now() + Duration::from_secs(12);
     while !handle.is_finished() && Instant::now() < deadline {
