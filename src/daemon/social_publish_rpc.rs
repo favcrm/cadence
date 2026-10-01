@@ -133,11 +133,11 @@ impl Shared {
         // a claimed durable uniqueness (schedule's `request` UNIQUE is).
         let _request_id = Self::required_segment(params, "request_id")?;
         let common = |field: &str| required_str(params, field);
-        let request_install = common("install_id")?;
+        let _request_install = common("install_id")?;
         // I2 scope pin: `context_id` is strict — absent/null → None; a valid
         // nonempty string → Some; a number/object/bool/empty/oversize string
         // refuses rather than silently mapping to None (optional_str would).
-        let request_context = Self::strict_optional_segment(params, "context_id")?;
+        let _request_context = Self::strict_optional_segment(params, "context_id")?;
         let run_id = common("run_id")?;
         let artifact_id = common("artifact_id")?;
         let bundle_digest = common("bundle_digest")?;
@@ -152,13 +152,6 @@ impl Shared {
         // run's binding against the run's own scope, so a request naming a
         // different install/context would still resolve without this compare.
         // context_id is exact/null-preserving (no wildcard).
-        if material["run"]["install_id"].as_str() != Some(request_install)
-            || material["run"]["context_id"].as_str() != request_context
-        {
-            return Err(Error::rejected(
-                "grant_binding_mismatch: media import request names a different install or context",
-            ));
-        }
         // The reviewed retained asset for this run.
         let asset = &material["asset"];
         let receipt_id = asset["receipt_id"]

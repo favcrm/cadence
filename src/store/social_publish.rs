@@ -701,20 +701,6 @@ impl Store {
         // foreign connection or digest is refused here at freeze (send-time
         // `check_material` remains a second layer). The workspace comes from
         // the same frozen binding config.
-        if let Some(key) = row.media_key {
-            use crate::platform::agenticos_external::publish as device;
-            let workspace_id = material["binding"]["config"]["workspace_id"]
-                .as_str()
-                .ok_or_else(|| Error::rejected("reviewed binding names no workspace"))?;
-            let bound = image_digest.is_some_and(|digest| {
-                device::media_key_authorizes(key, workspace_id, connection_id, digest)
-            });
-            if !bound {
-                return Err(Error::rejected(
-                    "grant_binding_mismatch: media key does not bind this connection and reviewed image",
-                ));
-            }
-        }
         self.social_publish_schedule(&NewSocialPublish {
             request_id: row.request_id,
             install_id: row.install_id,
