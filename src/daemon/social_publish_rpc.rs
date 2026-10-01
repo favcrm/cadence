@@ -95,9 +95,7 @@ impl Shared {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         {
-            return Err(Error::rejected(format!(
-                "malformed parameter '{field}'"
-            )));
+            return Err(Error::rejected(format!("malformed parameter '{field}'")));
         }
         Ok(value)
     }
@@ -111,18 +109,15 @@ impl Shared {
             Some(Value::String(s)) => {
                 if s.is_empty()
                     || s.len() > 128
-                    || !s.bytes()
+                    || !s
+                        .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
                 {
-                    return Err(Error::rejected(format!(
-                        "malformed parameter '{field}'"
-                    )));
+                    return Err(Error::rejected(format!("malformed parameter '{field}'")));
                 }
                 Ok(Some(s.as_str()))
             }
-            Some(_) => Err(Error::rejected(format!(
-                "malformed parameter '{field}'"
-            ))),
+            Some(_) => Err(Error::rejected(format!("malformed parameter '{field}'"))),
         }
     }
 
@@ -136,13 +131,13 @@ impl Shared {
         // validated BEFORE any custody read or provider call. import writes
         // no durable row, so this is an idempotency/receipt shape bound, not
         // a claimed durable uniqueness (schedule's `request` UNIQUE is).
-        let _request_id = required_segment(params, "request_id")?;
+        let _request_id = Self::required_segment(params, "request_id")?;
         let common = |field: &str| required_str(params, field);
         let request_install = common("install_id")?;
         // I2 scope pin: `context_id` is strict — absent/null → None; a valid
         // nonempty string → Some; a number/object/bool/empty/oversize string
         // refuses rather than silently mapping to None (optional_str would).
-        let request_context = strict_optional_segment(params, "context_id")?;
+        let request_context = Self::strict_optional_segment(params, "context_id")?;
         let run_id = common("run_id")?;
         let artifact_id = common("artifact_id")?;
         let bundle_digest = common("bundle_digest")?;
