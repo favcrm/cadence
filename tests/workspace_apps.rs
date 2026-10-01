@@ -4323,12 +4323,37 @@ fn cad867_view_read_http_actor_gate_and_parity() {
     let manifest = w.source().join("app.md");
     let mtext = std::fs::read_to_string(&manifest).unwrap();
     std::fs::write(&manifest, mtext.replace("version: 0.1.0", "version: 0.2.0")).unwrap();
-    let proposed = w.upgrade_check(&installed);
-    let new_digest = proposed["digest"].as_str().unwrap().to_string();
-    let generation = installed["catalog_generation"]
+    // The second install above advanced the catalog, so the generation
+    // captured before it is now stale: upgrade_check must reject it —
+    // asserted on the raw RPC error, not a helper unwrap.
+    let stale_check = w.daemon.operator_rpc(
+        "app_workspace_upgrade_check",
+        json!({
+            "install_id":installed["install_id"], "source":w.source(),
+            "expected_digest":installed["digest"],
+            "expected_generation":installed["catalog_generation"]
+        }),
+    );
+    assert!(
+        stale_check
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("catalog generation is stale")),
+        "pre-second-install generation must reject as stale: {stale_check:?}"
+    );
+    // Re-read the install: the catalog generation moved under it, but
+    // its bundle digest is untouched — the upgrade pins the fresh
+    // generation against the original installed digest.
+    let refreshed = w.show(&id);
+    assert_eq!(
+        refreshed["digest"], installed["digest"],
+        "cross-install changed the target bundle"
+    );
+    let generation = refreshed["catalog_generation"]
         .as_str()
         .unwrap()
         .to_string();
+    let proposed = w.upgrade_check(&refreshed);
+    let new_digest = proposed["digest"].as_str().unwrap().to_string();
     w.daemon
         .operator_rpc(
             "app_workspace_upgrade",
