@@ -311,27 +311,33 @@ mod embedded {
         HashMap::from([
             (
                 "ibm-plex-sans-latin-400-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-400-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-400-normal.woff2")
+                    as &[u8],
             ),
             (
                 "ibm-plex-sans-latin-500-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-500-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-500-normal.woff2")
+                    as &[u8],
             ),
             (
                 "ibm-plex-sans-latin-600-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-600-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-sans-latin-600-normal.woff2")
+                    as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-400-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-400-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-400-normal.woff2")
+                    as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-500-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-500-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-500-normal.woff2")
+                    as &[u8],
             ),
             (
                 "ibm-plex-mono-latin-600-normal.woff2",
-                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-600-normal.woff2") as &[u8],
+                include_bytes!("../../ui/dist/assets/ibm-plex-mono-latin-600-normal.woff2")
+                    as &[u8],
             ),
         ])
     });
