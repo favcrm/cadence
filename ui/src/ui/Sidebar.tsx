@@ -1,21 +1,9 @@
-import { Fragment, type ReactNode } from "react";
-import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
 import type { AppMenu } from "../features/app-shell/CrmOutlet";
-import { navMatches } from "../features/issues/model";
-import { NAV, type Route, type Screen } from "../lib/router";
+import type { Route, Screen } from "../lib/router";
 import type { IssueCard, Project, Meta } from "../lib/types";
-import Link from "./Link";
 import { Logo } from "./Logo";
-import {
-  IconAgents,
-  IconApps,
-  IconHome,
-  IconOutbox,
-  IconProjects,
-  IconSettings,
-  IconWiki,
-} from "./icons";
+import { NavList, ProjectList } from "./NavList";
 
 interface Props {
   screen: Screen;
@@ -40,27 +28,10 @@ interface Props {
   appMenu?: AppMenu | null;
 }
 
-const NAV_ICONS: Record<string, ReactNode> = {
-  home: <IconHome />,
-  projects: <IconProjects />,
-  wiki: <IconWiki />,
-  apps: <IconApps />,
-  agents: <IconAgents />,
-  outbox: <IconOutbox />,
-  settings: <IconSettings />,
-};
-
 export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, sessionUser, appMenu = null }: Props) {
-  // "…" until the cards load; a stale list keeps its numbers.
-  const count = (key: string) => {
-    if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
-    const c = issueCounts(issues.data, key);
-    return { n: String(c.open), title: countLabel(c) };
-  };
-  const all = count("all");
   return (
-    <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[22px] pb-4 overflow-y-auto">
-      <div className="px-[7px] pb-[23px]">
+    <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4 overflow-y-auto">
+      <div className="px-[7px] pb-[14px]">
         <span className="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
           <Logo size={25} />
           <span>
@@ -68,66 +39,12 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
           </span>
         </span>
       </div>
-      <nav className="grid gap-[3px]" aria-label="Primary">
-        {NAV.map((item) => (
-          <Fragment key={item.screen}>
-            <Link
-              href={navHref(item.route)}
-              className="navlink"
-              aria-current={navMatches(screen, item.screen) ? "page" : undefined}
-            >
-              {NAV_ICONS[item.screen]}
-              {item.label}
-            </Link>
-            {item.screen === "apps" && appMenu && (
-              <div className="mt-[4px] mb-[2px]">
-                <div className="slabel mx-[11px] mb-[7px]">
-                  <span className="truncate" title={appMenu.title}>{appMenu.title}</span>
-                </div>
-                <nav aria-label={`${appMenu.title} sections`} className="grid gap-[2px] ml-[10px] border-l border-ink-700 pl-[6px]">
-                  {appMenu.sections.map((s) => (
-                    <Link
-                      key={s.label}
-                      href={s.href}
-                      className="navlink"
-                      aria-current={s.current ? "page" : undefined}
-                    >
-                      {s.label}
-                    </Link>
-                  ))}
-                </nav>
-              </div>
-            )}
-          </Fragment>
-        ))}
-      </nav>
-      <div className="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]">
+      <NavList screen={screen} navHref={navHref} appMenu={appMenu} />
+      <div className="slabel flex justify-between mx-[11px] mt-[18px] mb-[5px]">
         <span>Projects</span>
         <span className="text-[10px]">~/pm</span>
       </div>
-      <div className="grid gap-[2px]">
-        <Link href={projectHref("all")} className={`proj ${project === "all" ? "on" : ""}`}>
-          <span className="truncate">All projects</span>
-          <span className="num text-micro text-ink-500" title={all.title}>{all.n}</span>
-        </Link>
-        {projects.map((p) => (
-          <Link
-            key={p.key}
-            href={projectHref(p.key)}
-            className={`proj ${project === p.key ? "on" : ""}`}
-          >
-            <span className="truncate">{p.key}</span>
-            <span className="num text-micro text-ink-500" title={count(p.key).title}>
-              {p.prefix} {count(p.key).n}
-            </span>
-          </Link>
-        ))}
-        {projectsError && (
-          <span className="mx-[11px] mt-1 text-micro text-fail" role="alert" title={projectsError}>
-            could not load projects
-          </span>
-        )}
-      </div>
+      <ProjectList project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
       <div className="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
         <div className="slabel mb-1">session</div>
         {signedIn === true ? (

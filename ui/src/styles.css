@@ -152,14 +152,18 @@ body {
 }
 .navlink {
   display: flex;
-  min-height: 38px;
+  min-height: 32px;
   align-items: center;
-  gap: 11px;
-  padding: 0 11px;
-  border-radius: 4px;
+  gap: 10px;
+  padding: 0 9px;
+  border-radius: 5px;
   color: var(--color-ink-400);
   font-size: 13px;
   transition: background-color .16s ease, color .16s ease;
+}
+.navlink[data-parent-current] {
+  background: none;
+  color: var(--color-ink-100);
 }
 .navlink:hover {
   background: var(--color-ink-800);
@@ -168,6 +172,18 @@ body {
 .navlink[aria-current="page"] {
   background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
   color: var(--color-accent);
+}
+.navlink-sub {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12.5px;
+}
+/* The phone menu keeps touch-sized rows. */
+#mobile-navigation .navlink {
+  min-height: 40px;
+}
+#mobile-navigation .navlink-sub {
+  min-height: 36px;
 }
 .proj {
   display: grid;

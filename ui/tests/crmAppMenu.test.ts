@@ -195,18 +195,17 @@ const phoneLinks = () =>
 assert(phoneLinks().length === 3, "phone menu nests the CRM submenu");
 // Same hierarchy on phone: the CRM group follows the Apps cell
 // inside the main grid, ahead of Agents.
-const phoneGrid = () => host.querySelector("#mobile-navigation div.grid-cols-2");
-assert(phoneGrid(), "phone main grid renders");
+const phoneGrid = () => host.querySelector('#mobile-navigation > nav[aria-label="Workspace"]');
+assert(phoneGrid(), "phone main list renders");
 const phoneKids = () => Array.from(phoneGrid()?.children ?? []);
 const phoneAppsIdx = phoneKids().findIndex(
   (el) => el.tagName === "A" && (el.textContent ?? "").trim() === "Apps",
 );
-assert(phoneAppsIdx >= 0, "Apps cell renders in the phone grid");
+assert(phoneAppsIdx >= 0, "Apps cell renders in the phone list");
 const phoneGroup = phoneKids()[phoneAppsIdx + 1];
 assert(
   phoneGroup?.tagName === "DIV" &&
-    phoneGroup.getAttribute("aria-label") === "CRM sections" &&
-    phoneGroup.querySelectorAll("a").length === 3,
+    phoneGroup.querySelector('nav[aria-label="CRM sections"]')?.querySelectorAll("a").length === 3,
   "CRM group nests immediately under Apps on phone",
 );
 assert(
