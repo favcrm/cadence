@@ -10,6 +10,10 @@
 //! a forged `--as` whose env alias does not match the pane's, a revoked
 //! grant, and an expired grant.
 
+// The shared harness spawns `cadence`/bash/git children directly
+// (`Command::output`/`spawn`); the CAD-308 reaper rule is for the daemon.
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use serde_json::json;
