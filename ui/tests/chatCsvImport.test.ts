@@ -243,4 +243,4 @@ async function main() {
   console.log("chat csv import checks passed");
 }
 
-await main();
+void main();
