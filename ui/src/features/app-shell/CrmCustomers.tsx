@@ -275,7 +275,7 @@ function CustomerList({
         <Notice state="read-only">Read-only view. Record creation and edits are unavailable.</Notice>
       )}
       {scope.contextId === "" && viewer.operator && (
-        <Notice>Pick an App context above to list its customers.</Notice>
+        <Notice>Administrator CRM setup is required before customers open.</Notice>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
         <Loading>Reading customers…</Loading>
@@ -286,11 +286,11 @@ function CustomerList({
       {scope.contextId !== "" && viewer.operator && error === null && !loading && records.length === 0 && (
         <EmptyState
           name="customers"
-          title={committed === "" ? "No customers yet in this context" : "No customers match this search"}
+          title={committed === "" ? "No customers yet" : "No customers match this search"}
         >
           {committed === ""
             ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
-            : "Clear the search to see every record in this context."}
+            : "Clear the search to see every record."}
         </EmptyState>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
@@ -337,12 +337,6 @@ function CustomerList({
                     {viewProfile(record.profile).consentEmail}
                   </span>
                 ),
-              },
-              {
-                key: "rev",
-                header: "Rev",
-                cellClassName: "num text-ink-500",
-                cell: (record) => `r${record.revision}`,
               },
               {
                 key: "open",
@@ -556,14 +550,14 @@ function CustomerNew({
         <button type="button" className="lnk" onClick={onCancel}>
           ← Customers
         </button>{" "}
-        · Context {scope.contextId || "none"} — duplicates and stale writes are refused by the server.
+        — duplicates and stale writes are refused by the server.
       </p>
       {!canWrite ? (
         <Notice className="mt-2" state="read-only">
           Read-only view. A verified operator creates customer records.
         </Notice>
       ) : scope.contextId === "" ? (
-        <Notice className="mt-2">Pick an App context above before creating a customer.</Notice>
+        <Notice className="mt-2">Administrator CRM setup is required before creating a customer.</Notice>
       ) : (
         <div className="mt-2">
           <CustomerForm
@@ -675,10 +669,19 @@ function CustomerDrawer({
           Close
         </Button>
       </div>
-      <p className="num text-micro text-ink-500">
-        {recordId} · {scope.contextId || "no context"} · selection is chat context only — the server
-        re-proves scope on every send.
+      <p className="text-micro text-ink-500">
+        Selection is chat context only — the server re-proves scope on every send.
       </p>
+      <details className="crm-diag">
+        <summary className="text-micro text-ink-500">Record diagnostics</summary>
+        <p className="num text-micro text-ink-500 mt-1">
+          Record <span className="num">{recordId}</span>
+          {record !== null && (
+            <> · revision r{record.revision} · digest {record.digest.slice(0, 18)}…</>
+          )}{" "}
+          · scope <span className="num">{scope.contextId || "none"}</span>
+        </p>
+      </details>
       {loading && (
         <Loading className="mt-2">Reading the record…</Loading>
       )}
@@ -718,16 +721,6 @@ function CustomerDrawer({
                 term: "SMS consent",
                 value: <span className="chip">{view.consentSms ?? "unknown"}</span>,
               },
-              {
-                key: "revision",
-                term: "Revision",
-                value: (
-                  <span className="num">
-                    r{record.revision} ·{" "}
-                    <span title="Server content digest">{record.digest.slice(0, 18)}…</span>
-                  </span>
-                ),
-              },
             ]}
           />
           {consentTrail.length > 0 && (
@@ -760,12 +753,12 @@ function CustomerDrawer({
             editing ? (
               <div className="mt-3">
                 <h4 className="text-label font-medium text-ink-200 mb-2">
-                  Edit — expected revision r{record.revision}
+                  Edit — saving is refused if the record changed since you opened it
                 </h4>
                 <CustomerForm
                   key={record.revision}
                   initial={formFromProfile(record.profile)}
-                  submitLabel={`Save as r${record.revision + 1}`}
+                  submitLabel="Save changes"
                   pending={pending}
                   formError={formError}
                   onSubmit={(fields) => {

@@ -277,12 +277,18 @@ export default function AppShell({
     if (staleCtx) {
       setContextId(fallbackContext());
       setLinkNotice(
-        "The linked context is not active in this installation — the selection was cleared.",
+        installation.name === "crm"
+          ? "This link names a scope that is not active in this CRM installation, so nothing was opened. Ask an administrator to review the installation's CRM setup."
+          : "The linked context is not active in this installation — the selection was cleared.",
       );
     } else if (scopelessRecord) {
       // A record link without scope is ambiguous: refuse it with a
       // notice rather than guessing which context it names.
-      setLinkNotice("The record link names no context — the selection was cleared.");
+      setLinkNotice(
+        installation.name === "crm"
+          ? "This link does not say which scope the record belongs to, so nothing was opened. Ask an administrator to review the installation's CRM setup."
+          : "The record link names no context — the selection was cleared.",
+      );
       setContextId(fallbackContext());
     } else if (urlCtx !== null) {
       // The URL's ctx+record/appview are adopted verbatim: they were
@@ -481,6 +487,14 @@ export default function AppShell({
                 <p className="num text-micro text-ink-500">
                   {installId} · {installation.version} · context is managed inside the workspace screen
                 </p>
+              ) : installation.name === "crm" ? (
+                // Single-company CRM (CAD-1008): a bound scope shows no
+                // context/scope subtitle at all — the page is the
+                // company's records. Only the exceptional unbound
+                // ambiguous state below names a setup action.
+                contextId === "" && activeIds.length > 1 ? (
+                  <p className="text-micro text-ink-500">CRM setup is required before records open.</p>
+                ) : null
               ) : (
                 <p className="num text-micro text-ink-500">
                   {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
@@ -518,8 +532,12 @@ export default function AppShell({
                     }
                   >
                     {contextId === ""
-                      ? `Choose a context to open ${title}'s records.`
-                      : "Context:"}
+                      ? installation.name === "crm"
+                        ? "This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open."
+                        : `Choose a context to open ${title}'s records.`
+                      : installation.name === "crm"
+                        ? "Scope:"
+                        : "Context:"}
                   </p>
                   <ul
                     className={

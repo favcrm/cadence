@@ -295,7 +295,12 @@ await settle(() => assert(text().includes("Search Alpha One"), "list paints real
 assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
 assert(!host.querySelector(".crm-crumb"), "the CRM outlet does not duplicate the shell breadcrumb");
 assert(!host.querySelector('nav[aria-label="CRM sections"]'), "the outlet leaves navigation to the host sidebar");
-assert(text().includes("r1") && text().includes("granted"), "revision and consent cues render");
+assert(text().includes("granted"), "consent state renders in the list");
+// The customers table no longer leads with the diagnostic revision
+// column — record bookkeeping lives under the drawer's collapsed
+// Record diagnostics instead (CAD-1008).
+const custHeaders = Array.from(host.querySelectorAll('section[aria-label="Customers list"] th')).map((th) => th.textContent?.trim());
+assert(!custHeaders.includes("Rev"), "the customers table drops the diagnostic Rev column (CAD-1008)");
 assert(!text().includes("No records yet"), "populated list shows no empty state");
 
 // Search narrows through the peer; the route URL keeps scope only.
@@ -317,10 +322,10 @@ async function openPage(section: "customers" | "segments" | "campaigns") {
   await flush();
 }
 await openPage("segments");
-await settle(() => assert(text().includes("No segments yet in this context"), "segments empty state is server-driven"));
+await settle(() => assert(text().includes("No segments yet"), "segments empty state is server-driven"));
 assert(location.search.includes("crm=segments"), "submenu move routes");
 await openPage("campaigns");
-await settle(() => assert(text().includes("No campaigns yet in this context"), "campaigns empty state is server-driven"));
+await settle(() => assert(text().includes("No campaigns yet"), "campaigns empty state is server-driven"));
 assert(!host.querySelector('section[aria-label="Campaigns list"] input'), "campaigns list holds no inline builder");
 await openPage("customers");
 await settle(() => assert(text().includes("Search Alpha One"), "customers link restores the list"));

@@ -482,6 +482,35 @@
   padding: 0;
 }
 
+/* CAD-1008: the email content form and its saved-version preview sit
+   side by side on wide viewports — the operator writes and sees the
+   rendered email in one glance. Narrow viewports stack them so the
+   preview lands immediately after the content card, before approval. */
+.crm-compose {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  align-items: start;
+}
+
+@media (min-width: 1100px) {
+  .crm-compose {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* Diagnostic record metadata (ids, revisions, digests, workspace)
+   collapses behind this details block instead of leading the page. */
+.crm-diag summary {
+  cursor: pointer;
+  list-style: disclosure-closed;
+}
+
+.crm-diag[open] summary {
+  list-style: disclosure-open;
+}
+
 /* Campaign email preview: source/text forms scroll internally so a
    long render never pushes the document past narrow viewports. */
 .crm-preview {

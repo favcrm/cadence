@@ -227,7 +227,7 @@ export default function CustomerCsvImport({
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
           Import customers
         </h3>
-        <Notice className="mt-2">Pick an App context above before importing customers.</Notice>
+        <Notice className="mt-2">Administrator CRM setup is required before importing customers.</Notice>
       </section>
     );
   }
@@ -244,8 +244,7 @@ export default function CustomerCsvImport({
           <button type="button" className="lnk" onClick={onCancel} disabled={pending === "import"}>
             ← Customers
           </button>{" "}
-          · Context {scope.contextId} — the preview writes nothing; the import commits the rows
-          you approve below.
+          — the preview writes nothing; the import commits only the rows you approve below.
         </p>
       </div>
 
@@ -330,8 +329,11 @@ export default function CustomerCsvImport({
               {preview.summary.skip} already current · {preview.summary.error} refused
             </p>
             <p className="text-micro text-ink-500 mt-1">
-              Nothing is written yet. Preview token {preview.previewToken.slice(0, 24)}… binds these
-              exact bytes — changing the text above requires a new preview.
+              Nothing is written yet — this preview is bound to the exact CSV above; changing the
+              text requires a new preview.{" "}
+              <span className="num" title={`Preview token ${preview.previewToken}`}>
+                token {preview.previewToken.slice(0, 12)}…
+              </span>
             </p>
           </div>
           <DataTable

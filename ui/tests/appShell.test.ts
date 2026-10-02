@@ -769,7 +769,11 @@ async function mountCrm(url: string) {
   await React.act(async () => {
     cold.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
   });
-  await settle(() => assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), `crm mount binds ctx-a: ${url}`));
+  // A bound CRM scope renders no context/scope subtitle at all — the
+  // page is the company's records (CAD-1008). Wait for the outlet to
+  // paint any CRM section as the mount signal instead of a scope label.
+  await settle(() => assert(hostEl.querySelector("[data-outlet-heading]"), `crm mount binds ctx-a: ${url}`));
+  assert(!(hostEl.textContent ?? "").match(/Workspace|No context ·/), "bound CRM shows no scope/context subtitle");
   await flush(); await flush();
   return { hostEl, cold };
 }
@@ -781,7 +785,7 @@ const appsLinks = (hostEl: HTMLElement) =>
   const { hostEl, cold } = await mountCrm(
     "/app-installations/install-crm?ctx=ctx-a",
   );
-  await settle(() => assert((hostEl.textContent ?? "").includes("No customers yet in this context"), "customers list paints its server-driven empty state"));
+  await settle(() => assert((hostEl.textContent ?? "").includes("No customers yet"), "customers list paints its server-driven empty state"));
   equal(appsLinks(hostEl).length, 1, "customers renders exactly one Apps link — the shell row only");
   assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on customers");
   equal(
@@ -810,7 +814,7 @@ const appsLinks = (hostEl: HTMLElement) =>
   const { hostEl, cold } = await mountCrm(
     "/app-installations/install-crm?ctx=ctx-a&crm=segments",
   );
-  await settle(() => assert((hostEl.textContent ?? "").includes("No segments yet in this context"), "segments list paints its server-driven empty state"));
+  await settle(() => assert((hostEl.textContent ?? "").includes("No segments yet"), "segments list paints its server-driven empty state"));
   equal(appsLinks(hostEl).length, 1, "segments renders exactly one Apps link — the shell row only");
   assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on segments");
   equal(
@@ -829,7 +833,7 @@ const appsLinks = (hostEl: HTMLElement) =>
   const { hostEl, cold } = await mountCrm(
     "/app-installations/install-crm?ctx=ctx-a&crm=campaigns",
   );
-  await settle(() => assert((hostEl.textContent ?? "").includes("No campaigns yet in this context"), "campaigns list paints its server-driven empty state"));
+  await settle(() => assert((hostEl.textContent ?? "").includes("No campaigns yet"), "campaigns list paints its server-driven empty state"));
   equal(appsLinks(hostEl).length, 1, "campaigns renders exactly one Apps link — the shell row only");
   assert(!hostEl.querySelector('.crm-crumb'), "no inner CRM breadcrumb nav on campaigns");
   equal(

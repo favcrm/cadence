@@ -688,11 +688,18 @@ async function mountedFlow() {
   const createdId = new URLSearchParams(location.search).get("record");
   void createdId;
 
-  // Host-rendered preview: visual frame plus HTML/Text tabs from one revision.
-  await click(byText("button", "Render preview"));
+  // Host-rendered preview (CAD-1008): the saved revision renders
+  // automatically on save — no Render button — with the visual frame
+  // beside the content form. A manual Refresh re-renders the same
+  // saved version with the current sample name.
   await settle(() => {
     const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
-    assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "visual frame carries the host HTML");
+    assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "the saved revision auto-rendered");
+  });
+  await click(byText("button", "Refresh preview"));
+  await settle(() => {
+    const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
+    assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "refresh re-renders the saved revision");
   });
   await click(byText("button", "Text"));
   await flush();
@@ -727,7 +734,7 @@ async function mountedFlow() {
   await click(byText("button", "Submit editor as proposal (operator-submitted)"));
   await settle(() => assert(byText("button", "Discard"), "drifted proposal pends"));
   await fillInput("#cmp-subject", "Launch v3");
-  await click(byText("button", "Save as r3"));
+  await click(byText("button", "Save draft"));
   await settle(() => assert(text().includes("Saved revision 3"), "draft moves to r3"));
   await settle(() => assert(text().includes("Needs review (stale)"), "drifted proposal renders stale"));
   const staleApply = Array.from(host.querySelectorAll('[data-proposal]'))
@@ -827,11 +834,104 @@ async function mountedFlow() {
     ),
   );
 
-  // Open the full detail directly: frozen audience validity rechecks.
+  // Open the full detail directly: the saved campaign renders in the
+  // CAD-1008 task order — Content+Preview → approval → Audience/freeze
+  // → Sender → Test → Proposals → Final send — and the saved revision
+  // renders in the preview without a manual render click.
   await click(byText("button", "Open campaign detail →"));
   await settle(() => assert(host.querySelector('section[aria-label="Frozen audience"]'), "detail names its freeze panel"));
+  await settle(() => {
+    const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement;
+    assert(frame && (frame.getAttribute("srcdoc") ?? "").includes("HTML form"), "the saved campaign auto-renders its preview on open");
+  });
+  {
+    const labels = [
+      'form[aria-label="Email content"]',
+      'section[aria-label="Email preview"]',
+      'section[aria-label="Content approval"]',
+      'section[aria-label="Frozen audience"]',
+      'section[aria-label="SMTP sender"]',
+      'section[aria-label="Test send"]',
+      'section[aria-label="Assistant proposals"]',
+      'section[aria-label="Final send"]',
+    ];
+    const seen: number[] = [];
+    for (const sel of labels) {
+      const el = host.querySelector(sel);
+      assert(el, `panel renders: ${sel}`);
+      const pos = Array.from(host.querySelectorAll("form, section")).indexOf(el as Element);
+      seen.push(pos);
+    }
+    const ordered = seen.every((pos, i) => i === 0 || pos > seen[i - 1]);
+    assert(ordered, `panels render in the saved-campaign task order: ${seen.join(",")}`);
+  }
   await click(byText("button", "Recheck freeze"));
   await settle(() => assert(text().includes("Valid"), "freeze validity rechecks live"));
+
+  // CAD-1008 stale-render guard: a slow saved-render answer that lands
+  // after a newer save can never claim the new revision. Hold the next
+  // render response, save revision N+1, then release the stale answer —
+  // the preview must still render the newer saved revision, not the
+  // stale bytes.
+  const renderDoc = () => contents[openDoc().campaign_id];
+  const renderResponse = (revision: number, html: string, text: string, digest: string) =>
+    new Response(JSON.stringify({ render: {
+      campaign_id: renderDoc().campaign_id, install_id: "install-crm", context_id: "ctx-a",
+      revision, content_digest: renderDoc().content_digest, sample_first_name: null,
+      binding: { binding_id: "preview", revision: 1, digest: "binding-digest", preview_only: true },
+      preview_only: true, send_ready: false,
+      sender: { name: "Cadence CRM", address: "noreply@cadence.invalid" },
+      unsubscribe_url: "https://cadence.invalid/unsubscribe/preview",
+      html, text, render_digest: digest,
+    } }), { status: 200, headers: { "Content-Type": "application/json" } });
+  let heldRender: ((value: Response) => void) | null = null;
+  const innerRenderFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = new URL(String(input), "http://localhost");
+    if (init?.method === "POST" && url.pathname.endsWith("/render") && heldRender === null) {
+      return new Promise<Response>((resolve) => {
+        heldRender = resolve;
+      });
+    }
+    return innerRenderFetch(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+  // Refresh once: the held response answers with the current revision
+  // while we save the next one.
+  await click(byText("button", "Refresh preview"));
+  await settle(() => assert(heldRender !== null, "the refresh render is in flight"));
+  const heldRevision = renderDoc().revision;
+  // Save a newer revision while the stale render is outstanding.
+  await fillInput("#cmp-subject", "Launch v4");
+  await click(byText("button", "Save draft"));
+  await settle(() => assert(renderDoc().revision === heldRevision + 1, "the newer revision saved while the stale render was in flight"));
+  // Release the stale answer now that the saved revision has moved on.
+  const release = heldRender!;
+  heldRender = null;
+  await React.act(async () => { release(renderResponse(heldRevision, "<h1>STALE render</h1>", "STALE", `stale-${heldRevision}`)); });
+  await settle(() => {
+    const frame = host.querySelector('iframe[data-preview="visual"]') as HTMLIFrameElement | null;
+    assert(frame, "the preview re-rendered after the save");
+    const src = frame.getAttribute("srcdoc") ?? "";
+    assert(!src.includes("STALE"), "the stale render never claimed the new revision");
+    assert(src.includes("HTML form"), "the preview shows the current saved revision");
+  });
+  globalThis.fetch = innerRenderFetch;
+
+  // CAD-1008 receipt guard: a render answer whose revision/digest
+  // differs from the saved doc it was requested for is never shown as
+  // the current email — it surfaces a reload-needed mismatch instead.
+  const currentRevision = renderDoc().revision;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = new URL(String(input), "http://localhost");
+    if (init?.method === "POST" && url.pathname.endsWith("/render")) {
+      return renderResponse(currentRevision + 99, "<h1>FUTURE render</h1>", "FUTURE", `future-${currentRevision + 99}`);
+    }
+    return innerRenderFetch(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+  await click(byText("button", "Refresh preview"));
+  await settle(() => assert(text().includes("changed to r") || text().includes("reload the campaign"), "a mismatched render receipt demands a reload, not a false preview"));
+  assert(!text().includes("FUTURE render"), "the mismatched receipt never renders as the current email");
+  globalThis.fetch = innerRenderFetch;
 
   // Direct HTTP failures surface: an unknown campaign ID refuses.
   await React.act(async () => { root.unmount(); });

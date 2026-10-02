@@ -20,6 +20,14 @@ import {
   SEGMENT_OPS,
 } from "./segmentGrammar";
 
+/** Human-readable predicate: the same labels the rule form offers.
+ *  Unknown stored values fall back to the raw tokens, never hide. */
+export function describeRule(rule: SegmentPredicate): string {
+  const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
+  const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
+  return `${field} ${op} ${rule.value}`;
+}
+
 /**
  * Saved-rule segment screens inside the trusted CRM shell (CAD-784
  * over the CAD-780 audience engine). List, separate New page and a
@@ -243,7 +251,7 @@ function SegmentList({
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its segments.
+          Administrator CRM setup is required before segments open.
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
@@ -261,7 +269,7 @@ function SegmentList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && segments.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="segments" role="status">
-          <p className="font-medium text-ink-200">No segments yet in this context</p>
+          <p className="font-medium text-ink-200">No segments yet</p>
           <p className="mt-1">
             Create the first saved rule with New segment. Only real server rows appear here.
           </p>
@@ -279,7 +287,6 @@ function SegmentList({
               <tr>
                 <th scope="col">Name</th>
                 <th scope="col">Rules</th>
-                <th scope="col">Rev</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
                 </th>
@@ -295,7 +302,6 @@ function SegmentList({
                   <td className="num text-ink-300">
                     {segment.predicates.length} rule{segment.predicates.length === 1 ? "" : "s"}
                   </td>
-                  <td className="num text-ink-500">r{segment.revision}</td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(segment.id)}>
                       Open
@@ -430,8 +436,7 @@ function SegmentNew({
         <button type="button" className="lnk" onClick={onCancel}>
           ← Segments
         </button>{" "}
-        · Context {scope.contextId || "none"} — exact host preview counts render on the detail
-        after Create.
+        — exact recipient counts render on the detail after Create.
       </p>
       {!canWrite ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
@@ -439,7 +444,7 @@ function SegmentNew({
         </p>
       ) : scope.contextId === "" ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Pick an App context above before creating a segment.
+          Administrator CRM setup is required before creating a segment.
         </p>
       ) : (
         <form
@@ -695,9 +700,18 @@ function SegmentDrawer({
           Close
         </Button>
       </div>
-      <p className="num text-micro text-ink-500">
-        {segmentId} · {scope.contextId || "no context"}
-      </p>
+      <details className="crm-diag">
+        <summary className="text-micro text-ink-500">Record diagnostics</summary>
+        <p className="num text-micro text-ink-500 mt-1">
+          Segment <span className="num">{segmentId}</span> · scope{" "}
+          <span className="num">{scope.contextId || "none"}</span>
+          {segment !== null && (
+            <>
+              {" "}· revision r{segment.revision} · digest {segment.digest.slice(0, 18)}…
+            </>
+          )}
+        </p>
+      </details>
       {loading && (
         <p className="text-secondary text-ink-400 mt-2" role="status">
           Reading the segment…
@@ -725,20 +739,12 @@ function SegmentDrawer({
       )}
       {!loading && error === null && segment !== null && (
         <>
-          <dl className="crm-detail mt-2">
-            <div>
-              <dt>Revision</dt>
-              <dd className="num">
-                r{segment.revision} · <span title="Server rule digest">{segment.digest.slice(0, 18)}…</span>
-              </dd>
-            </div>
-          </dl>
           <section aria-label="Segment rules" className="mt-3">
             <h4 className="text-label font-medium text-ink-200">Rules ({segment.predicates.length})</h4>
             <ol className="crm-history">
               {segment.predicates.map((rule, index) => (
-                <li key={index} className="num text-label text-ink-300">
-                  {rule.field} {rule.op} {rule.value}
+                <li key={index} className="text-label text-ink-300">
+                  {describeRule(rule)}
                 </li>
               ))}
             </ol>
@@ -831,7 +837,7 @@ function SegmentEdit({
       }}
     >
       <h4 className="text-label font-medium text-ink-200">
-        Edit — expected revision r{segment.revision}
+        Edit — saving is refused if the segment changed since you opened it
       </h4>
       <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
         {(c) => (
@@ -860,13 +866,13 @@ function SegmentEdit({
       )}
       {formError && (
         <p className="text-label text-fail" role="alert">
-          {formError} A stale revision means another operator saved first — close and reopen to
-          review their rules before retrying.
+          {formError} If another operator saved first, close and reopen to review their rules
+          before retrying.
         </p>
       )}
       <div className="crm-toolbar">
         <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-          {`Save as r${segment.revision + 1}`}
+          Save changes
         </Button>
         <button type="button" className="lnk text-label" onClick={onCancel}>
           Discard edit

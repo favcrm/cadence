@@ -218,8 +218,7 @@ function CampaignList({
       <div className="crm-toolbar mb-4">
         <p className="text-secondary text-ink-300">
           Versioned email content with content-only approval. Audience freezes and test-send
-          receipts live on each campaign's detail page — the host stores no campaign-level
-          audience link beyond the named freeze.
+          receipts live on each campaign's page.
         </p>
         <span className="flex-1" />
         {canWrite && (
@@ -240,7 +239,7 @@ function CampaignList({
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above to list its campaigns.
+          Administrator CRM setup is required before campaigns open.
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
@@ -258,7 +257,7 @@ function CampaignList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && campaigns.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="campaigns" role="status">
-          <p className="font-medium text-ink-200">No campaigns yet in this context</p>
+          <p className="font-medium text-ink-200">No campaigns yet</p>
           <p className="mt-1">
             Create the first campaign with New campaign — audience, editor, preview and test-send
             all live there, never on this list. Only real server rows appear here.
@@ -275,10 +274,8 @@ function CampaignList({
           <table className="crm-table">
             <thead>
               <tr>
-                <th scope="col">Campaign</th>
                 <th scope="col">Subject</th>
-                <th scope="col">Rev</th>
-                <th scope="col">Status</th>
+                <th scope="col">Content</th>
                 <th scope="col">Latest send</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
@@ -288,15 +285,24 @@ function CampaignList({
             <tbody>
               {campaigns.map((campaign) => (
                 <tr key={campaign.campaignId}>
-                  <td className="num text-ink-100">{campaign.campaignId}</td>
-                  <td className="text-ink-300">{campaign.subject}</td>
-                  <td className="num text-ink-500">r{campaign.revision}</td>
+                  <td className="text-ink-100">
+                    {campaign.subject}
+                    <span className="num text-micro text-ink-500"> · {campaign.campaignId}</span>
+                  </td>
                   <td>
                     <span
                       className="chip"
-                      title={campaign.approval.valid ? "Content-only approval on this revision" : "No content approval on this revision"}
+                      title={
+                        campaign.approval.valid
+                          ? `The saved content is approved${campaign.approval.revision !== campaign.revision ? " on an earlier saved version" : ""}`
+                          : "The saved content is not approved yet"
+                      }
                     >
-                      {campaign.approval.valid ? `Approved r${campaign.approval.revision}` : "Draft"}
+                      {campaign.approval.valid
+                        ? campaign.approval.revision === campaign.revision
+                          ? "Approved"
+                          : "Needs review — edited since approval"
+                        : "Draft"}
                     </span>
                   </td>
                   <td className="num text-ink-300" data-send-state>
@@ -304,6 +310,17 @@ function CampaignList({
                       const send = latestSendByCampaign.get(campaign.campaignId);
                       if (send === undefined) {
                         return <span className="text-ink-500">—</span>;
+                      }
+                      if (send.state === "prepared") {
+                        return (
+                          <span
+                            className="chip crm-send-chip"
+                            data-state={send.state}
+                            title="Prepared but not yet approved — nothing was sent"
+                          >
+                            Pending send
+                          </span>
+                        );
                       }
                       const total =
                         send.counts.queued +
@@ -1792,6 +1809,7 @@ function CampaignWorkspace({
   onDoc,
   freezeId,
   freeze,
+  audienceSlot,
 }: {
   scope: AudienceScope;
   scopedChatMessage: string | null;
@@ -1803,6 +1821,11 @@ function CampaignWorkspace({
    *  the final-send gate reads both. */
   freezeId?: string;
   freeze?: { valid: boolean | null } | null;
+  /** CAD-1008: the saved campaign's audience/freeze panel, supplied by
+   *  the owning page so the task order renders Content+Preview →
+   *  approval → Audience → Sender → Test → Proposals → Final send.
+   *  `undefined` on the new-campaign page, which keeps its own layout. */
+  audienceSlot?: React.ReactNode;
 }) {
   const canWrite = viewer.operator && !viewer.readOnly;
   const [subject, setSubject] = useState(doc?.subject ?? "");
@@ -1815,6 +1838,7 @@ function CampaignWorkspace({
   const [render, setRender] = useState<ContentRender | null>(null);
   const [renderPending, setRenderPending] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
+  const [renderToken, setRenderToken] = useState(0);
   const [previewTab, setPreviewTab] = useState<"visual" | "html" | "text">("visual");
   const [sampleName, setSampleName] = useState("");
   const [approvePending, setApprovePending] = useState(false);
@@ -1849,10 +1873,75 @@ function CampaignWorkspace({
     setSubject(doc.subject);
     setPreheader(doc.preheader);
     setBlocks(blocksFromDoc(doc));
-    setRender(null);
     setTestReceipt(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docIdentity]);
+
+  // Saved-version email preview (CAD-1008): the host-rendered saved
+  // revision loads automatically on open, on every successful save and
+  // on Refresh — never the unsaved editor bytes. The async answer is
+  // dropped whenever the mounted campaign/revision or the request
+  // generation moved on, so a stale render can never claim the new
+  // saved revision.
+  const renderLive = useRef<{ campaign: string; doc: string; seq: number }>({
+    campaign: campaignId,
+    doc: docIdentity,
+    seq: 0,
+  });
+  renderLive.current.campaign = campaignId;
+  renderLive.current.doc = docIdentity;
+  useEffect(() => {
+    if (doc === null) {
+      setRender(null);
+      setRenderPending(false);
+      setRenderError(null);
+      return;
+    }
+    const seq = ++renderLive.current.seq;
+    const key = { campaign: campaignId, doc: docIdentity };
+    // The revision+digest the render is asked for — a server-side
+    // concurrent save can answer with newer content even when the
+    // client generation still matches, so the receipt is validated
+    // against the doc it was requested for before it can claim it.
+    const expected = doc === null ? null : { revision: doc.revision, digest: doc.contentDigest };
+    setRender(null);
+    setRenderPending(true);
+    setRenderError(null);
+    const controller = new AbortController();
+    contentClient
+      .render(scope, campaignId, {
+        sampleFirstName: sampleName.trim() === "" ? undefined : sampleName.trim(),
+      })
+      .then((value) => {
+        const live = renderLive.current;
+        if (controller.signal.aborted || live.seq !== seq || live.campaign !== key.campaign || live.doc !== key.doc) return;
+        const next = parseRender(value);
+        if (expected !== null && (next.revision !== expected.revision || next.contentDigest !== expected.digest)) {
+          // A concurrent save moved the revision past the request:
+          // surface the mismatch as a reload-needed state, never as
+          // the current editor's render.
+          setRender(null);
+          setRenderError(
+            `The saved campaign changed to r${next.revision} while the preview rendered — reload the campaign to see the current email.`,
+          );
+          return;
+        }
+        setRender(next);
+      })
+      .catch((err: unknown) => {
+        const live = renderLive.current;
+        if (controller.signal.aborted || live.seq !== seq || live.campaign !== key.campaign || live.doc !== key.doc) return;
+        setRenderError(friendlyCampaignError(err));
+      })
+      .finally(() => {
+        const live = renderLive.current;
+        if (!controller.signal.aborted && live.seq === seq && live.campaign === key.campaign && live.doc === key.doc) {
+          setRenderPending(false);
+        }
+      });
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope.installId, scope.contextId, campaignId, docIdentity, renderToken]);
 
   // The sender binding is host state — read on mount and whenever a
   // bind/rebind/revoke lands (`bindingToken`). A none-bound refusal
@@ -1996,26 +2085,144 @@ function CampaignWorkspace({
       .finally(() => setPending(false));
   };
 
-  const preview = () => {
-    if (doc === null) return;
-    setRenderPending(true);
-    setRenderError(null);
-    void contentClient
-      .render(scope, campaignId, sampleName.trim() === "" ? undefined : { sampleFirstName: sampleName.trim() })
-      .then((value) => setRender(parseRender(value)))
-      .catch((err: unknown) => setRenderError(friendlyCampaignError(err)))
-      .finally(() => setRenderPending(false));
-  };
+  // The editor diverged from the saved revision: the preview keeps
+  // naming the last saved bytes instead of implying live content.
+  // Blocks compare semantically — field order over the wire is not
+  // the draft's identity.
+  const blockKey = (block: CampaignBlock) =>
+    block.type === "button" ? `button:${block.label}${block.url}` : `${block.type}:${block.text}`;
+  const savedBlocks = doc?.blocks.map(blockKey) ?? [];
+  const draftBlocks = blocksToGrammar(blocks).map(blockKey);
+  const dirty =
+    doc !== null &&
+    (subject !== doc.subject ||
+      preheader !== doc.preheader ||
+      savedBlocks.length !== draftBlocks.length ||
+      savedBlocks.some((key, index) => key !== draftBlocks[index]));
 
   const updateBlock = (key: number, patch: Partial<EditorBlock>) => {
     setBlocks((prev) => prev.map((block) => (block.key === key ? { ...block, ...patch } : block)));
   };
 
-  return (
-    <div className="grid gap-3">
+  const previewBody =
+    doc === null ? (
+      <p className="text-label text-ink-400" data-preview="unsaved">
+        Save your draft to preview the email.
+      </p>
+    ) : (
+      <>
+        <div className="crm-field-row">
+          <div className="crm-field">
+            <label className="text-label text-ink-300" htmlFor="cmp-sample">
+              Sample first name (optional)
+            </label>
+            <input
+              id="cmp-sample"
+              className="field"
+              value={sampleName}
+              onChange={(e) => setSampleName(e.target.value)}
+              maxLength={40}
+              autoComplete="off"
+              placeholder="Ada"
+            />
+          </div>
+          <div>
+            <span className="text-label text-ink-300">Saved render</span>
+            <div className="mt-1">
+              <Button
+                size="sm"
+                loading={renderPending}
+                disabled={renderPending}
+                title="Re-render the last saved version with the current sample name"
+                onClick={() => setRenderToken((count) => count + 1)}
+              >
+                Refresh preview
+              </Button>
+            </div>
+          </div>
+        </div>
+        {renderError !== null && !renderPending && (
+          <p className="text-label text-fail" role="alert">
+            {renderError}{" "}
+            <button type="button" className="lnk" onClick={() => setRenderToken((count) => count + 1)}>
+              Retry
+            </button>
+          </p>
+        )}
+        {render === null && renderPending && (
+          <p className="text-label text-ink-500" role="status" data-preview="loading">
+            Rendering the saved email…
+          </p>
+        )}
+        {dirty && (
+          <p className="text-micro text-ink-500" data-preview="dirty">
+            Preview shows the last saved version. Save changes to refresh.
+          </p>
+        )}
+        {render !== null && (
+          <>
+            <p className="text-label text-ink-300">
+              <span className="chip" title="Sender material is host-locked preview-only bytes">
+                preview-only
+              </span>{" "}
+              <span className="num">
+                {render.sender.name} · {render.sender.address}
+              </span>
+            </p>
+            <div className="app-outlet-tabs" role="tablist" aria-label="Preview format">
+              {(
+                [
+                  ["visual", "Visual"],
+                  ["html", "HTML"],
+                  ["text", "Text"],
+                ] as ["visual" | "html" | "text", string][]
+              ).map(([tab, label]) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={previewTab === tab}
+                  className="app-outlet-tab"
+                  data-on={previewTab === tab || undefined}
+                  onClick={() => setPreviewTab(tab)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {previewTab === "visual" && (
+              <iframe
+                title={`Visual email preview, saved revision ${render.revision}`}
+                sandbox=""
+                srcDoc={render.html}
+                className="crm-preview-frame"
+                data-preview="visual"
+              />
+            )}
+            {previewTab !== "visual" && (
+              <pre className="crm-preview" data-preview={previewTab}>
+                {previewTab === "html" ? render.html : render.text}
+              </pre>
+            )}
+            <SenderPanel render={render} />
+          </>
+        )}
+      </>
+    );
+
+  const previewSection = (
+    <section aria-label="Email preview" className="card px-4 py-4 grid gap-3">
+      <h4 className="text-cardtitle font-medium text-ink-100">
+        Preview{doc !== null ? " — saved version" : ""}
+      </h4>
+      {previewBody}
+    </section>
+  );
+
+  const contentForm = (
       <form className="card px-4 py-4 grid gap-3" aria-label="Email content" onSubmit={save}>
         <h4 className="text-cardtitle font-medium text-ink-100">
-          Content {doc === null ? "— unsaved draft" : `— revision r${doc.revision}`}
+          Content {doc === null ? "— unsaved draft" : ""}
         </h4>
         <div className="crm-field-row">
           <Field
@@ -2249,13 +2456,14 @@ function CampaignWorkspace({
         ) : (
           <div>
             <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-              {doc === null ? "Create campaign (revision 1)" : `Save as r${doc.revision + 1}`}
+              {doc === null ? "Create campaign (revision 1)" : "Save draft"}
             </Button>
           </div>
         )}
       </form>
+  );
 
-      {doc !== null && (
+  const approvalSection = doc !== null && (
         <section aria-label="Content approval" className="card px-4 py-4 grid gap-2">
           <h4 className="text-cardtitle font-medium text-ink-100">Approval — content-only</h4>
           <p className="text-label text-ink-300">
@@ -2297,94 +2505,9 @@ function CampaignWorkspace({
             </div>
           )}
         </section>
-      )}
+  );
 
-      {doc !== null && (
-        <section aria-label="Email preview" className="card px-4 py-4 grid gap-3">
-          <h4 className="text-cardtitle font-medium text-ink-100">
-            Preview — host-rendered revision r{render?.revision ?? doc.revision}
-          </h4>
-          <div className="crm-field-row">
-            <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor="cmp-sample">
-                Sample first name (optional)
-              </label>
-              <input
-                id="cmp-sample"
-                className="field"
-                value={sampleName}
-                onChange={(e) => setSampleName(e.target.value)}
-                maxLength={40}
-                autoComplete="off"
-                placeholder="Ada"
-              />
-            </div>
-            <div>
-              <span className="text-label text-ink-300">Host render</span>
-              <div className="mt-1">
-                <Button size="sm" loading={renderPending} disabled={renderPending} onClick={preview}>
-                  Render preview
-                </Button>
-              </div>
-            </div>
-          </div>
-          {renderError && (
-            <p className="text-label text-fail" role="alert">
-              {renderError}
-            </p>
-          )}
-          {render !== null && (
-            <>
-              <p className="text-label text-ink-300">
-                <span className="chip" title="Sender material is host-locked preview-only bytes">
-                  preview-only
-                </span>{" "}
-                <span className="num">
-                  {render.sender.name} · {render.sender.address}
-                </span>
-              </p>
-              <div className="app-outlet-tabs" role="tablist" aria-label="Preview format">
-                {(
-                  [
-                    ["visual", "Visual"],
-                    ["html", "HTML"],
-                    ["text", "Text"],
-                  ] as ["visual" | "html" | "text", string][]
-                ).map(([tab, label]) => (
-                  <button
-                    key={tab}
-                    type="button"
-                    role="tab"
-                    aria-selected={previewTab === tab}
-                    className="app-outlet-tab"
-                    data-on={previewTab === tab || undefined}
-                    onClick={() => setPreviewTab(tab)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              {previewTab === "visual" && (
-                <iframe
-                  title={`Visual email preview, revision ${render.revision}`}
-                  sandbox=""
-                  srcDoc={render.html}
-                  className="crm-preview-frame"
-                  data-preview="visual"
-                />
-              )}
-              {previewTab !== "visual" && (
-                <pre className="crm-preview" data-preview={previewTab}>
-                  {previewTab === "html" ? render.html : render.text}
-                </pre>
-              )}
-              <SenderPanel render={render} />
-            </>
-          )}
-        </section>
-      )}
-
-      {doc !== null && (
+  const senderSection = doc !== null && (
         <section aria-label="SMTP sender" className="card px-4 py-4 grid gap-2">
           <h4 className="text-cardtitle font-medium text-ink-100">Sender binding</h4>
           {binding === undefined && bindingError === null && (
@@ -2417,9 +2540,9 @@ function CampaignWorkspace({
             />
           )}
         </section>
-      )}
+  );
 
-      {doc !== null && (
+  const testSection = doc !== null && (
         <section aria-label="Test send" className="card px-4 py-4 grid gap-2 crm-test">
           <h4 className="text-cardtitle font-medium text-ink-100">
             Test send — one operator address, real SMTP
@@ -2528,9 +2651,9 @@ function CampaignWorkspace({
             </dl>
           )}
         </section>
-      )}
+  );
 
-      {doc !== null && (
+  const proposalsSection = doc !== null && (
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
@@ -2673,20 +2796,55 @@ function CampaignWorkspace({
             </ol>
           )}
         </section>
-      )}
+  );
 
-      {doc !== null && freezeId !== undefined && (
-        <FinalSendPanel
-          scope={scope}
-          viewer={viewer}
-          campaignId={campaignId}
-          doc={doc}
-          freezeId={freezeId}
-          freeze={freeze ?? null}
-          binding={binding}
-          testEvidence={testReceipt}
-        />
-      )}
+  const finalSend = doc !== null && freezeId !== undefined && (
+    <FinalSendPanel
+      scope={scope}
+      viewer={viewer}
+      campaignId={campaignId}
+      doc={doc}
+      freezeId={freezeId}
+      freeze={freeze ?? null}
+      binding={binding}
+      testEvidence={testReceipt}
+    />
+  );
+
+  // New campaign (or a host without an audience slot): content first
+  // with the always-mounted preview beside it; the audience picker
+  // stays on the new page itself. Saved campaigns take the ordered
+  // task layout below.
+  if (audienceSlot === undefined) {
+    return (
+      <div className="grid gap-3">
+        <div className="crm-compose">
+          {contentForm}
+          {previewSection}
+        </div>
+        {approvalSection}
+        {senderSection}
+        {testSection}
+        {proposalsSection}
+        {finalSend}
+      </div>
+    );
+  }
+  // CAD-1008 saved campaign task order: Content+Preview → content
+  // approval → Audience/freeze → Sender → Test → Proposals → Final
+  // send. Outcomes (sends list) render on the detail page after this.
+  return (
+    <div className="grid gap-3">
+      <div className="crm-compose">
+        {contentForm}
+        {previewSection}
+      </div>
+      {approvalSection}
+      {audienceSlot}
+      {senderSection}
+      {testSection}
+      {proposalsSection}
+      {finalSend}
     </div>
   );
 }
@@ -2882,8 +3040,8 @@ function CampaignNew({
           <button type="button" className="lnk" onClick={onCancel}>
             ← Campaigns
           </button>{" "}
-          · Context {scope.contextId || "none"} — audience previews need no save; content preview,
-          test-send and proposals unlock after the first save.
+          — audience previews need no save; the email preview, test send and proposals unlock
+          after the first save.
         </p>
       </div>
       {!viewer.operator ? (
@@ -2896,7 +3054,7 @@ function CampaignNew({
         </p>
       ) : scope.contextId === "" ? (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Pick an App context above before creating a campaign.
+          Administrator CRM setup is required before creating a campaign.
         </p>
       ) : (
         <>
@@ -3122,11 +3280,20 @@ function CampaignDetail({
           <button type="button" className="lnk" onClick={onBack}>
             ← Campaigns
           </button>{" "}
-          <span className="num">
-            · {campaignId} · {scope.contextId || "no context"}
-            {doc !== null ? ` · r${doc.revision} · ${doc.contentDigest.slice(0, 18)}…` : ""}
-          </span>
+          <span className="num">· {campaignId}</span>
         </p>
+        <details className="crm-diag">
+          <summary className="text-micro text-ink-500">Record diagnostics</summary>
+          <p className="num text-micro text-ink-500 mt-1">
+            Campaign <span className="num">{campaignId}</span> · workspace{" "}
+            <span className="num">{scope.contextId || "none"}</span>
+            {doc !== null && (
+              <>
+                {" "}· revision r{doc.revision} · digest {doc.contentDigest.slice(0, 18)}…
+              </>
+            )}
+          </p>
+        </details>
       </div>
       {loading && (
         <p className="text-secondary text-ink-400" role="status">
@@ -3164,12 +3331,12 @@ function CampaignDetail({
             onDoc={setDoc}
             freezeId={freezeId}
             freeze={freeze}
-          />
-          <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
-            <h4 className="text-cardtitle font-medium text-ink-100">Frozen audience</h4>
+            audienceSlot={
+              <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
+            <h4 className="text-cardtitle font-medium text-ink-100">Audience &amp; freeze</h4>
             <p className="text-label text-ink-400">
-              Freezes are context-scoped rows addressed by operator-chosen IDs — the host stores
-              no campaign-to-audience link, so this panel names the freeze explicitly (default{" "}
+              Freezes are named workspace rows the operator addresses by ID — the host stores no
+              campaign-to-audience link, so this panel names the freeze explicitly (default{" "}
               <span className="num">{campaignId}-freeze-1</span>) and rechecks its live validity.
               Any segment, exclusion, consent or suppression drift reports invalid.
             </p>
@@ -3238,7 +3405,9 @@ function CampaignDetail({
                 </div>
               </dl>
             )}
-          </section>
+              </section>
+            }
+          />
           <CampaignSends scope={scope} viewer={viewer} campaignId={campaignId} />
         </>
       )}
