@@ -84,6 +84,7 @@ fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
         },
         &state.join("agents").join("w.provider.log"),
         &env,
+        None,
     )
 }
 

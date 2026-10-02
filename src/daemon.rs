@@ -59,6 +59,7 @@ mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
 mod social_publish_rpc;
+mod supervisor_grant;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;

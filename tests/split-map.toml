@@ -962,6 +962,7 @@ tests = [
     "review_verb_suite_lock_serializes",
     "review_verb_refuses_to_adopt_an_existing_dir",
     "review_verb_base_prepare_failure_marks_inconclusive",
+    "review_verb_isolates_unit_tests_via_test_command_lib",
     "review_verb_gates_with_the_base_config_when_the_pr_rewrites_it",
     "review_verb_gates_run_without_a_git_identity",
     "review_verb_ui_typecheck_gate_catches_a_ui_type_error",

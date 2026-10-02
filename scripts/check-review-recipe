@@ -33,6 +33,10 @@ def validate(recipe, metadata):
 
     commands = [(key, command) for key in ("prepare", "gates") for command in recipe[key]]
     commands += [(key, recipe[key]) for key in ("full_suite", "test_command")]
+    # CAD-799: the optional lib-test isolation template is checked the
+    # same way when the recipe declares it.
+    if "test_command_lib" in recipe:
+        commands.append(("test_command_lib", recipe["test_command_lib"]))
     errors = []
     for key, command in commands:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)

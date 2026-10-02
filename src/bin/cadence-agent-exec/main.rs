@@ -13,13 +13,16 @@
 //! sanity) is a pure unit-tested function in `policy`. The order is the
 //! contract: close inherited fds, gate the caller, resolve the target
 //! from the fixed name and vet its ids, validate argv, drop
-//! setgroups→setgid→setuid and verify, set no_new_privs, then act.
+//! seal bounding/ambient/securebits, setgroups→setgid→setuid and verify,
+//! explicitly empty capability sets, verify no_new_privs/seal, then act.
 //! Nothing runs as root after the drop; a defect before it is why this
 //! file stays small.
 
 // The policy module is pure and portable — it compiles and its unit
 // tests run on every target; only the syscall layer below is
 // Linux-only, so on other targets its items go unused.
+#[cfg(target_os = "linux")]
+mod capabilities;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod policy;
 
@@ -99,6 +102,13 @@ fn run() -> i32 {
         Ok(r) => r,
         Err(why) => return refuse(&why),
     };
+    // Bounding/ambient removal and locked securebits require supervisor-side
+    // authority. They happen before UID drop; explicit capset follows it.
+    let mut capability_seal = capabilities::Linux;
+    let last_cap = match capability_seal.prepare() {
+        Ok(last) => last,
+        Err(e) => return fail(&format!("capability seal preparation: {e}")),
+    };
     if let Err(e) = drop_to(agent.uid, agent.gid, &supplementary) {
         return fail(&format!("privilege drop: {e}"));
     }
@@ -109,8 +119,8 @@ fn run() -> i32 {
     // one-way and survives execve — the exec'd child can never regain
     // privilege through a setuid or file-capability exec — and a failed
     // prctl refuses the request outright.
-    if let Err(e) = set_no_new_privs() {
-        return fail(&format!("PR_SET_NO_NEW_PRIVS: {e}"));
+    if let Err(e) = capability_seal.finish(last_cap) {
+        return fail(&format!("capability seal verification: {e}"));
     }
     match request {
         policy::Request::Exec { env, argv } => exec(&agent, &env, &argv),
@@ -139,7 +149,7 @@ fn fail(why: &str) -> i32 {
 /// before `execve`. The flag is one-way and survives exec, so the
 /// exec'd child can never regain privilege through a setuid binary or
 /// a file-capability exec. A failed prctl is a refusal, not a warning.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn set_no_new_privs() -> std::io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());

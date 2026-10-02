@@ -53,6 +53,25 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pi;
+// The protected managed-Pi launch seam is Linux-only (openat2 + fd-exec +
+// NSS account topology). On other targets the whole module is a stub whose
+// `protected_prereqs_satisfied` still fails closed — a non-Linux build never
+// reaches a spawn through the split path.
+#[cfg(all(unix, target_os = "linux"))]
+pub(crate) mod pi_guest;
+
+#[cfg(not(all(unix, target_os = "linux")))]
+pub(crate) mod pi_guest {
+    use crate::error::{Error, Result};
+    /// Non-Linux builds fail closed: the protected launch seam does not exist
+    /// off Linux, so eligibility is permanently UNKNOWN.
+    pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
+        Err(Error::rejected(
+            "protected managed-Pi launch is Linux-only — openat2/fd-exec \
+             unavailable; eligibility UNKNOWN and refused",
+        ))
+    }
+}
 pub mod pty;
 pub mod registry;
 pub mod stdio;
@@ -607,11 +626,19 @@ pub fn build(
     // produced inline. `fake` resolves for any provider via the
     // registry's provider-agnostic lookup, so no bypass is needed here.
     registry::spec(&agent.provider, &agent.endpoint_kind)?;
+    // Only the PTY layer and the managed-Pi seam consume the fixed agent-UID
+    // launch context; every other provider/endpoint refuses a split launch
+    // here rather than silently executing as the protected operator. The
+    // managed-Pi constructor is reached only to fail closed inside `open`
+    // (the external protected prerequisites are unavailable → Err UNKNOWN).
+    require_split_launch_path(agent_uid, &agent.provider, &agent.endpoint_kind)?;
     match agent.endpoint_kind.as_str() {
         "managed" => match agent.provider.as_str() {
             "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path, env))),
             "claude" => Ok(Box::new(claude::ClaudeAdapter::new(hooks, log_path, env))),
-            "pi" => Ok(Box::new(pi::PiAdapter::new(hooks, log_path, env))),
+            "pi" => Ok(Box::new(pi::PiAdapter::new(
+                hooks, log_path, env, agent_uid,
+            ))),
             other => Err(crate::error::Error::rejected(format!(
                 "No managed adapter for provider '{other}' (implemented: codex, claude, pi)"
             ))),
@@ -680,6 +707,174 @@ pub fn build(
             "Endpoint kind '{other}' is not implemented \
              (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
+    }
+}
+
+fn require_split_launch_path(
+    agent_uid: Option<u32>,
+    provider: &str,
+    endpoint_kind: &str,
+) -> Result<()> {
+    if agent_uid.is_none() {
+        return Ok(());
+    }
+    // `pty` and `fake` carry their own split proofs. `managed`+`pi` is the
+    // single managed seam under construction (CAD-1012) — it constructs so
+    // `open` can reach the fail-closed protected-prereq gate, never to launch.
+    let allowed =
+        matches!(endpoint_kind, "pty" | "fake") || (endpoint_kind == "managed" && provider == "pi");
+    if !allowed {
+        return Err(crate::error::Error::rejected(
+            "This endpoint does not implement protected agent-UID launch; refusing operator-UID fallback",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod split_launch_tests {
+    use super::{build, require_split_launch_path, AdapterHooks, ProviderEnv};
+    use crate::store::Agent;
+    #[test]
+    fn actual_adapter_entrypoint_refuses_every_uncovered_provider_and_master() {
+        // managed/pi is the one constructed seam — it is covered separately
+        // below: build succeeds so `open` can reach the fail-closed
+        // protected-prereq gate, but no launch can occur. Every other
+        // provider/endpoint still refuses at construction.
+        for (provider, endpoint) in [
+            ("claude", "managed"),
+            ("codex", "managed"),
+            ("codex", "managed-ws"),
+            ("devin", "cloud"),
+        ] {
+            for alias in ["master", "fixture-worker"] {
+                let agent = Agent {
+                    alias: alias.into(),
+                    provider: provider.into(),
+                    endpoint_kind: endpoint.into(),
+                    role: if alias == "master" {
+                        "master"
+                    } else {
+                        "worker"
+                    }
+                    .into(),
+                    team_role: None,
+                    cwd: "/tmp".into(),
+                    sandbox: "".into(),
+                    instructions: None,
+                    thread_id: None,
+                    session_id: None,
+                    model: None,
+                    effort: None,
+                    pid: None,
+                    pid_start: None,
+                    endpoint: None,
+                    params: None,
+                    model_selection: None,
+                    quota: None,
+                    generation: None,
+                    state: "registered".into(),
+                    enabled: true,
+                    error: None,
+                    created: 0.0,
+                    updated: 0.0,
+                };
+                let hooks = AdapterHooks {
+                    on_event: Box::new(|_, _| panic!("unsupported provider emitted traffic")),
+                    on_request: Box::new(|_| panic!("unsupported provider requested authority")),
+                };
+                let result = build(
+                    &agent,
+                    hooks,
+                    std::path::Path::new("/nonexistent/fixture.log"),
+                    &ProviderEnv::refusing_providers(),
+                    Some(21001),
+                );
+                let Err(error) = result else {
+                    panic!("{provider}/{endpoint}/{alias} constructed");
+                };
+                assert!(
+                    error.to_string().contains("protected agent-UID launch"),
+                    "{error}"
+                );
+            }
+        }
+    }
+    /// managed+pi constructs under split so `open` reaches the protected
+    /// gate — but `open` itself must fail closed on the unavailable external
+    /// prerequisites. Construction is not launch authority.
+    #[test]
+    fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
+        let agent = Agent {
+            alias: "fixture-worker".into(),
+            provider: "pi".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: "/tmp".into(),
+            sandbox: "".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "registered".into(),
+            enabled: true,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let hooks = AdapterHooks {
+            on_event: Box::new(|_, _| {}),
+            on_request: Box::new(|_| {}),
+        };
+        let adapter = build(
+            &agent,
+            hooks,
+            std::path::Path::new("/nonexistent/fixture.log"),
+            &ProviderEnv::refusing_providers(),
+            Some(21001),
+        )
+        .unwrap_or_else(|e| panic!("managed/pi constructs under split: {e}"));
+        // open() must fail closed — the protected prerequisites are absent.
+        let e = match adapter.open(&agent) {
+            Err(e) => e,
+            Ok(_) => panic!("open succeeded with the prerequisites unavailable"),
+        };
+        assert!(e.to_string().contains("UNKNOWN"), "{e}");
+    }
+    #[test]
+    fn split_managed_and_remote_paths_refuse_before_constructors() {
+        // pi/managed constructs; every other managed/remote path refuses.
+        assert!(require_split_launch_path(Some(21001), "pi", "managed").is_ok());
+        for (provider, endpoint) in [
+            ("claude", "managed"),
+            ("codex", "managed"),
+            ("codex", "managed-ws"),
+            ("devin", "cloud"),
+            ("pi", "managed-ws"),
+            ("pi", "cloud"),
+            ("pi", "unknown"),
+        ] {
+            assert!(
+                require_split_launch_path(Some(21001), provider, endpoint).is_err(),
+                "{provider}/{endpoint}"
+            );
+            assert!(require_split_launch_path(None, provider, endpoint).is_ok());
+        }
+    }
+    #[test]
+    fn pty_retains_its_own_profile_gate_and_fake_is_not_production_coverage() {
+        assert!(require_split_launch_path(Some(21001), "devin", "pty").is_ok());
+        assert!(require_split_launch_path(Some(21001), "claude", "pty").is_ok());
+        assert!(require_split_launch_path(Some(21001), "pi", "fake").is_ok());
     }
 }
 
