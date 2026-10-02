@@ -163,14 +163,30 @@ where
 }
 
 /// `openat2`-relative open of a canonical absolute `path`, walking each
-/// component beneath the pinned `/` dirfd with per-hop directory checks.
-/// Intermediates must be directories; the leaf is opened with `kind` flags.
-/// This is the single-component convenience form used where the caller only
-/// needs the leaf verified (every ancestor still must be a non-symlink dir,
-/// but its owner/mode is the caller's `verify_skeleton`/`verify_view` job via
-/// `check`). Non-Linux refuses.
+/// component beneath the pinned `/` dirfd. This is the exec-target walk used
+/// by `open_bound`: every ancestor must be an **immutable root-owned**
+/// directory — owned by uid 0 and not group- or other-writable — so no
+/// intermediate a guest or group could reshape ever sits on the path to a
+/// binary the kernel will exec. The leaf itself is `fstat`-checked by the
+/// caller (owner/mode/ELF/digest). Non-Linux refuses.
 pub(crate) fn open_at2(path: &Path, kind: OpenKind) -> Result<OwnedFd> {
-    open_walk_kind(path.to_string_lossy().as_ref(), kind, |_, _| Ok(()))
+    open_walk_kind(path.to_string_lossy().as_ref(), kind, |meta, walked| {
+        if meta.uid() != 0 {
+            return Err(Error::rejected(format!(
+                "{walked}: exec-path ancestor owned by uid {} not 0 — an exec \
+                 target must sit under root-owned immutable dirs",
+                meta.uid()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(Error::rejected(format!(
+                "{walked}: exec-path ancestor is group/other-writable (mode {:04o}) \
+                 — refuse a reshapeable intermediate",
+                meta.mode() & 0o7777
+            )));
+        }
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -409,16 +425,14 @@ impl ProtectedTopology {
         }
     }
 
-    /// Verify the per-alias view slots exist in the exact pre-provisioned
-    /// shape. `…/<alias-sha256>` and its `durable` + `<generation>` parents are
-    /// supervisor:cadence 0750; the guest leaf dirs under them are
-    /// guest:guest 0700. A missing or mis-owned slot refuses — the source
-    /// never creates a privileged node. Every ancestor on the way to a leaf
-    /// is checked against the view policy.
-    pub(crate) fn verify_view(&self, segs: &Segments, _role: Role) -> Result<()> {
+    /// The hop policy for the dynamic per-alias view: the skeleton rows plus
+    /// the alias/generation segment rows this launch names. Both `verify_view`
+    /// and `view_dir` walk against this so the per-hop check knows every
+    /// intermediate on the protected view path — an alias or generation dir
+    /// that is not in the policy is refused.
+    fn view_policy(&self, segs: &Segments) -> HopPolicy {
         let base = format!("/srv/cadence/guest-views/{}", segs.alias_hex());
         let gen = segs.generation_hex();
-        // Expected owner/mode per hop, longest-path first for the leaf lookup.
         let mut map = self.skeleton_policy().map;
         for (p, u, g, m) in [
             (base.clone(), self.supervisor, self.shared, 0o750u32),
@@ -452,7 +466,19 @@ impl ProtectedTopology {
                 0o700,
             ));
         }
-        let policy = HopPolicy { map };
+        HopPolicy { map }
+    }
+
+    /// Verify the per-alias view slots exist in the exact pre-provisioned
+    /// shape. `…/<alias-sha256>` and its `durable` + `<generation>` parents are
+    /// supervisor:cadence 0750; the guest leaf dirs under them are
+    /// guest:guest 0700. A missing or mis-owned slot refuses — the source
+    /// never creates a privileged node. Every ancestor on the way to a leaf
+    /// is checked against the view policy.
+    pub(crate) fn verify_view(&self, segs: &Segments, _role: Role) -> Result<()> {
+        let base = format!("/srv/cadence/guest-views/{}", segs.alias_hex());
+        let gen = segs.generation_hex();
+        let policy = self.view_policy(segs);
         // supervisor-owned parents
         for (path, mode) in [
             (base.clone(), 0o750u32),
@@ -498,11 +524,6 @@ impl ProtectedTopology {
         self.check_with(n.path, n.owner, n.group, n.mode, n.is_dir, &policy)
     }
 
-    fn check(&self, path: &str, uid: u32, gid: u32, mode: u32, is_dir: bool) -> Result<OwnedFd> {
-        let policy = self.skeleton_policy();
-        self.check_with(path, uid, gid, mode, is_dir, &policy)
-    }
-
     /// Walk `path` component-by-component beneath the held root, checking each
     /// intermediate's owner/mode against `policy` (a hop absent from the map
     /// must still be a non-world-writable directory), then `fstat` the leaf.
@@ -517,34 +538,13 @@ impl ProtectedTopology {
     ) -> Result<OwnedFd> {
         #[cfg(target_os = "linux")]
         {
-            let hop_ok = |meta: &std::fs::Metadata, walked: &str| -> Result<()> {
-                match policy.lookup(walked) {
-                    Some((u, g, m)) => {
-                        if meta.uid() != u || meta.gid() != g || meta.mode() & 0o7777 != m {
-                            return Err(Error::rejected(format!(
-                                "{walked}: ancestor owned {}:{:o} mode {:04o}, expected \
-                                 {u}:{g} mode {m:04o}",
-                                meta.uid(),
-                                meta.gid(),
-                                meta.mode() & 0o7777
-                            )));
-                        }
-                    }
-                    None => {
-                        // No policy row: still must be a dir that a guest or
-                        // world writer cannot reshape — refuse world-writable.
-                        if meta.mode() & 0o002 != 0 {
-                            return Err(Error::rejected(format!(
-                                "{walked}: ancestor is world-writable — refusing to walk \
-                                 beneath a reshapeable intermediate"
-                            )));
-                        }
-                    }
-                }
-                Ok(())
-            };
-            let fd = open_walk(&self.root, path, OpenKind::Dir, hop_ok)
-                .map_err(|e| Error::rejected(format!("protected node {path}: {e}")))?;
+            let fd = open_walk(
+                &self.root,
+                path,
+                OpenKind::Dir,
+                protected_hop_ok(policy, self.guest),
+            )
+            .map_err(|e| Error::rejected(format!("protected node {path}: {e}")))?;
             let meta = fd_metadata(&fd)?;
             if is_dir && !meta.is_dir() {
                 return Err(Error::rejected(format!("{path}: not a directory")));
@@ -585,7 +585,60 @@ impl ProtectedTopology {
                 )
             }
         };
-        self.check(&path, self.supervisor, self.shared, 0o750, true)
+        // Walk the view path under the *view* policy — the alias/generation
+        // segments have their own rows; a skeleton-only policy would refuse
+        // them as unprofiled.
+        let policy = self.view_policy(segs);
+        self.check_with(&path, self.supervisor, self.shared, 0o750, true, &policy)
+    }
+}
+
+/// The per-hop policy check for a *protected* (skeleton or view) path. A hop
+/// must appear in `policy` (an unnamed ancestor on a protected path refuses —
+/// we never walk beneath a node the topology does not name), match its owner
+/// and exact mode, AND be supervisor-owned non-group/other-writable: a
+/// guest-owned or group-writable intermediate can be reshaped by the guest or
+/// a shared-group member even when its row matches, so both are refused.
+#[cfg(target_os = "linux")]
+fn protected_hop_ok(
+    policy: &HopPolicy,
+    guest_uid: u32,
+) -> impl Fn(&std::fs::Metadata, &str) -> Result<()> + '_ {
+    move |meta, walked| {
+        match policy.lookup(walked) {
+            Some((u, g, m)) => {
+                if meta.uid() != u || meta.gid() != g || meta.mode() & 0o7777 != m {
+                    return Err(Error::rejected(format!(
+                        "{walked}: ancestor owned {}:{} mode {:04o}, expected \
+                         {u}:{g} mode {m:04o}",
+                        meta.uid(),
+                        meta.gid(),
+                        meta.mode() & 0o7777
+                    )));
+                }
+            }
+            None => {
+                return Err(Error::rejected(format!(
+                    "{walked}: ancestor has no topology policy — refusing to \
+                     walk beneath an unprofiled protected intermediate"
+                )));
+            }
+        }
+        if meta.uid() == guest_uid {
+            return Err(Error::rejected(format!(
+                "{walked}: protected ancestor is guest-owned (uid {}) — the \
+                 guest must not own a dir on a protected path",
+                meta.uid()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(Error::rejected(format!(
+                "{walked}: protected ancestor is group/other-writable \
+                 (mode {:04o})",
+                meta.mode() & 0o7777
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -687,29 +740,131 @@ mod tests {
         assert_eq!(relative_segments("/a/b/c").unwrap(), vec!["a", "b", "c"]);
     }
 
-    /// Writable-intermediate refusal: an ancestor the walker has no policy row
-    /// for that is world-writable must refuse — `RESOLVE_NO_SYMLINKS` does not
-    /// stop a rename under a writable parent, so the per-hop check must.
+    /// A policy covering the tempdir-anchor tree: each named hop maps to its
+    /// real owner/mode. `guest_uid` is chosen as a non-0 uid distinct from the
+    /// test files' owner (which is the real euid — typically 0 in the sandbox,
+    /// or the agent uid).
+    fn policy_for(paths: &[(&str, u32, u32, u32)]) -> HopPolicy {
+        HopPolicy {
+            map: paths
+                .iter()
+                .map(|(p, u, g, m)| (p.to_string(), *u, *g, *m))
+                .collect(),
+        }
+    }
+
+    /// The real `protected_hop_ok` refuses a hop with no policy row — a
+    /// protected path never walks beneath an intermediate the topology does
+    /// not name.
     #[test]
-    fn world_writable_intermediate_is_refused() {
+    fn unknown_policy_ancestor_on_protected_path_refuses() {
         let base = tempfile::tempdir().unwrap();
-        let w = base.path().join("a");
-        std::fs::create_dir_all(w.join("b")).unwrap();
-        // Make the intermediate world-writable.
-        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::create_dir_all(base.path().join("a/b")).unwrap();
         let root = anchor(base.path());
-        // Policy with no row for /a -> default rule refuses world-writable.
-        let policy = HopPolicy { map: vec![] };
-        let hop_ok = |meta: &std::fs::Metadata, walked: &str| -> Result<()> {
-            if policy.lookup(walked).is_none() && meta.mode() & 0o002 != 0 {
-                return Err(Error::rejected(format!(
-                    "{walked}: ancestor is world-writable"
-                )));
-            }
-            Ok(())
-        };
-        let e = open_walk(&root, "/a/b", OpenKind::Dir, hop_ok).unwrap_err();
-        assert!(e.to_string().contains("world-writable"), "{e}");
+        // Policy knows only "/a" — "/a/b"'s walk hits "/a" (has row) then the
+        // leaf; but "/a" row must match or fail. Give "/a" its real ids.
+        let meta_a = fd_metadata(&anchor(&base.path().join("a"))).unwrap();
+        // Policy empty: even "/a" has no row -> refuse.
+        let empty = policy_for(&[]);
+        let e = open_walk(
+            &root,
+            "/a/b",
+            OpenKind::Dir,
+            protected_hop_ok(&empty, 99999),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no topology policy"), "{e}");
+        let _ = meta_a;
+    }
+
+    /// A protected ancestor whose recorded owner/mode does not match its
+    /// policy row refuses — an owner/mode flip under us is caught by the
+    /// per-hop check, not just the leaf.
+    #[test]
+    fn ancestor_owner_mode_mismatch_refuses() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a/b")).unwrap();
+        let root = anchor(base.path());
+        let meta_a = fd_metadata(&anchor(&base.path().join("a"))).unwrap();
+        // Policy expects /a to be a DIFFERENT owner than it actually is.
+        let wrong_owner = policy_for(&[(
+            "/a",
+            meta_a.uid() + 1111,
+            meta_a.gid(),
+            meta_a.mode() & 0o7777,
+        )]);
+        let e = open_walk(
+            &root,
+            "/a/b",
+            OpenKind::Dir,
+            protected_hop_ok(&wrong_owner, 99999),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("ancestor owned"), "{e}");
+    }
+
+    /// A group-writable or guest-owned protected ancestor refuses even when
+    /// its policy row otherwise matches — the extra not-reshapeable rule.
+    #[test]
+    fn group_writable_or_guest_owned_protected_ancestor_refuses() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a/b")).unwrap();
+        let meta_a = fd_metadata(&anchor(&base.path().join("a"))).unwrap();
+        let root = anchor(base.path());
+        // Case 1: policy row matches, but /a is group-writable.
+        std::fs::set_permissions(
+            base.path().join("a"),
+            std::fs::Permissions::from_mode(0o770),
+        )
+        .unwrap();
+        let p = policy_for(&[("/a", meta_a.uid(), meta_a.gid(), 0o770)]);
+        let e = open_walk(&root, "/a/b", OpenKind::Dir, protected_hop_ok(&p, 99999)).unwrap_err();
+        assert!(e.to_string().contains("group/other-writable"), "{e}");
+        // Case 2: policy row matches, but /a is "guest-owned" (the guest uid).
+        std::fs::set_permissions(
+            base.path().join("a"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let p2 = policy_for(&[("/a", meta_a.uid(), meta_a.gid(), 0o750)]);
+        let e2 = open_walk(
+            &root,
+            "/a/b",
+            OpenKind::Dir,
+            protected_hop_ok(&p2, meta_a.uid()), // guest_uid == /a's owner
+        )
+        .unwrap_err();
+        assert!(e2.to_string().contains("guest-owned"), "{e2}");
+    }
+
+    /// A hop-by-hop rename under a held anchor: swap the leaf dir for a fresh
+    /// one after the parent dirfd is held — the leaf `fstat` still must see
+    /// the expected owner/mode, and a swapped-in foreign-owned dir refuses.
+    /// This is the substitution-under-writable-parent class the per-hop rule
+    /// plus the leaf check together close.
+    #[test]
+    fn leaf_substitution_under_anchor_is_restat_checked() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a/b")).unwrap();
+        // Make /a supervisor-like: non-group/other-writable so the hop passes.
+        std::fs::set_permissions(
+            base.path().join("a"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let root = anchor(base.path());
+        let meta_a = fd_metadata(&anchor(&base.path().join("a"))).unwrap();
+        let p = policy_for(&[("/a", meta_a.uid(), meta_a.gid(), 0o750)]);
+        // First walk succeeds and yields the leaf.
+        let leaf = open_walk(&root, "/a/b", OpenKind::Dir, protected_hop_ok(&p, 99999)).unwrap();
+        assert!(fd_metadata(&leaf).unwrap().is_dir());
+        // Swap b for a file (not a dir) — the leaf check must reject it.
+        std::fs::remove_dir(base.path().join("a/b")).unwrap();
+        std::fs::write(base.path().join("a/b"), b"not a dir").unwrap();
+        // The walker still opens the leaf (OpenKind::Dir sets O_DIRECTORY on
+        // the leaf), so a regular file leaf fails at open with ENOTDIR-like.
+        let e = open_walk(&root, "/a/b", OpenKind::Dir, protected_hop_ok(&p, 99999));
+        assert!(e.is_err(), "a substituted non-dir leaf must refuse");
     }
 
     /// A fifo must NOT hang the exec-file open: `O_NONBLOCK` lets `open` return
