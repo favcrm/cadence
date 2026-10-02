@@ -313,7 +313,7 @@ impl Store {
     /// Best-effort audit for a test send: digests and the SMTP
     /// verdict only — never addresses, content or secrets.
     pub fn note_crm_smtp_test(&self, install: &str, context: &str, receipt: &Value) {
-        let _ = self.write_tx(|tx| {
+        if let Err(e) = self.write_tx(|tx| {
             Self::event(
                 &*tx,
                 Self::DAEMON_STREAM,
@@ -327,6 +327,8 @@ impl Store {
                    "accepted": receipt["accepted"],
                    "smtp_code": receipt["smtp_code"]}),
             )
-        });
+        }) {
+            eprintln!("store: best-effort CRM SMTP test audit failed: {e}");
+        }
     }
 }

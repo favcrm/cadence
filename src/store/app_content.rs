@@ -2241,8 +2241,10 @@ impl Store {
         digest: &str,
         actor: &str,
     ) {
-        let _ = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
+        if let Err(e) = self.write_tx(|tx| Self::event(&*tx, Self::DAEMON_STREAM,
             "app_content_changed",
-            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": actor}),));
+            json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": actor}),)) {
+            eprintln!("store: best-effort app content audit failed: {e}");
+        }
     }
 }

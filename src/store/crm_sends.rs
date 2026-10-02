@@ -162,13 +162,15 @@ impl Store {
     /// Best-effort audit for the unsubscribe origin — the origin is
     /// public configuration, never a secret.
     pub fn note_crm_send_origin(&self, origin: Option<&str>) {
-        let _ = self.write_tx(|tx| {
+        if let Err(e) = self.write_tx(|tx| {
             Self::event(
                 &*tx,
                 Self::DAEMON_STREAM,
                 "crm_send_origin_set",
                 json!({"unsubscribe_origin": origin}),
             )
-        });
+        }) {
+            eprintln!("store: best-effort CRM send origin audit failed: {e}");
+        }
     }
 }

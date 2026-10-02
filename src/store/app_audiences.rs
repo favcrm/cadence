@@ -1122,8 +1122,7 @@ impl Store {
     /// committed inside its installation file. Advisory like
     /// `note_app_record`: counts and digests only, never member IDs.
     pub fn note_app_audience(&self, install: &str, context: &str, action: &str, digest: &str) {
-        if self
-            .write_tx(|tx| {
+        if let Err(e) = self.write_tx(|tx| {
                 Self::event(
                     &*tx,
                     Self::DAEMON_STREAM,
@@ -1131,9 +1130,8 @@ impl Store {
                     json!({"install_id": install, "context_id": context, "action": action, "digest": digest, "actor": "operator"}),
                 )
             })
-            .is_err()
         {
-            eprintln!("audience audit event skipped");
+            eprintln!("audience audit event skipped: {e}");
         }
     }
 }
