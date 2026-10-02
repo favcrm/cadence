@@ -1743,4 +1743,45 @@ mod tests {
             assert!(!master_may_call(closed), "{closed} must stay refused");
         }
     }
+
+    /// CAD-1009: delivering the turn token to the master widens nothing.
+    /// The operator-only scoped verbs stay off its method allowlist, and
+    /// the `app_*` methods it holds are exactly the assistant set — an
+    /// allowlist, so a new verb must be named here to be reachable.
+    #[test]
+    fn delivered_turn_token_reaches_only_the_assistant_verbs() {
+        for operator_only in [
+            "app_record_csv_confirm",
+            "app_record_csv_preview",
+            "app_record_csv_import",
+            "app_segment_save",
+            "app_content_approve",
+            "app_content_apply",
+            "app_content_send",
+            "app_audience_freeze",
+            "app_campaign_freeze",
+        ] {
+            assert!(!master_may_call(operator_only), "{operator_only}");
+        }
+        let mut held: Vec<&str> = MASTER_ALLOWED
+            .iter()
+            .copied()
+            .filter(|m| m.starts_with("app_"))
+            .collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            [
+                "app_content_assistant_draft",
+                "app_content_assistant_proposal_show",
+                "app_content_assistant_proposals",
+                "app_record_csv_assistant_import",
+                "app_record_csv_assistant_preview",
+                "app_segment_assistant_list",
+                "app_segment_assistant_preview",
+                "app_segment_assistant_save",
+                "app_segment_assistant_show",
+            ]
+        );
+    }
 }

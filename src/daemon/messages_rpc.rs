@@ -686,7 +686,7 @@ impl Shared {
         // CAD-565: the recovery re-sends the same delivery the pane got
         // — the bounded notice, not the full body (endpoint_kind is
         // already proven `pty` above).
-        let delivery = self.delivery_body(&alias, "pty", &message);
+        let delivery = self.delivery_body(&alias, "pty", &message, None);
         let outcome = adapter.recover_submit(&generation, &delivery, &confirm);
         let (before, after, confirmed, send_error) = match outcome {
             Ok(adapter::RecoverSubmit::Sent {

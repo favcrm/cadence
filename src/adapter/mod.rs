@@ -333,6 +333,28 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
+    /// scoped-turn token `slot` (a unique marker the daemon left after
+    /// the App hint). An adapter that mints its turn token inside
+    /// `run_turn` (managed Pi and Claude) replaces the slot with
+    /// [`scoped_turn_line`] naming `client_message_id` and the very
+    /// token it hands `on_started`, so what the model is shown is
+    /// exactly what the redeem gate compares. This default is for
+    /// endpoints that cannot redeem: it drops the slot and runs the
+    /// turn unchanged.
+    fn run_turn_slotted(
+        &self,
+        prompt: &str,
+        slot: Option<&str>,
+        client_message_id: &str,
+        on_started: &dyn Fn(&str),
+    ) -> Result<TurnResult> {
+        let prompt = match slot {
+            Some(slot) => without_turn_slot(prompt, slot),
+            None => prompt.to_string(),
+        };
+        self.run_turn(&prompt, client_message_id, on_started)
+    }
     /// CAD-565: pre-write screening of the stored `body` — distinct
     /// from the check on the paste itself. A pty pane now receives a
     /// bounded notice while the body is pulled, so refusing the body
@@ -540,6 +562,34 @@ pub trait ProviderAdapter: Send + Sync {
             "the '{command}' command is not supported by this provider"
         )))
     }
+}
+
+/// CAD-1009: the prompt line that lets a scoped App turn redeem its
+/// verbs — the message id and THIS turn's token, with the one
+/// instruction the master needs. Both values are daemon-minted (id
+/// grammar checked before the slot exists; token `<scheme>-<gen>-<hex>`).
+pub fn scoped_turn_line(message_id: &str, token: &str) -> String {
+    format!(
+        "[Scoped chat turn — message \"{message_id}\", turn token \"{token}\". \
+         Run the scoped `cadence app …` verbs with `--message {message_id} --token {token}`; \
+         they are valid for this turn only. Never repeat the token in a reply.]"
+    )
+}
+
+/// CAD-1009: `prompt` with its first `slot` marker replaced by the
+/// scoped line for `token`. The slot is a random per-turn value the
+/// daemon never stores, so only the daemon-placed occurrence can match.
+pub fn with_turn_token(prompt: &str, slot: Option<&str>, message_id: &str, token: &str) -> String {
+    match slot {
+        Some(slot) => prompt.replacen(slot, &scoped_turn_line(message_id, token), 1),
+        None => prompt.to_string(),
+    }
+}
+
+/// CAD-1009: `prompt` without its slot line — the endpoint cannot
+/// redeem, so the turn carries the hint only.
+fn without_turn_slot(prompt: &str, slot: &str) -> String {
+    prompt.replacen(&format!("{slot}\n"), "", 1)
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.
