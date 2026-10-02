@@ -1023,16 +1023,28 @@ impl Store {
             Self::rollback_tx(state, &guard, tx)?;
             return Err(e);
         }
-        let out = f(&tx);
-        match out {
-            Ok(v) => {
+        // Catch a panic in `f` — a `Transaction` dropped on unwind would
+        // run its auto-rollback *without* TxControl armed (the authorizer
+        // denies it) and leave the conn inside a tx. Catch, then the
+        // verified `rollback_tx` runs under the guard's own TxControl
+        // window before resuming the unwind. Mirrors `sealed_tx`.
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&tx)));
+        match outcome {
+            Ok(Ok(v)) => {
                 let _ctrl = ControlPhase::enter(state);
                 tx.commit().map_err(|e| Error::internal(e.to_string()))?;
                 Ok(v)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 Self::rollback_tx(state, &guard, tx)?;
                 Err(e)
+            }
+            Err(payload) => {
+                if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                    eprintln!("store: owner-tx panic rollback failed: {rb}");
+                }
+                std::panic::resume_unwind(payload);
             }
         }
     }
@@ -1078,8 +1090,10 @@ impl Store {
     /// may write; a `Sealed`, `Malformed` or unreadable latch records
     /// nothing (a sealed or Protected-unknown store never produces a
     /// false `rolled_back`/`store_poisoned` row). `conn` is the held
-    /// guard — this never re-locks `self.conn()`.
-    pub(crate) fn forensic_poison_event(
+    /// guard — this never re-locks `self.conn()`. `pub(super)` — the
+    /// private `GuardState`/`&Connection` it takes is never a pub(crate)
+    /// authority escape.
+    pub(super) fn forensic_poison_event(
         state: &GuardState,
         conn: &Connection,
         rolled_back: bool,
