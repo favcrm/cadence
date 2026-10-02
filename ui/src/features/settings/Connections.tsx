@@ -23,6 +23,44 @@ import {
 import { connectionLabel } from "../../lib/connections";
 
 /**
+ * CAD-1013 safe enrollment errors. A provider/daemon refusal can carry
+ * raw downstream text that echoes the credential the operator just
+ * typed (SMTP host/password in a TLS or auth error). The UI never
+ * renders `ApiError.message` on this path — it renders a stable, typed
+ * `code` mapped to a safe reason + recovery, and falls back to a
+ * generic message when the code is absent or unknown. New typed codes
+ * land here as the backend (CAD-1014) supplies them; anything else is
+ * deliberately non-specific.
+ */
+const ENROLL_ERROR: Record<string, string> = {
+  connection_refused:
+    "The connection was refused. Check the provider host and the account, then retry.",
+  connection_unavailable:
+    "Connection management is unavailable right now. Wait a moment and retry — nothing was saved.",
+  smtp_unreachable:
+    "The SMTP host could not be reached. Check the host and port, then retry.",
+  smtp_tls_failed:
+    "The SMTP TLS check failed. The daemon refuses plaintext, downgrades and unverifiable hosts — confirm the certificate and TLS mode (465 implicit / 587 STARTTLS), then retry.",
+  smtp_auth_failed:
+    "The SMTP login was rejected. Re-check the username and password, then retry — the password is cleared from this form either way.",
+  smtp_sender_unverified:
+    "The sender address is not verified for this provider. Verify the sender, then retry.",
+  provider_not_registered:
+    "This provider is not registered for enrollment. Choose a provider from the list, then retry.",
+  scope_not_reviewed:
+    "A declared scope is not reviewed for this provider. Keep only the reviewed scopes, then retry.",
+};
+
+function enrollErrorMessage(e: unknown): string {
+  const err = e instanceof ApiError ? e : null;
+  const code = err?.code;
+  if (code !== undefined && code in ENROLL_ERROR) return ENROLL_ERROR[code];
+  // Unknown or absent code: never surface the raw downstream text — it
+  // can echo the credential. Report a bounded generic refusal instead.
+  return "The connection could not be added. Check the details and retry — nothing was saved.";
+}
+
+/**
  * Settings → Connections (CAD-585): the operator's view of exact
  * provider accounts — the reviewed providers, the always-present Local
  * outbox, enrolled credentials and their local configuration check,
@@ -425,7 +463,9 @@ function RotateForm({
         onDone();
         onClose();
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      // CAD-1013: rotate also carries the fresh SMTP password — same
+      // typed-code safe reason, never the raw downstream message.
+      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
@@ -688,7 +728,8 @@ function AddConnection({
         ...(acceptRisk ? { accept_same_uid_risk: true } : {}),
       })
       .then((out) => onAdded(out.connection.id))
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      // CAD-1013: typed-code safe reason — never raw downstream text.
+      .catch((e: ApiError) => setError(enrollErrorMessage(e)))
       .finally(() => {
         // The credential crossed this one request into daemon custody.
         // It must not survive in the form, whatever the outcome.
