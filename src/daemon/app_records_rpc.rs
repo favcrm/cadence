@@ -157,8 +157,6 @@ impl Shared {
                 "preview_token",
                 "request_id",
                 "decisions_digest",
-                "csv_text",
-                "decisions",
             ],
             _ => return Err(Error::rejected("unknown app record method")),
         };
@@ -235,8 +233,6 @@ impl Shared {
                 required_str(params, "request_id")?,
                 required_str(params, "preview_token")?,
                 required_str(params, "decisions_digest")?,
-                &csv_text(params)?,
-                params.get("decisions").unwrap_or(&Value::Null),
             ),
             _ => Err(Error::rejected("unknown app record method")),
         }?;
