@@ -425,6 +425,25 @@ pub enum OpenMode {
     Protected,
 }
 
+/// What `Store::verified_rollback` proved about the conn after a
+/// poisoned panic — distinguishes a conn that was *already clean*
+/// (autocommit, no rollback needed) from one whose live tx was actually
+/// rolled back, and both from an *unverified* state (rollback attempted
+/// but the conn never returned to autocommit, so it may still be inside
+/// a tx). Recovery writes and `rolled_back` telemetry must only claim a
+/// rollback that actually happened.
+pub(super) enum PoisonRecovery {
+    /// The conn was already in autocommit — nothing was rolled back.
+    CleanAutocommit,
+    /// A live tx existed and the ROLLBACK verifiably returned the conn
+    /// to autocommit.
+    RolledBack,
+    /// A tx was open but the ROLLBACK was denied/failed or the conn is
+    /// still not autocommit — rollback is UNVERIFIED; record no
+    /// `rolled_back` event and run no recovery write.
+    Unverified,
+}
+
 /// Why a writable open was refused.
 #[derive(Debug)]
 pub enum SealError {
@@ -669,7 +688,9 @@ impl Store {
         // passes `on_sealed` and verifies the latch itself inside `f`.
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
-                Self::rollback_tx(state, tx);
+                // A rollback failure is reported alongside the latch
+                // refusal — never silently swallowed.
+                Self::rollback_tx(state, &guard, tx)?;
                 return Err(e);
             }
         }
@@ -689,11 +710,17 @@ impl Store {
                 Ok(v)
             }
             Ok(Err(e)) => {
-                Self::rollback_tx(state, tx);
+                // Propagate a rollback failure over the callback error —
+                // a still-open tx is a worse fault than the abort itself.
+                Self::rollback_tx(state, &guard, tx)?;
                 Err(e)
             }
             Err(payload) => {
-                Self::rollback_tx(state, tx);
+                // On unwind we still must not leave the conn inside a
+                // tx; log a rollback failure, then resume the panic.
+                if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                    eprintln!("store: sealed-tx panic rollback failed: {rb}");
+                }
                 std::panic::resume_unwind(payload);
             }
         }
@@ -742,7 +769,11 @@ impl Store {
         };
         if !on_sealed {
             if let Err(e) = Self::check_closed_tx(&tx) {
-                Self::rollback_tx(state, tx);
+                if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        rb,
+                    )));
+                }
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)));
             }
         }
@@ -757,11 +788,17 @@ impl Store {
                 Ok(v)
             }
             Ok(Err(e)) => {
-                Self::rollback_tx(state, tx);
+                if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        rb,
+                    )));
+                }
                 Err(e)
             }
             Err(payload) => {
-                Self::rollback_tx(state, tx);
+                if let Err(rb) = Self::rollback_tx(state, &guard, tx) {
+                    eprintln!("store: sealed-tx panic rollback failed: {rb}");
+                }
                 std::panic::resume_unwind(payload);
             }
         }
@@ -771,11 +808,55 @@ impl Store {
     /// `TxControl` window — the authorizer denies a `ROLLBACK` issued at
     /// `phase=Callback`, so the owner performs it here, never the
     /// callback's own `Transaction` drop (which would be refused and
-    /// leave the connection inside a tx). Takes the `Transaction` by
-    /// value; dropping it issues `ROLLBACK`.
-    fn rollback_tx(state: &GuardState, tx: Transaction<'_>) {
-        let _ctrl = ControlPhase::enter(state);
-        drop(tx);
+    /// leave the connection inside a tx).
+    ///
+    /// Verified, not assumed: `tx.rollback()` runs `ROLLBACK` under
+    /// TxControl, then we check the *actual* `conn.is_autocommit()` — the
+    /// connection is passed in explicitly precisely so the verification
+    /// reads live state, not the `rollback()` return value. `Ok` only
+    /// when the conn is genuinely back in autocommit; a `rollback()`
+    /// error, or a conn still inside a tx afterwards, is a reported
+    /// failure — never a silent `Ok`.
+    fn rollback_tx(state: &GuardState, conn: &Connection, tx: Transaction<'_>) -> Result<()> {
+        let rb_err = {
+            let _ctrl = ControlPhase::enter(state);
+            tx.rollback().err()
+        };
+        if let Some(e) = rb_err {
+            return Err(Error::internal(format!("sealed-tx ROLLBACK failed: {e}")));
+        }
+        if !conn.is_autocommit() {
+            return Err(Error::internal(
+                "sealed-tx rollback did not return the connection to autocommit"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verified rollback for the *guard's* connection after a panic while
+    /// the conn mutex was held — used by `conn()` poison recovery.
+    /// Distinguishes clean-autocommit from an actual rollback, and both
+    /// from `Unverified`: a `ROLLBACK` the disarmed authorizer refuses,
+    /// or one that errors, or one after which the conn is still inside a
+    /// tx, is **not** ignored — it returns `Unverified` so the caller
+    /// never mislabels a still-open tx as `rolled_back`.
+    pub(super) fn verified_rollback(state: &GuardState, conn: &Connection) -> PoisonRecovery {
+        if conn.is_autocommit() {
+            return PoisonRecovery::CleanAutocommit; // nothing to roll back
+        }
+        let rb = {
+            let _ctrl = ControlPhase::enter(state);
+            conn.execute_batch("ROLLBACK")
+        };
+        // Verify against live state, not the return value alone: a
+        // denied or failed ROLLBACK — or one that left the conn inside a
+        // tx — is unverified, never `RolledBack`.
+        if rb.is_ok() && conn.is_autocommit() {
+            PoisonRecovery::RolledBack
+        } else {
+            PoisonRecovery::Unverified
+        }
     }
 
     /// Owner-maintenance write scope: takes the conn mutex, checks the
@@ -1220,11 +1301,21 @@ impl<'t> WriteTxn<'t> {
                 Ok(v)
             }
             Err(e) => {
-                let _ctrl = ControlPhase::enter(state);
-                let _ = self
-                    .tx
-                    .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
-                Err(e)
+                // A failed savepoint rollback must propagate — swallowing
+                // it would report the sub-batch as cleanly aborted while
+                // the savepoint's writes may still be live. The rollback
+                // failure is the worse fault, so it wins the error.
+                let rb = {
+                    let _ctrl = ControlPhase::enter(state);
+                    self.tx
+                        .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))
+                };
+                match rb {
+                    Ok(()) => Err(e),
+                    Err(rb_err) => Err(Error::internal(format!(
+                        "savepoint rollback failed after callback error ({e}): {rb_err}"
+                    ))),
+                }
             }
         }
     }
