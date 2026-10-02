@@ -2146,6 +2146,202 @@ fn lane_push_blocks_on_failed_pre_push_and_allows_on_pass() {
     assert!(landed.contains("x-lands"), "{landed}");
 }
 
+// ---------- CAD-1021 slice 3: lane cargo shim ----------
+
+/// The shim dir under the worktree's git dir — sibling of the hook.
+fn shim_dir(wt: &Path) -> PathBuf {
+    wt_git_dir(wt).join("cadence-hooks/bin")
+}
+
+/// A fake `cargo` that logs its argv then exits 0 — the "real" cargo the
+/// shim hands un-gated work to, and what a held slot's children reach.
+/// Put it (and a logging `cadence`) in `dir`, return nothing — the
+/// caller points PATH at `dir`.
+fn stub_bins(dir: &Path) {
+    let cargo = dir.join("cargo");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\necho \"real-cargo:$*\" >> \"{}\"\nexit 0\n",
+            dir.join("cargo.log").display()
+        ),
+    )
+    .unwrap();
+    let cadence = dir.join("cadence");
+    std::fs::write(
+        &cadence,
+        format!(
+            "#!/bin/sh\necho \"cadence:$*\" >> \"{}\"\nexit 0\n",
+            dir.join("cadence.log").display()
+        ),
+    )
+    .unwrap();
+    for b in [&cargo, &cadence] {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(b, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+/// Run `shim` with `args` under `envs` — a real exec so PATH resolution,
+/// the slot pass-through and the argv log all behave exactly as a lane's
+/// shell sees them.
+fn run_shim(shim: &Path, args: &[&str], envs: &[(&str, String)]) -> String {
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg(shim).args(args);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    let out = c.output().unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// The shim PATH: shim dir first (so `cargo` resolves to it), then the
+/// stub dir holding `cargo`/`cadence`, then the ambient PATH.
+fn shim_path(shim: &Path, stubs: &Path) -> String {
+    format!(
+        "{}:{}:{}",
+        shim.parent().unwrap().display(),
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn lane_gets_cargo_shim_on_env_path() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Shim", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    // The shim lives under the worktree's own git dir, executable.
+    let shim = shim_dir(&wt).join("cargo");
+    assert!(shim.is_file(), "shim missing at {}", shim.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(shim.metadata().unwrap().permissions().mode() & 0o111, 0o111);
+    }
+    // The lane's `.env` puts the shim dir on PATH.
+    let env = std::fs::read_to_string(wt.join(".env")).unwrap();
+    let path_line = env.lines().find(|l| l.starts_with("PATH=")).unwrap_or("");
+    assert!(
+        path_line.contains(&shim_dir(&wt).to_string_lossy().to_string()),
+        ".env PATH lacks the shim dir: {env}"
+    );
+    // The main checkout has neither a shim nor a PATH entry.
+    assert!(!repo.join(".cargo").exists());
+    let main_env = repo.join(".env");
+    if main_env.exists() {
+        let m = std::fs::read_to_string(&main_env).unwrap();
+        assert!(!m.contains("cadence-hooks/bin"), "main .env touched: {m}");
+    }
+}
+
+#[test]
+fn cargo_build_in_a_lane_goes_through_build_slot() {
+    let (_tmp, pm, state, _repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Route", "--project", "demo"]).0);
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    let shim = shim_dir(&wt).join("cargo");
+    let stubs = _tmp.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    stub_bins(&stubs);
+    let path = shim_path(&shim, &stubs);
+    // `cargo build` on the lane routes through `build-slot run build`.
+    run_shim(
+        &shim,
+        &["build"],
+        &[
+            ("PATH", path.clone()),
+            ("HOME", _tmp.path().display().to_string()),
+        ],
+    );
+    let log = std::fs::read_to_string(stubs.join("cadence.log")).unwrap_or_default();
+    assert!(
+        log.contains("build-slot run build -- cargo build"),
+        "cargo build did not route through the slot: {log}"
+    );
+    // The real cargo was never invoked for the gated subcommand.
+    assert!(
+        !stubs.join("cargo.log").exists(),
+        "gated cargo reached the real binary directly"
+    );
+}
+
+#[test]
+fn cargo_ungated_and_held_slot_pass_through() {
+    let (_tmp, pm, state, _repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Pass", "--project", "demo"]).0);
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    let shim = shim_dir(&wt).join("cargo");
+    let stubs = _tmp.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    stub_bins(&stubs);
+    let path = shim_path(&shim, &stubs);
+    // `cargo fmt` is not a heavy compile — straight to real cargo.
+    run_shim(&shim, &["fmt"], &[("PATH", path.clone())]);
+    let clog = std::fs::read_to_string(stubs.join("cargo.log")).unwrap_or_default();
+    assert!(
+        clog.contains("real-cargo:fmt"),
+        "fmt not passed through: {clog}"
+    );
+    assert!(
+        !stubs.join("cadence.log").exists(),
+        "ungated subcommand hit the slot"
+    );
+    // Inside a held slot (a real live pid named), a nested cargo
+    // re-uses the hold — passes through, no re-queue deadlock.
+    let me = std::process::id().to_string();
+    run_shim(
+        &shim,
+        &["build"],
+        &[("PATH", path), ("CADENCE_BUILD_SLOT_PID", me)],
+    );
+    let clog2 = std::fs::read_to_string(stubs.join("cargo.log")).unwrap_or_default();
+    assert!(
+        clog2.contains("real-cargo:build"),
+        "held slot's cargo did not pass through: {clog2}"
+    );
+}
+
+#[test]
+fn forged_slot_pid_does_not_skip_the_shim_queue() {
+    let (_tmp, pm, state, _repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Forge", "--project", "demo"]).0);
+    let (_, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+    let shim = shim_dir(&wt).join("cargo");
+    let stubs = _tmp.path().join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    stub_bins(&stubs);
+    let path = shim_path(&shim, &stubs);
+    // A pid that names NO live holder (99999 is almost certainly dead)
+    // must not adopt the pass-through — the call still queues.
+    run_shim(
+        &shim,
+        &["build"],
+        &[("PATH", path), ("CADENCE_BUILD_SLOT_PID", "99999".into())],
+    );
+    let log = std::fs::read_to_string(stubs.join("cadence.log")).unwrap_or_default();
+    assert!(
+        log.contains("build-slot run build"),
+        "forged CADENCE_BUILD_SLOT_PID skipped the queue: {log}"
+    );
+    assert!(
+        !stubs.join("cargo.log").exists(),
+        "forged pid reached real cargo without a slot"
+    );
+}
+
 /// A lane whose checkout lacks `scripts/pre-push` (a fixture, a sparse repo)
 /// must not be blocked by the gate — the hook records a skipped receipt and
 /// lets the push through rather than fail on a script that isn't there.

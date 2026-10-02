@@ -1040,6 +1040,7 @@ tests = [
     "check_acquire_names_a_check_kind_recipe_only",
     "check_grants_while_build_pool_is_full",
     "forged_slot_pid_does_not_skip_the_queue",
+    "run_check_binds_the_recipe_argv_not_the_asked_command",
 ]
 helpers = [
     "slot_release",

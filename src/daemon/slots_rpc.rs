@@ -184,12 +184,32 @@ impl Shared {
             return Err(crate::slots::exec_not_peer(pid));
         }
         // CAD-1021: a `check` slot is the lane's pre-push gate — admitted
-        // ONLY against a project recipe declared `kind: check` (verbatim
-        // name match). An arbitrary `acquire check`/`run check` with no
-        // recipe, or a recipe that is not check-kind, is refused — an
-        // agent can never label a full build `check` and drain the pool.
+        // ONLY against a project recipe declared `kind: check`. The gate
+        // binds the recipe's declared argv, not just its name: a `run
+        // check --recipe X -- <cmd>` whose <cmd> differs from X's argv is
+        // refused, and the grant echoes the declared argv so the caller
+        // execs exactly the gated command (the 20261002-231458 verdict).
+        let mut recipe_argv: Option<Vec<String>> = None;
         if kind == SlotKind::Check {
-            self.check_recipe_for_caller(params, pid)?;
+            let recipe = self.check_recipe_for_caller(params, pid)?;
+            let declared = recipe.argv.clone();
+            if let Some(asked) = params["argv"].as_array() {
+                let asked: Vec<String> = asked
+                    .iter()
+                    .filter_map(|a| a.as_str().map(str::to_string))
+                    .collect();
+                if asked != declared {
+                    return Err(Error::rejected(format!(
+                        "check slot recipe '{}' declares argv {:?} — `run \
+                         check --recipe {} -- <cmd>` must exec exactly that, \
+                         not {asked:?}",
+                        params["recipe"].as_str().unwrap_or("?"),
+                        declared,
+                        params["recipe"].as_str().unwrap_or("?"),
+                    )));
+                }
+            }
+            recipe_argv = Some(declared);
         } else if params.get("recipe").is_some() {
             return Err(Error::rejected(
                 "'recipe' is only meaningful for kind=check — a build/test/\
@@ -198,13 +218,16 @@ impl Shared {
         }
         let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let (result, events) = match &who {
+        let (mut result, events) = match &who {
             SlotWho::Pane { lane, .. } => slots.acquire(kind, lane, pid, request_id, probe, clk)?,
             SlotWho::Strict(caller) => {
                 slots.acquire_strict_bound(kind, caller, pid, request_id, probe, clk, exec)?
             }
         };
         drop(slots);
+        if let Some(argv) = recipe_argv {
+            result["recipe_argv"] = json!(argv);
+        }
         self.emit_slot_events(events);
         Ok(result)
     }
@@ -213,7 +236,11 @@ impl Shared {
     /// entry of kind `check` for the project the caller's cwd resolves
     /// to. The recipe name is caller-supplied but constrained to the
     /// declared allowlist — anything else refuses the `check` grant.
-    fn check_recipe_for_caller(&self, params: &Value, pid: u32) -> Result<()> {
+    fn check_recipe_for_caller(
+        &self,
+        params: &Value,
+        pid: u32,
+    ) -> Result<crate::issue::project::Recipe> {
         let recipe = optional_text(params, "recipe")?.ok_or_else(|| {
             Error::rejected(
                 "kind=check needs --recipe <name> naming a build.recipes entry \
@@ -261,7 +288,7 @@ impl Shared {
                 r.kind.as_deref().unwrap_or("build")
             )));
         }
-        Ok(())
+        Ok(r.clone())
     }
 
     /// `slot_release` — the release must name the holding (lane,

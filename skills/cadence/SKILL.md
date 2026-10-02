@@ -311,6 +311,20 @@ below the `[host]` floors (`slot_mem_min_available_bytes`,
 request waits — `build-slot status` names the `wait_reason`
 (`capacity`/`memory`/`disk`) — and never fails the caller outright.
 
+A lane also carries a `cargo` shim on its `.env` PATH (`<git-dir>/
+cadence-hooks/bin/cargo`, installed with the hook): `cargo
+build|clippy|check` run through a `build` slot, `cargo test` a `test`
+slot and `cargo nextest` a `suite` slot — so a lane's compile work is
+always admitted without any flag to remember. `cargo fmt`, `cargo add`
+and the other light subcommands pass straight to the real cargo, and a
+`cargo` run inside a held slot (`CADENCE_BUILD_SLOT_PID` naming a live
+holder) passes through rather than re-queueing on itself. The main
+checkout has no shim; nothing here touches a global config.
+
+`build-slot run check --recipe <name>` execs the recipe's *declared*
+argv — a trailing `<cmd>` that differs is refused, so a `check` grant
+never covers a heavier command than the gated recipe.
+
 Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash
