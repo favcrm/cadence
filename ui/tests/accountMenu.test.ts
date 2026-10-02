@@ -92,6 +92,18 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
+// Activating any link in the panel (here a footer slot item) closes the dialog; a plain button does not.
+{
+  const footer = createElement("div", null, createElement("a", { href: "#v", id: "footer-link" }, "v1"), createElement("button", { id: "footer-btn" }, "b"));
+  const { host, done } = mount(menu(signedIn, { footer }));
+  act(() => trigger(host).click());
+  act(() => (host.querySelector("#footer-btn") as HTMLElement).click());
+  assert(panel(host), "a non-link click in the panel keeps it open");
+  act(() => (host.querySelector("#footer-link") as HTMLElement).click());
+  assert(!panel(host), "clicking a link in the footer closes the dialog");
+  done();
+}
+
 // The sidebar row trigger: avatar, name, "role · host" with the full value in a title, an up-chevron.
 {
   const longHost = "demo-company-with-a-very-long-name.cadencecloud.app";

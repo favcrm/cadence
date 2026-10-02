@@ -139,6 +139,8 @@ export default function AccountMenu({
           ref={panelRef}
           role="dialog"
           aria-label="Account"
+          // Any link in the panel (Settings, a footer slot item) navigates away: close.
+          onClick={(event) => { if ((event.target as Element).closest("a")) setOpen(false); }}
           className={`absolute z-50 card p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2 w-64" : "left-0 bottom-full mb-2 w-[max(100%,16rem)]"}`}
         >
           <div className="px-2 py-1.5" title={meta.session ? `session ${meta.session.id}` : undefined}>

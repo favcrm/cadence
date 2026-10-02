@@ -32,7 +32,9 @@ interface Props {
 
 export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, appMenu = null }: Props) {
   return (
-    <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4 overflow-y-auto">
+    <aside className="hidden lg:flex sticky top-0 z-[35] h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-4">
+      {/* Only the nav scrolls: the footer's account dialog opens above its row and must not be clipped by a scroll container. */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="px-[7px] pb-[14px]">
         <span className="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
           <Logo size={25} />
@@ -47,7 +49,8 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
         <span className="text-[10px]">~/pm</span>
       </div>
       <ProjectList project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
-      <div className="mt-auto pt-2 border-t border-ink-700 text-label text-ink-500">
+      </div>
+      <div data-sidebar-footer className="pt-2 border-t border-ink-700 text-label text-ink-500">
         {signedIn === true ? account : (
           <div className="px-2 py-1.5">{signedIn === false ? "Not signed in · read only" : "…"}</div>
         )}

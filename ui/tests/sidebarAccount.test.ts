@@ -73,6 +73,7 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   assert(row, "the sidebar footer renders the row trigger");
   assert(row.className.includes("account-row") && row.textContent?.includes("Fable Chen") && row.textContent.includes("member · localhost"), "row shows name and role · host");
   assert(!(host.querySelector("aside")?.textContent ?? "").toLowerCase().includes("session"), "no old SESSION block");
+  assert(!row.closest(".overflow-y-auto"), "the footer is outside the scrolling nav, so its dialog is not clipped");
   await React.act(async () => { row.click(); });
   const dialog = host.querySelector("aside [role=dialog]");
   assert(dialog && (dialog.className as string).includes("bottom-full"), "the row opens the dialog above itself");
@@ -103,7 +104,7 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
 // Signed out: plain text, no menu, and the header keeps the theme button instead of an avatar.
 {
   const { host, done } = await mountApp({ ...base, signed_in: false });
-  const footer = host.querySelector("aside .mt-auto");
+  const footer = host.querySelector("aside [data-sidebar-footer]");
   assert(footer?.textContent?.trim() === "Not signed in · read only", `signed-out footer text, got ${footer?.textContent}`);
   assert(!host.querySelector("[data-account-menu]"), "signed out: no account menu anywhere");
   done();
@@ -112,7 +113,7 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
 // Unknown (meta not loaded): the placeholder, no menu.
 {
   const { host, done } = await mountApp("hang");
-  assert(host.querySelector("aside .mt-auto")?.textContent?.trim() === "…", "unknown footer keeps the ellipsis");
+  assert(host.querySelector("aside [data-sidebar-footer]")?.textContent?.trim() === "…", "unknown footer keeps the ellipsis");
   assert(!host.querySelector("[data-account-menu]"), "unknown: no account menu");
   done();
 }
