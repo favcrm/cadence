@@ -1074,7 +1074,7 @@ pub(crate) trait StoreConn {
 /// (`Transaction`, `WriteTxn` via its `tx`). `|$g| expr` yields the
 /// `&Connection`/`&Transaction` to call the matching inherent verb on.
 macro_rules! storeconn_impl {
-    ($t:ty, |$g:ident| $get:expr) => {
+    ($t:ty, |$g:ident| -> $ret:ty { $get:expr }) => {
         impl StoreConn for $t {
             fn execute(
                 &self,
