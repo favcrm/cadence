@@ -6430,17 +6430,53 @@ fn cad561_update_refuses_a_dropped_alias_claiming_the_operator() {
 #[test]
 fn native_nudge_selects_only_the_verified_runtime_path() {
     let d = TestDaemon::start();
-    let owner = LaneShell::spawn(d.dir.path());
-    plant_pane(&d, "pty1", owner.pid());
-    cad162_sql(&d, "UPDATE agents SET enabled=1 WHERE alias='pty1'", &[]);
+    let mock = d.mock_devin();
+    d.register("pm");
+    d.register_devin("w1", None);
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 20);
+    d.send(
+        "w1",
+        json!({"text": "hold the turn", "message": "t1", "reply_to": "pm"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "w1", "t1");
+    atomic_write(
+        d.pane_file(&mock, "w1", "status"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n",
+    );
+    atomic_write(
+        d.pane_file(&mock, "w1", "inputbox"),
+        "Guide Devin while it works\n",
+    );
     let allowed = d
         .operator_rpc(
             "agent_send",
-            json!({"alias": "pty1", "text": "hold", "message": "npty", "nudge": true}),
+            json!({"alias": "w1", "text": "hold", "message": "npty", "nudge": true}),
         )
         .unwrap();
     assert_eq!(allowed["delivery"], Value::Null, "{allowed}");
     assert_eq!(allowed["state"], "queued", "{allowed}");
+    // The durable row is what `take_queued` admits: a queued nudge is
+    // bound to the running turn only when claimed, and its delivery is
+    // the provider's own pane path.
+    let bound = d.wait_event_where(
+        "w1",
+        "submitting",
+        |e| e["payload"]["message"] == "npty",
+        10,
+    );
+    assert_eq!(bound["payload"]["message"], "npty", "{bound}");
+    let row = rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT source, turn_id FROM messages WHERE id='npty'",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "nudge");
+    assert_eq!(row.1.as_deref(), Some(token.as_str()));
 
     let _pi = d.mock_pi("normal");
     d.register_pi("pi-old", json!({"model": "fake/model-1"}));
@@ -6477,6 +6513,9 @@ fn native_nudge_selects_only_the_verified_runtime_path() {
 fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
     let d = TestDaemon::start();
     let _pi = d.mock_pi("normal");
+    let home = TempDir::new().unwrap();
+    let mut pm_pane = LaneShell::spawn(home.path());
+    plant_member_pane(&d, "pm", "inbox", None, pm_pane.pid());
     let upstream = json!({"model": "fake/model-1", "upstream": "pm"}).to_string();
     let owner = d.register_pcp(
         "w-native",
@@ -6488,17 +6527,12 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
     assert_eq!(owner.unwrap()["alias"], "w-native");
     d.wait_agent("w-native", "idle", 10);
 
-    // A planted pane has a real process identity, while the seeded
-    // `upstream` is deliberately provider params, not a durable PM
-    // row: this caller is a peer identity, not the steer owner.
-    let home = TempDir::new().unwrap();
-    let mut pm_pane = LaneShell::spawn(home.path());
-    plant_pane(&d, "pm", pm_pane.pid());
     let mut peer = LaneShell::spawn(home.path());
     plant_pane(&d, "peer", peer.pid());
-    // A planted caller that shares the provider's params text still has
-    // only its own enrolled endpoint identity. The params value cannot
-    // promote the planted `pm` pane into a PM agent row or authority.
+    // A caller named `pm` is still only its own enrolled connection
+    // identity; it gains authority only when the target's durable PM row
+    // is the same registered alias and predates the member. Anything
+    // else is a peer, self or unattributed caller and is refused.
     for (who, frame) in [
         (
             "peer",
@@ -6506,14 +6540,6 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
                 &d.state,
                 "agent_send",
                 json!({"alias": "w-native", "text": "steer", "message": "n-peer", "nudge": true}),
-            ),
-        ),
-        (
-            "self-named-params",
-            pm_pane.rpc(
-                &d.state,
-                "agent_send",
-                json!({"alias": "w-native", "text": "steer", "message": "n-self", "nudge": true}),
             ),
         ),
         (
@@ -6532,6 +6558,34 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
             "{who}: {error}"
         );
     }
+
+    // `w-native` may not steer its own queue, and a request field cannot
+    // pretend the caller is its PM. A seam-armed fixture makes the
+    // caller's own agent name the connection's answer; the ambient shape
+    // keeps its detached/unproven refusal.
+    let self_frame = if cadence_agent::test_seam::armed(&d.state) {
+        d.agent_rpc(
+            "w-native",
+            "agent_send",
+            json!({"alias": "w-native", "text": "steer", "message": "n-self", "nudge": true}),
+        )
+        .unwrap_err()
+        .to_string()
+    } else {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w-native", "text": "steer", "message": "n-self", "nudge": true,
+                   "by": "pm"}),
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    assert!(
+        self_frame.contains("steering rule")
+            || self_frame.contains("not provably the operator")
+            || self_frame.contains("request field 'by' is not accepted"),
+        "self: {self_frame}"
+    );
 
     // Runtime identities are derived from the live row and the running
     // turn, never callable JSON. The old runtime refuses before a
@@ -6560,12 +6614,38 @@ fn native_nudge_refuses_unproven_peer_self_and_forged_binding() {
             )
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not accepted"), "{field}: {error}");
+        assert!(
+            error.contains("not accepted")
+                || error.contains("forged turn references are refused")
+                || error.contains("request field 'by' is not accepted"),
+            "{field}: {error}"
+        );
     }
     let show = d.rpc("agent_show", json!({"alias": "w-native"})).unwrap();
     assert!(
         show["messages"].as_array().unwrap().is_empty(),
         "unauthorized/native-forgery sends left durable rows: {show}"
+    );
+
+    // PM authority is not assumed; prove it on the one intended path: the
+    // registered `pm` caller may steer the same native target. The fake
+    // Pi runtime has no guard, so it must reject the steer at admission
+    // and leave no durable row.
+    let pm_ok = pm_pane.rpc(
+        &d.state,
+        "agent_send",
+        json!({"alias": "w-native", "text": "steer", "message": "n-pm", "nudge": true}),
+    );
+    assert_eq!(pm_ok["ok"], false, "pm: {pm_ok}");
+    let error = frame_err(&pm_ok);
+    assert!(
+        error.contains("no verified native exact-turn input guard"),
+        "pm: {error}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "w-native"})).unwrap();
+    assert!(
+        show["messages"].as_array().unwrap().is_empty(),
+        "a PM nudge on an unguarded runtime must not write a row: {show}"
     );
 }
 
