@@ -599,7 +599,13 @@ await React.act(async () => {
 await flush(); await flush(); await flush();
 assert(!host.querySelector('[aria-label="App context"]'), "no shell selector — social workspace owns its own");
 assert(host.querySelector("#brand"), "the workspace keeps its own selector");
-assert(text().includes("managed inside the workspace screen"), "shell display defers to the workspace owner");
+// The Social private screen renders its own chrome — the shell must NOT
+// emit the technical `installId · version · context` subtitle.
+assert(
+  !text().includes("managed inside the workspace screen") &&
+    !text().includes("install-social · 0.1.0"),
+  "shell emitted the removed Social technical subtitle",
+);
 posts.length = 0;
 await fill("#app-shell-chat-box", "stale scope question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
