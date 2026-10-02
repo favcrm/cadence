@@ -92,6 +92,24 @@ def contract_scripts(root):
     return seen
 
 
+def focused_tests(root, changed):
+    """CAD-1021: cheap invariant unit tests run when their input file
+    changes — a path → test-target map. Each entry is
+    (paths-it-watches, [cargo test filter args]). The test runs with
+    the same --test-threads budget as every other step."""
+    MAP = {
+        # CAD-1024: a new top-level verb in src/cli/commands.rs went red
+        # on CI — the help-bucket invariant lives in cli::help tests.
+        "src/cli/commands.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
+        "src/cli/help.rs": ["cargo", "test", "--bin", "cadence", "cli::help"],
+    }
+    out = []
+    for path, argv in MAP.items():
+        if changed is None or path in changed:
+            out.append((f"focused {path}", argv))
+    return out
+
+
 def required_features(root):
     """{test target: required-features} from Cargo.toml [[test]] tables."""
     try:
@@ -130,6 +148,9 @@ def plan(root, changed, with_tests):
     steps.append(("nextest wrapper", ["scripts/test-cadence-nextest"],
                   None if changed is None or wrapper & set(changed)
                   else "nextest wrapper scripts unchanged"))
+    # CAD-1021: cheap focused unit tests gated on the file they guard.
+    for name, argv in focused_tests(root, changed):
+        steps.append((name, argv, None))
     if not with_tests:
         steps.append(("tests", None, "pass --tests to run changed binaries"))
     elif changed is None:
