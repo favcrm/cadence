@@ -484,9 +484,9 @@ export default function AppShell({
           {installation && (
             <>
               {isSocial ? (
-                <p className="num text-micro text-ink-500">
-                  {installId} · {installation.version} · context is managed inside the workspace screen
-                </p>
+                // The private-screen frame owns its own chrome — the
+                // shell shows no installId/version/context subtitle.
+                null
               ) : installation.name === "crm" ? (
                 // Single-company CRM (CAD-1008): a bound scope shows no
                 // context/scope subtitle at all — the page is the
