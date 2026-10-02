@@ -36,7 +36,7 @@ const ENROLL_ERROR: Record<string, string> = {
   connection_refused:
     "The connection was refused. Check the provider host and the account, then retry.",
   connection_unavailable:
-    "Connection management is unavailable right now. Wait a moment and retry — nothing was saved.",
+    "Connection management is unavailable right now. Wait a moment, refresh the connections list, then retry.",
   smtp_unreachable:
     "The SMTP host could not be reached. Check the host and port, then retry.",
   smtp_tls_failed:
@@ -50,10 +50,12 @@ const ENROLL_ERROR: Record<string, string> = {
   scope_not_reviewed:
     "A declared scope is not reviewed for this provider. Keep only the reviewed scopes, then retry.",
   // CAD-1014 backend (52a2a7d0): the daemon's stable enrollment codes.
+  // custody_unprotected is the one code that can truthfully say nothing
+  // was stored — the daemon refused before custody took the credential.
   custody_unprotected:
-    "The daemon could not store this credential under its protection. Choose 'I understand…' in Advanced only if you accept that risk, then retry — nothing was saved.",
+    "The daemon could not store this credential under its protection — nothing was stored. To save it anyway, tick the storage-consent box below, then retry — it is never pre-selected.",
   revision_conflict:
-    "This connection changed since you opened the form. Reload the page, then retry — your credential was not saved.",
+    "This connection changed while the form was open. Refresh the connections list, then retry.",
 };
 
 /**
@@ -64,10 +66,13 @@ const ENROLL_ERROR: Record<string, string> = {
  */
 function smtpRequiredScopes(provider: ConnectionProvider | null): string[] {
   const caps = provider?.descriptor?.capabilities ?? [];
-  const send = caps.filter((c) => c.effect === "send");
-  const source = send.length > 0 ? send : caps;
+  // Only the reviewed send-capability scopes — a provider that declares
+  // none cannot express an SMTP enrollment, so return empty rather than
+  // falling back to the union of every permission it happens to list.
   const seen = new Set<string>();
-  for (const cap of source) for (const scope of cap.scopes ?? []) seen.add(scope);
+  for (const cap of caps) {
+    if (cap.effect === "send") for (const scope of cap.scopes ?? []) seen.add(scope);
+  }
   return [...seen].sort();
 }
 
@@ -76,8 +81,10 @@ function enrollErrorMessage(e: unknown): string {
   const code = err?.code;
   if (code !== undefined && code in ENROLL_ERROR) return ENROLL_ERROR[code];
   // Unknown or absent code: never surface the raw downstream text — it
-  // can echo the credential. Report a bounded generic refusal instead.
-  return "The connection could not be added. Check the details and retry — nothing was saved.";
+  // can echo the credential. The network outcome may be uncertain (the
+  // daemon can commit before a lost response), so do not claim 'nothing
+  // was saved' — ask the operator to confirm before retrying instead.
+  return "Could not confirm the connection was added. Refresh connections before retrying.";
 }
 
 /**
@@ -685,6 +692,7 @@ function AddConnection({
 
   const submit = () => {
     if (busy) return;
+    setRiskNeeded(false);
     const cleanedAccount = account.trim();
     // CAD-1013 SMTP simplification: an SMTP sender enrolls exactly the
     // send capability's reviewed scope — not operator-typed, and never
@@ -693,6 +701,14 @@ function AddConnection({
     const wanted = smtpShape
       ? smtpRequiredScopes(chosen)
       : scopes.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    if (smtpShape && wanted.length === 0) {
+      // No reviewed send capability on this provider — SMTP enrollment is
+      // unsupported here; do not widen the grant to unrelated permissions.
+      setError(
+        "This provider does not offer SMTP sending — it has no reviewed send permission to enroll.",
+      );
+      return;
+    }
     if (!provider || cleanedAccount === "" || wanted.length === 0) {
       setError(
         smtpShape
@@ -999,11 +1015,41 @@ function AddConnection({
               </p>
             </div>
           )}
-          <details className="text-label">
-            <summary className="cursor-pointer select-none text-ink-400">
-              Advanced: custody risk acceptance
-            </summary>
-            <label className="flex items-start gap-2 text-ink-300 mt-2">
+          {/* CAD-1013: the storage consent stays collapsed while it is
+             optional. When the daemon reports custody_unprotected it
+             moves inline above Save so the required consent is visible
+             at the point of action — and it is never pre-selected. */}
+          {!riskNeeded && (
+            <details className="text-label">
+              <summary className="cursor-pointer select-none text-ink-400">
+                Advanced: custody risk acceptance
+              </summary>
+              <label className="flex items-start gap-2 text-ink-300 mt-2">
+                <input
+                  type="checkbox"
+                  checked={acceptRisk}
+                  onChange={(e) => setAcceptRisk(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5"
+                />
+                <span>
+                  I understand this stores the credential under my existing user account and
+                  I accept that risk. Leave this off unless you knowingly accept it — it is
+                  never pre-selected.
+                </span>
+              </label>
+            </details>
+          )}
+          {error && (
+            <p className="text-label text-fail break-words" role="alert">
+              {error}
+            </p>
+          )}
+          {riskNeeded && (
+            <label
+              className="flex items-start gap-2 text-ink-200 border border-warn/40 rounded px-3 py-2 bg-warn/10"
+              data-risk-needed
+            >
               <input
                 type="checkbox"
                 checked={acceptRisk}
@@ -1012,23 +1058,11 @@ function AddConnection({
                 className="mt-0.5"
               />
               <span>
-                I understand this stores the credential under my existing user account and
-                I accept that risk. Leave this off unless you knowingly accept it — it is
-                never pre-selected.
+                <strong>Storage consent required:</strong> the daemon reports this credential
+                is stored unprotected. I understand it is stored under my existing user
+                account and I accept that risk. This is never pre-selected.
               </span>
             </label>
-          </details>
-          {error && (
-            <p className="text-label text-fail break-words" role="alert">
-              {error}
-            </p>
-          )}
-          {riskNeeded && !acceptRisk && (
-            <p className="text-label text-warn break-words" data-risk-needed>
-              The daemon reports this credential is stored unprotected. To save it anyway,
-              open <strong>Advanced: custody risk acceptance</strong> above and check the box —
-              it is never pre-selected.
-            </p>
           )}
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" size="sm" type="submit" loading={busy}>
