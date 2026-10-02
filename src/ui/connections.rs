@@ -4,7 +4,7 @@ use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
-use tiny_http::{Header, Request};
+use tiny_http::{Header, Request, Response, StatusCode};
 
 const BODY_CAP: u64 = 16 * 1024;
 const RESULT_CAP: usize = 64 * 1024;
@@ -202,18 +202,44 @@ pub(super) fn handle(
         }
         Err(error) => {
             // Neither serde unknown-field diagnostics nor downstream errors
-            // may reflect a credential-bearing request into an HTTP response.
+            // may reflect a credential-bearing request into an HTTP response —
+            // the daemon's message is never relayed verbatim (a custody error
+            // can name an account). The structured `code` is stable wire
+            // metadata, so the board maps it to a safe, actionable refusal and
+            // echoes the code itself for the UI to key on. An unmapped code
+            // keeps the historic opaque body — better a vague refusal than a
+            // reflected one.
             let operator_refusal = error.to_string().contains("operator action")
                 || error.to_string().contains("not provably the operator");
-            let code = if operator_refusal {
-                403
-            } else {
-                match error {
-                    Error::Rejected(_) | Error::Structured(_) => 409,
-                    _ => 503,
+            if operator_refusal {
+                return err_response(403, "connection management requires the signed-in operator");
+            }
+            // Stable daemon codes map to actionable refusals; the code
+            // itself is wire metadata the UI may key on. Any other
+            // failure keeps the historic opaque body — a vague refusal
+            // beats a reflected one.
+            let (code, message): (&str, &str) = match error.code() {
+                Some("custody_unprotected") => (
+                    "custody_unprotected",
+                    "the daemon refused to store the credential: custody is not isolated from managed agents — enrol only if you accept the same-user custody risk (the form's custody-risk acceptance), or isolate custody first",
+                ),
+                Some("revision_conflict") => (
+                    "revision_conflict",
+                    "the connection changed since the page loaded — reload and retry",
+                ),
+                _ => {
+                    let status = match error {
+                        Error::Rejected(_) | Error::Structured(_) => 409,
+                        _ => 503,
+                    };
+                    return err_response(status, "connection management refused or unavailable");
                 }
             };
-            err_response(code, "connection management refused or unavailable")
+            let body = serde_json::to_vec_pretty(&json!({"error": message, "code": code}))
+                .unwrap_or_default();
+            let mut resp = Response::from_data(body).with_status_code(StatusCode(409));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
         }
     }
 }
