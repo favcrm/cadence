@@ -4935,12 +4935,21 @@ fn turn_tokens_are_shown_only_to_the_owning_connection() {
 /// marker so it holds the lane's one turn.
 fn plant_pty_turn(d: &TestDaemon, alias: &str, id: &str, token: &str) {
     if d.rpc("agent_show", json!({"alias": alias})).is_err() {
-        d.register(alias);
+        // Register as an `inbox` mailbox: it owns no actor, so no async
+        // `set_identity` can land after this plant and overwrite the
+        // planted generation (`register`'s fake provider spawns an actor
+        // whose open clears it — the CAD-375 CI flake shape).
+        let _ = d.fixture_rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "inbox",
+                   "endpoint_kind": "inbox",
+                   "cwd": d.dir.path().to_str().unwrap()}),
+        );
     }
     cad162_sql(
         d,
         "UPDATE agents SET provider='devin', endpoint_kind='pty', \
-         generation='planted', pid=NULL, pid_start=NULL WHERE alias=?1",
+         generation='planted', pid=NULL, pid_start=NULL, enabled=0 WHERE alias=?1",
         &[alias],
     );
     let now = format!(
