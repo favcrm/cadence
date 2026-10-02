@@ -816,10 +816,14 @@ async function mountedFlow() {
   const mintButton = () => byText("button", "Ask assistant to draft") as HTMLButtonElement | null;
   const mintsAtSeam = mintBodies.length;
   const sendsAtSeam = sendBodies.length;
+  // Isolate the precondition for real: the resource merges incremental
+  // reads onto its cached data, so clearing the fake array alone leaves
+  // the sent message cached. write() the store to the empty thread — a
+  // genuine no-scoped-message state — before asserting the disabled mint.
   await React.act(async () => {
-    threadEntries.length = 0;
     const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-    await resources.masterThread.refresh();
+    const { EMPTY_THREAD } = require("../src/features/home/thread") as typeof import("../src/features/home/thread");
+    resources.masterThread.write(() => EMPTY_THREAD);
   });
   await settle(() => assert(mintButton()!.disabled, "mint is disabled once the scoped message is gone"));
   assert(
