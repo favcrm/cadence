@@ -387,7 +387,7 @@ function CampaignList({
               Assistant drafts awaiting review
             </h4>
             <p className="text-secondary text-ink-400">
-              A scoped-chat assistant turn drafted these campaigns. Nothing is saved until you
+              The assistant drafted these emails from your chat. Nothing is saved until you
               open one and Apply.
             </p>
             <ul className="grid gap-2 mt-2">
@@ -2665,10 +2665,9 @@ function CampaignWorkspace({
         <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
           <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
           <p className="text-label text-ink-400">
-            The left chat assistant drafts copy when the operator asks it to: a scoped message
-            invokes the assistant-draft turn, which lands an inert pending proposal here. Only
-            Apply changes the draft revision (approval invalidates); Discard is non-mutating.
-            Nothing proposes, edits or sends silently.
+            Ask the assistant in the left chat to draft this email — its draft appears here
+            for review. Only Apply changes the saved version (approval invalidates); Discard
+            is non-mutating. Nothing proposes, edits or sends silently.
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
@@ -2820,9 +2819,29 @@ function ProposalRow({
 }) {
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
   const [showBody, setShowBody] = useState(false);
+  const [bodyRender, setBodyRender] = useState<ContentRender | null>(null);
+  const [bodyPending, setBodyPending] = useState(false);
+  const [bodyError, setBodyError] = useState<string | null>(null);
+  const [bodyTab, setBodyTab] = useState<"visual" | "html" | "text">("visual");
   const verified = proposal.actor === "assistant" && proposal.assistantReceipt !== null;
   const stale = proposal.sourceRevision !== expectedRevision;
   const receipt = proposal.assistantReceipt;
+
+  // CAD-1016: the real Visual/HTML/Text preview of the pending draft —
+  // the host renders the proposal's own inert subject/preheader/blocks
+  // (proposal-render); no save, no send. Falls back to the escaped
+  // structured body if the host render is unavailable.
+  const openBody = () => {
+    setShowBody(true);
+    if (bodyRender !== null || bodyPending) return;
+    setBodyPending(true);
+    setBodyError(null);
+    contentClient
+      .proposalRender(scope, proposal.proposalId)
+      .then((value) => setBodyRender(parseRender(value)))
+      .catch((e: unknown) => setBodyError(friendlyCampaignError(e)))
+      .finally(() => setBodyPending(false));
+  };
   return (
     <li className="card px-3 py-3" data-proposal={proposal.proposalId}>
       <p className="text-label text-ink-200">
@@ -2833,13 +2852,12 @@ function ProposalRow({
           <span
             className="chip"
             data-badge="verified-assistant"
-            title="Host-verified: the daemon stamped this draft's agent, request, campaign and source revision — the browser's copy is never the authority"
+            title="Host-verified: the assistant produced this draft on this campaign — the browser's copy is never the authority"
           >
             Verified assistant draft
           </span>{" "}
           <span className="num text-micro text-ink-500">
-            agent {receipt.agent} · request {receipt.requestId} · campaign {receipt.campaignId} ·
-            source r{receipt.sourceRevision}
+            {receipt.agent} · campaign {receipt.campaignId} · source r{receipt.sourceRevision}
           </span>
         </p>
       ) : (
@@ -2856,49 +2874,111 @@ function ProposalRow({
           </span>
         </p>
       )}
-      {/* CAD-1016: the pending draft's actual body renders BEFORE Apply —
-          subject, preheader and the bounded blocks, all escaped text
-          (no raw HTML). This is the real draft the operator reviews,
-          never a save or a render of unsaved editor state. */}
+      {/* CAD-1016: the pending draft's real body previews BEFORE Apply —
+          the host-rendered Visual/HTML/Text of the proposal's own inert
+          subject/preheader/blocks (proposal-render), never a save or an
+          unsaved-editor render. Falls back to the escaped structured
+          body if the host render is unavailable. */}
       <button
         type="button"
         className="lnk text-label mt-1"
         aria-expanded={showBody}
         data-proposal-preview={proposal.proposalId}
-        onClick={() => setShowBody((open) => !open)}
+        onClick={() => (showBody ? setShowBody(false) : openBody())}
       >
-        {showBody ? "Hide draft body" : "Preview draft body"}
+        {showBody ? "Hide preview" : "Preview draft"}
       </button>
       {showBody && (
         <div className="crm-proposal-body mt-2" data-proposal-body={proposal.proposalId}>
-          <p className="text-label text-ink-200">
-            <span className="text-ink-500">Subject:</span> {proposal.subject}
-          </p>
-          {proposal.preheader !== "" && (
-            <p className="text-label text-ink-400">
-              <span className="text-ink-500">Preheader:</span> {proposal.preheader}
+          {bodyPending && (
+            <p className="text-label text-ink-500" role="status" data-preview="loading">
+              Rendering the draft preview…
             </p>
           )}
-          <ol className="grid gap-1 mt-1" aria-label="Draft body blocks">
-            {proposal.blocks.map((block, index) => (
-              <li key={index} className="text-label text-ink-300">
-                {block.type === "heading" ? (
-                  <strong className="text-ink-100">{block.text}</strong>
-                ) : block.type === "button" ? (
-                  <span className="chip" data-block="button">
-                    Button: {block.label}
-                  </span>
-                ) : (
-                  block.text
+          {bodyError !== null && (
+            <p className="text-label text-fail" role="alert">
+              {bodyError}
+            </p>
+          )}
+          {bodyRender !== null ? (
+            <>
+              <p className="text-label text-ink-300">
+                <span className="chip" title="Preview-only sender material — host-locked">
+                  preview-only
+                </span>{" "}
+                <span className="num">
+                  {bodyRender.sender.name} · {bodyRender.sender.address}
+                </span>
+              </p>
+              <div className="app-outlet-tabs" role="tablist" aria-label="Draft preview format">
+                {(
+                  [
+                    ["visual", "Visual"],
+                    ["html", "HTML"],
+                    ["text", "Text"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className="app-outlet-tab"
+                    role="tab"
+                    aria-selected={bodyTab === key}
+                    onClick={() => setBodyTab(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {bodyTab === "visual" && (
+                <iframe
+                  title="Draft email preview"
+                  sandbox=""
+                  srcDoc={bodyRender.html}
+                  className="crm-preview-frame"
+                  data-preview="visual"
+                />
+              )}
+              {bodyTab !== "visual" && (
+                <pre className="crm-preview" data-preview={bodyTab}>
+                  {bodyTab === "html" ? bodyRender.html : bodyRender.text}
+                </pre>
+              )}
+            </>
+          ) : (
+            bodyError === null && !bodyPending ? null : (
+              <>
+                <p className="text-label text-ink-200">
+                  <span className="text-ink-500">Subject:</span> {proposal.subject}
+                </p>
+                {proposal.preheader !== "" && (
+                  <p className="text-label text-ink-400">
+                    <span className="text-ink-500">Preheader:</span> {proposal.preheader}
+                  </p>
                 )}
-              </li>
-            ))}
-          </ol>
+                <ol className="grid gap-1 mt-1" aria-label="Draft body blocks">
+                  {proposal.blocks.map((block, index) => (
+                    <li key={index} className="text-label text-ink-300">
+                      {block.type === "heading" ? (
+                        <strong className="text-ink-100">{block.text}</strong>
+                      ) : block.type === "button" ? (
+                        <span className="chip" data-block="button">
+                          Button: {block.label}
+                        </span>
+                      ) : (
+                        block.text
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )
+          )}
         </div>
       )}
       {stale && proposal.state === "pending" && (
         <p className="text-label text-warn mt-1" data-state="stale">
-          Needs review (stale) — stamped against source r{proposal.sourceRevision}, the draft is
+          Needs review (stale) — drafted against r{proposal.sourceRevision}, the saved version is
           now r{expectedRevision}. Re-review its text before asking the assistant to draft again.
         </p>
       )}

@@ -128,6 +128,8 @@ export const contentPaths = {
     `${scopePath(scope)}/proposals/${proposalId}/apply`,
   proposalDiscardPath: (scope: ContentScope, proposalId: string) =>
     `${scopePath(scope)}/proposals/${proposalId}/discard`,
+  proposalRenderPath: (scope: ContentScope, proposalId: string) =>
+    `${scopePath(scope)}/proposals/${proposalId}/render`,
   bindingSavePath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings`,
   bindingListPath: (scope: ContentScope) => `${scopePath(scope)}/sender-bindings/list`,
   bindingPath: (scope: ContentScope, bindingId: string) =>
@@ -230,6 +232,19 @@ export const contentClient = {
     const body: Record<string, unknown> = { expected_revision: expectedRevision };
     assertClean(body, APPROVE_KEYS, "approve");
     return post(contentPaths.approvePath(scope, campaignId), body);
+  },
+  /** `POST …/proposals/<id>/render` — the host renders the inert draft's
+   *  own subject/preheader/blocks (never a save, never a send) so the
+   *  operator reviews the real Visual/HTML/Text body before Apply. */
+  proposalRender(
+    scope: ContentScope,
+    proposalId: string,
+    opts?: { sampleFirstName?: string },
+  ): Promise<unknown> {
+    const body: Record<string, unknown> = {};
+    if (opts?.sampleFirstName !== undefined) body.sample_first_name = opts.sampleFirstName;
+    assertClean(body, RENDER_KEYS, "proposal render");
+    return post(contentPaths.proposalRenderPath(scope, proposalId), body);
   },
   testPrepare(
     scope: ContentScope,

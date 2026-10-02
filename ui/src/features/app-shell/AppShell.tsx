@@ -829,6 +829,10 @@ function ChatPane({
         <details className="app-chat-import">
           <summary className="text-label text-ink-300">Import a customer list</summary>
           <ChatCsvImport
+            // CAD-1016: a context change remounts the import — a pending
+            // plan/preview/choices from the prior scope can never bleed
+            // into the new one.
+            key={`${binding.scope.install_id}:${binding.scope.context_id}`}
             scope={{ installId: binding.scope.install_id, contextId: binding.scope.context_id }}
             canWrite={canSend}
             onSendIntent={async (intent) => {

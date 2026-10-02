@@ -135,8 +135,10 @@ export default function ChatCsvImport({
       });
       if (!live.current.mounted || live.current.scope !== scopeKey) return;
       if (sendError === null) {
-        setSent("Confirmed — the import intent went to the assistant's scoped turn. It applies the reviewed rows; this board shows the outcome.");
+        // Clear the plan first, then set the status — resetPlan() clears
+        // `sent`, so the message is written after the reset, not before.
         resetPlan();
+        setSent("Confirmed — the import went to the assistant. It applies the reviewed rows; this board shows the outcome.");
       } else {
         // The confirm minted but the hand-off send failed — say so
         // honestly; the operator retries the same request id, which the
@@ -167,8 +169,8 @@ export default function ChatCsvImport({
   return (
     <section aria-label="Import customers via chat" className="grid gap-2" data-chat-import>
       <p className="text-label text-ink-400">
-        Paste a small customer CSV — the assistant previews it, you review each row, then a Confirm
-        hands the approved plan to its next turn. Nothing imports until you Confirm.
+        Paste a small customer CSV — review each row, then Confirm to import it with the
+        assistant. Nothing imports until you Confirm.
       </p>
       {preview === null && (
         <form
@@ -266,6 +268,7 @@ export default function ChatCsvImport({
                       aria-label={`Expected revision for row ${row.row}`}
                       placeholder={row.currentRevision !== null ? `r${row.currentRevision}` : "revision"}
                       value={revisions.get(row.row) ?? ""}
+                      disabled={pending !== null}
                       onChange={(e) => setRevisions(new Map(revisions).set(row.row, e.target.value))}
                     />
                   ) : (
@@ -285,6 +288,7 @@ export default function ChatCsvImport({
                       id={`chat-csv-choice-${row.row}`}
                       size="sm"
                       value={choice}
+                      disabled={pending !== null}
                       onChange={(value) => {
                         if (value === "apply" || value === "skip") {
                           setChoices(new Map(choices).set(row.row, value));
@@ -324,12 +328,12 @@ export default function ChatCsvImport({
                 applyCount === 0
                   ? "No row is set to apply — the plan refused or skipped every row"
                   : csvDecisionsReady(preview.rows, choices, revisions)
-                    ? "Confirm and hand the reviewed plan to the assistant's next turn"
+                    ? "Confirm this plan — the assistant imports the reviewed rows"
                     : "Every row marked for update needs its expected revision"
               }
               onClick={confirmPlan}
             >
-              Confirm &amp; hand to assistant ({applyCount})
+              Confirm import ({applyCount})
             </Button>
             <Button size="sm" disabled={pending !== null} onClick={resetPlan}>
               Cancel
