@@ -236,7 +236,7 @@ export default function PublishPanel({
     setBusy(true);
     setActionError(null);
     try {
-      await client.cancel(intentId);
+      await client.cancel(intentId, installId, contextId);
       setConfirmCancel(null);
       setNotice(`Cancelled ${intentId} before dispatch. Nothing was sent.`);
       statusRef.current?.focus();

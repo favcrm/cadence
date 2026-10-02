@@ -72,7 +72,7 @@ const stub = {
     imports.push(body);
     return { media_key: `dp1.ws.conn.${importHex.slice(0, 32)}`, image_digest: importHex };
   },
-  cancel: async (intentId: string) => { cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
+  cancel: async (intentId: string, installId: string, contextId: string | null) => { assert(installId === "install-a" && contextId === null, "Panel cancels in its own install/context scope"); cancelled.push(intentId); intents = intents.map(value => value.intent_id === intentId ? { ...value, state: "cancelled" } : value); return { intent: intents.find(value => value.intent_id === intentId) }; },
 };
 let mounts = 0;
 async function render(props: any) {

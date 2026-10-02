@@ -309,14 +309,21 @@ impl Store {
         Ok(result)
     }
 
-    /// Operator cancellation before dispatch. Any other state refuses.
-    pub fn social_publish_cancel(&self, intent_id: &str) -> Result<Value> {
+    /// Operator cancellation before dispatch, scoped (CAD-1027): the intent
+    /// must belong to exactly this install and context (null-preserving).
+    /// Any other state or scope refuses and changes nothing.
+    pub fn social_publish_cancel(
+        &self,
+        intent_id: &str,
+        install_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Value> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued'",params![now(),intent_id])?;
+        let changed = tx.execute("UPDATE social_publish_intents SET state='cancelled',updated=? WHERE intent_id=? AND state='queued' AND install_id=? AND context_id IS ?",params![now(),intent_id,install_id,context_id])?;
         if changed != 1 {
             return Err(Error::rejected(
-                "only a queued social publish intent can be cancelled",
+                "only a queued social publish intent in this install and context can be cancelled",
             ));
         }
         Self::event(
@@ -730,6 +737,47 @@ impl Store {
             row.bundle_digest,
             row.slot,
         )?;
+        // CAD-1027: the request's install/context must be the run's own —
+        // the material proves the run's binding in the run's scope only, so
+        // a request naming another scope would otherwise freeze under it.
+        // context_id is exact and null-preserving (no wildcard).
+        if material["run"]["install_id"].as_str() != Some(row.install_id)
+            || material["run"]["context_id"].as_str() != row.context_id
+        {
+            return Err(Error::rejected(
+                "grant_binding_mismatch: schedule names a different install or context than the run",
+            ));
+        }
+        // CAD-1027: the effect must be an app effect authorized by THIS run's
+        // artifact in this exact scope — never a forged id or another run's.
+        let effect_scope = self
+            .conn()
+            .query_row(
+                "SELECT install_id,context_id,run_id,artifact_id FROM app_effect_authorizations WHERE effect_id=?",
+                [row.effect_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if effect_scope
+            .as_ref()
+            .is_none_or(|(install, context, run, artifact)| {
+                install != row.install_id
+                    || context.as_deref() != row.context_id
+                    || run != row.run_id
+                    || artifact != row.artifact_id
+            })
+        {
+            return Err(Error::rejected(
+                "bad_effect: effect does not belong to this run, artifact and scope",
+            ));
+        }
         let caption_digest = bare_digest(
             material["artifact"]["digest"]
                 .as_str()

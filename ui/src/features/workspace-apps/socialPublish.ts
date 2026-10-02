@@ -234,6 +234,7 @@ const SCHEDULE_KEYS = [
   "artifact_id", "bundle_digest", "slot", "destination_id", "toolkit",
   "media_key", "grant_id", "approval_id", "due_epoch", "timezone",
 ] as const;
+const CANCEL_KEYS = ["install_id", "context_id"] as const;
 const MEDIA_IMPORT_KEYS = [
   "request_id", "install_id", "context_id", "run_id", "artifact_id",
   "bundle_digest", "slot", "toolkit", "destination_id",
@@ -284,8 +285,11 @@ export const socialPublish = {
     if (!key || !digest) throw new ApiError("The server returned an invalid media import receipt", 502);
     return { media_key: key, image_digest: digest };
   },
-  cancel: async (intentId: string) => {
-    const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, {});
+  /** CAD-1027: cancel names the intent's own install and exact context;
+   *  the daemon refuses any other scope. */
+  cancel: async (intentId: string, installId: string, contextId: string | null) => {
+    const body = { install_id: installId, ...(contextId ? { context_id: contextId } : {}) };
+    const reply = await request<{ intent: BackendIntent }>(paths.cancel(intentId), undefined, body, CANCEL_KEYS);
     return { intent: toPublishIntent(reply.intent) };
   },
 };

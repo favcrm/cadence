@@ -55,7 +55,9 @@ async function main() {
   assert(write?.body.slot === "publication" && write?.body.timezone === "Asia/Hong_Kong"
     && write?.body.destination_id === "17841400008460056"
     && !Object.hasOwn(write?.body ?? {}, "caption_digest"), "Artifact-freeze body carries no caller-invented digest");
-  const cancelled = await store.socialPublish.cancel("intent-a");
+  const cancelled = await store.socialPublish.cancel("intent-a", "install-a", "ctx-a");
+  const cancelCall = calls.find(call => call.url === "/api/social-publishes/intent-a/cancel");
+  assert(cancelCall?.body.install_id === "install-a" && cancelCall?.body.context_id === "ctx-a" && Object.keys(cancelCall.body).length === 2, "Cancel names the intent's install and context scope only");
   assert(cancelled.intent.state === "cancelled", "Cancel closes the intent");
   assert(calls.length > 0 && calls.every(call => call.url.startsWith("/api/") && !call.url.includes("http")), "Every client call stays same-origin — no external provider reachable");
   const states = ["queued", "processing", "posted", "refused", "cancelled", "held"] as const;

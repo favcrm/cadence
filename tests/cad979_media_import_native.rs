@@ -153,7 +153,11 @@ fn approved_image_run(h: &Release, png: &[u8], tag: &str) -> (Value, String, Str
     )
     .unwrap();
     h.dispatch(&run);
-    let run = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    let mut run = h.wait_state(run["id"].as_str().unwrap(), "succeeded");
+    // CAD-1027: freeze proves the effect belongs to this run+artifact, so
+    // every fixture schedules against a real staged app effect.
+    let effect = h.stage(&run, &format!("cad979-effect-{tag}"));
+    run["staged_effect_id"] = effect["effect_id"].clone();
     let receipt = h
         .daemon
         .operator_rpc("app_run_capability_results", json!({"run_id":run["id"]}))
@@ -184,7 +188,7 @@ fn schedule_body(
         "run_id": run["id"],
         "artifact_id": run["artifacts"][0]["id"],
         "bundle_digest": bundle,
-        "slot": "publication", "effect_id": "cad_fx_cad979",
+        "slot": "publication", "effect_id": run["staged_effect_id"],
         "destination_id": "17841400008460056", "toolkit": "instagram",
         "grant_id": "dpq_synthetic_grant_ig", "approval_id": approval_for(request),
         "due_epoch": 1_750_000_000, "timezone": "Asia/Hong_Kong"});
