@@ -98,7 +98,7 @@ mod tests;
 /// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -277,7 +277,7 @@ impl Store {
     /// before it returns, so no write starts post-trip.
     pub(crate) fn write_tx<R>(
         &self,
-        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> Result<R>,
+        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> Result<R>,
     ) -> Result<R>
     where
         R: 'static,
@@ -293,7 +293,7 @@ impl Store {
     /// source (e.g. `shutdown_entries`' typed-retry path).
     pub(crate) fn write_tx_raw<T>(
         &self,
-        f: impl for<'t> FnOnce(&mut WriteTxn<'t>) -> rusqlite::Result<T>,
+        f: impl for<'t> FnOnce(&WriteTxn<'t>) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T>
     where
         T: 'static,

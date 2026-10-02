@@ -72,7 +72,7 @@ fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewAppr
 /// `(kind, approval_id)` rows on the approval stream, in order.
 fn approval_rows(s: &Store) -> Vec<(String, String)> {
     s.fixture_write(|conn| {
-        conn.query_map(
+        (*conn).query_map(
             "SELECT kind, payload FROM events WHERE alias=? ORDER BY seq",
             [APPROVAL_STREAM],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
@@ -104,7 +104,7 @@ fn v3_db(dir: &TempDir) -> std::path::PathBuf {
     }
     // Downgrade to a genuine v3: drop the v4 objects + columns.
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch(
+    (*conn).execute_batch(
         "DROP TABLE verdicts; DROP TABLE tasks; DROP TABLE jobs;
              DROP INDEX msg_task; DROP INDEX events_job;
              ALTER TABLE messages DROP COLUMN task_id;

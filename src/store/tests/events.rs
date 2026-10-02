@@ -176,12 +176,12 @@
     fn delivery(s: &Store, alias: &str, id: &str, state: &str, events: &[(&str, f64)]) {
         s.enqueue(alias, "work", None, id, "user").unwrap();
         s.fixture_write(|conn| {
-            conn.execute(
+            (*conn).execute(
                 "UPDATE messages SET state=?1 WHERE id=?2",
                 params![state, id],
             )?;
             for (kind, age) in events {
-                conn.execute(
+                (*conn).execute(
                     "INSERT INTO events(alias,kind,payload,at) VALUES(?1,?2,?3,?4)",
                     params![alias, kind, json!({"message": id}).to_string(), now() - age],
                 )?;
@@ -316,13 +316,13 @@
                 "agent_gc_removed",
                 "a_kind_added_later",
             ] {
-                conn.execute(
+                (*conn).execute(
                     "INSERT INTO events(alias,kind,payload,at) VALUES('a1',?1,?2,?3)",
                     params![kind, json!({"message": "m-done"}).to_string(), old],
                 )?;
             }
             // A delivery row a job view reads stays in that view.
-            conn.execute(
+            (*conn).execute(
                 "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
                  VALUES('a1','submitted',?1,'job-1','job-1-impl',?2)",
                 params![json!({"message": "m-done"}).to_string(), old],

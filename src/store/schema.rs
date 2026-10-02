@@ -1394,7 +1394,7 @@ impl Store {
     /// the caller can tell retryable lock contention from a dead store.
     fn shutdown_entries_tx(
         &self,
-        tx: &mut super::WriteTxn<'_>,
+        tx: &super::WriteTxn<'_>,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> rusqlite::Result<Vec<AdoptEntry>> {
         // The sealed facade already opened this `BEGIN IMMEDIATE` —

@@ -45,7 +45,7 @@
         // created_bits proof must still admit the original recipient.
         let (seq, payload): (i64, String) = s
             .fixture_write(|conn| {
-                conn.query_row(
+                (*conn).query_row(
                     "SELECT seq,payload FROM events
                      WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
                     [],
@@ -58,7 +58,7 @@
         payload["recipient_identity"]["created"] =
             json!(f64::from_bits(created.to_bits().wrapping_add(1)));
         s.fixture_write(|conn| {
-            conn.execute(
+            (*conn).execute(
                 "UPDATE events SET payload=? WHERE seq=?",
                 rusqlite::params![payload.to_string(), seq],
             )
@@ -153,7 +153,7 @@
         s.enqueue("w1", "look", None, "m-nudge", "nudge").unwrap();
         s.enqueue("w1", "task", None, "m-work", "user").unwrap();
         s.set_state_detached("w1", "stopped", None).unwrap();
-        s.fixture_write(|c| c.execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
+        s.fixture_write(|c| (*c).execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
             .map_err(Into::into)).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
@@ -164,7 +164,7 @@
         assert_eq!(s.message("m-nudge").unwrap().unwrap().state, "unknown");
         assert_eq!(s.message("m-work").unwrap().unwrap().state, "queued");
         // A fencing unknown also offers unfence.
-        s.fixture_write(|c| c.execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
+        s.fixture_write(|c| (*c).execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
             .map_err(Into::into)).unwrap();
         let err = s
             .remove_agent("w1", true, &operator_by())
@@ -250,7 +250,7 @@
         assert_eq!(ids, vec!["fresh-1".to_string()]);
         // Nothing old refuses a plain removal of the new agent.
         s.set_state_detached("w1", "stopped", None).unwrap();
-        s.fixture_write(|c| c.execute(
+        s.fixture_write(|c| (*c).execute(
                 "UPDATE messages SET state='completed' WHERE id='fresh-1'",
                 [],
             )
@@ -697,12 +697,12 @@
         )
         .unwrap();
         s.enqueue("w1", "chat", None, "m-chat", "user").unwrap();
-        s.fixture_write(|c| c.execute(
+        s.fixture_write(|c| (*c).execute(
                 "UPDATE messages SET state='completed' WHERE id='m-chat'",
                 [],
             )
             .map_err(Into::into)).unwrap();
-        s.fixture_write(|c| c.execute(
+        s.fixture_write(|c| (*c).execute(
                 "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                  updated=? WHERE alias='w1'",
                 params![now() - 30.0 * 86_400.0],
@@ -734,7 +734,7 @@
             "old", "done", "queued", "running", "unknown", "future", "enabled", "young", "live",
         ] {
             reg(&s, alias, &cwd);
-            s.fixture_write(|c| c.execute(
+            s.fixture_write(|c| (*c).execute(
                     "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                      updated=? WHERE alias=?",
                     params![aged, alias],
@@ -751,16 +751,16 @@
             ("future", "m-f", "awaiting_report"),
         ] {
             s.enqueue(alias, "work", None, id, "user").unwrap();
-            s.fixture_write(|c| c.execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
+            s.fixture_write(|c| (*c).execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
                 .map_err(Into::into)).unwrap();
         }
         s.fixture_write(|c| {
-            c.execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])?;
-            c.execute(
+            (*c).execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])?;
+            (*c).execute(
                 "UPDATE agents SET updated=? WHERE alias='young'",
                 params![now() - 2.0 * 86_400.0],
             )?;
-            c.execute("UPDATE agents SET endpoint='sock' WHERE alias='live'", [])?;
+            (*c).execute("UPDATE agents SET endpoint='sock' WHERE alias='live'", [])?;
             Ok(())
         })
         .unwrap();
