@@ -92,6 +92,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // delegated writes, never the operator verbs or a generic app write.
     "app_record_csv_assistant_import",
     "app_segment_assistant_save",
+    // CAD-1014(b): the composer-free scoped-chat email draft — the turn
+    // IS the request (no manual mint); one turn one inert proposal.
+    "app_content_assistant_draft",
     // CAD-1014(b): the scoped-chat reads behind the commits — segment
     // revision/membership and the CSV preview. Read-only, no claim.
     "app_segment_assistant_list",

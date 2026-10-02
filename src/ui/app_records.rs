@@ -30,6 +30,9 @@ pub(super) enum Route<'a> {
     /// write transport while the daemon itself writes nothing.
     CsvPreview(&'a str, &'a str),
     CsvImport(&'a str, &'a str),
+    /// POST-only CSV confirm: the operator mints the one-use delegated
+    /// confirm receipt the agent redeems — never a commit itself.
+    CsvConfirm(&'a str, &'a str),
 }
 
 fn segment(id: &str) -> bool {
@@ -61,14 +64,14 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
     // and `csv-import` are unaddressable over HTTP (RPC still serves
     // them) so a bulk POST can never create or read a record, and
     // suffixed paths under them never resolve.
-    if matches!(record, "csv-preview" | "csv-import") {
+    if matches!(record, "csv-preview" | "csv-import" | "csv-confirm") {
         if parts.next().is_some() {
             return None;
         }
-        return Some(if record == "csv-preview" {
-            Route::CsvPreview(install, context)
-        } else {
-            Route::CsvImport(install, context)
+        return Some(match record {
+            "csv-preview" => Route::CsvPreview(install, context),
+            "csv-import" => Route::CsvImport(install, context),
+            _ => Route::CsvConfirm(install, context),
         });
     }
     if !segment(record) {
@@ -115,6 +118,17 @@ struct CsvDecision {
     action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_revision: Option<u64>,
+}
+
+/// Operator confirm: binds the exact preview token, request id and
+/// decisions digest the agent will redeem. The URL install/context are
+/// authority; the body carries no identity.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CsvConfirm {
+    request_id: String,
+    preview_token: String,
+    decisions_digest: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -302,6 +316,22 @@ pub(super) fn handle(
             }
             ("app_record_csv_import", params)
         }
+        Route::CsvConfirm(install, context) => {
+            let body: CsvConfirm = match typed(request) {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            (
+                "app_record_csv_confirm",
+                json!({
+                    "install_id": install,
+                    "context_id": context,
+                    "request_id": body.request_id,
+                    "preview_token": body.preview_token,
+                    "decisions_digest": body.decisions_digest,
+                }),
+            )
+        }
     };
     match client::rpc(state, method, params) {
         Ok(value) if value.to_string().len() <= RESULT_CAP => {
@@ -351,6 +381,10 @@ mod tests {
             route("/api/app-installations/install-a/contexts/context-b/records/csv-import"),
             Some(Route::CsvImport("install-a", "context-b"))
         ));
+        assert!(matches!(
+            route("/api/app-installations/install-a/contexts/context-b/records/csv-confirm"),
+            Some(Route::CsvConfirm("install-a", "context-b"))
+        ));
         // The bulk verbs are POST-only transport: never reads.
         assert!(
             !route("/api/app-installations/i/contexts/c/records/csv-preview")
@@ -362,6 +396,12 @@ mod tests {
                 .unwrap()
                 .is_read()
         );
+        // The confirm is an operator write — never a read.
+        assert!(
+            !route("/api/app-installations/i/contexts/c/records/csv-confirm")
+                .unwrap()
+                .is_read()
+        );
         for path in [
             "/api/app-installations/install-a/records",
             "/api/app-installations/install-a/contexts/",
@@ -370,6 +410,7 @@ mod tests {
             "/api/app-installations/install-a/contexts/context-b/records/customer-1/archive",
             "/api/app-installations/install-a/contexts/context-b/records/csv-preview/extra",
             "/api/app-installations/install-a/contexts/context-b/records/csv-import/extra",
+            "/api/app-installations/install-a/contexts/context-b/records/csv-confirm/extra",
             "/api/app-installations/../contexts",
             "/api/app-records",
         ] {
@@ -425,6 +466,25 @@ mod tests {
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","decisions":[{"row":1,"action":"update","expected_revision":2}]}"#
         )
         .is_ok());
+        // The confirm body binds token+request+digest only — no
+        // identity, install or context can ride the body.
+        assert!(serde_json::from_str::<CsvConfirm>(
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y"}"#
+        )
+        .is_ok());
+        for body in [
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","install_id":"other"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","context_id":"other"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","actor":"operator"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x","decisions_digest":"sha256:y","by":"operator"}"#,
+            r#"{"request_id":"req-1","preview_token":"sha256:x"}"#,
+            r#"{"preview_token":"sha256:x","decisions_digest":"sha256:y"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CsvConfirm>(body).is_err(),
+                "csv confirm admitted {body}"
+            );
+        }
         for body in [
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","install_id":"other"}"#,
             r#"{"csv_text":"a","preview_token":"sha256:x","request_id":"req-1","actor":"operator"}"#,

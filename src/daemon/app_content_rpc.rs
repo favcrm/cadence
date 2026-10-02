@@ -566,44 +566,40 @@ impl Shared {
             &payload_digest,
             &scoped.caller,
         )?;
-        // Explicit host-side confirm, not chat prose: the operator's
-        // `app_record_csv_confirm` minted a one-use nonce bound to the
-        // preview_token + request id + decisions digest. The agent
-        // supplies the nonce; it cannot mint or hash-forge it (server
-        // uuid). The decisions digest pins the confirmed row plan.
         let decisions = csv_decisions(params)?;
-        // Identical replay (same request id + bytes, already completed)
-        // returns the stored receipt WITHOUT spending a confirm — the
-        // claim above already bound action+request, so a completed
-        // receipt means this import's confirm was spent legitimately.
+        // The confirm-bound decisions digest (raw `decisions` JSON — the
+        // same normalized array the operator's confirm digested).
+        let decisions_digest = crate::store::app_records::csv_decisions_digest(
+            params.get("decisions").unwrap_or(&Value::Null),
+        )?;
+        // Identical replay (same request id + bytes + confirmed digest,
+        // already completed) returns the stored receipt WITHOUT spending
+        // a confirm — the claim bound this exact payload.
         let already = records.app_record_csv_receipt_exists(
             &scoped.context,
             required_str(params, "request_id")?,
             required_str(params, "preview_token")?,
+            &decisions_digest,
         )?;
-        if !already {
-            // Explicit host-side confirm, not chat prose: the operator's
-            // `app_record_csv_confirm` minted a one-use nonce bound to
-            // preview_token + request id + decisions digest. The agent
-            // supplies the nonce; it cannot mint or hash-forge it
-            // (server uuid). The digest pins the confirmed row plan.
-            let decisions_digest = crate::store::app_records::csv_decisions_digest(
-                params.get("decisions").unwrap_or(&Value::Null),
-            )?;
-            records.app_record_csv_redeem_confirm(
-                &scoped.context,
-                required_str(params, "request_id")?,
-                required_str(params, "preview_token")?,
-                &decisions_digest,
+        // The operator's confirm is spent atomically inside the import's
+        // own reservation transaction — a crash can never burn it
+        // without a pending receipt. A replay needs no confirm (the
+        // receipt IS the receipt); a fresh import spends it here.
+        let confirm = if already {
+            None
+        } else {
+            Some((
                 required_str(params, "confirm_token")?,
-            )?;
-        }
+                decisions_digest.as_str(),
+            ))
+        };
         let result = records.app_record_csv_import(
             &scoped.context,
             &csv_text(params)?,
             required_str(params, "preview_token")?,
             required_str(params, "request_id")?,
             decisions,
+            confirm,
         )?;
         self.store.note_app_record_csv_import(
             &scoped.install,
@@ -730,6 +726,66 @@ impl Shared {
             }
             _ => Err(Error::rejected("unknown app assistant read method")),
         }
+    }
+
+    /// CAD-1014(b) composer-free email draft: the agent turn drafts a
+    /// campaign email straight from the scoped chat — NO operator mint,
+    /// no request id. The host derives campaign source revision (0 for a
+    /// first draft) and stamps the proposal `pending` /
+    /// `assistant-receipt` with the message id as the receipt — the
+    /// verified turn IS the intent. The unique per-message claim makes
+    /// one turn produce one draft; an identical proposal id + bytes +
+    /// same message replays idempotently. Never edits live content,
+    /// approves or sends — Apply/Discard stay the operator's.
+    pub(super) fn rpc_app_content_assistant_draft(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::rejected("app content payload must be an object"))?;
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "campaign_id",
+            "proposal_id",
+            "subject",
+            "preheader",
+            "blocks",
+            "message",
+            "token",
+        ];
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "app content payload has unsupported fields",
+            ));
+        }
+        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant email draft")?;
+        let draft = content_draft(params)?;
+        let records = RecordStore::open(&self.state_dir, &scoped.install)?;
+        let result = records.app_content_assistant_draft(
+            &scoped.context,
+            required_str(params, "campaign_id")?,
+            required_str(params, "proposal_id")?,
+            &draft,
+            &scoped.caller,
+            &scoped.message_id,
+        )?;
+        let digest = result
+            .get("proposal")
+            .and_then(|proposal| proposal.get("content_digest"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.store.note_app_content_by(
+            &scoped.install,
+            &scoped.context,
+            "app_content_assistant_draft",
+            digest,
+            &scoped.caller,
+        );
+        self.wake();
+        Ok(result)
     }
 }
 

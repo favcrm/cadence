@@ -173,6 +173,10 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence app audience segment-assistant-ls *)",
     "Bash(cadence app audience segment-assistant-show *)",
     "Bash(cadence app record csv-assistant-preview *)",
+    // The composer-free scoped-chat email draft — the turn IS the
+    // request; one turn one inert pending proposal, never a send/
+    // approve/edit. The operator applies or discards it.
+    "Bash(cadence app content assistant-draft *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):

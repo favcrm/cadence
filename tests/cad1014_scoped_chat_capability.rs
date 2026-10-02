@@ -526,13 +526,13 @@ fn cad1014_scoped_chat_refusals_are_closed() {
     );
 }
 
-/// Email creation from scoped chat with NO prior draft — the composer-
-/// free initial-draft path. The operator's own stamped chat message is
-/// the intent; the one-time proposal request mints on a fresh campaign
-/// (`source_revision` resolves to 0 with no doc), and the agent redeems
-/// it through `app_content_assistant_propose` into an inert `pending`
-/// proposal carrying `assistant-receipt` provenance. No send, no
-/// approval — Apply stays the operator's.
+/// Email creation from scoped chat — the COMPOSER-FREE initial-draft
+/// path root requires: no operator mint, no request id. The verified
+/// turn IS the request; `app_content_assistant_draft` derives the
+/// campaign source host-side (0 on a fresh campaign, live revision on
+/// an existing one), produces an inert `pending`/`assistant-receipt`
+/// proposal, and enforces one turn = one draft. No send, no approval —
+/// Apply stays the operator's.
 #[test]
 fn cad1014_scoped_chat_email_first_draft_is_inert() {
     let w = Crm::new();
@@ -545,27 +545,15 @@ fn cad1014_scoped_chat_email_first_draft_is_inert() {
     plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
     let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-4");
 
-    // Fresh campaign — no draft exists; the mint stamps source_revision 0.
-    let minted = w.mint(
-        install,
-        context_id,
-        "welcome-1",
-        "chat-1014-4",
-        "req-1014-e1",
-    );
-    assert_eq!(
-        minted["request"]["source_revision"].as_i64(),
-        Some(0),
-        "{minted}"
-    );
-
+    // Fresh campaign, NO manual mint — the agent drafts directly and
+    // the host derives source_revision 0 (no doc exists).
     let proposed: Value = lane.rpc(
         &w.daemon.state,
-        "app_content_assistant_propose",
+        "app_content_assistant_draft",
         json!({"install_id": install, "context_id": context_id, "campaign_id": "welcome-1",
                "proposal_id": "prop-1014-e1", "subject": "Welcome, {{first_name|friend}}",
                "preheader": "A note", "blocks": blocks(),
-               "message": "chat-1014-4", "token": token, "request_id": "req-1014-e1"}),
+               "message": "chat-1014-4", "token": token}),
     );
     assert_eq!(proposed["ok"], true, "{proposed}");
     let proposal = &proposed["result"]["proposal"];
@@ -573,7 +561,52 @@ fn cad1014_scoped_chat_email_first_draft_is_inert() {
     assert_eq!(proposal["actor"], "assistant");
     assert_eq!(proposal["origin"], "assistant-receipt");
     assert_eq!(proposal["source_revision"], 0);
-    // The proposal is inert: applying/approving/sending stays the
-    // operator's — the assistant verb can never reach them (asserted in
-    // the CAD-813 suite).
+    // One turn = one draft: a second draft under the SAME message
+    // refuses — the unique per-message claim holds.
+    let second: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_draft",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "welcome-2",
+               "proposal_id": "prop-1014-e2", "subject": "Other",
+               "preheader": "A note", "blocks": blocks(),
+               "message": "chat-1014-4", "token": token}),
+    );
+    assert_eq!(second["ok"], false, "one turn minted two drafts: {second}");
+}
+
+/// The composer-free draft also covers a REPLACEMENT revision: a scoped
+/// turn on a campaign that already has a draft produces a proposal at
+/// the host-derived live source_revision — never agent text. The saved
+/// content doc is untouched; the proposal stays inert pending.
+#[test]
+fn cad1014_scoped_chat_email_draft_binds_live_revision() {
+    let w = Crm::new();
+    let installed = w.install();
+    let install = installed["install_id"].as_str().unwrap();
+    let context = w.context(install, "Client", "ctx-1014-6");
+    let context_id = context["id"].as_str().unwrap();
+    // An operator-saved draft at revision 1 already exists.
+    w.daemon
+        .operator_rpc(
+            "app_content_save",
+            json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1",
+                   "subject": "Spring launch", "preheader": "News", "blocks": blocks()}),
+        )
+        .unwrap();
+
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "crm-chat", "claude", None, lane.pid());
+    let token = w.chat_turn("crm-chat", install, context_id, "chat-1014-6");
+    let proposed: Value = lane.rpc(
+        &w.daemon.state,
+        "app_content_assistant_draft",
+        json!({"install_id": install, "context_id": context_id, "campaign_id": "launch-1",
+               "proposal_id": "prop-1014-e3", "subject": "Revised launch",
+               "preheader": "A note", "blocks": blocks(),
+               "message": "chat-1014-6", "token": token}),
+    );
+    assert_eq!(proposed["ok"], true, "{proposed}");
+    // Host-derived live revision 1 — never agent text; doc unchanged.
+    assert_eq!(proposed["result"]["proposal"]["source_revision"], 1);
+    assert_eq!(proposed["result"]["proposal"]["state"], "pending");
 }

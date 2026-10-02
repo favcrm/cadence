@@ -1802,6 +1802,99 @@ impl RecordStore {
         self.app_content_proposal_show(context, proposal_id)
     }
 
+    /// CAD-1014(b) composer-free scoped-chat draft: an assigned agent
+    /// turn drafts a campaign email with NO manual mint. The host
+    /// derives `source_revision` from the LIVE doc (0 when the campaign
+    /// has none — a first draft), stamps `receipt_request` with the
+    /// message id itself (the verified turn IS the request — there is
+    /// no operator-minted request row to redeem), and claims the
+    /// message via the `app_content_proposal_claim` unique index so one
+    /// turn produces one draft. The proposal stays `pending` /
+    /// `assistant-receipt` — never edits content, approves or sends;
+    /// Apply/Discard are still the operator's. `request_id` in the
+    /// provenance is the message id, honest because no mint exists.
+    pub fn app_content_assistant_draft(
+        &self,
+        context: &str,
+        campaign: &str,
+        proposal_id: &str,
+        draft: &Draft,
+        agent: &str,
+        message: &str,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(campaign, "campaign ID")?;
+        crate::proto::identifier(proposal_id, "proposal ID")?;
+        if agent.is_empty()
+            || agent.len() > 80
+            || !agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(Error::rejected("draft agent identity is malformed"));
+        }
+        if message.is_empty() || message.len() > 128 || message.chars().any(char::is_control) {
+            return Err(Error::rejected("draft message identity is malformed"));
+        }
+        let digest = proposal_digest(self.install(), context, campaign, proposal_id, draft);
+        let blocks_text = serde_json::to_string(&draft.canonical_blocks())
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let conn = self.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::internal(e.to_string()))?;
+        // Host-derived source: the live draft revision, or 0 for a
+        // first draft — never agent text.
+        let source_revision = tx
+            .query_row(
+                "SELECT revision FROM app_content_docs WHERE context_id=? AND campaign_id=?",
+                params![context, campaign],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?
+            .unwrap_or(0);
+        // Idempotent replay of the same proposal id on the same
+        // message+agent+identical bytes returns the stored proposal.
+        let existing: Option<(String, i64, String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT campaign_id,source_revision,content_digest,receipt_message,receipt_agent FROM app_content_proposals WHERE context_id=? AND proposal_id=?",
+                params![context, proposal_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(stored) = existing {
+            if stored.0 == campaign
+                && stored.1 == source_revision
+                && stored.2 == digest
+                && stored.3.as_deref() == Some(message)
+                && stored.4.as_deref() == Some(agent)
+            {
+                drop(tx);
+                drop(conn);
+                return self.app_content_proposal_show(context, proposal_id);
+            }
+            return Err(Error::rejected("email draft proposal ID is already used"));
+        }
+        // One turn = one draft: the unique claim index on
+        // receipt_message refuses a second proposal for this message.
+        if let Err(error) = tx.execute(
+            "INSERT INTO app_content_proposals(context_id,proposal_id,campaign_id,source_revision,subject,preheader,blocks,content_digest,actor,origin,receipt_message,receipt_agent,receipt_request,state,created,decided) VALUES(?,?,?,?,?,?,?,?,'assistant','assistant-receipt',?,?,?,'pending',?,NULL)",
+            params![context, proposal_id, campaign, source_revision, draft.subject, draft.preheader, blocks_text, digest, message, agent, message, now()],
+        ) {
+            if is_claim_conflict(&error) {
+                return Err(Error::rejected(
+                    "this scoped chat message already produced a draft",
+                ));
+            }
+            return Err(Error::internal(error.to_string()));
+        }
+        tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+        drop(conn);
+        self.app_content_proposal_show(context, proposal_id)
+    }
+
     pub fn app_content_proposal_list(
         &self,
         context: &str,

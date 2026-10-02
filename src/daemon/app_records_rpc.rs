@@ -217,6 +217,10 @@ impl Shared {
                 required_str(params, "preview_token")?,
                 required_str(params, "request_id")?,
                 csv_decisions(params)?,
+                // The operator's own direct import needs no confirm —
+                // the operator connection IS the authority; the
+                // confirm receipt exists only for the delegated agent.
+                None,
             ),
             // CAD-1014: the operator's explicit confirm of the exact
             // byte-bound plan — mints the host-held one-use nonce the

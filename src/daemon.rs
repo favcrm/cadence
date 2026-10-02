@@ -2957,6 +2957,12 @@ impl Shared {
                 self.rpc_app_record_csv_assistant_import(params, peer_pid)
             }
             "app_segment_assistant_save" => self.rpc_app_segment_assistant_save(params, peer_pid),
+            // Scoped-chat reads — data exposes, never mutations; the
+            // same verified-turn gate, no claim (a read doesn't spend).
+            // One handler routes all three to their store calls.
+            "app_segment_assistant_list" | "app_segment_assistant_show" | "app_record_csv_assistant_preview" => {
+                self.rpc_app_assistant_read(method, params, peer_pid)
+            }
             "app_segment_assistant_list"
             | "app_segment_assistant_show"
             | "app_record_csv_assistant_preview" => {
@@ -2985,6 +2991,7 @@ impl Shared {
             "app_content_assistant_propose" => {
                 self.rpc_app_content_assistant_propose(params, peer_pid)
             }
+            "app_content_assistant_draft" => self.rpc_app_content_assistant_draft(params, peer_pid),
             "app_content_proposal_show" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_apply" => self.rpc_app_content(method, params, peer_pid),

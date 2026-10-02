@@ -217,6 +217,21 @@ cadence app record csv-assistant-preview <install> --context-id <ctx> \
   --csv <tmp>/in.csv --message <msg> --token <token>
 ```
 
+Draft a campaign email straight from the scoped chat — no mint, no
+request id; the verified turn IS the request. Stage the draft JSON
+(`{subject, preheader, blocks}`) in your tmp dir, then:
+
+```sh
+cadence app content assistant-draft <install> --context-id <ctx> \
+  --campaign-id <camp> --proposal-id <id> --draft <tmp>/draft.json \
+  --message <msg> --token <token>
+```
+
+The proposal lands `pending` with `assistant-receipt` provenance — the
+operator applies or discards it; you never edit live content, approve
+or send. One turn produces one draft; re-drafting the same turn is
+refused.
+
 One message redeems one COMMIT action — a second verb or request id on
 the same message is refused; reads and inert email/segment proposals
 run from chat without a claim. These verbs can never send, approve, or

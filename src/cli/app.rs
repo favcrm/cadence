@@ -34,6 +34,13 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: AudienceAction,
     },
+    /// Campaign email content — the scoped-chat inert assistant draft
+    /// (CAD-1014): drafts a pending proposal the operator applies or
+    /// discards. Never edits, approves or sends.
+    Content {
+        #[command(subcommand)]
+        action: ContentAction,
+    },
     /// Stable workspace installation IDs; execution and approval are separate.
     Catalog {
         #[command(subcommand)]
@@ -355,6 +362,34 @@ pub(crate) enum RecordAction {
         csv: PathBuf,
         #[arg(long, requires = "token")]
         message: String,
+        #[arg(long, requires = "message")]
+        token: String,
+    },
+}
+
+/// CAD-1014 scoped-chat email draft — the agent drafts an inert
+/// `pending`/`assistant-receipt` proposal on its live scoped turn.
+/// No manual mint, no request id: the verified turn IS the request.
+/// `blocks`/`subject`/`preheader` come from a JSON draft file.
+#[derive(Subcommand)]
+pub(crate) enum ContentAction {
+    /// Draft a campaign email on the live scoped chat turn (inert
+    /// pending proposal; first draft or a replacement revision).
+    AssistantDraft {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        proposal_id: String,
+        /// JSON file holding `{subject, preheader, blocks}`.
+        #[arg(long)]
+        draft: PathBuf,
+        /// The scoped chat message the operator sent (turn identity).
+        #[arg(long, requires = "token")]
+        message: String,
+        /// The live turn token for that message.
         #[arg(long, requires = "message")]
         token: String,
     },
@@ -837,6 +872,42 @@ fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
     }
     serde_json::from_slice(&bytes)
         .map_err(|_| Error::invalid("app_audience", format!("{kind} must be JSON")))
+}
+
+fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        ContentAction::AssistantDraft {
+            install_id,
+            context_id,
+            campaign_id,
+            proposal_id,
+            draft,
+            message,
+            token,
+        } => {
+            // The draft JSON file holds {subject, preheader, blocks};
+            // the daemon's content grammar validates every field. The
+            // message+token are the live scoped turn's identity.
+            let body = read_audience_json(draft, "email draft")?;
+            let obj = body
+                .as_object()
+                .ok_or_else(|| Error::invalid("app_content", "email draft must be an object"))?;
+            let mut params = json!({
+                "install_id": install_id,
+                "context_id": context_id,
+                "campaign_id": campaign_id,
+                "proposal_id": proposal_id,
+                "message": message,
+                "token": token,
+            });
+            for key in ["subject", "preheader", "blocks"] {
+                if let Some(v) = obj.get(key) {
+                    params[key] = v.clone();
+                }
+            }
+            ("app_content_assistant_draft", params)
+        }
+    })
 }
 
 fn audience_params(action: &AudienceAction) -> Result<(&'static str, serde_json::Value)> {
@@ -1575,6 +1646,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Audience { action } => {
             let (method, params) = audience_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
+        AppAction::Content { action } => {
+            let (method, params) = content_params(action)?;
             client::rpc(state_dir, method, params)?
         }
         AppAction::Dev {
