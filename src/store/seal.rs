@@ -2180,6 +2180,44 @@ mod tests {
     }
 
     #[test]
+    fn review_regression_shutdown_closure_is_not_a_lease_fence() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        store
+            .propose_close(&permit(&db, OwnerOp::Close, b"c", "a", "art", 1), "test")
+            .unwrap();
+        let err = store
+            .shutdown_entries(&std::collections::HashMap::new())
+            .unwrap_err();
+        assert!(
+            !err.is_fenced(),
+            "closure refusal mislabeled as lease loss: {err}"
+        );
+        assert!(store.conn().is_autocommit());
+    }
+
+    #[test]
+    fn review_regression_shutdown_callback_rejection_is_not_a_lease_fence() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut store) = open_legacy(&dir);
+        store
+            .set_shutdown_entries_hook(Some(Arc::new(|_| {
+                Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    Error::rejected("callback refusal, not a lease fence"),
+                )))
+            })))
+            .unwrap();
+        let err = store
+            .shutdown_entries(&std::collections::HashMap::new())
+            .unwrap_err();
+        assert!(
+            !err.is_fenced(),
+            "callback refusal mislabeled as lease loss: {err}"
+        );
+        assert!(store.conn().is_autocommit());
+    }
+
+    #[test]
     fn review_regression_witness_records_actual_database_schema() {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
