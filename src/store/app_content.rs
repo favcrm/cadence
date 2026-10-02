@@ -576,7 +576,11 @@ fn render_html(draft: &Draft, sample: Option<&str>, binding: &BindingView) -> St
         out.push_str(&html_escape(&personalize(&draft.preheader, sample)));
         out.push_str("</div>");
     }
-    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
+    // CAD-1014: the content column must shrink to the preview iframe —
+    // a fixed `width="600"` clips under the narrow-390 CRM preview. Keep
+    // the 600px desktop measure but cap it as a style (never a fixed
+    // attribute) so the column fills the frame at narrower widths.
+    out.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\"><tr><td style=\"padding:32px;font-family:Arial,sans-serif;color:#222222;\">");
     for block in &draft.blocks {
         match block {
             Block::Heading { text } => {
@@ -2266,5 +2270,43 @@ impl Store {
         {
             eprintln!("content audit event skipped: event write refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_draft() -> Draft {
+        Draft::parse(
+            "Welcome {{first_name|friend}}",
+            "A note",
+            &[
+                json!({"type": "heading", "text": "Hello {{first_name|friend}}"}),
+                json!({"type": "paragraph", "text": "First line.\nSecond line."}),
+                json!({"type": "button", "label": "Open", "url": "https://example.com/x"}),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// CAD-1014: the email content column is responsive — `width="100%"`
+    /// with a `max-width:600px` style cap — so the narrow-390 CRM preview
+    /// frame shows the whole message instead of clipping a fixed 600px
+    /// table. No `width="600"` attribute ever returns.
+    #[test]
+    fn render_html_content_column_is_responsive() {
+        let html = render_html(&test_draft(), Some("Amina"), &preview_binding_view());
+        assert!(
+            !html.contains("width=\"600\""),
+            "fixed 600px content table clipped the narrow preview: {html}"
+        );
+        assert!(
+            html.contains("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#ffffff;max-width:600px;margin:24px auto;\">"),
+            "responsive content column missing: {html}"
+        );
+        // Content still renders through the new table shape.
+        assert!(html.contains("Hello Amina"), "{html}");
+        assert!(html.contains("https://example.com/x"), "{html}");
     }
 }
