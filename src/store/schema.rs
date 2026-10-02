@@ -230,9 +230,11 @@ impl Store {
             hook(path);
         }
         // CAD-1011: the schema bootstrap + every migration run under the
-        // constructor's single held owner-maintenance transaction. Legacy
-        // eligibility is rechecked after BEGIN and before all bootstrap DDL.
-        super::seal::with_legacy_migration_tx(&conn, &seal_state, |conn| -> Result<()> {
+        // constructor's owner/control window. Bootstrap and each migration
+        // acquire IMMEDIATE and recheck legacy eligibility before DDL.
+        // Completed steps survive a later failure, preserving recovery.
+        super::seal::with_owner_tx_control(&seal_state, || -> Result<()> {
+            let bootstrap = super::seal::begin_legacy_migration_tx(&conn)?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
              INSERT INTO schema_version(version)
@@ -265,6 +267,7 @@ impl Store {
                  UPDATE schema_version SET version=1;",
                 )?;
             }
+            bootstrap.commit()?;
             if version < 2 {
                 // Atomic: the column add and version bump commit together, so
                 // a crash cannot leave version=1 with the column present
@@ -276,11 +279,12 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .any(|name| name == "endpoint");
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !has_endpoint {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN endpoint TEXT")?;
                 }
                 tx.execute("UPDATE schema_version SET version=2", [])?;
+                tx.commit()?;
             }
             if version < 3 {
                 // v3: `params` holds endpoint-specific registration options
@@ -293,7 +297,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|c| c == "params") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN params TEXT")?;
                 }
@@ -301,6 +305,7 @@ impl Store {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN generation TEXT")?;
                 }
                 tx.execute("UPDATE schema_version SET version=3", [])?;
+                tx.commit()?;
             }
             if version < 4 {
                 // v4: the work axis. `jobs`/`tasks`/`verdicts` tables plus
@@ -319,7 +324,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(
                     "CREATE TABLE IF NOT EXISTS jobs(
                     id TEXT PRIMARY KEY,
@@ -378,6 +383,7 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS events_job ON events(job_id, seq);
                  UPDATE schema_version SET version=4;",
                 )?;
+                tx.commit()?;
             }
             if version < 5 {
                 // v5: `verdicts.verify` — the CLI's worktree-verification
@@ -389,11 +395,12 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|c| c == "verify") {
                     tx.execute_batch("ALTER TABLE verdicts ADD COLUMN verify TEXT")?;
                 }
                 tx.execute("UPDATE schema_version SET version=5", [])?;
+                tx.commit()?;
             }
             if version < 6 {
                 // v6: `jobs.stall_secs` — the per-job silence budget for
@@ -404,11 +411,12 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|c| c == "stall_secs") {
                     tx.execute_batch("ALTER TABLE jobs ADD COLUMN stall_secs INTEGER")?;
                 }
                 tx.execute("UPDATE schema_version SET version=6", [])?;
+                tx.commit()?;
             }
             if version < 8 {
                 // v8: daemon-owned supervision registrations. PR #80 owns v7
@@ -425,7 +433,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !agent_columns.iter().any(|column| column == "effort") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN effort TEXT")?;
                 }
@@ -471,6 +479,7 @@ impl Store {
                     ON monitor_alerts(monitor_id, seq);
                  UPDATE schema_version SET version=8;",
                 )?;
+                tx.commit()?;
             }
             if version < 9 {
                 // v9: provider-owned allowance telemetry. It is kept in its own
@@ -482,11 +491,12 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|column| column == "quota") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
                 }
                 tx.execute("UPDATE schema_version SET version=9", [])?;
+                tx.commit()?;
             }
             if version < 10 {
                 // v10: background dispatch is a separate, durable consent from
@@ -507,7 +517,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !agent_columns.iter().any(|column| column == "quota") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
                 }
@@ -521,6 +531,7 @@ impl Store {
                     )?;
                 }
                 tx.execute("UPDATE schema_version SET version=10", [])?;
+                tx.commit()?;
             }
             if version < 11 {
                 // v11: daemon-wide model defaults plus per-agent team role and
@@ -531,7 +542,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|column| column == "team_role") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN team_role TEXT")?;
                 }
@@ -548,6 +559,7 @@ impl Store {
                    WHERE NOT EXISTS (SELECT 1 FROM model_defaults WHERE id = 1);
                  UPDATE schema_version SET version=11;",
                 )?;
+                tx.commit()?;
             }
             if version < 12 {
                 // v12: rollout lease + the build commit the daemon last
@@ -555,18 +567,20 @@ impl Store {
                 // the file; reaching here means the crossing was allowed
                 // (fresh database, current schema, matching backup receipt,
                 // or the one-time CADENCE_ROLLOUT_BOOTSTRAP introduction).
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 crate::rollout::ensure_lease_tables(&tx)?;
                 tx.execute("UPDATE schema_version SET version=12", [])?;
+                tx.commit()?;
             }
             if version < 13 {
                 // v13: durable conversation threads (CAD-319) — a thread per
                 // agent alias and its ordered entries, outliving provider
                 // sessions. New objects only, `IF NOT EXISTS`, one
                 // transaction: a half-applied v13 converges on reopen.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(threads::SCHEMA_V13)?;
                 tx.execute("UPDATE schema_version SET version=13", [])?;
+                tx.commit()?;
             }
             if version < 14 {
                 // v14: `agents.pid_start` (CAD-385) — the recorded pid's
@@ -581,11 +595,12 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|column| column == "pid_start") {
                     tx.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")?;
                 }
                 tx.execute("UPDATE schema_version SET version=14", [])?;
+                tx.commit()?;
             }
             if version < 15 {
                 // v15: `messages.priority` (CAD-158) — the delivery rank
@@ -598,13 +613,14 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 if !columns.iter().any(|column| column == "priority") {
                     tx.execute_batch(
                         "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                     )?;
                 }
                 tx.execute("UPDATE schema_version SET version=?1", [15])?;
+                tx.commit()?;
             }
             if version < 16 {
                 // v16: `messages.issue`/`messages.worktree` (CAD-467) —
@@ -618,7 +634,7 @@ impl Store {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(std::result::Result::ok)
                     .collect();
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 for column in ["issue", "worktree"] {
                     if !columns.iter().any(|c| c == column) {
                         tx.execute_batch(&format!(
@@ -627,6 +643,7 @@ impl Store {
                     }
                 }
                 tx.execute("UPDATE schema_version SET version=?1", [16])?;
+                tx.commit()?;
             }
             if version < 17 {
                 // v17: platform custody records, per-agent grants and
@@ -634,9 +651,10 @@ impl Store {
                 // handles and fingerprints only, never credential bytes.
                 // New objects, `IF NOT EXISTS`, one transaction: a
                 // half-applied v17 converges on reopen.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(platform::SCHEMA_V17)?;
                 tx.execute("UPDATE schema_version SET version=?1", [17])?;
+                tx.commit()?;
             }
             if version < 18 {
                 // v18: the durable pending-effect record and the draft log
@@ -644,9 +662,10 @@ impl Store {
                 // by effect_id with the brokered handle UNIQUE, so a retried
                 // open dedupes and a restart reconciles. Input/summary/
                 // preview only — credentials never land here.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(effects::SCHEMA_V18)?;
                 tx.execute("UPDATE schema_version SET version=?1", [18])?;
+                tx.commit()?;
             }
             if version < 19 {
                 // v19: app-derived grants and `install_id` (CAD-577) — the install a
@@ -656,7 +675,7 @@ impl Store {
                 // once. Released v18 has no app_grants table; intermediate
                 // builds have one without install_id. Create/alter/version
                 // bump share a transaction, preserving either upgrade path.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(platform::SCHEMA_APP_GRANTS)?;
                 let columns: Vec<String> = tx
                     .prepare("PRAGMA table_info(app_grants)")?
@@ -669,14 +688,16 @@ impl Store {
                     )?;
                 }
                 tx.execute("UPDATE schema_version SET version=?1", [19])?;
+                tx.commit()?;
             }
             if version < 20 {
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_runs::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=20", [])?;
+                tx.commit()?;
             }
             if version < 21 {
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 let mut statement = tx.prepare("PRAGMA table_info(platform_credentials)")?;
                 let columns = statement
                     .query_map([], |r| r.get::<_, String>(1))?
@@ -690,12 +711,13 @@ impl Store {
                 }
                 tx.execute_batch("UPDATE platform_credentials SET connection_id='conn-' || lower(hex(randomblob(16))) WHERE connection_id=''; CREATE UNIQUE INDEX IF NOT EXISTS platform_connection_id ON platform_credentials(connection_id); CREATE TABLE IF NOT EXISTS connection_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),workspace_id TEXT NOT NULL); INSERT OR IGNORE INTO connection_metadata VALUES(1,lower(hex(randomblob(16))));")?;
                 tx.execute("UPDATE schema_version SET version=21", [])?;
+                tx.commit()?;
             }
             if version < 22 {
                 // Context rows and the nullable association are additive. Keep
                 // historical snapshots, approvals and provider receipts untouched;
                 // DDL and the schema checkpoint either commit together or roll back.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_contexts::SCHEMA)?;
                 let columns = tx
                     .prepare("PRAGMA table_info(app_runs)")?
@@ -708,12 +730,13 @@ impl Store {
                 }
                 tx.execute_batch("CREATE INDEX IF NOT EXISTS app_runs_context ON app_runs(install_id,context_id,created);")?;
                 tx.execute("UPDATE schema_version SET version=22", [])?;
+                tx.commit()?;
             }
             if version < 23 {
                 // The actual predecessor is merged CAD690's schema22. Legacy
                 // effects remain agent-grant records; an app child never falls
                 // back to them. DDL, discriminator and checkpoint are atomic.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_bindings::SCHEMA)?;
                 tx.execute_batch(super::app_effects::SCHEMA)?;
                 let columns = tx
@@ -724,17 +747,19 @@ impl Store {
                     tx.execute_batch("ALTER TABLE platform_effects ADD COLUMN authorization_kind TEXT NOT NULL DEFAULT 'agent_grant' CHECK(authorization_kind IN ('agent_grant','app_artifact'));")?;
                 }
                 tx.execute("UPDATE schema_version SET version=23", [])?;
+                tx.commit()?;
             }
             if version < 24 {
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_capabilities::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=24", [])?;
+                tx.commit()?;
             }
             if version < 25 {
                 // A review can additionally pin one immutable, run-scoped binary
                 // capability receipt. Both columns and the version advance commit
                 // together; existing text-only reviews retain NULL asset fields.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 for (table, column, definition) in [
                     (
                         "app_run_reviews",
@@ -757,12 +782,13 @@ impl Store {
                     }
                 }
                 tx.execute("UPDATE schema_version SET version=25", [])?;
+                tx.commit()?;
             }
             if version < 26 {
                 // CAD-720: historical v26 source rows are inert. No migration
                 // backfills older messages: their cloud enrollment and restore
                 // generation are unknown. v27 fences every v26 row as local.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS cloud_dispatch_outbox(
                     cursor INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -799,13 +825,14 @@ impl Store {
                 BEGIN SELECT RAISE(ABORT, 'cloud dispatch source or claim is immutable'); END;
                 UPDATE schema_version SET version=26;",
             )?;
+                tx.commit()?;
             }
             if version < 27 {
                 // Every v26 row was created by a local dispatch without issuer
                 // enrollment. Preserve it for audit, but make it permanently
                 // ineligible for a future cloud turn claim. No current insert
                 // path is permitted to create an eligible row either.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 let columns = tx
                     .prepare("PRAGMA table_info(cloud_dispatch_outbox)")?
                     .query_map([], |row| row.get::<_, String>(1))?
@@ -839,12 +866,13 @@ impl Store {
                  BEGIN SELECT RAISE(ABORT, 'cloud dispatch eligibility is unverified'); END;
                  UPDATE schema_version SET version=27;",
                 )?;
+                tx.commit()?;
             }
             if version < 28 {
                 // A package upgrade preserves the exact approval epoch of completed
                 // work. Backfill only the current, independently recorded epoch;
                 // older epochs discarded by pre-v28 code cannot be reconstructed.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS app_capability_epochs(
                     install_id TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch>0),
@@ -859,33 +887,38 @@ impl Store {
                  WHERE state='configured';
                  UPDATE schema_version SET version=28;",
             )?;
+                tx.commit()?;
             }
             if version < 29 {
                 // CAD-771: durable scheduled external-post intents. New table
                 // only; existing rows and code paths are untouched.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::social_publish::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=29", [])?;
+                tx.commit()?;
             }
             if version < 30 {
                 // CAD-785: one host-custodied SMTP sender link per CRM
                 // installation/context. New table only; the secret itself
                 // lives in custody, never in this row.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::crm_smtp::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=30", [])?;
+                tx.commit()?;
             }
             if version < 31 {
                 // CAD-786: the PII-free send intent (`crm_sends`, crash
                 // reconciliation only) and the hash-only unsubscribe
                 // index. Recipient rows never live in core.
-                let tx = conn;
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::crm_sends::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=31", [])?;
+                tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
-                    conn,
+                    &tx,
                     Self::DAEMON_STREAM,
                     "rollout_migration_allowed",
                     json!({
@@ -894,6 +927,7 @@ impl Store {
                         "reason": crossing.reason,
                     }),
                 )?;
+                tx.commit()?;
             }
             Ok(())
         })?;

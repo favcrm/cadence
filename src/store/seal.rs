@@ -242,17 +242,25 @@ pub(super) fn with_owner_tx_control<R>(state: &GuardState, f: impl FnOnce() -> R
     f()
 }
 
-/// Bootstrap and every schema migration share one SQLite writer lock.
-/// A sibling latch installed after read-only preflight refuses before DDL;
-/// no intermediate migration commit can reopen that race.
+/// Each migration step checks the latch under its own writer lock, preserving
+/// completed earlier steps if a later migration fails. Call only inside the
+/// constructor's private owner/control window so refusal can roll back.
+pub(super) fn begin_legacy_migration_tx(conn: &Connection) -> Result<Transaction<'_>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    require_legacy_writer_tx(&tx)?;
+    Ok(tx)
+}
+
+/// One finite migration step; callback failure or panic rolls it back before
+/// the owner/control window closes. A sibling latch refuses before DDL.
+#[cfg(test)]
 pub(super) fn with_legacy_migration_tx<R>(
     conn: &Connection,
     state: &GuardState,
     f: impl FnOnce(&Connection) -> Result<R>,
 ) -> Result<R> {
     with_owner_tx_control(state, || {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        require_legacy_writer_tx(&tx)?;
+        let tx = begin_legacy_migration_tx(conn)?;
         match f(&tx) {
             Ok(value) => {
                 tx.commit()?;
