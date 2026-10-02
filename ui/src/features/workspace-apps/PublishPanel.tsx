@@ -18,6 +18,7 @@ import {
   type PublishIntent,
   type PublishState,
 } from "./socialPublish";
+import { workspaceApps } from "./workspaceApps";
 
 export interface PublishCandidate {
   run_id: string;
@@ -49,12 +50,14 @@ export default function PublishPanel({
   candidates,
   canWrite,
   client = socialPublish,
+  loadArtifact = workspaceApps.artifact,
 }: {
   installId: string;
   contextId: string | null;
   candidates: PublishCandidate[];
   canWrite: boolean;
   client?: typeof socialPublish;
+  loadArtifact?: typeof workspaceApps.artifact;
 }) {
   const [intents, setIntents] = useState<PublishIntent[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -62,6 +65,14 @@ export default function PublishPanel({
   const [grantId, setGrantId] = useState("");
   // One operator confirmation: its approval id doubles as the request id,
   // so a retry or double submit of this confirmation replays one intent.
+  // CAD-1027: the reviewed artifact text freeze will post, loaded for the
+  // open confirmation (tagged by its approval id) — never the run title.
+  const [reviewed, setReviewed] = useState<{
+    approvalId: string;
+    artifactId: string;
+    text: string;
+    digest: string;
+  } | null>(null);
   const [confirmation, setConfirmation] = useState<{
     approvalId: string;
     epoch: number;
@@ -115,11 +126,30 @@ export default function PublishPanel({
       choice === "now" ? Math.floor(Date.now() / 1000) : dueEpoch;
     if (epoch === null) return;
     setActionError(null);
-    setConfirmation({ approvalId: mintApprovalId(), epoch });
+    const approvalId = mintApprovalId();
+    const artifactId = candidate?.artifact_id ?? "";
+    setConfirmation({ approvalId, epoch });
+    setReviewed(null);
+    loadArtifact(artifactId).then(
+      (artifact) => {
+        if (artifact.id !== artifactId || typeof artifact.text !== "string") {
+          setActionError("The reviewed caption does not match this draft. Nothing was scheduled.");
+          return;
+        }
+        setReviewed({ approvalId, artifactId, text: artifact.text, digest: artifact.digest });
+      },
+      (error) => setActionError(message(error)),
+    );
   };
+  const reviewedReady =
+    confirmation !== null &&
+    candidate !== null &&
+    reviewed !== null &&
+    reviewed.approvalId === confirmation.approvalId &&
+    reviewed.artifactId === candidate.artifact_id;
 
   const schedule = async () => {
-    if (!candidate || !confirmation || !canReview) return;
+    if (!candidate || !confirmation || !canReview || !reviewedReady) return;
     const { approvalId, epoch } = confirmation;
     const mode = choice;
     setBusy(true);
@@ -407,8 +437,19 @@ export default function PublishPanel({
               <section className="wa-panel wa-stack" aria-label="Confirm publish">
                 <h3>Confirm this exact post</h3>
                 <dl className="wa-stack">
-                  <dt className="wa-kicker">Caption</dt>
-                  <dd>{candidate.caption}</dd>
+                  <dt className="wa-kicker">Caption (reviewed text that will post)</dt>
+                  <dd>
+                    {reviewedReady && reviewed ? (
+                      <>
+                        <p className="wa-caption" style={{ whiteSpace: "pre-wrap" }}>
+                          {reviewed.text}
+                        </p>
+                        <code>{reviewed.digest}</code>
+                      </>
+                    ) : (
+                      "Loading the reviewed caption…"
+                    )}
+                  </dd>
                   <dt className="wa-kicker">Image digest</dt>
                   <dd>
                     {candidate.image_digest ? (
@@ -434,7 +475,7 @@ export default function PublishPanel({
                 <div className="wa-row">
                   <Button
                     variant="primary"
-                    disabled={!canReview}
+                    disabled={!canReview || !reviewedReady}
                     loading={busy}
                     onClick={() => void schedule()}
                   >

@@ -29,6 +29,21 @@ const flush = () => React.act(async () => { await new Promise(resolve => setTime
 const text = () => host.textContent ?? "";
 const button = (label: string) => Array.from(host.querySelectorAll("button")).find(value => value.textContent?.trim() === label) ?? null;
 const candidate = { run_id: "run-a", effect_id: "effect-a", artifact_id: "artifact-a", bundle_digest: "bundle-digest", title: "Synthetic caption", caption: "Synthetic caption", image_digest: "i-digest", writer: "writer-a", reviewer: "reviewer-a" };
+// CAD-1027: the run title and the reviewed artifact text differ on purpose —
+// the confirmation must show the text freeze posts, never the title.
+const reviewedText = "Reviewed caption body that will post.\nSecond line, verbatim.";
+let artifactId = "artifact-a";
+let releaseArtifact: (() => void) | null = null;
+const loadArtifact = (id: string) => new Promise<any>(resolve => {
+  const done = () => resolve({ id: artifactId === id ? id : artifactId, digest: "sha256:artifact-digest", media_type: "text/plain", size: reviewedText.length, text: reviewedText });
+  releaseArtifact = done;
+});
+async function openConfirmation() {
+  await React.act(async () => { button("Review post now")?.click(); });
+  await flush();
+  await React.act(async () => { releaseArtifact?.(); });
+  await flush();
+}
 let intents: any[] = [];
 let failList = false;
 const scheduled: any[] = [];
@@ -48,7 +63,7 @@ const stub = {
 };
 let mounts = 0;
 async function render(props: any) {
-  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], canWrite: true, client: stub, ...props })); });
+  await React.act(async () => { root.render(React.createElement(PublishPanel, { key: ++mounts, installId: "install-a", contextId: null, candidates: [], canWrite: true, client: stub, loadArtifact, ...props })); });
   await flush();
 }
 async function typeGrant(value: string) {
@@ -81,19 +96,28 @@ async function main() {
   assert(!button("Confirm and post now"), "Nothing schedules without the confirmation step");
   await React.act(async () => { button("Review post now")?.click(); });
   await flush();
+  assert(button("Confirm and post now")?.disabled && text().includes("Loading the reviewed caption"), "Confirm stays disabled until the reviewed artifact text loads");
+  await React.act(async () => { releaseArtifact?.(); });
+  await flush();
   const confirm = host.querySelector('[aria-label="Confirm publish"]')?.textContent ?? "";
-  assert(confirm.includes("Synthetic caption") && confirm.includes("i-digest") && confirm.includes("Asia/Hong_Kong") && confirm.includes("17841400008460056") && confirm.includes("instagram") && /apv-[0-9a-f]{32}/.test(confirm), "Confirmation shows caption, image digest, due, timezone, destination and the approval id");
+  assert(confirm.includes(reviewedText) && confirm.includes("sha256:artifact-digest") && !confirm.includes("Synthetic caption"), "Confirmation shows the reviewed artifact text verbatim with its digest, not the run title");
+  assert(!button("Confirm and post now")?.disabled, "A loaded matching artifact enables Confirm");
+  assert(confirm.includes("i-digest") && confirm.includes("Asia/Hong_Kong") && confirm.includes("17841400008460056") && confirm.includes("instagram") && /apv-[0-9a-f]{32}/.test(confirm), "Confirmation shows caption, image digest, due, timezone, destination and the approval id");
   await React.act(async () => { button("Confirm and post now")?.click(); button("Confirm and post now")?.click(); });
   await flush(); await flush();
   assert(scheduled.length >= 1 && scheduled.every(body => body.approval_id === scheduled[0].approval_id) && text().includes("intent-0"), "A double press reuses one approval id, so the daemon keeps one intent");
   const firstApproval = scheduled[0].approval_id;
-  await React.act(async () => { button("Review post now")?.click(); });
+  artifactId = "artifact-other";
+  await openConfirmation();
+  assert(button("Confirm and post now")?.disabled && text().includes("does not match this draft"), "An artifact that is not the draft's keeps Confirm disabled");
+  artifactId = "artifact-a";
+  await React.act(async () => { button("Back")?.click(); });
   await flush();
+  await openConfirmation();
   await typeGrant("dpq_synthetic_grant_other");
   assert(!button("Confirm and post now"), "Editing after review voids the confirmation");
   await typeGrant("dpq_synthetic_grant_ig");
-  await React.act(async () => { button("Review post now")?.click(); });
-  await flush();
+  await openConfirmation();
   await React.act(async () => { button("Confirm and post now")?.click(); });
   await flush(); await flush();
   assert(scheduled[scheduled.length - 1].approval_id !== firstApproval, "A new confirmation mints a new approval id");
